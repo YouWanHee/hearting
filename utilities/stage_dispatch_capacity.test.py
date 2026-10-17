@@ -8,6 +8,8 @@ S=importlib.util.spec_from_file_location("fallback",ROOT/"utilities/stage-dispat
 F=importlib.util.module_from_spec(S);S.loader.exec_module(F)
 import sys;sys.path.insert(0,str(ROOT/"utilities"))
 from model_config import parse_config
+import os
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 class CapacityTest(unittest.TestCase):
  def setUp(self):

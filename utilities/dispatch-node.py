@@ -712,7 +712,7 @@ def bind_dispatch_evidence(route, node, adapter, adapter_args, parent_identity=N
     return extra
 
 
-def pin_harness_available(route, node, harness, jobs):
+def pin_harness_available(route, node, harness, jobs, recheck=True):
     """Whether the route's sealed worker pin can run this node now.
 
     The same hard checks `dispatch-batch` applies before it places a leg: the node's own harness
@@ -725,7 +725,7 @@ def pin_harness_available(route, node, harness, jobs):
         if harness not in members:
             return False
     from dispatch_capacity_evidence import active_limits
-    if harness in active_limits(jobs, profile=node.get("model_profile")):
+    if harness in active_limits(jobs, profile=node.get("model_profile"), recheck=recheck and harness == "claude"):
         return False
     if node.get("dispatch_depth") == 2:
         try:
@@ -915,7 +915,7 @@ def main():
  if worker_type not in {"owner","frame"} and not a.subsession_id and not replaying:
   a.adapter,overridden_adapter=ROUTE_AUTHORITY.pinned_launch_harness(
    route,worker_type=worker_type,requested=a.adapter,
-   available=lambda harness:pin_harness_available(route,node,harness,registry.path))
+   available=lambda harness:pin_harness_available(route,node,harness,registry.path,recheck=a.action!="dry-run"))
  wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
  # SD-165: a borrowed part reads its origin capability's contract; the route binding stays the host's.
  contract=assigned_contract(capability=(node.get("part") or "").partition(":")[0] or route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)

@@ -236,9 +236,10 @@ def tuple_key(row: dict) -> str:
     ))
 
 
-def _usage_states(jobs: Path, profile=None) -> dict[str, str]:
+def _usage_states(jobs: Path, profile=None, recheck=False) -> dict[str, str]:
     result = subprocess.run(
-        [str(ROOT / "utilities/usage-check.sh"), "--harness", "all", "--jobs", str(jobs),
+        [str(ROOT / "utilities/usage-check.sh"), "--harness", "all", *(["--recheck"] if recheck else []),
+         "--jobs", str(jobs),
          "--model-profile", profile or ""],
         cwd=ROOT,
         text=True,
@@ -340,9 +341,11 @@ def apply_worker_pin(route: dict, hops: list[dict], parent_identity: dict | None
 
 
 def ordered_fallback_hops(
-    route: dict, node: dict, jobs: Path, *, parent_identity: dict | None = None
+    route: dict, node: dict, jobs: Path, *, parent_identity: dict | None = None, recheck: bool = False
 ) -> tuple[list[dict], dict | None]:
     """Rank the checked direct-headless band from the sealed allocation policy.
+
+    `recheck` (a launch, not a dry run) lets the usage gate probe a held Claude login.
 
     Both paths end in ``apply_worker_pin``: a pinned step is never moved to
     another tool.
@@ -360,7 +363,7 @@ def ordered_fallback_hops(
         # parent filter.
         return apply_worker_pin(route, list(node["fallback_hops"]), parent_identity), None
     counts = attempt_counts(jobs, window=int(allocation["window"]))
-    states = _usage_states(jobs, node.get("model_profile"))
+    states = _usage_states(jobs, node.get("model_profile"), recheck=recheck)
     headless: dict[str, tuple[dict, dict]] = {}
     trailing_rows: list[tuple[dict, dict]] = []
     tail_hops = []
@@ -1609,7 +1612,8 @@ def capacity_retry(
         return "descend", {}, rejected
 
     from dispatch_capacity_evidence import active_limits
-    quota = active_limits(args.jobs, models={harness: alt_model}).get(harness)
+    quota = active_limits(args.jobs, models={harness: alt_model},
+                          recheck=harness == "claude" and getattr(args, "action", "start") != "dry-run").get(harness)
     if quota:
         reason = f"capacity-quota-until-{quota['reset_epoch']}"
         attempts.append(f"{ordinal}:{tuple_key(row)}:{reason}")
@@ -1916,7 +1920,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
     fallback_hops, allocation_context = ordered_fallback_hops(
-        route, node, args.jobs, parent_identity=parent_identity
+        route, node, args.jobs, parent_identity=parent_identity, recheck=args.action != "dry-run"
     )
     if allocation_context is not None:
         os.environ["AGENT_DISPATCH_PARENT_CROSS"] = str(
@@ -1975,7 +1979,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 # Re-read after an early failure too: a whole-account quota
                 # cannot be cured by changing models later in this same chain.
                 from dispatch_capacity_evidence import active_limits
-                quota = active_limits(args.jobs, profile=node.get("model_profile")).get(row.get("child_harness"))
+                quota = active_limits(args.jobs, profile=node.get("model_profile"),
+                                      recheck=row.get("child_harness") == "claude"
+                                      and getattr(args, "action", "start") != "dry-run").get(row.get("child_harness"))
                 if quota:
                     row = {**row, "_allocation_skip": f"quota-until-{quota['reset_epoch']}"}
                 if row.get("_allocation_skip"):

@@ -14,6 +14,7 @@ from unittest import mock
 import dispatch_replacement as R
 import dispatch_contract as D
 import route_identity
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 
 class ReplacementTest(unittest.TestCase):

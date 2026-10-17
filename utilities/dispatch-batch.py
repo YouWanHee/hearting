@@ -737,8 +737,10 @@ def assign_harnesses(
     allow_degraded: bool,
     parent_identity: dict[str, str] | None = None,
     jobs: Path | None = None,
+    recheck: bool = False,
 ) -> tuple[list[tuple[dict[str, object], str, str, int]], str, dict[str, object]]:
-    """Pick a harness per node. Side-effect free: never writes the ledger.
+    """Pick a harness per node. Side-effect free unless `recheck` (a launch that will start),
+    which may send the usage gate's Claude probe; never writes the ledger.
 
     A caller that realizes a new child launch may persist this function's
     returned diagnostics (`degradation_cause`/`degradation_detail`). Raised
@@ -762,7 +764,8 @@ def assign_harnesses(
         # legitimately wants group-wide reasons.
         node_exclusions: dict[str, set[str]] = {}
         from dispatch_capacity_evidence import active_limits
-        quota_limits = active_limits(jobs, profile=node.get("model_profile")) if jobs is not None else {}
+        quota_limits = (active_limits(jobs, profile=node.get("model_profile"), recheck=recheck)
+                        if jobs is not None else {})
         node_policy = node.get("harness_policy")
         policy_members = (
             {name for band in ("primary", "relief", "last_resort")
@@ -2476,7 +2479,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             assignments, independence, diagnostics = assign_harnesses(
                 route, nodes, allow_degraded=args.allow_degraded_independence,
-                parent_identity=parent_identity, jobs=jobs,
+                parent_identity=parent_identity, jobs=jobs, recheck=args.action == "start",
             )
         self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG", "")
         parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
@@ -2933,7 +2936,8 @@ def main(argv: list[str] | None = None) -> int:
     # require no spawn and therefore consume no fresh capacity (SD-157/160).
     from dispatch_capacity_evidence import active_limits
     for leg in pending_legs:
-        limits = active_limits(jobs, profile=leg.get("model_profile"))
+        limits = active_limits(jobs, profile=leg.get("model_profile"),
+                               recheck=args.action == "start" and leg["adapter"] == "claude")
         if leg["adapter"] in limits:
             proof = limits[leg["adapter"]]
             return fail("batch-pending-hard-limit", 75, admitted=0, spawned=0,

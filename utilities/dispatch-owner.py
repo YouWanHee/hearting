@@ -578,8 +578,8 @@ def _declares_top(harness):
     return True
 
 
-def _usage(jobs, profile=None):
-    cmd = [str(ROOT / "utilities" / "usage-check.sh"), "--harness", "all"]
+def _usage(jobs, profile=None, recheck=False):
+    cmd = [str(ROOT / "utilities" / "usage-check.sh"), "--harness", "all", *(["--recheck"] if recheck else [])]
     if profile:
         cmd += ["--model-profile", profile]
     if jobs:
@@ -864,7 +864,7 @@ def main(argv):
                 }
         else:
             dropped = []
-        states = _usage(jobs, profile)
+        states = _usage(jobs, profile, recheck="--dry-run" not in forwarded)
         overridden = None
         pin_chosen = False
         if pin_doc is not None:

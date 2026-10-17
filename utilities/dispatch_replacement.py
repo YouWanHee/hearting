@@ -1506,7 +1506,7 @@ def _capacity_wait(jobs, aid, source, hold=None):
         if hold is None and source.get('worker_type') == 'owner':
             # Preserve reset evidence for a capacity-dead owner before an explicit resume.
             from dispatch_capacity_evidence import harness_hold
-            hold = harness_hold(jobs, result['harness'], model=source.get('model'))
+            hold = harness_hold(jobs, result['harness'], model=source.get('model'), recheck=True)
     if hold:
         result['usage_state'] = hold['label']
         for key in ('headroom', 'usage_gate_used_percent', 'capacity_source'):
@@ -1533,10 +1533,10 @@ def _capacity_hold(jobs, source, model=None):
         # The ordinary selector judges all candidates; the old owner's limit or
         # soft allocation gate cannot prevent that selection. A named pin waits
         # only at a real limit, and admission refuses a silently ignored pin.
-        return harness_hold(jobs, pin, model=model) if pin else None
+        return harness_hold(jobs, pin, model=model, recheck=True) if pin else None
     if not harness:
         return None
-    hold = harness_hold(jobs, harness, model=model or source.get('model'))
+    hold = harness_hold(jobs, harness, model=model or source.get('model'), recheck=True)
     if hold:
         return hold
     if pin == harness:
@@ -1561,7 +1561,7 @@ def _capacity_hold(jobs, source, model=None):
     if allocation['strategy'] == 'capacity-aware' and score is not None and score > 0 and not capacity.is_gated(
             scores, harness, usage_gate_used_percent=gate):
         return None
-    states = usage_states(jobs, models={harness: model or source.get('model')})
+    states = usage_states(jobs, models={harness: model or source.get('model')}, recheck=True)
     from dispatch_allocation import attempt_counts
     counts = attempt_counts(jobs, window=allocation.get('window', 30))
     selected, _, _, _ = capacity.select(
@@ -1733,7 +1733,7 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
             # them mean a pause; auth/unknown/policy failures keep their diagnostic.
             from dispatch_capacity_evidence import harness_hold
             candidates = [h for h in diagnostic.get('configured_candidates', '').split(',') if h]
-            holds = [(h, harness_hold(jobs, h)) for h in candidates]
+            holds = [(h, harness_hold(jobs, h, recheck=True)) for h in candidates]
             if holds and all(hold for _, hold in holds):
                 harness, hold = min(holds, key=lambda item: item[1].get('until_epoch') or float('inf'))
                 return _capacity_wait(jobs, aid, {**source, 'harness': harness}, hold)

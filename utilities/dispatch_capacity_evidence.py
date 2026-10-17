@@ -3,6 +3,8 @@
 This reader never closes attempts or authorizes retries. Execution/cleanup and
 the sealed selection policy retain those decisions. No credential bytes leave
 scope hashing; legacy evidence without a launch scope remains diagnostic only.
+A launch decision may recheck a holding Claude limit with one minimal request
+through the login a worker would use (`probe`, at most every PROBE_INTERVAL).
 """
 from __future__ import annotations
 
@@ -44,6 +46,12 @@ def _json(path):
         return {}
 
 
+def _api_configured(env):
+    return any(env.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                                    "CLAUDE_CODE_USE_FOUNDRY"))
+
+
 def _scope_parts(harness, env=None):
     """Seal the selected authentication scope before model start, without a probe.
 
@@ -56,8 +64,7 @@ def _scope_parts(harness, env=None):
         return {}
     home = Path(env.get("HOME") or Path.home())
     runtime = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude").expanduser().resolve()
-    if any(env.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")):
+    if _api_configured(env):
         return {}  # API/provider throttling is not subscription quota.
     token = env.get("CLAUDE_CODE_OAUTH_TOKEN")
     config = runtime / ".claude.json" if env.get("CLAUDE_CONFIG_DIR") else home / ".claude.json"
@@ -492,34 +499,382 @@ def _limit_models(profile, models, env):
     return models
 
 
+def _scope_covers(model_scope, model):
+    """Does a limit on `model_scope` hold the requested `model` (None: no model asked)?"""
+    if model_scope == "all":
+        return True
+    if not isinstance(model, str) or not model:
+        return False
+    if model_scope.startswith("model:"):
+        return model == model_scope.removeprefix("model:")
+    return model_scope in model.lower()
+
+
+def _admitted(native, models):
+    """Unexpired observations for the current account that hold the requested model."""
+    return [o for o in native if not o["expired"] and o["scope_matches"]
+            and _scope_covers(o["model_scope"], models.get("claude"))]
+
+
 def _select_limits(native, models):
     result = {}
-    for observation in native:
-        if observation["expired"] or not observation["scope_matches"]:
-            continue
-        model_scope = observation["model_scope"]
-        if model_scope.startswith("model:"):
-            if models.get("claude") != model_scope.removeprefix("model:"):
-                continue
-        elif model_scope != "all" and model_scope not in models.get("claude", "").lower():
-            continue
+    for observation in _admitted(native, models):
         previous = result.get("claude")
         if not previous or previous["reset_epoch"] < observation["reset_epoch"]:
             result["claude"] = observation
     return result
 
 
-def active_limits(jobs, *, profile=None, models=None, now=None, env=None, registry_lines=None):
+def _native_items(admitted):
+    """Admitted native observations as holding items: when, on which window family, until when."""
+    return [{"at": o["observed_at"], "scope": o["model_scope"], "reset": o["reset_epoch"],
+             "window": o.get("window"), "source": "native"} for o in admitted]
+
+
+def active_limits(jobs, *, profile=None, models=None, now=None, env=None, registry_lines=None, recheck=False):
+    now = time.time() if now is None else now
     models = _limit_models(profile, models, env)
-    return _select_limits(observations(jobs, now=now, env=env, registry_lines=registry_lines), models)
+    native = observations(jobs, now=now, env=env, registry_lines=registry_lines)
+    limits = _select_limits(native, models)
+    verdict, holder = _recheck(jobs, _native_items(_admitted(native, models)), models, env, now, recheck)
+    if verdict == "ok":
+        limits.pop("claude", None)
+    elif verdict is not None:
+        held = limits.get("claude") or {
+            "harness": "claude", "window": holder.get("window"), "model_scope": holder["scope"],
+            "observed_at": holder["at"], "scope_authority": holder["source"], "expired": False}
+        limits["claude"] = {**held, "reset_epoch": verdict}
+    return limits
 
 
 def apply_limits(states, limits):
     states = dict(states)
     for harness, limit in limits.items():
-        reset = datetime.fromtimestamp(limit["reset_epoch"], timezone.utc).isoformat().replace("+00:00", "Z")
-        states[harness] = f"limited({reset})"
+        states[harness] = f"limited({_iso(limit['reset_epoch'])})"
     return states
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# A recorded Claude limit describes the moment it was observed. The login a worker
+# would use can recover before the recorded reset: another account is signed in,
+# extra usage was added, or the window reset early. While Claude is held, a launch
+# decision (`recheck=True`) sends that login one minimal request, at most every
+# PROBE_INTERVAL seconds per login (or "unscoped" when none resolves) and model family,
+# whatever the outcome of the last attempt. The probe model follows the window that
+# holds: the shipped minimal probe alias for an all-model window, the limited
+# family alias or exact model for a model-scoped one.
+# Each limit is judged on its own (`_verdict`): an answer that went through later
+# on a model its window covers lifts it, and a rejection holds the models its window
+# covers until its own reset. A later rejection never revives a limit an earlier
+# answer lifted: the entry retains successes per model and rejections per window.
+# Gauges and other readers honor stored answers and never send one.
+# No credential bytes are read here: the CLI authenticates from the credential
+# source worker homes link.
+PROBE_INTERVAL = 600
+PROBE_TIMEOUT = 30
+PROBE_SCHEMA = 1
+# The CLI the probe runs. HEARTING_CAPACITY_PROBE_CLI replaces it for one environment,
+# as HARNESS_CAPACITY_SCORES replaces the live gauges: tests point it at a fake or at nothing.
+PROBE_CLI = "claude"
+PROBE_PROMPT = "Reply with the single word OK."
+PROBE_ARGS = ("-p", PROBE_PROMPT, "--output-format", "stream-json", "--verbose", "--setting-sources", "",
+              "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
+              "--tools", "", "--no-session-persistence")
+UNSCOPED = "unscoped"
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
+_LATEST_EPOCH = 4102444800  # 2100-01-01: anything later in a stored answer is damage
+
+
+def _probe_path(jobs):
+    return Path(f"{os.path.abspath(jobs)}.capacity-probe.json")
+
+
+_FAMILIES = tuple(window.removeprefix("seven_day_") for window in WINDOWS if window.startswith("seven_day_"))
+
+
+def _probe_aliases():
+    # Provider request aliases belong to adapter configuration, not worker quality
+    # tiers. Read shipped defaults so old user config files need no migration.
+    from model_config import parse_config, shipped_path
+    return dict(part.split(":", 1) for part in
+                parse_config(shipped_path("claude"))["CFG_CAPACITY_PROBE_MODELS"].split())
+
+
+def _family(model):
+    """The cadence key of a model: its quota family when it names one, else the model itself."""
+    lowered = model.lower()
+    return next((name for name in (*_FAMILIES, _probe_aliases()["all"]) if name in lowered), model)
+
+
+def _probe_model(held, reader_model, env):
+    """Choose from the holding window, independently of the requested worker profile."""
+    scopes = sorted({item["scope"] for item in held})
+    scope = "all" if "all" in scopes else next(iter(scopes), "")
+    model = scope.removeprefix("model:") if scope.startswith("model:") else _probe_aliases().get(scope)
+    return model if isinstance(model, str) and _MODEL_NAME.fullmatch(model) else None
+
+
+def _login_scope(env):
+    """The quota scope of the login a worker would use: its account, or UNSCOPED while the
+    account cannot be resolved (the CLI still authenticates it). None for API/provider
+    configuration, which is not subscription quota."""
+    if _api_configured(env):
+        return None
+    return _scope_candidates("claude", env).get("claude-subscription-v2") or UNSCOPED
+
+
+def _epoch_value(value):
+    return (not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            and 0 <= value <= _LATEST_EPOCH)
+
+
+def _valid_probe(entry):
+    """A stored answer: when it was given, whether the request went through, its reset, and
+    for a rejection the latest earlier answer that went through (`ok_at`)."""
+    return (isinstance(entry, dict) and isinstance(entry.get("ok"), bool) and _epoch_value(entry.get("at"))
+            and (entry.get("reset_epoch") is None or _epoch_value(entry["reset_epoch"]))
+            and (entry.get("ok_at") is None or _epoch_value(entry["ok_at"]))
+            and isinstance(entry.get("model_scope", "all"), str))
+
+
+def _read_probes(jobs):
+    try:
+        data = json.loads(_probe_path(jobs).read_text())
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    probes = data.get("probes") if isinstance(data, dict) and data.get("schema") == PROBE_SCHEMA else None
+    return probes if isinstance(probes, dict) else {}
+
+
+def _probe_due(entry, now):
+    """No probe for this login and model family was tried within PROBE_INTERVAL, whatever
+    its outcome (an answer, a timeout, a missing CLI, an auth error)."""
+    tried = entry.get("tried", entry.get("at")) if isinstance(entry, dict) else None
+    return not _epoch_value(tried) or now - tried >= PROBE_INTERVAL
+
+
+def _write_probe(jobs, key, entry, now):
+    """Keep bounded observations per key beside jobs.log: 0600, atomic replace.
+
+    Successful observations may suppress legacy holds beyond the native eight-day
+    horizon, so age alone cannot discard them without reviving an old hold.
+    """
+    path = _probe_path(jobs)
+    probes = _read_probes(jobs)
+    probes[key] = entry
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"schema": PROBE_SCHEMA, "probes": probes}, handle, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp, path)
+        tmp = None
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def probe(env=None, *, model, now=None):
+    """Send one minimal request through the caller's Claude login.
+
+    `{"at", "ok", "reset_epoch", "window", "model_scope"}`, or None when the answer says
+    nothing about quota (the CLI is missing, timed out, or failed for another reason).
+    """
+    return _probe_once(env, model, time.time() if now is None else now)
+
+
+def _probe_once(env, model, now):
+    env = {k: v for k, v in (os.environ if env is None else env).items() if k != "CLAUDECODE"}
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    cli = env.get("HEARTING_CAPACITY_PROBE_CLI") or PROBE_CLI
+    try:
+        with tempfile.TemporaryDirectory(prefix="capacity-probe-") as cwd:
+            done = subprocess.run([cli, *PROBE_ARGS, "--model", model], cwd=cwd, env=env,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):  # includes a timeout
+        return None
+    rows = []
+    for line in done.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    result = next((r for r in reversed(rows) if r.get("type") == "result"), None)
+    info = next((r.get("rate_limit_info") for r in reversed(rows) if r.get("type") == "rate_limit_event"), None)
+    info = info if isinstance(info, dict) else {}
+    window = info.get("rateLimitType") if isinstance(info.get("rateLimitType"), str) else None
+    # Same family rule as native_quota; a window it cannot name holds only the probed model.
+    if window in WINDOWS:
+        model_scope = window.removeprefix("seven_day_") if window.startswith("seven_day_") else "all"
+    else:
+        model_scope = "model:" + model
+    if result is not None and str(result.get("api_error_status", "")) == "429":
+        # Quota only when the event itself rejected (as native_quota reads it); an overload or
+        # concurrency 429 says nothing about the window.
+        if info.get("status") != "rejected" or info.get("isUsingOverage") is True:
+            return None
+        reset = info.get("resetsAt")
+        known = _epoch_value(reset) and now < reset <= now + 8 * 86400
+        return {"at": now, "ok": False, "reset_epoch": int(reset) if known else None,
+                "window": window, "model_scope": model_scope}
+    if result is not None and result.get("is_error") is not False:
+        return None  # an auth/transport error is not evidence of restored capacity
+    if result is None and (done.returncode != 0 or not (
+            info.get("status") in {"allowed", "allowed_warning"} or info.get("isUsingOverage") is True)):
+        return None
+    return {"at": now, "ok": True, "reset_epoch": None, "window": window, "model_scope": model_scope}
+
+
+@contextmanager
+def _probe_lock(jobs):
+    """True while this process alone may probe; False when another one is probing."""
+    if fcntl is None:
+        yield False
+        return
+    fd = None
+    try:
+        fd = os.open(f"{_probe_path(jobs)}.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _answers(probes, scope):
+    """Valid observations for this login, including the initial sidecar format."""
+    prefix = scope + ":"
+    answers = []
+    for key, entry in probes.items():
+        if not isinstance(key, str) or not key.startswith(prefix) or not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("answers"), list):
+            answers.extend(a for a in entry["answers"] if _valid_probe(a)
+                           and isinstance(a.get("model"), str) and _MODEL_NAME.fullmatch(a["model"]))
+            continue
+        if not _valid_probe(entry):
+            continue
+        model = entry.get("model") or key[len(prefix):]
+        answers.append({**entry, "model": model})
+        if not entry["ok"] and entry.get("ok_at") is not None:
+            answers.append({"at": entry["ok_at"], "ok": True, "reset_epoch": None, "window": None,
+                            "model_scope": "all", "model": model})
+    return answers
+
+
+def _retain_answers(answers):
+    """Latest success per actual model and rejection per window/scope.
+
+    Cadence is family-wide, but a success on one exact model cannot be rewritten
+    as a success on another when that family's next check runs.
+    """
+    latest = {}
+    for answer in answers:
+        key = ((True, answer["model"]) if answer["ok"] else
+               (False, answer.get("window"), answer.get("model_scope", "all")))
+        if key not in latest or answer["at"] > latest[key]["at"]:
+            latest[key] = answer
+    return list(latest.values())
+
+
+def _held(recorded, answers, reader_model, now):
+    """`(recorded items, probe items)` still holding Claude for this reader.
+
+    Each holding item stops holding at its reset, once a later answer went through on a
+    model its window covers (an all-model window: any model; a family or model window: that
+    one only), or once a later rejection on the same window speaks for it (a legacy marker
+    names no window, so any rejection of its scope does).
+    """
+    oks = [a for a in answers if a["ok"]]
+    probed = [{"at": a["at"], "scope": a.get("model_scope", "all"), "reset": a["reset_epoch"],
+               "window": a.get("window"), "source": "probe"}
+              for a in answers if not a["ok"] and a.get("reset_epoch")
+              and _scope_covers(a.get("model_scope", "all"), reader_model)]
+
+    def holds(item):
+        if item["reset"] is None or item["reset"] <= now:
+            return False
+        if any(o["at"] > item["at"] and _scope_covers(item["scope"], o["model"]) for o in oks):
+            return False
+        return not any(p is not item and p["at"] > item["at"] and p["scope"] == item["scope"]
+                       and (not p.get("window") or not item.get("window") or p["window"] == item["window"])
+                       for p in probed)
+
+    return [item for item in recorded if holds(item)], [item for item in probed if holds(item)]
+
+
+def _verdict(recorded, answers, reader_model, now):
+    """`(verdict, holder)` for Claude as this reader sees it.
+
+    `recorded` holds Claude now; probe rejections that cover the reader's model hold it too
+    (see `_held`). verdict None keeps the recorded state, "ok" lifts it, an epoch holds
+    Claude until then. holder: the item that holds longest, None when nothing holds.
+    """
+    held_recorded, held_probed = _held(recorded, answers, reader_model, now)
+    if not held_recorded and not held_probed:
+        return ("ok" if recorded else None), None
+    holder = max(held_recorded + held_probed, key=lambda item: item["reset"])
+    if not held_probed and len(held_recorded) == len(recorded):
+        return None, holder
+    return int(holder["reset"]), holder
+
+
+def _recheck(jobs, recorded, models, env, now, allow):
+    """`(verdict, holder)` for Claude; `allow` marks a launch decision, which may probe first."""
+    if jobs is None:
+        return None, None
+    try:
+        return _recheck_answer(jobs, recorded, models, os.environ if env is None else env, now, allow)
+    except Exception:  # noqa: BLE001 - a recheck that fails leaves the recorded state as it was
+        return None, None
+
+
+def _recheck_answer(jobs, recorded, models, env, now, allow):
+    if not recorded and not _probe_path(jobs).exists():
+        return None, None  # nothing holds Claude and nothing was ever answered
+    scope = _login_scope(env)
+    if scope is None:
+        return None, None
+    reader_model = models.get("claude")
+    held = _held(recorded, _answers(_read_probes(jobs), scope), reader_model, now)
+    model = _probe_model([*held[0], *held[1]], reader_model, env) if allow and any(held) else None
+    key = f"{scope}:{_family(model)}" if model else None
+    if key and _probe_due(_read_probes(jobs).get(key), now):
+        with _probe_lock(jobs) as mine:
+            prior = _read_probes(jobs).get(key) if mine else None  # another process may have probed meanwhile
+            if mine and _probe_due(prior, now):
+                answers = _answers({key: prior}, scope)
+                entry = {"tried": now, "answers": answers}
+                # Reserve before launch: interruption and failed persistence cannot
+                # create another request inside the same interval.
+                if not _write_probe(jobs, key, entry, now):
+                    return _verdict(recorded, _answers(_read_probes(jobs), scope), reader_model, now)
+                result = _probe_once(env, model, now)
+                if result is not None:
+                    entry["answers"] = _retain_answers([*answers, {**result, "model": model}])
+                    _write_probe(jobs, key, entry, now)
+    return _verdict(recorded, _answers(_read_probes(jobs), scope), reader_model, now)
 
 
 _RESET_SENTENCE = re.compile(r"resets\s+([^()\n.·]+?)\s*(?:\(([^()]+)\)|[.·]|$)", re.I)
@@ -594,20 +949,35 @@ def _cached_result_reset(snapshot, record, meta):
     return value
 
 
-def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
+def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None, recheck=False):
     """`(states, epochs)`: the usage state per harness and, when known, when it ends."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
+    models = _limit_models(profile, models, env)
     with _snapshot_guard(jobs, now) as snapshot:
-        return _usage_snapshot(snapshot, profile=profile, models=models,
-                               unknown_window_min=unknown_window_min, now=now, env=env)
+        states, epochs, recorded = _usage_snapshot(
+            snapshot, models=models, unknown_window_min=unknown_window_min, now=now, env=env)
+    if states["claude"] == "unknown":
+        return states, epochs
+    # Outside the snapshot guard: a probe takes seconds and must not hold the cache lock.
+    verdict, _holder = _recheck(jobs, recorded, models, env, now, recheck)
+    if verdict == "ok":
+        states["claude"] = "ok"
+        epochs.pop("claude", None)
+    elif verdict is not None:
+        states["claude"] = f"limited({_iso(verdict)})"
+        epochs["claude"] = verdict
+    return states, epochs
 
 
-def _usage_snapshot(snapshot, *, profile, models, unknown_window_min, now, env):
+def _usage_snapshot(snapshot, *, models, unknown_window_min, now, env):
+    """`(states, epochs, recorded)`; `recorded` lists the evidence holding Claude now as
+    `_verdict` items (legacy markers hold every model)."""
     if snapshot is None:
-        return dict.fromkeys(HARNESSES, "unknown"), {}
+        return dict.fromkeys(HARNESSES, "unknown"), {}, []
     states = dict.fromkeys(HARNESSES, "ok")
     epochs = {}
+    recorded = []
     scopes = _scope_candidates("claude", env)
     native = _native_observations(snapshot, env, now)
     native_ids = {r["attempt_id"] for r in native}
@@ -635,32 +1005,51 @@ def _usage_snapshot(snapshot, *, profile, models, unknown_window_min, now, env):
         if expires is not None:
             if now < expires:
                 # A sentence-derived reset has no row label of its own; name the moment instead.
-                label = reset if tz is None else datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z")
+                label = reset if tz is None else _iso(expires)
                 states[harness] = f"limited({label})"
                 epochs[harness] = expires
+                if harness == "claude":
+                    recorded.append({"at": observed, "scope": "all", "reset": expires, "source": "legacy"})
         elif 0 <= now - observed < unknown_window_min * 60:
             states[harness] = "limited(unknown-reset)"
             epochs[harness] = int(observed + unknown_window_min * 60)
-    limits = _select_limits(native, _limit_models(profile, models, env))
+            if harness == "claude":
+                recorded.append({"at": observed, "scope": "all", "reset": epochs[harness], "source": "legacy"})
+    limits = _select_limits(native, models)
     epochs.update({harness: limit["reset_epoch"] for harness, limit in limits.items()})
+    recorded += _native_items(_admitted(native, models))
     _persist(snapshot)
-    return apply_limits(states, limits), epochs
+    return apply_limits(states, limits), epochs, recorded
 
 
-def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
-    """One read contract for scoped native proof and legacy text compatibility."""
+def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None, recheck=False):
+    """One read contract for scoped native proof and legacy text compatibility.
+
+    `recheck=True` marks a launch decision: while Claude is held, it may send one probe
+    first (see PROBE_INTERVAL). Every reader honors stored probe answers.
+    """
     return _usage(jobs, profile=profile, models=models, unknown_window_min=unknown_window_min,
-                  now=now, env=env)[0]
+                  now=now, env=env, recheck=recheck)[0]
 
 
-def harness_hold(jobs, harness, *, model=None, now=None, env=None, unknown_window_min=60):
+def harness_hold(jobs, harness, *, model=None, now=None, env=None, unknown_window_min=60, recheck=False):
     """`{'until_epoch', 'label'}` while the usage gate reports this harness limited, else None."""
+    # Only a Claude decision sends a probe; another harness's decision must not wait on one.
     states, epochs = _usage(jobs, models={harness: model} if model else None,
-                            unknown_window_min=unknown_window_min, now=now, env=env)
+                            unknown_window_min=unknown_window_min, now=now, env=env,
+                            recheck=recheck and harness == "claude")
     state = states.get(harness, "ok")
     if not state.startswith("limited("):
         return None
     return {"until_epoch": epochs.get(harness), "label": state[len("limited("):-1]}
+
+
+def attempt_model(jobs, attempt_id, *, now=None):
+    """The model a Claude attempt that ended at a limit was launched with, when the registry kept it."""
+    now = time.time() if now is None else now
+    with _snapshot_guard(jobs, now) as snapshot:
+        records = snapshot["native"] if snapshot else []
+    return next((r["m"] for r in records if r["a"] == attempt_id and r.get("m")), None)
 
 
 def main():
@@ -670,6 +1059,8 @@ def main():
     parser.add_argument("--harness", choices=(*HARNESSES, "all"), default="all")
     parser.add_argument("--unknown-window-min", "--window-min", type=int, default=int(os.environ.get("UNKNOWN_WINDOW_MIN", "60")))
     parser.add_argument("--model-profile")
+    parser.add_argument("--recheck", action="store_true",
+                        help="launch decision: recheck a holding Claude limit with one probe (at most every 10 minutes)")
     args = parser.parse_args()
     if not args.jobs:
         args.jobs = os.environ.get("AGENT_DISPATCH_JOBS")
@@ -679,7 +1070,8 @@ def main():
     if args.action == "inspect":
         print(json.dumps(observations(args.jobs), sort_keys=True))
     else:
-        states = usage_states(args.jobs, profile=args.model_profile, unknown_window_min=args.unknown_window_min)
+        states = usage_states(args.jobs, profile=args.model_profile, unknown_window_min=args.unknown_window_min,
+                              recheck=args.recheck)
         for harness in HARNESSES if args.harness == "all" else [args.harness]:
             print(harness, states[harness])
         print("bias", os.environ.get("HARNESS_CAPACITY_BIAS", "auto"))

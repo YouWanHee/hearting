@@ -3,6 +3,7 @@ import importlib.util, io, json, os, subprocess, sys, tempfile, time, unittest
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 ROOT=Path(__file__).resolve().parents[1]
 S=importlib.util.spec_from_file_location("route",ROOT/"utilities/capability-route.py"); R=importlib.util.module_from_spec(S); S.loader.exec_module(R)
@@ -2567,9 +2568,13 @@ class FallbackTest(unittest.TestCase):
   route=json.loads(path.read_text())
   return path,route,next(n for n in route["nodes"] if n["id"]=="plan")
  def compiled_order(self):
-  # The stage's compiled hop order, without the usage/capacity ranking.
-  return mock.patch.object(F,"ordered_fallback_hops",side_effect=lambda route,node,jobs,parent_identity=None:(
-   F.apply_worker_pin(route,list(node["fallback_hops"]),parent_identity),None))
+  # The stage's compiled hop order, without the usage/capacity ranking. `recheck_seen`
+  # records whether each ranking was a launch decision (--start) or not (--dry-run).
+  self.recheck_seen=getattr(self,"recheck_seen",[])
+  def order(route,node,jobs,parent_identity=None,recheck=False):
+   self.recheck_seen.append(recheck)
+   return F.apply_worker_pin(route,list(node["fallback_hops"]),parent_identity),None
+  return mock.patch.object(F,"ordered_fallback_hops",side_effect=order)
  def start(self,path,*extra,lifecycle=None,patches=()):
   self.seed_predecessor_markers(path,"plan"); self.seed_parent()
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan","--slug","fallback-plan",
@@ -2644,6 +2649,16 @@ class FallbackTest(unittest.TestCase):
    "notice: --parent wrong-owner is not this session's name; using owner (from AGENT_DISPATCH_SELF_SLUG).",
   ])
   self.assertEqual(self.arg(calls[0][0],"--parent"),"owner")
+ def test_a_start_ranks_as_a_launch_decision_that_may_recheck_a_held_login(self):
+  ok=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
+      "worker_exit=0\nworker_failure=-\n")
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   calls=[]
+   code,out,err=self.start(path,lifecycle=F.FOREGROUND_SCOPED,
+                           patches=(self.compiled_order(),self.forwarded(calls,stdout=ok)))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(self.recheck_seen,[True])
  def test_a_detached_start_keeps_the_plain_launch_and_no_notice(self):
   with self.dispatch_env():
    path,_route,_node=self.standard_route()

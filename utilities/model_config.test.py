@@ -29,6 +29,16 @@ BASE = (
 
 
 class ModelConfigTest(unittest.TestCase):
+    def test_capacity_probe_defaults_do_not_replace_existing_user_policy(self):
+        root = self.make_root(shipped=BASE + 'CFG_CAPACITY_PROBE_MODELS="all:haiku opus:opus sonnet:sonnet"\n')
+        with tempfile.TemporaryDirectory() as home:
+            user = Path(home) / "agent-config/models.conf"
+            user.parent.mkdir()
+            user.write_text(BASE.replace("shipped-model", "user-model"))
+            values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+            self.assertEqual(receipt.source, "user")
+            self.assertEqual(values["CFG_TIER_DEEP_MODEL"], "user-model")
+
     def make_root(self, adapter="claude", shipped=BASE):
         root = Path(tempfile.mkdtemp())
         shipped_path = root / "adapters" / adapter / "config" / "models.conf"
@@ -377,7 +387,7 @@ class TopProfileOptionalityTest(unittest.TestCase):
         # so pin what it must satisfy -- the key exists in that adapter's
         # shipped file (otherwise the entry is dead), and a user copy without
         # it stays selected whole-file with the key absent (the consumer must
-        # tolerate that, which is why the Claude key is deliberately absent
+        # tolerate that, which is why Claude's main-session-only key is absent
         # from this map: its wrapper raises when the key is missing).
         # Absence *tolerance* itself is asserted at the consumer, not here:
         # `codex_dispatch_model_eligibility.test.py`
@@ -389,7 +399,7 @@ class TopProfileOptionalityTest(unittest.TestCase):
             for key in keys:
                 with self.subTest(adapter=adapter, key=key):
                     self.assertIn(key, shipped)
-        self.assertNotIn("claude", config.OPTIONAL_POLICY_KEYS)
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", config.OPTIONAL_POLICY_KEYS.get("claude", ()))
         # and a shipped key that is registered nowhere still makes a copy
         # incomplete -- the deliberate default this map is an exception to
         shipped_text = BASE + 'CFG_SOME_NEW_POLICY_KEY=value\n'
