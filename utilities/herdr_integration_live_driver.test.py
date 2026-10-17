@@ -79,35 +79,93 @@ class NativeDriverContractTest(unittest.TestCase):
             start_at = actual_argv.index("start")
             self.assertEqual(actual_argv[start_at - 1], "agent")
             delimiter = actual_argv.index("--", start_at)
-            self.assertEqual(actual_argv[delimiter + 1:], [live.CODEX_START_PROMPT])
-            self.assertEqual(actual_argv.count(live.CODEX_START_PROMPT), 1)
+            self.assertEqual(actual_argv[delimiter + 1:], [live.NATIVE_START_PROMPT])
+            self.assertEqual(actual_argv.count(live.NATIVE_START_PROMPT), 1)
 
             rows = [json.loads(line) for line in driver.commands_path.read_text().splitlines()]
             start_row = next(row for row in rows if row["step"] == "native-codex-session-start")
             self.assertEqual(start_row["argv"].count("[redacted]"), 1)
-            self.assertNotIn(live.CODEX_START_PROMPT, driver.commands_path.read_text())
+            self.assertNotIn(live.NATIVE_START_PROMPT, driver.commands_path.read_text())
 
-    def test_non_codex_start_does_not_receive_codex_positional_input(self):
+    def test_opencode_start_submits_one_initial_prompt_and_redacts_durable_argv(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project = root / "project"
             project.mkdir()
-            for runtime in ("claude", "opencode"):
-                with self.subTest(runtime=runtime):
-                    driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
-                        "--case", "callbacks", "--output-dir", str(root / runtime),
-                        "--project", str(project), "--timeout", "10",
-                    ]))
-                    self.addCleanup(driver.runtime_dir.cleanup)
-                    start = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
-                    get = json.dumps({"result": {"agent": {
-                        "name": "fixture-agent", "agent_session": {"value": "typed-sid"}}}})
-                    with mock.patch.object(driver, "herdr_command",
-                            side_effect=[(0, start, ""), (0, get, "")]) as command:
-                        driver._agent_start(runtime, "private-pane", name="fixture-agent")
-                    start_args = command.call_args_list[0].args[1]
-                    self.assertNotIn("--", start_args)
-                    self.assertNotIn(live.CODEX_START_PROMPT, start_args)
+            captured_calls = root / "private-herdr-calls.json"
+            fake_herdr = root / "herdr-fixture"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                f"capture = pathlib.Path({str(captured_calls)!r})\n"
+                "if args[args.index('agent') + 1] == 'start':\n"
+                "    capture.write_text(json.dumps({'argv': args, 'cwd': os.getcwd()}))\n"
+                "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', "
+                "'agent_status': 'idle'}}}))\n"
+                "elif args[args.index('agent') + 1] == 'get':\n"
+                "    print(json.dumps({'result': {'agent': {"
+                "'name': 'fixture-agent', 'pane_id': 'private-pane', "
+                "'agent_session': {'value': 'typed-native-sid'}, 'agent_status': 'idle'}}}))\n"
+                "else:\n"
+                "    print(json.dumps({'error': {'code': 'unexpected-command'}}))\n"
+                "    raise SystemExit(1)\n",
+                encoding="utf-8")
+            fake_herdr.chmod(0o700)
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10", "--herdr", str(fake_herdr),
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+
+            native = driver._agent_start("opencode", "private-pane", name="fixture-agent")
+
+            self.assertTrue(native["start_ok"])
+            self.assertTrue(native["session_confirmed_by_get"])
+            self.assertEqual(native["session_id"], "typed-native-sid")
+            actual = json.loads(captured_calls.read_text(encoding="utf-8"))
+            actual_argv = actual["argv"]
+            start_at = actual_argv.index("start")
+            self.assertEqual(actual_argv[start_at - 1], "agent")
+            delimiter = actual_argv.index("--", start_at)
+            self.assertEqual(actual_argv[delimiter + 1:], ["--prompt", live.NATIVE_START_PROMPT])
+            self.assertEqual(actual_argv.count(live.NATIVE_START_PROMPT), 1)
+            self.assertEqual(actual["cwd"], str(project))
+            self.assertNotIn(str(project), actual_argv)
+
+            rows = [json.loads(line) for line in driver.commands_path.read_text().splitlines()]
+            start_row = next(row for row in rows if row["step"] == "native-opencode-session-start")
+            get_row = next(row for row in rows if row["step"] == "native-opencode-session-get")
+            self.assertLess(rows.index(start_row), rows.index(get_row))
+            self.assertEqual(start_row["argv"][-2:], ["--prompt", "[redacted]"])
+            self.assertEqual(start_row["argv"].count("[redacted]"), 1)
+            durable = driver.commands_path.read_text()
+            self.assertNotIn(live.NATIVE_START_PROMPT, durable)
+            self.assertNotIn(str(project), durable)
+
+    def test_claude_start_keeps_existing_no_prompt_behavior(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            start = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
+            get = json.dumps({"result": {"agent": {
+                "name": "fixture-agent", "agent_session": {"value": "typed-sid"}}}})
+            with mock.patch.object(driver, "herdr_command",
+                    side_effect=[(0, start, ""), (0, get, "")]) as command:
+                driver._agent_start("claude", "private-pane", name="fixture-agent")
+            start_args = command.call_args_list[0].args[1]
+            self.assertEqual(start_args[:6], [
+                "agent", "start", "fixture-agent", "--kind", "claude", "--pane",
+            ])
+            self.assertNotIn("--", start_args)
+            self.assertNotIn("--prompt", start_args)
+            self.assertNotIn(live.NATIVE_START_PROMPT, start_args)
 
     def test_native_session_id_requires_successful_start_and_typed_get(self):
         with tempfile.TemporaryDirectory() as temporary:

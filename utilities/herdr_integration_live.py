@@ -32,7 +32,7 @@ MAX_TIMEOUT = 900
 CASES = ("callbacks", "codex-async-local-skip", "codex-busy",
          "opencode-busy", "booked-seat", "events-lost")
 RUNTIMES = ("claude", "codex", "opencode")
-CODEX_START_PROMPT = (
+NATIVE_START_PROMPT = (
     "This is an isolated native-session startup probe. Reply with READY, then stop."
 )
 _SECRET_ENV = re.compile(r"(?:API[_-]?KEY|ACCESS[_-]?TOKEN|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)", re.I)
@@ -562,7 +562,9 @@ class HerdrIntegrationLive:
         start_args = ["agent", "start", name, "--kind", runtime, "--pane", pane,
                       "--timeout", str(timeout_ms)]
         if runtime == "codex":
-            start_args.extend(("--", CODEX_START_PROMPT))
+            start_args.extend(("--", NATIVE_START_PROMPT))
+        elif runtime == "opencode":
+            start_args.extend(("--", "--prompt", NATIVE_START_PROMPT))
         rc, stdout, stderr = self.herdr_command(
             f"native-{runtime}-session-start",
             start_args, timeout=min(65, self._remaining(65)),
