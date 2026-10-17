@@ -112,6 +112,65 @@ class BatchObligationTest(unittest.TestCase):
             self.assertEqual(obligations.ensure_observers(self.jobs), 0)
         launch.assert_not_called()
 
+    def test_absent_compatibility_slots_are_known_empty(self):
+        roots = (self.base / "release" / ".dispatch",
+                 self.base / "xdg-state" / "hearting" / "dispatch")
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.base / "release"), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=roots):
+            self.assertEqual(obligations.pending_observer_signature(), ())
+            self.assertFalse(obligations.has_unowned_work())
+
+        unused_jobs = self.base / "unused" / "jobs.log"
+        unused_jobs.parent.mkdir()
+        self.assertEqual(obligations.pending_observer_signature(unused_jobs), ())
+        self.assertFalse(obligations.has_unowned_work(unused_jobs))
+
+    def test_empty_existing_registry_and_sidecar_state_are_known_empty(self):
+        empty_jobs = self.base / "empty" / "jobs.log"
+        empty_jobs.parent.mkdir(parents=True)
+        empty_jobs.touch()
+        (empty_jobs.parent / "supervisor-state" / "obligations").mkdir(parents=True)
+        self.assertEqual(obligations.pending_observer_signature(empty_jobs), ())
+        self.assertFalse(obligations.has_unowned_work(empty_jobs))
+
+    def test_missing_registry_keeps_durable_pending_records_visible(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           reason="awaiting-recipient")
+        self.jobs.unlink()
+
+        signature = obligations.pending_observer_signature(self.jobs)
+        self.assertEqual(len(signature), 1)
+        self.assertEqual(signature[0][:3], (str(self.jobs), duty_id, "delivery-pending"))
+        self.assertTrue(obligations.has_unowned_work(self.jobs))
+        with self.assertRaises(obligations.BatchObligationError):
+            obligations._root(self.jobs)
+
+    def test_unreadable_malformed_and_symlink_state_remains_unknown(self):
+        root = obligations._root(self.jobs)
+        root.mkdir(parents=True)
+        with mock.patch.object(obligations.os, "scandir", side_effect=PermissionError("protected")):
+            self.assertEqual(obligations.pending_observer_signature(self.jobs),
+                             ((str(self.jobs), "unavailable"),))
+            self.assertTrue(obligations.has_unowned_work(self.jobs))
+
+        malformed = root / "batch-malformed.json"
+        malformed.write_text("{not-json", encoding="utf-8")
+        self.assertEqual(obligations.pending_observer_signature(self.jobs),
+                         ((str(self.jobs), malformed.name, "unreadable"),))
+        self.assertTrue(obligations.has_unowned_work(self.jobs))
+
+        protected_jobs = self.base / "protected" / "jobs.log"
+        protected_jobs.parent.mkdir(parents=True)
+        protected_jobs.touch()
+        protected_root = protected_jobs.parent / "supervisor-state" / "obligations"
+        target = self.base / "protected-target"
+        target.mkdir()
+        protected_root.parent.mkdir()
+        protected_root.symlink_to(target, target_is_directory=True)
+        self.assertEqual(obligations.pending_observer_signature(protected_jobs),
+                         ((str(protected_jobs), "unavailable"),))
+
     def test_unowned_work_probe_is_read_only_and_uses_exact_observer_identity(self):
         duty_id, _record = obligations.create(self.args)
         path = obligations._record_path(self.jobs, duty_id)

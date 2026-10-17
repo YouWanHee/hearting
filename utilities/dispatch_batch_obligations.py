@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -199,11 +200,78 @@ def release(fd: int | None) -> None:
         os.close(fd)
 
 
-def _jobs_paths(jobs: str | Path | None) -> list[Path]:
+def _jobs_paths(jobs: str | Path | None, *, strict: bool = True) -> list[Path]:
     if jobs:
-        return [Path(jobs).expanduser().resolve(strict=True)]
+        path = Path(jobs).expanduser()
+        return [path.resolve(strict=True) if strict else Path(os.path.abspath(path))]
     from dispatch_contract import dispatch_state_roots, resolve_agent_home
     return [Path(root) / "jobs.log" for root in dispatch_state_roots(resolve_agent_home())]
+
+
+def _observer_root(jobs: str | Path) -> Path | None:
+    """Find an obligation root without requiring its compatibility registry.
+
+    Writers continue to use ``_root`` and its strict existing-registry check.
+    Read-only observers can still see durable records after jobs.log disappears;
+    a missing registry and missing sidecar tree are known-empty, while unsafe or
+    unreadable paths remain unknown to callers.
+    """
+    path = Path(jobs).expanduser()
+    if not path.is_absolute():
+        raise BatchObligationError("batch-obligation-jobs-invalid")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            parent = path.parent.resolve(strict=True)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise BatchObligationError("batch-obligation-jobs-unavailable") from exc
+        root = parent / "supervisor-state" / "obligations"
+    except OSError as exc:
+        raise BatchObligationError("batch-obligation-jobs-unavailable") from exc
+    else:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise BatchObligationError("batch-obligation-jobs-invalid")
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            os.close(fd)
+            parent = path.resolve(strict=True).parent
+        except OSError as exc:
+            raise BatchObligationError("batch-obligation-jobs-unavailable") from exc
+        root = parent / "supervisor-state" / "obligations"
+
+    for directory in (root.parent, root):
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise BatchObligationError("batch-obligation-root-unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise BatchObligationError("batch-obligation-root-invalid")
+    return root
+
+
+def _read_only_records(jobs: str | Path) -> tuple[tuple[Path, dict | None, Exception | None], ...]:
+    """Enumerate records with one shared absent-versus-unknown read policy."""
+    root = _observer_root(jobs)
+    if root is None:
+        return ()
+    try:
+        with os.scandir(root) as entries:
+            paths = sorted(root / entry.name for entry in entries
+                           if entry.name.startswith("batch-") and entry.name.endswith(".json"))
+    except OSError as exc:
+        raise BatchObligationError("batch-obligation-root-unavailable") from exc
+    records = []
+    for path in paths:
+        try:
+            records.append((path, _read(path), None))
+        except (OSError, ValueError, BatchObligationError) as exc:
+            records.append((path, None, exc))
+    return tuple(records)
 
 
 def _proc_lifetime(pid):
@@ -396,11 +464,13 @@ def has_unowned_work(jobs: str | Path | None = None) -> bool:
         SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
     )
 
-    for jobs_path in _jobs_paths(jobs):
+    for jobs_path in _jobs_paths(jobs, strict=False):
         try:
             lines = jobs_path.read_text().splitlines()
-        except OSError:
+        except FileNotFoundError:
             lines = ()
+        except (OSError, UnicodeError):
+            return True
         for raw in lines:
             fields = raw.split("\t")
             if len(fields) != 6 or fields[1] not in {"open", "running"}:
@@ -417,23 +487,20 @@ def has_unowned_work(jobs: str | Path | None = None) -> bool:
                     continue
 
         try:
-            root = _root(jobs_path)
-            records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
+            records = _read_only_records(jobs_path)
         except (OSError, BatchObligationError):
-            continue
-        for path in records:
-            try:
-                record = _read(path)
-                if not record or record.get("state") not in _PENDING:
-                    continue
-                observer = record.get("observer") or {}
-                pid = observer.get("pid")
-                start = observer.get("pid_start")
-                if (not isinstance(pid, int) or not isinstance(start, str) or not start
-                        or _pid_start(pid) != start):
-                    return True
-            except (OSError, ValueError, BatchObligationError):
+            return True
+        for _path, record, error in records:
+            if error is not None:
+                return True
+            if not record or record.get("state") not in _PENDING:
                 continue
+            observer = record.get("observer") or {}
+            pid = observer.get("pid")
+            start = observer.get("pid_start")
+            if (not isinstance(pid, int) or not isinstance(start, str) or not start
+                    or _pid_start(pid) != start):
+                return True
     return False
 
 
@@ -444,17 +511,14 @@ def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, .
     authority and deliberately excludes sealed arguments and route identity.
     """
     signature = []
-    for jobs_path in _jobs_paths(jobs):
+    for jobs_path in _jobs_paths(jobs, strict=False):
         try:
-            root = _root(jobs_path)
-            records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
+            records = _read_only_records(jobs_path)
         except (OSError, BatchObligationError):
             signature.append((str(jobs_path), "unavailable"))
             continue
-        for path in records:
-            try:
-                record = _read(path)
-            except (OSError, ValueError, BatchObligationError):
+        for path, record, error in records:
+            if error is not None:
                 signature.append((str(jobs_path), path.name, "unreadable"))
                 continue
             if not record or record.get("state") not in _PENDING:
