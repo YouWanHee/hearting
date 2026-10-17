@@ -3519,13 +3519,48 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
     def booking(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
 
+    def test_claude_continue_types_once_into_the_idle_tui(self):
+        self.cleared()
+        guard = mock.Mock(return_value=(None, {"pid": 202}))
+        with mock.patch.object(peer_steward, "_claude_idle_prompt_guard", guard), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as send:
+            rc, line = self.continue_cmd()
+        self.assertEqual(rc, 0, line)
+        self.assertIn("continued=true", line)
+        self.assertIn("verify=state-flip", line)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args, ("w1:pX", self.clear.CONTINUE_TEXT))
+        self.assertEqual(guard.call_args_list[1].kwargs, {"expected_foreground": {"pid": 202}})
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        row = peer_steward.peer_message._read_pending(ref)
+        # Not pending: the new session's prompt hook must not deliver it a second time.
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(peer_steward.peer_message.claim_pending_herdr(
+            ref, {"harness": "claude", "session_id": "sid-B", "pane_id": "w1:pX"}))
+
+    def test_claude_continue_send_without_state_flip_is_never_retyped(self):
+        self.cleared()
+        with mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                               return_value=(None, {"pid": 202})), \
+             mock.patch.object(peer_steward, "_herdr_prompt",
+                               return_value=(1, {"error": {"code": "timeout"}})):
+            rc, line = self.continue_cmd()
+        self.assertEqual(rc, 5, line)
+        self.assertIn("continued=unverified", line)
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "unverified")
+
     def test_continue_keeps_exact_no_trailer_ref_pending_for_native_callback(self):
         self.cleared()
-        with mock.patch.object(peer_steward, "_herdr_prompt", side_effect=AssertionError("continue PTY send")), \
-             mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
+        refused = mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                                    return_value=("draft", None))
+        no_send = mock.patch.object(peer_steward, "_herdr_prompt",
+                                    side_effect=AssertionError("continue PTY send"))
+        with refused, no_send:
             rc, line = self.continue_cmd()
         self.assertEqual(rc, 3, line)
         self.assertIn("continued=queued", line)
+        self.assertIn("reason=draft", line)
         ref = line.split("transfer_ref=", 1)[1].split()[0]
         row = peer_steward.peer_message._read_pending(ref)
         self.assertEqual((row["state"], row["text"], row["no_trailer"], row["receipt"]),
@@ -3538,7 +3573,8 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             claim_id=claim_id, transfer_ref=ref))
         booked = self.booking()["continued"]
         self.assertEqual((booked["state"], booked["transfer_ref"]), ("pending", ref))
-        second_rc, second = self.continue_cmd()
+        with refused, no_send:
+            second_rc, second = self.continue_cmd()
         self.assertEqual(second_rc, 3, second)
         self.assertIn("transfer_ref=" + ref, second)
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
