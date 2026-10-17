@@ -39,7 +39,7 @@ _COMMANDS = {
 _SESSION_COMMANDS = {"claude": set(), "codex": {"exec", "review", "resume", "fork"},
                      "opencode": {"run", "attach", "tui"}}
 _VALUE_OPTIONS = set("--model -m --effort --config -c --enable --disable --remote --remote-auth-token-env --local-provider --profile -p --sandbox -s --add-dir --ask-for-approval -a --cd -C --image -i --session-id --resume -r --agent --permission-mode --allowedTools --disallowedTools --mcp-config --settings --append-system-prompt --system-prompt --cwd --port --hostname --log-level".split())
-_FLAG_OPTIONS = set("--oss --strict-config --approve-for-me --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --worktree --no-alt-screen --no-daemon --search --help -h --version -V --dangerously-skip-permissions --allow-dangerously-skip-permissions --verbose --debug --continue --no-session-persistence --print-logs".split())
+_FLAG_OPTIONS = set("--oss --strict-config --approve-for-me --dangerously-bypass-approvals-and-sandbox --yolo --dangerously-bypass-hook-trust --worktree --no-alt-screen --no-daemon --search --help -h --version -V --dangerously-skip-permissions --allow-dangerously-skip-permissions --verbose --debug --continue --no-session-persistence --print-logs".split())
 
 
 def invocation_mode(harness, argv):
