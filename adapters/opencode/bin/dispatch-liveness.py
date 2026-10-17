@@ -127,7 +127,7 @@ def heartbeat_age_min(agent_home: Path, slug: str, now: float) -> float | None:
     """Return the heartbeat file age in minutes, or None when no heartbeat exists.
 
     The plugin hearting-guards.js touches
-    <agent-home>/.dispatch/logs/<slug>.heartbeat on every session.idle event
+    <dispatch-state-root>/logs/<slug>.heartbeat on every session.idle event
     when OPENCODE_DISPATCH_SLUG is set (i.e., the session is a dispatched
     headless worker). A missing or aging heartbeat is a secondary liveness
     signal: it never overrides a fresher OpenCode SQLite mtime, but when the
@@ -148,7 +148,7 @@ def plugin_loaded_for_slug(agent_home: Path, slug: str) -> bool:
     """True when the plugin-load marker for this dispatch slug exists.
 
     dispatch-headless.py exports OPENCODE_DISPATCH_SLUG to the runtime child;
-    hearting-guards.js writes <agent-home>/.dispatch/plugin-load.<slug>.mark
+    hearting-guards.js writes <dispatch-state-root>/plugin-load.<slug>.mark
     once at plugin init. A missing marker means the plugin did not load in the
     headless runtime — a strong DEAD signal even when the OpenCode SQLite
     session is alive (the session is running but no harness guards are active).

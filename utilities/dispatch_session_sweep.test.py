@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from types import SimpleNamespace
@@ -846,6 +847,49 @@ hooks.dispose();
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout.strip().splitlines()[-1])["carrierEnv"]
+
+
+class OpenCodeLivenessSideChannelTest(IsolatedRootMixin, unittest.TestCase):
+    """A dispatched OpenCode worker's plugin-load marker and heartbeat land where
+    dispatch-liveness.py reads them, never inside the release that is AGENT_HOME."""
+
+    def test_marker_and_heartbeat_land_beside_the_registry_not_in_the_release(self):
+        # Under AGENT_HOME the reader never sees them, and the release grows a
+        # .dispatch tree that the session sweep then logs into on every prompt,
+        # so the superseded release refuses pruning (delta-digest-mismatch).
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        release = self.root.parent / "release"
+        plugin = release / "adapters/opencode/plugins/hearting-guards.js"
+        plugin.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / "adapters/opencode/plugins/hearting-guards.js", plugin)
+        (release / "package.json").write_text('{"type":"module"}')
+        for folder in ("core", "utilities", "tools", "hooks"):
+            (release / folder).symlink_to(ROOT / folder, target_is_directory=True)
+        (release / "adapters/opencode/bin").symlink_to(ROOT / "adapters/opencode/bin", target_is_directory=True)
+        env = dict(os.environ)
+        env.update(AGENT_HOME=str(release), AGENT_DISPATCH_JOBS=str(jobs), HARNESS_STATE_ROOT=str(self.root),
+                   OPENCODE_DISPATCH_SLUG="oc-worker", AGENT_SESSION_ROLE="worker")
+        script = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+process.env.HERDR_PANE_ID = "";
+const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session: {}}, directory: process.cwd()});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-worker"}}});
+hooks.dispose();
+process.exit(0);
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", script], env=env, cwd=str(self.root),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse((release / ".dispatch").exists())
+        self.assertTrue((self.root / "plugin-load.oc-worker.mark").is_file())
+        self.assertTrue((self.root / "logs" / "oc-worker.heartbeat").is_file())
+        liveness = _load("opencode_dispatch_liveness", ROOT / "adapters/opencode/bin/dispatch-liveness.py")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
+            self.assertTrue(liveness.plugin_loaded_for_slug(release, "oc-worker"))
+            self.assertIsNotNone(liveness.heartbeat_age_min(release, "oc-worker", time.time()))
 
 
 if __name__ == "__main__":

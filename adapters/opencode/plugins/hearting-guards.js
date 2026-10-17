@@ -121,15 +121,33 @@ function baseDir(ctx) {
 // same env to the runtime child). Recording two artifacts at plugin init gives
 // dispatch-liveness.py a secondary, cheap signal independent of the OpenCode
 // SQLite session mtime:
-//   * <agent-home>/.dispatch/plugin-load.<slug>.mark — created once at plugin
+//   * <state-root>/plugin-load.<slug>.mark — created once at plugin
 //     init, proving the plugin was actually loaded by the headless runtime.
-//   * <agent-home>/.dispatch/logs/<slug>.heartbeat — touched on every
+//   * <state-root>/logs/<slug>.heartbeat — touched on every
 //     session.idle event (idle == turn done == still alive), so a stale or
 //     crashed headless that never reaches idle will have an aging heartbeat.
+// <state-root> is the directory of the registry the dispatch exported as
+// AGENT_DISPATCH_JOBS, the root dispatch-liveness.py and Fleet read
+// (dispatch_contract.dispatch_state_root). AGENT_HOME is the installed release:
+// writing there hides both files from those readers and leaves a .dispatch tree
+// in the release that keeps it from being pruned once it is superseded.
 // Both are best-effort: a plugin must never block a turn because it failed to
 // record a liveness side-channel.
 function dispatchSlug() {
   return process.env.OPENCODE_DISPATCH_SLUG || ""
+}
+
+function dispatchStateRoot() {
+  const jobs = process.env.AGENT_DISPATCH_JOBS || ""
+  if (!jobs) return ""
+  let registry = path.resolve(jobs)
+  try {
+    registry = realpathSync(registry)
+  } catch {
+    // not created yet; the unresolved path names the same directory
+  }
+  const stateRoot = path.dirname(registry)
+  return existsSync(stateRoot) ? stateRoot : ""
 }
 
 function isWorkerSession() {
@@ -143,10 +161,10 @@ function isWorkerSession() {
 }
 
 function touchHeartbeat(slug) {
-  if (!slug) return
+  const stateRoot = dispatchStateRoot()
+  if (!slug || !stateRoot) return
   try {
-    const dispatchDir = path.join(root, ".dispatch")
-    const logsDir = path.join(dispatchDir, "logs")
+    const logsDir = path.join(stateRoot, "logs")
     mkdirSync(logsDir, { recursive: true })
     const hb = path.join(logsDir, `${slug}.heartbeat`)
     const now = new Date()
@@ -161,11 +179,10 @@ function touchHeartbeat(slug) {
 }
 
 function markPluginLoaded(slug) {
-  if (!slug) return
+  const stateRoot = dispatchStateRoot()
+  if (!slug || !stateRoot) return
   try {
-    const dispatchDir = path.join(root, ".dispatch")
-    mkdirSync(dispatchDir, { recursive: true })
-    const marker = path.join(dispatchDir, `plugin-load.${slug}.mark`)
+    const marker = path.join(stateRoot, `plugin-load.${slug}.mark`)
     writeFileSync(marker, `${new Date().toISOString()}\n`, { encoding: "utf8" })
   } catch {
     // best-effort
