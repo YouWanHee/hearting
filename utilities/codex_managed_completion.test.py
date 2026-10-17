@@ -120,6 +120,42 @@ class ControlServer:
         self.thread.join(timeout=2)
 
 
+class ParentLifetimeStopTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_completion_module()
+        self.binding = {"pid": 123, "pid_start": "456", "session_id": SESSION,
+                        "pane": "w1:p9", "socket_path": "", "pid_namespace": "ns"}
+        self.args = SimpleNamespace(parent_session_id=SESSION, thread_id=SESSION,
+                                    parent_lifetime=dict(self.binding), jobs=Path("/jobs"))
+
+    def test_capture_binds_one_native_tui_process_start(self):
+        binding = {key: value for key, value in self.binding.items() if key != "pid_namespace"}
+        with mock.patch("pane_ownership.codex_tui_process_bindings", return_value=[binding]), \
+             mock.patch.object(self.module, "process_namespace_identity", side_effect=["ns", "ns"]):
+            self.assertEqual(self.module.capture_parent_lifetime(self.args), self.binding)
+
+    def test_live_exact_parent_does_not_trigger_observer_exit(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("live", "456")), \
+             mock.patch("pane_ownership._native_session", return_value=SESSION):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}), "")
+
+    def test_proven_parent_exit_stops_only_without_a_bound_successor(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("gone", None)), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor", return_value=""):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}),
+                             self.module.PARENT_SESSION_ENDED)
+
+    def test_confirmed_attempt_successor_keeps_the_obligation(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("gone", None)), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor", return_value="successor"):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}), "")
+
+
 class ReplacementAuthorityTest(unittest.TestCase):
     def test_requires_current_epoch_generation_and_exact_parent(self):
         from argparse import Namespace

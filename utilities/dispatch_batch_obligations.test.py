@@ -87,6 +87,25 @@ class BatchObligationTest(unittest.TestCase):
         obligations.update(self.jobs, duty_id, state="complete")
         self.assertFalse(obligations.has_unowned_work(self.jobs))
 
+    def test_parent_ended_duty_waits_dormant_until_recipient_returns(self):
+        args = Namespace(**vars(self.args))
+        args.parent_session_id = "parent-thread"
+        args.parent_attempt_id = None
+        args.thread_id = "parent-thread"
+        args.delivery_parent_id = "parent-thread"
+        args.parent_lifetime = {"pid": 123, "pid_start": "456", "pane": "w1:p2",
+                                "session_id": "parent-thread", "pid_namespace": "ns"}
+        duty_id, _record = obligations.create(args)
+        obligations.update(self.jobs, duty_id, state="unknown", reason="parent-session-ended",
+                           parent_lifetime=args.parent_lifetime)
+        with mock.patch.object(obligations, "_parent_duty_has_recipient", return_value=False), \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertEqual(obligations.ensure_observers(self.jobs), 0)
+        launch.assert_not_called()
+        with mock.patch.object(obligations, "_parent_duty_has_recipient", return_value=True), \
+             mock.patch.object(obligations.subprocess, "Popen", return_value=type("P", (), {"pid": 9001})()):
+            self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

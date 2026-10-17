@@ -125,7 +125,7 @@ class PaneContinuityTest(unittest.TestCase):
                 herdr_projection.project(harness, "current", pane_id="w:p")
                 report.assert_not_called()
 
-    def test_codex_display_projection_keeps_resume_and_fork_lifecycle_out_of_metadata(self):
+    def test_codex_projection_reports_start_lifecycle_for_start_resume_and_fork(self):
         lifecycle_path = ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py"
         lifecycle_spec = importlib.util.spec_from_file_location("codex_sessionstart_lifecycle_test",
                                                                  lifecycle_path)
@@ -148,10 +148,32 @@ class PaneContinuityTest(unittest.TestCase):
                     self.assertTrue(projection.project(payload, current_thread))
                 args, kwargs = publish.call_args
                 self.assertEqual(args, ("codex", current_thread))
-                self.assertIs(kwargs["report_session"], False)
-                self.assertNotIn("session_seq", kwargs)
-                self.assertNotIn("session_start_source", kwargs)
+                self.assertIs(kwargs.get("report_session", True), True)
+                self.assertGreater(kwargs["session_seq"], 0)
+                self.assertEqual(kwargs["session_start_source"], source)
                 self.assertNotIn("resume_argv", kwargs)
+
+    def test_proven_embedded_sessionstart_keeps_reporting_with_the_v10_state_hook(self):
+        path = ROOT / "adapters/codex/hooks/herdr_session_projection.py"
+        spec = importlib.util.spec_from_file_location("codex_embedded_projection_test", path)
+        projection = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(projection)
+        payload = {"hook_event_name": "SessionStart", "session_id": "thread-A",
+                   "transcript_path": "/fixture/rollout.jsonl", "source": "resume"}
+        with tempfile.TemporaryDirectory(prefix="codex-home-") as temporary:
+            (Path(temporary) / "herdr-agent-state.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            env = {"HERDR_SOCKET_PATH": "/fixture/herdr.sock", "HERDR_PANE_ID": "w:p",
+               "CODEX_HOME": temporary,
+               "CODEX_THREAD_ID": "thread-A"}
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(projection, "_may_report", return_value=True), \
+                 mock.patch.object(projection, "_project", return_value=True) as publish, \
+                 mock.patch.object(projection.subprocess, "Popen"):
+                projection.project(payload, "thread-A")
+        kwargs = publish.call_args.kwargs
+        self.assertIs(kwargs["report_session"], False)
+        self.assertEqual(kwargs["session_start_source"], "resume")
+        self.assertGreater(kwargs["session_seq"], 0)
 
     def test_claude_pane_badge_survives_native_id_change(self):
         self.record("claude", "old", now=100)

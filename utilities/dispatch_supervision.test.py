@@ -265,6 +265,19 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
             managed_sealed_batch_id="batch-test", pid="99999999", pid_start="1")
             + row("att-child", pid="99999998", pid_start="1"))
 
+    def test_parent_session_ended_notice_keeps_exact_attempts_without_manual_recovery(self):
+        self._notice_rows()
+        records = supervision.materialize(
+            self.jobs, {"att-child"}, reason="parent-session-ended")
+        receipt = records[0]["receipt"]
+        self.assertEqual(receipt["monitored_attempt_ids"], ["att-child"])
+        self.assertEqual(receipt["reason"], "parent-session-ended")
+        text = supervision.render_text(receipt)
+        self.assertIn("continue unchanged", text)
+        self.assertIn("durable batch record", text)
+        self.assertIn("confirmed same-seat successor", text)
+        self.assertNotIn("run the route's start command", text)
+
     def test_an_answer_from_another_session_reaches_the_parent_as_a_notice(self):
         # RA-10: a non-parent's answer to a BLOCKED owner is not a dead end; the parent is told.
         for kind in ("claude-parent-runtime", "codex-native-queue", "opencode-turn"):

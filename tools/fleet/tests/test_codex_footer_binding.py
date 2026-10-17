@@ -105,7 +105,7 @@ class CodexFooterBindingTest(unittest.TestCase):
     def runtime(self, pid):
         return ("codex", int(pid) in self.services) if int(pid) in self.records else ("", False)
 
-    def native_session(self, pid, harness):
+    def native_session(self, pid, harness, *, codex_observation=None):
         return self.native.get(int(pid), "") if harness == "codex" else ""
 
     def is_worker(self, pid):
@@ -263,12 +263,28 @@ class CodexFooterBindingTest(unittest.TestCase):
                  mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": str(self.root)}), \
                  mock.patch.object(projection, "_codex_status_line_feasibility", return_value=feasibility), \
                  mock.patch.object(projection.subprocess, "Popen") as spawn:
-                projection._defer_until_proven(THREAD_A, True)
+                projection._defer_until_proven(
+                    THREAD_A, True, session_seq=123, session_start_source="resume")
                 self.assertEqual(spawn.called, should_spawn)
                 if should_spawn:
                     args, kwargs = spawn.call_args
-                    self.assertEqual(args[0][args[0].index("--session-id") + 1], THREAD_A)
+                    command = args[0]
+                    self.assertEqual(command[command.index("--session-id") + 1], THREAD_A)
+                    self.assertNotIn("--no-report-session", command)
+                    self.assertEqual(command[command.index("--seq") + 1], "123")
+                    self.assertEqual(command[command.index("--session-start-source") + 1], "resume")
                     self.assertTrue(kwargs["start_new_session"])
+
+    def test_shared_daemon_projection_defers_real_session_report_with_lifecycle(self):
+        with mock.patch.object(projection.shutil, "which", return_value="/fake/herdr"), \
+             mock.patch.object(projection, "_in_shared_codex_service", return_value=True), \
+             mock.patch.object(projection, "_defer_until_proven") as defer, \
+             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "HERDR_PANE_ID": "",
+                                           "HERDR_SOCKET_PATH": ""}, clear=True):
+            projection.project("codex", THREAD_A, report_session=True,
+                               session_seq=123456, session_start_source="resume")
+        defer.assert_called_once_with(THREAD_A, True, session_seq=123456,
+                                     session_start_source="resume")
 
     def test_deferred_proof_feasibility_reads_the_frontend_home_and_retained_overrides(self):
         home = self.root / "frontend-codex-home"

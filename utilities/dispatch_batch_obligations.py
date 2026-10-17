@@ -205,6 +205,86 @@ def _jobs_paths(jobs: str | Path | None) -> list[Path]:
     return [Path(root) / "jobs.log" for root in dispatch_state_roots(resolve_agent_home())]
 
 
+def _proc_lifetime(pid):
+    """Return (state, start) without treating unreadable /proc as process death."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return "gone", None
+    except (OSError, ValueError, TypeError):
+        return "unknown", None
+    try:
+        fields = raw[raw.rfind(")") + 2:].split()
+        if fields[0] in {"Z", "X"}:
+            return "gone", None
+        return "live", fields[19]
+    except (IndexError, ValueError):
+        return "unknown", None
+
+
+def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
+    """Keep a stopped duty dormant until its exact parent or bound successor returns."""
+    identity = record.get("identity") or {}
+    parent = identity.get("parent_session_id") or ""
+    if not parent:
+        return True
+    binding = record.get("parent_lifetime")
+    if not isinstance(binding, dict):
+        binding = (record.get("arguments") or {}).get("parent_lifetime")
+    if not isinstance(binding, dict):
+        return True
+    try:
+        from dispatch_contract import process_namespace_identity
+        namespace = binding.get("pid_namespace")
+        if not namespace or process_namespace_identity() != namespace:
+            return True
+        pid = int(binding.get("pid"))
+        start = str(binding.get("pid_start") or "")
+    except (ImportError, OSError, TypeError, ValueError):
+        return True
+    state, observed_start = _proc_lifetime(pid)
+    if state == "unknown":
+        return True
+    if state == "live" and observed_start == start:
+        try:
+            from pane_ownership import _native_session
+            current = _native_session(pid, "codex")
+        except Exception:
+            return True
+        if not current:
+            return True
+        if current == parent:
+            return True
+
+    # A replacement TUI may carry the original native thread under a new PID,
+    # so confirm that case using the same pane ownership contract.
+    try:
+        from pane_ownership import codex_tui_processes_for_session
+        bindings = codex_tui_processes_for_session(parent)
+    except Exception:
+        return True
+    if bindings:
+        return True
+
+    # The original parent may have handed these exact attempts to a new seat.
+    # Keep the observer available for that durable recipient even if it has not
+    # started a TUI process yet.
+    try:
+        import dispatch_seat_handover as handover
+        rows = handover.latest_rows(jobs)
+        attempts = record.get("effective_attempts") or identity.get("attempt_ids") or []
+        for attempt in attempts:
+            row = rows.get(attempt)
+            if row is None:
+                continue
+            recipient = handover.effective_parent(row[1], jobs)
+            if recipient and recipient != parent:
+                return True
+    except Exception:
+        return True
+    return False
+
+
 def ensure_observers(jobs: str | Path | None = None) -> int:
     """Resume unfinished exact batches through the existing completion sidecar."""
     launched = 0
@@ -222,6 +302,10 @@ def ensure_observers(jobs: str | Path | None = None) -> int:
             try:
                 record = _read(path)
                 if not record or record.get("state") not in _PENDING:
+                    continue
+                if (record.get("state") == "unknown"
+                        and record.get("reason") == "parent-session-ended"
+                        and not _parent_duty_has_recipient(record, jobs_path)):
                     continue
                 duty_id = record["id"]
                 fd = acquire(jobs_path, duty_id)

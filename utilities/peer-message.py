@@ -650,17 +650,87 @@ def pending_delivery_recipient(row):
     return original if _valid_transfer_endpoint(original) else None
 
 
-def bind_pending_recipient(ref, recipient):
-    """Bind one SID-less pending message to the session observed on its same pane."""
+def _valid_first_input_process(proof, original=None):
+    if not isinstance(proof, dict):
+        return False
+    if (proof.get("schema") != "peer-first-input-process-v1"
+            or proof.get("harness") not in ("claude", "codex", "opencode")
+            or type(proof.get("pid")) is not int or proof["pid"] <= 0
+            or not isinstance(proof.get("start"), str)
+            or not proof["start"].isdigit()
+            or not isinstance(proof.get("pid_namespace"), str)
+            or not re.fullmatch(r"pid:\[\d+\]", proof["pid_namespace"])
+            or not isinstance(proof.get("pane_id"), str)
+            or not proof["pane_id"] or len(proof["pane_id"]) > 512):
+        return False
+    return (original is None or
+            (proof["harness"] == original.get("harness")
+             and proof["pane_id"] == original.get("pane_id")))
+
+
+def pending_first_input_process(row):
+    """Return only the original validated foreground-process admission proof."""
+    if not isinstance(row, dict):
+        return None
+    proof = row.get("first_input_process")
+    original = row.get("to") or {}
+    return dict(proof) if (_valid_pane_bound_endpoint(original)
+                          and _valid_first_input_process(proof, original)) else None
+
+
+def first_input_process_matches(expected, observed):
+    """Compare the complete TUI process identity saved at pane-bound admission."""
+    if not _valid_first_input_process(expected) or not _valid_first_input_process(observed):
+        return False
+    return all(expected.get(key) == observed.get(key)
+               for key in ("schema", "harness", "pane_id", "pid", "start", "pid_namespace"))
+
+
+def _first_input_process_is_current(proof, session_id):
+    """Prove that this exact original TUI process now owns the received SID."""
+    if not _valid_first_input_process(proof) or not usable_session_id(session_id):
+        return False
+    try:
+        namespace = os.readlink(f"/proc/{proof['pid']}/ns/pid")
+        if namespace != proof["pid_namespace"] or namespace != os.readlink("/proc/self/ns/pid"):
+            return False
+        tools = str(Path(__file__).resolve().parent.parent / "tools")
+        if tools not in sys.path:
+            sys.path.append(tools)
+        if proof["harness"] == "codex":
+            utilities = str(Path(__file__).resolve().parent)
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            import pane_ownership
+            bindings = pane_ownership.codex_tui_process_bindings(
+                session_id, pane_hint=proof["pane_id"])
+            return any(binding.get("pid") == proof["pid"]
+                       and str(binding.get("pid_start")) == proof["start"]
+                       and binding.get("pane") == proof["pane_id"]
+                       for binding in bindings)
+        from fleet.process_identity import current_launch_context
+        launch = current_launch_context(proof["harness"], session_id)
+        return bool(launch and launch.get("pid") == proof["pid"]
+                    and str(launch.get("proc_start")) == proof["start"])
+    except Exception:
+        return False
+
+
+def bind_pending_recipient(ref, recipient, *, process_proof=None):
+    """Bind a SID-less message only to its prompt-time proven foreground process."""
     if not _valid_transfer_endpoint(recipient):
         return None
     with pending_lock(ref):
         row = _read_pending(ref)
         original = (row or {}).get("to") or {}
-        if not row or row.get("state") != "pending" or not _valid_pane_bound_endpoint(original):
+        if (not row or row.get("state") not in {"pending", "unverified", "queued"}
+                or not _valid_pane_bound_endpoint(original)):
             return None
         if (recipient.get("harness") != original.get("harness")
                 or recipient.get("pane_id") != original.get("pane_id")):
+            return None
+        expected = pending_first_input_process(row)
+        if (expected is None or not first_input_process_matches(expected, process_proof)):
             return None
         bound = row.get("bound_to")
         proposed = {"harness": recipient["harness"], "session_id": recipient["session_id"],
@@ -669,6 +739,35 @@ def bind_pending_recipient(ref, recipient):
                                      for key in ("harness", "session_id", "pane_id")):
             return None
         updated = dict(row, bound_to=proposed)
+        _save_pending(updated)
+        return updated
+
+
+def claim_pending_first_input(ref, recipient, process_proof):
+    """Claim exactly one guarded first-turn submission while the target has no SID."""
+    if (not isinstance(recipient, dict)
+            or recipient.get("harness") not in ("claude", "codex", "opencode")
+            or not isinstance(recipient.get("pane_id"), str)
+            or not _valid_first_input_process(process_proof, recipient)):
+        return None
+    from dispatch_contract import process_start_ticks
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        original = (row or {}).get("to") or {}
+        expected = pending_first_input_process(row)
+        if (not row or row.get("state") != "pending" or row.get("rpc_claim")
+                or not _valid_pane_bound_endpoint(original)
+                or original.get("harness") != recipient["harness"]
+                or original.get("pane_id") != recipient["pane_id"]
+                or expected is None
+                or not first_input_process_matches(expected, process_proof)):
+            return None
+        if _registered_delivery_settled(row):
+            return None
+        claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
+                 "start": process_start_ticks(os.getpid())}
+        updated = dict(row, state="unverified", receipt="native-first-input-inflight",
+                       rpc_claim=claim)
         _save_pending(updated)
         return updated
 
@@ -717,7 +816,13 @@ def _read_pending(ref, *, roots=None):
         raise ValueError("peer-pending-recipient-binding-invalid")
     if (_valid_pane_bound_endpoint(original) and row.get("state") in ("queued", "received")
             and bound is None):
-        raise ValueError("peer-pending-recipient-binding-invalid")
+        submitted_sidless = (
+            row.get("state") == "queued"
+            and row.get("receipt") == "native-first-input-submitted"
+            and pending_first_input_process(row) is not None
+        )
+        if not submitted_sidless:
+            raise ValueError("peer-pending-recipient-binding-invalid")
     no_trailer = row.get("no_trailer", False)
     if type(no_trailer) is not bool:
         raise ValueError("peer-pending-trailer-mode-invalid")
@@ -910,7 +1015,7 @@ def pending_messages(recipient):
 
 
 def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open",
-                         with_trailer=True, reference_evidence=None):
+                         with_trailer=True, reference_evidence=None, first_input_process=None):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
     endpoints_verified = (_valid_transfer_sender(sender)
                           and (_valid_transfer_endpoint(recipient)
@@ -959,6 +1064,9 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
             "state": "pending" if endpoints_verified else "unverified", "text": text,
             "no_trailer": not with_trailer,
             "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"}
+        if (_valid_pane_bound_endpoint(recipient)
+                and _valid_first_input_process(first_input_process, recipient)):
+            pending["first_input_process"] = dict(first_input_process)
         transfer = _read_transfer_record(ref)
         if transfer and transfer.get("body_ref") is not None:
             pending["body_ref"] = transfer["body_ref"]
@@ -1057,8 +1165,9 @@ def mark_pending_queued(ref, *, receipt="delivery-observed"):
 
 
 def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitted"):
-    """Record one exact claimed Claude prompt submission, never its consumption."""
-    if receipt != "claude-pty-prompt-submitted" or not isinstance(claim, dict):
+    """Record one exact claimed native prompt submission, never its consumption."""
+    if receipt not in {"claude-pty-prompt-submitted", "native-first-input-submitted"} \
+            or not isinstance(claim, dict):
         return False
     from dispatch_contract import process_start_ticks
     current_pid = os.getpid()
@@ -1475,6 +1584,38 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
 
 def receive_peer_message(text, recipient, project="", *, summary_text=""):
     """Actual receiver observation; rendering a callback is never this boundary."""
+    # A SID-less first-turn message is bound only after the native callback can
+    # prove that the same foreground process admitted it. Pane reuse alone is
+    # never enough, including when an old row has no readable process proof.
+    matches = list(_PEER_TRAILER_RE.finditer(text or ""))
+    if matches and isinstance(recipient, dict) and _valid_transfer_endpoint(recipient):
+        match = matches[-1]
+        _display_name, separator, candidate_ref = (match.group("name") or "").rpartition("; ref=")
+        if (match.group("sid").startswith("[") and separator
+                and re.fullmatch(r"[0-9a-f]{32}", candidate_ref)):
+            try:
+                pending = _read_pending(candidate_ref)
+                original = (pending or {}).get("to") or {}
+                if _valid_pane_bound_endpoint(original):
+                    proof = pending_first_input_process(pending)
+                    if (proof is None or proof["harness"] != recipient.get("harness")
+                            or not _first_input_process_is_current(proof, recipient.get("session_id"))):
+                        return 0
+                    bound = pending_delivery_recipient(pending)
+                    if bound is None:
+                        bound_row = bind_pending_recipient(
+                            candidate_ref,
+                            {"harness": recipient["harness"],
+                             "session_id": recipient["session_id"],
+                             "pane_id": proof["pane_id"]},
+                            process_proof=proof)
+                        bound = pending_delivery_recipient(bound_row)
+                    if (bound is None or bound.get("session_id") != recipient.get("session_id")):
+                        return 0
+            except (OSError, ValueError, KeyError, TypeError):
+                # Preserve the ordinary transfer/body integrity verdict below;
+                # only a readable pane-bound row enters process binding here.
+                pass
     trailer = parse_peer_trailer(text, recipient, include_ref=True)
     if not trailer or not usable_session_id(recipient.get("session_id")):
         return 0

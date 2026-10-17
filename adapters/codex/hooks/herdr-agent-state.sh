@@ -47,16 +47,25 @@ if os.environ.get("CODEX_THREAD_ID") and os.environ["CODEX_THREAD_ID"] != sessio
 pane_id = os.environ.get("HERDR_PANE_ID")
 socket_path = os.environ.get("HERDR_SOCKET_PATH")
 source = "herdr:codex"
-root = Path(os.environ.get("HERDR_HOOK_SCRIPT", __file__)).resolve().parents[3]
-tools = root / "tools"
-try:
-    sys.path.insert(0, str(tools))
-    from fleet.herdr_projection import may_report
-    if not may_report("codex", session_id, pane_id=pane_id):
-        raise SystemExit(0)
-except SystemExit:
-    raise
-except Exception:
+roots = []
+pinned_root = os.environ.get("AGENT_HOME")
+if pinned_root:
+    roots.append(Path(pinned_root) / "tools")
+script = os.environ.get("HERDR_HOOK_SCRIPT")
+if script:
+    roots.extend(parent / "tools" for parent in Path(script).resolve().parents)
+allowed = False
+for tools in roots:
+    if not (tools / "fleet" / "herdr_projection.py").is_file():
+        continue
+    try:
+        sys.path.insert(0, str(tools))
+        from fleet.herdr_projection import may_report
+        allowed = may_report("codex", session_id, pane_id=pane_id)
+        break
+    except Exception:
+        continue
+if not allowed:
     raise SystemExit(0)
 
 params = {

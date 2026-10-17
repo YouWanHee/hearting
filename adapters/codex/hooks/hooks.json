@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -f \"$root/adapters/codex/hooks/herdr-agent-state.sh\" ]; then exec bash \"$root/adapters/codex/hooks/herdr-agent-state.sh\" session; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69",
+            "command": "bash \"${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh\" session",
             "timeout": 5
           }
         ]

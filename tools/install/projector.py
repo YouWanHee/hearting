@@ -15,7 +15,7 @@ import paths
 
 _CLAUDE_SYMLINK_NAMES = [
     "CLAUDE.md", "README.md", "core", "commands", "skills", "agents",
-    "agent-modes", "hooks", "utilities", "tools", "scaffolds", "loops",
+    "agent-modes", "utilities", "tools", "scaffolds", "loops",
     "manifest.json", "statusline.sh",
 ]
 
@@ -43,6 +43,18 @@ _CLAUDE_TABLE = (
         "action": "seed_once",
         "source": "adapters/claude/config/models.conf",
         "dest_name": "agent-config/models.conf",
+    }]
+    + [{
+        "action": "symlink_glob",
+        "source_dir": "adapters/claude/hooks",
+        "dest_subdir": "hooks",
+        "pattern": "*",
+        "exclude": ["herdr-agent-state.sh"],
+    }, {
+        "action": "copy_managed",
+        "source": "hooks/herdr-agent-state.sh",
+        "dest_name": "hooks/herdr-agent-state.sh",
+        "integration_id": "claude",
     }]
     + [
         # Delegate the Windows-only path without reimplementing install-windows.sh.
@@ -83,6 +95,12 @@ _CODEX_TABLE = (
         "action": "seed_once",
         "source": "adapters/codex/config/models.conf",
         "dest_name": "agent-config/models.conf",
+    }]
+    + [{
+        "action": "copy_managed",
+        "source": "adapters/codex/hooks/herdr-agent-state.sh",
+        "dest_name": "herdr-agent-state.sh",
+        "integration_id": "codex",
     }]
     + [
         {
@@ -126,10 +144,7 @@ _OPENCODE_FIXED_SYMLINKS = [
     ("agent-agents", "opencode_setting/opencode-agents"),
     ("agent-commands", "opencode_setting/opencode-commands"),
     ("plugins/hearting-guards.js", "opencode_setting/opencode-plugins/hearting-guards.js"),
-    ("plugins/herdr-agent-state.js", "adapters/opencode/plugins/herdr-agent-state.js"),
     ("tui/hearting-tui-identity.ts", "adapters/opencode/tui/hearting-tui-identity.ts"),
-    ("tui/herdr-tui-session.js", "adapters/opencode/tui/herdr-tui-session.js"),
-    ("tui/herdr-opencode/tui.js", "adapters/opencode/tui/herdr-opencode/tui.js"),
     ("tui/hearting-owned-tui.json", "adapters/opencode/tui/owned-tui.json"),
     ("tui/hearting-owned-cli.json", "adapters/opencode/tui/owned-cli.json"),
 ]
@@ -167,6 +182,14 @@ _OPENCODE_TABLE = (
             ),
         },
     ]
+    + [
+        {"action": "copy_managed", "source": "adapters/opencode/plugins/herdr-agent-state.js",
+         "dest_name": "plugins/herdr-agent-state.js", "integration_id": "opencode"},
+        {"action": "copy_managed", "source": "adapters/opencode/tui/herdr-tui-session.js",
+         "dest_name": "herdr-tui-session.js", "integration_id": "opencode-tui"},
+        {"action": "copy_managed", "source": "adapters/opencode/tui/herdr-opencode/tui.js",
+         "dest_name": "herdr-opencode/tui.js", "integration_id": "opencode-tui-v2"},
+    ]
 )
 
 
@@ -200,7 +223,7 @@ def _expand(table, runtime, scope):
     for item in table:
         action = item["action"]
 
-        if action in ("symlink", "copy_once", "seed_once"):
+        if action in ("symlink", "copy_once", "seed_once", "copy_managed"):
             source_relpath = item["source"]
             source_path = _resolve_source_path(source_relpath)
             dest_path = runtime_home / item["dest_name"]
@@ -212,6 +235,8 @@ def _expand(table, runtime, scope):
                         "source": str(source_path),
                         "dest": str(dest_path),
                         "source_present": True,
+                        **({"integration_id": item["integration_id"]}
+                           if action == "copy_managed" else {}),
                     }
                 )
             else:
@@ -237,6 +262,8 @@ def _expand(table, runtime, scope):
                 # A missing source directory produces no entries and is not an error.
                 continue
             for match in sorted(source_dir.glob(item["pattern"])):
+                if match.name in item.get("exclude", ()):
+                    continue
                 dest_path = dest_dir / match.name
                 source_present = match.exists()
                 if source_present:
