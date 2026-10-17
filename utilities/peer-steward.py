@@ -4083,15 +4083,8 @@ def _resume_message_obligation(duty, store):
                          observation={"ref": ref, "reason": reason or "target-identity-changed",
                                       "observed_pane": ident.get("pane", "")})
             return
-        native_sid = pane_info = None
         if pane_bound:
             observed_sid = ident.get("session_id")
-            if observed_sid in (None, "", "-") and recipient.get("harness") == "codex":
-                native_sid, pane_info = _codex_pane_session(ident.get("pane"))
-                if peer_message.usable_session_id(native_sid):
-                    observed_sid = native_sid
-                else:
-                    native_sid = pane_info = None
             if observed_sid in (None, "", "-"):
                 store.update(duty["id"], state="pending",
                              observation={"ref": ref, "reason": "target-session-unresolved",
@@ -4108,8 +4101,7 @@ def _resume_message_obligation(duty, store):
             recipient = peer_message.pending_delivery_recipient(bound)
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
-                                    expected_sid=recipient.get("session_id"), purpose="input",
-                                    pane_info=pane_info, native_session_id=native_sid)
+                                    expected_sid=recipient.get("session_id"), purpose="input")
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
                 store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
@@ -4464,28 +4456,17 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
     from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, t_name = _resolve_target(args.target)
-    observed = None
-    native_sid = pane_info = None
-    if t_harness == "codex" and not peer_message.usable_session_id(t_sid):
-        # herdr reports no session; the pane's foreground TUI may prove one.
-        observed = _agent_state(args.target)
-        native_sid, pane_info = _codex_pane_session(observed[1])
-        if peer_message.usable_session_id(native_sid):
-            t_sid = native_sid
-        else:
-            native_sid = pane_info = None
     if expected_recipient is not None and (t_harness, t_sid) != expected_recipient:
         print("prompted=false reason=target-identity-changed")
         return 5
-    state_before, target_pane = observed or _agent_state(args.target)
+    state_before, target_pane = _agent_state(args.target)
     recipient = {"harness": t_harness, "session_id": peer_message.usable_session_id(t_sid),
                  "name": t_name}
     if target_pane:
         recipient["pane_id"] = target_pane
     readiness = _pane_readiness(args.target, state_before, expected_harness=t_harness,
                                 expected_sid=recipient["session_id"], expected_pane=target_pane,
-                                purpose="input", pane_info=pane_info,
-                                native_session_id=native_sid)
+                                purpose="input")
     input_reason = None if readiness.state == "ready" else (
         readiness.reason or "target-identity-unverified")
 
@@ -4835,19 +4816,6 @@ def _continue_native_session(pane, harness, *, process_info):
     if harness != "codex" and _proven_session([{"pid": foreground["pid"]}], harness) != session_id:
         return None
     return session_id
-
-
-def _codex_pane_session(pane):
-    """The thread a Codex pane's foreground TUI proves while herdr reports none.
-
-    core/OPERATIONS: a session the foreground process already proves is that
-    pane's session until herdr reports one. Returns (session_id, process_info);
-    the same process_info must reach _pane_readiness so proof and readiness
-    judge one foreground."""
-    info = _retire_pane_info(pane) if pane else None
-    if not isinstance(info, dict):
-        return None, None
-    return _continue_native_session(pane, "codex", process_info=info), info
 
 
 def _proven_session(processes, harness):
