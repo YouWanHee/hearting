@@ -2908,7 +2908,12 @@ def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     found: ChildRow | None = None
+    # A row of this attempt always carries this text; skipping the others before
+    # parsing keeps a lookup cheap on a registry of thousands of rows.
+    needle = "attempt_id=" + attempt_id
     for order, line in enumerate(lines):
+        if needle not in line:
+            continue
         fields = line.split("\t")
         if len(fields) != 6:
             continue
