@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Bounded native Herdr integration evidence runner for an isolated test home.
 
-This is an internal test driver. It writes only under ``--output-dir`` and the
-supplied scratch project. It never copies credentials or records prompt text,
-screen contents, or raw command output.
+This internal driver keeps durable evidence under ``--output-dir`` and uses a
+short private temporary runtime to fit Unix socket limits. It never copies
+credentials or persists prompt text, screen contents, or raw command output
+in its evidence.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -113,6 +115,8 @@ def _failure_reason(stderr, returncode, timed_out=False):
     if timed_out:
         return "command-timeout"
     text = (stderr or "").lower()
+    if "sun_path" in text or "socket name length exceeds" in text:
+        return "local-socket-path-too-long"
     if any(term in text for term in ("not logged in", "authentication", "unauthorized", "login required")):
         return "authentication-unavailable"
     if any(term in text for term in ("unknown command", "unsupported", "not supported")):
@@ -139,7 +143,11 @@ class HerdrIntegrationLive:
         self.events_path = self.case_dir / "events.jsonl"
         self.result_path = self.case_dir / "result.json"
         self.project_root = self.project
-        self.env = _LIVE.isolated_environment(self.case_dir, self.project)
+        # Evidence paths can exceed sun_path even when they are valid file paths.
+        self.runtime_dir = tempfile.TemporaryDirectory(
+            prefix="hhl-", dir="/tmp" if Path("/tmp").is_dir() else None)
+        self.runtime_root = Path(self.runtime_dir.name)
+        self.env = _LIVE.isolated_environment(self.runtime_root, self.project)
         self.env.update({
             "AGENT_HOME": str(ROOT),
             "CODEX_HOME": str(Path(self.env["HOME"]) / ".codex"),
@@ -181,6 +189,7 @@ class HerdrIntegrationLive:
                           "xdg_state": self.env["XDG_STATE_HOME"], "codex_home": self.env["CODEX_HOME"],
                           "claude_config": self.env["CLAUDE_CONFIG_DIR"],
                           "opencode_config": self.env["OPENCODE_CONFIG_DIR"],
+                          "runtime_root": str(self.runtime_root), "runtime_storage": "ephemeral",
                           "credentials_copied": False},
             "expected": {}, "observed": {}, "evidence_paths": [], "cleanup": self.cleanup,
         }
@@ -311,12 +320,14 @@ class HerdrIntegrationLive:
         if not self.herdr:
             return False
         argv = [self.herdr, "--session", self.session, "server"]
+        error_path = Path(self.env["TMPDIR"]) / "herdr-server.stderr"
         try:
-            self.server = subprocess.Popen(
-                argv, cwd=self.project, env=self.env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True, close_fds=True,
-            )
+            with error_path.open("wb") as errors:
+                self.server = subprocess.Popen(
+                    argv, cwd=self.project, env=self.env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=errors,
+                    start_new_session=True, close_fds=True,
+                )
         except OSError as exc:
             self._append(self.commands_path, {"step": "herdr-server-start", "argv": _redact_argv(argv),
                                               "returncode": None, "stderr_reason": type(exc).__name__,
@@ -331,6 +342,15 @@ class HerdrIntegrationLive:
             if rc == 0 and _json(stdout) is not None:
                 return True
             time.sleep(min(0.2, max(0.0, ready_until - time.monotonic())))
+        with error_path.open("rb") as errors:
+            diagnostic = errors.read(8192)
+        self._append(self.commands_path, {
+            "step": "herdr-server-startup-result", "argv": _redact_argv(argv),
+            "returncode": self.server.poll(), "finished_at": _utc_now(),
+            "stderr_bytes": error_path.stat().st_size,
+            "stderr_hmac": hmac.new(self.salt, diagnostic, hashlib.sha256).hexdigest(),
+            "stderr_reason": _failure_reason(diagnostic.decode("utf-8", "replace"), self.server.poll()),
+        })
         return False
 
     def create_pane(self, label):
@@ -658,6 +678,11 @@ class HerdrIntegrationLive:
                 self.cleanup_owned()
             except Exception as exc:
                 self.cleanup.append({"action": "cleanup-error", "reason": type(exc).__name__})
+            try:
+                self.runtime_dir.cleanup()
+                self.cleanup.append({"action": "remove-private-runtime", "result": "removed"})
+            except OSError as exc:
+                self.cleanup.append({"action": "cleanup-runtime-error", "reason": type(exc).__name__})
             self.result["finished_at"] = _utc_now()
             self.result["evidence_paths"] = [str(self.commands_path), str(self.events_path), str(self.result_path)]
             self._append(self.commands_path, {"step": "driver-finish", "started_at": self.result["finished_at"],

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import sys
 import tempfile
 import unittest
@@ -53,11 +54,12 @@ class NativeDriverContractTest(unittest.TestCase):
                     "--case", "callbacks", "--output-dir", str(output),
                     "--project", str(project), "--timeout", "10",
                 ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
             self.assertNotIn("OPENAI_API_KEY", driver.env)
             self.assertNotIn("HERDR_SOCKET_PATH", driver.env)
             self.assertNotIn("CODEX_THREAD_ID", driver.env)
             self.assertEqual(driver.result["isolation"]["credentials_copied"], False)
-            self.assertEqual(Path(driver.env["HOME"]).parent, driver.case_dir / "isolated")
+            self.assertEqual(Path(driver.env["HOME"]).parent, driver.runtime_root / "isolated")
 
     def test_command_evidence_keeps_exit_and_hash_but_not_output(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -68,6 +70,7 @@ class NativeDriverContractTest(unittest.TestCase):
                 "--case", "codex-busy", "--output-dir", str(root / "out"),
                 "--project", str(project), "--timeout", "10",
             ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
             rc, stdout, _stderr = driver.command(
                 "fixture", ["sh", "-c", "printf '%s' \"$PAYLOAD\""],
                 env={**driver.env, "PAYLOAD": "private-output"})
@@ -90,6 +93,7 @@ class NativeDriverContractTest(unittest.TestCase):
                 "--case", "callbacks", "--output-dir", str(root / "out"),
                 "--project", str(project), "--timeout", "10",
             ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
             for runtime, event in (("claude", "SessionStart"), ("codex", "SessionStart")):
                 with self.subTest(runtime=runtime):
                     log = driver._seed_user_callback(runtime)
@@ -104,6 +108,58 @@ class NativeDriverContractTest(unittest.TestCase):
                     argv = shlex.split(command)
                     self.assertEqual(argv[:3], ["printf", runtime, ">>"])
                     self.assertEqual(argv[3], str(log))
+
+    def test_long_evidence_path_can_bind_a_private_socket_and_failure_keeps_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            output = root / ("long-evidence-" + "a" * 100) / ("b" * 100)
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "events-lost", "--output-dir", str(output),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            runtime = driver.runtime_root
+            endpoint = Path(driver.env["HERDR_CONFIG_PATH"]).parent / "sessions" / driver.session / "herdr-client.sock"
+            endpoint.parent.mkdir(parents=True)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(endpoint))
+            with mock.patch.object(driver, "_case", return_value={"outcome": "unavailable", "reason": "fixture"}), \
+                    mock.patch("sys.stdout"):
+                self.assertEqual(driver.execute(), 2)
+            self.assertFalse(runtime.exists())
+            self.assertTrue(driver.result_path.is_file())
+            result = json.loads(driver.result_path.read_text())
+            self.assertIn({"action": "remove-private-runtime", "result": "removed"}, result["cleanup"])
+
+    def test_startup_error_keeps_classification_without_raw_server_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "events-lost", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver.herdr = "/fixture/herdr"
+            server = mock.Mock(pid=2147483647)
+            server.poll.return_value = 1
+
+            def start(_argv, **kwargs):
+                kwargs["stderr"].write(b"private startup text: socket name length exceeds capacity of sun_path")
+                kwargs["stderr"].flush()
+                return server
+
+            with mock.patch.object(live.subprocess, "Popen", side_effect=start):
+                self.assertFalse(driver.start_server())
+            evidence = driver.commands_path.read_text()
+            self.assertNotIn("private startup text", evidence)
+            last = json.loads(evidence.splitlines()[-1])
+            self.assertEqual(last["stderr_reason"], "local-socket-path-too-long")
+            self.assertEqual(last["returncode"], 1)
+            self.assertTrue(last["stderr_hmac"])
 
 
 if __name__ == "__main__":
