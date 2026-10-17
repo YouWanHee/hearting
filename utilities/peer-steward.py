@@ -107,6 +107,11 @@ _PERMISSION_FLAGS = {
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
     "opencode": ["--auto"],
 }
+# A started session has no one at its keyboard: Codex's startup update dialog would hold
+# it at agent_not_ready. The user's own `codex` keeps its update check.
+_STARTUP_FLAGS = {
+    "codex": ["-c", "check_for_update_on_startup=false"],
+}
 
 def _current_session_identity():
     """`(session_id, harness)` — delegates to `dispatch_parent_completion
@@ -1110,7 +1115,10 @@ def _mark_started(args, sid, mode):
 
 
 def _grid_split(layout):
-    """Match partial 2×2 grids, including herdr's odd-cell rounding."""
+    """Match partial 2×2 grids by their dividers, at any split ratio.
+
+    The user resizes columns and rows; the shape, not a 0.5 ratio, decides the next split.
+    """
     area, panes = layout.get("area"), layout.get("panes")
     if not isinstance(area, dict) or not isinstance(panes, list) or not 1 <= len(panes) <= 3:
         return None
@@ -1122,11 +1130,18 @@ def _grid_split(layout):
         if not isinstance(rect, dict) or any(type(rect.get(k)) is not int for k in keys):
             return None
     panes = sorted(panes, key=lambda p: (p["rect"]["x"], p["rect"]["y"]))
-    # Expected rectangles in x/y order, index of the full cell, split direction.
-    full = (0, 0, 1, 1)
-    left, right = (0, 0, .5, 1), (.5, 0, .5, 1)
-    top, bottom = (0, 0, 1, .5), (0, .5, 1, .5)
-    tl, bl, tr, br = (0, 0, .5, .5), (0, .5, .5, .5), (.5, 0, .5, .5), (.5, .5, .5, .5)
+    x0, y0, x1, y1 = area["x"], area["y"], area["x"] + area["width"], area["y"] + area["height"]
+    xs = sorted({p["rect"]["x"] for p in panes} - {x0})
+    ys = sorted({p["rect"]["y"] for p in panes} - {y0})
+    if len(xs) > 1 or len(ys) > 1:
+        return None
+    # One column divider and one row divider at most; an absent one is never consulted.
+    cx = xs[0] if xs else (x0 + x1) // 2
+    cy = ys[0] if ys else (y0 + y1) // 2
+    full = (x0, y0, x1, y1)
+    left, right = (x0, y0, cx, y1), (cx, y0, x1, y1)
+    top, bottom = (x0, y0, x1, cy), (x0, cy, x1, y1)
+    tl, bl, tr, br = (x0, y0, cx, cy), (x0, cy, cx, y1), (cx, y0, x1, cy), (cx, cy, x1, y1)
     patterns = (([full], 0, "right"), ([left, right], 1, "down"),
                 ([left, tr, br], 0, "down"), ([tl, bl, right], 2, "down"),
                 ([top, bottom], 0, "right"), ([tl, bottom, tr], 1, "right"),
@@ -1134,14 +1149,10 @@ def _grid_split(layout):
     for expected, index, direction in patterns:
         if len(expected) != len(panes):
             continue
-        matches = True
-        for pane, (x, y, w, h) in zip(panes, expected):
-            desired = (area["x"] + x * area["width"], area["y"] + y * area["height"],
-                       w * area["width"], h * area["height"])
-            if any(abs(pane["rect"][k] - v) > .5 for k, v in zip(keys, desired)):
-                matches = False
-                break
-        if matches:
+        if all(abs(pane["rect"]["x"] - ax) <= 1 and abs(pane["rect"]["y"] - ay) <= 1
+               and abs(pane["rect"]["x"] + pane["rect"]["width"] - bx) <= 1
+               and abs(pane["rect"]["y"] + pane["rect"]["height"] - by) <= 1
+               for pane, (ax, ay, bx, by) in zip(panes, expected)):
             return panes[index]["pane_id"], direction
     return None
 
@@ -1426,7 +1437,8 @@ def _start_in_pane(args):
     project_arg = [pane_cwd] if args.kind == "opencode" and pane_cwd else []
     # Codex's shared-daemon defaults and caller-supplied connection flags pass through
     # unchanged. Identity is resolved once from the started foreground process below.
-    full_agent_args = prefix + cwd_flag + project_arg + agent_args
+    full_agent_args = (list(_STARTUP_FLAGS.get(args.kind, [])) + prefix + cwd_flag
+                       + project_arg + agent_args)
 
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when

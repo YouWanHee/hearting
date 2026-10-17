@@ -943,6 +943,21 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         cmd = _agent_start_cmd(run_mock)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
+    def test_codex_start_skips_its_startup_update_dialog(self):
+        for mode in ("bypass", "inherit"):
+            with self.subTest(mode=mode), \
+                    mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                    mock.patch.object(peer_steward.subprocess, "run",
+                                      return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+                self._start(kind="codex", permission_mode=mode)
+                cmd = _agent_start_cmd(run_mock)
+                self.assertEqual(cmd[cmd.index("--") + 1:][:2], ["-c", "check_for_update_on_startup=false"])
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(peer_steward.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            self._start(kind="claude")
+        self.assertNotIn("check_for_update_on_startup=false", _agent_start_cmd(run_mock))
+
     def test_default_bypass_prepends_opencode_flag(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
@@ -3796,6 +3811,19 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
     def test_odd_terminal_dimensions_use_the_actual_half_cells(self):
         rects = [(23, 1, 138, 76), (161, 1, 137, 38), (161, 39, 137, 38)]
         self.assertEqual(self.decision(self.layout(rects, (23, 1, 275, 76))), ("split", "w1:p0", "down"))
+
+    def test_user_resized_dividers_still_fill_the_same_tab(self):
+        # The user drags column and row dividers; a 0.465 split is still the same grid.
+        for rects, area, expected in (
+                ([(0, 0, 125, 76), (125, 0, 143, 76)], (0, 0, 268, 76), ("split", "w1:p1", "down")),
+                ([(10, 2, 93, 100), (103, 2, 107, 40), (103, 42, 107, 60)], None, ("split", "w1:p0", "down")),
+                ([(10, 2, 140, 30), (10, 32, 140, 70), (150, 2, 60, 100)], None, ("split", "w1:p2", "down")),
+                ([(10, 2, 200, 30), (10, 32, 200, 70)], None, ("split", "w1:p0", "right"))):
+            with self.subTest(rects=rects):
+                self.assertEqual(self.decision(self.layout(rects, area)), expected)
+        # Two different row dividers are not one grid.
+        uneven = [(10, 2, 100, 30), (10, 32, 100, 70), (110, 2, 100, 60)]
+        self.assertEqual(self.decision(self.layout(uneven)), ("tab", "w1", None))
 
     def test_full_tab_reuses_only_an_empty_foreground_shell_otherwise_creates_a_tab(self):
         layout = self.layout(self.FOUR)
