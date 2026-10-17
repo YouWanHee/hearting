@@ -389,7 +389,11 @@ class CorrectionTest(unittest.TestCase):
             result = real_once(path, payload)
             if "reviewer_disposition" in payload: R.atomic_write(canonical, changed)
             return result
-        with mock.patch.object(R, "write_once", side_effect=perturb), self.assertRaisesRegex(ValueError, "origin-drift"):
+        # The source-epoch integrity check can see the edited head (canonical no
+        # longer equals its history) before the final origin check; either refusal
+        # leaves the perturbed head in place.
+        with mock.patch.object(R, "write_once", side_effect=perturb), \
+                self.assertRaisesRegex(ValueError, "origin-drift|terminal-artifact-mismatch"):
             f.replay()
         self.assertEqual(json.loads(canonical.read_text()), changed)
 

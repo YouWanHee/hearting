@@ -7343,14 +7343,21 @@ def write_completion_marker(
         route_hash=route["route_hash"],
         owner_override=owner_override, owner_chain=owner_chain,
     )
-    from review_source_subject import SourceSubjectError, marker_subject
+    from review_source_subject import SourceSubjectError, is_implementation_review, marker_subject
     try:
         source_subject = marker_subject(
             route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
             jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
         )
     except SourceSubjectError as exc:
-        raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+        # Only an implementation review consumes its source subject as evidence.
+        # Another scoped node's subject is optional epoch history: when its tree
+        # cannot be observed, the marker records none (legacy-unknown).
+        if (is_implementation_review(route, node) or exc.reason not in {
+                "review-source-git-unavailable", "review-source-worktree-unavailable",
+                "review-source-scope-unavailable"}):
+            raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+        source_subject = None
     replayed=_completion_marker_replay(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,
