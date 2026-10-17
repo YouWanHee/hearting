@@ -16,6 +16,51 @@ import fixture_env  # noqa: E402
 import codex_hook_trust  # noqa: E402
 
 
+class ManagedCopyProjectionHealthTest(unittest.TestCase):
+    def test_copy_health_requires_matching_regular_file_bytes_and_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.sh"
+            dest = root / "projected.sh"
+            source.write_bytes(b"#!/bin/sh\necho managed\n")
+            source.chmod(0o755)
+            entry = {"source": str(source), "dest": str(dest), "kind": "copy"}
+
+            dest.write_bytes(source.read_bytes())
+            dest.chmod(0o755)
+            self.assertEqual(activation._entries_healthy([entry]), (False, False))
+
+            dest.write_bytes(b"changed bytes\n")
+            dest.chmod(0o755)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+            dest.write_bytes(source.read_bytes())
+            dest.chmod(0o644)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+            dest.unlink()
+            self.assertEqual(activation._entries_healthy([entry]), (True, False))
+
+            # Even a symlink to the expected source is the wrong managed kind.
+            dest.symlink_to(source)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), source.resolve())
+
+            foreign = root / "foreign.sh"
+            foreign.write_bytes(source.read_bytes())
+            foreign.chmod(0o755)
+            dest.unlink()
+            dest.symlink_to(foreign)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), foreign.resolve())
+
+            dest.unlink()
+            dest.mkdir()
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+
 class CodexHookTrustTest(unittest.TestCase):
     def test_codex_projection_binds_the_herdr_home_consumer_path(self):
         with tempfile.TemporaryDirectory() as temporary:

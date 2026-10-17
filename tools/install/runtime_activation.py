@@ -3298,6 +3298,17 @@ def _entries_healthy(entries: List[dict]) -> tuple[bool, bool]:
         if item.get("kind") == "copytree":
             if _tree_digest(dest) != _tree_digest(source):
                 stale = True
+        elif item.get("kind") == "copy":
+            try:
+                if (
+                    dest.is_symlink()
+                    or not dest.is_file()
+                    or dest.read_bytes() != source.read_bytes()
+                    or (dest.stat().st_mode & 0o777) != (source.stat().st_mode & 0o777)
+                ):
+                    stale = True
+            except OSError:
+                stale = True
         elif not dest.is_symlink() or dest.resolve(strict=False) != source.resolve(strict=False):
             stale = True
     return missing, stale

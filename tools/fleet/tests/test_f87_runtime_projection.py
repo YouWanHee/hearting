@@ -200,19 +200,31 @@ class RuntimeProjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _, rows = self.project(root, sid, title="A title")
-            self.assertEqual(rows, [["pane","report-metadata","pane-7","--source","herdr:codex","--display-agent",agent,"--title",agent + " A title"]])
-            self.assertNotIn("report-agent-session", [row[1] for row in rows])
+            self.assertEqual(rows, [
+                ["pane", "report-agent-session", "pane-7", "--source", "herdr:codex",
+                 "--agent", "codex", "--agent-session-id", sid],
+                ["pane", "report-metadata", "pane-7", "--source", "herdr:codex",
+                 "--display-agent", agent, "--title", agent + " A title"],
+            ])
             _, rows = self.project(root, sid, title="{")
             # No summary is not "no header": the number still has to reach the pane.
-            self.assertEqual(rows[0][rows[0].index("--title") + 1], agent)
+            metadata = next(row for row in rows if row[1] == "report-metadata")
+            self.assertEqual(metadata[metadata.index("--title") + 1], agent)
             _, rows = self.project(root, sid, title="가" * 60)
-            projected = rows[0][rows[0].index("--title") + 1]
+            metadata = next(row for row in rows if row[1] == "report-metadata")
+            projected = metadata[metadata.index("--title") + 1]
             # Identity first and whole; the summary is what yields to the budget.
             self.assertTrue(projected.startswith(agent + " "), projected)
             self.assertTrue(projected.endswith("…"), projected)
             for mode in ("nonzero", "timeout"):
-                _, rows = self.project(root, sid, mode=mode)
-                self.assertEqual(len(rows), 1)
+                result, rows = self.project(root, sid, mode=mode)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual([row[1] for row in rows],
+                                 ["report-agent-session", "report-metadata"])
+                self.assertEqual(rows[0], [
+                    "pane", "report-agent-session", "pane-7", "--source", "herdr:codex",
+                    "--agent", "codex", "--agent-session-id", sid,
+                ])
             before = root / "codex/config.toml"
             self.assertFalse(before.exists())
             _, rows = self.project(root, sid, worker=True)
@@ -234,24 +246,29 @@ class RuntimeProjectionTest(unittest.TestCase):
             )
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Session summary", formatter=formatter)
+            self.assertEqual([row[1] for row in rows],
+                             ["report-agent-session", "report-metadata"])
+            metadata = next(row for row in rows if row[1] == "report-metadata")
             # A personal formatter renames the middle harness word only: the `[tag]` badge
             # and the steward mark are hearting's, composed OUTSIDE the formatter result,
             # so a formatter cannot quietly delete the two things that identify a session.
-            self.assertEqual(rows[0][6:],
+            self.assertEqual(metadata[6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Session summary" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nprint('{')\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Fallback", formatter=formatter)
-            self.assertEqual(rows[0][6:],
+            metadata = next(row for row in rows if row[1] == "report-metadata")
+            self.assertEqual(metadata[6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Fallback" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nimport time;time.sleep(.5)\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Timeout", formatter=formatter)
-            self.assertEqual(rows[0][6:],
+            metadata = next(row for row in rows if row[1] == "report-metadata")
+            self.assertEqual(metadata[6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Timeout" % minted_tag(sid)])
 
@@ -279,7 +296,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                     self.assertIn(expected, self.statusline(root, sid, title).stdout)
                 else:
                     _, rows = self.project(root, sid, title=title)
-                    self.assertEqual(rows[0][-1], "[%s] codex %s" % (minted_tag(sid), title))
+                    metadata = next(row for row in rows if row[1] == "report-metadata")
+                    self.assertEqual(metadata[-1], "[%s] codex %s" % (minted_tag(sid), title))
 
     def test_pane_header_order_is_number_then_steward_then_harness(self):
         """User-fixed format `[번호] (⚑) 하네스 요약` (2026-09-09; ⚑ moved before the harness
@@ -343,8 +361,8 @@ class RuntimeProjectionTest(unittest.TestCase):
         """The 2026-09-24 leak: `portable-guards.test.sh` fed `directpromptsid` to the Codex
         prompt hook while inheriting the pane's HERDR_*, and a live header read
         `[0d] codex`. The hook's process is not that session's runtime, so nothing is sent
-        for a fake session. The active native SessionStart hook owns session reporting;
-        this prompt hook may publish metadata only for the exact current thread. Asserted
+        for a fake session. A session report requires this process to hold the exact native
+        rollout and pass its footer proof; metadata requires the same current thread. Asserted
         in every case, whatever
         runtime happens to run this suite: a Codex hook gets no `CODEX_THREAD_ID`
         (measured 2026-09-25), and when one is set it proves nothing either."""
@@ -381,7 +399,17 @@ class RuntimeProjectionTest(unittest.TestCase):
                 case = (session, thread, held)
                 if reported:
                     rows = [json.loads(line) for line in log.read_text().splitlines()]
-                    self.assertEqual([row[1] for row in rows], ["report-metadata"], case)
+                    self.assertEqual([row[1] for row in rows],
+                                     ["report-agent-session", "report-metadata"], case)
+                    self.assertEqual(rows[0], [
+                        "pane", "report-agent-session", "wB:pN", "--source", "herdr:codex",
+                        "--agent", "codex", "--agent-session-id", CODEX_SID,
+                    ], case)
+                    metadata = [row for row in rows if row[1] == "report-metadata"]
+                    self.assertEqual(len(metadata), 1, case)
+                    self.assertEqual(metadata[0][3:6],
+                                     ["--source", "herdr:codex", "--display-agent"], case)
+                    self.assertEqual(metadata[0][6], "[cd] codex", case)
                 else:
                     self.assertEqual(log.read_text(), "", case)
 
