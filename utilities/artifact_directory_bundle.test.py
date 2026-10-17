@@ -55,6 +55,43 @@ class DirectoryBundleTests(unittest.TestCase):
             self.assertEqual(tree.body["file_count"], 1)
             self.assertEqual(tree.leaves[0].digest, "sha256:" + hashlib.sha256(b"abc").hexdigest())
 
+    def test_selector_prunes_only_when_candidate_policy_is_supplied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = Path(tmp) / "artifacts"
+            excluded = artifacts / "cache"
+            excluded.mkdir(parents=True)
+            (excluded / "raw-results").symlink_to("missing-target", target_is_directory=True)
+            sibling = artifacts / "run" / "raw-results"
+            sibling.mkdir(parents=True)
+            (sibling / "result.txt").write_text("kept")
+            seen = []
+
+            def prune(path):
+                seen.append(path)
+                return path == excluded
+
+            self.assertEqual(B.select_outermost(artifacts, prune_directory=prune),
+                             ("artifacts/run/raw-results",))
+            self.assertNotIn(excluded / "raw-results", seen)
+            # The descriptor verifier's default selection retains its historical behavior.
+            with self.assertRaises(B.DirectoryBundleError):
+                B.select_outermost(artifacts)
+            self.assertEqual(B.select_outermost(artifacts, prune_directory=lambda _path: True), ())
+
+    def test_candidate_bundle_is_not_selected_when_a_descendant_is_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = Path(tmp) / "artifacts"
+            raw = artifacts / "raw-results"
+            (raw / "cache").mkdir(parents=True)
+            (raw / "cache" / "CACHEDIR.TAG").write_bytes(b"marker")
+            (raw / "cache" / "raw-results").symlink_to("missing", target_is_directory=True)
+            (raw / "result.csv").write_text("kept")
+            cache = raw / "cache"
+            self.assertEqual(B.select_outermost(artifacts,
+                                                prune_directory=lambda path: path == cache), ())
+            # Historical verification without a candidate callback is unchanged.
+            self.assertEqual(B.select_outermost(artifacts), ("artifacts/raw-results",))
+
     def test_tree_digest_unicode_order_same_size_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "artifacts" / "raw-results"

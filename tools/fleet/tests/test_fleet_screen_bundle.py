@@ -519,8 +519,8 @@ class BundleTest(unittest.TestCase):
                             pos += render._dw(value)
                 self.assertEqual(starts, [anchor] * 6)
                 gauges = [render._dw(row[:row.index("━")]) for row in rows if "━" in row and "50%" in row]
-                self.assertEqual(gauges.count(4 + render._HW), 7)  # MAIN + three OWNER/FRAME pairs
-                self.assertEqual(gauges.count(17), 3)              # original worker detail column
+                # MAIN + three OWNER/FRAME pairs + three in-card workers on the owner's column
+                self.assertEqual(gauges.count(4 + render._HW), 10)
                 self.assertEqual(sum("frame 0/1" in row for row in rows if "╰" in row), 3)
                 self.assertFalse(any("frame 0/1" in row for row in rows if "╭" in row or "│" in row))
                 self.assertTrue(all(row.index("╭") == render._SESSION_DETAIL_COL

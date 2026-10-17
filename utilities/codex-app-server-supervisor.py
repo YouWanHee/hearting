@@ -20,6 +20,7 @@ from typing import Any
 from dispatch_receipt_identity import JOIN_REASONS, COMPLETION_ACTIONS
 from dispatch_owner_input import OwnerInput
 import dispatch_resource_wait as RESOURCE_WAIT
+import git_index_lock
 
 from dispatch_completion_join import (
     JoinContractError,
@@ -219,6 +220,146 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
             "status": item.get("status"),
         }
     return {"type": str(item_type or "unknown"), "id": item.get("id")}
+
+
+class CodexGitFailureFeedback:
+    """Bounded, advisory turn/steer transport for exact command-result items."""
+
+    MAX_PENDING = 32
+    MAX_TURNS = 8
+    MAX_COMMANDS_PER_TURN = 128
+
+    def __init__(self, server):
+        self.server = server
+        self.active: tuple[str, str] | None = None
+        self.turn_order: list[tuple[str, str]] = []
+        self.seen: dict[tuple[str, str], set[str]] = {}
+        self.limit_reported: set[tuple[str, str]] = set()
+        self.pending: dict[int, dict[str, str]] = {}
+
+    @staticmethod
+    def _event(status: str, record: dict[str, str], **extra) -> None:
+        emit({"type": "dispatch.supervisor.git_failure_feedback", "status": status,
+              "thread_id": record.get("thread_id"), "turn_id": record.get("turn_id"),
+              "command_item_id": record.get("command_item_id"), **extra})
+
+    def begin_turn(self, thread_id: str, turn_id: str) -> None:
+        if (not isinstance(thread_id, str) or not thread_id or len(thread_id) > 256
+                or not isinstance(turn_id, str) or not turn_id or len(turn_id) > 256):
+            self.active = None
+            return
+        key = (thread_id, turn_id)
+        self.active = key
+        if key not in self.seen:
+            self.seen[key] = set()
+            self.turn_order.append(key)
+        while len(self.turn_order) > self.MAX_TURNS:
+            old = self.turn_order.pop(0)
+            self.seen.pop(old, None)
+            self.limit_reported.discard(old)
+
+    def finish_turn(self, turn_id: str) -> None:
+        if self.active is None or self.active[1] != turn_id:
+            return
+        ended = self.active
+        self.active = None
+        for record in self.pending.values():
+            if (record["thread_id"], record["turn_id"]) == ended and not record.get("end_reported"):
+                record["end_reported"] = "1"
+                self._event("observation-limit", record, reason="turn-ended-before-feedback-ack")
+
+    def consider(self, thread_id: str, turn_id: str, item: dict[str, Any]) -> None:
+        key = (thread_id, turn_id)
+        if self.active != key or item.get("type") != "commandExecution":
+            return
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id or len(item_id) > 256:
+            return
+        seen = self.seen.get(key)
+        if seen is None:
+            return
+        status = item.get("status")
+        exit_code = item.get("exitCode")
+        command, cwd, output = item.get("command"), item.get("cwd"), item.get("aggregatedOutput")
+        if (not isinstance(status, str) or status not in ("completed", "failed")
+                or not git_index_lock.codex_command_candidate(command, cwd, exit_code, output)):
+            return
+        if item_id in seen:
+            self._event("duplicate-ignored", {
+                "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
+            })
+            return
+        if len(seen) >= self.MAX_COMMANDS_PER_TURN:
+            if key not in self.limit_reported:
+                self.limit_reported.add(key)
+                self._event("observation-limit", {
+                    "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
+                }, reason="per-turn-command-result-limit")
+            return
+        seen.add(item_id)
+
+        try:
+            diagnosis = git_index_lock.diagnose_codex_command(
+                command, cwd, exit_code, output,
+            )
+        except Exception as exc:
+            self._event("observation-limit", {
+                "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
+            }, reason=f"diagnostic-failed:{type(exc).__name__}")
+            return
+        if diagnosis is None or diagnosis.get("state") == "unbound":
+            return
+
+        record = {"thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id}
+        if len(self.pending) >= self.MAX_PENDING:
+            self._event("observation-limit", record, reason="pending-feedback-limit")
+            return
+        request_id = self.server.next_id
+        self.server.next_id += 1
+        pending = {**record, "diagnosis_state": str(diagnosis.get("state", "unavailable"))}
+        self.pending[request_id] = pending
+        request = {
+            "jsonrpc": "2.0", "id": request_id, "method": "turn/steer",
+            "params": {
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{"type": "text", "text": diagnosis.get("message", "Git index-lock diagnosis unavailable."),
+                           "text_elements": []}],
+            },
+        }
+        try:
+            self.server.send(request)
+        except Exception as exc:
+            self.pending.pop(request_id, None)
+            self._event("observation-limit", record, reason=f"feedback-send-failed:{type(exc).__name__}")
+            return
+        self._event("submitted", record, diagnosis_state=pending["diagnosis_state"])
+
+    def response(self, value: dict[str, Any]) -> bool:
+        request_id = value.get("id")
+        record = (self.pending.get(request_id)
+                  if isinstance(request_id, int) and not isinstance(request_id, bool) else None)
+        if (record is None or value.get("jsonrpc") != "2.0" or "method" in value
+                or ("result" in value) == ("error" in value)):
+            return False
+        if ("result" in value and not isinstance(value.get("result"), dict)) or (
+                "error" in value and not isinstance(value.get("error"), dict)):
+            return False
+        self.pending.pop(request_id, None)
+        late = self.active != (record["thread_id"], record["turn_id"])
+        if "error" in value:
+            self._event("observation-limit", record,
+                        reason="late-feedback-rejected" if late else "feedback-rejected")
+            return True
+        result = value.get("result")
+        if not isinstance(result, dict) or result.get("turnId") != record["turn_id"]:
+            self._event("observation-limit", record,
+                        reason="late-feedback-ack-mismatch" if late else "feedback-ack-mismatch")
+        elif late:
+            self._event("observation-limit", record, reason="late-feedback-ack")
+        else:
+            self._event("acknowledged", record)
+        return True
 
 
 def _usage_counter(value: Any) -> int | None:
@@ -464,6 +605,7 @@ class AppServer:
         self.next_id = 1
         self.pending: list[dict[str, Any]] = []
         self.input_control = None
+        self.git_failure_feedback = CodexGitFailureFeedback(self)
         self.messages = queue.Queue()
         def receive():
             for line in self.process.stdout:
@@ -498,6 +640,8 @@ class AppServer:
         if not isinstance(value, dict):
             raise SupervisorError("app-server-protocol-shape-invalid")
         if self.input_control is not None and self.input_control.response(value):
+            return self.read()
+        if self.git_failure_feedback.response(value):
             return self.read()
         return value
 
@@ -611,6 +755,9 @@ def run_turn(
     control = getattr(args, "owner_input", None)
     if control is not None:
         control.started(turn_id)
+    feedback = getattr(server, "git_failure_feedback", None)
+    if feedback is not None:
+        feedback.begin_turn(thread_id, turn_id)
     emit({"type": "dispatch.supervisor.turn.started", "thread_id": thread_id, "turn_id": turn_id})
     final_text: str | None = None
     final_item: dict[str, Any] | None = None
@@ -651,6 +798,8 @@ def run_turn(
         if method == "item/completed" and event_params.get("turnId") == turn_id:
             raw_item = event_params.get("item")
             if isinstance(raw_item, dict):
+                if event_params.get("threadId") == thread_id and feedback is not None:
+                    feedback.consider(thread_id, turn_id, raw_item)
                 item = normalize_item(raw_item)
                 emit({"type": "item.completed", "item": item})
                 if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
@@ -665,6 +814,8 @@ def run_turn(
             emit({"type": "dispatch.supervisor.turn.completed", "thread_id": thread_id,
                   "turn_id": turn_id, "status": completed.get("status")})
             if completed.get("status") != "completed":
+                if feedback is not None:
+                    feedback.finish_turn(turn_id)
                 raw_completed_error = completed.get("error")
                 error = (
                     raw_completed_error
@@ -676,6 +827,8 @@ def run_turn(
                 raise TurnFailed(payload)
             if control is not None:
                 control.completed(turn_id)
+            if feedback is not None:
+                feedback.finish_turn(turn_id)
             return final_text, final_item
 
 

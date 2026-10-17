@@ -761,6 +761,27 @@ def _half_up(value):
     return int(math.floor(float(value) + 0.5))
 
 
+def _native_context_gauge(entity):
+    """Without an applied compaction trigger, draw the native gauge: raw window and percent.
+
+    An unknown or disabled policy still has a measured window and usage; showing nothing would
+    hide what every session showed before applied triggers existed."""
+    policy = getattr(entity, "context_policy", None)
+    if isinstance(policy, dict) and policy.get("state") == "applied":
+        return None, None
+    window = getattr(entity, "context_window_tokens", None)
+    raw = policy.get("raw_percentage") if isinstance(policy, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return min(99, round(raw)), window
+    active = getattr(entity, "active_context_tokens", None)
+    if getattr(entity, "harness", None) == "codex":
+        from .token_budget import codex_context_used_pct
+        return codex_context_used_pct(active, window), window
+    if (type(active) is int and active >= 0 and type(window) is int and window > 0):
+        return min(99, round(100 * active / window)), window
+    return None, window
+
+
 def _context_gauge_track(window):
     """F-52b context-gauge track length: `clamp(half_up(16 * window / 1M), 1, 16)`.
 
@@ -1958,8 +1979,11 @@ def _unused_badge(s, compact=False):
 
 def _interaction_badge(s):
     state = getattr(s, "interaction_state", None)
-    label = _INTERACTION_LABEL.get(state.get("kind")) if isinstance(state, dict) else None
-    return " " + label if label else ""
+    kinds = [state.get("kind")] if isinstance(state, dict) else []
+    kinds.extend(row.get("kind") for row in (getattr(s, "interaction_observations", None) or [])
+                 if isinstance(row, dict))
+    labels = list(dict.fromkeys(_INTERACTION_LABEL[kind] for kind in kinds if kind in _INTERACTION_LABEL))
+    return " " + " + ".join(labels) if labels else ""
 
 
 def _interaction_chip(s):
@@ -4683,10 +4707,12 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         # F-65: a missing first-turn denominator is an unknown gauge, not a missing row.
         # Dispatch rows retain their dim visual weight and sit two cells AFTER their own
         # spinner, matching the main row's ``spinner + 2`` relationship without flattening
-        # the hierarchy back onto the main-session detail column.
+        # the hierarchy back onto the main-session detail column. Inside a card the box
+        # already carries the hierarchy, so every worker gauge shares the owner's column.
         shown_depth = min(depth, 1) if in_card else depth
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
-        detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
+        detail_indent = (4 + _HW - _CTX_LABEL_W
+                         if _route_rides_the_rail(job, None, in_card) or (in_card and not orphan)
                          else indicator_col + 2)
         content_width = (_dispatch_box_width(term_width) - 2 if in_card and term_width else
                          _context_content_width(term_width))
@@ -5279,7 +5305,10 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_window_tokens", None))
+    window = getattr(entity, "context_display_window_tokens", None)
+    if pct is None and window is None:
+        pct, window = _native_context_gauge(entity)
+    track = _context_gauge_track(window)
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))
@@ -6235,8 +6264,7 @@ def _gpu_session_label(owner, sessions=None, display_snapshot=None):
     key = _gpu_session_key(owner)
     if key is None:
         return "미귀속", "미귀속"
-    session = next((s for s in sessions or ()
-                    if (getattr(s, "harness", None), getattr(s, "session_id", None)) == key), None)
+    session = next((s for s in sessions or () if key in _gpu_session_keys(s)), None)
     name = ""
     if session is not None:
         for candidate in (getattr(session, "runtime_name", None),
@@ -10552,6 +10580,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_pump.stop(join_timeout=1.0)
         if install_pump is not None:
             install_pump.stop(join_timeout=0.1)
+        close_observation = getattr(collect_all, "close", None)
+        if callable(close_observation):
+            try:
+                close_observation()
+            except Exception:
+                pass
 
 
 def _stderr_log_path():

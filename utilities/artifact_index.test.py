@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -530,6 +531,27 @@ class TestIndex(unittest.TestCase):
         ]
         index = ix.build(items)
         self.assertEqual(len(index.cycles), 2)
+
+    def test_many_single_event_streams_apply_and_build_in_one_pass(self):
+        # A sealed cycle with ~60k artifacts declared ~60k one-event streams;
+        # a per-stream rescan of the events never finished (BC, 2026-10-17).
+        doc = _document(self.root_id, self.alloc)
+        template = doc["events"][0]
+        doc["events"] = [dict(template, event_id="evt_%032x" % n, stream_id="stm_%032x" % n)
+                         for n in range(20000)]
+        doc["events"].append(dict(template, event_id="evt_last", stream_id="stm_%032x" % 7))
+        started = time.monotonic()
+        index, _, _ = self._apply(ix.empty(self.root_id), doc)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(index.streams), 20000)
+        self.assertEqual(index.streams["stm_%032x" % 3]["last_event_id"], "evt_%032x" % 3)
+        # Same stream and sequence twice: the later row wins, as before.
+        self.assertEqual(index.streams["stm_%032x" % 7]["last_event_id"], "evt_last")
+        del doc["events"][-1]
+        started = time.monotonic()
+        built = ix.build([(doc, "p/" + doc["cycle"]["cycle_id"], m.manifest_digest(doc), doc["manifest_id"])])
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(built.streams), 20000)
 
 
 if __name__ == "__main__":

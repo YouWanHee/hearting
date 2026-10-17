@@ -6715,6 +6715,14 @@ class ForegroundInterruptedOutcomeTest(unittest.TestCase):
   self.assertEqual(D._foreground_outcome_values_from_pipe(pipe)["foreground_process_failure"],
                    "interrupted")
 
+ def test_no_progress_round_trips_as_a_fixed_failure(self):
+  self.assertIn("no-progress",D.FOREGROUND_FAILURES)
+  values=D._foreground_outcome_values(exit_code=-15,failure="no-progress",group_empty=True)
+  pipe=",".join(f"{key}={value}" for key,value in
+                {**values,"foreground_outcome_source":D.FOREGROUND_OUTCOME_SOURCE}.items())
+  self.assertEqual(D._foreground_outcome_values_from_pipe(pipe)["foreground_process_failure"],
+                   "no-progress")
+
  def test_unknown_words_and_the_none_exit_relation_still_fail(self):
   for failure,exit_code in (("interrupted-1",-15),("interrupt",-15),("interrupted",0)):
    with self.subTest(failure=failure,exit_code=exit_code), \
@@ -6801,5 +6809,16 @@ class ReviewSelfDispositionObserverTest(unittest.TestCase):
   origin=f.directory/f"{f.node['id']}.1.json"
   origin.write_bytes(origin.read_bytes()+b" ")
   self.assertIsNone(D._marker_bound_prepare_marker_proof(meta,"att-review-self"))
+
+
+class GitOptionalLocksEnvironmentTest(unittest.TestCase):
+ def test_worker_override_is_fixed_and_does_not_mutate_parent_environment(self):
+  for inherited in (None, "0", "1"):
+   with self.subTest(inherited=inherited):
+    values={} if inherited is None else {"GIT_OPTIONAL_LOCKS": inherited}
+    with mock.patch.dict(os.environ, values, clear=True):
+     before=dict(os.environ)
+     self.assertEqual(D.git_optional_locks_env(), {"GIT_OPTIONAL_LOCKS":"0"})
+     self.assertEqual(dict(os.environ), before)
 
 if __name__=="__main__": unittest.main()

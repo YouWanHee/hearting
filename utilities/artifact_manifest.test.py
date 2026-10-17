@@ -474,6 +474,32 @@ class TestLocatorSafety(unittest.TestCase):
                         self.assertIn(reason, _codes(interim), relative)
                         self.assertIn(reason, _codes(final), relative)
 
+    def test_root_support_locator_requires_a_nonempty_valid_tail(self):
+        for relative, reason in (
+                ("_internal/", "locator-trailing-slash"),
+                ("_internal//manifest.json", "locator-empty-component"),
+                ("_internal", "locator-empty-tail"),
+                ("artifacts", "locator-empty-tail"),
+                ("_internal/reviews/bad|name", "locator-invalid-component")):
+            with self.subTest(path=relative):
+                result = m.classify_artifact_path(
+                    "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+                    "locator", relative, "regular")
+                self.assertEqual((result.allowed, result.reason), (False, reason))
+        missing = m.classify_artifact_path(
+            "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+            "payload", "campaigns/camp/cyc/_internal/reviews/missing.json", "missing")
+        self.assertEqual((missing.allowed, missing.reason), (False, "payload-node-not-regular"))
+        prospective = m.classify_artifact_path(
+            "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+            "payload", "campaigns/camp/cyc/_internal/reviews/prospective.json", "missing",
+            prospective=True)
+        self.assertEqual((prospective.allowed, prospective.reason), (True, None))
+        root_only = m.classify_artifact_path(
+            "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+            "payload", "campaigns/camp/cyc/_internal", "regular")
+        self.assertEqual((root_only.allowed, root_only.reason), (False, "outside-cycle-artifacts"))
+
     def test_rejects_duplicate_locator_path(self):
         doc = _valid_document()
         doc["artifact_revisions"][1]["locator"]["path"] = doc["artifact_revisions"][0]["locator"]["path"]
@@ -496,6 +522,14 @@ SHARED_PATH_CORPUS = (
     ("control", ".runtime/other/anything.json", "regular", False, True, None, {}),
     ("payload", ".runtime/other/anything.json", "regular", False, False, "outside-cycle-artifacts", {"lifecycle": "locator-hidden-component", "admission": "locator-hidden-component", "producer": "file-outside-artifacts"}),
     ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None, {}),
+    ("payload", "campaigns/camp/cyc/_internal/reviews/manifest.json", "regular", False, True, None, {}),
+    ("payload", "campaigns/camp/cyc/_internal/reviews/report + (8).md", "regular", False, True, None, {}),
+    ("payload", "campaigns/camp/cyc/_internal/reviews/prospective.json", "missing", True, True, None, {}),
+    ("payload", "campaigns/camp/cyc/_internal", "regular", False, False, "outside-cycle-artifacts", {"admission": "locator-empty-tail", "lifecycle": "locator-empty-tail", "producer": "file-outside-artifacts"}),
+    ("payload", "campaigns/camp/cyc/_internal/reviews/bad|name", "regular", False, False, "locator-invalid-component", {}),
+    ("locator", "_internal", "regular", False, False, "locator-empty-tail", {"admission": "locator-empty-tail", "lifecycle": "locator-empty-tail", "producer": "file-outside-artifacts"}),
+    ("locator", "_internal/reviews/manifest.json", "regular", False, True, None, {}),
+    ("locator", "_internal/reviews/report + (8).md", "regular", False, True, None, {}),
     ("locator", "artifacts/manifest.json", "regular", False, True, None, {}),
     ("locator", "artifacts/_internal/candidate/round_1/manifest.json", "regular", False, True, None, {}),
     ("locator", "artifacts/_internal/candidate/round_2/manifest.json", "regular", False, True, None, {}),

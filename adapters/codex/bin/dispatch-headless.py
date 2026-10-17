@@ -42,6 +42,7 @@ from dispatch_contract import (
     annotate_attempt_row,
     adapter_launch_failure_outcome,
     bytecode_cache_env,
+    git_optional_locks_env,
     launch_mismatch_annotation,
     attempt_launch_is_available,
     attempt_launch_state,
@@ -343,7 +344,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--foreground-timeout",
         type=float,
-        default=float(os.environ.get("CODEX_DISPATCH_FOREGROUND_TIMEOUT", "3600")),
+        default=float(os.environ.get("CODEX_DISPATCH_FOREGROUND_TIMEOUT", "14400")),
         help="maximum child lifetime for foreground-scoped launch; non-positive clamps to the safe default (never waits indefinitely)",
     )
     add_stage_session_arguments(p)
@@ -2158,6 +2159,9 @@ def main(argv: list[str]) -> int:
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
+        # This is the final child environment merge: nested runtime-home and
+        # worker-home values cannot restore optional Git index writes.
+        dispatch_env.update(git_optional_locks_env())
         try:
             proc, launch_metadata = spawn_claimed_attempt(
                 jobs,
@@ -2358,12 +2362,25 @@ def main(argv: list[str]) -> int:
         args.child_pid = proc.pid
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
+        activity_context = None
+        if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":
+            try:
+                from foreground_activity import build_activity_context
+                activity_context = build_activity_context(
+                    worker_type=args.worker_type, harness="codex", log_path=log_path,
+                    jobs=jobs, launch_metadata=launch_metadata, attempt_id=args.attempt_id,
+                    route_id=args.route_id, route_node=args.route_node,
+                    environment=dispatch_env, worktree=args.worktree,
+                )
+            except Exception as exc:
+                print(f"warning=foreground activity context unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
             binding = args.parent_binding
             try:
                 outcome = wait_foreground(
                     proc, args.foreground_timeout,
                     watchdog_budget=args.watchdog_budget,
+                    activity_context=activity_context,
                     parent_pid=binding.observed_pid if binding else None,
                     parent_pid_start=binding.observed_pid_start if binding else None,
                     parent_is_live=(
@@ -2410,6 +2427,7 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 watchdog_budget=args.watchdog_budget,
+                activity_context=activity_context,
             )
             annotate_attempt_row(
                 jobs,

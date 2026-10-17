@@ -772,6 +772,57 @@ class WrapperAdmissionTest(unittest.TestCase):
                 os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
                 self.assertIsNone(RA.bind_launch_access(args, runtime="opencode", default_roots=()))
 
+
+class ComputeLaunchAccessTest(unittest.TestCase):
+    def test_borrowed_owner_and_compute_child_keep_defaults_noncompute_child_filters_them(self):
+        from execution_access import (
+            COMPUTE_INVENTORY_REASON, COMPUTE_NETWORK_REASON, ParentGrant,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifacts, state = root / "worktree", root / "artifacts", root / "state"
+            worktree.mkdir(); artifacts.mkdir(); state.mkdir()
+            run_root, inventory_root = root / "runs", root / "inventory"
+            run_root.mkdir(); inventory_root.mkdir()
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps({
+                "schema_version": 1,
+                "writable_roots": [str(run_root)],
+                "read_roots": [str(inventory_root)],
+                "network": {"required": True, "reason": COMPUTE_NETWORK_REASON, "hosts": []},
+                "enforcement_required": "any",
+                "justification": {str(run_root): "Compute-hosts inventory run_root for lab resource work",
+                                  str(inventory_root): COMPUTE_INVENTORY_REASON},
+            }))
+            route = {"route_id": "rt-borrowed-access", "route_hash": "sha256:" + "a" * 64,
+                     "capability": "autopilot-code", "cwd": str(worktree),
+                     "artifact_root": str(artifacts), "nodes": [
+                         {"id": "lab-run", "part": "autopilot-lab:full-run"},
+                         {"id": "test"},
+                     ]}
+            route_file = root / "route.json"
+            route_file.write_text(json.dumps(route))
+            parent = ParentGrant((run_root,), (inventory_root,), network_allowed=True,
+                                 attempt_id="att-parent", runtime="opencode")
+            results = {}
+            for node, depth in ((None, 1), ("lab-run", 2), ("test", 2)):
+                args = SimpleNamespace(
+                    worktree=str(worktree), artifact_root=str(artifacts), jobs_path=state / "jobs.log",
+                    agent_home=ROOT, dispatch_depth=depth, execution_access_file=str(request_path),
+                    parent_binding=SimpleNamespace(attempt_id="att-parent") if depth == 2 else None,
+                    route_file=str(route_file), route_node=node, owner_route_binding=None,
+                )
+                patchers = [mock.patch("execution_access.load_parent_effective_grant", return_value=parent)]
+                with patchers[0]:
+                    results[node or "owner"] = RA.bind_launch_access(
+                        args, runtime="opencode", default_roots=(), network_available=True)
+            self.assertEqual(results["owner"].read_roots, (inventory_root,))
+            self.assertEqual(results["lab-run"].read_roots, (inventory_root,))
+            self.assertEqual(results["owner"].network, "granted-unenforced")
+            self.assertEqual(results["lab-run"].network, "granted-unenforced")
+            self.assertEqual(results["test"].read_roots, ())
+            self.assertEqual(results["test"].network, "not-requested")
+
 class SealedContractReadTest(unittest.TestCase):
     """An activated replacement still reads the route's original contracts."""
 

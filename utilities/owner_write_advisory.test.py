@@ -237,6 +237,8 @@ class OwnerWriteAdvisoryTest(unittest.TestCase):
             out = io.StringIO()
             with mock.patch.object(sys, "argv", ["capability-route", *argv, "--jobs", str(self.root / "jobs")]), \
                  mock.patch.object(R, "compose_route", return_value=self.route), \
+                 mock.patch.object(R, "prepare_isolated_worktree",
+                                   return_value={"state": "reused", "cwd": str(self.primary)}), \
                  mock.patch.object(R, "verify_route", return_value=self.route), \
                  mock.patch.object(R, "_record_route_chain"), \
                  mock.patch.object(R, "_resolve_compose_plan", return_value=(None, None)), \

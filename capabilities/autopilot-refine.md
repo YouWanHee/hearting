@@ -100,28 +100,17 @@ W7C write-cutover contract (`utilities/artifact_producer.py`, registry table
 `producer_lifecycle` in `capabilities/topologies.json`). The same lifecycle
 binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
-1. **begin before the first write.** After route compile/bind, depth-0 runs
-   `begin` before either frame leg starts; the later owner inherits that cycle.
-   Without frame, the acting owner (inline for `direct`, depth-1 otherwise)
-   begins the cycle. The command is `artifact_producer.py begin --artifact-root
-   <root> --route <route file> --capability autopilot-refine --intensity <intensity>`.
-   While the cutover is inactive this returns `legacy-compat` and the legacy
-   `<artifact-root>/target/` layout stays writable; once active it
-   issues `campaign_id`/`cycle_id`/`producer_id` and the cycle directory
-   `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
-2. **write only inside the open cycle.** Every durable artifact goes under
-   `<cycle_dir>/artifacts/target/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
+1. The launcher prepares the route's cycle and carries its exact context.
+2. **write only inside the open cycle.** Routed support outputs use the
+   current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`; the
+   existing target remains the transaction input.
    `artifact_producer.py` owns cycle output paths and shared revisions.
-3. **stage workers join, never fork.** `standard+` stage workers receive
-   `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
-   from the owner (dispatch env pass-through) and call `begin --node <id>`
-   on the same route, which resumes the owner's open cycle.
+3. The runtime carries the same producer context through stage dispatch.
 4. **runtime-owned closure.** A new registered owner returns its final report;
    the shared completion controller owns workflow/route closure and exact-cycle
    sealing after PASS and process cleanup. Interrupted closure retains the
    result and transaction, retries without a model turn, and carries a recovery
-   notice. `roles/worker-types/owner.md` defines this shared contract. Explicit
-   close/finalize commands remain for inline work and legacy recovery.
+   notice. `roles/worker-types/owner.md` defines this shared contract.
 5. **shared admission.** This capability's output is cycle-local; it is never admitted to `shared/` (only `spec`, `analysis`, and explicitly promoted `research` are shared kinds).
 
 ## Role Requirements

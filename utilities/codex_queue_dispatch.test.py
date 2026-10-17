@@ -15,6 +15,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import codex_queue_dispatch as QUEUE
+import codex_queue_delivery as DELIVERY
 
 
 class QueueDispatchTest(unittest.TestCase):
@@ -28,6 +29,28 @@ class QueueDispatchTest(unittest.TestCase):
     def test_new_unmanaged_session_uses_native_control_socket(self):
         socket = QUEUE.resolve_queue_socket({"CODEX_HOME": "/tmp/codex-home"})
         self.assertEqual(socket, Path("/tmp/codex-home/app-server-control/app-server-control.sock"))
+
+    def test_source_runtime_home_alias_resolves_daemon_beside_private_cli_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_home = root / "runtime-home"
+            private_home = root / "private-profile"
+            daemon_root = root / "codex-daemon-uid"
+            control = runtime_home / "app-server-control"
+            control.mkdir(parents=True)
+            daemon_root.mkdir(mode=0o700)
+            socket_target = daemon_root / "daemon-socket"
+            socket_alias = control / "app-server-control.sock"
+            socket_alias.symlink_to(socket_target)
+
+            source_endpoint = QUEUE.resolve_queue_socket({"CODEX_HOME": str(runtime_home)})
+            private_endpoint = QUEUE.resolve_queue_socket({"CODEX_HOME": str(private_home)})
+
+            self.assertEqual(source_endpoint, socket_alias)
+            self.assertEqual(DELIVERY.resolve_endpoint(source_endpoint), socket_target)
+            self.assertEqual(private_endpoint,
+                             private_home / "app-server-control" / "app-server-control.sock")
+            self.assertNotEqual(private_endpoint, source_endpoint)
 
     def test_sidecar_uses_exact_thread_and_attempts_without_gateway_flags(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -37,6 +37,8 @@ class CurrentSessionTest(unittest.TestCase):
             "status": "idle", "name": "이틀 전 작업 완료", "updatedAt": 1000000,
         }))
         (self.home / ".statusline").mkdir()
+        # These legacy taps prove raw percentages and identity, not an applied
+        # compaction policy. Keep the raw diagnostic without inventing a gauge.
         for sid, pct in (("old", 26), ("current", 17)):
             (self.home / ".statusline" / (sid + ".json")).write_text(json.dumps({
                 "session_id": sid, "context_window": {"used_percentage": pct},
@@ -55,7 +57,8 @@ class CurrentSessionTest(unittest.TestCase):
     def test_clear_uses_current_sid_for_all_telemetry_without_old_idle_or_name(self):
         s = self.enrich(["old"])
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
         self.assertIsNone(s.registry_name)
         self.assertTrue(s._transcript_path.endswith("current.jsonl"))
@@ -121,13 +124,15 @@ class CurrentSessionTest(unittest.TestCase):
     def test_incomplete_other_pane_keeps_current_identity_and_telemetry(self):
         s = self._enrich_pane_observation(bound=True, complete=False)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
 
     def test_complete_pane_observation_resolves_first_snapshot(self):
         s = self._enrich_pane_observation(bound=True, complete=True)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
 
     def test_agent_list_failure_does_not_reconfirm_herdr_registry(self):
         s = self._enrich_failed_agent_list("herdr")
@@ -150,13 +155,15 @@ class CurrentSessionTest(unittest.TestCase):
     def test_agent_list_failure_preserves_already_observed_pane_identity(self):
         s = self._enrich_failed_agent_list("herdr", bound=True)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
 
     def test_absent_herdr_preserves_plain_terminal_native_identity(self):
         s = self._enrich_failed_agent_list("terminal")
         self.assertEqual(s.session_id, "old")
-        self.assertEqual(s.ctx_pct, 26)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 26)
 
     def test_standalone_failed_target_pane_is_unobserved(self):
         with mock.patch.object(procscan, "_comm_of", return_value="claude"), \
@@ -239,12 +246,37 @@ class CurrentSessionTest(unittest.TestCase):
                 mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
             session_tidy._fold_ledger(seat)
             rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "compact",
-                          "cwd": self.cwd, "ts": 4},
+                          "session_seq": 400, "cwd": self.cwd, "ts": 4},
                          {"harness": "claude", "sid": "current", "event": "prompt", "cwd": self.cwd, "ts": 5}])
             session_tidy._fold_ledger(seat)
             current = next(row for row in rows if row["sid"] == "current" and row["event"] == "summary")
             self.assertEqual((current["start_source"], current["start_at"]), ("clear", 2))
             edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd)
+            rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "resume",
+                          "session_seq": 600, "resume_argv": ["claude", "--resume", "current"],
+                          "launch_cwd": "/new-cwd", "transcript": "/transcript/current.jsonl",
+                          "cwd": "/new-cwd", "ts": 6},
+                         {"harness": "claude", "sid": "current", "event": "prompt",
+                          "cwd": "/new-cwd", "ts": 7}])
+            session_tidy._fold_ledger(seat)
+            current = next(row for row in rows if row["sid"] == "current" and row["event"] == "summary")
+            self.assertEqual((current["start_source"], current["start_at"]), ("clear", 2))
+            context = session_tidy.session_start_context("claude", "current", "wB:p3N")
+            self.assertEqual(context, {"session_start_source": "resume", "session_seq": 600,
+                                      "resume_argv": ["claude", "--resume", "current"],
+                                      "launch_cwd": "/new-cwd",
+                                      "transcript": "/transcript/current.jsonl"})
+            # A later resume without proven launch context must not inherit an
+            # earlier launch's argv or cwd merely because the SID is unchanged.
+            rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "resume",
+                          "session_seq": 800, "cwd": self.cwd, "ts": 8},
+                         {"harness": "claude", "sid": "current", "event": "prompt",
+                          "cwd": self.cwd, "ts": 9}])
+            session_tidy._fold_ledger(seat)
+            context = session_tidy.session_start_context("claude", "current", "wB:p3N")
+            self.assertEqual((context["session_start_source"], context["session_seq"]), ("resume", 800))
+            self.assertNotIn("resume_argv", context)
+            self.assertNotIn("launch_cwd", context)
         sid, _ = process_identity.resolve_session_claims({"registry": "old", "pane": "current"}, edges)
         self.assertEqual(sid, "current")
 
@@ -297,6 +329,9 @@ class ProcessRolesTest(unittest.TestCase):
             process_identity.finalize_process_roles(rows, jobs)
         self.assertEqual({s.pid for s in rows}, {20, 21, 22, 30, 40})
         self.assertEqual({s.process_role for s in rows}, {"conversation", "session-backend", "registered-worker"})
+        generic_app_server = next(session for session in rows if session.pid == 30)
+        self.assertTrue(generic_app_server.app_server)
+        self.assertEqual(generic_app_server._invocation_mode, "command")
 
     def test_unbound_session_cannot_infer_stage_from_cwd_basename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -337,9 +372,7 @@ class ProcessRolesTest(unittest.TestCase):
                     session_id="0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47", app_server=True)
         s._tty, s._invocation_mode = "?", "command"
         path = "/tmp/rollout-0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47.jsonl"
-        with mock.patch.object(codex, "_proc_rollout", return_value=path), \
-                mock.patch.object(codex, "_reserve_start_matched_rollouts"), \
-                mock.patch("fleet.session_registry.read", return_value=None):
+        with mock.patch.object(codex, "_proc_rollout", return_value=path):
             codex.process_rollouts([s], "/tmp/codex")
             rows = [s]
             process_identity.finalize_process_roles(rows, [])

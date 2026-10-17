@@ -63,12 +63,28 @@ function selectedSid(api) {
   } catch { return null }
 }
 
+function lifecycleSource(type, event, sid) {
+  const properties = (event && event.properties) || {}
+  const info = properties.info || {}
+  const eventSid = cleanSid(info.id) || cleanSid(properties.sessionID)
+  const explicit = cleanSid(properties.session_start_source) || cleanSid(info.session_start_source)
+  if (["startup", "resume", "clear", "compact", "fork"].includes(explicit)) return explicit
+  if (type === "session.created" && eventSid === sid) {
+    return cleanSid(info.parentID) ? "fork" : "startup"
+  }
+  if (type === "tui.session.select") {
+    if (eventSid && eventSid !== sid) return null
+    return "select"
+  }
+  return null
+}
+
 function recordPath(dir, own) {
   if (!dir || !own) return ""
   return path.join(dir, own.pid + "-" + own.start + ".json")
 }
 
-function syncRecord(api, mem) {
+function syncRecord(api, mem, sourceHint = null) {
   const env = (typeof process !== "undefined" && process.env) || {}
   const own = ownLifecycle()
   const file = recordPath(recordDir(env), own)
@@ -78,20 +94,32 @@ function syncRecord(api, mem) {
     if (!sid) {
       rmSync(file, { force: true })
       mem.last = ""
+      mem.sequence = 0
+      mem.source = ""
       return true
     }
     // Change-gated: steady activity re-reads the same selection without
     // churning the record, so the server's pre-publication generation
     // comparison stays stable until the selection actually moves.
     const key = "S:" + sid
-    if (mem.last === key) return true
-    mkdirSync(path.dirname(file), { recursive: true })
-    const body = JSON.stringify({ schema: RECORD_SCHEMA,
-      sessionID: sid, pid: own.pid, start: own.start, writtenAt: new Date().toISOString() })
+    const changed = mem.last !== key || (sourceHint && mem.source !== sourceHint)
+    if (!changed) return true
+    if (mem.last !== key) {
+      mem.last = key
+      mem.sequence = Math.max(Date.now() * 1000, (mem.sequence || 0) + 1)
+      mem.source = ""
+    }
+    if (["startup", "resume", "clear", "compact", "fork"].includes(sourceHint)) {
+      mem.source = sourceHint
+    }
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+    const record = { schema: RECORD_SCHEMA, sessionID: sid, pid: own.pid, start: own.start,
+      sessionSeq: mem.sequence, writtenAt: new Date().toISOString() }
+    if (mem.source) record.sessionStartSource = mem.source
+    const body = JSON.stringify(record)
     const tmp = file + ".tmp-" + own.pid
-    writeFileSync(tmp, body, { encoding: "utf8" })
+    writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 })
     renameSync(tmp, file)
-    mem.last = key
     return true
   } catch { return false }
 }
@@ -124,7 +152,7 @@ function clearRecord() {
 }
 
 async function tui(api) {
-  const mem = { last: "" }
+  const mem = { last: "", sequence: 0, source: "" }
   const refresh = () => { syncRecord(api, mem) }
   refresh()
   const unsubs = []
@@ -137,7 +165,9 @@ async function tui(api) {
         if (gone && selectedSid(api) === gone) clearRecord()
         refresh()
       }))
-      else unsubs.push(api.event.on(type, refresh))
+      else unsubs.push(api.event.on(type, (event) => {
+        syncRecord(api, mem, lifecycleSource(type, event, selectedSid(api)))
+      }))
     }
   } catch {
     // Partial subscriptions are still disposed below; a broken bus must

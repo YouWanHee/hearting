@@ -65,10 +65,9 @@ Interactive completion uses Codex's native queue, addressed to the caller's
 The exact-batch sidecar checks consumed and pending messages before sending;
 ambiguous sends may repeat. Only an exact Hearting item may restart an interrupted
 parent. The TUI owns questions and approvals; headless owners keep their separate
-supervisor. Default mode asks through `request_user_input_async`; its question box vanishes when the turn ends, so an open decision question is restated in the final message and the next reply is its answer (response-policy). Empty answers are not decisions.
+supervisor. Default mode asks via waiting `request_user_input` (`default_mode_request_user_input`); it submits empty at 120 s (countdown from 60 s; typing cancels). Empty is no decision: restate at turn end (Fleet keeps `answer needed`); `_async`: fallback.
 Arbitrary detached shell output still does not auto-resume. For non-dispatch
-long-running work, obey `preflight.sh
-loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
+long-running work, obey `preflight.sh loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
 instead of ending with a detached completion promise.
 
 The session uses one canonical `AGENT_DISPATCH_JOBS`.
@@ -188,8 +187,8 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 terminal, and a graph that breaks this is refused at route compile and at launch.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Keep unfinished tracked work in this turn or its existing registered continuation; when automatic follow-up is unsupported, state the checked fallback. Report PID/start, exit/log and artifact evidence.
-On completion, read the exact result and perform approved parent review/follow-through now or through that continuation. Receipt/queue/ACK is not execution; report actual chronology. Reply before processing an actionable peer request; no-reply notices need no reply. After reading a handoff card/docs, accept with `utilities/session_tidy.py handoff accept <ref>`.
+Keep unfinished work here or in its registered continuation; state checked fallback if unsupported. Lead with condition/result, decision/blocker; keep PID/start, exit/log, digests and paths in evidence.
+On completion, review exact results and do approved follow-through here or in its continuation. Receipt/queue/ACK is not execution; report chronology. Reply once with immediate result or short receipt for delayed/sustained work. Informational notices need no reply. Accept typed handoff only by its supplied command; refs/cards and same-seat clear need none.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
 The native queue never substitutes for a continuation.

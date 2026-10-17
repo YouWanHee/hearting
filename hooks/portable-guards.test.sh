@@ -476,6 +476,7 @@ else
   fi
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >"$TMP/codex_headless_install.out" 2>"$TMP/codex_headless_install.err" \
+  && grep -Fq 'status_line = ["thread-title", "git-branch", "context-used", "model-with-reasoning", "five-hour-limit", "weekly-limit", "thread-id"]' "$TMP/codex_headless_home/config.toml" \
   && AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access "$CODEX" headless --check "$TMP/repo" >"$TMP/codex_headless_check.out" 2>"$TMP/codex_headless_check.err" \
   && grep -q '^runtime_projection=ok$' "$TMP/codex_headless_check.out" \
   && grep -q '^check=hook-trust:skipped reason=authoritative-current-hash-check-not-requested' "$TMP/codex_headless_check.out" \
@@ -1134,7 +1135,7 @@ EOF
 if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >"$TMP/codex_tui.out" 2>"$TMP/codex_tui.err" \
   && grep -q '^status=ok$' "$TMP/codex_tui.out" \
   && grep -q '^changed=yes$' "$TMP/codex_tui.out" \
-  && grep -Fq "$(grep '^status_line = ' "$ROOT/adapters/codex/config/tui-statusline.toml")" "$TUIHOME/config.toml" \
+  && grep -Fq 'status_line = ["old", "thread-id"]' "$TUIHOME/config.toml" \
   && grep -Fq 'status_line_use_colors = true' "$TUIHOME/config.toml" \
   && grep -Fq 'model = "keep-me"' "$TUIHOME/config.toml" \
   && grep -Fq '[hooks.state]' "$TUIHOME/config.toml" \
@@ -2267,6 +2268,18 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" "$ROOT/adapters/codex/bin/install-run
   ok "codex install-runtime-projection wires the home and the checker passes"
 else
   bad "codex install-runtime-projection + checker should wire and validate the runtime home"
+fi
+TUIBAD="$TMP/codex-runtime-home-invalid-tui"
+mkdir -p "$TUIBAD"
+printf '[tui\nstatus_line = ["keep-bytes"]\n' >"$TUIBAD/config.toml"
+cp "$TUIBAD/config.toml" "$TMP/codex-runtime-home-invalid-tui.before"
+if AGENT_HOME="$ROOT" CODEX_HOME="$TUIBAD" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >"$TMP/codex_rp_invalid_tui.out" 2>"$TMP/codex_rp_invalid_tui.err" \
+  && grep -q '^tui_config=skipped reason=merge-unavailable$' "$TMP/codex_rp_invalid_tui.out" \
+  && cmp -s "$TUIBAD/config.toml" "$TMP/codex-runtime-home-invalid-tui.before" \
+  && [ -L "$TUIBAD/hearting" ]; then
+  ok "codex install-runtime-projection leaves malformed TUI config bytes and continues"
+else
+  bad "codex projection install should preserve malformed TUI config without blocking links"
 fi
 RPSELF="$TMP/codex-runtime-home-self"
 rm -rf "$RPSELF"; mkdir -p "$RPSELF"

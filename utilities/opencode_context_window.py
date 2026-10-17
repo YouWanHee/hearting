@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -62,6 +63,18 @@ def _installed_command(command: str | None = None) -> str:
     if command:
         return command
     return shutil.which("opencode") or "opencode"
+
+
+def _installed_version(command: str, *, cwd: str, env: Mapping[str, str]) -> str | None:
+    try:
+        result = subprocess.run([command, "--version"], cwd=cwd, env=dict(env),
+                                text=True, capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)", result.stdout or "")
+    return match.group(1) if match else None
 
 
 def _resolved_config(*, cwd: str, env: Mapping[str, str], command: str) -> dict[str, object]:
@@ -338,7 +351,14 @@ def _hook_main() -> None:
         config = payload.get("config") if isinstance(payload, dict) else None
         if not isinstance(config, dict):
             return
-        print(json.dumps({"config": apply_runtime_config(config)}, ensure_ascii=False))
+        home = Path(os.environ.get("HOME") or Path.home()).expanduser()
+        runtime = Path(os.environ.get("OPENCODE_CONFIG_DIR") or
+                       Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+                       / "opencode").expanduser()
+        values, _receipt = resolve_config("opencode", runtime=runtime, environ=os.environ)
+        requested, _source = resolve_context_window(values)
+        print(json.dumps({"config": apply_runtime_config(config),
+                          "context_window_request": str(requested)}, ensure_ascii=False))
     except Exception:
         # The plugin retains its input config on any helper error.
         return
@@ -352,6 +372,7 @@ def prepare_launch_context(*, model: str, context_window: str | int,
     native_command = _installed_command(command)
     env = dict(os.environ if environ is None else environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
+    runtime_version = _installed_version(native_command, cwd=cwd, env=env)
     before_config = _resolved_config(cwd=cwd, env=env, command=native_command)
     selected_model = before_config.get("model") if model == "inherit" else model
     if not isinstance(selected_model, str) or selected_model.count("/") < 1:
@@ -376,6 +397,53 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         )
     final_limits = _model_limits(after_config, selected_model)
     _verify_final_limits(selected_model, applied, final_limits)
+    compaction = after_config.get("compaction") if isinstance(after_config, dict) else None
+    compaction = compaction if isinstance(compaction, dict) else {}
+    auto = compaction.get("auto")
+    configured_reserve = compaction.get("reserved")
+    context_limit = final_limits.get("context")
+    input_limit = final_limits.get("input")
+    output_limit = final_limits.get("output")
+    policy = {
+        "state": "unknown", "enabled": None, "trigger_tokens": None,
+        "context_tokens": _integer_limit(final_limits, "context", required=False),
+        "input_tokens": _integer_limit(final_limits, "input", required=False),
+        "output_allowance_tokens": _integer_limit(final_limits, "output", required=False),
+        "configured_reserve_tokens": None, "effective_reserve_tokens": None,
+        "source": "opencode-v1.19.0-session-overflow",
+        "reason": "native-compaction-input-unavailable",
+    }
+    if type(configured_reserve) is int and configured_reserve >= 0:
+        policy["configured_reserve_tokens"] = configured_reserve
+    if runtime_version != "1.19.0":
+        policy.update(reason="native-consumer-version-unverified")
+    elif auto is False or context_limit == 0:
+        policy.update(state="disabled", enabled=False, reason="native-auto-compaction-disabled")
+    elif auto in (None, True):
+        output_allowance = policy["output_allowance_tokens"]
+        if policy["configured_reserve_tokens"] is not None:
+            reserve = policy["configured_reserve_tokens"]
+        elif output_allowance is not None:
+            reserve = min(20_000, output_allowance)
+        else:
+            reserve = None
+        trigger = None
+        effective_reserve = None
+        if (type(input_limit) is int and input_limit > 0 and reserve is not None):
+            trigger = max(0, input_limit - reserve)
+            effective_reserve = reserve
+        elif ((input_limit is None or type(input_limit) is int and input_limit == 0)
+              and type(context_limit) is int and context_limit >= 0
+              and output_allowance is not None):
+            trigger = max(0, context_limit - output_allowance)
+            effective_reserve = output_allowance
+        if trigger is not None:
+            policy.update(state="applied", enabled=True, trigger_tokens=trigger,
+                          effective_reserve_tokens=effective_reserve, reason=None)
+        else:
+            policy.update(enabled=True, reason="native-output-or-input-limit-unavailable")
+    else:
+        policy.update(reason="invalid-native-compaction-auto-setting")
     return {
         "config_content": updated,
         "model": selected_model,
@@ -384,6 +452,8 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         "native_limits": limits,
         "applied_limits": applied,
         "final_limits": final_limits,
+        "compaction_policy": policy,
+        "runtime_version": runtime_version,
     }
 
 

@@ -1285,7 +1285,7 @@ check_codex_utility_projection() {
   # codex-adapter-parity audit P-40 (2026-07-04): derived under-projection completeness pair — every
   # top-level utilities/* entry must be classified projected or deferred, else fail loud (closes the
   # leak window where a newly added utility silently has no projection decision).
-  UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py token-budget.py token-budget-experiment.py worker_bootstrap.py"
+  UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py token-budget.py token-budget-experiment.py worker_bootstrap.py codex_tui_config.py"
   UTILITY_DEFERRED=$(census utility-deferred)
   utility_count=0
   for f in utilities/*; do
@@ -2296,7 +2296,7 @@ check_opencode_utility_projection() {
   # codex-adapter-parity audit P-40 (2026-07-04): derived under-projection completeness pair — every
   # top-level utilities/* entry must be classified projected or deferred, else fail loud (closes the
   # leak window where a newly added utility silently has no projection decision).
-  UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py worker_bootstrap.py"
+  UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py worker_bootstrap.py codex_tui_config.py"
   UTILITY_DEFERRED=$(census utility-deferred)
   utility_count=0
   for f in utilities/*; do
@@ -2677,9 +2677,10 @@ check_opencode_native_plugin_projection() {
   plugin="adapters/opencode/plugins/hearting-guards.js"
   plugin_entries=$(find adapters/opencode/plugins -mindepth 1 -maxdepth 1 ! -name __pycache__ -exec basename {} \; 2>/dev/null || true)
   for entry in $plugin_entries; do
-    if [ "$entry" != "hearting-guards.js" ]; then
-      fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection"
-    fi
+    case "$entry" in
+      hearting-guards.js|herdr-agent-state.js) ;;
+      *) fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection" ;;
+    esac
   done
 
   if [ ! -f "$plugin" ]; then
@@ -3211,7 +3212,7 @@ check_adaptation_inventory_native_surfaces() {
   fi
   if [ ! -x adapters/codex/bin/apply-tui-config.sh ] \
     || [ ! -f adapters/codex/config/tui-statusline.toml ] \
-    || ! grep -Fq 'status_line = ["thread-id", "thread-title", "git-branch", "context-used", "model-with-reasoning", "five-hour-limit", "weekly-limit"]' adapters/codex/config/tui-statusline.toml \
+    || ! grep -Fq 'status_line = ["thread-title", "git-branch", "context-used", "model-with-reasoning", "five-hour-limit", "weekly-limit", "thread-id"]' adapters/codex/config/tui-statusline.toml \
     || ! grep -Fq 'status_line_use_colors = true' adapters/codex/config/tui-statusline.toml \
     || ! grep -Fq 'codex_setting/codex-config/tui-statusline.toml' adapters/codex/README.md \
     || ! grep -Fq 'codex_setting/codex-config/tui-statusline.toml' adapters/codex/AGENTS.md \

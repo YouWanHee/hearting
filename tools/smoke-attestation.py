@@ -93,11 +93,61 @@ def verify(data):
     if data.get("status")!="passed" or data.get("exit_code")!=0: raise ValueError("smoke did not pass")
     return True
 
-def main():
+def _route_defaults(argv):
+    values = list(argv)
+    if not values or values[0] != "attest":
+        return values
+    from pathlib import Path
+    import os, sys
+    utilities = Path(__file__).resolve().parents[1] / "utilities"
+    if str(utilities) not in sys.path:
+        sys.path.insert(0, str(utilities))
+    from artifact_context import ArtifactContextError, resolve_context
+    context = resolve_context(environ=os.environ)
+    if not context.route or not context.node:
+        return values
+    def option_value(name):
+        try:
+            index = values.index(name)
+            return values[index + 1]
+        except (ValueError, IndexError):
+            found = next((part[len(name) + 1:] for part in values if part.startswith(name + "=")), None)
+            return found
+    divider = values.index("--") if "--" in values else len(values)
+    if option_value("--cwd") is None:
+        if not context.source_worktree:
+            raise ArtifactContextError("source-worktree-unavailable")
+        values[1:1] = ["--cwd", str(context.source_worktree)]
+        divider += 2
+    else:
+        supplied_cwd = Path(option_value("--cwd")).expanduser().resolve(strict=False)
+        if context.source_worktree and supplied_cwd != context.source_worktree:
+            raise ArtifactContextError("source-worktree-route-mismatch", str(supplied_cwd))
+    output = option_value("--output")
+    try:
+        binding = context.resolve_output("smoke-attestation", explicit=output)
+    except ArtifactContextError:
+        raise
+    if binding is None or binding.path is None:
+        raise ArtifactContextError("artifact-output-role-missing", "smoke-attestation")
+    if output is None:
+        values[divider:divider] = ["--output", str(binding.path)]
+    return values
+
+
+def main(argv=None):
     p=argparse.ArgumentParser(); s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("attest"); a.add_argument("--input",action="append",required=True); a.add_argument("--config-manifest"); a.add_argument("--cwd",required=True); a.add_argument("--output",required=True); a.add_argument("command",nargs=argparse.REMAINDER)
     v=s.add_parser("verify"); v.add_argument("--attestation",required=True)
-    x=p.parse_args()
+    try:
+        import sys
+        utilities = Path(__file__).resolve().parents[1] / "utilities"
+        if str(utilities) not in sys.path:
+            sys.path.insert(0, str(utilities))
+        from artifact_context import ArtifactContextError
+        x=p.parse_args(_route_defaults(sys.argv[1:] if argv is None else argv))
+    except ArtifactContextError as e:
+        raise ValueError(str(e)) from e
     if x.cmd=="verify": verify(json.loads(Path(x.attestation).read_text())); print("smoke_attestation=valid"); return
     command=x.command[1:] if x.command[:1]==["--"] else x.command
     if not command: raise ValueError("smoke command required")

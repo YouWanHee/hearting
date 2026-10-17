@@ -45,6 +45,9 @@ shared-utility-deferred	execution_access.py
 shared-utility-deferred	execution_access_diagnose.py
 shared-utility-deferred	governor_identity.py
 shared-utility-deferred	hearting_gates.py
+shared-utility-deferred	herdr_observation.py
+shared-utility-deferred	herdr_opencode_live.py
+shared-utility-deferred	human_gate_observation.py
 shared-utility-deferred	interactive-main-recovery.py
 shared-utility-deferred	memory-store.sh
 shared-utility-deferred	merge-line.py
@@ -60,10 +63,13 @@ shared-utility-deferred	report_verification_projection.py
 shared-utility-deferred	resource_resume.py
 shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py
+shared-utility-deferred	session_tidy_idle.py
+shared-utility-deferred	session_tidy_policy.py
 shared-utility-deferred	route_parent_close.py
 shared-utility-deferred	route_plan.py
 shared-utility-deferred	route_presence_gate.py
 shared-utility-deferred	frame_native_answer.py
+shared-utility-deferred	git_index_lock.py
 shared-utility-deferred	spec_merge.py
 shared-utility-deferred	ship-parent-deploy.py
 shared-utility-deferred	ship_parent_deploy.py
@@ -75,6 +81,7 @@ utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh
 utility-deferred	artifact-snapshot.py
+utility-deferred	artifact_context.py
 utility-deferred	artifact_admission.py
 utility-deferred	artifact_checkpoint_trigger.py
 utility-deferred	artifact_cutover.py
@@ -82,6 +89,7 @@ utility-deferred	artifact_cross_root_move.py
 utility-deferred	artifact_history.py
 utility-deferred	artifact_identity.py
 utility-deferred	artifact_index.py
+utility-deferred	artifact_payload.py
 utility-deferred	artifact_lifecycle.py
 utility-deferred	artifact_locator.py
 utility-deferred	artifact_manifest.py
@@ -99,6 +107,7 @@ utility-deferred	capability-route.py
 utility-deferred	capability_route.test.py
 utility-deferred	capacity_auto_resume.py
 utility-deferred	claude-session-supervisor.py
+utility-deferred	claude_credential_recovery.py
 utility-deferred	claude_project_dir.py
 utility-deferred	claude_session_supervisor.test.py
 utility-deferred	codex-app-server-supervisor.py
@@ -155,6 +164,7 @@ utility-deferred	dispatch_degradation.py
 utility-deferred	dispatch_harvest.test.py
 utility-deferred	dispatch_launch_tuple.py
 utility-deferred	dispatch_lifecycle.py
+utility-deferred	foreground_activity.py
 utility-deferred	dispatch_lifecycle.test.py
 utility-deferred	dispatch_liveness_matrix.test.py
 utility-deferred	dispatch_lock_order.py
@@ -204,6 +214,7 @@ utility-deferred	parent_next_directive.py
 utility-deferred	peer-message.py
 utility-deferred	peer-steward.py
 utility-deferred	peer_obligations.py
+utility-deferred	peer_read_context.py
 utility-deferred	registered_parent_park.test.py
 utility-deferred	replica_batch_contract.py
 utility-deferred	resource-runner.py
@@ -215,6 +226,7 @@ utility-deferred	resource_run_evidence.py
 utility-deferred	resource_runner.test.py
 utility-deferred	review_round_cap.py
 utility-deferred	review_round_cap.test.py
+utility-deferred	review_source_subject.py
 utility-deferred	ripple-map.py
 utility-deferred	route_authority.py
 utility-deferred	route_authority.test.py

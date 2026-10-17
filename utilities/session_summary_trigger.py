@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -27,14 +28,53 @@ def _bounded_anchor(value: str | None) -> str:
 
 def _codex_transcript(sid: str) -> Path | None:
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-    root = home / "sessions"
+    root = Path(os.path.abspath(home / "sessions"))
     if not root.is_dir() or not sid:
         return None
     suffix = "-" + sid + ".jsonl"
-    candidates = [path for path in root.rglob("rollout-*.jsonl") if path.name.endswith(suffix)]
+    candidates = [
+        exact for path in root.rglob("rollout-*.jsonl")
+        if path.name.endswith(suffix)
+        for exact in [_validated_codex_transcript(sid, path)]
+        if exact is not None
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _validated_codex_transcript(sid: str, transcript: str | Path | None) -> Path | None:
+    """Accept only a regular exact-SID rollout beneath this Codex sessions root."""
+    if not isinstance(sid, str) or not sid or not transcript:
+        return None
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    root = Path(os.path.abspath(home / "sessions"))
+    candidate = Path(transcript).expanduser()
+    if not candidate.is_absolute():
+        return None
+    root_abs = Path(os.path.abspath(root))
+    candidate_abs = Path(os.path.abspath(candidate))
+    try:
+        relative = candidate_abs.relative_to(root_abs)
+        root.resolve(strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if (not relative.parts or not candidate.name.startswith("rollout-")
+            or not candidate.name.endswith("-" + sid + ".jsonl")):
+        return None
+    current = root_abs
+    try:
+        for part in relative.parts:
+            current = current / part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                return None
+        if not stat.S_ISREG(current.stat().st_mode):
+            return None
+        current.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return current
 
 
 def _opencode_db() -> Path:
@@ -53,10 +93,20 @@ def trigger(harness: str, sid: str, phase: str, transcript: str | None = None,
     if harness not in HARNESSES or phase not in PHASES or not sid:
         return False
     deadline = time.monotonic() + max(0.0, wait_seconds)
-    source: Path | None = Path(transcript).expanduser() if transcript else None
+    next_codex_search = 0.0
+    source: Path | None = (
+        _validated_codex_transcript(sid, transcript)
+        if harness == "codex" and transcript else
+        Path(transcript).expanduser() if transcript else None
+    )
     while True:
-        if harness == "codex" and source is None:
+        now = time.monotonic()
+        if harness == "codex" and source is None and now >= next_codex_search:
             source = _codex_transcript(sid)
+            # A rollout can appear after UserPromptSubmit. Keep retrying within
+            # this trigger, but avoid rescanning the complete sessions tree on
+            # every 100 ms wait.
+            next_codex_search = now + 0.5
         if harness == "opencode":
             database = _opencode_db()
             if database.is_file():
@@ -93,7 +143,7 @@ def trigger(harness: str, sid: str, phase: str, transcript: str | None = None,
                 quota_class=phase if phase in {"initial", "final"} else None,
                 anchor_text=_bounded_anchor(anchor_text),
             ))
-        if time.monotonic() >= deadline:
+        if now >= deadline:
             return False
         time.sleep(0.1)
 

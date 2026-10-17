@@ -690,8 +690,9 @@ class NextLegTest(PlanFixture):
         self.assertIsNone(RP.project_next_leg(route, "cyc_" + "b" * 32))
 
 
-class SecondLegCommandTest(PlanFixture):
+class SecondLegCommandTest(S.OwnCheckout, PlanFixture):
     # A direct second leg needs no readiness probe, so the real CLI compiles the printed command.
+    # It is a source start: its child process prepares in the frame's own checkout.
     LEGS = [DIRECT, {"capability": "autopilot-code", "shape": "direct", "why": "second"}]
 
     def test_route_plan_cli_without_cwd_uses_the_legs_folder_relative_to_the_original_frame(self):
@@ -726,6 +727,9 @@ class SecondLegCommandTest(PlanFixture):
         self.assertEqual(second["route_plan"], {**route["route_plan"], "index": 1})
         self.assertEqual((second["parent_cycle_id"], second["campaign_key"]), (parent, "framed-key"))
         self.assertEqual(second["selection"]["shape"], "direct")
+        # Both legs run in the one worktree the first leg prepared from the frame's checkout.
+        self.assertEqual(Path(route["cwd"]).parent, (self.primary.parent / "repo-wt").resolve())
+        self.assertEqual(second["cwd"], route["cwd"])
         # Every leg of the same decision carries the frozen task and the start's execution scope.
         self.assertEqual(second["work_request"]["text"], route["work_request"]["text"])
         self.assertEqual(route["entry_execution_scope"], "complete")
@@ -899,7 +903,7 @@ class SelectionPinFilteredTopModelTest(PinnedPlanFixture):
         self.assertEqual(second["selection_pins"], self.route["selection_pins"])
 
 
-class UnpinnedContinuationTest(PlanFixture):
+class UnpinnedContinuationTest(S.OwnCheckout, PlanFixture):
     LEGS = [DIRECT, {"capability": "autopilot-code", "shape": "direct", "why": "second"}]
 
     def test_a_route_with_no_pin_prints_none_and_seals_none(self):

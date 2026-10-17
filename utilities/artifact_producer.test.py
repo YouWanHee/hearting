@@ -13,6 +13,7 @@ import json
 import hashlib
 import os
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -27,6 +28,7 @@ import artifact_campaign as campaign_reader  # noqa: E402
 import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
+import artifact_payload  # noqa: E402
 import artifact_producer as P  # noqa: E402
 import artifact_reader as reader  # noqa: E402
 import dispatch_contract as D  # noqa: E402
@@ -116,12 +118,14 @@ class ProducerTestBase(unittest.TestCase):
         home = Path(self._tmp.name) / "agent-home"
         (home / "core").mkdir(parents=True, exist_ok=True)
         (home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
-        self._env = {k: os.environ.get(k) for k in (
-            "AGENT_HOME", "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT")}
+        self._env = {k: v for k, v in os.environ.items() if k == "AGENT_HOME" or k.startswith((
+            "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))}
         os.environ["AGENT_HOME"] = str(home)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
-        for key in ("AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
-            os.environ.pop(key, None)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_")) \
+                    and key != "AGENT_DISPATCH_JOBS":
+                os.environ.pop(key, None)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -1063,6 +1067,18 @@ class CheckWriteTest(ProducerTestBase):
         self.assertEqual(unknown["reason"], "cycle-unknown")
         self.assertEqual(P.cycle_bucket(self.root, base / "artifacts" / "spec" / "prd.md"), ("spec", cyc))
 
+    def test_cycle_root_internal_is_admitted_without_becoming_an_output_bucket(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        target = cycle / "_internal" / "reviews" / "prospective.json"
+        verdict = P.check_write(self.root, target)
+        self.assertEqual((verdict["verdict"], verdict["reason"], verdict["bucket"]),
+                         ("allow", "open-cycle-artifacts", None))
+        self.assertEqual(Path(verdict["output_dir"]), cycle / "artifacts")
+        self.assertEqual(P.check_write(self.root, cycle / "_internal")["verdict"], "deny")
+        self.assertEqual(P.check_write(self.root, cycle / "stray.md")["verdict"], "deny")
+
     def test_shared_classifier_corpus_matches_check_write_namespace(self):
         self.activate()
         _route, _route_file, result = self.begin()
@@ -1197,6 +1213,141 @@ class FinalizeTest(ProducerTestBase):
                     typed_reason = violations[0].split(":", 1)[0]
                     expected = public_reasons.get("producer", reason)
                     self.assertEqual(typed_reason, expected, (relative, violations))
+
+    def test_support_only_manifest_has_no_fabricated_primary_requirement(self):
+        self.activate()
+        route, _route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        support = cycle / "_internal/reviews/notes.bin"
+        support.parent.mkdir(parents=True)
+        support.write_bytes(b"support only\n")
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        document = P.build_manifest(
+            self.root, record, route, (), state="completed", primary=None,
+            allow_open_route=True, allocator=idm.IdAllocator(), now=1,
+            interim=True,
+            facts=[("_internal/reviews/notes.bin", m.digest_bytes(support.read_bytes()), support.stat().st_size)],
+        )
+        artifact = document["artifacts"][0]
+        self.assertEqual((artifact["role"], artifact["type"], artifact["title"]),
+                         ("support", "file", "_internal/reviews/notes.bin"))
+        self.assertEqual(document["cycle"]["outcome_criterion"]["required_artifact_roles"], [])
+        self.assertTrue(m.validate_interim(document).ok, m.validate_interim(document).violations)
+
+    def test_cycle_root_support_is_collected_in_place_with_exact_identity_and_primary_scope(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        root_support = cycle / "_internal/reviews/manifest.json"
+        artifact_support = cycle / "artifacts/_internal/reviews/manifest.json"
+        primary = self.write_output(result, "documents/final_report.md", b"normal result\n")
+        support_bytes = {
+            "_internal/reviews/manifest.json": b'{"root":"support"}\n',
+            "artifacts/_internal/reviews/manifest.json": b'{"artifacts":"support"}\n',
+        }
+        for rel, data in support_bytes.items():
+            path = cycle / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            self.assertEqual(P.check_write(self.root, path)["verdict"], "allow")
+        before_paths = {rel: cycle.joinpath(*rel.split("/")).read_bytes() for rel in support_bytes}
+
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        revisions = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        support_paths = set(support_bytes)
+        self.assertTrue(support_paths <= set(revisions))
+        root_row = revisions["_internal/reviews/manifest.json"]
+        artifact_row = revisions["artifacts/_internal/reviews/manifest.json"]
+        self.assertNotEqual(root_row["artifact_id"], artifact_row["artifact_id"])
+        self.assertEqual(artifacts[root_row["artifact_id"]]["role"], "support")
+        self.assertEqual(artifacts[root_row["artifact_id"]]["type"], "file")
+        self.assertEqual(artifacts[root_row["artifact_id"]]["title"], "_internal/reviews/manifest.json")
+        self.assertEqual(artifacts[artifact_row["artifact_id"]]["role"], "output")
+        for rel, data in support_bytes.items():
+            row = revisions[rel]
+            self.assertEqual(cycle.joinpath(*rel.split("/")).read_bytes(), data)
+            self.assertEqual((row["content_digest"], row["byte_size"]),
+                             (m.digest_bytes(data), len(data)))
+        primary_row = next(row for row in document["artifacts"] if row["role"] == "primary")
+        self.assertEqual(primary_row["title"], "documents/final_report.md")
+        self.assertEqual(primary.read_bytes(), b"normal result\n")
+        self.assertEqual({rel: cycle.joinpath(*rel.split("/")).read_bytes() for rel in support_bytes},
+                         before_paths)
+        self.assertEqual(P._output_placements(self.root, P.read_cycle_record(self.root, result["cycle_id"])), [])
+        self.assertTrue(m.validate(document).ok, m.validate(document).violations)
+        self.assertEqual(L.verify_artifact_revisions(document, cycle), ())
+        admitted = L.read_admitted_cycle(self.root, result["campaign_id"], result["cycle_id"])
+        self.assertEqual(admitted["cycle_id"], result["cycle_id"])
+
+    def test_cycle_root_support_symlink_is_reported_without_reading_its_target(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        outside = Path(self._tmp.name) / "outside-support.bin"
+        outside.write_bytes(b"outside bytes remain untouched\n")
+        internal = cycle / "_internal"
+        internal.mkdir()
+        link = internal / "review.bin"
+        link.symlink_to(outside)
+        self.write_output(result, "documents/final_report.md", b"result\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("_internal/review.bin",
+                         {row["locator"]["path"] for row in document["artifact_revisions"]})
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside bytes remain untouched\n")
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        self.assertIn("_internal/review.bin", record.get("excluded_symlinks", []))
+
+    def test_cycle_root_support_ancestor_symlink_is_never_followed(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        outside = Path(self._tmp.name) / "outside-support-tree"
+        outside.mkdir()
+        outside_file = outside / "review.md"
+        outside_file.write_bytes(b"outside tree remains untouched\n")
+        internal = cycle / "_internal"
+        internal.symlink_to(outside, target_is_directory=True)
+        self.write_output(result, "documents/final_report.md", b"result\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertNotIn("_internal/review.md", paths)
+        self.assertTrue(internal.is_symlink())
+        self.assertEqual(outside_file.read_bytes(), b"outside tree remains untouched\n")
+        self.assertIn("_internal", P.read_cycle_record(self.root, result["cycle_id"]).get("excluded_symlinks", []))
+
+    def test_cycle_root_support_special_node_refuses_before_manifest_publication(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        pipe = cycle / "_internal/reviews/pipe"
+        pipe.parent.mkdir(parents=True)
+        os.mkfifo(pipe)
+        self.write_output(result, "documents/final_report.md", b"result\n")
+        self.close(route, route_file)
+        with self.assertRaisesRegex(P.ProducerError, "output-invalid"):
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(stat.S_ISFIFO(pipe.lstat().st_mode))
+        self.assertFalse((cycle / "manifest.json").exists())
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "open")
+
+    def test_root_support_modern_locator_survives_legacy_exclusion_mode(self):
+        cycle = Path(self._tmp.name) / "cycle"
+        (cycle / "artifacts").mkdir(parents=True)
+        support = cycle / "_internal/reviews/review notes + (8).md"
+        support.parent.mkdir(parents=True)
+        support.write_bytes(b"support bytes\n")
+        paths, violations = P._output_paths(cycle, exclude_hidden=True)
+        self.assertEqual(violations, [])
+        self.assertIn(("_internal/reviews/review notes + (8).md", support), paths)
 
     def test_nested_manifest_payload_survives_write_finalize_and_reader(self):
         self.activate()
@@ -1512,6 +1663,180 @@ class BrowserProfileCollectionTest(ProducerTestBase):
         invalid.write_bytes(b"invalid")
         self.assertEqual(P._enumerate_output(cycle)[1],
                          ["locator-invalid-component:artifacts/bad|name.txt"])
+
+
+class SelfExclusionPayloadTest(ProducerTestBase):
+    def test_marker_predicates_are_independent_exact_and_no_follow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "payload"
+            directory.mkdir()
+            cachedir = directory / "CACHEDIR.TAG"
+            cachedir.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            cachedir.write_bytes(artifact_payload.CACHEDIR_SIGNATURE + b"description\n")
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            for invalid in (artifact_payload.CACHEDIR_SIGNATURE[:-1], b"Signature: wrong" + b"x" * 32):
+                cachedir.write_bytes(invalid)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory))
+
+            cachedir.unlink()
+            (directory / "pyvenv.cfg").write_bytes(b"")
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            (directory / "pyvenv.cfg").unlink()
+            (directory / "pyvenv.cfg").mkdir()
+            self.assertFalse(artifact_payload.self_excluded_directory(directory))
+            (directory / "pyvenv.cfg").rmdir()
+
+            gitignore = directory / ".gitignore"
+            for allowed in (b"*", b"*\n", b"*\r\n"):
+                gitignore.write_bytes(allowed)
+                self.assertTrue(artifact_payload.self_excluded_directory(directory), allowed)
+            for invalid in (b"", b"* ", b"*\n\n", b"# comment\n*", b"*\n!keep", b"*\r"):
+                gitignore.write_bytes(invalid)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory), invalid)
+
+            gitignore.unlink()
+            marker_contents = {"CACHEDIR.TAG": artifact_payload.CACHEDIR_SIGNATURE,
+                               "pyvenv.cfg": b"", ".gitignore": b"*\n"}
+            target = Path(tmp) / "target"
+            for name, content in marker_contents.items():
+                target.write_bytes(content)
+                (directory / name).symlink_to(target)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory), name)
+                (directory / name).unlink()
+            if hasattr(os, "mkfifo"):
+                for name in marker_contents:
+                    os.mkfifo(directory / name)
+                    self.assertFalse(artifact_payload.self_excluded_directory(directory), name)
+                    (directory / name).unlink()
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(directory, target_is_directory=True)
+            self.assertFalse(artifact_payload.self_excluded_directory(alias))
+
+    def test_payload_root_marker_is_scoped_and_does_not_hide_cycle_controls(self):
+        cycle = self.root / "cycle"
+        artifacts = cycle / "artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / "CACHEDIR.TAG").write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+        (artifacts / "bad|name.txt").write_bytes(b"excluded by root marker")
+        support = cycle / "_internal" / "support.md"
+        support.parent.mkdir()
+        support.write_bytes(b"still collected")
+        excluded = []
+        paths, violations = P._output_paths(cycle, excluded=excluded)
+        self.assertEqual(violations, [])
+        self.assertEqual([rel for rel, _path in paths], ["_internal/support.md"])
+        self.assertIn("artifacts/", excluded)
+
+        (cycle / "rogue.txt").write_bytes(b"outside payload")
+        _paths, violations = P._output_paths(cycle, excluded=[])
+        self.assertEqual(violations, ["file-outside-artifacts:rogue.txt"])
+
+    def test_marker_replacement_after_lstat_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "payload"
+            directory.mkdir()
+            marker = directory / "CACHEDIR.TAG"
+            marker.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            target = Path(tmp) / "target"
+            target.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            real_open = os.open
+            replaced = False
+
+            def replace_before_open(path, flags, *args, **kwargs):
+                nonlocal replaced
+                if path == "CACHEDIR.TAG" and kwargs.get("dir_fd") is not None and not replaced:
+                    marker.unlink()
+                    marker.symlink_to(target)
+                    replaced = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(artifact_payload.os, "open", side_effect=replace_before_open):
+                self.assertFalse(artifact_payload.self_excluded_directory(directory))
+            self.assertTrue(replaced)
+            self.assertTrue(marker.is_symlink())
+
+    def test_finalize_prunes_marker_tree_before_locator_and_bundle_checks(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        cache = cycle / "artifacts" / "cache"
+        cache.mkdir(parents=True)
+        marker = cache / ".gitignore"
+        marker.write_bytes(b"*\r\n")
+        (cache / "bad|locator.txt").write_bytes(b"must not be read")
+        invalid_raw = cache / "raw-results"
+        invalid_raw.symlink_to(self.root, target_is_directory=True)
+        self.write_output(result, "plans/report.md", b"report")
+        self.write_output(result, "run/raw-results/data.csv", b"kept,bundle\n")
+        support = cycle / "_internal" / "support.txt"
+        support.parent.mkdir(parents=True)
+        support.write_bytes(b"support")
+        self.assertEqual([tree.directory for tree in P._scan_directory_bundles(cycle)],
+                         ["artifacts/run/raw-results"])
+        invalid_raw.unlink()
+        marker_bytes = marker.read_bytes()
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/plans/report.md", paths)
+        self.assertIn("_internal/support.txt", paths)
+        artifacts_by_id = {item["artifact_id"]: item for item in document["artifacts"]}
+        bundle_rows = [row for row in document["artifact_revisions"]
+                       if artifacts_by_id[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundle_rows), 1)
+        bundle_artifact = artifacts_by_id[bundle_rows[0]["artifact_id"]]
+        self.assertEqual(bundle_artifact["title"], "run/raw-results")
+        self.assertNotIn("artifacts/cache/bad|locator.txt", paths)
+        self.assertIn("artifacts/cache/", sealed["excluded_hidden"])
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+
+    def test_marker_below_raw_results_prevents_bundle_bypass_but_keeps_sibling_leaf(self):
+        cycle = self.root / "cycle"
+        raw = cycle / "artifacts/raw-results"
+        cache = raw / "cache"
+        cache.mkdir(parents=True)
+        (cache / "pyvenv.cfg").write_bytes(b"")
+        (cache / "bad|locator.txt").write_bytes(b"excluded")
+        kept = raw / "result.csv"
+        kept.write_bytes(b"kept\n")
+
+        self.assertEqual(P._scan_directory_bundles(cycle), [])
+        excluded, links = [], []
+        paths, violations = P._output_paths(cycle, excluded=excluded, excluded_symlinks=links)
+        self.assertEqual(violations, [])
+        self.assertEqual([rel for rel, _path in paths], ["artifacts/raw-results/result.csv"])
+        self.assertIn("artifacts/raw-results/cache/", excluded)
+        self.assertEqual(links, [])
+
+    def test_adoption_reuses_marker_observations_without_reading_under_admission_lock(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        legacy = Path(result["cycle_dir"]) / "owner_brief.md"
+        legacy.write_text("owner brief\n", encoding="utf-8")
+        cache = Path(result["cycle_dir"]) / "artifacts/cache"
+        cache.mkdir(parents=True)
+        (cache / ".gitignore").write_bytes(b"*")
+        (cache / "bad|name.txt").write_bytes(b"excluded")
+        R.close_route(route, route_file, commit="a" * 40, summary="abandoned fixture")
+        original = artifact_payload.observe_directory
+
+        def guarded_observe(path):
+            P.dispatch_lock_order.assert_not_held("producer-admission", "marker-predicate-test")
+            return original(path)
+
+        with mock.patch.object(artifact_payload, "observe_directory", guarded_observe):
+            result_after = P.finalize(
+                self.root, cycle_id=result["cycle_id"], state="abandoned",
+                abandon_reason="route-unrecoverable", adopt_root_outputs=["owner_brief.md"])
+        self.assertEqual(result_after["status"], "sealed", result_after)
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/owner_brief.md", paths)
+        self.assertNotIn("artifacts/cache/bad|name.txt", paths)
 
 
 class DirectoryBundleFinalizeTest(ProducerTestBase):
@@ -3968,6 +4293,11 @@ class SharedBaseGuardTest(ProducerTestBase):
         with self.assertRaises(P.ProducerError) as ctx:
             self._admit(cycle, 0, base_revision="none")
         self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        # The refusal names what was compared: the requested base against the source's own receipt.
+        self.assertIn("--base-revision=none", ctx.exception.detail)
+        self.assertIn(P.SPEC_BASE_RECEIPT, ctx.exception.detail)
+        self.assertIn(first["shared_reference_revision_id"], ctx.exception.detail)
+        self.assertNotIn("latest=", ctx.exception.detail)
         self.assertEqual(self._admit(cycle, 0)["status"], "admitted")
 
     def test_malformed_sealed_receipt_cannot_fall_back_to_cli_base(self):
@@ -6660,6 +6990,17 @@ class PrimarySupportExclusionTest(unittest.TestCase):
         rows = [("artifacts/_internal/audit-brief.md", b""),
                 ("artifacts/reviews/audit/audit-report.md", b"")]
         self.assertEqual(P._choose_primary(rows, None), "artifacts/reviews/audit/audit-report.md")
+
+    def test_explicit_primary_remains_inside_artifacts_when_root_support_is_present(self):
+        with self.assertRaisesRegex(P.ProducerError, "primary-artifact-missing"):
+            P._choose_primary([("_internal/reviews/report.md", b"support")],
+                              "_internal/reviews/report.md")
+
+    def test_cycle_root_support_is_never_an_automatic_primary_candidate(self):
+        rows = [("_internal/reviews/manifest.json", b"support")]
+        self.assertIsNone(P._choose_primary(rows, None))
+        rows.append(("artifacts/documents/final_report.md", b"result"))
+        self.assertEqual(P._choose_primary(rows, None), "artifacts/documents/final_report.md")
 
     def test_support_only_cycle_keeps_its_first_row(self):
         rows = [("artifacts/_internal/dispatch/retrieval_prompt.md", b""),

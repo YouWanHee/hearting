@@ -16,8 +16,8 @@ You are a bounded worker, not the user-facing main session.
   files in the assigned worktree; they do not move source edits into artifacts.
   Durable outputs remain under the canonical cycle output directory.
   Write under the cycle output directory supplied in dispatch metadata and
-  report the artifact by its path inside the artifact root; a relative path is
-  read against the artifact root, then the worktree.
+  use the sealed node's declared outputs and write scope under the supplied
+  cycle output directory. Source scopes stay in the route worktree.
 - Put changed files, commands, results, warnings, reasoning, and unsupported
   runtime-contract details in the canonical artifact. File handoff must be
   sufficient for the next stage without conversation history.

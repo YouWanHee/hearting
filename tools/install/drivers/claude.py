@@ -19,6 +19,7 @@ import verifier
 import user_model_config
 import safe_fs
 import claude_settings_config
+import herdr_integration
 
 RUNTIME = "claude"
 
@@ -106,6 +107,9 @@ def install(scope="global", plugin=False, dry_run=False):
 
     actions = [claude_settings_config.retire_hook_registrations(
         paths.runtime_home(RUNTIME, scope) / "settings.json", dry_run=dry_run)]
+    actions.append(herdr_integration.migrate_hook_file(
+        paths.runtime_home(RUNTIME, scope) / "settings.json", RUNTIME,
+        dry_run=dry_run, source_root=paths.agent_home()))
 
     if plugin:
         actions.append(_plugin_action(dry_run))
@@ -299,8 +303,11 @@ def install(scope="global", plugin=False, dry_run=False):
     blocked = any(a.get("status") == "blocked" for a in actions)
 
     manifest_result = None
-    if not dry_run and not blocked and copy_once_files:
-        manifest_result = manifest.record("claude", copy_once_files, scope=scope)
+    integration_assets = herdr_integration.manifest_assets(
+        RUNTIME, paths.agent_home(), paths.runtime_home(RUNTIME, scope))
+    if not dry_run and not blocked and (copy_once_files or integration_assets["assets"]):
+        manifest_result = manifest.record(
+            "claude", copy_once_files, scope=scope, integration_assets=integration_assets)
 
     return {
         "runtime": "claude",
@@ -349,6 +356,8 @@ def checks(scope="global"):
             cwd=agent_home,
         )
     )
+
+    check_list.append(verifier.check_herdr_integration(RUNTIME, paths.agent_home()))
 
     check_list.append(
         verifier.check_cmd(

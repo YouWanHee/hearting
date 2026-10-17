@@ -1711,6 +1711,44 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             self.assertEqual(gates["sync"]["evidence_digest"], "b" * 64)
             self.assertEqual((root / "sync.json").read_bytes(), raw)
 
+    def test_settled_worker_row_keeps_the_evidence_digest_its_closed_outcome_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs.log"
+            path = root / "route.json"
+            route = {"route_id": "rt-report-edit", "route_hash": "sha256:" + "a" * 64,
+                "nodes": [{"id": "report", "terminal": True, "terminal_gate": "code-report"}]}
+            marker = {"route_id": route["route_id"], "route_hash": route["route_hash"],
+                "node_id": "report", "attempt_id": "att-report", "completion_gate": "code-report",
+                "evidence": {"sha256": "b" * 64, "path": str(root / "final_report.md")}}
+            raw = json.dumps(marker).encode()
+            (root / "report.json").write_bytes(raw)
+            recorded = {"passed": True, "current": True, "node_id": "report", "attempt_id": "att-report",
+                "completion_gate": "code-report", "marker_digest": T.hashlib.sha256(raw).hexdigest(),
+                "evidence_digest": "c" * 64, "evidence": str(root / "final_report.md")}
+            outcome = root / "outcome.json"
+            module = mock.Mock()
+            module.owner_executed_terminal.return_value = False
+            module.completion_dir.return_value = root
+            module.outcome_path.return_value = outcome
+            request = T.TerminalCommitRequest(path, "att-owner", jobs, root)
+            cases = (
+                ("edited-after-marker", recorded, "c" * 64),
+                ("other-marker-bytes", {**recorded, "marker_digest": "d" * 64}, "b" * 64),
+                ("other-attempt", {**recorded, "attempt_id": "att-other"}, "b" * 64),
+            )
+            for name, row, expected in cases:
+                with self.subTest(name):
+                    outcome.write_text(json.dumps({"route_id": route["route_id"], "route_hash": route["route_hash"],
+                        "terminal_gate_proven": True, "terminal_gates": {"report": row}}))
+                    for historical in (False, True):
+                        gates = T._settled_gate_rows(module, route, request, {"report": {}}, historical=historical)
+                        self.assertEqual(gates["report"]["evidence_digest"], expected)
+                        self.assertEqual(gates["report"]["marker_digest"], T.hashlib.sha256(raw).hexdigest())
+            outcome.unlink()
+            gates = T._settled_gate_rows(module, route, request, {"report": {}})
+            self.assertEqual(gates["report"]["evidence_digest"], "b" * 64)
+
     def test_historical_root_alias_cleaned_cwd_and_no_transitive_writes(self):
         fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):

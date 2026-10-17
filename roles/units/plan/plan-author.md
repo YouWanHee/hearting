@@ -75,6 +75,8 @@ Preload per `_shared/profile-preload.md`:
    potential impact areas.
 4. **Create the plan file** at the path specified in the prompt, using the
    plan-document schema below.
+   In a routed stage, use the node's declared plan output; standalone paths keep
+   the code-plan defaults.
 5. **Do not create an audience-language companion during the QA loop.** If the
    caller explicitly requested one, create it only after the primary plan is
    final. Otherwise, leave the plan as a single canonical file.
