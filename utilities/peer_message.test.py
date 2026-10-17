@@ -661,7 +661,8 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     sender = {"harness": "codex", "session_id": "sender", "name": "original"}
     recipient = {"harness": "codex", "session_id": "recipient"}
 
-    def prepare_reference(self, body, recipient=None, **kwargs):
+    def prepare_reference(self, body, recipient=None, sender=None, **kwargs):
+        sender = sender or self.sender
         recipient = recipient or self.recipient
         evidence = {
             "schema": "peer-read-access-observation-v1",
@@ -673,10 +674,47 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         }
         with mock.patch.object(peer_message, "_reference_local_process_matches", return_value=True):
             return peer_message.prepare_peer_message(
-                body, self.sender, recipient, reference_evidence=evidence, **kwargs)
+                body, sender, recipient, reference_evidence=evidence, **kwargs)
 
     def pending(self, body="original peer body", **kwargs):
         return self.prepare_reference(body, defer=True, **kwargs)
+
+    def test_recipient_scan_only_checks_settlement_for_exact_receiver_or_sender(self):
+        _text, wanted = self.pending()
+        _text, foreign = self.pending("foreign", recipient={
+            "harness": "claude", "session_id": "another-recipient"}, sender={
+                "harness": "claude", "session_id": "foreign-sender"})
+        seen = []
+
+        def settled(row, **_kwargs):
+            seen.append(row["ref"])
+            return False
+
+        with mock.patch.object(peer_message, "_registered_delivery_settled", side_effect=settled):
+            rows = list(peer_message._pending_rows(recipient=self.recipient))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertEqual(seen, [wanted])
+
+        seen.clear()
+        with mock.patch.object(peer_message, "_registered_delivery_settled", side_effect=settled):
+            rows = list(peer_message._pending_rows(sender=self.sender))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertEqual(seen, [wanted])
+        self.assertNotEqual(wanted, foreign)
+
+    def test_filtered_scan_still_quarantines_malformed_foreign_rows(self):
+        _text, wanted = self.pending()
+        outside = self.tmp_root / "outside"
+        outside.write_bytes(b"foreign")
+        malformed = peer_message._pending_dir() / ("f" * 32 + ".json")
+        malformed.symlink_to(outside)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            rows = list(peer_message._pending_rows(recipient=self.recipient))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertIn("peer-pending-invalid", errors.getvalue())
+        quarantine = malformed.parent.parent / "quarantine"
+        self.assertEqual(len(list(quarantine.rglob(malformed.name))), 1)
 
     def test_production_read_scope_source_is_codex_adapter_contract_only(self):
         self.assertTrue(peer_message._codex_model_read_access(self.recipient))

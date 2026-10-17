@@ -2896,11 +2896,13 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     return matches[0]
 
 
-def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
+def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> ChildRow | None:
     """Return the latest exact registry row for one attempt identity."""
 
     if not _safe_identity(attempt_id):
         raise JoinContractError("attempt-id-invalid")
+    if read_context is not None:
+        return read_context.current_attempt_row(jobs, attempt_id)
     try:
         lines = registry_lines(jobs)
     except FileNotFoundError:

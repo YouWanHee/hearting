@@ -4257,6 +4257,87 @@ def _resume_registered_obligation(duty, store):
         globals()["_HERDR_SESSION"] = old_server
 
 
+def _runner_duties(store):
+    return [duty for duty in store.list()
+            if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch"}
+                or duty.get("id", "").startswith(("message-", "delay-")))]
+
+
+def _completed_retire_needs_reconciliation(store):
+    for duty in store.list(states={"complete"}):
+        if duty.get("intent", {}).get("kind") != "retire":
+            continue
+        if duty.get("result") not in {"normal-exit", "target-already-gone"}:
+            continue
+        pane = (duty.get("intent", {}).get("requester") or {}).get("pane")
+        if pane and _seat_successor_path(pane).is_file():
+            return True
+    return False
+
+
+def _watch_reconciliation_needed():
+    root = _watch_root()
+    for watch_id, arm in _watch_entries(root):
+        if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
+            continue
+        if not _watcher_present(arm):
+            return True
+    return False
+
+
+def _obligation_reconciliation_needed(store):
+    if _runner_duties(store) or _completed_retire_needs_reconciliation(store):
+        return True
+    try:
+        if _watch_reconciliation_needed():
+            return True
+    except Exception:
+        return True
+    try:
+        return dispatch_batch_obligations.has_unowned_work()
+    except Exception:
+        return True
+
+
+def _reconcile_obligations(store, *, include_external=True):
+    """Run each existing recovery owner from the shared obligation runner."""
+    if include_external:
+        try:
+            _ensure_watch_observers()
+        except Exception:
+            pass
+    for duty in store.list():
+        try:
+            kind = duty.get("intent", {}).get("kind")
+            if kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
+                _resume_message_obligation(duty, store)
+            elif kind == "retire":
+                with peer_obligations.legacy_runner_lock(store) as acquired:
+                    if acquired:
+                        _resume_retire_obligation(duty, store)
+            elif kind == "registered-batch":
+                _resume_registered_obligation(duty, store)
+        except Exception:
+            try:
+                store.update(duty["id"], observer_error="observer-unavailable")
+            except Exception:
+                pass
+    for duty in store.list(states={"complete"}):
+        if duty.get("intent", {}).get("kind") != "retire":
+            continue
+        pane = (duty.get("intent", {}).get("requester") or {}).get("pane")
+        if pane and _seat_successor_path(pane).is_file():
+            try:
+                _resume_retire_obligation(duty, store)
+            except Exception:
+                pass
+    if include_external:
+        try:
+            dispatch_batch_obligations.ensure_observers()
+        except Exception:
+            pass
+
+
 def cmd_obligation_runner(args):
     """Existing peer steward, scoped to accepted duties and stopped when they settle."""
     store = peer_obligations.ObligationStore(args.state_root)
@@ -4267,66 +4348,49 @@ def cmd_obligation_runner(args):
         os.fstat(args.lock_fd)
     except (OSError, ValueError, TypeError):
         return 70
+    _reconcile_obligations(store)
+    service_current = getattr(args, "service_current", None)
+    if service_current:
+        peer_obligations.exec_service_runner(
+            args.lock_fd, store.root.parents[1], service_current,
+            herdr_session=_HERDR_SESSION,
+        )
+    if not _obligation_reconciliation_needed(store):
+        return 0
     delay = 1.0
     while True:
-        duties = store.list()
-        if not duties:
-            return 0
-        for duty in duties:
-            try:
-                if duty.get("intent", {}).get("kind") == "message" or duty.get("id", "").startswith(
-                        ("message-", "delay-")):
-                    _resume_message_obligation(duty, store)
-                elif duty.get("intent", {}).get("kind") == "retire":
-                    with peer_obligations.legacy_runner_lock(store) as acquired:
-                        if acquired:
-                            _resume_retire_obligation(duty, store)
-                elif duty.get("intent", {}).get("kind") == "registered-batch":
-                    _resume_registered_obligation(duty, store)
-            except Exception:
-                try:
-                    store.update(duty["id"], observer_error="observer-unavailable")
-                except Exception:
-                    pass
-        if not store.list():
-            return 0
-        service_current = getattr(args, "service_current", None)
+        _reconcile_obligations(store)
         if service_current:
             peer_obligations.exec_service_runner(
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
+        if not _obligation_reconciliation_needed(store):
+            return 0
         time.sleep(delay)
         delay = min(15.0, delay * 1.7)
 
 
 def cmd_ensure_obligations(_args):
-    """Reconnect accepted peer duties from an existing harness lifecycle callback."""
+    """Reconnect existing recovery owners from one shared runner entry."""
+    store = peer_obligations.ObligationStore()
     try:
-        _ensure_watch_observers()
-        # Reconnect with the activated code, even if an older runner is still
-        # holding its lock. Existing transfer claims serialize submission.
-        store = peer_obligations.ObligationStore()
-        for duty in store.list():
-            if duty.get("intent", {}).get("kind") == "message":
-                try:
-                    _resume_message_obligation(duty, store)
-                except Exception:
-                    store.update(duty["id"], observer_error="observer-unavailable")
-        # Older observers could close a retire without consuming its successor
-        # mark. Lifecycle observers are detached, just like the task runner;
-        # the accepted request and original mark carry the authority.
-        for duty in store.list(states={"complete"}):
-            if duty.get("intent", {}).get("kind") == "retire":
-                pane = (duty["intent"].get("requester") or {}).get("pane")
-                if pane and _seat_successor_path(pane).is_file():
-                    _resume_retire_obligation(duty, store)
         lifecycle_root = getattr(_args, "lifecycle_root", None)
+        if not _obligation_reconciliation_needed(store):
+            if lifecycle_root is not None:
+                # Preserve the existing managed-current binding for later
+                # producers even while no recovery work needs a runner.
+                peer_obligations.ensure_normal_runner(lifecycle_root=lifecycle_root)
+            return 0
         if lifecycle_root is None:
-            peer_obligations.ensure_runner()
+            started = peer_obligations.ensure_runner(reconciliation_required=True)
         else:
-            peer_obligations.ensure_normal_runner(lifecycle_root=lifecycle_root)
-        dispatch_batch_obligations.ensure_observers()
+            started = peer_obligations.ensure_normal_runner(
+                lifecycle_root=lifecycle_root, reconciliation_required=True)
+        # A legacy runner without the current reconciliation code, or a runtime
+        # without pidfd takeover support, leaves the established fallback here.
+        if not started:
+            _reconcile_obligations(store)
     except Exception:
         pass
     return 0

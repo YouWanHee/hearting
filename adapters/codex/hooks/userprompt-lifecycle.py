@@ -449,7 +449,9 @@ def main() -> int:
     retry_pending_peer(interaction_sid)
     if interaction_sid:
         launch_trigger(
-            "codex", interaction_sid, "initial", anchor_text=current_prompt
+            "codex", interaction_sid, "initial",
+            transcript=nested_string(payload, "transcript_path", "transcriptPath"),
+            anchor_text=current_prompt
         )
     sd111_first_prompt_sweep(sid)
 

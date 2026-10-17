@@ -742,13 +742,16 @@ def _quarantine_pending(path, expected):
         return False
 
 
-def _pending_rows():
+def _pending_rows(*, recipient=None, sender=None, read_context=None):
     # Every row of one scan reads the same ledger roots; resolving them per row
     # cost seconds on each prompt once a few thousand rows had accumulated.
     try:
         roots, _source = steward_marker_roots()
     except (OSError, ValueError):
         roots = None  # each row then resolves (and fails) on its own, as before
+    if read_context is None:
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext()
     for path in sorted(_pending_dir().glob("*.json")):
         if _received_on_disk(path):
             continue
@@ -767,8 +770,19 @@ def _pending_rows():
                 ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
                 print(f"peer-pending-invalid ref={ref}", file=sys.stderr)
             continue
-        if row and row["state"] != "received" and not _registered_delivery_settled(row):
+        if not row or row["state"] == "received":
+            continue
+        receiver_match = recipient is not None and _same_transfer_session(row.get("to"), recipient)
+        sender_match = sender is not None and _same_transfer_session(row.get("from"), sender)
+        if (recipient is not None or sender is not None) and not (receiver_match or sender_match):
+            continue
+        if not _registered_delivery_settled(row, read_context=read_context):
             yield row
+
+
+def _same_transfer_session(left, right):
+    return (isinstance(left, dict) and isinstance(right, dict)
+            and all(left.get(key) == right.get(key) for key in ("harness", "session_id")))
 
 
 def _received_on_disk(path):
@@ -790,10 +804,11 @@ def _received_on_disk(path):
     return isinstance(row, dict) and row.get("state") == "received"
 
 
-def _registered_delivery_settled(row):
+def _registered_delivery_settled(row, *, read_context=None):
     try:
         from peer_obligations import registered_delivery_settled
-        return registered_delivery_settled(row)
+        return (registered_delivery_settled(row) if read_context is None else
+                registered_delivery_settled(row, read_context=read_context))
     except (OSError, ValueError, KeyError, RuntimeError):
         return False
 
@@ -803,7 +818,7 @@ def pending_messages(recipient):
     if not _valid_transfer_endpoint(recipient):
         return []
     rows = []
-    for row in _pending_rows():
+    for row in _pending_rows(recipient=recipient):
         if all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id")):
             rows.append(row)
     return rows
@@ -1467,7 +1482,7 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
     claims, warnings, context = [], [], []
     if recipient["harness"] == "codex":
         retry_pending_codex(recipient)
-    rows = list(_pending_rows())
+    rows = list(_pending_rows(recipient=recipient, sender=recipient))
     if recipient["harness"] == "claude":
         for row in rows:
             if len(claims) >= 3:

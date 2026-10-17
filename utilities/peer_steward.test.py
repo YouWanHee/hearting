@@ -2610,18 +2610,26 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
 
 class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
-    def test_existing_lifecycle_callback_reconnects_all_observer_families(self):
-        with mock.patch.dict(os.environ, {
-                "AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_CHILD": "1",
-                "AGENT_DISPATCH_DEPTH": "2", "OPENCODE_DISPATCH_SLUG": "fixture"}), \
+    def test_existing_lifecycle_callback_reconnects_through_one_runner(self):
+        with mock.patch.object(peer_steward, "_obligation_reconciliation_needed", return_value=True), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=True) as runner, \
+             mock.patch.object(peer_steward, "_reconcile_obligations") as inline, \
              mock.patch.object(peer_steward, "_ensure_watch_observers") as watches, \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner") as peers, \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "ensure_observers") as batches:
             self.assertEqual(peer_steward.main(["__ensure-obligations"]), 0)
-        watches.assert_called_once_with()
-        peers.assert_called_once_with()
-        batches.assert_called_once_with()
+        runner.assert_called_once_with(reconciliation_required=True)
+        inline.assert_not_called()
+        watches.assert_not_called()
+        batches.assert_not_called()
+
+    def test_legacy_or_unavailable_runner_uses_one_reconciliation_fallback(self):
+        with mock.patch.object(peer_steward, "_obligation_reconciliation_needed", return_value=True), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False) as runner, \
+             mock.patch.object(peer_steward, "_reconcile_obligations") as inline:
+            self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
+        runner.assert_called_once_with(reconciliation_required=True)
+        inline.assert_called_once()
 
 
 class NormalProducerRunnerBindingTest(unittest.TestCase):
@@ -5623,7 +5631,9 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(peer_steward, "_current_session_identity", return_value=("observer", "claude")), \
              mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
              mock.patch.object(peer_steward, "_ensure_watch_observers"), \
-             mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"):
+             mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
+             mock.patch.object(peer_steward, "_obligation_reconciliation_needed", return_value=True), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False):
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
         self.assert_authority()
 
@@ -6027,12 +6037,15 @@ class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
 
     def test_detached_lifecycle_needs_no_observer_native_identity(self):
         before = self.protected()
+        runner_start = len(peer_steward.peer_obligations._RUNNERS)
         with mock.patch.object(peer_steward, "_current_session_identity", return_value=("observer", "claude")), \
              mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
              mock.patch.object(peer_steward, "_ensure_watch_observers"), \
              mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
+        for process in peer_steward.peer_obligations._RUNNERS[runner_start:]:
+            self.assertEqual(process.wait(timeout=15), 0)
         self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
         self.assertEqual(self.protected(), before)
 

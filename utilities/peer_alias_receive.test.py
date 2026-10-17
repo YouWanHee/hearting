@@ -261,7 +261,7 @@ console.log(JSON.stringify(output));'''
         text, ref = self.deferred(sender=sender, old=True)
         rows = list(pm._pending_rows())
         barrier = threading.Barrier(2)
-        def same_snapshot():
+        def same_snapshot(**_kwargs):
             barrier.wait(timeout=5)
             return iter(rows)
         streams = [io.StringIO(), io.StringIO()]
