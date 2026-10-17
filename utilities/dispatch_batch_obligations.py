@@ -392,14 +392,23 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
                 fd = acquire(jobs_path, duty_id)
                 if fd is None:
                     observer = record.get("observer") or {}
-                    if not binding or not observer.get("pid") or not observer.get("pid_start"):
+                    if (not isinstance(observer, dict) or not binding
+                            or not observer.get("pid")):
                         continue
+                    if "pid_start" in observer:
+                        observer_start = observer["pid_start"]
+                        if (not isinstance(observer_start, str)
+                                or not observer_start.isdecimal()):
+                            continue
+                    else:
+                        observer_start = None
                     replaced = peer_obligations.replace_managed_observer(
-                        observer["pid"], observer["pid_start"],
+                        observer["pid"], observer_start,
                         root / (duty_id + ".lease"),
                         "utilities/codex-managed-completion.py",
                         ("--jobs", str(jobs_path), "--resume-obligation", duty_id),
                         binding, lock_fd_option="--obligation-lock-fd",
+                        exact_arguments=True,
                     )
                     if replaced != "replaced":
                         continue

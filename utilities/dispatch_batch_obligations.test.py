@@ -104,6 +104,27 @@ class BatchObligationTest(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_malformed_present_observer_start_is_not_treated_as_missing(self):
+        duty_id, _record = obligations.create(self.args)
+        outcome = {"state": "ready", "children": [
+            {"attempt_id": "att-child", "status": "done"},
+        ]}
+        obligations.update(self.jobs, duty_id, state="delivery-pending", outcome=outcome,
+                           observer={"pid": 321, "pid_start": ""})
+        binding = "/fixture/managed/current"
+        with mock.patch("peer_obligations.service_script",
+                        return_value=(Path("/fixture/current/codex-managed-completion.py"),
+                                      {}, binding)), \
+             mock.patch.object(obligations, "acquire", return_value=None), \
+             mock.patch("peer_obligations.replace_managed_observer") as replace, \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertEqual(obligations.ensure_observers(
+                self.jobs, service_current=binding), 0)
+        replace.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(obligations.read(self.jobs, duty_id)["observer"],
+                         {"pid": 321, "pid_start": ""})
+
     def test_complete_duty_is_not_replayed(self):
         duty_id, _record = obligations.create(self.args)
         obligations.update(self.jobs, duty_id, state="complete", outcome={"state": "ready"},
