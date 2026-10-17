@@ -173,6 +173,13 @@ class PureTelemetryTest(unittest.TestCase):
                          ("observed", 0, 1_200, 1_240))
         self.assertEqual(telemetry.context_used_pct, 0)
 
+    def test_native_incomplete_with_null_info_is_unknown(self):
+        event = json.loads(token_line())
+        event["payload"]["info"] = None
+        telemetry = parse_codex_token_count(json.dumps(event), session_id=SID)
+        self.assertEqual((telemetry.status, telemetry.reason),
+                         ("unknown", "missing-token-info"))
+
     def test_truthy_non_object_usage_is_unknown_instead_of_raising(self):
         for field in ("last_token_usage", "total_token_usage"):
             for malformed in ("not-an-object", [1], 7):
