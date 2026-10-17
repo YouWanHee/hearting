@@ -224,6 +224,7 @@ utility-deferred	resource_run_evidence.py
 utility-deferred	resource_runner.test.py
 utility-deferred	review_round_cap.py
 utility-deferred	review_round_cap.test.py
+utility-deferred	review_source_subject.py
 utility-deferred	ripple-map.py
 utility-deferred	route_authority.py
 utility-deferred	route_authority.test.py

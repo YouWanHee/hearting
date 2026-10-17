@@ -1180,7 +1180,7 @@ def _validate_batch_peer(
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"parallel batch peer marker unreadable: {exc}") from exc
         if not isinstance(node, dict) or not completion_marker_is_current(
-            route, node, marker_path, marker
+            route, node, marker_path, marker, jobs=jobs,
         ):
             raise ValueError("parallel batch peer marker is not current")
         readiness = completion_attempt_readiness(

@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,20 @@ N = importlib.util.module_from_spec(S)
 S.loader.exec_module(N)
 import route_identity as ROUTE_IDENTITY
 REVIEW_ROUND_CAP = N.REVIEW_ROUND_CAP
+_FIXTURE_TEMP = tempfile.TemporaryDirectory(prefix="hearting-dispatch-node-")
+_FIXTURE_ROOT = Path(_FIXTURE_TEMP.name)
+FIXTURE_WORKTREE = _FIXTURE_ROOT / "fixture-worktree"
+FIXTURE_WORKTREE.mkdir()
+subprocess.run(["git", "init", "-q", str(FIXTURE_WORKTREE)], check=True)
+subprocess.run(["git", "-C", str(FIXTURE_WORKTREE), "config", "user.email", "fixture@example.com"], check=True)
+subprocess.run(["git", "-C", str(FIXTURE_WORKTREE), "config", "user.name", "Fixture"], check=True)
+(FIXTURE_WORKTREE / "fixture.py").write_text("fixture = True\n", encoding="utf-8")
+subprocess.run(["git", "-C", str(FIXTURE_WORKTREE), "add", "fixture.py"], check=True)
+subprocess.run(["git", "-C", str(FIXTURE_WORKTREE), "commit", "-qm", "fixture"], check=True)
+FIXTURE_HEAD = subprocess.check_output(["git", "-C", str(FIXTURE_WORKTREE), "rev-parse", "HEAD"], text=True).strip()
+FIXTURE_LINKED = _FIXTURE_ROOT / "fixture-linked-worktree"
+subprocess.run(["git", "-C", str(FIXTURE_WORKTREE), "worktree", "add", "-q", "--detach",
+                str(FIXTURE_LINKED), FIXTURE_HEAD], check=True)
 
 
 def seal_route_hash(route):
@@ -35,7 +50,7 @@ def seal_route_hash(route):
 def base_tuple(child_harness, status="supported", probe_source="fixture-check", failure_class="", parent=None):
     row = {
         "child_harness": child_harness,
-        "checked_worktree": "/tmp/fixture-worktree",
+        "checked_worktree": str(FIXTURE_WORKTREE),
         "codex_command": "ok" if child_harness == "codex" else "not-applicable",
         "failure_class": failure_class,
         "failure_scope": "none" if status == "supported" else "runtime-global",
@@ -88,8 +103,11 @@ def make_node(depth=2, dispatch_fallback=None):
 
 
 def make_route(node, tuples=None):
-    return {
-        "cwd": "/tmp/fixture-worktree",
+    route = {
+        "schema_version": 2,
+        "dispatch_contract_version": 3,
+        "cwd": str(FIXTURE_WORKTREE),
+        "source_commit": FIXTURE_HEAD,
         "capability": "autopilot-code",
         "capability_mode": "dev",
         "effective_intensity": "standard",
@@ -103,6 +121,7 @@ def make_route(node, tuples=None):
             ],
         },
     }
+    return seal_route_hash(route)
 
 
 class SelectCheckedTupleTest(unittest.TestCase):
@@ -461,13 +480,15 @@ class MainMaterializationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             route_path = Path(td) / "route.json"
             route_path.write_text(json.dumps(route))
-            full_argv = ["dispatch-node.py", "--route", str(route_path)] + argv
+            full_argv = ["dispatch-node.py", "--route", str(route_path)] + argv + [
+                "--", "--launch-lifecycle", "detached"]
             with mock.patch.object(sys, "argv", full_argv), \
                  mock.patch.dict(
                      N.os.environ,
                      {**fixture_state_environ(td), **(environ or {})},
                      clear=True,
                  ), \
+                 mock.patch.object(N.ROUTE_AUTHORITY, "route_in_force", return_value=route), \
                  mock.patch.object(N.subprocess, "run", side_effect=fake_run):
                 try:
                     N.main()
@@ -556,6 +577,7 @@ class MainMaterializationTest(unittest.TestCase):
         if pin:
             route["selection_pins"] = {"contract_version": 1,
                                        target: {"harness": pin, "model": None, "effort": None}}
+        route = seal_route_hash(route)
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch("dispatch_capacity_evidence.active_limits", return_value=limits or {}):
             jobs = Path(td) / "jobs.log"
@@ -794,7 +816,7 @@ class RoundProtocolTest(unittest.TestCase):
 
     def test_review_round_is_closure_check(self):
         node = dict(make_node(depth=1, dispatch_fallback=[]), id="impl-review",
-                    kind="review-worker", unit="qa/code-review", completion_gate="code-impl-review")
+                    kind="review-worker", unit="qa/custom-review", completion_gate="code-review-fixture")
         prompt, _ = self._launch(node, self._rows("impl-review", 1) + self._rows("execute", 5))
         self.assertIn("Round protocol (round 2 of route node `impl-review`", prompt)
         self.assertIn("closed/open/regressed", prompt)
@@ -840,7 +862,8 @@ class ReviewRoundCapTest(unittest.TestCase):
                         kind="pipeline-stage", unit="qa/test", completion_gate="code-" + node_id)
         else:
             node = dict(make_node(depth=1, dispatch_fallback=[]), id=node_id,
-                        kind="review-worker", unit="qa/code-review", completion_gate="code-" + node_id)
+                        kind="review-worker", unit="qa/custom-review",
+                        completion_gate="code-review-fixture" if node_id == "impl-review" else "code-" + node_id)
         route = make_route(node, tuples=[])
         route["effective_intensity"] = effective_intensity
         route = seal_route_hash(route)
@@ -1039,6 +1062,8 @@ class ReviewRoundCapTest(unittest.TestCase):
                     kind="review-worker", unit="qa/code-review", completion_gate="code-plan-check")
         route = make_route(node, tuples=[])
         route["effective_intensity"] = "direct"
+        route = seal_route_hash(route)
+        route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
         printed = []
         code = None
         with tempfile.TemporaryDirectory() as td:
@@ -1334,7 +1359,7 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
     """A slice launches in the worktree its sealed manifest names; the route is
     still verified at the route cwd, and every other worker keeps the route cwd."""
 
-    LINKED = "/tmp/fixture-linked-worktree"
+    LINKED = str(FIXTURE_LINKED)
 
     def _launch(self, *, action="start", subsession=True, sealed_worktree=LINKED,
                 declared_worktree=LINKED, adapter_args=()):
@@ -1344,6 +1369,8 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
         route = make_route(node, tuples=[])
         route["effective_intensity"] = "direct"
         printed, calls = [], []
+        route = seal_route_hash(route)
+        route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
         code = None
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / ".dispatch" / "jobs.log"
@@ -1369,6 +1396,7 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
                 if declared_worktree:
                     argv += ["--subsession-worktree", declared_worktree]
             argv += list(adapter_args)
+            argv += ["--", "--launch-lifecycle", "detached"]
             def run(cmd, **_kw):
                 calls.append(list(cmd))
                 return mock.Mock(returncode=0)
@@ -1398,7 +1426,7 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
         _code, _printed, calls = self._launch()
         verify = [c for c in calls if "verify" in c and c[1].endswith("capability-route.py")]
         self.assertEqual(len(verify), 1)
-        self.assertEqual(self._value(verify[0], "--cwd"), "/tmp/fixture-worktree")
+        self.assertEqual(self._value(verify[0], "--cwd"), str(FIXTURE_WORKTREE))
 
     def test_subsession_start_refuses_worktree_disagreeing_with_sealed_manifest(self):
         code, printed, calls = self._launch(declared_worktree="/tmp/some-other-worktree")
@@ -1426,7 +1454,7 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
     def test_non_subsession_launch_keeps_route_cwd(self):
         code, _printed, calls = self._launch(subsession=False)
         self.assertEqual(code, 0)
-        self.assertEqual(self._value(calls[-1], "--worktree"), "/tmp/fixture-worktree")
+        self.assertEqual(self._value(calls[-1], "--worktree"), str(FIXTURE_WORKTREE))
 
 
 class ForegroundLaunchTest(unittest.TestCase):

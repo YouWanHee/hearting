@@ -1149,7 +1149,7 @@ def _reuse_snapshot(jobs, route, lines):
         if not path.exists():
             continue
         marker = _read(path)
-        if not DC.completion_marker_is_current(route, node, path, marker):
+        if not DC.completion_marker_is_current(route, node, path, marker, jobs=jobs):
             raise DC.DispatchContractError('replacement-completion-unproven', str(node['id']))
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
