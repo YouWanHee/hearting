@@ -5111,6 +5111,11 @@ def _resume_message_obligation(duty, store, *, read_context=None):
     duty_id = duty["id"]
 
     def checkpoint(**changes):
+        # This duty came from the current read pass. If the requested checkpoint
+        # is already present, skip the lock and record reread as well as the write.
+        # A concurrent advance is preserved because this path never writes it back.
+        if all(duty.get(key) == value for key, value in changes.items()):
+            return duty
         return store.update(duty_id, skip_unchanged=True, **changes)
 
     target = intent.get("target")
