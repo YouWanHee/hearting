@@ -7399,6 +7399,7 @@ def write_completion_marker(
     # real census (round_budget's own fail-soft on an unknown intensity is
     # the only `None` case) rather than the field being silently omitted.
     round_census=None
+    census_subject=(source_subject or {}).get("digest")
     if REVIEW_ROUND_CAP.is_round_capped_node(node):
         rows=()
         census_jobs=Path(jobs or _compose_default_jobs())
@@ -7436,7 +7437,14 @@ def write_completion_marker(
                     if metadata.get("attempt_id") == attempt_id and metadata.get("review_input_digest"):
                         reviewed_input = review_input.read_binding(jobs, metadata)
                         break
-            if source_subject is not None and node.get("kind") == "review-worker" and jobs is not None:
+            if census_subject is None and node.get("kind") == "review-worker" and jobs is not None and attempt_metadata:
+                # A pre-deploy review carries no marker subject; its launch binding
+                # names the deploy-request subject admission counted.
+                from review_source_subject import is_deploy_review, read_binding as read_review_subject
+                if is_deploy_review(route, node):
+                    binding = read_review_subject(jobs, attempt_metadata, required=False)
+                    census_subject = binding["subject_digest"] if binding else None
+            if census_subject is not None and node.get("kind") == "review-worker" and jobs is not None:
                 from review_source_subject import read_binding as read_review_subject
                 bound_rows = []
                 for status, metadata in rows:
@@ -7449,7 +7457,7 @@ def write_completion_marker(
         round_census=REVIEW_ROUND_CAP.marker_round_census(
             route,node,rows,site=site,revisions=revisions,
             independently_reviewed=review_identity.get("review_independence")=="independent",
-            source_subject_digest=(source_subject or {}).get("digest"),
+            source_subject_digest=census_subject,
         )
     if REVIEW_ROUND_CAP.is_round_capped_node(node) and site == "inline":
         ROUTE_AUTHORITY.require_continuation(ROUTE_AUTHORITY.decide_continuation(
@@ -9026,11 +9034,11 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
     source_subject_digest = None
-    from review_source_subject import SourceSubjectError, is_implementation_review, observe, read_binding, source_epoch
-    if is_implementation_review(route, node):
+    from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding, source_epoch
+    if has_review_subject(route, node, jobs):
         try:
             binding = read_binding(jobs, row_metadata, required=False) if jobs else None
-            current = observe(route, node, worktree=route.get("cwd"))
+            current = observe(route, node, worktree=route.get("cwd"), jobs=jobs)
             epoch = source_epoch(route, node, current["digest"], completion_dir(route["route_id"], jobs=jobs))
         except (SourceSubjectError, OSError, ValueError) as exc:
             refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))

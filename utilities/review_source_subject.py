@@ -71,6 +71,70 @@ def is_implementation_review(route: dict, node: dict) -> bool:
             or node.get("source_review_kind") == "implementation")
 
 
+def is_deploy_review(route: dict, node: dict) -> bool:
+    """A review the ship deploy node depends on: it judges what the deploy runs."""
+    if node.get("kind") != "review-worker" or is_implementation_review(route, node):
+        return False
+    node_id = str(node.get("id"))
+    return any(node_id in _ancestor_ids(route, item) for item in route.get("nodes", [])
+               if isinstance(item, dict) and item.get("completion_gate") == "ship-deploy")
+
+
+def _input_match(path: str, scopes: tuple[str, ...]) -> bool:
+    import fnmatch
+    for scope in scopes:
+        pattern = scope.rstrip("/")
+        if fnmatch.fnmatchcase(path, scope) or path == pattern or path.startswith(pattern + "/"):
+            return True
+    return False
+
+
+def deploy_request_subject(route: dict, node: dict, jobs: str | Path) -> dict | None:
+    """The parent deploy request's hashed inputs inside this review's input scope.
+
+    None while the route has no request yet or the request lists none of the
+    review's inputs; that review keeps the plain per-node count.
+    """
+    request = Path(jobs).resolve().parent / "ship-parent-deploy" / f"{route.get('route_id')}.json"
+    try:
+        value = json.loads(request.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise SourceSubjectError("review-deploy-request-unreadable", str(request)) from exc
+    if (not isinstance(value, dict) or value.get("route_id") != route.get("route_id")
+            or value.get("route_hash") != route.get("route_hash")):
+        return None
+    record = value.get("deploy_record")
+    inputs = (value.get("command") or {}).get("inputs") if isinstance(value.get("command"), dict) else None
+    if not isinstance(record, str) or not isinstance(inputs, dict):
+        return None
+    artifacts = Path(record).parents[1]  # <cycle>/artifacts/release-config/deploy-record.json
+    scopes = tuple(scope for scope in node.get("inputs") or () if isinstance(scope, str) and scope)
+    manifest = []
+    for name, sha in sorted(inputs.items()):
+        try:
+            relative = Path(name).relative_to(artifacts).as_posix()
+        except ValueError:
+            continue
+        if _input_match(relative, scopes):
+            manifest.append([relative, str(sha)])
+    if not manifest:
+        return None
+    return {"schema_version": SCHEMA_VERSION,
+            "digest": _sha(_canonical({"schema_version": SCHEMA_VERSION, "manifest": manifest})),
+            "manifest": manifest, "scope": list(scopes),
+            "provenance": {"source": "parent-deploy-request", "request_digest": value.get("request_digest")}}
+
+
+def has_review_subject(route: dict, node: dict, jobs: str | Path | None = None) -> bool:
+    """Whether this review's round cap and PASS are counted per reviewed subject."""
+    if is_implementation_review(route, node):
+        return True
+    return (jobs is not None and is_deploy_review(route, node)
+            and deploy_request_subject(route, node, jobs) is not None)
+
+
 def _ancestor_ids(route: dict, node: dict) -> list[str]:
     by_id = {str(item.get("id")): item for item in route.get("nodes", []) if isinstance(item, dict)}
     seen: set[str] = set()
@@ -345,8 +409,14 @@ def _snapshot_once(root: Path, scopes: tuple[str, ...], *, depth: int = 0) -> tu
     return manifest, provenance
 
 
-def observe(route: dict, node: dict, *, worktree: str | Path | None = None) -> dict:
+def observe(route: dict, node: dict, *, worktree: str | Path | None = None,
+            jobs: str | Path | None = None) -> dict:
     """Return a stable effective-tree manifest and content-only digest."""
+    if jobs is not None and not is_implementation_review(route, node) and is_deploy_review(route, node):
+        subject = deploy_request_subject(route, node, jobs)
+        if subject is None:
+            raise SourceSubjectError("review-deploy-subject-unavailable", str(node.get("id", "")))
+        return subject
     root = Path(worktree or route.get("cwd", "")).resolve()
     if not root.is_dir():
         raise SourceSubjectError("review-source-worktree-unavailable", str(root))
@@ -427,8 +497,8 @@ def _write_once(path: Path, payload: dict) -> None:
 def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
                  worktree: str | Path | None = None, predecessor_attempt_id: str | None = None,
                  expected_subject_digest: str | None = None) -> dict:
-    """Bind a new implementation-review attempt, inheriting exact retry lineage."""
-    if not is_implementation_review(route, node):
+    """Bind a new subject-bound review attempt, inheriting exact retry lineage."""
+    if not has_review_subject(route, node, jobs):
         return {}
     path = binding_path(jobs, attempt_id)
     if predecessor_attempt_id:
@@ -436,7 +506,7 @@ def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
             route_id=route["route_id"], route_hash=route["route_hash"], node_id=node["id"])
         if predecessor is None:
             return {}  # A legacy unknown attempt stays unknown through replacement.
-        current = observe(route, node, worktree=worktree)
+        current = observe(route, node, worktree=worktree, jobs=jobs)
         if expected_subject_digest and current["digest"] != expected_subject_digest:
             raise SourceSubjectError("review-source-admission-subject-changed", attempt_id)
         expected_epoch = source_epoch(route, node, current["digest"],
@@ -446,7 +516,7 @@ def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
         record = {k: v for k, v in predecessor.items() if k not in {"attempt_id", "binding_digest"}}
         record.update(attempt_id=attempt_id, predecessor_attempt_id=predecessor_attempt_id)
     else:
-        current = observe(route, node, worktree=worktree)
+        current = observe(route, node, worktree=worktree, jobs=jobs)
         if expected_subject_digest and current["digest"] != expected_subject_digest:
             raise SourceSubjectError("review-source-admission-subject-changed", attempt_id)
         completion_dir = Path(jobs).resolve().parent / "completion" / route["route_id"]
@@ -499,7 +569,8 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
                      require_new: bool = False) -> dict | None:
     """Registration/launch fence: exact binding integrity and effective bytes."""
     likely_review = (metadata.get("completion_gate") == "code-impl-review"
-                     or metadata.get("unit") == "qa/code-review")
+                     or metadata.get("unit") == "qa/code-review"
+                     or bool(metadata.get("review_subject_digest")))
     if not likely_review:
         return None
     if (not metadata.get("review_subject_digest")
@@ -518,12 +589,12 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
         raise SourceSubjectError("review-source-route-identity-mismatch")
     node = next((item for item in route.get("nodes", [])
                  if item.get("id") == metadata.get("route_node")), None)
-    if node is None or not is_implementation_review(route, node):
+    if node is None or not has_review_subject(route, node, jobs):
         return None
     record = read_binding(jobs, metadata, required=require_new)
     if record is None:
         return None  # A pre-feature registry row remains unknown, never inferred.
-    current = observe(route, node, worktree=fields[3])
+    current = observe(route, node, worktree=fields[3], jobs=jobs)
     current_epoch = source_epoch(route, node, current["digest"],
                                   Path(jobs).resolve().parent / "completion" / route["route_id"])
     if current["digest"] != record["subject_digest"] or current_epoch != record["source_epoch"]:

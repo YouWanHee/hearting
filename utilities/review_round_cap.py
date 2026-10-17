@@ -197,9 +197,9 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
                 rows.append((cols, meta))
         rows = [(cols[1], meta) for cols, meta in logical_round_records(rows, jobs=jobs)]
         source_digest = None
-        from review_source_subject import is_implementation_review, observe, read_binding
-        if is_implementation_review(route, node):
-            source_digest = observe(route, node, worktree=route.get("cwd"))["digest"]
+        from review_source_subject import has_review_subject, observe, read_binding
+        if has_review_subject(route, node, jobs):
+            source_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
             bound_rows = []
             for status, meta in rows:
                 binding = read_binding(jobs, meta, required=False)

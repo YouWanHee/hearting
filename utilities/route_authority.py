@@ -558,10 +558,10 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             source_digest = None
             current_history = history
             if candidate.get("kind") == "review-worker":
-                from review_source_subject import SourceSubjectError, annotate_rows, is_implementation_review, observe
-                if is_implementation_review(route, candidate):
+                from review_source_subject import SourceSubjectError, annotate_rows, has_review_subject, observe
+                if has_review_subject(route, candidate, jobs):
                     try:
-                        source_digest = observe(route, candidate, worktree=route.get("cwd"))["digest"]
+                        source_digest = observe(route, candidate, worktree=route.get("cwd"), jobs=jobs)["digest"]
                         current_history = [(status, metadata) for status, metadata in
                             annotate_rows(jobs, history)
                             if metadata.get("_review_subject_digest") == source_digest
@@ -613,10 +613,10 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         budget_rows = rows
         budget_kinds = kinds
         if node.get("kind") == "review-worker":
-            from review_source_subject import annotate_rows, is_implementation_review, observe
-            if is_implementation_review(route, node):
+            from review_source_subject import annotate_rows, has_review_subject, observe
+            if source_digest is not None or has_review_subject(route, node, jobs):
                 if source_digest is None and jobs is not None:
-                    source_digest = observe(route, node, worktree=route.get("cwd"))["digest"]
+                    source_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
                     rows = annotate_rows(jobs, rows)
                     kinds = [_ROUND.classify_round_row(s, m,
                         worker_type=m.get("worker_type") or worker_type) for s, m in rows]

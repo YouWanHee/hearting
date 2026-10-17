@@ -10227,7 +10227,7 @@ def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> boo
 def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadata: dict[str, str], *,
                                       new_attempt: bool) -> tuple[list[str], dict[str, str]]:
     """Bind implementation-review source once and verify it at registration."""
-    from review_source_subject import SourceSubjectError, is_implementation_review, seal_attempt, validate_attempt
+    from review_source_subject import SourceSubjectError, has_review_subject, seal_attempt, validate_attempt
     require_binding = False
     try:
         if new_attempt and metadata.get("route_file") and metadata.get("route_node"):
@@ -10235,7 +10235,7 @@ def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadat
             route = json.loads(route_path.read_text(encoding="utf-8"))
             node = next((item for item in route.get("nodes", [])
                          if item.get("id") == metadata.get("route_node")), None)
-            if node is not None and is_implementation_review(route, node):
+            if node is not None and has_review_subject(route, node, jobs):
                 predecessor = (metadata.get("automatic_retry_of")
                                or metadata.get("replacement_original_attempt_id"))
                 if not predecessor and metadata.get("capacity_retry") == "1":
