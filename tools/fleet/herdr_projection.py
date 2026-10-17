@@ -261,7 +261,7 @@ def refresh_observed_tag_metadata(agents) -> None:
     This reads target identity immediately before each metadata attempt; it
     never changes session identity/lifecycle or reclassifies Fleet rows.
     """
-    from .collectors.herdr import list_agents
+    from fleet.collectors.herdr import list_agents
     herdr = shutil.which("herdr")
     if not herdr:
         return
@@ -482,6 +482,11 @@ def _herdr_endpoint(socket_path):
 def _codex_tui_endpoint(session_id: str):
     """The unique pane/socket pair whose live foreground Codex TUI proves ``session_id``."""
     try:
+        # The deferred reporter runs this module as a script, without the
+        # hook's utilities path.
+        utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
         from pane_ownership import codex_tui_pane_endpoint
         return codex_tui_pane_endpoint(session_id)
     except Exception:
@@ -533,7 +538,7 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
 
 def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None, *, session_id=None):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
-    from .process_identity import native_resume_wire_argv
+    from fleet.process_identity import native_resume_wire_argv
 
     if session_seq is None and session_start_source is None and resume_argv is None:
         return {}

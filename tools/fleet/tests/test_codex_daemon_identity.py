@@ -15,6 +15,7 @@ if str(UTILITIES) not in sys.path:
 
 from fleet.collectors import codex, procscan  # noqa: E402
 
+_REAL_LISTENER_SNAPSHOT = codex._tcp_listener_snapshot
 PID = 43101
 ROOT = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
 SECOND = "01a0fa57-7f0e-7eb0-bffe-1d56df94e91c"
@@ -255,6 +256,22 @@ class CodexDaemonIdentityTest(unittest.TestCase):
             self.assertIsNone(codex._daemon_session_for_process(PID, {"CODEX_HOME": "/fake"}))
         self.assertEqual(codex._DAEMON_ORIGINS, {})
 
+    def test_observation_and_recheck_each_share_one_fd_walk(self):
+        self.threads[SECOND] = (41302, "user")
+        seen = []
+
+        def snapshot(port, scan=None):
+            seen.append((port, scan))
+            return self.listener if port == 41301 else (frozenset({"881133"}), frozenset({999}))
+
+        with mock.patch.object(codex, "_tcp_listener_snapshot", side_effect=snapshot):
+            self.assertEqual(codex._daemon_session_for_process(PID, {"CODEX_HOME": "/fake"}), ROOT)
+        self.assertCountEqual([port for port, _scan in seen], [41301, 41302, 41301, 41302])
+        observe, recheck = [scan for _port, scan in seen[:2]], [scan for _port, scan in seen[2:]]
+        self.assertIs(observe[0], observe[1])
+        self.assertIs(recheck[0], recheck[1])
+        self.assertIsNot(observe[0], recheck[0])
+
     def test_thread_to_process_revalidates_listener_and_pid_start(self):
         replacement = (frozenset({"551144"}), frozenset({PID}))
         with mock.patch.object(codex, "_tcp_listener_snapshot",
@@ -316,6 +333,27 @@ class TcpListenerSnapshotTest(unittest.TestCase):
 
     def test_other_proc_failures_still_make_the_owner_set_unknown(self):
         self.assertIsNone(self._scan(OSError(5, "I/O error")))
+
+    def test_ports_of_one_observation_share_one_fd_walk(self):
+        tcp = self.TCP + ("   1: 0100007F:A156 00000000:0000 0A 00000000:00000000 00:00000000 "
+                          "00000000  1002        0 881133 1 0 100 0 0 10 0\n")
+        owners = {"881122": {100}, "881133": {200}, "990011": {300}}
+        with mock.patch.object(codex, "open", mock.mock_open(read_data=tcp), create=True), \
+                mock.patch.object(codex, "_socket_owners_by_inode", return_value=owners) as walk:
+            scan = {}
+            self.assertEqual(_REAL_LISTENER_SNAPSHOT(41301, scan),
+                             (frozenset({"881122"}), frozenset({100})))
+            self.assertEqual(_REAL_LISTENER_SNAPSHOT(41302, scan),
+                             (frozenset({"881133"}), frozenset({200})))
+            self.assertEqual(walk.call_count, 1)
+            _REAL_LISTENER_SNAPSHOT(41301, {})
+            _REAL_LISTENER_SNAPSHOT(41301)
+            self.assertEqual(walk.call_count, 3)
+        with mock.patch.object(codex, "open", mock.mock_open(read_data=tcp), create=True), \
+                mock.patch.object(codex, "_socket_owners_by_inode", return_value=None):
+            scan = {}
+            self.assertIsNone(_REAL_LISTENER_SNAPSHOT(41301, scan))
+            self.assertIsNone(_REAL_LISTENER_SNAPSHOT(41302, scan))
 
 
 if __name__ == "__main__":
