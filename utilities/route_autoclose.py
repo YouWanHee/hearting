@@ -921,9 +921,13 @@ def _decision_unfinished(route: Mapping[str, Any], home, root: Path | None = Non
     if not directory:
         return False
     record_path = Path(directory) / "artifacts" / route_plan.RECORD_RELATIVE
-    if not record_path.is_file():
+    try:
+        written = record_path.stat().st_mtime
+    except FileNotFoundError:
         return False
-    if (time.time() if now is None else now) - _mtime(record_path) >= IDLE_SECONDS:
+    except OSError:
+        return True   # an unreadable record is not an expired one
+    if (time.time() if now is None else now) - written >= IDLE_SECONDS:
         return False
     if root is None:
         return True

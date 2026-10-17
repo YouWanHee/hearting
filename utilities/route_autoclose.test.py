@@ -278,6 +278,14 @@ class RouteAutocloseTest(unittest.TestCase):
             os.utime(record_path, (time.time(), time.time()))
             leg_path.with_name(f"{leg_id}.outcome.json").write_text("{}", encoding="utf-8")
             self.assertFalse(RA._decision_unfinished(route, lambda: cycle_home, self.root, time.time()))
+            # A record whose metadata cannot be read keeps its protection.
+            real_stat = Path.stat
+            def failing_stat(path, *args, **kwargs):
+                if path == record_path:
+                    raise PermissionError("metadata unavailable")
+                return real_stat(path, *args, **kwargs)
+            with mock.patch.object(Path, "stat", failing_stat):
+                self.assertTrue(RA._decision_unfinished(route, lambda: cycle_home, self.root, time.time()))
 
     def test_crashed_claude_session_closes_after_an_hour_of_quiet(self):
         self.claude_crashed("claude-crashed")
