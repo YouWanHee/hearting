@@ -383,6 +383,30 @@ class WaitTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(self._wait(), 4)
         self.assertNotIn(("claude", "sid-steward-3"), peer_steward.peer_message.read_steward_markers())
 
+    def test_wait_marker_uses_resolved_name_and_pane_then_completes_with_sid(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        sidless = _agent_json("codex", "bad/id", "hearting-1d")
+        identified = _agent_json("codex", "sid-new", "hearting-1d")
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("codex", None, "raw-pane-alias")), \
+             mock.patch.object(peer_steward, "_run_herdr_wait",
+                               side_effect=[sidless, identified]):
+            self.assertEqual(self._wait(target="raw-pane-alias"), 0)
+            markers = peer_steward.peer_message.read_steward_markers()
+            entries = markers[("claude", "sid-steward")]["targets"]
+            self.assertEqual(set(entries), {"hearting-1d"})
+            self.assertEqual(entries["hearting-1d"], {
+                "harness": "codex", "session_id": None, "name": "hearting-1d",
+                "kind": "watch", "ts": entries["hearting-1d"]["ts"],
+                "source": "watch", "pane": "w1:pX"})
+            self.assertEqual(self._wait(target="raw-pane-alias"), 0)
+        entries = peer_steward.peer_message.read_steward_markers()[("claude", "sid-steward")]["targets"]
+        self.assertEqual(set(entries), {"sid-new"})
+        self.assertEqual((entries["sid-new"]["session_id"], entries["sid-new"]["name"],
+                          entries["sid-new"]["pane"]), ("sid-new", "hearting-1d", "w1:pX"))
+
     def test_herdr_binary_missing_is_herdr_unavailable_exit_4(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value=None):
             rc = self._wait()
@@ -1147,7 +1171,7 @@ if agent_state_file and os.path.exists(agent_state_file):
     agent_state = open(agent_state_file, encoding="utf-8").read().strip() or agent_state
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
-    "agent_status": agent_state, "name": target, "pane_id": "w1:p9",
+    "agent_status": agent_state, "name": os.environ.get("FAKE_HERDR_NAME", target), "pane_id": "w1:p9",
     "window_id": os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move")}, "type": "agent_info"}}
 identity_path = os.environ.get("FAKE_HERDR_IDENTITY_FILE")
 if identity_path and os.path.exists(identity_path):
@@ -1614,6 +1638,14 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         watch_id, _arm, _identity, _env = self._unbound_watch("idle")
         receipt = self._wait_for_receipt(watch_id)
         self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-fake", "w1:p9"))
+
+    def test_sidless_watch_marker_uses_resolved_name_and_pane(self):
+        _watch_id, _arm, _identity, env = self._unbound_watch(
+            "idle", {"FAKE_HERDR_NAME": "hearting-1d"})
+        markers = peer_steward.peer_message.read_steward_markers()
+        entry = markers[("claude", "steward-1")]["targets"]["hearting-1d"]
+        self.assertEqual((entry["harness"], entry["session_id"], entry["name"], entry["pane"]),
+                         ("claude", None, "hearting-1d", "w1:p9"))
 
     def test_pane_armed_watch_keeps_the_session_it_took(self):
         watch_id, arm_path, identity_path, env = self._unbound_watch("held")
@@ -3308,6 +3340,119 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         row = peer_steward.peer_message._read_pending(record["transfer_ref"])
         return rc, printed.call_args[0][0], row, sent, schedule
 
+    def _run_sidless_prompt(self, guard_results, *, send_result=(0, {}), text="[steer] first Codex turn"):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        sent = []
+        guard = mock.Mock(side_effect=guard_results)
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("sid-steward", "claude")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="steward"), \
+             mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("codex", None, "fresh")), \
+             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:pX")), \
+             mock.patch.object(peer_steward, "_first_input_foreground_proof", return_value=proof), \
+             mock.patch.object(peer_steward, "_sidless_idle_prompt_guard", guard), \
+             mock.patch.object(peer_steward, "_herdr_prompt",
+                               side_effect=lambda target, body, **kw:
+                               (sent.append((target, body, kw)) or send_result)), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+             mock.patch("builtins.print") as printed:
+            args = peer_steward.build_parser().parse_args(["prompt", "fresh", text])
+            rc = peer_steward.cmd_prompt(args)
+        record = self._all_records()[-1]
+        row = peer_steward.peer_message._read_pending(record["transfer_ref"])
+        return rc, printed.call_args[0][0], row, sent, schedule, guard.call_count
+
+    def test_sidless_codex_first_input_submits_one_private_trailer_and_stays_queued(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, guard_calls = self._run_sidless_prompt(
+            [(None, proof), (None, proof)])
+        self.assertEqual(rc, 3, line)
+        self.assertEqual((row["state"], row["receipt"]),
+                         ("queued", "native-first-input-submitted"))
+        self.assertEqual(row["first_input_process"]["pid"], os.getpid())
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "w1:pX")
+        self.assertIn("peer-from:", sent[0][1])
+        self.assertEqual(guard_calls, 2)  # before claim, then after claim at submit boundary
+        schedule.assert_not_called()
+
+    def test_sidless_target_process_race_defers_without_submitting(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, _calls = self._run_sidless_prompt(
+            [(None, proof), ("target-process-changed", None)])
+        self.assertEqual(rc, 3, line)
+        self.assertIn("reason=target-process-changed", line)
+        self.assertEqual((row["state"], row.get("rpc_claim")), ("pending", None))
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
+
+    def test_sidless_busy_draft_form_and_unknown_proof_all_defer_safely(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        for reason in ("native-state-working", "draft", "form-open", "foreground-unverified"):
+            with self.subTest(reason=reason):
+                rc, line, row, sent, schedule, calls = self._run_sidless_prompt([(reason, None)])
+                self.assertEqual(rc, 3, line)
+                self.assertIn("first-input-deferred", line)
+                self.assertEqual(row["state"], "pending")
+                self.assertEqual(sent, [])
+                self.assertEqual(calls, 1)
+                schedule.assert_called_once()
+
+    def test_sidless_ambiguous_prompt_submission_is_never_retried(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, _calls = self._run_sidless_prompt(
+            [(None, proof), (None, proof)], send_result=(None, None))
+        self.assertEqual(rc, 5, line)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["receipt"], "native-first-input-inflight")
+        self.assertIsNotNone(row.get("rpc_claim"))
+        self.assertEqual(len(sent), 1)
+        schedule.assert_called_once()
+
+    def test_sidless_guard_requires_idle_empty_composer_exact_pane_and_same_process(self):
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
+
+        def guard(harness, status, screen, observed=process, expected=process):
+            identity = {"harness": harness, "session_id": "-", "pane": "w1:pX"}
+            with mock.patch.object(peer_steward, "_retire_target",
+                                   return_value=(status, identity, 0, None)), \
+                 mock.patch.object(peer_steward, "_agent_state", return_value=(status, "w1:pX")), \
+                 mock.patch.object(peer_steward, "_pane_readiness",
+                                   return_value=SimpleNamespace(state="ready", reason="")), \
+                 mock.patch.object(peer_steward, "_first_input_foreground_proof",
+                                   return_value=observed), \
+                 mock.patch.object(peer_steward, "_read_screen",
+                                   return_value=peer_steward._screen_lines(screen)):
+                return peer_steward._sidless_idle_prompt_guard(
+                    "fresh", harness, "w1:pX", expected_foreground=expected)[0]
+
+        self.assertIsNone(guard("codex", "idle", CODEX_EMPTY))
+        self.assertEqual(guard("codex", "working", CODEX_EMPTY), "native-state-working")
+        self.assertEqual(guard("codex", "idle", CODEX_DRAFT), "draft")
+        self.assertEqual(guard("codex", "idle", CODEX_POPUP), "draft-unknown")
+        self.assertEqual(guard("claude", "idle", CLAUDE_FORM,
+                               observed={**process, "harness": "claude"},
+                               expected={**process, "harness": "claude"}), "form-open")
+        self.assertEqual(guard("codex", "idle", CODEX_EMPTY,
+                               observed={**process, "start": "replaced-start"}),
+                         "target-process-changed")
+
     def test_idle_claude_empty_composer_uses_exact_prompt_and_receiver_ref(self):
         rc, line, row, sent, schedule = self._run_claude_prompt(consume=True)
         self.assertEqual(rc, 0, line)
@@ -3470,7 +3615,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch("builtins.print") as printed:
             rc = peer_steward.main(["prompt", "fresh", "wait for the exact thread"])
         self.assertEqual(rc, 3)
-        self.assertIn("reason=target-session-unresolved", printed.call_args[0][0])
+        self.assertIn("reason=target-process-proof-unknown", printed.call_args[0][0])
         row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
         self.assertEqual((row["state"], row["to"]["session_id"], row["to"]["pane_id"]),
                          ("pending", None, "w1:pX"))
@@ -3656,6 +3801,96 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len(accepted), 1)
         self.assertEqual(resumed.call_count, 1)
         self.assertEqual(store.get(accepted[0]["id"])["state"], "complete")
+
+
+class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
+    def _row_and_duty(self, *, process_proof=True, submitted=False):
+        sender = {"harness": "claude", "session_id": "sid-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": 4242, "start": "123",
+                 "pid_namespace": "pid:[77]"}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] bounded first input", sender, recipient, defer=True,
+            **({"first_input_process": proof} if process_proof else {}))
+        if submitted:
+            claim = peer_steward.peer_message.claim_pending_first_input(
+                ref, {"harness": "codex", "pane_id": "w1:pX"}, proof)
+            self.assertIsNotNone(claim)
+            self.assertTrue(peer_steward.peer_message.mark_pending_prompt_queued(
+                ref, claim["rpc_claim"], receipt="native-first-input-submitted"))
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "w1:pX", "harness": "codex", "session_id": ""},
+            {"ref": ref, "target": "fresh", "to": recipient, "from": sender})
+        return proof, ref, store, duty
+
+    def test_replaced_foreground_cannot_bind_or_queue_and_records_typed_reason(self):
+        proof, ref, store, duty = self._row_and_duty()
+        changed = {**proof, "pid": 4243, "start": "456"}
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof", return_value=changed), \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue, \
+             mock.patch.object(peer_steward, "_ensure_sender_delay_notice") as notice:
+            peer_steward._resume_message_obligation(duty, store)
+        result = store.get(duty["id"])
+        self.assertEqual((result["state"], result["observation"]["reason"]),
+                         ("unknown", "target-process-changed"))
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+        bind.assert_not_called()
+        queue.assert_not_called()
+        notice.assert_not_called()
+
+    def test_replaced_foreground_uses_only_the_existing_bounded_sender_notice(self):
+        proof, _ref, store, duty = self._row_and_duty()
+        pending_ref = duty["intent"]["ref"]
+        row = peer_steward.peer_message._read_pending(pending_ref)
+        peer_steward.peer_message._save_pending(
+            dict(row, created=time.time() - peer_steward._FLUSH_STUCK_HOURS * 3600 - 1))
+        changed = {**proof, "pid": 4243, "start": "456"}
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof", return_value=changed), \
+             mock.patch.object(peer_steward, "_ensure_sender_delay_notice") as notice, \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue:
+            peer_steward._resume_message_obligation(duty, store)
+        notice.assert_called_once()
+        bind.assert_not_called()
+        queue.assert_not_called()
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"],
+                         "target-process-changed")
+
+    def test_old_sidless_row_without_process_proof_stays_unknown(self):
+        _proof, ref, store, duty = self._row_and_duty(process_proof=False)
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof") as current:
+            peer_steward._resume_message_obligation(duty, store)
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"],
+                         "target-process-proof-unknown")
+        current.assert_not_called()
+        self.assertIsNone(peer_steward.peer_message._read_pending(ref).get("bound_to"))
+
+    def test_submitted_first_input_is_never_queued_again_after_sid_appears(self):
+        _proof, ref, store, duty = self._row_and_duty(submitted=True)
+        with mock.patch.object(peer_steward, "_retire_target") as target, \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue:
+            peer_steward._resume_message_obligation(duty, store)
+        result = store.get(duty["id"])
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["observation"]["reason"], "native-first-input-submitted")
+        target.assert_not_called()
+        bind.assert_not_called()
+        queue.assert_not_called()
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "queued")
 
 
 class NormalProducerRunnerBindingTest(unittest.TestCase):

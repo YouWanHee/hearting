@@ -931,9 +931,12 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def test_sidless_pending_stays_on_its_exact_pane_until_a_session_is_observed(self):
         recipient = {"harness": "codex", "session_id": None, "name": "fresh",
                      "pane_id": "w1:pX"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
         body = "[steer] unresolved pane\n" + "detail " * 400 + "\n실행하지 말 것; STFT 크기 하한 1e-5"
         text, ref = peer_message.prepare_peer_message(
-            body, self.sender, recipient, defer=True)
+            body, self.sender, recipient, defer=True, first_input_process=process)
         row = peer_message._read_pending(ref)
         self.assertEqual(row["state"], "pending")
         self.assertEqual(row["to"], recipient)
@@ -941,9 +944,15 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(peer_message._read_transfer_record(ref).get("body_ref"))
         self.assertIsNone(peer_message.pending_delivery_recipient(row))
         self.assertIsNone(peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"}))
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"},
+            process_proof=process))
+        changed = dict(process, pid=os.getpid() + 1)
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"},
+            process_proof=changed))
         bound = peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"})
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"},
+            process_proof=process)
         self.assertEqual(peer_message.pending_delivery_recipient(bound), bound["bound_to"])
         self.assertEqual(bound["text"], text)
         self.assertIsNone(bound.get("body_ref"))
@@ -951,18 +960,24 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
             text, {"harness": "codex", "session_id": "new-thread"}, include_ref=True)
         self.assertEqual(parsed["transfer_ref"], ref)
         self.assertIsNone(peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "different-thread", "pane_id": "w1:pX"}))
+            ref, {"harness": "codex", "session_id": "different-thread", "pane_id": "w1:pX"},
+            process_proof=process))
 
     def test_no_trailer_pending_is_observed_as_queued_without_claiming_receiver_ack(self):
         recipient = {"harness": "claude", "session_id": None, "name": "fresh",
                      "pane_id": "w2:p1"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "claude",
+                   "pane_id": "w2:p1", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
         text, ref = peer_message.prepare_peer_message(
-            "plain user message", self.sender, recipient, defer=True, with_trailer=False)
+            "plain user message", self.sender, recipient, defer=True, with_trailer=False,
+            first_input_process=process)
         self.assertEqual(text, "plain user message")
         row = peer_message._read_pending(ref)
         self.assertTrue(row["no_trailer"])
         bound = peer_message.bind_pending_recipient(
-            ref, {"harness": "claude", "session_id": "resolved-session", "pane_id": "w2:p1"})
+            ref, {"harness": "claude", "session_id": "resolved-session", "pane_id": "w2:p1"},
+            process_proof=process)
         claim = peer_message.claim_pending_herdr(ref, peer_message.pending_delivery_recipient(bound))
         self.assertIsNotNone(claim)
         self.assertTrue(peer_message.mark_pending_queued(ref))
@@ -971,6 +986,91 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(current.get("rpc_claim"))
         self.assertIsNone(peer_message.parse_peer_trailer(text, {
             "harness": "claude", "session_id": "resolved-session"}, include_ref=True))
+
+    def test_sidless_first_input_claim_submits_once_and_only_exact_trailer_receives(self):
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        text, ref = peer_message.prepare_peer_message(
+            "[steer] first peer turn", self.sender, recipient, defer=True,
+            first_input_process=process)
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"}))
+        claim = peer_message.claim_pending_first_input(ref,
+            {"harness": "codex", "pane_id": "w1:pX"}, process)
+        self.assertIsNotNone(claim)
+        self.assertIsNone(peer_message.claim_pending_first_input(ref,
+            {"harness": "codex", "pane_id": "w1:pX"}, process))
+        self.assertTrue(peer_message.mark_pending_prompt_queued(
+            ref, claim["rpc_claim"], receipt="native-first-input-submitted"))
+        queued = peer_message._read_pending(ref)
+        self.assertEqual((queued["state"], queued["receipt"]),
+                         ("queued", "native-first-input-submitted"))
+        self.assertNotIn("bound_to", queued)
+        self.assertEqual(peer_message.receive_peer_message("text without the sealed trailer", {
+            "harness": "codex", "session_id": "new-thread"}), 0)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        with mock.patch.object(peer_message, "_first_input_process_is_current", return_value=False):
+            self.assertEqual(peer_message.receive_peer_message(text, {
+                "harness": "codex", "session_id": "new-thread"}), 0)
+        self.assertIsNone(peer_message._read_pending(ref).get("bound_to"))
+        with mock.patch.object(peer_message, "_first_input_process_is_current", return_value=True):
+            self.assertEqual(peer_message.receive_peer_message(text, {
+                "harness": "codex", "session_id": "new-thread"}), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual((received["state"], received["receipt"],
+                          received["bound_to"]["session_id"]),
+                         ("received", "exact-peer-ref", "new-thread"))
+        records = [json.loads(line) for line in
+                   self._ledger_file(self.sender["session_id"]).read_text().splitlines()]
+        notices = [row for row in records
+                   if row.get("transfer_ref") == ref and row.get("kind") == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual((notices[0]["from"]["harness"], notices[0]["from"]["session_id"],
+                          notices[0]["to"]["session_id"]),
+                         (self.sender["harness"], self.sender["session_id"], "new-thread"))
+
+    def test_codex_receiver_proof_matches_original_pid_start_namespace_and_pane(self):
+        if str(_HERE) not in sys.path:
+            sys.path.insert(0, str(_HERE))
+        import pane_ownership
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": 4242, "start": "123",
+                 "pid_namespace": "pid:[77]"}
+        binding = {"pid": 4242, "pid_start": "123", "pane": "w1:pX"}
+        real_readlink = os.readlink
+        def readlink(target, namespace="pid:[77]", own_namespace="pid:[77]"):
+            if str(target) == "/proc/4242/ns/pid":
+                return namespace
+            if str(target) == "/proc/self/ns/pid":
+                return own_namespace
+            return real_readlink(target)
+        with mock.patch.object(peer_message.os, "readlink", side_effect=readlink), \
+             mock.patch.object(pane_ownership, "codex_tui_process_bindings", return_value=[binding]):
+            self.assertTrue(peer_message._first_input_process_is_current(proof, "thread-new"))
+        for changed in (dict(binding, pid=4243), dict(binding, pid_start="456"),
+                        dict(binding, pane="w1:pOther")):
+            with self.subTest(binding=changed), \
+                 mock.patch.object(peer_message.os, "readlink", side_effect=readlink), \
+                 mock.patch.object(pane_ownership, "codex_tui_process_bindings",
+                                   return_value=[changed]):
+                self.assertFalse(peer_message._first_input_process_is_current(
+                    proof, "thread-new"))
+        with mock.patch.object(peer_message.os, "readlink",
+                               side_effect=lambda target: readlink(target, namespace="pid:[other]")), \
+             mock.patch.object(pane_ownership, "codex_tui_process_bindings", return_value=[binding]):
+            self.assertFalse(peer_message._first_input_process_is_current(proof, "thread-new"))
+
+    def test_sidless_old_rows_without_process_proof_remain_unbindable(self):
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        _text, ref = peer_message.prepare_peer_message(
+            "old pending message", self.sender, recipient, defer=True)
+        self.assertIsNone(peer_message.pending_first_input_process(peer_message._read_pending(ref)))
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"}))
 
     def test_exact_claude_prompt_claim_can_be_queued_but_only_receiver_ref_acks(self):
         recipient = {"harness": "claude", "session_id": "claude-target"}

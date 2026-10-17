@@ -66,6 +66,31 @@ class PinnedSourceTest(unittest.TestCase):
         self.assertEqual([item["path"] for item in receipt["assets"]],
                          ["herdr-agent-state.sh"])
 
+    def test_configured_codex_session_command_parses_and_runs_in_fake_codex_home(self):
+        hooks = json.loads((ROOT / "adapters/codex/hooks/hooks.json").read_text(encoding="utf-8"))
+        commands = [item["command"] for group in hooks["hooks"]["SessionStart"]
+                    for item in group.get("hooks", [])]
+        self.assertIn(herdr.CODEX_SESSION_COMMAND, commands)
+        with tempfile.TemporaryDirectory(prefix="codex session command ") as temporary:
+            home = Path(temporary) / "codex home"
+            home.mkdir()
+            marker = Path(temporary) / "invoked.txt"
+            helper = home / "herdr-agent-state.sh"
+            helper.write_text('#!/bin/sh\nprintf "%s\\n" "$1" > "$CODEX_HOOK_MARKER"\n',
+                              encoding="utf-8")
+            helper.chmod(0o700)
+            env = {**os.environ, "HOME": str(Path(temporary) / "home"),
+                   "CODEX_HOME": str(home), "CODEX_HOOK_MARKER": str(marker)}
+            env.pop("HERDR_SOCKET_PATH", None)
+            env.pop("HERDR_PANE_ID", None)
+            syntax = subprocess.run(["bash", "-n", "-c", herdr.CODEX_SESSION_COMMAND],
+                                    text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+            result = subprocess.run(["bash", "-c", herdr.CODEX_SESSION_COMMAND],
+                                    text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "session\n")
+
     def test_hearting_update_adopts_only_the_matching_herdr_owned_file(self):
         with tempfile.TemporaryDirectory(prefix="herdr-asset-adoption-") as temporary:
             root = Path(temporary)
@@ -504,15 +529,17 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 }, allowed=False, launch_argv=launch)
                 self.assertIsNone(request)
 
-    def test_codex_display_projection_does_not_compute_inactive_session_lifecycle(self):
+    def test_codex_display_projection_carries_native_lifecycle_to_reporter(self):
         path = ROOT / "adapters" / "codex" / "hooks" / "herdr_session_projection.py"
         module_spec = importlib.util.spec_from_file_location("herdr_session_projection_fixture", path)
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         with mock.patch.object(module, "_project", return_value=True) as project, \
-                mock.patch.object(module.subprocess, "Popen"):
+                mock.patch.object(module.subprocess, "Popen"), \
+                mock.patch.object(module.time, "time_ns", return_value=123456):
             module.project({"hook_event_name": "SessionStart", "source": "resume"}, "ses-A")
-        project.assert_called_once_with("codex", "ses-A", worker=False, report_session=False)
+        project.assert_called_once_with("codex", "ses-A", worker=False, report_session=True,
+                                        session_seq=123456, session_start_source="resume")
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for the asset registration fixture")
