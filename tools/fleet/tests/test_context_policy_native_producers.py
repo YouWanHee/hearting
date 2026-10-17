@@ -499,7 +499,8 @@ class CodexRegisteredTest(_CodexFixture, unittest.TestCase):
         Path(path).write_text("".join(json.dumps(row) + "\n" for row in rows))
         job = self._job(760_000, 200_000)
         job._registry_metadata = {"runtime_home": self.home}
-        payload, row = self._collect(job)
+        with mock.patch("fleet.collectors.dispatch._native_home_admitted", return_value=True):
+            payload, row = self._collect(job)
         self.assertEqual(payload["context_display_window_tokens"], 400_000)
         self.assertEqual(payload["ctx_pct"], 50)
         self.assertIn("50%", row)

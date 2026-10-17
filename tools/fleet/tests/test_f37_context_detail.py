@@ -799,7 +799,8 @@ class ClaudeStreamSessionTest(unittest.TestCase):
              "modelUsage": {"claude-opus-5-5": {"contextWindow": 1000000}}},
         ], home=worker_home)
 
-        dispatch_collector._enrich_claude_stream_session(job)
+        with mock.patch.object(dispatch_collector, "_native_home_admitted", return_value=True):
+            dispatch_collector._enrich_claude_stream_session(job)
 
         self.assertEqual(job._runtime_session_id, sid)
         self.assertEqual(job.resolved_model, "claude-opus-5-5")

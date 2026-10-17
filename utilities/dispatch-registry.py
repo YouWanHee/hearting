@@ -1771,6 +1771,12 @@ def reconcile(rows, args):
         # backstop and the single declared expiry actor share its cadence
         # rather than introducing a new driver process.
         record["pending_delivery"] = {"applied": reconcile_pending_delivery(args.jobs)}
+        # The same bounded cadence retires expired per-attempt worker homes.
+        try:
+            from worker_home_retention import sweep
+            record["worker_homes"] = sweep(args.jobs)
+        except Exception as exc:  # noqa: BLE001 -- the report must not fail on it
+            record["worker_homes"] = {"error": type(exc).__name__}
     else:
         # Dry-run surface for the SD-111 §(7) v67 retention prune: the plan
         # counts only (the `dispatch_pending_delivery.py prune` CLI prints the

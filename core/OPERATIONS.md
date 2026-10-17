@@ -324,6 +324,53 @@ the observed runtime-home location is launch metadata, like its process identity
 and does not turn a duplicate start into a different assignment. Fleet's native
 observations use that attempt's recorded home across the three harnesses.
 
+**Per-attempt home retention.** A per-attempt home under `homes/workers/<key>`
+retires itself once its attempt has been terminal, quiescent and unused for seven
+days; no user command, flag, daemon or approval is involved. The pass runs at the end
+of every post-exit reaper and in a `reconcile --apply` that is not scoped to one exact attempt. It is due at
+most every five minutes, examines at most 32 homes (a fair cursor), and removes at
+most four destructively touched homes, including partial leftovers of an interrupted removal. The seven-day clock starts
+at the first pass that proves every protection below, because terminal rows record
+no close time; uncertain prepared evidence defers without restarting an established
+clock, while freshly observed renewed protection restarts it. Later activity (a Fleet
+view, a route outcome, a resolved delivery, a recovery record, a supervisor update,
+or a write to the home) extends it, including activity arriving before detach. A home is
+kept while: its row is not terminal; any open row references the attempt; a
+by-source replacement reservation or claim, a recovery-attention record or a
+pending delivery intent is unresolved or unreadable; only actual attempt IDs in
+delivery records protect worker homes (a depth-1 `-` parent and session notice
+identities refer to no worker home); a delivery record or group
+is malformed, unreadable or unattributable; a pruned delivery has only a legacy
+zero-byte or mismatched tombstone; its route is open, missing or its
+binding is unreadable; a terminal replacement successor still has unresolved
+route or delivery obligations; a summary owner or the supervisor lease is live or
+unverifiable; process quiescence is not proven; Fleet displayed it within the
+window; or its `.credentials.json` is a regular file, which a Claude native refresh
+left in place of the link and which may hold the only copy of a rotated token. A home
+is also kept, and counted rather than hidden in
+`homes/worker-retention/state.json`, when its attempt cannot be proven from the
+manifest, the row's `runtime_home` and the legacy key; shared `homes/codex`,
+`<slug>.<profile>` and `destination=` homes are not enumerated. Detaching is one
+rename into `homes/worker-retention/retiring/` under a nonblocking registry lock
+and a reader-mark lock. Evidence is prepared outside the registry lock; its
+freshness and the full idle clock are checked before rename. Per-detach freshness
+covers candidate-relevant evidence; out-of-protocol late writes into unrelated
+historical delivery groups are caught by the next pass's discovery. Available,
+compatible mount identities are proved before detachment. Complete malformed
+registry lines are skipped, while a torn final append leaves the pass uncertain. The
+tree is then removed outside every lock, by directory descriptor, without following
+a link or crossing the detached leaf's mount boundary. Deletion belongs to this pass alone,
+outside the builder, Fleet, the installer and registry critical sections. Fleet
+admits excluded native homes without retention bookkeeping and admits each candidate
+native-home read through a valid recent marker written at most hourly;
+if admission cannot be proved promptly, independent attempt summaries, titles and
+streams remain available while native-home reads are withheld. A
+post-exit reaper pass runs only after that reaper exits; selector-less reconcile
+also carries the sweep when normal work invokes it. Neither carrier promises a
+wall-clock cleanup deadline on a machine with no later normal work. Older
+cross-namespace owner evidence without a host-visible death receipt remains
+unknown and keeps its home.
+
 **Inline exceptions.** Main or a dispatch-depth-1 owner may run such work inline only when at least one holds: the work is `direct` scale or a micro-stage inside the checked `quick` one-shot owner; file or state boundaries make it genuinely non-separable; every route-sealed registered-headless candidate has a typed hard-unavailable result and the compiled fallback policy reaches inline; the work is tightly coupled to external GPU or process state a worker cannot reach; the user explicitly requires main-session execution; or the stage is so small that dispatch overhead clearly exceeds it. A native-subagent restriction is surface-local and is never evidence that registered headless is unavailable. A failed hook-trust or worktree-safety check is a stop/re-isolate condition, not inline authority; `failure_scope=exact-worktree,retry_on_isolated_worktree=1` retains the stricter fail-close rule below. Running `standard+` separable work inline without recording the concrete reason — in `plans/<slug>/_internal/metrics.md` for code cycles, or the experiment `_RUNLOG`/`_internal` for lab cycles — is a contract violation; this generalizes SD-17 beyond code stages.
 
 **Durable capability participation.** A capability route is required before the first durable write under a capability-owned artifact bucket, including `direct`; direct means an inline node in a compiled route, not route absence. A route card, Skill/capability grounding marker, `pipeline_state.yaml` field such as `execution: inline`, or a failed native-subagent probe is not participation proof. Main sessions bind the checked route to the exact session/cwd; registered workers use their immutable route environment. Standard+ artifact writes therefore fail closed when route compilation fails, before public or `_internal` output can be used as retroactive authority.

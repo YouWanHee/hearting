@@ -627,6 +627,11 @@ class PruneTest(IsolatedRootMixin, unittest.TestCase):
         self.assertFalse(old_acked.with_name(old_acked.name + ".lock").exists())
         tomb = PD.tombstone_path(old_acked)
         self.assertTrue(tomb.is_file(), "the tombstone is what stops re-materialization (B1)")
+        proof = json.loads(tomb.read_text())
+        self.assertEqual(proof["schema"], PD.PRUNE_TOMBSTONE_SCHEMA)
+        self.assertEqual(proof["delivery_id"], old_acked.name[:-5])
+        self.assertEqual(proof["recipient_digest"], old_acked.parent.name)
+        self.assertEqual(proof["terminal_state"], "acked")
         self.assertTrue(old_acked.parent.is_dir(), "recipient directories are never removed")
         # a second prune sees nothing to do and creates no orphan lock
         again = PD.prune(self.root, apply=True)

@@ -42,6 +42,7 @@ from dispatch_contract import (  # noqa: E402
     process_launch_identity,
     process_namespace_identity,
     process_observation,
+    recorded_pid_namespace_state,
     review_governed_lease_path,
     review_governed_lease_payload,
 )
@@ -241,6 +242,58 @@ def _owner_live(metadata: dict[str, str]) -> bool:
     ):
         return _proc_live(int(host_pid), host_start)[0]
     return False
+
+
+def owner_process_state(metadata: dict[str, str]) -> str:
+    """Three-way view of the same owner evidence `_owner_live` reads.
+
+    ``live``    the declared owner is provably running;
+    ``dead``    the declared owner is provably gone (absent, a reused pid or a zombie);
+    ``absent``  the row declares no summary owner;
+    ``unknown`` declared, but unreadable, malformed, or not observable from here.
+
+    `_owner_live` folds the last two into False, which is wrong for a caller that
+    must not act on a guess.
+    """
+
+    declared = ("summary_owner_pid", "summary_owner_pid_start",
+                "summary_state_file", "summary_owner_pid_observer_ns")
+    if not any(metadata.get(key) for key in declared):
+        return "absent"
+    if _owner_live(metadata):
+        return "live"
+    raw_pid = metadata.get("summary_owner_pid", "")
+    expected = metadata.get("summary_owner_pid_start", "")
+    observer_namespace = metadata.get("summary_owner_pid_observer_ns", "")
+    if not raw_pid.isdigit() or not expected or not observer_namespace:
+        return "unknown"
+    current_namespace = process_namespace_identity()
+    if current_namespace is None:
+        return "unknown"
+    if current_namespace == observer_namespace:
+        pid, start = int(raw_pid), expected
+    elif (
+        metadata.get("summary_owner_pid_host", "").isdigit()
+        and metadata.get("summary_owner_pid_host_start")
+        and current_namespace == metadata.get("summary_owner_pid_host_ns")
+        and metadata.get("summary_owner_pid_host_proof") == PID_HOST_NAMESPACE_PROOF
+    ):
+        pid, start = int(metadata["summary_owner_pid_host"]), metadata["summary_owner_pid_host_start"]
+    elif recorded_pid_namespace_state(observer_namespace) == "extinct":
+        # A process never leaves its PID namespace: once that namespace has left the
+        # host, the owner cannot be running anywhere.
+        return "dead"
+    else:
+        return "unknown"
+    visibility, actual_start, state = process_observation(pid)
+    if visibility == "missing":
+        return "dead"
+    if visibility != "present":
+        return "unknown"
+    if actual_start != start or state == "Z":
+        return "dead"
+    # The exact process is alive although its state file no longer vouches for it.
+    return "unknown"
 
 
 def _owner_env() -> dict[str, str]:

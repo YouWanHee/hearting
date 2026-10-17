@@ -92,13 +92,14 @@ EXPIRY_ACTOR = "dispatch-reconcile"
 # then pruned by the same single declared actor (the dispatch reconcile path);
 # open-state records are never pruned whatever their age. Ages are file mtimes:
 # the terminal transition is the record's last write. A pruned record leaves a
-# zero-byte tombstone (`<record>.json.pruned`, never deleted) so the
+# binding-bearing tombstone (`<record>.json.pruned`, never deleted) so the
 # materialize backstop cannot resurrect it from the append-only jobs.log row
 # (review round 1, B1).
 TERMINAL_STATES = frozenset({"acked", "expired", "rejected"})
 TERMINAL_RETENTION_SECONDS = 7 * 86400
 ORPHAN_LOCK_RETENTION_SECONDS = 24 * 3600
 TOMBSTONE_SUFFIX = ".pruned"
+PRUNE_TOMBSTONE_SCHEMA = "delivery-prune-v1"
 _LOCK_REOPEN_LIMIT = 16
 
 REQUIRED_FIELDS = (
@@ -811,6 +812,29 @@ def tombstone_path(record_file: Path) -> Path:
     return record_file.with_name(record_file.name + TOMBSTONE_SUFFIX)
 
 
+def _write_prune_tombstone(record_file: Path, value: dict) -> None:
+    """Bind a pruned terminal obligation before unlinking its record."""
+    tomb = tombstone_path(record_file)
+    proof = {"schema": PRUNE_TOMBSTONE_SCHEMA,
+             "delivery_id": value["delivery_id"],
+             "recipient_digest": value["recipient_digest"],
+             "attempt_ids": value["attempt_ids"],
+             "parent_attempt_id": value["parent_attempt_id"],
+             "terminal_state": value["state"]}
+    fd, temp_name = tempfile.mkstemp(prefix=f".{tomb.name}.", dir=str(tomb.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(proof, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, tomb)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
 def prune_plan(
     root: Path,
     *,
@@ -932,7 +956,7 @@ def prune(
                 ):
                     result["skipped"] += 1
                     continue
-                tombstone_path(path).touch(mode=FILE_MODE, exist_ok=True)
+                _write_prune_tombstone(path, value)
                 path.unlink()
                 try:
                     lock_path.unlink()

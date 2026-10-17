@@ -464,7 +464,16 @@ def main(argv=None) -> int:
             "--drain-interval-max must be >= --interval and --residue-grace >= 0"
         )
     args.jobs = args.jobs.resolve()
-    return watch(args)
+    result = watch(args)
+    # Every drain, receipt and delivery obligation of this attempt is settled by
+    # now. The tail is where an expired per-attempt home is retired, so no user
+    # command is needed; it can never change this watcher's own outcome.
+    try:
+        from worker_home_retention import sweep_best_effort
+        sweep_best_effort(args.jobs)
+    except Exception:  # noqa: BLE001
+        pass
+    return result
 
 
 if __name__ == "__main__":
