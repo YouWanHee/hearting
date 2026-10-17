@@ -1490,6 +1490,42 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(calls, ["thread/queue/list", "thread/queue/add"])
         self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
 
+    def test_actual_observer_publish_failure_keeps_attempt_unverified_without_readd(self):
+        import codex_queue_delivery as queue
+        _text, ref = self.pending("accepted then unpublishable")
+        calls = []
+
+        def rpc(_path, method, _params, *, timeout):
+            calls.append(method)
+            if method == "thread/queue/list":
+                return {"data": [], "nextCursor": None}
+            if method == "thread/queue/add":
+                return {"queuedSubmission": {"id": "native-item"}}
+            self.fail(f"unexpected native RPC: {method}")
+
+        save_pending = peer_message._save_pending
+
+        def fail_queued_publish(row):
+            if row["state"] == "queued":
+                raise OSError("fixture-publish-failure")
+            save_pending(row)
+
+        with mock.patch.object(queue, "_rpc", side_effect=rpc), \
+             mock.patch.object(peer_message, "_save_pending", side_effect=fail_queued_publish):
+            with self.assertRaisesRegex(OSError, "fixture-publish-failure"):
+                peer_message.deliver_pending_codex(ref)
+        after_failure = peer_message._read_pending(ref)
+        self.assertEqual(after_failure["state"], "unverified")
+        self.assertIsInstance(after_failure.get("rpc_claim"), dict)
+
+        with mock.patch("dispatch_contract.process_identity_disposition", return_value="dead"), \
+             mock.patch.object(queue, "_rpc", side_effect=rpc):
+            replay = peer_message.deliver_pending_codex(ref)
+        self.assertEqual(replay["status"], "unverified")
+        self.assertEqual(calls, ["thread/queue/list", "thread/queue/add", "thread/queue/list"])
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        self.assertFalse(self._ledger_file("sender").exists())
+
     def test_actual_observer_concurrent_claim_other_ref_and_receiver_ack_race(self):
         import codex_queue_delivery as queue
         text, ref = self.pending("first exact peer body")
