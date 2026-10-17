@@ -1583,7 +1583,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         # this repo checkout is that checkout.
         self.agent_home = MODULE_PATH.parents[1]
         self.environment = mock.patch.dict(
-            os.environ, {"AGENT_HOME": str(self.agent_home), "AGENT_DISPATCH_JOBS": str(self.jobs)},
+            os.environ, {
+                "AGENT_HOME": str(self.agent_home),
+                "AGENT_DISPATCH_JOBS": str(self.jobs),
+                "HOME": str(self.root / "home"),
+                "XDG_STATE_HOME": str(self.root / "xdg-state"),
+                "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+                "HARNESS_STATE_ROOT": str(self.root / "harness-state"),
+                "AGENT_PEER_LEDGER_ROOT": str(self.root / "peer-ledger"),
+                "CODEX_HOME": str(self.root / "home" / ".codex"),
+                "CLAUDE_CONFIG_DIR": str(self.root / "home" / ".claude"),
+            },
             clear=False
         )
         self.environment.start()
@@ -1627,8 +1637,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             f"{stamp}\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
         )
 
-    def _close_and_materialize(self):
-        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-marker"))
+    def _close_and_materialize(self, note="completed-marker"):
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", note))
         fields = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")
         path = JOIN.materialize_pending_delivery(self.jobs, fields)
         self.assertIsNotNone(path)
@@ -1670,10 +1680,23 @@ class CarrierOneClaimGateTest(unittest.TestCase):
     def test_a_notice_consumed_by_another_carrier_suppresses_its_deferred_peer_payload(self):
         self._check_restored_courier(immediate=False, other_carrier=True)
 
-    def _check_restored_courier(self, *, immediate, other_carrier=False):
+    def test_repeated_received_callback_repairs_ack_after_transient_failure(self):
+        self._check_restored_courier(immediate=True, recovery="repeat-receive")
+
+    def test_retained_courier_repairs_ack_after_reclaim_without_resend(self):
+        self._check_restored_courier(immediate=True, recovery="courier-reentry",
+                                     close_note="dead-worker-fail")
+
+    def test_new_courier_instance_repairs_ack_after_receiver_interruption(self):
+        self._check_restored_courier(immediate=True, recovery="crash-before-ack")
+
+    def _check_restored_courier(self, *, immediate, other_carrier=False, recovery=None,
+                                close_note="completed-marker"):
         spec = importlib.util.spec_from_file_location("restored_steward_test", ROOT / "utilities/peer-steward.py")
         steward = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(steward)
+        import codex_queue_delivery
+        import codex_queue_dispatch
         from dispatch_session_sweep import activate, sweep_deliver
         self.enterContext(mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.root)}))
         self.enterContext(mock.patch.object(steward.peer_obligations, "ensure_normal_runner"))
@@ -1682,7 +1705,7 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 self._open_row()
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
-                path = self._close_and_materialize()
+                path = self._close_and_materialize(close_note)
                 with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):
                     activate(self.root, carrier, "session-1")
                 store = rewake.peer_obligations.ObligationStore(self.root)
@@ -1691,40 +1714,126 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 agents = {"result": {"agents": []}}
                 real_prompt = steward.cmd_prompt
                 delivered = []
+                sent_texts = []
+                prepared_refs = []
+                real_write = rewake.pending_delivery._write_unlocked
+                real_receiver_ack = steward.peer_message._ack_registered_delivery
+                ack_failure = {"remaining": (
+                    (2 if harness == "codex" else 1)
+                    if recovery in {"repeat-receive", "courier-reentry"} else 0
+                )}
+                crash_failure = {"remaining": 1 if recovery == "crash-before-ack" else 0}
+                def write_record(path, value):
+                    if ack_failure["remaining"] and value.get("state") == "acked":
+                        ack_failure["remaining"] -= 1
+                        raise OSError("simulated received-delivery ACK write failure")
+                    return real_write(path, value)
+                def receiver_ack(received):
+                    if crash_failure["remaining"]:
+                        crash_failure["remaining"] -= 1
+                        raise SystemExit("simulated interruption after received persistence")
+                    return real_receiver_ack(received)
+                real_bind = steward.peer_message.bind_dispatch_notice
+                def bind(ref, binding):
+                    prepared_refs.append(ref)
+                    return real_bind(ref, binding)
+
+                def receive_native(text):
+                    sent_texts.append(text)
+                    record = json.loads(path.read_text())
+                    self.assertGreater(record["claim_deadline_ns"], time.monotonic_ns())
+                    self.assertEqual(sweep_deliver(self.root, carrier, "session-1")[0], [])
+                    ref = steward.peer_message.parse_peer_trailer(
+                        text, {"harness": harness, "session_id": "session-1"}, include_ref=True
+                    )["transfer_ref"]
+                    if harness == "claude":
+                        # Claude's existing UserPromptSubmit context carrier emits the exact
+                        # pending row; context emission is still not receiver acknowledgement.
+                        stream = io.StringIO()
+                        steward.peer_message.emit_peer_context(
+                            {"harness": harness, "session_id": "session-1"},
+                            "UserPromptSubmit", stream=stream)
+                        emitted = json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"]
+                        self.assertIn(text, emitted)
+                        text = emitted
+                    elif harness == "opencode":
+                        # Match the plugin's existing promptAsync acceptance transition.
+                        message_id = "opencode-item-" + ref
+                        queued = steward.peer_message.argparse.Namespace(
+                            to_harness=harness, to_session_id="session-1", claim=None,
+                            queued=ref, resuming=None, received=None, message_id=message_id)
+                        self.assertEqual(steward.peer_message.cmd_pending(queued), 0)
+                    self.assertEqual(steward.peer_message.receive_peer_message(text, {
+                        "harness": harness, "session_id": "session-1"}), 0)
+                    if harness == "opencode":
+                        received = steward.peer_message.argparse.Namespace(
+                            to_harness=harness, to_session_id="session-1", claim=None,
+                            queued=None, resuming=None, received=ref, message_id=message_id)
+                        self.assertEqual(steward.peer_message.cmd_pending(received), 0)
+                    delivered.append(text)
+
+                native_sends = []
+                def codex_native_send(_socket, *, thread_id, client_message_id, message,
+                                      before_add, **_options):
+                    native_sends.append((thread_id, client_message_id, message))
+                    self.assertEqual(thread_id, "session-1")
+                    self.assertEqual(client_message_id, "delivery-peer-" + prepared_refs[0])
+                    before_add()
+                    if not immediate:
+                        return {"status": "queued", "queued_submission_id": "queue-item-1"}
+                    receive_native(message)
+                    return {"status": "consumed", "queued_submission_id": None}
+
                 def prompt(args, **kwargs):
-                    # Run the real preparation and dispatch binding. Only the external
-                    # transport is substituted; no timer expiry is involved.
-                    def receive(text):
-                        record = json.loads(path.read_text())
-                        self.assertGreater(record["claim_deadline_ns"], time.monotonic_ns())
-                        self.assertEqual(sweep_deliver(self.root, carrier, "session-1")[0], [])
-                        self.assertEqual(steward.peer_message.receive_peer_message(text, {
-                            "harness": harness, "session_id": "session-1"}), 0)
-                        delivered.append(text)
-                    def herdr_prompt(target, text, **options):
-                        receive(text)
-                        return 0, {}
-                    def queue(ref):
-                        if not immediate:
-                            return {"status": "queued", "reason": "native-queue-accepted"}
-                        receive(steward.peer_message._read_pending(ref)["text"])
-                        return {"status": "received", "reason": "exact-peer-ref"}
-                    with mock.patch.object(steward, "_herdr_missing", return_value=False), \
+                    # Keep native claim/receiver accounting real. Only Codex's external
+                    # socket API is replaced; Claude/OpenCode callbacks use their existing
+                    # native context/pending transitions and exact-session receiver.
+                    with mock.patch.object(rewake.pending_delivery, "_write_unlocked",
+                                           side_effect=write_record), \
+                            mock.patch.object(steward.peer_message, "_ack_registered_delivery",
+                                              side_effect=receiver_ack), \
+                            mock.patch.object(steward.peer_message, "bind_dispatch_notice", side_effect=bind), \
+                            mock.patch.object(steward, "_herdr_missing", return_value=False), \
                             mock.patch.object(steward, "_current_session_identity", return_value=("sender-1", "claude")), \
                             mock.patch.object(steward, "_from_name", return_value="fixture"), \
                             mock.patch.object(steward, "_agent_state", return_value=("idle", "w1:p9")), \
-                            mock.patch.object(steward, "_prompt_input_reason",
-                                return_value=None if immediate else "target-form-open"), \
+                            mock.patch.object(steward, "_pane_readiness", return_value=type(
+                                "Ready", (), {"state": "ready", "reason": ""})()), \
                             mock.patch.object(steward, "_flush_pending_for_target", return_value=(0, 0)), \
                             mock.patch.object(steward, "_schedule_message_obligation") as scheduled, \
-                            mock.patch.object(steward, "_herdr_prompt", side_effect=herdr_prompt), \
-                            mock.patch.object(steward.peer_message, "deliver_pending_codex", side_effect=queue), \
+                            mock.patch.object(steward, "_herdr_prompt",
+                                              side_effect=AssertionError("native courier used PTY prompt")), \
+                            mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                              return_value=self.root / "codex.sock"), \
+                            mock.patch.object(codex_queue_delivery, "send_at_least_once",
+                                              side_effect=codex_native_send), \
                             mock.patch.object(steward, "_record"):
                         code = real_prompt(args, **kwargs)
-                        scheduled.assert_called_once()
+                        if harness == "codex":
+                            scheduled.assert_not_called()
+                        else:
+                            scheduled.assert_called_once()
+                        if immediate and harness in {"claude", "opencode"}:
+                            receive_native(steward.peer_message._read_pending(prepared_refs[0])["text"])
+                        if immediate and recovery is None:
+                            received = steward.peer_message._read_pending(prepared_refs[0])
+                            with mock.patch.object(
+                                    steward.peer_message, "_observe_continue_receipt",
+                                    wraps=steward.peer_message._observe_continue_receipt) as observe, \
+                                    mock.patch.object(steward.peer_message, "_ack_registered_delivery",
+                                                      wraps=real_receiver_ack) as repair_ack:
+                                self.assertEqual(
+                                    steward.peer_message.deliver_pending_codex(prepared_refs[0])["status"],
+                                    "received")
+                            observe.assert_called_once_with(
+                                steward.peer_message.pending_delivery_recipient(received) or {},
+                                prepared_refs[0])
+                            repair_ack.assert_called_once_with(received)
                         return code
                 with mock.patch.object(steward.subprocess, "run", side_effect=lambda *a, **kw:
                         type("Reply", (), {"stdout": json.dumps(agents), "returncode": 0})()), \
+                        mock.patch.object(rewake.pending_delivery, "claim",
+                                          wraps=rewake.pending_delivery.claim) as claim_spy, \
                         mock.patch.object(steward, "_resolve_target", return_value=(harness, "session-1", None)), \
                         mock.patch.object(steward, "cmd_prompt", side_effect=prompt) as prompt_call:
                     steward._resume_registered_obligation(duty, store)
@@ -1733,17 +1842,27 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                     self.assertEqual(store.get(duty["id"])["observation"]["reason"], "recipient-unavailable")
                     agents["result"]["agents"] = [{"agent": harness, "pane_id": "w1:p9",
                                                     "agent_session": {"value": "session-1"}}]
-                    steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    if recovery == "crash-before-ack":
+                        with self.assertRaisesRegex(SystemExit, "after received persistence"):
+                            steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    else:
+                        steward._resume_registered_obligation(store.get(duty["id"]), store)
                     self.assertEqual(prompt_call.call_count, 1)
                     self.assertEqual(prompt_call.call_args.kwargs["expected_recipient"], (harness, "session-1"))
+                    self.assertTrue(any(call.kwargs.get("jobs") == self.jobs
+                                        for call in claim_spy.call_args_list))
                     if not immediate:
                         queued = store.get(duty["id"])
                         self.assertEqual(queued["state"], "pending")
                         self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
                         transfer = steward.peer_message._read_pending(queued["observation"]["transfer_ref"])
                         text = transfer["text"]
+                        if harness == "codex":
+                            self.assertEqual(transfer["state"], "queued")
+                            self.assertEqual(len(native_sends), 1)
                         steward._resume_registered_obligation(queued, store)
                         self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(native_sends), 1 if harness == "codex" else 0)
                         # An unrelated session and an altered body cannot consume the notice.
                         steward.peer_message.receive_peer_message(text, {"harness": harness, "session_id": "stranger"})
                         steward.peer_message.receive_peer_message("altered " + text, {"harness": harness, "session_id": "session-1"})
@@ -1756,23 +1875,72 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                             self.assertIsNone(steward.peer_message.claim_pending_herdr(transfer["ref"], transfer["to"]))
                             self.assertEqual(steward.peer_message.deliver_pending_codex(transfer["ref"])["status"], "not-required")
                             msg = store.get("message-" + transfer["ref"])
-                            self.assertIsNotNone(msg)
-                            with mock.patch.object(steward, "_flush_pending_for_target") as resend:
-                                steward._resume_message_obligation(msg, store)
-                                resend.assert_not_called()
-                            self.assertEqual(store.get(msg["id"])["state"], "complete")
-                            self.assertEqual(steward.peer_message._read_pending(transfer["ref"])["state"], "pending")
+                            if harness == "codex":
+                                # The exact-thread queue is the retry owner for Codex;
+                                # this route does not mint a separate peer duty.
+                                self.assertIsNone(msg)
+                                send_count = len(native_sends)
+                                steward.peer_message.retry_pending_codex({
+                                    "harness": harness, "session_id": "session-1"})
+                                self.assertEqual(len(native_sends), send_count)
+                            else:
+                                self.assertIsNotNone(msg)
+                                with mock.patch.object(steward, "_flush_pending_for_target") as resend:
+                                    steward._resume_message_obligation(msg, store)
+                                    resend.assert_not_called()
+                            if msg is not None:
+                                self.assertEqual(store.get(msg["id"])["state"], "complete")
+                            self.assertEqual(
+                                steward.peer_message._read_pending(transfer["ref"])["state"],
+                                "queued" if harness == "codex" else "pending")
                             steward._resume_registered_obligation(queued, store)
                             self.assertEqual(prompt_call.call_count, 1)
                             self.assertEqual(store.get(duty["id"])["state"], "complete")
                             self.jobs.write_text("")
                             continue
-                        self.assertEqual(steward.peer_message.receive_peer_message(text, {
-                            "harness": harness, "session_id": "session-1"}), 0)
-                    else:
+                        receive_native(text)
+                    elif recovery != "crash-before-ack":
                         self.assertEqual(len(delivered), 1)
-                    self.assertEqual(json.loads(path.read_text())["state"], "acked")
-                    self.assertEqual(store.get(duty["id"])["state"], "complete")
+                    if recovery == "repeat-receive":
+                        self.assertIn("required_action=advance-completed", sent_texts[-1])
+                        self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+                        self.assertEqual(steward.peer_message.receive_peer_message(sent_texts[-1], {
+                            "harness": harness, "session_id": "session-1"}), 0)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                    elif recovery == "courier-reentry":
+                        self.assertIn("required_action=inspect-done-failure", sent_texts[-1])
+                        current = json.loads(path.read_text())
+                        current_duty = store.get(duty["id"])
+                        rewake.pending_delivery.reclaim(self.root, "session-1",
+                            current_duty["observation"]["delivery_id"],
+                            now_ns=current["claim_deadline_ns"] + 1)
+                        steward._resume_registered_obligation(current_duty, store)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                        self.assertEqual(len(native_sends), 0 if harness != "codex" else 1)
+                    elif recovery == "crash-before-ack":
+                        self.assertEqual(json.loads(path.read_text())["state"], "claimed")
+                        fresh_spec = importlib.util.spec_from_file_location(
+                            "restarted_steward_test", ROOT / "utilities/peer-steward.py")
+                        fresh = importlib.util.module_from_spec(fresh_spec)
+                        fresh_spec.loader.exec_module(fresh)
+                        with mock.patch.object(fresh.subprocess, "run",
+                                               side_effect=AssertionError("received work must not rerun transport")), \
+                                mock.patch.object(fresh, "cmd_prompt",
+                                                  side_effect=AssertionError("received notice must not be resent")):
+                            fresh._resume_registered_obligation(store.get(duty["id"]), store)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                        self.assertEqual(len(native_sends), 0 if harness != "codex" else 1)
+                        self.assertEqual(store.get(duty["id"])["state"], "complete")
+                    else:
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(store.get(duty["id"])["state"], "complete")
+                        self.assertEqual(len(native_sends), 0 if harness != "codex" else 1)
                 with mock.patch.object(steward, "cmd_prompt") as prompt:
                     steward._resume_registered_obligation(store.get(duty["id"]), store)
                     prompt.assert_not_called()

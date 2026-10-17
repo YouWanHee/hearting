@@ -186,6 +186,26 @@ class PaneOwnershipTest(unittest.TestCase):
                 mock.patch.object(po, "_registered_worker", return_value=False):
             self.assertIsNone(po.codex_tui_pane_endpoint(current, executable=str(self.herdr)))
 
+    def test_endpoint_reads_the_pane_hint_before_the_session_proof(self):
+        from fleet.collectors import procscan
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        owner_env = {"HERDR_PANE_ID": "wB:p3N", "HERDR_SOCKET_PATH": "/owner.sock"}
+        with mock.patch.object(po.os, "listdir", return_value=[str(foreground.pid)]), \
+                mock.patch.object(procscan, "read_environ", return_value=owner_env), \
+                mock.patch.object(po, "_native_session", return_value=current) as proof, \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value=set()), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertIsNone(po.codex_tui_pane_endpoint(
+                current, pane_hint="wB:p9Z", executable=str(self.herdr)))
+            proof.assert_not_called()
+            self.assertEqual(po.codex_tui_pane_endpoint(
+                current, pane_hint="wB:p3N", executable=str(self.herdr)),
+                ("wB:p3N", "/owner.sock"))
+            # The loader's own before/after reads are the whole proof.
+            self.assertEqual(proof.call_count, 2)
+
     def test_codex_hook_can_report_new_thread_only_after_current_footer_proof(self):
         from fleet import herdr_projection as hp
         from fleet.collectors import procscan

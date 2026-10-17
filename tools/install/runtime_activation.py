@@ -41,6 +41,7 @@ import retired_memory_state
 import safe_fs
 import user_model_config
 import codex_tui_config
+import herdr_integration
 
 
 RUNTIMES = ("claude", "codex", "opencode")
@@ -760,13 +761,21 @@ def _linked_entries(
         )
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
+        herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
+        entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
         entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
+        herdr_tui = source_root / "adapters/opencode/tui/herdr-tui-session.js"
+        entries.append(_entry(herdr_tui, home / "tui/herdr-tui-session.js", "hook_config"))
+        herdr_tui_v2 = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
+        entries.append(_entry(herdr_tui_v2, home / "tui/herdr-opencode/tui.js", "hook_config"))
         # Owned scoped TUI config: dormant until an owned launch points
         # OPENCODE_TUI_CONFIG at it. Never auto-read (the loader only reads
         # tui.json/tui.jsonc by name), never merged into user files.
         owned_tui = source_root / "adapters/opencode/tui/owned-tui.json"
         entries.append(_entry(owned_tui, home / "tui/hearting-owned-tui.json", "hook_config"))
+        owned_cli = source_root / "adapters/opencode/tui/owned-cli.json"
+        entries.append(_entry(owned_cli, home / "tui/hearting-owned-cli.json", "hook_config"))
     else:
         raise ActivationError(f"unsupported runtime: {runtime}")
 
@@ -1582,6 +1591,10 @@ def _merge_claude_settings(
             else:
                 conflicts.append(f"env.{key}")
 
+    has_claude_v11 = herdr_integration.version_marker(
+        active_root / "hooks/herdr-agent-state.sh", "claude", 11)
+    changed = herdr_integration.migrate_hook_data(
+        data, "claude", register=has_claude_v11) or changed
     if changed:
         _atomic_json(config, data)
     context_previous = context_before if context_present else None
@@ -2303,11 +2316,12 @@ def _hook_command_files_present(hooks: dict) -> bool:
 
 
 def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Path]:
-    """Return only state plus the narrow Claude field-owned settings leaf."""
+    """Protect user config leaves that integration migration edits additively."""
     paths_owned = [_state_path(runtime, scope)]
     if runtime == "claude":
         paths_owned.append(_config_path(runtime, scope, "settings.json"))
     elif runtime == "codex":
+        paths_owned.append(paths.runtime_home(runtime, scope) / "hooks.json")
         config = _config_path(runtime, scope, "config.toml")
         paths_owned.append(config)
         if config.is_symlink():
@@ -2318,6 +2332,11 @@ def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Pat
             if target != config:
                 paths_owned.append(target)
         paths_owned.append(_config_path(runtime, scope, CODEX_IDENTITY_BACKUP))
+    elif runtime == "opencode":
+        home = paths.runtime_home(runtime, scope)
+        paths_owned.extend(home / name for name in (
+            "tui.json", "tui.jsonc", "cli.json", "cli.jsonc",
+        ))
     return paths_owned
 
 
@@ -2369,9 +2388,26 @@ def _prepare_runtime_config(
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
         result["native_context"] = native
-        return [result]
+        herdr_hook = herdr_integration.migrate_hook_file(
+            paths.runtime_home("codex", scope) / "hooks.json", "codex",
+            source_root=active_root,
+        )
+        return [result, herdr_hook]
     if runtime == "opencode":
-        return [_seed_opencode_tui_entry(active_root, previous, scope)]
+        seeded = _seed_opencode_tui_entry(active_root, previous, scope)
+        registration = herdr_integration.migrate_opencode_configs(
+            paths.runtime_home("opencode", scope), active_root,
+            previous=(previous or {}).get("managed_config", {}).get("herdr_opencode"),
+        )
+        if seeded.get("status") == "seeded":
+            registration["managed_config"]["files"].append({
+                "path": "tui.json",
+                "added": [herdr_integration.OPENCODE_IDENTITY,
+                          herdr_integration.OPENCODE_TUI_V1],
+                "created": True,
+                "seeded": seeded["managed_config"]["seeded"],
+            })
+        return [seeded, registration]
     return []
 
 
@@ -2401,12 +2437,35 @@ def _remove_path(path: Path) -> None:
         raise ActivationError(str(exc)) from exc
 
 
+_HERDR_INSTALL_HEADER = re.compile(r"^(?:#|//)\s*installed by herdr\s*$", re.M)
+_HERDR_INTEGRATION_ID = re.compile(r"^(?:#|//)\s*HERDR_INTEGRATION_ID=(\S+)\s*$", re.M)
+
+
+def _herdr_integration_id(path: Path) -> Optional[str]:
+    """The integration id of a file carrying herdr's own install header, else None."""
+    try:
+        head = path.read_bytes()[:4096].decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if not _HERDR_INSTALL_HEADER.search(head):
+        return None
+    match = _HERDR_INTEGRATION_ID.search(head)
+    return match.group(1) if match else None
+
+
 def _safe_existing_dest(
-    dest: Path, kind: str, owned: set, allowed_link_roots: Sequence[Path]
+    dest: Path, kind: str, owned: set, allowed_link_roots: Sequence[Path],
+    source: Optional[Path] = None,
 ) -> None:
     if not (dest.exists() or dest.is_symlink()):
         return
     if str(dest) in owned:
+        return
+    # herdr overwrites its own integration file on reinstall; hearting now ships the
+    # same integration, so adopt that file (the caller snapshots it first).
+    if (source is not None and kind != "copytree" and not dest.is_symlink() and dest.is_file()
+            and _herdr_integration_id(source) is not None
+            and _herdr_integration_id(dest) == _herdr_integration_id(source)):
         return
     if dest.is_symlink():
         target = dest.resolve(strict=False)
@@ -2774,7 +2833,9 @@ def _apply_transaction(
             seen.add(key)
             _ensure_owned_destination(runtime, dest, scope)
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
-            _safe_existing_dest(dest, kind, owned, allowed_link_roots)
+            source = desired_by_dest.get(key, {}).get("source")
+            _safe_existing_dest(dest, kind, owned, allowed_link_roots,
+                                Path(source) if source else None)
             record = _snapshot_record(dest, backup_root, len(snapshots))
             record["postimage"] = (
                 safe_fs.PathState("missing").public()
@@ -3413,6 +3474,17 @@ def activate(
                     ),
                     None,
                 ),
+                "codex_herdr_hook": next(
+                    (change.get("managed_config") for change in config_changes
+                     if change.get("action") == "herdr-codex-session-hook"
+                     and change.get("managed_config")),
+                    previous_managed.get("codex_herdr_hook") if isinstance(previous_managed, dict) else None,
+                ),
+                "herdr_opencode": next(
+                    (change.get("managed_config") for change in config_changes
+                     if change.get("kind") == "herdr-opencode-registration"),
+                    previous_managed.get("herdr_opencode") if isinstance(previous_managed, dict) else None,
+                ),
                 "codex_conflicts": next(
                     (
                         change["conflicts"]
@@ -3785,8 +3857,16 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
         restored = _unmerge_claude_settings(state, scope, dry_run=dry_run)
     elif runtime == "codex":
         restored = _unmerge_codex_identity_config(state, scope, dry_run=dry_run)
+        managed_hook = (state.get("managed_config") or {}).get("codex_herdr_hook")
+        hook_path = paths.runtime_home("codex", scope) / "hooks.json"
+        if herdr_integration.remove_managed_hook_file(hook_path, managed_hook, dry_run=dry_run):
+            restored.append(str(hook_path))
     elif runtime == "opencode":
         restored = _unseed_opencode_tui_entry(state, scope, dry_run=dry_run)
+        managed_registration = (state.get("managed_config") or {}).get("herdr_opencode")
+        restored.extend(herdr_integration.remove_opencode_configs(
+            paths.runtime_home("opencode", scope), managed_registration or {}, dry_run=dry_run
+        ))
     if not dry_run:
         bundles = paths.harness_state_dir(runtime, scope) / "bundles"
         if bundles.is_dir() and not bundles.is_symlink():

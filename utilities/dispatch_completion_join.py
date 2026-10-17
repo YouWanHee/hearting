@@ -2896,11 +2896,13 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     return matches[0]
 
 
-def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
+def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> ChildRow | None:
     """Return the latest exact registry row for one attempt identity."""
 
     if not _safe_identity(attempt_id):
         raise JoinContractError("attempt-id-invalid")
+    if read_context is not None:
+        return read_context.current_attempt_row(jobs, attempt_id)
     try:
         lines = registry_lines(jobs)
     except FileNotFoundError:
@@ -2908,7 +2910,12 @@ def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     found: ChildRow | None = None
+    # A row of this attempt always carries this text; skipping the others before
+    # parsing keeps a lookup cheap on a registry of thousands of rows.
+    needle = "attempt_id=" + attempt_id
     for order, line in enumerate(lines):
+        if needle not in line:
+            continue
         fields = line.split("\t")
         if len(fields) != 6:
             continue

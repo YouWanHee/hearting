@@ -283,6 +283,23 @@ invalid. Absolute/escaping paths and out-of-payload files remain invalid. Cycle 
 Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
+A payload directory may opt itself and its descendants out of new candidate
+collection with any one of three independent markers: a regular, no-follow
+`CACHEDIR.TAG` whose first 43 bytes are exactly
+`Signature: 8a477f597d28d172789f06886806bc55`; a regular, no-follow
+`pyvenv.cfg` of any contents; or a regular, no-follow `.gitignore` whose entire
+contents are exactly `*`, `*\n`, or `*\r\n`. Marker checks apply only to the
+exact cycle payload roots `artifacts/` and `_internal/` and directories below
+them; a marker in a repository, artifact-root, or cycle-root ancestor has no
+effect. The marked directory is pruned before descending into it, reading its
+payload, or validating descendant locators. Marker symlinks and special files
+are not markers, and their targets are not followed. A marked tree changes only
+the current candidate set: existing manifest rows remain unchanged under
+§45 D-123, actual file removal continues to follow D-124, and completion proof
+continues to describe the recorded close under D-127. Candidate bundle search
+uses this rule; validation of already-published bundle descriptors retains its
+recorded coverage behavior.
+
 **Cycle payload buckets.** The top-level table above closes only the names
 directly under the artifact root. Inside a cycle, the first segment below
 `artifacts/` is the bucket, and this table closes the bucket names: it lists

@@ -1149,7 +1149,7 @@ def _reuse_snapshot(jobs, route, lines):
         if not path.exists():
             continue
         marker = _read(path)
-        if not DC.completion_marker_is_current(route, node, path, marker):
+        if not DC.completion_marker_is_current(route, node, path, marker, jobs=jobs):
             raise DC.DispatchContractError('replacement-completion-unproven', str(node['id']))
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
@@ -1400,16 +1400,14 @@ def _replacement_task(record, source, replay):
 
 def _access_in_force(jobs, route):
     """The prepared request the route's parent last handed its owner (`route_authority.access_in_force`),
-    with its digest. GPU lab replacements also prepare the current runtime's
+    with its digest. Compute-stage replacements also prepare the current runtime's
     normal compute defaults instead of replaying an older owner's request."""
     change = route_authority.access_in_force(route)
-    from gpu_execution_sandbox import select as gpu_selection
+    import execution_access as EA
     runtime_defaults = ((change is None or change.get('source') == 'derived')
-                        and route.get('capability') == 'autopilot-lab'
-                        and gpu_selection(route, environ={})['gpu_scope'])
+                        and EA.compute_execution_scope(route, owner=True))
     if not runtime_defaults and (change is None or change.get('source') == 'derived'):
         return None
-    import execution_access as EA
     try:
         path = EA.prepare_task_request(route, jobs, node='owner', environment=False)
         context = EA.AccessContext.build(
@@ -1421,7 +1419,7 @@ def _access_in_force(jobs, route):
     if request is None:
         return None
     return {'request_path': str(path), 'request_sha256': request.request_sha256,
-            'source': 'lab-runtime-defaults' if runtime_defaults else change['source'],
+            'source': 'compute-runtime-defaults' if runtime_defaults else change['source'],
             'at': change['at'] if change else None}
 
 

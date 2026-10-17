@@ -1803,7 +1803,7 @@ def existing_leg_result(
         if (
             isinstance(node, dict)
             and isinstance(marker, dict)
-            and completion_marker_is_current(route, node, marker_path, marker)
+            and completion_marker_is_current(route, node, marker_path, marker, jobs=jobs)
         ):
             readiness = completion_attempt_readiness(
                 route, node, marker, jobs, registry_lines=lines
@@ -3059,6 +3059,11 @@ def main(argv: list[str] | None = None) -> int:
                 "AGENT_MODEL_GOVERNOR_ROOT": str(governor_root),
                 "AGENT_DISPATCH_JOBS": str(jobs),
             })
+            env.pop("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST", None)
+            admitted_subject = getattr(round_admissions.get(str(leg["node"])),
+                                       "source_subject_digest", None)
+            if admitted_subject:
+                env["AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"] = admitted_subject
             if partial is not None:
                 # Message content only: the original raw task still supplies
                 # the exact reservation assignment digest in every adapter.

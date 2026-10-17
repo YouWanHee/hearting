@@ -25,6 +25,13 @@ sys.modules[HOOK_SPEC.name] = HOOK
 HOOK_SPEC.loader.exec_module(HOOK)
 
 
+def codex_transcript(home, sid="sid"):
+    path = home / "sessions" / "2026" / "10" / "17" / f"rollout-2026-10-17T00-00-00-{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    return path
+
+
 class SessionSummaryTriggerTest(unittest.TestCase):
     def test_codex_resolves_only_exact_rollout_suffix(self):
         with tempfile.TemporaryDirectory() as td:
@@ -37,6 +44,51 @@ class SessionSummaryTriggerTest(unittest.TestCase):
             foreign.write_text("{}\n")
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
                 self.assertEqual(T._codex_transcript("exact-sid"), exact)
+
+    def test_codex_transcript_rejects_foreign_and_symlink_hints(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "codex"
+            exact = codex_transcript(home)
+            outside = Path(td) / "rollout-2026-10-17T00-00-00-sid.jsonl"
+            outside.write_text("{}\n")
+            link = exact.with_name("rollout-2026-10-17T00-00-01-sid.jsonl")
+            link.symlink_to(outside)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                self.assertIsNone(T._validated_codex_transcript("sid", outside))
+                self.assertIsNone(T._validated_codex_transcript("sid", link))
+                self.assertEqual(T._validated_codex_transcript("sid", exact), exact)
+
+    def test_codex_trigger_reuses_exact_hint_without_tree_search(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "codex"
+            transcript = codex_transcript(home)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                 mock.patch.object(T, "_codex_transcript", side_effect=AssertionError("tree scan")), \
+                 mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+                self.assertTrue(T.trigger("codex", "sid", "initial", str(transcript)))
+            self.assertEqual(spawn.call_args.kwargs["transcript"], str(transcript))
+
+    def test_codex_trigger_finds_a_rollout_that_appears_after_the_first_miss(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "codex"
+            transcript = codex_transcript(home)
+            transcript.unlink()
+
+            def create_late_rollout():
+                time.sleep(0.55)
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text("{}\n")
+
+            writer = threading.Thread(target=create_late_rollout)
+            writer.start()
+            try:
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                     mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+                    self.assertTrue(T.trigger("codex", "sid", "initial", wait_seconds=1))
+            finally:
+                writer.join()
+            self.assertEqual(spawn.call_count, 1)
+            self.assertEqual(spawn.call_args.kwargs["transcript"], str(transcript))
 
     def test_trigger_maps_phase_to_ticket_and_priority(self):
         with tempfile.TemporaryDirectory() as td:
@@ -55,19 +107,23 @@ class SessionSummaryTriggerTest(unittest.TestCase):
             source = Path(td) / "source"
             source.write_text("{}\n")
             for harness in ("claude", "codex", "opencode"):
-                with self.subTest(harness=harness), \
+                codex_home = Path(td) / "codex-home"
+                source_for_harness = codex_transcript(codex_home) if harness == "codex" else source
+                env = {"CODEX_HOME": str(codex_home)} if harness == "codex" else {}
+                with self.subTest(harness=harness), mock.patch.dict(os.environ, env), \
                      mock.patch.object(T, "_opencode_db", return_value=source), \
                      mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
-                    self.assertTrue(T.trigger(harness, "sid", "periodic", str(source)))
+                    self.assertTrue(T.trigger(harness, "sid", "periodic", str(source_for_harness)))
                     self.assertEqual(spawn.call_args.kwargs["debounce"], 300)
                     self.assertFalse(spawn.call_args.kwargs["priority"])
                     self.assertIsNone(spawn.call_args.kwargs["quota_class"])
 
     def test_trigger_forwards_current_user_context_to_refresher(self):
         with tempfile.TemporaryDirectory() as td:
-            transcript = Path(td) / "session.jsonl"
-            transcript.write_text("{}\n")
-            with mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+            home = Path(td) / "codex-home"
+            transcript = codex_transcript(home)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                 mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
                 self.assertTrue(T.trigger(
                     "codex", "sid", "initial", str(transcript),
                     anchor_text="current user query",
@@ -76,8 +132,8 @@ class SessionSummaryTriggerTest(unittest.TestCase):
 
     def test_codex_initial_waits_for_post_hook_rollout_write(self):
         with tempfile.TemporaryDirectory() as td:
-            transcript = Path(td) / "session.jsonl"
-            transcript.write_text("{}\n")
+            home = Path(td) / "codex-home"
+            transcript = codex_transcript(home)
             boundary = transcript.stat().st_mtime_ns
 
             def append_prompt():
@@ -87,7 +143,8 @@ class SessionSummaryTriggerTest(unittest.TestCase):
             writer = threading.Thread(target=append_prompt)
             writer.start()
             try:
-                with mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                     mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
                     self.assertTrue(T.trigger(
                         "codex", "sid", "initial", str(transcript),
                         wait_seconds=1, after_mtime_ns=boundary,
@@ -98,10 +155,11 @@ class SessionSummaryTriggerTest(unittest.TestCase):
 
     def test_codex_initial_does_not_spawn_before_rollout_advances(self):
         with tempfile.TemporaryDirectory() as td:
-            transcript = Path(td) / "session.jsonl"
-            transcript.write_text("{}\n")
+            home = Path(td) / "codex-home"
+            transcript = codex_transcript(home)
             boundary = transcript.stat().st_mtime_ns
-            with mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                 mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
                 self.assertFalse(T.trigger(
                     "codex", "sid", "initial", str(transcript),
                     wait_seconds=0.02, after_mtime_ns=boundary,
@@ -156,7 +214,8 @@ class SessionSummaryTriggerTest(unittest.TestCase):
         )
 
     def test_codex_userprompt_hook_forwards_exact_current_prompt(self):
-        payload = {"session_id": "sid", "cwd": "/repo", "prompt": "current query"}
+        payload = {"session_id": "sid", "cwd": "/repo", "prompt": "current query",
+                   "transcript_path": "/codex/sessions/2026/10/17/rollout-current-sid.jsonl"}
         projection = types.SimpleNamespace(project=lambda *_args, **_kwargs: None)
         with mock.patch.object(HOOK, "load_payload", return_value=payload), \
              mock.patch.object(HOOK, "is_worker_session", return_value=False), \
@@ -170,7 +229,8 @@ class SessionSummaryTriggerTest(unittest.TestCase):
              mock.patch("fleet.interaction.clear_wait"):
             self.assertEqual(HOOK.main(), 0)
         launch.assert_called_once_with(
-            "codex", "sid", "initial", anchor_text="current query"
+            "codex", "sid", "initial", transcript=payload["transcript_path"],
+            anchor_text="current query"
         )
 
 

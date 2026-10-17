@@ -262,7 +262,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                 node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
                 share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         output_receipt = RUN_EVIDENCE.paths({"artifact_base": artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
-            "declared_outputs": node.get("outputs", ["run.json"])}, prepare=True)
+            "declared_outputs": node.get("outputs", ["run.json"]),
+            "route_file": str(route_file), "route_id": route.get("route_id"),
+            "route_hash": route.get("route_hash"), "node": args.node}, prepare=True)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
         runtime = ledger.root / "resource"
         runtime.mkdir(parents=True, exist_ok=True)

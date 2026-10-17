@@ -147,13 +147,18 @@ def run_wrapper(args: argparse.Namespace, command: list[str]):
         lifecycle,
         args.direct_timeout,
     )
+    env = direct_env()
+    env.pop("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST", None)
+    source_subject_digest = getattr(args, "review_source_subject_digest", None)
+    if source_subject_digest:
+        env["AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"] = source_subject_digest
     if getattr(args, "action", None) == "start" and lifecycle == FOREGROUND_SCOPED:
         return run_forwarding_termination(
-            command, cwd=ROOT, env=direct_env(), capture=True, timeout=timeout,
+            command, cwd=ROOT, env=env, capture=True, timeout=timeout,
         )
     return subprocess.run(
         command, cwd=ROOT, text=True, capture_output=True, check=False,
-        timeout=timeout, env=direct_env(),
+        timeout=timeout, env=env,
     )
 
 
@@ -1853,6 +1858,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # keeps its own `len(prior)+1 > max_round` comparison, or its own
     # auto-revision copy, any more.
     node_round_admission = None
+    args.review_source_subject_digest = None
     if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
         own_registration = own_registered_attempt(args, route, node)
         round_rows = DISPATCH_NODE.prior_round_attempts(
@@ -1868,6 +1874,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 **admission_options,
             )
             node_round_budget = node_round_admission.budget
+            args.review_source_subject_digest = node_round_admission.source_subject_digest
         except (DispatchContractError, ValueError) as exc:
             return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
         choice = decide_continuation(route, action="round", node=node, facts={"budget": node_round_budget})

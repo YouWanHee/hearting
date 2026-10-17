@@ -220,8 +220,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
     # A campaign deleted since the finish is the campaign it was; a cycle moved to another campaign is
     # still this route's cycle (§45 D-126), so its campaign's key is not the route's to compare.
     campaign = artifact_producer.campaign_or_tombstone(root, record["campaign_id"])
-    if not campaign or not route.get("campaign_key") or (
-            campaign.get("key") != route.get("campaign_key") and not record.get("moved_at") and not finished):
+    expected_key = _route_campaign_key(root, route)
+    if not campaign or not expected_key or (
+            campaign.get("key") != expected_key and not record.get("moved_at") and not finished):
         raise InlineFinishError("finish-campaign-key-mismatch")
     if not choice.allowed:
         error = InlineFinishError(choice.reason)
@@ -542,6 +543,17 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
             return result
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+def _route_campaign_key(root: Path, route: Mapping[str, Any]) -> str | None:
+    """The campaign key the route's own selection names: its key, the reserved `_unassigned`
+    container for `--unassigned`, or the parent cycle's campaign for `--parent-cycle`."""
+    from route_autoclose import campaign_key_of
+    key = campaign_key_of(route)
+    if key is None and route.get("parent_cycle_id"):
+        parent = artifact_producer.read_cycle_record(root, str(route["parent_cycle_id"]))
+        if parent:
+            key = (artifact_producer.campaign_or_tombstone(root, parent["campaign_id"]) or {}).get("key")
+    return key
 
 def _finish_deleted_cycle(root: Path, route: dict, route_file: Path, record: dict, args, api) -> dict:
     """Close the route of a deleted cycle the way the runtime closes one nobody works on: no proof is

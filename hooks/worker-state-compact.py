@@ -14,7 +14,13 @@ try:
         input=None if active else sys.stdin.read(), text=True, capture_output=True, check=False,
         timeout=None if active else 5,
     )
-except (OSError, subprocess.SubprocessError):
+except subprocess.TimeoutExpired:
+    if action == "compact-after" and not active:
+        sys.stderr.write("session-tidy: booking=pending reason=compact-bridge-timeout\n")
+    raise SystemExit(0 if not active else 2)
+except OSError:
+    if action == "compact-after" and not active:
+        sys.stderr.write("session-tidy: booking=pending reason=compact-bridge-unavailable\n")
     raise SystemExit(0 if not active else 2)
 if active:
     sys.stdout.write(result.stdout or "")
@@ -23,4 +29,9 @@ if active:
 harness = next((sys.argv[i + 1] for i in range(len(sys.argv) - 1) if sys.argv[i] == "--harness"), "")
 if result.returncode == 0 and action == "compact-before" and harness in ("claude", "opencode"):
     sys.stdout.write(result.stdout or "")
+elif result.returncode == 0 and action == "compact-after":
+    status = next((line.strip() for line in (result.stdout or "").splitlines()
+                   if line.strip().startswith("booking=")), "")
+    if status:
+        sys.stderr.write(f"session-tidy: {status}\n")
 raise SystemExit(0)

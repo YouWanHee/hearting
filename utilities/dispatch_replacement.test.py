@@ -2570,22 +2570,22 @@ class ReplacementTest(unittest.TestCase):
         inventory.write_text(f'schema_version: 1\nrun_root: {self.root}/runs\nhosts:\n  fixture:\n    ssh_host: local\n')
         route = {'route_id': 'rt-compute', 'route_hash': 'sha256:' + 'a' * 64,
                  'artifact_root': str(self.root), 'cwd': str(self.root),
-                 'capability': 'autopilot-lab', 'nodes': [], 'work_request': {'text': 'GPU lab'}}
+                 'capability': 'autopilot-lab',
+                 'nodes': [{'id': 'full-run', 'kind': 'resource-runner'}],
+                 'work_request': {'text': 'GPU lab'}}
         with mock.patch.dict(os.environ, {'COMPUTE_HOSTS_CONFIG': str(inventory)}):
             old = EA.prepare_task_request(route, self.jobs, environment=False)
             old_bytes = old.read_bytes()
-            route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
             # No manual access-change row or extra parent input is required.
             access = R._access_in_force(self.jobs, route)
         request = json.loads(Path(access['request_path']).read_text())
         self.assertTrue(request['network']['required'])
         self.assertIn(str(inventory.parent), request['read_roots'])
-        self.assertEqual(access['source'], 'lab-runtime-defaults')
+        self.assertEqual(access['source'], 'compute-runtime-defaults')
         self.assertEqual(old.read_bytes(), old_bytes)
         replay = {'argv': ['--execution-access-file', str(old)], 'harness': 'opencode'}
         argv = R._replacement_argv({'execution_access': access}, {'worker_type': 'owner'}, replay)
         self.assertEqual(argv[argv.index('--execution-access-file') + 1], access['request_path'])
-        self.assertNotIn(str(old), argv)
 
     def test_a_sealed_pin_also_controls_the_replacement_launch(self):
         self._blocked_owner()

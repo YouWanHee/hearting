@@ -330,7 +330,7 @@ class RouteDemand(unittest.TestCase):
                 continuation=fixture._build(source)
                 self.assertEqual(set(continuation["profile_demands"]),{"test"})
                 self.assertEqual(set(source["profile_demands"]),{"plan","test"})
-                R.verify_route(continuation,R.ROOT)
+                R.verify_route(continuation,source["cwd"])
         finally:
             fixture.doCleanups()
 

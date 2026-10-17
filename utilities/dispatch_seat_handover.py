@@ -131,7 +131,13 @@ def read_snapshot(seat_key: str) -> Optional[dict]:
     return None
 
 
-def _all_snapshots() -> list[dict]:
+def _all_snapshots(read_context=None) -> list[dict]:
+    if read_context is not None:
+        return list(read_context.handover_snapshots(_all_snapshots_uncached))
+    return _all_snapshots_uncached()
+
+
+def _all_snapshots_uncached() -> list[dict]:
     out = []
     try:
         names = sorted(p for p in _snapshot_dir().glob("*.json") if p.is_file() and not p.is_symlink())
@@ -144,9 +150,13 @@ def _all_snapshots() -> list[dict]:
     return out
 
 
-def handover_rows(seat) -> list[dict]:
+def handover_rows(seat, *, read_context=None) -> list[dict]:
     """The seat ledger's handover rows, oldest first."""
-    rows = [e for e in _st()._read_ledger_lines(seat) if e.get("event") == ROW_EVENT and e.get("from")]
+    def load():
+        return [e for e in _st()._read_ledger_lines(seat)
+                if e.get("event") == ROW_EVENT and e.get("from")]
+
+    rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
 
 
@@ -188,7 +198,7 @@ def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
                and b.get("node") == node for b in bindings if isinstance(b, dict))
 
 
-def _effective(meta: dict, jobs=None) -> tuple[str, str]:
+def _effective(meta: dict, jobs=None, *, read_context=None) -> tuple[str, str]:
     """``(session, harness)`` answering for ``meta``'s attempt now.  The chain may cross panes
     and harnesses (a seat change hands a Codex parent's route to a Claude successor), so the
     rows of every seat whose snapshot binds the attempt are read together, oldest first."""
@@ -197,7 +207,8 @@ def _effective(meta: dict, jobs=None) -> tuple[str, str]:
     if not registered or jobs is None or not eligible_row(meta):
         return registered, harness
     try:
-        rows = sorted((row for seat in _seats_for_binding(jobs, meta) for row in handover_rows(seat)),
+        rows = sorted((row for seat in _seats_for_binding(jobs, meta, read_context=read_context)
+                       for row in handover_rows(seat, read_context=read_context)),
                       key=lambda r: float(r.get("ts", 0) or 0))
         current, seen = registered, {registered}
         for row in rows:
@@ -211,15 +222,15 @@ def _effective(meta: dict, jobs=None) -> tuple[str, str]:
         return registered, str(meta.get("parent_harness") or "")
 
 
-def effective_parent(meta: dict, jobs=None) -> str:
+def effective_parent(meta: dict, jobs=None, *, read_context=None) -> str:
     """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
     the end of its A -> B (-> C) handover chain.  Any failure answers the registered parent."""
-    return _effective(meta, jobs)[0]
+    return _effective(meta, jobs, read_context=read_context)[0]
 
 
-def effective_parent_harness(meta: dict, jobs=None) -> str:
+def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str:
     """The harness of :func:`effective_parent` (the registered ``parent_harness`` without a handover)."""
-    return _effective(meta, jobs)[1]
+    return _effective(meta, jobs, read_context=read_context)[1]
 
 
 def owns(meta: dict, session: str, jobs=None) -> bool:
@@ -229,11 +240,12 @@ def owns(meta: dict, session: str, jobs=None) -> bool:
     return meta.get("parent_sid") == session or (jobs is not None and effective_parent(meta, jobs) == session)
 
 
-def _seats_for_binding(jobs, meta: dict) -> list:
+def _seats_for_binding(jobs, meta: dict, *, read_context=None) -> list:
     """Every seat whose snapshot binds this exact registry/route/node.  No recency, cwd or pane
     name decides it: only an exact binding.  A snapshot is written only by a session that
     answered for the attempt, so each one belongs to the same chain."""
-    return [_seat_of(str(s["seat"].get("key") or ""), s) for s in _all_snapshots()
+    return [_seat_of(str(s["seat"].get("key") or ""), s)
+            for s in _all_snapshots(read_context)
             if isinstance(s.get("seat"), dict) and _binds(s["bindings"], jobs, meta)]
 
 
@@ -442,18 +454,39 @@ def current_bindings(harness: str, sid: str, jobs=None) -> list:
 
 def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
     """Take (or drop) the snapshot; return its flat binding count.  Caller holds the seat lock."""
+    bindings = collect_snapshot_bindings(harness, sid, jobs=jobs)
+    return publish_snapshot_locked(seat, harness, sid, bindings, now=now, jobs=jobs)
+
+
+def collect_snapshot_bindings(harness: str, sid: str, jobs=None) -> list[dict]:
+    """Read the registry outside a seat lock; publication performs the identity recheck."""
+    return current_bindings(harness, sid, jobs)
+
+
+def publish_snapshot_locked(seat, harness: str, sid: str, bindings: list[dict], *,
+                            now: Optional[float] = None, expected_prompt_seq: Optional[int] = None,
+                            expected_card_generation: Optional[int] = None, jobs=None) -> int:
+    """Publish a previously collected snapshot only if the seat's card/input window still matches."""
     st = _st()
     now = st.now_epoch() if now is None else now
     if seat.kind not in ("pane", "native"):
         return 0
-    bindings = current_bindings(harness, sid, jobs)
+    if expected_prompt_seq is not None and st.read_prompt_seq(seat) != expected_prompt_seq:
+        raise RuntimeError("snapshot-input-changed")
+    card = st.read_latest_card(seat)
+    generation = int(card.get("generation", 0) or 0) if card else 0
+    if expected_card_generation is not None and generation != expected_card_generation:
+        raise RuntimeError("snapshot-card-changed")
     if not bindings:
         with contextlib.suppress(OSError):
             os.unlink(_snapshot_path(seat.key))
         return 0
+    path = _snapshot_path(seat.key)
+    st._reject_symlink(path)
     st.atomic_write_json(_snapshot_path(seat.key), {
         "schema": SCHEMA, "seat": seat.as_dict(), "from": {"harness": harness, "sid": sid},
-        "at": now, "bindings": bindings})
+        "at": now, "prompt_seq": st.read_prompt_seq(seat), "card_generation": generation,
+        "bindings": bindings})
     return len(bindings)
 
 
