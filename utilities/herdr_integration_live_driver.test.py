@@ -24,7 +24,8 @@ SPEC.loader.exec_module(live)
 def _native_agent(*, name="fixture-agent", runtime="codex", pane="private-pane",
                   sid="typed-native-sid", session_kind="id", session_runtime="codex"):
     agent = {"name": name, "agent": runtime, "pane_id": pane,
-             "agent_session": {"agent": session_runtime, "kind": session_kind}}
+             "agent_session": {"source": "fixture", "agent": session_runtime,
+                               "kind": session_kind}}
     if sid is not None:
         agent["agent_session"]["value"] = sid
     return agent
@@ -194,12 +195,24 @@ class NativeDriverContractTest(unittest.TestCase):
             start_ok = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
             valid_agent = _native_agent()
             wrong_name = _native_agent(name="other-agent")
+            null_name = _native_agent()
+            null_name["name"] = None
             wrong_pane = _native_agent(pane="other-pane")
+            null_pane = _native_agent()
+            null_pane["pane_id"] = None
             wrong_runtime = _native_agent(runtime="opencode", session_runtime="opencode")
+            null_runtime = _native_agent()
+            null_runtime["agent"] = None
             wrong_session_runtime = _native_agent(session_runtime="opencode")
-            wrong_outer_kind = _native_agent()
-            wrong_outer_kind["kind"] = "opencode"
+            missing_session_runtime = _native_agent()
+            del missing_session_runtime["agent_session"]["agent"]
+            null_session_runtime = _native_agent()
+            null_session_runtime["agent_session"]["agent"] = None
             wrong_session_kind = _native_agent(session_kind="session")
+            missing_session_kind = _native_agent()
+            del missing_session_kind["agent_session"]["kind"]
+            null_session_kind = _native_agent()
+            null_session_kind["agent_session"]["kind"] = None
             metadata_only = {"name": "fixture-agent", "agent": "codex",
                              "pane_id": "private-pane", "session_id": "metadata-sid"}
             missing_name = _native_agent()
@@ -210,29 +223,62 @@ class NativeDriverContractTest(unittest.TestCase):
             del missing_pane["pane_id"]
             missing_session = _native_agent()
             del missing_session["agent_session"]
-            missing_session_id = _native_agent(sid=None)
-            optional_session_kind = _native_agent()
-            del optional_session_kind["agent_session"]["kind"]
+            null_session = _native_agent()
+            null_session["agent_session"] = None
+            malformed_session = _native_agent()
+            malformed_session["agent_session"] = "not-an-object"
+            missing_session_id = _native_agent()
+            del missing_session_id["agent_session"]["value"]
+            null_session_id = _native_agent()
+            null_session_id["agent_session"]["value"] = None
+            unknown_fields = _native_agent()
+            unknown_fields.update({"kind": "opencode", "display_agent": "untrusted-label",
+                                   "title": "display only", "metric": {"session_id": "fake"}})
+            missing_source = _native_agent()
+            del missing_source["agent_session"]["source"]
             identity_scenarios = (
                 ("valid-documented-tuple", valid_agent, None, "typed-native-sid", True),
-                ("optional-session-kind-omitted", optional_session_kind,
+                ("unknown-display-fields-do-not-authorize-or-reject", unknown_fields,
+                 None, "typed-native-sid", True),
+                ("session-source-is-not-identity-authority", missing_source,
                  None, "typed-native-sid", True),
                 ("wrong-requested-name", wrong_name, "native-agent-name-mismatch", None, False),
+                ("null-requested-name", null_name, "native-agent-name-mismatch", None, False),
                 ("wrong-pane", wrong_pane, "native-agent-pane-mismatch", None, False),
+                ("null-pane", null_pane, "native-agent-pane-mismatch", None, False),
                 ("wrong-runtime", wrong_runtime, "native-agent-runtime-mismatch", None, False),
+                ("null-runtime", null_runtime, "native-agent-runtime-mismatch", None, False),
                 ("wrong-session-runtime", wrong_session_runtime,
                  "native-agent-session-runtime-mismatch", None, False),
-                ("wrong-runtime-kind", wrong_outer_kind,
-                 "native-agent-kind-mismatch", None, False),
+                ("missing-session-runtime", missing_session_runtime,
+                 "native-agent-session-runtime-missing", None, False),
+                ("null-session-runtime", null_session_runtime,
+                 "native-agent-session-runtime-mismatch", None, False),
                 ("invalid-session-kind", wrong_session_kind,
+                 "native-agent-session-kind-mismatch", None, False),
+                ("missing-session-kind", missing_session_kind,
+                 "native-agent-session-kind-missing", None, False),
+                ("null-session-kind", null_session_kind,
                  "native-agent-session-kind-mismatch", None, False),
                 ("missing-name", missing_name, "native-agent-name-missing", None, False),
                 ("missing-runtime", missing_runtime, "native-agent-runtime-missing", None, False),
                 ("missing-pane", missing_pane, "native-agent-pane-missing", None, False),
+                ("missing-outer-agent", live._NATIVE_IDENTITY_MISSING,
+                 "native-agent-tuple-missing", None, False),
+                ("null-outer-agent", None,
+                 "native-agent-tuple-malformed", None, False),
+                ("malformed-outer-agent", ["not", "an", "object"],
+                 "native-agent-tuple-malformed", None, False),
                 ("missing-session", missing_session,
                  "native-agent-session-missing", None, False),
+                ("null-session", null_session,
+                 "native-agent-session-malformed", None, False),
+                ("malformed-session", malformed_session,
+                 "native-agent-session-malformed", None, False),
                 ("missing-session-id", missing_session_id,
                  "native-agent-session-id-missing", None, False),
+                ("null-session-id", null_session_id,
+                 "native-agent-session-id-unusable", None, False),
                 ("metadata-id-substitute", metadata_only,
                  "native-agent-session-missing", None, False),
                 ("placeholder-dash", _native_agent(sid="-"),
@@ -243,16 +289,92 @@ class NativeDriverContractTest(unittest.TestCase):
                  "native-agent-session-id-unusable", None, False),
             )
             for label, agent, reason, expected_sid, confirmed in identity_scenarios:
+                result = ({} if agent is live._NATIVE_IDENTITY_MISSING
+                          else {"agent": agent})
                 with self.subTest(scenario=label), mock.patch.object(
                         driver, "herdr_command", side_effect=[
                             (0, start_ok, ""),
-                            (0, json.dumps({"result": {"agent": agent}}), "")]):
+                            (0, json.dumps({"result": result}), "")]):
                     native = driver._agent_start("codex", "private-pane", name="fixture-agent")
                     self.assertTrue(native["start_ok"])
                     self.assertTrue(native["get_ok"])
                     self.assertEqual(native["session_confirmed_by_get"], confirmed)
                     self.assertEqual(native["session_id"], expected_sid)
                     self.assertEqual(native["session_identity_reason"], reason)
+
+            start_presence_scenarios = (
+                ("omitted-outer-agent", {"result": {}}, None, True),
+                ("omitted-start-fields", {"result": {"agent": {}}}, None, True),
+                ("omitted-start-name", {"result": {"agent": {
+                    "agent": "codex", "pane_id": "private-pane"}}}, None, True),
+                ("omitted-start-runtime", {"result": {"agent": {
+                    "name": "fixture-agent", "pane_id": "private-pane"}}}, None, True),
+                ("omitted-start-pane", {"result": {"agent": {
+                    "name": "fixture-agent", "agent": "codex"}}}, None, True),
+                ("null-start-agent", {"result": {"agent": None}},
+                 "native-agent-tuple-malformed", False),
+                ("malformed-start-agent", {"result": {"agent": []}},
+                 "native-agent-tuple-malformed", False),
+                ("null-start-name", {"result": {"agent": {"name": None}}},
+                 "native-agent-name-mismatch", False),
+                ("null-start-runtime", {"result": {"agent": {"agent": None}}},
+                 "native-agent-runtime-mismatch", False),
+                ("null-start-pane", {"result": {"agent": {"pane_id": None}}},
+                 "native-agent-pane-mismatch", False),
+                ("omitted-start-session", {"result": {"agent": {
+                    "name": "fixture-agent", "agent": "codex",
+                    "pane_id": "private-pane"}}},
+                 None, True),
+                ("null-start-session", {"result": {"agent": {"agent_session": None}}},
+                 "native-agent-session-malformed", False),
+                ("malformed-start-session", {"result": {"agent": {"agent_session": []}}},
+                 "native-agent-session-malformed", False),
+                ("start-session-runtime-omitted", {"result": {"agent": {
+                    "agent_session": {"kind": "id", "value": "typed-native-sid"}}}},
+                 "native-agent-session-runtime-missing", False),
+                ("start-session-runtime-null", {"result": {"agent": {
+                    "agent_session": {"agent": None, "kind": "id", "value": "typed-native-sid"}}}},
+                 "native-agent-session-runtime-mismatch", False),
+                ("start-session-kind-omitted", {"result": {"agent": {
+                    "agent_session": {"agent": "codex", "value": "typed-native-sid"}}}},
+                 "native-agent-session-kind-missing", False),
+                ("start-session-kind-null", {"result": {"agent": {
+                    "agent_session": {"agent": "codex", "kind": None,
+                                       "value": "typed-native-sid"}}}},
+                 "native-agent-session-kind-mismatch", False),
+                ("start-session-value-omitted", {"result": {"agent": {
+                    "agent_session": {"agent": "codex", "kind": "id"}}}},
+                 "native-agent-session-id-missing", False),
+                ("start-session-value-null", {"result": {"agent": {
+                    "agent_session": {"agent": "codex", "kind": "id", "value": None}}}},
+                 "native-agent-session-id-unusable", False),
+                ("start-session-valid-subset", {"result": {"agent": {
+                    "agent_session": {"agent": "codex", "kind": "id",
+                                       "value": "typed-native-sid"}}}}, None, True),
+            )
+            for label, start_payload, reason, confirmed in start_presence_scenarios:
+                with self.subTest(scenario=f"start-{label}"), mock.patch.object(
+                        driver, "herdr_command", side_effect=[
+                            (0, json.dumps(start_payload), ""),
+                            (0, json.dumps({"result": {"agent": valid_agent}}), "")]):
+                    native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+                    self.assertTrue(native["start_ok"])
+                    self.assertTrue(native["get_ok"])
+                    self.assertEqual(native["session_confirmed_by_get"], confirmed)
+                    self.assertEqual(native["session_id"],
+                                     "typed-native-sid" if confirmed else None)
+                    self.assertEqual(native["session_identity_reason"], reason)
+
+            sparse_start = json.dumps({"result": {}})
+            with self.subTest(scenario="mismatched-get-never-confirms-sparse-start"), \
+                    mock.patch.object(driver, "herdr_command", side_effect=[
+                        (0, sparse_start, ""),
+                        (0, json.dumps({"result": {"agent": wrong_pane}}), "")]):
+                native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+                self.assertFalse(native["session_confirmed_by_get"])
+                self.assertIsNone(native["session_id"])
+                self.assertEqual(native["session_identity_reason"],
+                                 "native-agent-pane-mismatch")
 
             start_mismatch = json.dumps({"result": {"agent": {"name": "other-agent"}}})
             with self.subTest(scenario="start-name-mismatch"), mock.patch.object(

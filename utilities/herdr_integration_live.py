@@ -120,6 +120,10 @@ def _session_id(value):
     agent = result.get("agent") if isinstance(result, dict) else None
     session = agent.get("agent_session") if isinstance(agent, dict) else None
     sid = session.get("value") if isinstance(session, dict) else None
+    return _usable_session_id(sid)
+
+
+def _usable_session_id(sid):
     if not isinstance(sid, str):
         return None
     sid = sid.strip()
@@ -129,44 +133,46 @@ def _session_id(value):
     return sid
 
 
+_NATIVE_IDENTITY_MISSING = object()
+
+
 def _native_agent_identity_reason(agent, *, name, runtime, pane, require_complete):
     """Check Herdr's reported agent tuple without guessing the SID's spelling."""
-    if not isinstance(agent, dict):
+    if agent is _NATIVE_IDENTITY_MISSING:
         return "native-agent-tuple-missing" if require_complete else None
+    if not isinstance(agent, dict):
+        return "native-agent-tuple-malformed"
 
     for field, expected, label in (
             ("name", name, "name"),
             ("agent", runtime, "runtime"),
             ("pane_id", pane, "pane")):
-        value = agent.get(field)
-        if value is None:
+        if field not in agent:
             if require_complete:
                 return f"native-agent-{label}-missing"
-        elif value != expected:
+        elif agent[field] != expected:
             return f"native-agent-{label}-mismatch"
 
-    # `agent` is the current API's runtime field. If an API response also
-    # supplies `kind`, keep that duplicate runtime identity consistent.
-    if "kind" in agent and agent["kind"] != runtime:
-        return "native-agent-kind-mismatch"
-
-    session = agent.get("agent_session")
-    if session is None:
+    if "agent_session" not in agent:
         return "native-agent-session-missing" if require_complete else None
+    session = agent["agent_session"]
     if not isinstance(session, dict):
         return "native-agent-session-malformed"
 
-    if "agent" in session and session["agent"] != runtime:
+    if "agent" not in session:
+        return "native-agent-session-runtime-missing"
+    if session["agent"] != runtime:
         return "native-agent-session-runtime-mismatch"
-    session_kind = session.get("kind")
-    if "kind" in session and session_kind != "id":
+
+    if "kind" not in session:
+        return "native-agent-session-kind-missing"
+    if session["kind"] != "id":
         return "native-agent-session-kind-mismatch"
 
-    if require_complete:
-        if "value" not in session:
-            return "native-agent-session-id-missing"
-        if _session_id({"result": {"agent": agent}}) is None:
-            return "native-agent-session-id-unusable"
+    if "value" not in session:
+        return "native-agent-session-id-missing"
+    if _usable_session_id(session["value"]) is None:
+        return "native-agent-session-id-unusable"
     return None
 
 
@@ -620,7 +626,9 @@ class HerdrIntegrationLive:
         start_error = _error_envelope(start_payload) or _error_envelope(_json(stderr))
         start_ok = rc == 0 and not start_error
         start_result = _result(start_payload)
-        start_agent = start_result.get("agent") if isinstance(start_result, dict) else None
+        start_agent = (start_result["agent"]
+                       if isinstance(start_result, dict) and "agent" in start_result
+                       else _NATIVE_IDENTITY_MISSING)
         start_identity_reason = (_native_agent_identity_reason(
             start_agent, name=name, runtime=runtime, pane=pane, require_complete=False)
             if start_ok else None)
@@ -628,7 +636,9 @@ class HerdrIntegrationLive:
             f"native-{runtime}-session-get", ["agent", "get", name], timeout=10)
         get_payload = _json(get_stdout) or _json(get_stderr)
         get_result = _result(get_payload)
-        agent = get_result.get("agent") if isinstance(get_result, dict) else None
+        agent = (get_result["agent"]
+                 if isinstance(get_result, dict) and "agent" in get_result
+                 else _NATIVE_IDENTITY_MISSING)
         get_error = _error_envelope(get_payload) or _error_envelope(_json(get_stderr))
         get_ok = rc_get == 0 and not get_error
         reported_sid = _session_id(get_payload) if get_ok else None
