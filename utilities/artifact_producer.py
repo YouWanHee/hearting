@@ -6908,9 +6908,10 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
                  bundle_directories: Sequence[Tuple[str, ...]] = (), marker_callback=None):
     """Entries under `top` in name order, depth first, as `(parts, DirEntry, is_dir)`.
 
-    `after` is the last entry an earlier run finished: everything up to it is
-    skipped without a `stat`.  A directory the rule leaves out is yielded once and
-    not entered."""
+    `after` is the last entry an earlier run finished: entries up to it are not
+    yielded as cursor positions. Marker directories are still observed so excluded
+    roots remain available to preserve prior rows. A later directory the rule leaves
+    out is yielded once and not entered."""
     try:
         entries = sorted(os.scandir(top), key=lambda entry: entry.name)
     except OSError:
@@ -6923,10 +6924,6 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
         if is_dir and not inside_bundle and not _pruned_directory(parts) and marker_callback is not None:
             marker_excluded = bool(marker_callback(entry.path, parts))
         enter = is_dir and not _pruned_directory(parts) and not inside_bundle and not marker_excluded
-        if marker_excluded:
-            # Record an excluded parent even when the resume cursor points inside it.
-            yield parts, entry, is_dir
-            continue
         if after is not None:
             head = after[:len(parts)]
             if parts < head:
@@ -6939,6 +6936,11 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
                 if enter:
                     yield from _walk_sorted(entry.path, parts, after, bundle_directories, marker_callback)
                 continue
+        if marker_excluded:
+            # The observation above is retained even when cursor ordering skips this
+            # entry or the cursor lies inside it; excluded payload is never entered.
+            yield parts, entry, is_dir
+            continue
         yield parts, entry, is_dir
         if enter:
             yield from _walk_sorted(entry.path, parts, None, bundle_directories, marker_callback)

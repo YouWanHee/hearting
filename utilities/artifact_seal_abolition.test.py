@@ -1338,6 +1338,71 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual([event["operation"] for event in self.history.published[-2:]], ["update", "delete"])
         self.assertTrue(L.verify_artifact_revisions(final, cycle) == ())
 
+    def test_b1_marked_directories_before_saved_cursor_do_not_regress_bounded_walk(self):
+        with tempfile.TemporaryDirectory(prefix="artifact-refresh-cursor-") as temp:
+            directory = Path(temp)
+            artifacts = directory / "artifacts"
+            artifacts.mkdir()
+            for name in ("a-cache", "b-cache", "c-cache"):
+                excluded = artifacts / name
+                excluded.mkdir()
+                (excluded / ".gitignore").write_bytes(b"*\n")
+                (excluded / "payload.txt").write_bytes(b"excluded payload\n")
+            for name in ("d-report.md", "z-report.md"):
+                (artifacts / name).write_bytes((name + "\n").encode())
+
+            hashed = []
+            real_stream = P._stream_file_facts
+
+            def recording_stream(path):
+                hashed.append(Path(path).relative_to(directory).as_posix())
+                return real_stream(path)
+
+            cursors = (
+                ("inside last excluded tree", "artifacts/c-cache/payload.txt"),
+                ("equal to last excluded directory", "artifacts/c-cache"),
+                ("ordinary start", None),
+            )
+            with mock.patch.object(P, "_stream_file_facts", recording_stream):
+                for label, cursor in cursors:
+                    with self.subTest(cursor=label):
+                        saved_cursor = cursor is not None
+                        collected = set()
+                        observed_markers = set()
+                        cursor_history = []
+                        for _ in range(10):
+                            budget = P.RefreshBudget(max_walk_entries=1)
+                            scan = P._bounded_scan(directory, cursor=cursor, known={}, budget=budget)
+                            self.assertLessEqual(budget.walked, 1)
+                            observed_markers.update(scan.marker_observations)
+                            if saved_cursor:
+                                self.assertTrue({
+                                    "artifacts/a-cache", "artifacts/b-cache", "artifacts/c-cache",
+                                } <= set(scan.marker_observations))
+                            self.assertFalse(any(path.endswith("/payload.txt") for path in scan.visited))
+                            self.assertFalse(any(path.endswith("/payload.txt") for path in scan.facts))
+                            collected.update(scan.facts)
+                            cursor_history.append(scan.cursor)
+                            if scan.complete:
+                                break
+                            self.assertNotEqual(scan.cursor, cursor)
+                            cursor = scan.cursor
+                        else:
+                            self.fail("the bounded walk did not finish")
+
+                        self.assertTrue(scan.complete)
+                        self.assertTrue({
+                            "artifacts/a-cache", "artifacts/b-cache", "artifacts/c-cache",
+                        } <= observed_markers)
+                        self.assertTrue({
+                            "artifacts/d-report.md", "artifacts/z-report.md",
+                        } <= collected)
+                        self.assertEqual(cursor_history[-2:], ["artifacts/d-report.md", None])
+
+            self.assertEqual(set(hashed), {
+                "artifacts/d-report.md", "artifacts/z-report.md",
+            })
+
     def test_b1_off_switch_pauses_closed_cycle_refresh(self):
         result = self.closed("b1-off", {"plans/cycle/a.md": b"a\n"})
         self.edit(result, "plans/cycle/a.md", b"a, edited\n")
