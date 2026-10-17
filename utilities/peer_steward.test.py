@@ -214,9 +214,9 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                     target="peer", until=[native], timeout=500, rearm_count=0,
                     steward_harness="codex", steward_session_id="sender", steward_project="fixture",
                     armed_ts="now", rearmed_from=None, ref=[])
-                payload = {"result": {"agent": {"agent": "codex", "agent_status": native,
-                           "agent_session": {"value": "sid-peer"}, "pane_id": "w1:p9", "name": "peer"}}}
-                agent = payload["result"]["agent"]
+                # Durable arms and wait observations use normalized identity,
+                # while Herdr's wire payload is normalized before persistence.
+                agent = {**identity, "name": "peer"}
                 peer_steward._write_json_atomic(paths.arm, {
                     "schema_version": peer_steward._WATCH_SCHEMA, "watch_id": watch_id,
                     "target": "peer", "until": [native], "timeout": 500,
@@ -1418,6 +1418,18 @@ class _WatchMixin(_TmpRootMixin):
             time.sleep(0.02)
         self.fail(f"observation checkpoint never appeared for {watch_id}")
 
+    def _wait_for_native_wait_started(self, watch_id, seconds=10):
+        path = self.watch_root / f"{watch_id}.observation.json"
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            observation = peer_steward._read_json(path) or {}
+            native_wait = observation.get("native_wait") or {}
+            if (native_wait.get("state") == "started"
+                    and native_wait.get("pid") and native_wait.get("pid_start")):
+                return native_wait
+            time.sleep(0.02)
+        self.fail(f"native wait never published its process identity for {watch_id}")
+
 
 class WatchDeadlineTest(unittest.TestCase):
     def test_same_boot_deadline_uses_monotonic_time_after_wall_clock_reversal(self):
@@ -1460,12 +1472,19 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         armed = self._run("watch", "peer-a", "--timeout", "500", env=env)
         self.assertEqual(armed.returncode, 0, armed.stderr)
         watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        original_deadline = peer_steward._read_json(arm_path)["deadline"]
         receipt = self._wait_for_receipt(watch_id)
         self.assertEqual(receipt["state"], "timeout")
         self.assertEqual(receipt["reason"], "watch-deadline")
         waits = [line for line in self.calllog.read_text().splitlines()
                  if line.startswith("agent wait ")]
-        self.assertEqual(len(waits), 1, self.calllog.read_text())
+        # The total budget can expire before the observer launches its waiter.
+        # Either path must remain terminal without another wait or a new budget.
+        self.assertLessEqual(len(waits), 1, self.calllog.read_text())
+        final_arm = peer_steward._read_json(arm_path)
+        self.assertEqual(final_arm["deadline"], original_deadline)
+        self.assertEqual(peer_steward._watch_timeout_remaining_ms(final_arm)[1], "expired")
         before = self.calllog.read_text()
         self.assertEqual(self._run("__ensure-obligations", env=env).returncode, 0)
         self.assertEqual(self.calllog.read_text(), before)
@@ -3027,8 +3046,7 @@ class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
     def test_exact_terminal_request_stops_only_its_watch_wait_and_sweep_keeps_receipt(self):
         armed = self._fields(self._run("watch", "peer-a", env=self._env("held")).stdout)
         watch_id = armed["watch_id"]
-        observation = self._wait_for_observation(watch_id)
-        wait_record = observation["native_wait"]
+        wait_record = self._wait_for_native_wait_started(watch_id)
         request = {"server": "default", "pane": "w1:p9", "harness": "claude",
                    "session_id": "sid-fake"}
         self.assertEqual(peer_steward._request_watch_terminal(
