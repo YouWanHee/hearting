@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import os
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +56,41 @@ class StopLifecycleTest(unittest.TestCase):
         self.assertNotIn("subprocess", source)
         self.assertNotIn("dispatch-wait", source)
         self.assertNotIn("join_session_batch", source)
+
+    def test_held_idle_observer_does_not_delay_stop_consumers(self):
+        module = load_stop()
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import session_tidy_idle
+        from fleet import interaction
+        import session_summary_trigger
+        import artifact_checkpoint_trigger
+
+        events = []
+
+        class InputSink:
+            def write(self, _data):
+                return None
+
+            def close(self):
+                return None
+
+        class HeldChild:
+            stdin = InputSink()
+
+        child = HeldChild()
+        payload = json.dumps({"thread_id": "thread-held", "cwd": str(ROOT), "transcript_path": ""})
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("sys.stdin", io.StringIO(payload)), \
+                mock.patch.object(session_tidy_idle.subprocess, "Popen", return_value=child), \
+                mock.patch.object(interaction, "clear_wait", side_effect=lambda *_: events.append("clear_wait")), \
+                mock.patch.object(session_summary_trigger, "launch_trigger",
+                                  side_effect=lambda *_: events.append("summary")), \
+                mock.patch.object(artifact_checkpoint_trigger, "launch_for_session",
+                                  side_effect=lambda *_: events.append("checkpoint")):
+            self.assertEqual(module.main(), 0)
+
+        # The fake child remains held; Stop has already progressed through its consumers.
+        self.assertEqual(events, ["clear_wait", "summary", "checkpoint"])
 
     def test_sessionend_has_no_stop_branch(self):
         source = SESSIONEND_PATH.read_text(encoding="utf-8")

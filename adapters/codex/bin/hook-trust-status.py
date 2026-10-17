@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import shlex
+import selectors
 import subprocess
 import sys
+import time
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "utilities"))
@@ -60,12 +62,12 @@ def expected_handlers(path: Path) -> Counter[str]:
 
 
 class AppServer:
-    def __init__(self, command: list[str], cwd: Path):
+    def __init__(self, command: list[str], cwd: Path, *, env: dict[str, str] | None = None):
         try:
             self.process = subprocess.Popen(
                 command,
                 cwd=cwd,
-                env=os.environ.copy(),
+                env=dict(env) if env is not None else os.environ.copy(),
                 text=True,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -75,6 +77,7 @@ class AppServer:
         except OSError as exc:
             raise HookTrustError("app-server-launch-failed") from exc
         self.next_id = 1
+        self._read_buffer = bytearray()
 
     def send(self, value: dict[str, Any]) -> None:
         if self.process.stdin is None:
@@ -82,44 +85,61 @@ class AppServer:
         self.process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
         self.process.stdin.flush()
 
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def request(self, method: str, params: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
         request_id = self.next_id
         self.next_id += 1
-        self.send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-        )
+        try:
+            self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        except (BrokenPipeError, OSError) as exc:
+            self.close()
+            raise HookTrustError("app-server-write-failed") from exc
         if self.process.stdout is None:
             raise HookTrustError("app-server-stdout-closed")
-        while True:
-            line = self.process.stdout.readline()
-            if not line:
-                raise HookTrustError("app-server-eof")
-            try:
-                value = json.loads(line)
-            except ValueError as exc:
-                raise HookTrustError("app-server-json-invalid") from exc
-            if not isinstance(value, dict) or value.get("id") != request_id:
-                continue
-            if "error" in value or not isinstance(value.get("result"), dict):
-                raise HookTrustError(f"app-server-request-failed-{method}")
-            return value["result"]
+        deadline = time.monotonic() + max(0.01, timeout)
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(self.process.stdout, selectors.EVENT_READ)
+            while True:
+                if b"\n" not in self._read_buffer:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        self.close()
+                        raise HookTrustError("app-server-timeout")
+                    chunk = os.read(self.process.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise HookTrustError("app-server-eof")
+                    self._read_buffer.extend(chunk)
+                    continue
+                raw_line, _, rest = self._read_buffer.partition(b"\n")
+                self._read_buffer = bytearray(rest)
+                try:
+                    value = json.loads(raw_line.decode("utf-8"))
+                except ValueError as exc:
+                    raise HookTrustError("app-server-json-invalid") from exc
+                if not isinstance(value, dict) or value.get("id") != request_id:
+                    continue
+                if "error" in value or not isinstance(value.get("result"), dict):
+                    raise HookTrustError(f"app-server-request-failed-{method}")
+                return value["result"]
+        finally:
+            selector.close()
 
     def notify(self, method: str) -> None:
         self.send({"jsonrpc": "2.0", "method": method})
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+        finally:
+            for stream in (self.process.stdin, self.process.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 def same_source(raw: object, expected: Path) -> bool:

@@ -761,6 +761,27 @@ def _half_up(value):
     return int(math.floor(float(value) + 0.5))
 
 
+def _native_context_gauge(entity):
+    """Without an applied compaction trigger, draw the native gauge: raw window and percent.
+
+    An unknown or disabled policy still has a measured window and usage; showing nothing would
+    hide what every session showed before applied triggers existed."""
+    policy = getattr(entity, "context_policy", None)
+    if isinstance(policy, dict) and policy.get("state") == "applied":
+        return None, None
+    window = getattr(entity, "context_window_tokens", None)
+    raw = policy.get("raw_percentage") if isinstance(policy, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return min(99, round(raw)), window
+    active = getattr(entity, "active_context_tokens", None)
+    if getattr(entity, "harness", None) == "codex":
+        from .token_budget import codex_context_used_pct
+        return codex_context_used_pct(active, window), window
+    if (type(active) is int and active >= 0 and type(window) is int and window > 0):
+        return min(99, round(100 * active / window)), window
+    return None, window
+
+
 def _context_gauge_track(window):
     """F-52b context-gauge track length: `clamp(half_up(16 * window / 1M), 1, 16)`.
 
@@ -1958,8 +1979,11 @@ def _unused_badge(s, compact=False):
 
 def _interaction_badge(s):
     state = getattr(s, "interaction_state", None)
-    label = _INTERACTION_LABEL.get(state.get("kind")) if isinstance(state, dict) else None
-    return " " + label if label else ""
+    kinds = [state.get("kind")] if isinstance(state, dict) else []
+    kinds.extend(row.get("kind") for row in (getattr(s, "interaction_observations", None) or [])
+                 if isinstance(row, dict))
+    labels = list(dict.fromkeys(_INTERACTION_LABEL[kind] for kind in kinds if kind in _INTERACTION_LABEL))
+    return " " + " + ".join(labels) if labels else ""
 
 
 def _interaction_chip(s):
@@ -1981,13 +2005,28 @@ def _interaction_chip(s):
 
 
 def _session_tag_chip(s, dim=False):
-    """F-100a — the 2-hex session tag (`hearting-46` → `46`) as an outline badge, exactly
-    `_TAG_W` cells: dim `[` `]` around the tag in soft white (user 2026-09-03: the reverse
-    chip read too heavy; white, not the harness hue, so it separates from the harness text).
+    """F-100a — the 2-hex session tag (`hearting-46` → `46`) as an outline badge in
+    `_TAG_W` cells, then the steward flag when the session supervises others: dim `[` `]`
+    around the tag in soft white (user 2026-09-03: the reverse chip read too heavy; white,
+    not the harness hue, so it separates from the harness text).
     A session without a tag draws the same cells blank — the badge is a slot, not a suffix,
     so every harness label starts in the same column. This is what replaced the F-99c
     ` · hearting-46` companion: the title owns the whole name zone again and the identity
     token has its own fixed home."""
+    return _session_tag_slot(s, dim) + _steward_flag(s, dim)
+
+
+def _steward_flag(s, dim=False):
+    """`[aa] ⚑ claude` — the flag sits between the tag and the harness word (user
+    2026-10-14: on the row under the ID it hid the supervisor line whenever the first
+    watched session was only one row away). Callers size the harness cell by the chip's
+    real width, so the name column stays where it was."""
+    if not getattr(s, "steward", False):
+        return []
+    return [(_ICON_STEWARD, "tag_dim" if dim else "tag_steward"), (" ", None)]
+
+
+def _session_tag_slot(s, dim=False):
     tag = getattr(s, "session_tag", None)
     steward = bool(getattr(s, "steward", False))
     if not isinstance(tag, str) or not tag:
@@ -2030,10 +2069,11 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
                 else _NAME_KEY.get(s.harness, "nm_other"))
     # F-33 (v11): harness field carries model/effort as a parenthetical — a dead/stale row has
     # no live telemetry to show (F-13), so it renders the bare harness name only.
-    segs = [("  ", None), (gch, gkey), (" ", None)]
-    segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
+    chip = _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
+    chip_w = sum(_dw(text) for text, _key in chip)
+    segs = [("  ", None), (gch, gkey), (" ", None)] + chip
     segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
-                                None if dead_stale else s.effort, _HMW - _TAG_W,
+                                None if dead_stale else s.effort, _HMW - chip_w,
                                 hkey, dim=dim_tel,
                                 effort_default=not dead_stale and bool(getattr(s, "effort_default", False)))
 
@@ -2066,6 +2106,11 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
         if chip and suffix_w + chip_w < avail:
             suffix.extend(chip)
             suffix_w += chip_w
+    peer_segs, peer_w = _peer_inline_fit(
+        s, tag_by_key, max(0, avail - suffix_w - _NAME_GAP - 1))
+    if peer_segs:
+        suffix.extend(peer_segs)
+        suffix_w += peer_w
     # Degradation ladder, tightest-last (the F-22 40-cell cap makes this reachable at every
     # width, so it cannot be left to chance): provenance drops first, then the badge's age,
     # and only then does the name itself clip. The name is what identifies the row — F-26
@@ -3176,9 +3221,10 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
             else ("hb_" + s.harness if s.harness in _BADGE_TEXT else "hb_other"))
     name_key = (_NAME_KEY_DIM.get(s.harness, "nmd_other") if dim_tel
                 else _NAME_KEY.get(s.harness, "nm_other"))   # F-76b, see `_session_row`
-    l1 = ([("  ", None), (gch, gkey), (" ", None)]
-          + _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
-          + [(_badge_cell(hn, _HW - _TAG_W), hkey)])   # word-boundary clip, last cell blank
+    chip = _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
+    chip_w = sum(_dw(text) for text, _key in chip)
+    l1 = ([("  ", None), (gch, gkey), (" ", None)] + chip
+          + [(_badge_cell(hn, _HW - chip_w), hkey)])   # word-boundary clip, last cell blank
     suffix = []
     if is_parent and child_count:
         suffix.append((" ▾%d" % child_count, name_key))
@@ -3222,10 +3268,34 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
         if prov_seg and avail - suffix_w - _dw(prov_seg[0]) >= _dw(name_txt):
             suffix.insert(prov_pos, prov_seg)
             suffix_w += _dw(prov_seg[0])
+        # Communication shares L1 with the session identity. Endpoint labels
+        # shed to arrows while preserving both directions and four title cells.
+        min_name_w = min(4, _dw(name_txt))
+        peer_options = _peer_inline_options(s, tag_by_key)
+        peer_min_w = (sum(_dw(text) for text, _key in peer_options[-1])
+                      if peer_options else 0)
+        peer_budget = max(0, avail - suffix_w - min_name_w)
+        if peer_min_w > peer_budget and prov_seg in suffix:
+            suffix.remove(prov_seg)
+            suffix_w -= _dw(prov_seg[0])
+            peer_budget = max(0, avail - suffix_w - min_name_w)
+        if peer_min_w > peer_budget and not _split:
+            for branch_seg in br_segs:
+                if branch_seg in suffix:
+                    suffix.remove(branch_seg)
+                    suffix_w -= _dw(branch_seg[0])
+            peer_budget = max(0, avail - suffix_w - min_name_w)
+        peer_segs, peer_w = _peer_inline_fit(s, tag_by_key, peer_budget)
+        if peer_segs:
+            suffix.extend(peer_segs)
+            suffix_w += peer_w
         title_budget = max(4, avail - suffix_w)
     else:
         if prov_seg:
             suffix.insert(prov_pos, prov_seg)
+        peer_segs, _peer_w = _peer_inline_fit(s, tag_by_key, None)
+        if peer_segs:
+            suffix.extend(peer_segs)
         title_budget = min(_NAME2_MAX, _TITLE_MAX)
     l1.append((_clip_w(name_txt, title_budget), _subject_name_key(s, name_key)))
     l1.extend(suffix)
@@ -3370,8 +3440,19 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
 _SYSTEM_GROUP = "⚙ system"
 
 
-def _group_key_session(s):
-    return project_of(s.cwd)
+def _project_fallback(cwd):
+    from .display_snapshot import path_label
+    return path_label(cwd)
+
+
+def _project_for_display(cwd, display_snapshot=None):
+    if display_snapshot is not None:
+        return display_snapshot.project_for(cwd, _project_fallback)
+    return _project_fallback(cwd)
+
+
+def _group_key_session(s, display_snapshot=None):
+    return _project_for_display(s.cwd, display_snapshot)
 
 
 def _mem_row(s, layout="wide"):
@@ -3384,12 +3465,12 @@ def _mem_row(s, layout="wide"):
     return [seg]
 
 
-def _periodic_curate_row(memory):
+def _periodic_curate_row(memory, display_snapshot=None):
     try:
         item = (memory or {}).get("periodic_curate")
         if not isinstance(item, dict) or not item.get("total"):
             return None
-        slug = project_of(item.get("current_cwd"))
+        slug = _project_for_display(item.get("current_cwd"), display_snapshot)
         elapsed = _fmt_exec_age(item.get("elapsed_s", 0))
         return [("  ⚙ ", "g_work"),
                 ("curator %d/%d %s %s" %
@@ -3609,7 +3690,8 @@ def _unique_managed_parents(sessions):
     return unique_managed_parents(sessions)
 
 
-def _group_key_job(j, session_groups=None, job_groups=None, managed_session_groups=None):
+def _group_key_job(j, session_groups=None, job_groups=None, managed_session_groups=None,
+                   display_snapshot=None):
     session_groups = session_groups or {}
     job_groups = job_groups or {}
     managed_session_groups = managed_session_groups or {}
@@ -3628,16 +3710,16 @@ def _group_key_job(j, session_groups=None, job_groups=None, managed_session_grou
     ):
         return managed_session_groups[os.path.normpath(parent_managed_dir)]
     if getattr(j, "parent_cwd", None):
-        return project_of(j.parent_cwd)
+        return _project_for_display(j.parent_cwd, display_snapshot)
     # Drill is fixture-rooted: keep its runner + dispatch-depth-1 owner + dispatch-depth-2 workers
     # together in one /tmp/drill-* card. Other scheduled loops stay in the shared
     # control-plane group.
     if j.key in _LOOPS_KEYS:
-        drill_group = project_of(j.cwd)
+        drill_group = _project_for_display(j.cwd, display_snapshot)
         if j.key == "drill" and drill_group.startswith("drill:"):
             return drill_group
         return "loops"
-    return project_of(j.cwd)
+    return _project_for_display(j.cwd, display_snapshot)
 
 
 def _visible_group_jobs(jobs, show_sessions, show_jobs):
@@ -4139,11 +4221,11 @@ def _peer_name_is_readable(name):
     return " " not in text or _session_handle_cell_width(text) <= _PEER_NAME_MAX_CELLS
 
 
-def _session_repo_label(session):
+def _session_repo_label(session, display_snapshot=None):
     cwd = getattr(session, "cwd", None)
     if not isinstance(cwd, str) or not cwd.startswith("/"):
         return ""
-    repo = project_of(cwd)
+    repo = _project_for_display(cwd, display_snapshot)
     return _sanitize_session_title(repo) if repo not in {"(unknown)", "(root)"} else ""
 
 
@@ -4253,6 +4335,147 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
         return []
     return [_fit_strip([lambda: build(True, True), lambda: build(True, False),
                         lambda: build(False, False)], term_width)]
+
+
+def _peer_inline_options(session, tag_by_key=None):
+    """Compact direction labels for the existing session identity row.
+
+    The display label is deliberately weaker than the ledger join: only exact
+    `(harness, full session_id)` pairs can combine into a bidirectional arrow.
+    Names, cwd/repository labels and resolver reads are not used here.
+    """
+    sent = getattr(session, "peer_last_sent", None) or None
+    recv = getattr(session, "peer_last_recv", None) or None
+
+    def competing_keys(identity):
+        canonical = getattr(tag_by_key, "canonical_by_key", {})
+        owner = canonical.get(identity, identity)
+        return {key for key in (tag_by_key or {})
+                if isinstance(key, tuple) and len(key) == 2
+                and canonical.get(key, key) != owner}
+
+    def endpoint(entry, direction, peer_ids):
+        if not entry:
+            return [], []
+        harness = str(entry.get("to_harness" if direction == "sent" else
+                                "from_harness") or "").lower()
+        sid = entry.get("to_session_id" if direction == "sent" else
+                        "from_session_id")
+        prefix = {"claude": "CL", "codex": "CX", "opencode": "OC"}.get(harness, "??")
+        if not isinstance(sid, str) or not sid:
+            label = [(prefix + "/?", "dim")]
+            return label, label
+
+        identity = (harness, sid)
+        tag = (tag_by_key or {}).get((harness, sid))
+        if isinstance(tag, str) and tag:
+            competitors = competing_keys(identity)
+            collisions = {key for key in competitors
+                          if isinstance(tag_by_key.get(key), str)
+                          and tag_by_key[key][:2] == tag[:2]}
+            if collisions:
+                label = [(prefix, "dim"), ("[", "dim"), (tag[:2], "tag"), ("]", "dim")]
+                same_harness = [owner_sid for owner_harness, owner_sid in collisions
+                                if owner_harness == harness and isinstance(owner_sid, str)]
+                if same_harness:
+                    peers = [other_sid for other_harness, other_sid in peer_ids
+                             if other_harness == harness and other_sid != sid]
+                    peers.extend(owner_sid for owner_sid in same_harness if owner_sid != sid)
+                    suffix = _peer_unique_sid_suffix(sid, peers)
+                    label.append(("~" + suffix, "dim"))
+                return label, label
+            label = [("[", "dim"), (tag[:2], "tag"), ("]", "dim")]
+            return label, label
+
+        peers = [other_sid for other_harness, other_sid in peer_ids
+                 if other_harness == harness and other_sid != sid]
+        peers.extend(owner_sid for owner_harness, owner_sid in competing_keys(identity)
+                     if owner_harness == harness and isinstance(owner_sid, str)
+                     and owner_sid != sid)
+        peers = list(dict.fromkeys(peers))
+        full_sid = sid[:6]
+        short_sid = sid[:4]
+        if any(other.startswith(full_sid) for other in peers):
+            full_sid += "~" + _peer_unique_sid_suffix(sid, peers)
+        if any(other.startswith(short_sid) for other in peers):
+            short_sid += "~" + _peer_unique_sid_suffix(sid, peers)
+        return [("%s/%s" % (prefix, full_sid), "dim")], \
+               [("%s/%s" % (prefix, short_sid), "dim")]
+
+    def key(entry, direction):
+        if not isinstance(entry, dict):
+            return None
+        harness = entry.get("to_harness" if direction == "sent" else
+                            "from_harness")
+        sid = entry.get("to_session_id" if direction == "sent" else
+                        "from_session_id")
+        harness = str(harness or "").lower()
+        if harness not in {"claude", "codex", "opencode"} or not isinstance(sid, str) or not sid:
+            return None
+        return harness, sid
+
+    peer_ids = [identity for identity in (key(sent, "sent"), key(recv, "recv"))
+                if identity is not None]
+
+    if not sent and not recv:
+        return []
+    sent_key = key(sent, "sent")
+    same = sent_key is not None and sent_key == key(recv, "recv")
+    if same:
+        endpoint_segs, _minimal = endpoint(sent, "sent", peer_ids)
+        full = [(" ↔ ", None)] + endpoint_segs
+        compact = [(" ↔", None)] + endpoint_segs
+        minimal = [(" ↔ ", None)] + _minimal
+    else:
+        entries = []
+        if sent:
+            entries.append(("→", "sent", sent))
+        if recv:
+            entries.append(("←", "recv", recv))
+        full, compact, minimal = [], [], []
+        for index, (arrow, direction, entry) in enumerate(entries):
+            label, min_label = endpoint(entry, direction, peer_ids)
+            if index:
+                full.append((" ", None))
+                compact.append((" ", None))
+            full.extend([(" " if index == 0 else "", None), (arrow, "dim"),
+                         (" ", None)] + label)
+            compact.extend([(" " if index == 0 else "", None), (arrow, "dim")] + label)
+            minimal.extend([(" ", None), (arrow, "dim"),
+                            ("", None)] + min_label)
+    # The shortest form still names each harness/peer token; only endpoint detail
+    # is shed at narrow widths, never the direction or the whole peer identity.
+    return [option for option in (full, compact, minimal) if option]
+
+
+def _peer_unique_sid_suffix(session_id, others):
+    """Shortest trailing SID fragment that separates this token from its peers."""
+    for length in range(1, len(session_id) + 1):
+        suffix = session_id[-length:]
+        if all(other == session_id or not other.endswith(suffix) for other in others):
+            return suffix
+    return session_id
+
+
+class _PeerTagMap(dict):
+    """Visible endpoint tags with aliases mapped back to their owning session."""
+
+    def __init__(self):
+        super().__init__()
+        self.canonical_by_key = {}
+
+
+def _peer_inline_fit(session, tag_by_key, available):
+    options = _peer_inline_options(session, tag_by_key)
+    if not options:
+        return [], 0
+    if available is None:
+        chosen = options[0]
+    else:
+        chosen = next((option for option in options
+                       if sum(_dw(text) for text, _key in option) <= max(0, available)),
+                      options[-1])
+    return chosen, sum(_dw(text) for text, _key in chosen)
 
 
 def _peer_obligation_strip(obligations=None, term_width=None, depth=0, in_card=False):
@@ -4484,10 +4707,12 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         # F-65: a missing first-turn denominator is an unknown gauge, not a missing row.
         # Dispatch rows retain their dim visual weight and sit two cells AFTER their own
         # spinner, matching the main row's ``spinner + 2`` relationship without flattening
-        # the hierarchy back onto the main-session detail column.
+        # the hierarchy back onto the main-session detail column. Inside a card the box
+        # already carries the hierarchy, so every worker gauge shares the owner's column.
         shown_depth = min(depth, 1) if in_card else depth
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
-        detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
+        detail_indent = (4 + _HW - _CTX_LABEL_W
+                         if _route_rides_the_rail(job, None, in_card) or (in_card and not orphan)
                          else indicator_col + 2)
         content_width = (_dispatch_box_width(term_width) - 2 if in_card and term_width else
                          _context_content_width(term_width))
@@ -4786,7 +5011,7 @@ def _gpu_and_resource_rows(children, resources=(), term_width=None, depth=0, in_
     return gpu_rows, cpu_rows
 
 
-def _orphan_resource_groups(resources, drawn_jobs):
+def _orphan_resource_groups(resources, drawn_jobs, display_snapshot=None):
     """Working declared children not on screen; cwd only places their project card."""
     shown = {id(child) for job in drawn_jobs
              for child in getattr(job, "resource_children", ())}
@@ -4794,7 +5019,8 @@ def _orphan_resource_groups(resources, drawn_jobs):
     for child in resources or ():
         if child.liveness != "working" or not child.parent_attempt_id or id(child) in shown:
             continue
-        name = project_of(child.cwd) if child.cwd else child.project
+        name = (_project_for_display(child.cwd, display_snapshot)
+                if child.cwd else child.project)
         groups.setdefault(name, []).append(child)
     return groups
 
@@ -5061,24 +5287,28 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     previous_summary = None
     if now_text:
         previous_summary = now_text
-        now_text = None
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now
-    elif (not now_text and getattr(entity, "_details_pending", False)
-          and not _exec_detail_segs(entity)):
+    elif not now_text and not _exec_detail_segs(entity):
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
-        now_text = "loading"
-    if previous_summary and resource_now is None:
-        now_text = " · ".join(part for part in (now_text, previous_summary) if part)
+        if getattr(entity, "_details_error", False):
+            now_text = "unavailable (detail failed)"
+        elif getattr(entity, "_details_pending", False):
+            now_text = "loading"
+        elif hasattr(entity, "_details_pending"):
+            now_text = "no summary yet"
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_window_tokens", None))
+    window = getattr(entity, "context_display_window_tokens", None)
+    if pct is None and window is None:
+        pct, window = _native_context_gauge(entity)
+    track = _context_gauge_track(window)
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))
@@ -5129,7 +5359,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             if clipped:
                 if sep:
                     tail.append((sep, None))
-                tail.append((clipped, now_key))
+                tail.append((clipped, "dim" if now_text == "no summary yet" else now_key))
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
@@ -6029,13 +6259,12 @@ def _gpu_process_session_key(process):
             or _gpu_session_key(process.get("owner")))
 
 
-def _gpu_session_label(owner, sessions=None):
+def _gpu_session_label(owner, sessions=None, display_snapshot=None):
     """Name only an exact session; workload labels carry no session identity."""
     key = _gpu_session_key(owner)
     if key is None:
         return "미귀속", "미귀속"
-    session = next((s for s in sessions or ()
-                    if (getattr(s, "harness", None), getattr(s, "session_id", None)) == key), None)
+    session = next((s for s in sessions or () if key in _gpu_session_keys(s)), None)
     name = ""
     if session is not None:
         for candidate in (getattr(session, "runtime_name", None),
@@ -6043,34 +6272,38 @@ def _gpu_session_label(owner, sessions=None):
             name = _sanitize_session_title(candidate)
             if name:
                 break
-    tag = _resolve_session_tag(*key)
+    tag = getattr(session, "session_tag", None) if session is not None else None
+    tag = tag or _resolve_session_tag(*key)
     short = "[%s]" % tag if tag else key[1][:8]
     if name:
         return name + " " + short, short
-    repo = _session_repo_label(session)
+    repo = _session_repo_label(session, display_snapshot)
     return (repo + " " + short if repo else short), short
 
 
-def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False):
+def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False,
+                    display_snapshot=None):
     """Session and start of one reservation, without task/run descriptions."""
     if processes is None:
-        label, short = _gpu_session_label(lease.get("owner"), sessions)
+        label, short = _gpu_session_label(lease.get("owner"), sessions, display_snapshot)
         if compact:
             label = short
     else:
         keys = dict.fromkeys(_gpu_process_session_key(process) for process in processes)
         owners = ({"kind": "session", "harness": key[0], "id": key[1]} if key else None
                   for key in keys)
-        label = " / ".join(_gpu_session_label(owner, sessions)[1 if compact else 0]
+        label = " / ".join(_gpu_session_label(owner, sessions, display_snapshot)[1 if compact else 0]
                            for owner in owners)
     started = lease.get("started_at")
     when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
     return [(_gpu_safe_text(label), "tag"), (" · " + when, "dim")]
 
 
-def _gpu_reservation_rows(leases, indent, width, unplaced=False, sessions=None):
+def _gpu_reservation_rows(leases, indent, width, unplaced=False, sessions=None,
+                          display_snapshot=None):
     prefix = "GPU reserved · device unknown · " if unplaced else "  reserved "
-    return [_clip_segs([(indent + prefix, "lvl_y")] + _gpu_lease_segs(lease, sessions), width)[0]
+    return [_clip_segs([(indent + prefix, "lvl_y")] + _gpu_lease_segs(
+        lease, sessions, display_snapshot=display_snapshot), width)[0]
             for lease in leases]
 
 
@@ -6106,7 +6339,7 @@ def _gpu_run_pairs(leases, processes):
 _GPU_RUN_COMMAND_MIN_W = 12   # minimum room for a useful observed command
 
 
-def _gpu_run_rows(gpu, indent, width, sessions=None):
+def _gpu_run_rows(gpu, indent, width, sessions=None, display_snapshot=None):
     """Expanded GPU: one row per run, its reservation and command together.
 
     Unjoined reservations and processes keep their own rows; whether they
@@ -6120,15 +6353,18 @@ def _gpu_run_rows(gpu, indent, width, sessions=None):
     rows = []
     for lease, matched in pairs:
         if not matched:
-            rows.extend(_gpu_reservation_rows([lease], indent, width, sessions=sessions))
+            rows.extend(_gpu_reservation_rows([lease], indent, width, sessions=sessions,
+                                              display_snapshot=display_snapshot))
             continue
-        row = [(indent + "  ", None), ("↳ ", "dim")] + _gpu_lease_segs(lease, sessions, matched)
+        row = [(indent + "  ", None), ("↳ ", "dim")] + _gpu_lease_segs(
+            lease, sessions, matched, display_snapshot=display_snapshot)
         more = [(" +%d" % (len(matched) - 1), "dim")] if len(matched) > 1 else []
         room = _gpu_command_room(row + more, width) - _dw(" · ")
         if room < _GPU_RUN_COMMAND_MIN_W:
             # An optional long alias cannot displace the observed command.
             row = ([(indent + "  ", None), ("↳ ", "dim")]
-                   + _gpu_lease_segs(lease, sessions, matched, compact=True))
+                   + _gpu_lease_segs(lease, sessions, matched, compact=True,
+                                     display_snapshot=display_snapshot))
             room = _gpu_command_room(row + more, width) - _dw(" · ")
         if room >= _GPU_RUN_COMMAND_MIN_W:
             row += [(" · ", "dim"),
@@ -6138,7 +6374,7 @@ def _gpu_run_rows(gpu, indent, width, sessions=None):
     return rows
 
 
-def _gpu_activity_summary(gpu, host, sessions=None):
+def _gpu_activity_summary(gpu, host, sessions=None, display_snapshot=None):
     """Count observed processes by full session identity, not saved badge text."""
     observed = Counter(_gpu_process_session_key(process)
                        for process in gpu.get("processes") or () if isinstance(process, dict))
@@ -6147,7 +6383,7 @@ def _gpu_activity_summary(gpu, host, sessions=None):
     groups = []
     for key, count in observed.items():
         owner = {"kind": "session", "harness": key[0], "id": key[1]} if key else None
-        label, short = _gpu_session_label(owner, sessions)
+        label, short = _gpu_session_label(owner, sessions, display_snapshot)
         groups.append((label, count, short))
     groups.sort(key=lambda group: (-group[1], group[0]))
     warnings = []
@@ -6198,7 +6434,7 @@ def _gpu_activity_tail(groups, warnings, available):
     return tail
 
 
-def _compute_host_rows(term_width=None, sessions=None, resources=None):
+def _compute_host_rows(term_width=None, sessions=None, resources=None, display_snapshot=None):
     _compute_host_rows.fold_rows = []
     snapshot = _COMPUTE_HOSTS
     if not isinstance(snapshot, dict):
@@ -6311,7 +6547,8 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
                 rows.append([(indent, None), (part, "lvl_y")])
                 text = text[len(part):].lstrip()
         rows.extend(_gpu_reservation_rows(host.get("unplaced_gpu_reservations") or (),
-                                         " " * prefix_width, width, unplaced=True, sessions=sessions))
+                                         " " * prefix_width, width, unplaced=True, sessions=sessions,
+                                         display_snapshot=display_snapshot))
         if not gpus:
             if isinstance(status, dict) and status.get("summary"):
                 continue
@@ -6336,12 +6573,13 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
                     "card_key": _gpu_fold_key(host.get("host"), gpu.get("index")), "folded": folded})
             row = [(indent, None)] + token + chip
             if folded:
-                groups, warnings = _gpu_activity_summary(gpu, host, sessions)
+                groups, warnings = _gpu_activity_summary(
+                    gpu, host, sessions, display_snapshot)
                 room = width - 1 - sum(_dw(text) for text, _key in row)
                 row += _gpu_activity_tail(groups, warnings, room)
             rows.append(_clip_segs(row, width)[0])
             if not folded:
-                rows.extend(_gpu_run_rows(gpu, indent, width, sessions))
+                rows.extend(_gpu_run_rows(gpu, indent, width, sessions, display_snapshot))
     return rows
 
 
@@ -6865,7 +7103,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
                          node_evidence=None, governor=_IO_UNSET, resources=None, loading=False,
-                         observations=None, resource_diagnostics=None):
+                         observations=None, resource_diagnostics=None, display_snapshot=None):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -6891,7 +7129,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         fixed_priorities[i] = 0
     divider_start = len(lines)
     lines.append([(_HFILL, None)])
-    compute_rows = _compute_host_rows(term_width, sessions, resources)
+    compute_rows = _compute_host_rows(term_width, sessions, resources, display_snapshot)
     _register_compute_folds(len(lines))
     lines.extend(compute_rows)
     if compute_rows:
@@ -6969,7 +7207,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         plugin_orphans.extend(remaining)
 
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
-            and not _orphan_resource_groups(resources, ())):
+            and not _orphan_resource_groups(resources, (), display_snapshot)):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
         message = ('  sessions loading…' if loading else '  jobs.log unknown'
                    if _jobs_unconfirmed(observations) else "  no observed work")
@@ -7042,7 +7280,8 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
 
     snapshot, _age = _fresh_compute_hosts()
     excluded = _drawn_gpu_processes(drawn_gpu_jobs, session_by_identity, gpu_resources, snapshot)
-    for name, children in sorted(_orphan_resource_groups(resources, drawn_gpu_jobs).items()):
+    for name, children in sorted(_orphan_resource_groups(
+            resources, drawn_gpu_jobs, display_snapshot).items()):
         if not first:
             lines.append(None)
         first = False
@@ -7558,7 +7797,8 @@ def _observation_lines(observations, term_width=None):
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
                  governor=_IO_UNSET, loading=False, node_evidence=None,
-                 route_entities=None, observations=None, resource_diagnostics=None, pending_delivery=None):
+                 route_entities=None, observations=None, resource_diagnostics=None,
+                 pending_delivery=None, display_snapshot=None):
     """One cell budget for plain output and curses, preserving row/map indexes."""
     if term_width and layout == "wide" and term_width < _TWO_LINE_CUTOFF:
         layout = "stack" if term_width < _NARROW_CUTOFF else "narrow"
@@ -7568,7 +7808,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                                     term_width, live_order, resources, usage_snapshots, governor, loading,
                                     node_evidence=node_evidence, route_entities=route_entities,
                                     observations=observations, resource_diagnostics=resource_diagnostics,
-                                    pending_delivery=pending_delivery)
+                                    pending_delivery=pending_delivery,
+                                    display_snapshot=display_snapshot)
     if term_width is None:
         return lines
     width = max(1, term_width - 1)  # curses reserves its rightmost cell
@@ -7601,7 +7842,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
                  governor=_IO_UNSET, loading=False, node_evidence=None,
-                 route_entities=None, observations=None, resource_diagnostics=None, pending_delivery=None):
+                 route_entities=None, observations=None, resource_diagnostics=None,
+                 pending_delivery=None, display_snapshot=None):
     """Return a flat list of segment-lines for the whole screen (None = blank line).
 
     Side effect: refreshes the module-level `_SELECTABLE` stash (F-27) — see its definition.
@@ -7660,7 +7902,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor,
             resources=resources, loading=loading, observations=observations,
-            resource_diagnostics=resource_diagnostics)
+            resource_diagnostics=resource_diagnostics,
+            display_snapshot=display_snapshot)
         top_rows = (_top_rows(term_width, narrow) + _observation_lines(observations, term_width)
                     + _delivery_pending_rows(pending_delivery))
         for entry in _FOLDABLE + _SELECTABLE:
@@ -7692,15 +7935,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     n_mem_total = sum(1 for s in sessions if getattr(s, "mem_worker", False))
     mem_by_group = {_SYSTEM_GROUP: n_mem_total} if n_mem_total else {}
     # F-19 repo rows: session-id -> display title, resolved on the ORIGINAL (unfiltered) list
-    # so a mem event's source session still resolves even after mem-worker/child filtering
-    # below drops it from the visible rows.
+    # so a mem event's source session still resolves even after mem-worker/child filtering.
     sid_titles = {s.session_id: (s.title or s.slug) for s in sessions
                   if s.session_id and (s.title or s.slug)}
-    repo_by_key = {
-        (str(s.harness or "").lower(), identity): _session_repo_label(s)
-        for s in sessions if s.session_id
-        for identity in [s.session_id] + list(getattr(s, "session_aliases", None) or [])
-    }
     # F-29 — a dispatched child session's own sub-agents survive the is_child filter below:
     # they re-attach as a strip under the dispatch row representing the child. Exact
     # attempt-owned evidence lives on the job; legacy persistent sessions fall back to
@@ -7719,12 +7956,13 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     groups = {}
     session_groups = {}
     for s in sessions:
-        gk = _SYSTEM_GROUP if getattr(s, "mem_worker", False) else _group_key_session(s)
+        gk = (_SYSTEM_GROUP if getattr(s, "mem_worker", False)
+              else _group_key_session(s, display_snapshot))
         groups.setdefault(gk, {"sessions": [], "jobs": []})["sessions"].append(s)
         if s.session_id:
             session_groups[s.session_id] = gk
     managed_session_groups = {
-        managed_dir: _group_key_session(session)
+        managed_dir: _group_key_session(session, display_snapshot)
         for managed_dir, session in _unique_managed_parents(sessions).items()
     }
     job_groups = {}
@@ -7739,6 +7977,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             session_groups=session_groups,
             job_groups=job_groups,
             managed_session_groups=managed_session_groups,
+            display_snapshot=display_snapshot,
         )
         groups.setdefault(gk, {"sessions": [], "jobs": []})["jobs"].append(j)
         if j.slug:
@@ -7764,7 +8003,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             drawn_jobs.extend(_drawn_group_jobs(classified, shown))
             resource_processes.update(_drawn_gpu_processes(
                 _drawn_group_jobs(classified, shown), session_by_identity, gpu_resources, snapshot))
-        for name, children in _orphan_resource_groups(resources, drawn_jobs).items():
+        for name, children in _orphan_resource_groups(
+                resources, drawn_jobs, display_snapshot).items():
             group = groups.setdefault(name, {"sessions": [], "jobs": []})
             group["resources"] = children
             group["resource_excluded_processes"] = set(resource_processes)
@@ -7819,7 +8059,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         name: _group_emission(groups[name], show_sessions, show_jobs, gpu_resources,
                               session_by_identity, name)
         for name in order}
-    tag_by_key = {}
+    tag_by_key = _PeerTagMap()
     for emission in emission_by_group.values():
         for s in emission["shown"]:
             sid = getattr(s, "session_id", None)
@@ -7830,9 +8070,11 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             # address it by the id it had before the resume — so every alias points at
             # the same badge and the relation is labelled instead of going anonymous.
             for identity in [sid] + list(getattr(s, "session_aliases", None) or []):
-                if getattr(s, "session_tag", None):
-                    tag_by_key[(harness, identity)] = s.session_tag
-
+                identity_key = (harness, identity)
+                tag = getattr(s, "session_tag", None)
+                if tag or identity_key not in tag_by_key:
+                    tag_by_key[identity_key] = tag
+                tag_by_key.canonical_by_key[identity_key] = (harness, sid)
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
     top_rows = _top_rows(term_width, narrow)
@@ -7885,7 +8127,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # Keep tint directory-only so the intelligence zone is not confused with active cards.
     compute_start = len(lines)
     lines.append([(_HFILL, None)])
-    compute_rows = _compute_host_rows(term_width, sessions, resources)
+    compute_rows = _compute_host_rows(term_width, sessions, resources, display_snapshot)
     _register_compute_folds(len(lines))
     lines.extend(compute_rows)
     if compute_rows:
@@ -8019,7 +8261,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         _g0 = len(lines)                # panel start (title INCLUDED in the tint range)
         lines.append(head_segs)
         if name == _SYSTEM_GROUP:
-            curate_row = _periodic_curate_row(memory)
+            curate_row = _periodic_curate_row(memory, display_snapshot)
             if curate_row is not None:
                 lines.append(curate_row)
         _rail_key = "grp_live" if n_work else "dim"
@@ -8253,7 +8495,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         if live_order is not None:
             shown = live_order.reconcile_sessions(name, shown)
         shown, steward_edges = _steward_hierarchy(shown)
-        session_starts, session_identity_rows, steward_markers = {}, set(), {}
+        session_starts, session_identity_rows = {}, set()
         rendered_parent_sids = set()  # ambiguous enrichment must not duplicate a dispatch tree
         for s in shown:
             if getattr(s, "mem_worker", False):
@@ -8353,10 +8595,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
-            # Peer communication remains a strip; steward relations use under-id lines.
-            lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
-                                          tag_by_key, term_width=term_width,
-                                          repo_by_key=repo_by_key))
+            # Peer communication occupies the identity row; accepted follow-through
+            # remains a separate obligation signal below the existing detail rows.
             lines.extend(_peer_obligation_strip(getattr(s, "peer_obligations", None),
                                                 term_width=term_width))
             for plugin_job in plugin_kids:
@@ -8368,24 +8608,18 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                                     detached_root=(
                                         max(1, int(getattr(cj, "depth", 1) or 1)) >= 2
                                     ), card_rail_col=_RAIL_COL)
-            if getattr(s, "steward", False):
-                marker_row = session_starts[id(s)] + 1
-                if marker_row == len(lines):
-                    lines.append([(" " * _SESSION_DETAIL_COL, None)])
-                steward_markers[marker_row] = ("tag_dim" if s.liveness in ("stale", "dead")
-                                                else "tag_steward")
         # Draw each supervisor interval after its complete session/card block exists.
+        # The line ends above the last watched session: none of that session's rows
+        # carry it (user 2026-10-14).
         connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
                 stop = session_starts.get(id(targets[-1]))
                 if stop is not None:
                     connector_rows.update(range(session_starts[parent] + 1, stop))
-        for idx in sorted(connector_rows - session_identity_rows - steward_markers.keys()):
+        for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
                 lines[idx] = _under_id_connector(lines[idx])
-        for idx, key in steward_markers.items():
-            lines[idx] = _under_id_connector(lines[idx], _ICON_STEWARD, key)
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 
@@ -8696,7 +8930,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
                              governor=governor_snapshot, node_evidence=snapshot.node_evidence,
                              route_entities=snapshot.route_entities, observations=snapshot.observations,
                              resource_diagnostics=resource_diagnostics,
-                             pending_delivery=snapshot.pending_delivery)
+                             pending_delivery=snapshot.pending_delivery,
+                             display_snapshot=getattr(snapshot, "display_snapshot", None))
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
     colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -9383,11 +9618,57 @@ def _handle_mouse_event(mx, my, bstate):
     return True
 
 
+def _base_navigation(ch, mouse_event):
+    """Only viewport movement is safe to handle without an intervening paint."""
+    if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+              curses.KEY_HOME, curses.KEY_END, ord("k"), ord("j"), ord("g"), ord("G")):
+        return True
+    if ch == curses.KEY_MOUSE and mouse_event is not None:
+        state = mouse_event[2]
+        return state in (getattr(curses, "BUTTON4_PRESSED", 0),
+                         getattr(curses, "BUTTON5_PRESSED", 0)) and state != 0
+    return False
+
+
+def _drain_navigation(reader, stdscr, ch, mouse_event, body_h, timeout_ms):
+    """Apply a bounded burst in order; put the first action back for next paint.
+
+    Call only with a current painted viewport in base mode. Clamping each step
+    preserves reversals at either boundary, including Home/End and page moves.
+    """
+    global _OFFSET
+    deadline = time.monotonic() + .004
+    size = stdscr.getmaxyx()
+    try:
+        stdscr.timeout(0)
+        for _ in range(128):
+            if ch == curses.KEY_MOUSE:
+                _handle_mouse_event(*mouse_event)
+            else:
+                _handle_base_key(ch, body_h)
+                _OFFSET = _clamp_offset(_OFFSET, _CURRENT_BODY_COUNT, body_h)
+            if time.monotonic() >= deadline:
+                break
+            next_ch, next_mouse = reader.read(stdscr, timeout_ms=0)
+            if next_ch == curses.ERR:
+                break  # incomplete packets stay in the reader; never wait for a tail
+            if (not _base_navigation(next_ch, next_mouse)
+                    or stdscr.getmaxyx() != size):
+                reader.ready.insert(0, (next_ch, next_mouse))
+                break
+            ch, mouse_event = next_ch, next_mouse
+        else:
+            # The final iteration already consumed its successor. Preserve it.
+            reader.ready.insert(0, (ch, mouse_event))
+    finally:
+        stdscr.timeout(timeout_ms)
+
+
 class _CursesInput:
     """Read keypad-off curses bytes and decode complete keys and SGR mouse packets.
 
-    ncurses' keypad mouse decoder can wait indefinitely after an SGR prefix. Reading one
-    byte per frame leaves that decision here, so an unfinished packet cannot stop refresh.
+    ncurses' keypad mouse decoder can wait indefinitely after an SGR prefix. Decoding
+    bounded available bytes here lets an unfinished packet yield without delaying refresh.
     """
 
     _SGR_PREFIX = b"\x1b[<"
@@ -9562,10 +9843,31 @@ class _CursesInput:
             return 27, None
         return self._fallback_bytes(raw)
 
-    def read(self, stdscr):
+    def read(self, stdscr, *, timeout_ms=100):
+        result = self._read_one(stdscr)
+        if result[0] != self.curses.ERR or not (self.pending or self.discarding_sgr):
+            return result
+        # A complete arrow already in curses' buffer should not pay for a full
+        # render after each byte. Never wait for a missing tail or consume a
+        # second complete action before its predecessor has been dispatched.
+        try:
+            stdscr.timeout(0)
+            for _ in range(self._MAX_SEQUENCE):
+                code = stdscr.getch()
+                if code == self.curses.ERR:
+                    break
+                result = self._read_one(stdscr, code)
+                if result[0] != self.curses.ERR or not (self.pending or self.discarding_sgr):
+                    break
+            return result
+        finally:
+            stdscr.timeout(timeout_ms)
+
+    def _read_one(self, stdscr, code=None):
         if self.ready:
             return self._ready_event()
-        code = stdscr.getch()
+        if code is None:
+            code = stdscr.getch()
         now = time.monotonic()
         if code == self.curses.ERR:
             return self._expire(now)
@@ -9882,7 +10184,8 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
                              observations=snapshot.observations if snapshot else None,
                              resource_diagnostics=(snapshot.resource_diagnostics if snapshot
                                                    else resource_diagnostics),
-                             pending_delivery=snapshot.pending_delivery if snapshot else None)
+                             pending_delivery=snapshot.pending_delivery if snapshot else None,
+                             display_snapshot=getattr(snapshot, "display_snapshot", None))
         _RELOAD_FRAME = lines
         _RELOAD_FRAME_AT = min(now, _COMPUTE_HOSTS_SET_AT) if _COMPUTE_HOSTS_SET_AT is not None else now
         _RELOAD_FRAME_COMPUTE_AT = _COMPUTE_HOSTS_SET_AT
@@ -10083,6 +10386,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             result = details.DetailSnapshot(details.state_key(source), value)
         gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
         value.memory, value.governor = _collect_memory(), governor
+        try:
+            from .display_snapshot import extend
+            value.display_snapshot = extend(value.display_snapshot, memory=value.memory)
+        except Exception:
+            pass
         hearting_refresh = getattr(collect_all, "hearting_refresh", None)
         if callable(hearting_refresh):
             try:
@@ -10139,9 +10447,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
             # is independent, so a slow ps/dispatch/git call cannot pause this cadence.
             _nb = (int(time.time() * 10) + 1) / 10.0
-            stdscr.timeout(max(20, min(100, int((_nb - time.time()) * 1000) + 1)))
-            ch, mouse_event = (input_reader.read(stdscr) if input_reader is not None
-                               else (stdscr.getch(), None))
+            timeout_ms = max(20, min(100, int((_nb - time.time()) * 1000) + 1))
+            stdscr.timeout(timeout_ms)
+            if input_reader is not None:
+                ch, mouse_event = input_reader.read(stdscr, timeout_ms=timeout_ms)
+            else:
+                ch, mouse_event = stdscr.getch(), None
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)
@@ -10239,7 +10550,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 continue
 
             # --- base mode: scroll keys UNCHANGED (F-27 regression budget = 0) ---
-            if _handle_base_key(ch, body_h):
+            if (hit_current and not _SELECT_MODE and _PENDING_KILL is None
+                    and _base_navigation(ch, mouse_event)):
+                _drain_navigation(input_reader, stdscr, ch, mouse_event, body_h, timeout_ms)
+            elif _handle_base_key(ch, body_h):
                 pass
             elif ch == curses.KEY_MOUSE:
                 mx, my, bstate = (mouse_event if mouse_event is not None
@@ -10266,6 +10580,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_pump.stop(join_timeout=1.0)
         if install_pump is not None:
             install_pump.stop(join_timeout=0.1)
+        close_observation = getattr(collect_all, "close", None)
+        if callable(close_observation):
+            try:
+                close_observation()
+            except Exception:
+                pass
 
 
 def _stderr_log_path():

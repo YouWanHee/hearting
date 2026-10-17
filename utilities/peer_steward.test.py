@@ -19,6 +19,25 @@ from types import SimpleNamespace
 from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
+# Real capture fixtures: codex-cli 0.162.1 via tmux capture-pane, 80x40 and
+# 40x30, alt-screen and inline launches; README records each file's provenance.
+_CODEX_REVIEW_FIXTURES = _HERE / "fixtures" / "codex-0.162.1-hook-review"
+
+
+def _codex_snapshot(name):
+    text = (_CODEX_REVIEW_FIXTURES / name).read_text()
+    separators = [index for index, row in enumerate(text.splitlines()) if row == "---"]
+    return "\n".join(text.splitlines()[separators[1] + 1:]) if len(separators) >= 2 else text
+
+
+def _codex_capture(name):
+    text = (_CODEX_REVIEW_FIXTURES / name).read_text()
+    body, delimiter, _tail = text.rpartition("# capture fixture delimiter\n")
+    if not delimiter:
+        raise AssertionError(f"capture fixture delimiter missing: {name}")
+    return body
+
+
 _SPEC = importlib.util.spec_from_file_location("peer_steward", str(_HERE / "peer-steward.py"))
 peer_steward = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(peer_steward)
@@ -35,7 +54,8 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         for key in tuple(os.environ):
-            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_")):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_",
+                               "AGENT_HERDR_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_")):
                 os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
@@ -48,6 +68,8 @@ class _TmpRootMixin:
         # without the test's scoped files; pin it to the isolated HOME so
         # config-home lookups stay inside the fixture.
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "home" / ".config")
+        os.environ["XDG_DATA_HOME"] = str(self.tmp_root / "home" / ".local" / "share")
+        os.environ["XDG_CACHE_HOME"] = str(self.tmp_root / "home" / ".cache")
         os.environ.pop("XDG_STATE_HOME", None)
         os.environ.pop("HARNESS_STATE_ROOT", None)
         os.environ.pop("CODEX_HOME", None)
@@ -59,7 +81,7 @@ class _TmpRootMixin:
         os.environ.pop("AGENT_HERDR_SESSION", None)
         self._old_herdr_session = peer_steward._HERDR_SESSION
         peer_steward._HERDR_SESSION = None
-        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
         # Existing peer tests use already admitted fixture panes. The shared
@@ -134,8 +156,9 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_pane_readiness", side_effect=ready), \
              mock.patch.object(peer_steward, "_flush_pending_for_target", side_effect=flush):
             peer_steward._resume_message_obligation(duty, store)
-            self.assertEqual(calls, [(stage, "secondary") for stage in ("resolve", "readiness", "flush")])
-            self.assertEqual(store.get(duty["id"])["state"], "complete")
+            self.assertEqual(calls, [(stage, "secondary") for stage in ("resolve", "readiness")])
+            self.assertEqual(store.get(duty["id"])["state"], "pending")
+            self.assertEqual(row["state"], "pending")
             self.assertEqual(peer_steward._HERDR_SESSION, "caller")
             row["state"] = "pending"
             with mock.patch.object(peer_steward, "_pane_readiness", side_effect=RuntimeError("probe")):
@@ -817,6 +840,31 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("ready=false reason=native-trust-wait", out.getvalue())
         self.assertFalse(any(argv[:3] == ["herdr", "pane", "send-text"] for argv in calls))
 
+    def test_codex_hook_review_start_reports_not_ready_without_answering_the_form(self):
+        import contextlib
+        import io
+        calls = []
+        screen = _codex_capture("cap-inline80.txt")
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "agent", "start"]:
+                return _herdr_json(_agent_json("codex", "thread-review", "peer-c"))
+            if argv[:3] == ["herdr", "agent", "read"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=screen, stderr="")
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {"foreground_processes": []}}})
+            return _herdr_json({"result": {"pane": {}}})
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        self.assertIn("ready=false reason=native-trust-wait", out.getvalue())
+        self.assertFalse(any(argv[:3] in (["herdr", "pane", "send-text"],
+                                         ["herdr", "pane", "send-keys"])
+                             for argv in calls))
+
     def test_a_cwd_that_is_not_a_directory_never_reaches_herdr(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run") as run_mock:
@@ -834,31 +882,35 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotIn("--cd", _agent_start_cmd(run_mock))
 
     def test_the_receipt_says_when_the_launch_produced_no_identity(self):
-        """A session herdr cannot name has no ledger endpoint and no board badge. That
-        used to surface hours later as a nameless row; it belongs in the launch receipt."""
+        """A successful launch stays successful when shared identity is unknown."""
         import io
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))), \
-             mock.patch.object(peer_steward, "_BIND_PROCESS_SECONDS", 0.1), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.02):
+                                return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+                rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with("w1:pM", "codex")
+        self.assertIn("started=true", out.getvalue())
         self.assertIn("session_id=-", out.getvalue())
-        self.assertIn("session_bind=no-process", out.getvalue())
+        self.assertNotIn("session_bind=", out.getvalue())
 
-    def test_the_receipt_names_the_identity_when_there_is_one(self):
+    def test_the_receipt_uses_only_the_shared_resolver_identity(self):
         import io
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", "thread-9", "peer-c"))):
+                                return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
+             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=thread-9", out.getvalue())
+                rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with("w1:pM", "codex")
+        self.assertIn("session_id=proven-thread", out.getvalue())
 
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
@@ -930,7 +982,8 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print"), \
              mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=subprocess.CompletedProcess([], 0, stdout=started, stderr="")):
+                                return_value=subprocess.CompletedProcess([], 0, stdout=started, stderr="")), \
+             mock.patch.object(peer_steward, "_process_session", return_value="child-sid"):
             self.assertEqual(self._start(name="peer-e", kind="codex"), 0)
         markers = peer_steward.peer_message.read_steward_markers()
         self.assertEqual(set(markers), {("claude", "sid-steward")})
@@ -1031,6 +1084,9 @@ if log:
         fh.write(" ".join(argv) + " window=" + os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move") + "\n")
 
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
+mode_file = os.environ.get("FAKE_HERDR_MODE_FILE")
+if mode_file and os.path.exists(mode_file):
+    mode = open(mode_file, encoding="utf-8").read().strip() or mode
 target = argv[2] if len(argv) > 2 else "-"
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
@@ -1050,6 +1106,12 @@ def fail(code):
     sys.exit(1)
 
 verb = argv[1] if len(argv) > 1 else ""
+if argv[:2] == ["pane", "list"]:
+    if mode == "pane-list-error":
+        fail("server_unavailable")
+    print(json.dumps({"result": {"panes": json.loads(os.environ.get(
+        "FAKE_HERDR_PANES", '[{"pane_id":"w1:p9"}]'))}}))
+    sys.exit(0)
 if verb == "process-info":
     print(json.dumps({"result": {"process_info": {
         "pane_id": argv[-1], "shell_pid": os.getppid(),
@@ -1059,7 +1121,7 @@ if verb == "process-info":
 if verb == "get" and mode == "hang-get":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:   # wedged socket
         fh.read()
-if mode == "not-found":
+if mode == "not-found" and verb in {"get", "wait"}:
     fail("agent_not_found")
 if verb == "get":
     print(json.dumps(info)); sys.exit(0)
@@ -1076,435 +1138,81 @@ if verb == "wait":
         fifo = os.environ["FAKE_HERDR_FIFO"]
         with open(fifo, "r") as fh:   # blocks until the test writes: an event, not a poll
             fh.read()
+        if mode_file and os.path.exists(mode_file):
+            mode = open(mode_file, encoding="utf-8").read().strip() or mode
+        if mode == "not-found":
+            fail("agent_not_found")
     print(json.dumps(info)); sys.exit(0)
 print(json.dumps(info)); sys.exit(0)
 '''
 
 
-class StartSessionBindTest(_TmpRootMixin, unittest.TestCase):
-    """`start --kind codex` binds the launched thread when the launcher can prove it.
 
-    A TUI attached to the shared Codex daemon holds no rollout file and the daemon creates
-    the thread's rollout about a second after the TUI starts, so Fleet sees an anonymous
-    row (several same-cwd starts overlap its start-time window). The launcher is the one
-    party that saw the launch: it notes the rollouts that exist before `herdr agent start`
-    and, afterwards, takes exactly one new root rollout for the target cwd as the session.
-    Zero or several new rollouts is no proof: no guess, `session_id=-`, and the start is
-    never failed or blocked beyond the bound.
-    """
 
-    def setUp(self):
-        super().setUp()
-        self.home = self.tmp_root / "codex-home"
-        (self.home / "sessions" / "2026" / "10" / "02").mkdir(parents=True)
-        self.project = self.tmp_root / "project"
-        self.project.mkdir()
-        self.registry = self.tmp_root / "registry"
-        os.environ["CODEX_HOME"] = str(self.home)
-        os.environ["FLEET_SESSION_REGISTRY_DIR"] = str(self.registry)
-        # the "TUI": a real process, so /proc has a start time and a cwd for it
-        self.tui = subprocess.Popen(["sleep", "60"], cwd=str(self.project))
-        self.addCleanup(self.tui.wait)
-        self.addCleanup(self.tui.kill)
-        self.late = []        # rollouts the "daemon" writes after the TUI is up
-        self.calls = []
 
-    def _rollout(self, sid, cwd=None, created=None, originator="codex-tui", source="vscode"):
-        created = created if created is not None else time.time()
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created)) + ".%03dZ" % (int(created * 1000) % 1000)
-        meta = {"id": sid, "timestamp": stamp, "cwd": str(cwd or self.project),
-                "originator": originator, "source": source}
-        path = self.home / "sessions" / "2026" / "10" / "02" / (
-            "rollout-%s-%s.jsonl" % (stamp[:19].replace(":", "-"), sid))
-        path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
-        return path
 
-    def _fake_herdr(self, argv, **_kwargs):
-        self.calls.append(list(argv))
-        if argv[:3] == ["herdr", "agent", "start"]:
-            return _herdr_json({"result": {"agent": {"name": argv[3], "agent": "codex",
-                                                     "pane_id": "w1:pM"}}})
-        if argv[:3] == ["herdr", "pane", "process-info"]:
-            for write in self.late:
-                write()
-            self.late = []
-            return _herdr_json({"result": {"process_info": {"foreground_processes": [
-                {"pid": self.tui.pid, "argv": ["codex", "--cd", str(self.project)]}]}}})
-        return _herdr_json({"result": {"pane": {}}})
 
-    def _start(self, *extra, kind="codex", name="bl-c1"):
-        import io
+
+class SharedDaemonCodexStartTest(_TmpRootMixin, unittest.TestCase):
+    """Exercise the real steward start path with Codex's shared defaults."""
+
+    def _start(self, agent_args, *, proof=None, herdr_sid="herdr-claim"):
         import contextlib
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", name, "--kind", kind, "--pane", "w1:pM",
-                                    *(["--cwd", str(self.project)] if kind == "codex" else []), *extra])
-        self.assertEqual(rc, 0)
-        return out.getvalue()
-
-    def _registry_record(self):
-        path = self.registry / "codex" / ("%d.json" % self.tui.pid)
-        return json.loads(path.read_text()) if path.is_file() else None
-
-    def _proc_start(self):
-        raw = Path("/proc/%d/stat" % self.tui.pid).read_text()
-        return raw[raw.rindex(")") + 1:].split()[19]
-
-    def test_one_new_root_rollout_is_the_launched_session(self):
-        sid = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
-        self.late.append(lambda: self._rollout(sid))
-        out = self._start()
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound", out)
-        record = self._registry_record()
-        self.assertEqual(record["sessionId"], sid)
-        self.assertEqual(record["procStart"], self._proc_start())
-        self.assertEqual(record["cwd"], os.path.realpath(str(self.project)))
-        self.assertEqual(record["name"], "bl-c1")
-        self.assertNotEqual(record.get("nameSource"), "derived")
-        self.assertEqual(record["harness"], "codex")
-        self.assertEqual(record["pid"], self.tui.pid)
-        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
-        self.assertEqual(sent[0]["to"]["session_id"], sid)
-
-    def test_two_new_root_rollouts_are_never_guessed(self):
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000001"))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000002"))
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=ambiguous", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_an_embedded_start_never_binds_a_time_candidate(self):
-        """F2: an Embedded TUI owns its rollout fd, but the fd appears only after
-        its first thread exists. While it does not, another same-cwd execution's
-        lone new root rollout would satisfy the before/after binder — and the
-        resulting tier-1 record would outrank the later own fd forever. So an
-        Embedded start skips the binder entirely: unknown until the fd proves it,
-        zero registry writes from time candidates."""
         import io
-        import contextlib
-        foreign = "01a0fa57-0000-7000-8000-0000000000f1"
-        self.late.append(lambda: self._rollout(foreign))
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
-             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
-                                    "--cwd", str(self.project)])
-        self.assertEqual(rc, 0)
-        text = out.getvalue()
-        self.assertIn("started=true", text)
-        self.assertIn("session_id=-", text)
-        self.assertNotIn("session_bind=", text)
-        self.assertEqual(bind_mock.call_count, 0)
-        self.assertIsNone(self._registry_record())
-        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        self.assertIn("--no-daemon", starts[0])
 
-    def test_a_caller_stated_no_daemon_start_never_binds_a_time_candidate(self):
-        """F2 residual: a caller-stated `--no-daemon` really is Embedded execution
-        (the helper returns ``[]`` only to avoid injecting a duplicate flag), so it
-        must skip the binder like an injected one. Reproduced against 4543a6ec with
-        `_start(--, --no-daemon)`: the foreign root bound and would have been
-        written tier-1. No duplicate flag is injected on top of the caller's own."""
-        import io
-        import contextlib
-        foreign = "01a0fa57-0000-7000-8000-0000000000f2"
-        self.late.append(lambda: self._rollout(foreign))
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
-                                    "--cwd", str(self.project), "--", "--no-daemon"])
-        self.assertEqual(rc, 0)
-        text = out.getvalue()
-        self.assertIn("started=true", text)
-        self.assertIn("session_id=-", text)
-        self.assertNotIn("session_bind=", text)
-        self.assertEqual(bind_mock.call_count, 0)
-        self.assertIsNone(self._registry_record())
-        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        typed = starts[0][starts[0].index("--") + 1:]
-        self.assertEqual(typed.count("--no-daemon"), 1)
-
-    def test_stated_no_daemon_ignores_option_values_and_native_literal_boundary(self):
-        self.assertTrue(peer_steward._codex_stated_no_daemon(["--no-daemon"]))
-        self.assertTrue(peer_steward._codex_stated_no_daemon(["resume", "--no-daemon"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon([]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["--remote", "unix:///x.sock"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["-m", "--no-daemon"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["--", "--no-daemon"]))
-
-    def test_no_new_rollout_within_the_bound_times_out_without_failing(self):
-        started = time.time()
-        out = self._start()
-        self.assertLess(time.time() - started, 5)
-        self.assertIn("started=true", out)
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_a_rollout_that_existed_before_the_start_is_never_taken(self):
-        self._rollout("01a0fa57-0000-7000-8000-0000000000aa")
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        sid = "01a0fa57-0000-7000-8000-0000000000bb"
-        self.late.append(lambda: self._rollout(sid))
-        self.assertIn("session_id=" + sid, self._start(name="bl-c2"))
-
-    def test_other_cwd_subagent_and_stale_rollouts_are_ignored(self):
-        other = self.tmp_root / "elsewhere"
-        other.mkdir()
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c1", cwd=other))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c2",
-                                               source={"subagent": {"parent": "x"}}))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c3",
-                                               created=time.time() - 3600))
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_a_session_id_herdr_already_gave_is_kept_and_not_searched_for(self):
-        def with_session(argv, **kwargs):
+        def fake_run(argv, **kwargs):
             if argv[:3] == ["herdr", "agent", "start"]:
-                self.calls.append(list(argv))
-                return _herdr_json({"result": {"agent": {
-                    "name": argv[3], "agent": "codex",
-                    "agent_session": {"value": "herdr-given-sid"}}}})
-            return self._fake_herdr(argv, **kwargs)
-        import io
-        import contextlib
-        out = io.StringIO()
+                return _herdr_json(_agent_json("codex", herdr_sid, argv[3]))
+            return _idle_shell_run(argv, **kwargs)
+
+        output = io.StringIO()
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=with_session), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run) as run_mock, \
+             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             contextlib.redirect_stdout(out):
-            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=herdr-given-sid", out.getvalue())
-        self.assertNotIn("session_bind=", out.getvalue())
-        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
-
-    def test_other_harnesses_are_not_searched_for_a_rollout(self):
-        out = self._start(kind="claude")
-        self.assertNotIn("session_bind=", out)
-        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
-
-    def test_the_cwd_defaults_to_the_launched_process_cwd(self):
-        sid = "01a0fa57-0000-7000-8000-0000000000d1"
-        self.late.append(lambda: self._rollout(sid))
-        import io
-        import contextlib
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=" + sid, out.getvalue())
-
-    def test_a_missing_proc_start_keeps_the_thread_id_but_writes_no_registry_record(self):
-        # Fleet rejects a record without a matching procStart, so none is written and the
-        # receipt says the binding is unregistered; the start itself is neither failed nor blocked.
-        sid = "01a0fa57-0000-7000-8000-0000000000e1"
-        self.late.append(lambda: self._rollout(sid))
-        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value=None):
-            out = self._start()
-        self.assertIn("started=true", out)
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound-unregistered", out)
-        self.assertNotIn("session_bind=bound ", out + " ")
-        self.assertIsNone(self._registry_record())
-        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
-        self.assertEqual(sent[0]["to"]["session_id"], sid)
-
-    def test_a_registry_write_that_fails_is_reported_unregistered_not_bound(self):
-        sid = "01a0fa57-0000-7000-8000-0000000000e2"
-        self.late.append(lambda: self._rollout(sid))
-        registry = peer_steward._session_registry()
-        with mock.patch.object(registry, "write", side_effect=OSError("read-only registry")):
-            out = self._start()
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound-unregistered", out)
-
-
-class BindDeadlineConfirmationTest(unittest.TestCase):
-    """A single candidate counts only after a second observation, also at the deadline.
-
-    A rollout first seen on the final poll cannot be told apart from a concurrent same-cwd
-    start, so the bind ends as `timeout` instead of taking it.
-    """
-
-    def _bind(self, sightings):
-        """Run `_bind_codex_session` on a fake clock; `sightings[i]` is the poll-i rollout list."""
-        clock = {"now": 0.0}
-        polls = iter(sightings)
-        fake_time = mock.Mock()
-        fake_time.monotonic = lambda: clock["now"]
-        fake_time.sleep = lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
-        fake_time.time = time.time
-        with mock.patch.object(peer_steward, "time", fake_time), \
-             mock.patch.object(peer_steward, "_fleet_codex_collector", return_value=object()), \
-             mock.patch.object(peer_steward, "_pane_codex_pid", return_value=4242), \
-             mock.patch.object(peer_steward, "_new_root_rollouts",
-                               side_effect=lambda *a, **k: next(polls, sightings[-1])), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.25):
-            return peer_steward._bind_codex_session("w1:pM", "/work", "/home", set(), 0.0)
-
-    def test_a_candidate_first_seen_on_the_final_poll_is_not_bound(self):
-        # polls at t=0, .25, .5, .75 -- the candidate appears only on the last one
-        state, sid, pid, cwd = self._bind([[], [], [], ["sid-late"]])
-        self.assertEqual((state, sid), ("timeout", None))
-        self.assertEqual((pid, cwd), (4242, "/work"))
-
-    def test_a_candidate_seen_on_the_last_two_polls_is_bound(self):
-        state, sid, _pid, _cwd = self._bind([[], [], ["sid-ok"], ["sid-ok"]])
-        self.assertEqual((state, sid), ("bound", "sid-ok"))
-
-    def test_a_candidate_that_changes_on_the_final_poll_is_not_bound(self):
-        state, sid, _pid, _cwd = self._bind([[], [], ["sid-a"], ["sid-b"]])
-        self.assertEqual((state, sid), ("timeout", None))
-
-    def test_a_candidate_that_vanishes_before_confirmation_is_not_bound(self):
-        state, sid, _pid, _cwd = self._bind([["sid-a"], [], [], []])
-        self.assertEqual((state, sid), ("timeout", None))
-
-
-class EmbeddedCodexStartTest(_TmpRootMixin, unittest.TestCase):
-    """Fresh steward-started Codex TUIs run Embedded (`--no-daemon`).
-
-    A shared-daemon TUI holds no rollout fd, so two same-cwd TUIs started moments
-    apart (2026-10-04: PID 3023216/3023356, 0.03 s apart) leave Fleet with no
-    per-process proof and both rows stay anonymous. An Embedded TUI owns its
-    transcript fd, and the existing fd resolver attributes each one exactly."""
-
-    def _start_cmd(self, *argv, kind="codex", support=True, ingress=None):
-        with mock.patch.object(peer_steward.shutil, "which",
-                               return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=_idle_shell_run) as run_mock, \
-             mock.patch.object(peer_steward, "_managed_ingress_dir",
-                               return_value=ingress), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon",
-                               return_value=support):
-            rc = peer_steward.main(["start", "peer-c", "--kind", kind,
-                                    "--pane", "w1:pM", *argv])
+             mock.patch.object(peer_steward, "_process_session", return_value=proof) as resolver, \
+             contextlib.redirect_stdout(output):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM",
+                                    "--", *agent_args])
         self.assertEqual(rc, 0)
-        return _agent_start_cmd(run_mock)
+        resolver.assert_called_once_with("w1:pM", "codex")
+        return output.getvalue(), _agent_start_cmd(run_mock)
 
-    def _typed(self, cmd):
-        return cmd[cmd.index("--") + 1:]
+    @staticmethod
+    def _typed(command):
+        return command[command.index("--") + 1:]
 
-    def test_a_fresh_codex_start_runs_embedded_first(self):
-        cmd = self._start_cmd("--cwd", str(self.tmp_root))
-        typed = self._typed(cmd)
-        self.assertEqual(typed[0], "--no-daemon")
-        self.assertEqual(typed[1], "--dangerously-bypass-approvals-and-sandbox")
-        self.assertEqual(typed.count("--no-daemon"), 1)
+    def test_fresh_start_keeps_shared_default_and_does_not_inject_no_daemon(self):
+        out, command = self._start([], proof=None, herdr_sid="untrusted-start-response")
+        self.assertNotIn("--no-daemon", self._typed(command))
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=-", out)
+        self.assertNotIn("session_bind=", out)
 
-    def test_resume_and_fork_keep_their_existing_thread(self):
-        # An Embedded resume of a thread open in another app is refused natively;
-        # continuing a thread must keep reaching it, never reshape the launch.
-        for args in (["resume", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"],
-                     ["fork", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"]):
+    def test_explicit_no_daemon_and_remote_arguments_are_preserved_once(self):
+        for args, expected in (
+            (["--no-daemon"], ["--no-daemon"]),
+            (["--remote", "unix:///tmp/explicit-codex.sock"],
+             ["--remote", "unix:///tmp/explicit-codex.sock"]),
+            (["--no-daemon", "--remote=unix:///tmp/explicit-codex.sock"],
+             ["--no-daemon", "--remote=unix:///tmp/explicit-codex.sock"]),
+        ):
             with self.subTest(args=args):
-                cmd = self._start_cmd("--", *args)
-                self.assertNotIn("--no-daemon", self._typed(cmd))
+                _out, command = self._start(args)
+                typed = self._typed(command)
+                self.assertIn(expected, [typed[i:i + len(expected)]
+                                         for i in range(len(typed) - len(expected) + 1)])
+                self.assertEqual(typed.count("--no-daemon"), args.count("--no-daemon"))
 
-    def test_a_managed_ingress_is_never_given_a_conflicting_flag(self):
-        # The wrapper forwards trailing args to its `--remote` client; the managed
-        # path already attributes via registry + rollout transfer.
-        cmd = self._start_cmd(ingress=str(self.tmp_root / "bin"))
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_a_caller_stated_daemon_stance_is_never_second_guessed(self):
-        for args in (["--no-daemon"], ["--remote", "unix:///tmp/x.sock"],
-                     ["--remote=unix:///tmp/x.sock"]):
+    def test_resume_and_fork_targets_are_forwarded_without_reshaping(self):
+        thread = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
+        for args in (["resume", thread], ["fork", thread]):
             with self.subTest(args=args):
-                cmd = self._start_cmd("--", *args)
-                self.assertLessEqual(self._typed(cmd).count("--no-daemon"),
-                                     1 if args == ["--no-daemon"] else 0)
-
-    def test_an_unrecognized_invocation_keeps_its_previous_shape(self):
-        cmd = self._start_cmd("--", "--future-flag")
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_an_initial_prompt_is_still_a_fresh_start(self):
-        # A quoted prompt phrase is one argv token with a space: no native
-        # subcommand name contains a space, so this cannot be a subcommand.
-        cmd = self._start_cmd("--", "do stuff")
-        self.assertEqual(self._typed(cmd)[0], "--no-daemon")
-
-    def test_a_subcommand_after_a_prompt_word_is_never_reshaped(self):
-        # F1: official 0.160 parses `codex hello resume` with `resume` as the
-        # subcommand (`hello` sits in the PROMPT slot), so the scan must not stop
-        # at the first positional. `hello` alone really is a prompt per
-        # `codex --help` (`codex [OPTIONS] [PROMPT]`), pinned here so no future
-        # "fix" re-breaks it; native aliases (`e`, `a`) fail closed too.
-        for args, fresh in ((["hello", "resume", "--help"], False),
-                            (["hello", "fork", "--help"], False),
-                            (["hello"], True),
-                            (["e", "dated"], False),
-                            (["a"], False),
-                            (["--help"], False),
-                            (["-h"], False),
-                            (["--version"], False),
-                            (["--", "resume"], True),
-                            (["-m", "resume"], True),
-                            (["do", "stuff"], True)):
-            with self.subTest(args=args):
-                self.assertEqual(peer_steward._codex_fresh_tui_args(args), fresh)
-                cmd = self._start_cmd("--", *args)
-                self.assertEqual("--no-daemon" in self._typed(cmd), fresh)
-
-    def test_other_harnesses_and_unprobed_support_add_nothing(self):
-        cmd = self._start_cmd("--cwd", str(self.tmp_root), kind="claude")
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-        cmd = self._start_cmd("--cwd", str(self.tmp_root), support=False)
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_the_support_probe_is_fail_closed(self):
-        with mock.patch.object(peer_steward.shutil, "which", return_value=None):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        with mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=OSError("no codex")):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        bad = subprocess.CompletedProcess([], 1, stdout="--no-daemon", stderr="")
-        with mock.patch.object(peer_steward.subprocess, "run", return_value=bad):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        plain = subprocess.CompletedProcess([], 0, stdout="usage: codex", stderr="")
-        with mock.patch.object(peer_steward.subprocess, "run", return_value=plain):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-
-    def test_freshness_scan_skips_known_root_options(self):
-        self.assertTrue(peer_steward._codex_fresh_tui_args(
-            ["--cd", "/work", "-m", "gpt-x", "--config", "k=v"]))
-        self.assertTrue(peer_steward._codex_fresh_tui_args([]))
-        self.assertFalse(peer_steward._codex_fresh_tui_args(["exec", "ls"]))
-        self.assertFalse(peer_steward._codex_fresh_tui_args(["--cd"]))
+                _out, command = self._start(args)
+                typed = self._typed(command)
+                self.assertIn(args, [typed[i:i + len(args)]
+                                     for i in range(len(typed) - len(args) + 1)])
+                self.assertNotIn("--no-daemon", typed)
 
 
 class _WatchMixin(_TmpRootMixin):
@@ -1923,7 +1631,6 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             "while time.monotonic() < deadline:\n    def later():\n        time.sleep(1)\n",
             "while time.monotonic() < deadline:\n    for event in events():\n        time.sleep(1)\n",
             "while time.monotonic() < deadline:\n    while ready():\n        time.sleep(1)\n",
-            "def _bind_codex_session():\n    time.sleep(1)\n",
         ):
             with self.subTest(source=forbidden):
                 self.assertTrue(violations(forbidden, bounded_ui=True))
@@ -1996,6 +1703,147 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
         self._release()
         self.assertEqual(self._wait_for_receipt(watch_id)["state"], "idle")
+
+    def test_agent_not_found_and_complete_pane_absence_settle_terminal_receipt(self):
+        env = self._env("held")
+        mode_file = self.tmp_root / "herdr-mode"
+        env["FAKE_HERDR_MODE_FILE"] = str(mode_file)
+        env["FAKE_HERDR_PANES"] = "[]"
+        armed = self._run("watch", "peer-a", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        fields = self._fields(armed.stdout)
+        self._wait_for_lock(fields["watch_id"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if "agent wait" in self.calllog.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("watcher did not enter the bounded native wait")
+        mode_file.write_text("not-found", encoding="utf-8")
+        self._release()
+        receipt = self._wait_for_receipt(fields["watch_id"])
+        self.assertEqual(receipt["state"], "pane-exited")
+        self.assertEqual(receipt["reason"], "pane-absent")
+        self.assertEqual(peer_steward._JOIN_EXIT[receipt["state"]], 2)
+        self.assertFalse(any(row["kind"] == "notice" and
+                             row["delivery"]["status"] == "received"
+                             for row in self._all_records()))
+        before = len(self.calllog.read_text(encoding="utf-8").splitlines())
+        for _ in range(2):
+            self.assertEqual(self._run("__ensure-obligations", env=env).returncode, 0)
+        after = len(self.calllog.read_text(encoding="utf-8").splitlines())
+        self.assertEqual(after, before, "a terminal receipt must prevent observer resurrection")
+
+    def test_completed_retire_requests_terminal_receipt_under_existing_watch_lock(self):
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "closed-pane-watch"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "named", "armed_ts": "then", "agent": {
+                   "harness": "opencode", "session_id": "sid-9", "name": "peer-a",
+                   "pane": "w1:p9"}, "steward": {}, "watcher": {}, "refs": []}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        lock_fd = peer_steward._open_lock(paths.lock)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            matched = peer_steward._request_watch_terminal({
+                "server": "named", "pane": "w1:p9", "harness": "opencode",
+                "session_id": "sid-9", "foreground": None,
+            }, "completed-retire")
+            self.assertEqual(matched, 1)
+            self.assertFalse(paths.receipt.exists())
+            self.assertEqual(json.loads(paths.observation.read_text())["state"], "terminal_pending")
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertTrue(peer_steward._settle_terminal_watch_if_unobserved(
+            watch_id, arm, self.watch_root))
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "completed-retire"))
+        self.assertFalse(paths.observation.exists())
+
+
+class WatchTerminalReconcileTest(unittest.TestCase):
+    def test_server_rearm_drops_a_socket_path_bound_to_another_endpoint(self):
+        module = peer_steward
+        foreign = module._herdr_env_for_server("fourth", {
+            "AGENT_HERDR_SESSION": "default", "HERDR_SOCKET_PATH": "/default.sock"})
+        self.assertEqual(foreign["AGENT_HERDR_SESSION"], "fourth")
+        self.assertNotIn("HERDR_SOCKET_PATH", foreign)
+        exact = module._herdr_env_for_server("fourth", {
+            "AGENT_HERDR_SESSION": "fourth", "HERDR_SOCKET_PATH": "/fourth.sock"})
+        self.assertEqual(exact["HERDR_SOCKET_PATH"], "/fourth.sock")
+        back_to_default = module._herdr_env_for_server("default", {
+            "AGENT_HERDR_SESSION": "fourth", "HERDR_SOCKET_PATH": "/fourth.sock"})
+        self.assertNotIn("HERDR_SOCKET_PATH", back_to_default)
+        self.assertNotIn("AGENT_HERDR_SESSION", back_to_default)
+
+    def test_terminal_event_requires_a_fresh_snapshot_that_rejects_reused_pane_id(self):
+        expected = {"harness": "codex", "session_id": "sid-old", "pane": "w1:p9"}
+        initial = SimpleNamespace(endpoint="named", complete=True,
+                                  terminal={"w1:p9": "pane-closed"}, panes=[])
+
+        class Transport:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def resnapshot(self):
+                return SimpleNamespace(endpoint="named", complete=True,
+                                       terminal={}, panes=self.rows)
+
+        reused = Transport([{"pane_id": "w1:p9", "agent": "codex",
+                             "agent_session": {"value": "sid-old"}}])
+        self.assertIsNone(peer_steward._watch_terminal_from_view(
+            initial, expected, "named", reused))
+        new_expected = {"harness": "codex", "session_id": "sid-new", "pane": "w1:p9"}
+        new_occupant = Transport([{"pane_id": "w1:p9", "agent": "codex",
+                                   "agent_session": {"value": "sid-new"}}])
+        self.assertIsNone(peer_steward._watch_terminal_from_view(
+            initial, new_expected, "named", new_occupant))
+        absent = Transport([])
+        self.assertEqual(peer_steward._watch_terminal_from_view(
+            initial, expected, "named", absent), "pane-closed")
+
+    def test_ensure_settles_closed_pane_receipt_before_spawning_orphan_observer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            watch_id = "terminal-reconcile"
+            arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer",
+                   "server": "named", "armed_ts": "then", "agent": {
+                       "harness": "codex", "session_id": "sid-old", "name": "peer",
+                       "pane": "w1:p9"}, "steward": {}, "watcher": {}, "refs": []}
+            paths = peer_steward._watch_paths(watch_id, root)
+            paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+            view = SimpleNamespace(endpoint="named", complete=True,
+                                   terminal={"w1:p9": "pane-closed"}, panes=[])
+
+            class Transport:
+                def observe(self):
+                    return view
+
+                def resnapshot(self):
+                    return SimpleNamespace(endpoint="named", complete=True,
+                                           terminal={}, panes=[])
+
+                def close(self):
+                    pass
+
+            with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value="/fixture.sock"), \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "ObservationTransport", return_value=Transport()), \
+                 mock.patch.object(peer_steward, "_watcher_present", return_value=False), \
+                 mock.patch.object(peer_steward, "_spawn_watch_observer") as spawn:
+                peer_steward._ensure_watch_observers()
+                spawn.assert_not_called()
+                receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+                self.assertEqual((receipt["state"], receipt["reason"]),
+                                 ("pane-exited", "pane-closed"))
+                peer_steward._ensure_watch_observers()
+                spawn.assert_not_called()
 
 
 class JoinTest(_WatchMixin, unittest.TestCase):
@@ -2360,190 +2208,85 @@ def _agent_json(harness, sid, name, status="idle"):
         "agent_session": ({"agent": harness, "kind": "id", "value": sid} if sid else None)}}}
 
 
-class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
-    """F-100c — the steward send is `prompt`: herdr resolves the target's exact session
-    id, the sender's registry name rides the record, and the body gets the trailer."""
+class PeerReferenceAccessEvidenceTest(_TmpRootMixin, unittest.TestCase):
+    def test_exact_local_codex_session_uses_declared_read_scope_evidence(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+        self.assertEqual(evidence["recipient"], {
+            "harness": "codex", "session_id": "thread-exact", "pane_id": "w1:pX"})
+        self.assertEqual(evidence["local_process"]["pid"], os.getpid())
+        self.assertEqual(evidence["local_process"]["pid_namespace"],
+                         os.readlink(f"/proc/{os.getpid()}/ns/pid"))
+        self.assertEqual(evidence["schema"], "peer-read-access-observation-v1")
 
+    def test_proven_ordinary_codex_recipient_keeps_reference_presentation(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        body = "[steer] normal supported delivery\n" + "evidence " * 300 + "\nlast condition: retain phase"
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+            text, ref = peer_steward.peer_message.prepare_peer_message(
+                body, {"harness": "claude", "session_id": "sender"},
+                {"harness": "codex", "session_id": "thread-exact"},
+                defer=True, reference_evidence=evidence)
+        self.assertLess(len(text.encode("utf-8")), 1024)
+        self.assertNotIn("last condition", text)
+        self.assertEqual(peer_steward.peer_message.read_peer_payload(ref)["body"], body)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["to"]["session_id"], "thread-exact")
+
+    def test_unknown_sidless_other_runtime_and_changed_session_fail_conservative(self):
+        with mock.patch.object(peer_steward, "_retire_target") as target:
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "fresh-pane", "codex", None, "w1:pX"))
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "claude-pane", "claude", "claude-session", "w1:pX"))
+        target.assert_not_called()
+
+        replies = iter((
+            ("idle", {"harness": "codex", "session_id": "old-thread", "pane": "w1:pX"}, 0, None),
+            ("idle", {"harness": "codex", "session_id": "replacement", "pane": "w1:pX"}, 0, None),
+        ))
+        with mock.patch.object(peer_steward, "_retire_target", side_effect=lambda _target: next(replies)), \
+             mock.patch.object(peer_steward, "_retire_foreground",
+                               return_value={"pid": os.getpid(), "start": "1", "argv": ["codex"]}), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "old-thread", "w1:pX"))
+
+
+class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        # These transport fixtures now also provide a readable empty input box.
-        # Draft parsing/races use actual ANSI reads in PromptDraftGuardTest below.
         for key in ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
                     "CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(key, None)
-        empty = peer_steward._screen_lines("❯\n────────────\n┃  Ask anything...\n┃  Build model\n")
-        patch = mock.patch.object(peer_steward, "_read_screen", return_value=empty)
-        patch.start()
-        self.addCleanup(patch.stop)
-        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner.start()
         self.addCleanup(runner.stop)
+        readiness = mock.patch.object(peer_steward, "_pane_readiness",
+                                      return_value=SimpleNamespace(state="ready", reason=""))
+        readiness.start()
+        self.addCleanup(readiness.stop)
 
-    def _fake_run(self, get_payload, prompt_rc=0, calls=None):
-        def run(argv, **kw):
+    def _fake_run(self, payload, calls=None):
+        def run(argv, **kwargs):
             if calls is not None:
                 calls.append(argv)
             if argv[:3] == ["herdr", "agent", "get"]:
-                return _herdr_json(get_payload)
-            if argv[:3] == ["herdr", "agent", "prompt"]:
-                return subprocess.CompletedProcess(argv, prompt_rc, stdout="{}", stderr="")
-            if argv[:3] == ["herdr", "agent", "start"]:
-                return _herdr_json({"id": "cli:agent:start", "result": {"agent": get_payload["result"]["agent"]}})
-            if argv[:3] == ["herdr", "pane", "process-info"]:
-                pid = os.getpid()
-                return _herdr_json({"result": {"process_info": {
-                    "pane_id": get_payload["result"]["agent"].get("pane_id", "w1:pX"),
-                    "shell_pid": pid, "foreground_process_group_id": os.getpgrp(),
-                    "foreground_processes": [{"pid": pid, "argv": ["python3", "peer_steward.test"]}],
-                }}})
-            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
-        return run
-
-    def test_prompt_resolves_target_appends_trailer_and_records_exact_ids(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._fake_run(_agent_json("codex", "thread-9", "child"), calls=calls)), \
-             mock.patch.object(peer_steward.peer_message, "claude_session_name", return_value="hearting-46"), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[handoff] do the thing\nline two"])
-        self.assertEqual(rc, 0)
-        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
-        self.assertEqual(prompt_call[3], "child")
-        self.assertIn("(peer-from: claude [?] hearting-46 ; ref=", prompt_call[4])
-        self.assertNotIn("sid-steward", prompt_call[4])
-        self.assertTrue(prompt_call[4].startswith("[handoff] do the thing\nline two"))
-        rec = self._all_records()[-1]
-        self.assertEqual(rec["kind"], "handoff")
-        self.assertEqual(rec["to"], {"harness": "codex", "session_id": "thread-9", "name": "child", "pane": "w1:pX"})
-        self.assertEqual(rec["from"]["name"], "hearting-46")
-        self.assertEqual(rec["summary"], "[handoff] do the thing")
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=true", line)
-        self.assertIn("to_alias=", line)
-        self.assertNotIn("thread-9", line)
-        # sending a handoff is a message, not a steward act: no marker (user 2026-09-06)
-        self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
-        self.assertFalse(peer_steward.peer_message.steward_marker_path("claude", "sid-steward").exists())
-
-    def test_codex_before_its_first_session_takes_the_typed_send(self):
-        """2026-10-10 regression: a fresh Codex has no session until its first
-        input, and the readiness gate parked every prompt in the SID-bound native
-        queue (`peer-endpoint-unverified`), so the first input never arrived.
-        Codex 0.162 already holds a session its process proves before that
-        input; herdr still reports none, and the send is the same."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        # The row an earlier parked attempt left behind must not capture the retry.
-        peer_steward.peer_message.prepare_peer_message(
-            "first brief", {"harness": "claude", "session_id": "sid-steward", "name": None},
-            {"harness": "codex", "session_id": None, "name": "fresh"},
-            defer=True, receipt="pane-identity-unverified")
-        for proven, status, outcome in ((None, "idle", "true"), (None, "blocked", "unverified"),
-                                        ("thread-real", "idle", "true"),
-                                        ("thread-real", "blocked", "unverified")):
-            with self.subTest(proven=proven, status=status):
-                calls = []
-                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-                     mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(
-                         _agent_json("codex", None, "fresh", status=status), calls=calls)), \
-                     mock.patch.object(peer_steward, "_proven_session", return_value=proven), \
-                     mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
-                                       return_value={"status": "unverified",
-                                                     "reason": "peer-endpoint-unverified"}) as queue, \
-                     mock.patch("builtins.print") as print_mock:
-                    peer_steward.main(["prompt", "fresh", "first brief"])
-                line = print_mock.call_args[0][0]
-                self.assertIn(f"prompted={outcome} ", line)
-                typed = [c for c in calls if c[:3] == ["herdr", "agent", "prompt"]]
-                if status == "idle":
-                    self.assertIn("verify=state-flip", line)
-                    self.assertEqual(len(typed), 1)
-                    self.assertIn("--wait", typed[0])
-                    queue.assert_not_called()
-                else:
-                    # An open form still receives no keystrokes.
-                    self.assertEqual(typed, [])
-
-    def test_consecutive_prompt_captures_sender_and_recipient_once(self):
-        calls = []
-        senders = [("sender-first", "codex"), ("sender-second", "opencode")]
-        targets = [("codex", "recipient-first", "same-name"),
-                   ("opencode", "recipient-second", "same-name")]
-
-        def sent(target, text, **kwargs):
-            calls.append(text)
-            # Ambient sender changes during submission cannot alter this send's ledger.
-            os.environ["CODEX_THREAD_ID"] = "unrelated-ambient"
-            return 0, {}
-
-        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
-             mock.patch.object(peer_steward, "_current_session_identity", side_effect=senders) as identity, \
-             mock.patch.object(peer_steward, "_resolve_target", side_effect=targets) as target, \
-             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:p1")), \
-             mock.patch.object(peer_steward, "_prompt_input_reason", return_value=None), \
-             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=sent), \
-             mock.patch("builtins.print"):
-            for body in ("첫 전송", "둘째 전송"):
-                self.assertEqual(peer_steward.main(["prompt", "same-name", body, "--no-verify"]), 0)
-        self.assertEqual(identity.call_count, 2)
-        self.assertEqual(target.call_count, 2)
-        rows = {r["from"]["session_id"]: r for r in self._all_records()}
-        for i, text in enumerate(calls):
-            row = rows[senders[i][0]]
-            self.assertEqual(row["to"]["session_id"], targets[i][1])
-            self.assertEqual(row["body_sha256"], hashlib.sha256(text.encode()).hexdigest())
-            self.assertEqual(row["message_id"], row["transfer_ref"])
-            pm = peer_steward.peer_message
-            metadata = json.loads(pm._transfer_path(row["transfer_ref"]).read_text())
-            self.assertEqual(metadata["from"]["session_id"], row["from"]["session_id"])
-            self.assertEqual(metadata["to"]["session_id"], row["to"]["session_id"])
-            self.assertEqual(metadata["body_sha256"], row["body_sha256"])
-            actual = {"harness": targets[i][0], "session_id": targets[i][1]}
-            self.assertEqual(pm.parse_peer_trailer(text, actual)["session_id"], senders[i][0])
-            self.assertIsNone(pm.parse_peer_trailer(calls[1-i], actual)["session_id"])
-
-    def test_prompt_without_trailer_flag_and_unresolvable_target(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._fake_run({"error": {"code": "agent_not_found"}}, calls=calls)), \
-             mock.patch("builtins.print"):
-            rc = peer_steward.main(["prompt", "ghost", "hello", "--no-trailer"])
-        self.assertEqual(rc, 1)
-        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
-        rec = self._all_records()[-1]
-        self.assertEqual(rec["to"], {"harness": "unknown", "name": "ghost"})
-        self.assertEqual((rec["kind"], rec["delivery"]["status"]), ("steer", "failed"))
-        self.assertIn("pane-identity-unverified", rec["delivery"]["receipt"])
-
-    def _verify_run(self, status, *, prompt_rc=0, prompt_err="", explain_evidence="\"❯\\n\"", calls=None,
-                    pane_text="❯ ", explain_stdout=None):
-        """herdr as measured 2026-09-06: an idle Claude pane is explained by
-        `live_prompt_box (region=prompt_box_body)` with the box as evidence; a
-        working pane by `osc_title_working (region=osc_title)` with the terminal
-        title; `explain_stdout` overrides both (e.g. OpenCode's `rule: none`)."""
-        get_payload = _agent_json("claude", "sid-child", "child", status=status)
-        if explain_stdout is None:
-            if status == "working":
-                explain_stdout = ("agent: claude\nstate: working\nrule: osc_title_working (region=osc_title priority=1100)\n"
-                                  "evidence: \"◐ some title\"\n")
-            else:
-                explain_stdout = (f"agent: claude\nstate: {status}\nrule: live_prompt_box (region=prompt_box_body priority=950)\n"
-                                  f"evidence: {explain_evidence}\n")
-        def run(argv, **kw):
-            if calls is not None:
-                calls.append(argv)
-            if argv[:3] == ["herdr", "agent", "get"]:
-                return _herdr_json(get_payload)
-            if argv[:3] == ["herdr", "agent", "read"]:
-                return subprocess.CompletedProcess(argv, 0, stdout=pane_text, stderr="")
-            if argv[:3] == ["herdr", "agent", "prompt"]:
-                return subprocess.CompletedProcess(argv, prompt_rc, stdout="{}" if prompt_rc == 0 else "",
-                                                   stderr=prompt_err)
-            if argv[:3] == ["herdr", "agent", "explain"]:
-                return subprocess.CompletedProcess(argv, 0, stdout=explain_stdout, stderr="")
+                return _herdr_json(payload)
             if argv[:3] == ["herdr", "pane", "process-info"]:
                 pid = os.getpid()
                 return _herdr_json({"result": {"process_info": {
@@ -2554,555 +2297,316 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
         return run
 
-    def test_prompt_to_an_idle_target_waits_for_the_state_flip(self):
-        """SD-122 (11): `prompted=true` only after herdr observed the submission."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("idle", calls=calls)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 0)
-        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
-        self.assertEqual(prompt_call[5:], ["--wait", "--until", "working", "--timeout", "8000"])
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=true", line)
-        self.assertIn("state_before=idle verify=state-flip", line)
-        rec = self._all_records()[-1]
-        self.assertEqual(rec["delivery"]["status"], "sent")
-        # SD-122 (11): the ledger row is the caller attribution herdr's own log lacks
-        self.assertEqual(rec["to"]["pane"], "w1:pX")
-        self.assertIn("prompted=true state_before=idle verify=state-flip herdr_rc=0", rec["delivery"]["receipt"])
-        self.assertEqual(rec["from"]["session_id"], "sid-steward")
-        self.assertTrue(rec["body_sha256"])
+    @staticmethod
+    def _pane_io_calls(calls):
+        return [argv for argv in calls if argv[:3] in (
+            ["herdr", "agent", "prompt"], ["herdr", "pane", "send-text"],
+            ["herdr", "pane", "send-keys"], ["herdr", "agent", "send-text"],
+            ["herdr", "agent", "send-keys"],
+        )]
 
-    def test_prompt_stalled_is_a_typed_failure_not_a_success(self):
+    def test_opencode_prompt_keeps_its_native_callback_path(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        stalled = json.dumps({"error": {"code": "agent_prompt_stalled", "message": "no state change"}})
+        harness = "opencode"
+        calls = []
+        payload = _agent_json(harness, "sid-" + harness, "child", status="idle")
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", prompt_rc=1, prompt_err=stalled)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 1)
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=failed", line)
-        self.assertIn("reason=agent-prompt-stalled", line)
-        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "failed")
-
-    def test_prompt_to_a_working_target_is_unverified_unless_the_transcript_shows_it(self):
-        """Review round 1, B2: a working Claude pane is explained by its terminal
-        title, never by the prompt box, so a box that was not read is not
-        "clear". The transcript is the ground truth; without it the verdict is
-        `unverified` (exit 5, ledger `unknown`), never `true`."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward, "_transcript_arrival", return_value=None), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", calls=calls)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it"])
-        self.assertEqual(rc, 5)
-        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
-        self.assertNotIn("--wait", prompt_call, "a working target is never waited on for a flip")
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=unverified", line)
-        self.assertIn("verify=prompt-box-unavailable", line)
-        self.assertIn("reason=submission-not-observed", line)
-        rec = self._all_records()[-1]
-        self.assertEqual(rec["delivery"]["status"], "unknown")
-        self.assertIn("prompted=unverified", rec["delivery"]["receipt"])
-        calls.clear()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward, "_transcript_arrival", return_value="2026-09-06T05:00:00.000Z"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", calls=calls)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it"])
-        self.assertEqual(rc, 0)
-        self.assertIn("prompted=true", print_mock.call_args[0][0])
-        self.assertIn("state_before=working verify=transcript-arrival", print_mock.call_args[0][0])
-
-    def test_prompt_timeout_with_our_text_still_in_the_box_is_queued(self):
-        """herdr `timeout` (state changed, no `working` within the bound) and a
-        *read* box still showing our first line: `queued`, without Enter."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        timeout = json.dumps({"error": {"code": "timeout"}})
-        residue = '"❯\\u{a0}[handoff] all done, merge it, then release the gate\\n"'
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward, "_transcript_arrival", return_value=None), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", prompt_rc=1, prompt_err=timeout,
-                                                            explain_evidence=residue, calls=calls)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it, then release the gate"])
+                               side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation"), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "child", "[steer] deliver once"])
         self.assertEqual(rc, 3)
-        self.assertEqual([c for c in calls if c[:3] == ["herdr", "agent", "send-keys"]],
-                         [])
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=queued", line)
-        self.assertIn("reason=prompt-box-residue", line)
-        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "unknown")
+        self.assertIn("prompted=queued", printed.call_args[0][0])
+        self.assertEqual(self._pane_io_calls(calls), [])
+        row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["to"]["session_id"], "sid-opencode")
+        self.assertTrue(peer_steward.peer_message.parse_peer_trailer(
+            row["text"], row["to"], include_ref=True))
 
-    def test_prompt_timeout_with_no_box_read_is_unverified_not_true(self):
-        """Review round 1, B3: `rule: none` (OpenCode's normal state) has no
-        `evidence:` line; a herdr `timeout` must then be `unverified`."""
+    def _run_claude_prompt(self, *, state="idle", screen=None,
+                           consume=False, readiness=None, foregrounds=None,
+                           send_result=(0, {})):
+        if screen is None:
+            screen = CLAUDE_SUGGESTION
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        timeout = json.dumps({"error": {"code": "timeout"}})
-        none = "agent: opencode\nstate: idle\nrule: none\nfallback_reason: default_known_agent_idle_fallback\n"
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward, "_transcript_arrival", return_value=None), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", prompt_rc=1, prompt_err=timeout, explain_stdout=none)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 5)
-        self.assertIn("prompted=unverified", print_mock.call_args[0][0])
-        self.assertIn("verify=prompt-box-unavailable", print_mock.call_args[0][0])
-
-    def test_prompt_verify_timeout_is_clamped_to_herdr_stall_bound(self):
-        """Review round 1, minor 4: below 5000 ms herdr answers `timeout` instead
-        of `agent_prompt_stalled`, hiding a real stall."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("idle", calls=calls)), \
-             mock.patch("builtins.print"):
-            peer_steward.main(["prompt", "child", "[steer] go", "--verify-timeout-ms", "1000"])
-        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
-        self.assertEqual(prompt_call[-2:], ["--timeout", "5000"])
-
-    def test_prompt_refuses_a_blocked_target_or_an_open_form(self):
-        """Measured 2026-09-06 (3/3): text injected into an open AskUserQuestion
-        form is lost and the Enter answers it with the default. It is now
-        private pending; no keystrokes or fictional received notice."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
-        for status, pane_text in (("blocked", "❯ "), ("idle", form), ("working", form)):
-            with self.subTest(status=status):
-                calls = []
-                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-                     mock.patch.object(peer_steward.subprocess, "run",
-                                       side_effect=self._verify_run(status, calls=calls, pane_text=pane_text)), \
-                     mock.patch("builtins.print") as print_mock:
-                    rc = peer_steward.main(["prompt", "child", "[steer] go"])
-                self.assertEqual(rc, 3)
-                self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]],
-                                 "nothing may be typed into an open form")
-                self.assertIn("prompted=queued", print_mock.call_args[0][0])
-                self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
-                rec = self._all_records()[-1]
-                self.assertEqual(rec["delivery"]["status"], "unknown")
-                self.assertIn("reason=target-form-open", rec["delivery"]["receipt"])
-                self.assertEqual(rec["to"]["pane"], "w1:pX")
-
-
-    def test_form_closed_normal_retry_reuses_ref_and_actual_receiver_ack(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        refs = []
-        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
-             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "recipient", "child")), \
-             mock.patch.object(peer_steward, "_from_name", return_value="sender"), \
-             mock.patch.object(peer_steward, "_agent_state", side_effect=[("blocked", "w1:pX"), ("idle", "w1:pX")]), \
-             mock.patch.object(peer_steward, "_prompt_input_reason",
-                               side_effect=["target-form-open", None, None]), \
-             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as sent, \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "original body", "--no-verify"]), 3)
-            refs.append(self._all_records()[-1]["transfer_ref"])
-            sent.assert_not_called() # Even --no-verify never types into a form.
-            self.assertEqual(peer_steward.main(["prompt", "child", "original body"]), 0)
-            refs.append(self._all_records()[-1]["transfer_ref"])
-        self.assertEqual(refs[0], refs[1])
-        # The retry carries the same content as the stranded row, so the
-        # flush leaves it to the normal path: exactly one send, same ref.
-        sent.assert_called_once()
-        text = sent.call_args.args[1]
-        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received",
-                         "the observed retry closes the row even without a receiver hook")
-        peer_steward.peer_message.receive_peer_message(text, {"harness": "claude", "session_id": "recipient"})
-        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received")
-
-    def test_idle_transcript_mentioning_a_form_stays_receivable(self):
-        """2026-10-07 supervisor stall: idle sends queued on transcript
-        tokens with no live form. Quoted UI words above the bottom window
-        must not withhold keystrokes (a quote inside the bottom window only
-        delays the send now; the flush redelivers it instead of stranding)."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        quoted = ("Review note: the old AskUserQuestion footer said esc to cancel "
-                  "when done\n" + "\n".join(f"filler line {i}" for i in range(20)) + "\n❯ ")
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", calls=calls, pane_text=quoted)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 0)
-        self.assertTrue([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
-        line = print_mock.call_args[0][0]
-        self.assertIn("prompted=true", line)
-        self.assertNotIn("queued", line)
-
-    def test_live_bottom_ui_still_withholds_keystrokes(self):
-        """The narrowed gate must still catch a real form: options plus
-        footer as the trailing block, cursor included."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = ("Background work is running\n❯ 1. Exit and stop tasks\n"
-                "  2. Move to background and exit\n  3. Stay\n"
-                "Enter to confirm · Esc to cancel\n❯ ")
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", calls=calls, pane_text=form)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 3)
-        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
-        self.assertIn("prompted=queued", print_mock.call_args[0][0])
-
-    def test_narrow_wrapped_footer_still_withholds_keystrokes(self):
-        """A narrow pane wraps the footer across lines; joined bottom lines
-        still reassemble the tokens, so a real form is never typed into."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = ("Pick one?\n❯ 1. Allow\n  2. Deny\nEnter to\nselect · Esc to\ncancel\n❯ ")
-        calls = []
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", calls=calls, pane_text=form)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go"])
-        self.assertEqual(rc, 3)
-        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
-        self.assertIn("prompted=queued", print_mock.call_args[0][0])
-
-    def test_retry_with_same_content_sends_once(self):
-        """Retrying the stranded content goes through the normal path's row
-        reuse: the flush skips it, so the content arrives exactly once."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("blocked", pane_text=form)), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "same body"]), 3)
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "same body"]), 0)
-            prompts = [c.args[0] for c in run_mock.call_args_list
-                       if c.args[0][:3] == ["herdr", "agent", "prompt"]]
-        self.assertEqual(len(prompts), 1)
-
-    def test_other_sender_same_body_sends_twice(self):
-        """A same-body row from another sender is flushed AND sent anew: the
-        normal path mints a separate row, so skipping by content alone would
-        strand the old row."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        peer_steward.peer_message.prepare_peer_message(
-            "shared body",
-            {"harness": "claude", "session_id": "sid-other", "name": "other"},
-            {"harness": "claude", "session_id": "sid-child", "name": "child"},
-            defer=True, refs=[])
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "shared body"]), 0)
-            prompts = [c.args[0] for c in run_mock.call_args_list
-                       if c.args[0][:3] == ["herdr", "agent", "prompt"]]
-        self.assertEqual(len(prompts), 2)
-        self.assertTrue(all("shared body" in argv[4] for argv in prompts))
-
-    def test_flush_delivers_a_stranded_row_then_skips_it_once_acked(self):
-        """A later receivable prompt resends deferred rows first and closes
-        the observed row itself, even when no receiver hook runs."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("blocked", pane_text=form)), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "stranded body"]), 3)
-        ref = self._all_records()[-1]["transfer_ref"]
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
-            sent_texts = [c.args[0][4] for c in run_mock.call_args_list
-                          if c.args[0][:3] == ["herdr", "agent", "prompt"]]
-        self.assertTrue(any("stranded body" in text for text in sent_texts),
-                        "the stranded row text must go out before the new send")
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received",
-                         "the observed send must close the row, not wait for a hook")
-        stranded = next(text for text in sent_texts if "stranded body" in text)
-        peer_steward.peer_message.receive_peer_message(
-            stranded, {"harness": "claude", "session_id": "sid-child"})
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock2, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "third body"]), 0)
-            sent_texts2 = [" ".join(c[3:]) for c in run_mock2.call_args_list
-                           for c in [c.args[0]] if c[:3] == ["herdr", "agent", "prompt"]]
-        self.assertFalse(any("stranded body" in text for text in sent_texts2),
-                         "an acked row must never be resent")
-
-    def _deferred_claude_row(self, body):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        text, ref = peer_steward.peer_message.prepare_peer_message(
-            body, {"harness": "claude", "session_id": "sid-steward", "name": "sender"},
-            {"harness": "claude", "session_id": "sid-child", "name": "child"}, defer=True)
-        return text, ref
-
-    def test_busy_redelivery_observes_pasted_queue_without_hook_ack(self):
-        text, ref = self._deferred_claude_row("긴 지연 원문 " * 50)
-        transcript = Path(os.environ["HOME"]) / ".claude/projects/-fixture/sid-child.jsonl"
-        transcript.parent.mkdir(parents=True)
-        fake = self._verify_run("working", pane_text="❯ ")
-        def send(argv, **kw):
-            if argv[:3] == ["herdr", "agent", "prompt"]:
-                self.assertEqual(argv[4], text)
-                transcript.write_text(json.dumps({
-                    "type": "queue-operation", "operation": "enqueue",
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "sessionId": "sid-child",
-                    "content": '<pasted_content id="fe20">\n' + text + '\n</pasted_content id="fe20">',
-                }, ensure_ascii=False) + "\n")
-            return fake(argv, **kw)
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=send), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 1)
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
-
-    def test_redelivery_claim_blocks_reentrant_flush(self):
-        text, ref = self._deferred_claude_row("one deferred row")
-        fake = self._verify_run("idle", pane_text="❯ ")
-        def send(argv, **kw):
-            if argv[:3] == ["herdr", "agent", "prompt"]:
-                self.assertEqual(argv[4], text)
-                self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "unverified")
-                self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 0)
-            return fake(argv, **kw)
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=send) as calls, \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 1)
-        prompts = [call.args[0] for call in calls.call_args_list if call.args[0][:3] == ["herdr", "agent", "prompt"]]
-        self.assertEqual(len(prompts), 1)
-
-    def test_ambiguous_redelivery_is_preserved_but_not_submitted_twice(self):
-        text, ref = self._deferred_claude_row("unobserved row")
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", pane_text="❯ ")) as calls, \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
-        row = peer_steward.peer_message._read_pending(ref)
-        self.assertEqual(row["state"], "unverified")
-        self.assertEqual(row["text"], text)
-        prompts = [call.args[0] for call in calls.call_args_list if call.args[0][:3] == ["herdr", "agent", "prompt"]]
-        self.assertEqual(len(prompts), 1)
-        wrapped = '<pasted_content id="fe20">\n' + text + '\n</pasted_content id="fe20">'
-        peer_steward.peer_message.receive_peer_message(wrapped, {"harness": "claude", "session_id": "sid-child"})
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
-
-    def test_late_flush_preserves_the_original_body_and_queues_sender_notice(self):
-        text, ref = self._deferred_claude_row("body submitted together")
-        row = peer_steward.peer_message._read_pending(ref)
-        with peer_steward.peer_message.pending_lock(ref):
-            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
+        ident = {"harness": "claude", "session_id": "sid-child",
+                 "name": "child", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "fixture-start",
+                      "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                      "session_id": "sid-child"}
+        snapshots = iter(foregrounds or [foreground, foreground])
         sent = []
-        def input_reason(*args):
-            return "target-draft" if sent else None
-        def send(*args, **kwargs):
-            sent.append(args[1])
-            return 0, {}
-        with mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:pX")), \
-             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-child", "child")), \
-             mock.patch.object(peer_steward, "_prompt_input_reason", side_effect=input_reason), \
-             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=send), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 1)
-        self.assertEqual(sent, [text])
-        duties = peer_steward.peer_obligations.ObligationStore().list()
-        notices = [d for d in duties if d.get("id") == "delay-" + ref]
-        self.assertEqual(len(notices), 1)
-        notice_ref = (notices[0].get("observation") or {}).get("transfer_ref")
-        notice = peer_steward.peer_message._read_pending(notice_ref)
-        self.assertEqual(notice["refs"], ["delay-notice:" + ref, ref])
-        self.assertIn(ref[:8], notice["text"])
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+        def deliver(target, text, *, wait, timeout_ms):
+            sent.append((target, text, wait, timeout_ms))
+            if consume:
+                self.assertEqual(peer_steward.peer_message.receive_peer_message(
+                    text, {"harness": "claude", "session_id": "sid-child"}), 0)
+            return send_result
+        ready = readiness or SimpleNamespace(state="ready", reason="")
+        screen_reader = mock.Mock(return_value=peer_steward._screen_lines(screen))
+        if state != "idle":
+            screen_reader.side_effect = AssertionError("busy/blocked target screen must not be read")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("sid-steward", "claude")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="steward"), \
+             mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("claude", "sid-child", "child")), \
+             mock.patch.object(peer_steward, "_agent_state",
+                               return_value=(state, "w1:pX")), \
+             mock.patch.object(peer_steward, "_retire_target",
+                               return_value=(state, ident, 0, None)), \
+             mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+             mock.patch.object(peer_steward, "_claude_prompt_foreground_proof",
+                               side_effect=lambda *_a, **_k: next(snapshots)), \
+             mock.patch.object(peer_steward, "_read_screen", screen_reader), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=deliver), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                               return_value=False), \
+             mock.patch("builtins.print") as printed:
+            args = peer_steward.build_parser().parse_args(
+                ["prompt", "child", "[steer] exact private recipient ref"])
+            rc = peer_steward.cmd_prompt(args)
+            if state != "idle":
+                self.assertEqual(screen_reader.call_count, 0)
+        record = self._all_records()[-1]
+        row = peer_steward.peer_message._read_pending(record["transfer_ref"])
+        return rc, printed.call_args[0][0], row, sent, schedule
 
-    def test_late_flush_keeps_original_transfer_exact_and_delay_notice_is_deduped(self):
-        """The recipient gets the sealed body; one separate normal message tells the sender."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("blocked", pane_text=form)), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "old body"]), 3)
-        ref = self._all_records()[-1]["transfer_ref"]
-        row = peer_steward.peer_message._read_pending(ref)
-        with peer_steward.peer_message.pending_lock(ref):
-            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
-            sent_texts = [c.args[0][4] for c in run_mock.call_args_list
-                          if c.args[0][:3] == ["herdr", "agent", "prompt"]]
-        stranded = next(text for text in sent_texts if "old body" in text)
-        self.assertTrue(stranded.startswith("old body\n"))
-        self.assertNotIn("[지연 전달", stranded)
-        notices = [d for d in peer_steward.peer_obligations.ObligationStore().list()
-                   if d.get("id") == "delay-" + ref]
-        self.assertEqual(len(notices), 1)
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+    def test_idle_claude_empty_composer_uses_exact_prompt_and_receiver_ref(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(consume=True)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("verify=exact-peer-ref", line)
+        self.assertEqual(row["state"], "received")
+        self.assertEqual(row["receipt"], "exact-peer-ref")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0][0], sent[0][2]), ("w1:pX", False))
+        self.assertEqual(schedule.call_count, 0)
 
-    def test_long_stuck_rows_warn_with_senders(self):
-        """Rows stranded over an hour name their senders on the next prompt
-        so the original sender learns without any new gate or input."""
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("blocked", pane_text=form)), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "child", "old body"]), 3)
-        ref = self._all_records()[-1]["transfer_ref"]
-        row = peer_steward.peer_message._read_pending(ref)
-        with peer_steward.peer_message.pending_lock(ref):
-            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=self._verify_run("idle", pane_text="❯ ")), \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
-             mock.patch("builtins.print") as print_mock:
-            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
-        notices = [d for d in peer_steward.peer_obligations.ObligationStore().list()
-                   if d.get("id") == "delay-" + ref]
-        self.assertEqual(len(notices), 1)
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+    def test_idle_prompt_return_stays_queued_without_exact_receiver_ref(self):
+        rc, line, row, sent, _schedule = self._run_claude_prompt()
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-prompt-submitted", line)
+        self.assertEqual((row["state"], row["receipt"]),
+                         ("queued", "claude-pty-prompt-submitted"))
+        self.assertEqual(len(sent), 1)
 
-    def test_form_unknown_target_keeps_private_unverified_without_attaching_sid(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sender"
-        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
-             mock.patch.object(peer_steward, "_resolve_target", return_value=("opencode", None, "same-name")), \
-             mock.patch.object(peer_steward, "_agent_state", return_value=("blocked", "w1:pX")), \
-             mock.patch.object(peer_steward, "_herdr_prompt") as sent, \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "same-name", "original body"]), 5)
-        sent.assert_not_called()
-        ref = self._all_records()[-1]["transfer_ref"]
-        row = peer_steward.peer_message._read_pending(ref)
+    def test_ambiguous_claude_prompt_reply_keeps_exact_claim_and_owner_without_retry(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            send_result=(None, None))
+        self.assertEqual(rc, 5, line)
+        self.assertIn("verify=native-prompt-unverified", line)
         self.assertEqual(row["state"], "unverified")
-        self.assertIsNone(row["to"]["session_id"])
-        self.assertEqual(peer_steward.peer_message.pending_messages({"harness": "opencode", "session_id": "fork"}), [])
-    def test_transcript_arrival_accepts_queued_rows_and_survives_a_stale_session_id(self):
-        """Measured 2026-09-06 06:25Z: a mid-turn send lands in the target
-        transcript as `queue-operation`/`enqueue` first; and herdr reported a
-        stale session id for the steward pane, so recently written transcripts
-        are scanned too."""
-        import tempfile, time as _time
-        home = tempfile.mkdtemp(); saved = os.environ.get("HOME"); os.environ["HOME"] = home
-        try:
-            proj = Path(home) / ".claude" / "projects" / "-proj"; proj.mkdir(parents=True)
-            now = _time.time(); ts = _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(now))
-            (proj / "real-sid.jsonl").write_text(json.dumps({
-                "type": "queue-operation", "operation": "enqueue", "timestamp": ts,
-                "sessionId": "real-sid", "content": "[handoff] merge it now — carrier(w1:p18)\n\nbody"}) + "\n",
-                encoding="utf-8")
-            (proj / "stale-sid.jsonl").write_text("", encoding="utf-8")
-            old = now - 3600; os.utime(proj / "stale-sid.jsonl", (old, old))
-            self.assertEqual(peer_steward._transcript_arrival("claude", "stale-sid", "[handoff] merge it now — carrier(w1:p18)", now - 5), ts)
-            self.assertIsNone(peer_steward._transcript_arrival("claude", "stale-sid", "[handoff] something else", now - 5))
-            self.assertIsNone(peer_steward._transcript_arrival("codex", "x", "[handoff] merge it now — carrier(w1:p18)", now - 5))
-            (proj / "real-sid.jsonl").write_text(json.dumps({
-                "type": "user", "timestamp": ts, "message": {"content": "[steer] plain user row"}}) + "\n", encoding="utf-8")
-            self.assertEqual(peer_steward._transcript_arrival("claude", "real-sid", "[steer] plain user row", now - 5), ts)
-        finally:
-            if saved is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = saved
+        self.assertIsNotNone(row.get("rpc_claim"))
+        self.assertEqual(len(sent), 1)
+        schedule.assert_called_once()
 
-    def test_only_peer_steward_types_into_panes(self):
-        """SD-122 (11): every pane prompt goes through `peer-steward.py prompt` so
-        the ledger row exists -- herdr's server log keeps no target and no
-        caller. Asserted over the repo's code (not docs/tests): any other
-        `herdr agent prompt|send-keys` / `herdr pane send-text|send-keys|run|close`
-        caller is a defect. Census 2026-09-06: 0 outside this module."""
-        import re
-        root = (_HERE / "..").resolve()
-        pattern = re.compile(r"herdr[\"', \[]+(agent|pane)[\"', ]+(prompt|send-text|send-keys|run|close)\b")
-        offenders = []
-        for path in root.rglob("*"):
-            if path.suffix not in {".py", ".sh", ".js", ".mjs", ".ts", ".toml", ".yaml", ".json"}:
-                continue
-            rel = path.relative_to(root).as_posix()
-            if any(part in rel for part in ("/dist/", "_scratch", ".agent_reports", "node_modules", ".test.", "/tests/")):
-                continue
-            if rel.startswith(("dist/", ".agent_reports/")) or path.name == "peer-steward.py":
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for n, line in enumerate(text.splitlines(), 1):
-                if pattern.search(line) and not line.lstrip().startswith(("#", "//", "*", '"""', "'")):
-                    # Recovery launches the verified executable in a newly
-                    # created visible pane; it never prompts an existing agent.
-                    # Pin this exact launch expression, not a whole-file exemption.
-                    if (rel == "utilities/interactive-main-recovery.py"
-                            and line.strip() == 'command = ["herdr", "pane", "run", created_pane,'):
-                        import ast
-                        launch = next(node for node in ast.walk(ast.parse(text))
-                                      if isinstance(node, ast.Assign) and node.lineno == n)
-                        expected = ast.parse(
-                            '["herdr", "pane", "run", created_pane, '
-                            'shlex.join([str(launcher), "--cd", workspace, *args.agent_args])]'
-                        ).body[0].value
-                        self.assertEqual(ast.dump(launch.value), ast.dump(expected))
-                        continue
-                    offenders.append(f"{rel}:{n}: {line.strip()[:100]}")
-        self.assertEqual(offenders, [], "pane prompts must go through peer-steward.py prompt")
+    def test_busy_claude_uses_callback_without_reading_or_typing_into_pane(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            state="working", screen="busy screen is intentionally unread")
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-callback", line)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
 
-    def test_prompt_no_verify_keeps_the_legacy_exit_code_report(self):
+    def test_busy_claude_with_native_busy_readiness_stays_callback_owned(self):
+        readiness = SimpleNamespace(state="pending", reason="native-turn-busy")
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            state="working", readiness=readiness)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-callback", line)
+        self.assertEqual((row["state"], sent), ("pending", []))
+        schedule.assert_called_once()
+
+    def test_claude_prompt_foreground_proof_requires_sid_pid_birth_and_namespace(self):
+        pid = 424242
+        group = pid
+        info = {"pane_id": "w1:pX", "shell_pid": 123,
+                "foreground_process_group_id": group,
+                "foreground_processes": [{"pid": pid, "argv": ["/usr/bin/claude", "--tui"]}]}
+        fields = ["S", "1", str(group), "0", "0", *(["0"] * 14), "123"]
+        stat = f"{pid} (claude) " + " ".join(fields)
+
+        def prove(*, session_ids=("sid-child", "sid-child"),
+                  starts=("123", "123"),
+                  target_ns="pid:[77]", sender_ns="pid:[77]"):
+            def read_text(path, *args, **kwargs):
+                if str(path) == f"/proc/{pid}/stat":
+                    return stat
+                if str(path) == f"/proc/{pid}/comm":
+                    return "claude\n"
+                raise AssertionError(f"unexpected proc read: {path}")
+            def readlink(path):
+                return sender_ns if str(path) == "/proc/self/ns/pid" else target_ns
+            with mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+                 mock.patch.object(peer_steward.Path, "read_text", autospec=True,
+                                   side_effect=read_text), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=starts), \
+                 mock.patch.object(peer_steward, "_proven_session", side_effect=session_ids), \
+                 mock.patch.object(peer_steward.os, "readlink", side_effect=readlink):
+                return peer_steward._claude_prompt_foreground_proof("w1:pX", "sid-child")
+
+        proof = prove()
+        self.assertEqual(proof, {"pid": pid, "start": "123",
+                                 "pid_namespace": "pid:[77]", "session_id": "sid-child"})
+        self.assertIsNone(prove(session_ids=("sid-child", "different-sid")))
+        self.assertIsNone(prove(starts=("123", "456")))
+        self.assertIsNone(prove(target_ns="pid:[other]"))
+
+    def test_forms_drafts_unknown_boxes_and_blocked_state_never_receive_prompt_input(self):
+        for state, screen in (("idle", CLAUDE_FORM), ("idle", CLAUDE_DRAFT),
+                              ("idle", "screen without a composer"),
+                              ("blocked", CLAUDE_EMPTY)):
+            with self.subTest(state=state, screen=screen[:20]):
+                rc, line, row, sent, _schedule = self._run_claude_prompt(state=state, screen=screen)
+                self.assertEqual(rc, 3, line)
+                self.assertEqual(row["state"], "pending")
+                self.assertEqual(sent, [])
+
+    def test_foreground_birth_change_between_checks_releases_unsent_claim(self):
+        first = {"pid": os.getpid(), "start": "old-start",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid"), "session_id": "sid-child"}
+        changed = {**first, "start": "new-start"}
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            foregrounds=[first, changed])
+        self.assertEqual(rc, 3, line)
+        self.assertIn("target-process-changed", line)
+        self.assertEqual(row["state"], "pending")
+        self.assertIsNone(row.get("rpc_claim"))
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
+
+    def test_codex_prompt_uses_exact_native_queue_and_never_prompt_typing(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        calls, queued = [], []
+        payload = _agent_json("codex", "exact-thread", "child", status="working")
+
+        def accept(ref, *, timeout=1.0):
+            row = peer_steward.peer_message._read_pending(ref)
+            queued.append((row["to"]["session_id"], ref, row["text"]))
+            return {"status": "queued", "reason": "native-queue-accepted"}
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=accept), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "child", "[handoff] continue"])
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0][0], "exact-thread")
+        self.assertEqual(self._pane_io_calls(calls), [])
+        self.assertIn("native-queue-accepted", printed.call_args[0][0])
+        record = self._all_records()[-1]
+        self.assertEqual(record["delivery"]["status"], "unknown")
+        self.assertIn("verify=native-queue-queued", record["delivery"]["receipt"])
+
+    def test_codex_exact_history_receipt_is_the_only_prompted_true(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        payload = _agent_json("codex", "exact-thread", "child", status="idle")
+        calls = []
+
+        def consume(ref, *, timeout=1.0):
+            with peer_steward.peer_message.pending_lock(ref):
+                row = peer_steward.peer_message._read_pending(ref)
+                peer_steward.peer_message._save_pending(dict(
+                    row, state="received", text=None, receipt="exact-native-history"))
+            return {"status": "received", "reason": "exact-native-history"}
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=consume), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "child", "[steer] exact receipt"])
+        self.assertEqual(rc, 0)
+        self.assertIn("prompted=true", printed.call_args[0][0])
+        self.assertIn("verify=native-queue-received", printed.call_args[0][0])
+        self.assertEqual(peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])["state"],
+                         "received")
+        self.assertEqual(self._pane_io_calls(calls), [])
+
+    def test_sidless_target_remains_pane_bound_until_native_session_exists(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         calls = []
+        payload = _agent_json("codex", None, "fresh", status="idle")
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", calls=calls)), \
-             mock.patch("builtins.print") as print_mock:
-            rc = peer_steward.main(["prompt", "child", "[steer] go", "--no-verify"])
-        self.assertEqual(rc, 0)
-        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "explain"]])
-        self.assertIn("verify=none", print_mock.call_args[0][0])
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward, "_proven_session", return_value=None), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "fresh", "wait for the exact thread"])
+        self.assertEqual(rc, 3)
+        self.assertIn("reason=target-session-unresolved", printed.call_args[0][0])
+        row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual((row["state"], row["to"]["session_id"], row["to"]["pane_id"]),
+                         ("pending", None, "w1:pX"))
+        self.assertEqual(self._pane_io_calls(calls), [])
 
-    def test_prompt_box_residue_needs_our_text_beyond_the_kind_prefix(self):
-        """Claude Code 2.1.263 renders a predicted next prompt in the empty box
-        (`❯ [handoff] 후속 결과 확인 — steward-carrier…`). Residue is decided on
-        the text after the `[kind]` prefix, at least 24 characters of it; a
-        prediction identical to our own text is undecidable here and is settled
-        by the transcript first (review round 1, M4)."""
-        ghost = '"❯\\u{a0}[handoff] 후속 결과 확인 — steward-carrier…\\n"'
-        self.assertFalse(peer_steward._prompt_box_residue(ghost, "[steer] 리뷰 끝나면 handoff 보내라"))
-        self.assertFalse(peer_steward._prompt_box_residue(ghost, "[handoff] 후속 결과 확인은 끝났다 — 다음은 병합"))
-        self.assertFalse(peer_steward._prompt_box_residue('"❯\\n"', "[steer] anything"))
-        self.assertTrue(peer_steward._prompt_box_residue(ghost, "[handoff] 후속 결과 확인 — steward-carrier 후속 4건"))
-        # a narrow pane truncates the box: fewer than 24 characters after the prefix is undecidable, not residue
-        self.assertFalse(peer_steward._prompt_box_residue('"❯[handoff] all done, m…"', "[handoff] all done, merge it"))
-        self.assertTrue(peer_steward._prompt_box_residue(
-            '"❯[handoff] all done, merge it, then release …"', "[handoff] all done, merge it, then release the gate"))
+    def test_same_sender_recipient_body_retry_reuses_the_same_ref(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        payload = _agent_json("claude", "sid-child", "child", status="idle")
+        refs = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload)), \
+             mock.patch("builtins.print"):
+            for _ in range(2):
+                self.assertEqual(peer_steward.main(["prompt", "child", "retry this exact body"]), 3)
+                refs.append(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual(refs[0], refs[1])
+        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "pending")
+
+    def test_pending_flush_only_uses_codex_native_queue(self):
+        claude_text, claude_ref = peer_steward.peer_message.prepare_peer_message(
+            "preserve until Claude callback", {"harness": "codex", "session_id": "sender"},
+            {"harness": "claude", "session_id": "claude-target"}, defer=True)
+        with mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue, \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=AssertionError("PTY prompt")):
+            self.assertEqual(peer_steward._flush_pending_for_target(
+                "claude-target", "claude", "claude-target", "idle")[0], 0)
+        queue.assert_not_called()
+        self.assertEqual(peer_steward.peer_message._read_pending(claude_ref)["text"], claude_text)
+
+        _text, codex_ref = peer_steward.peer_message.prepare_peer_message(
+            "exact Codex queued message", {"harness": "claude", "session_id": "sender"},
+            {"harness": "codex", "session_id": "thread"}, defer=True)
+        with mock.patch.object(peer_steward, "_resolve_target", return_value=("codex", "thread", "child")), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                               return_value={"status": "queued"}) as queue:
+            self.assertEqual(peer_steward._flush_pending_for_target(
+                "child", "codex", "thread", "idle"), (0, []))
+        queue.assert_called_once_with(codex_ref, timeout=0.25)
+
+    def test_claude_prompt_guard_accepts_a_finished_turn_but_not_work_or_questions(self):
+        ident = {"harness": "claude", "session_id": "sid-1", "pane": "w1:p1"}
+        proof = {"pid": 1, "start": "2", "pid_namespace": "pid:[1]", "session_id": "sid-1"}
+        ready = mock.Mock(state="ready", reason=None)
+        for state, expected in (("idle", None), ("done", None), ("working", "native-state-working"),
+                                ("blocked", "native-state-blocked")):
+            with self.subTest(state=state), \
+                 mock.patch.object(peer_steward, "_retire_target", return_value=(state, ident, 0, None)), \
+                 mock.patch.object(peer_steward, "_agent_state", return_value=(state, "w1:p1")), \
+                 mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+                 mock.patch.object(peer_steward, "_claude_prompt_foreground_proof", return_value=proof), \
+                 mock.patch.object(peer_steward, "_read_screen", return_value=["> "]), \
+                 mock.patch.object(peer_steward, "_screen_ready", return_value=None):
+                reason, got = peer_steward._claude_idle_prompt_guard("w1:p1", "sid-1", "w1:p1")
+                self.assertEqual(reason, expected)
+                self.assertEqual(got, proof if expected is None else None)
+
+    def test_source_has_no_general_prompt_observation_or_no_verify_bypass(self):
+        source = (_HERE / "../utilities/peer-steward.py").resolve().read_text()
+        start = source.index("def cmd_prompt(")
+        end = source.index("# --- clear:", start)
+        prompt = source[start:end]
+        for obsolete in ("_prompt_box", "_verify_after_send", "_transcript_arrival",
+                         "_prompt_input_reason", "no_verify", "state-flip"):
+            self.assertNotIn(obsolete, prompt)
+        self.assertIn("elif t_harness == \"claude\"", prompt)
+        self.assertIn("_claude_idle_prompt_guard", prompt)
+        self.assertNotIn("--no-verify", peer_steward.build_parser().format_help())
 
 
 class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
@@ -3120,292 +2624,151 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         batches.assert_called_once_with()
 
 
-class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
-    """Actual 0.8 CLI/screen fixtures: user input survives; exact payload goes once."""
+class NormalProducerRunnerBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        self.jobs = self.base / "dispatch" / "jobs.log"
+        self.env = {"AGENT_PEER_LEDGER_ROOT": str(self.state),
+                    "AGENT_DISPATCH_JOBS": str(self.jobs),
+                    "HOME": str(self.base / "home")}
+        Path(self.env["HOME"]).mkdir()
+        patch = mock.patch.dict(os.environ, self.env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
 
+    def _exact_retire(self):
+        return {"server": "default", "pane": "fixture-pane", "harness": "codex",
+                "session_id": "sid-retire", "name": "retire-target",
+                "foreground": {"pid": 123, "start": "456"}}
+
+    def test_message_and_delay_producers_use_the_shared_binding_helper(self):
+        sender = {"harness": "claude", "session_id": "sid-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "sid-recipient", "name": "recipient"}
+        message = {"ref": "a" * 32, "body_sha256": "b" * 64,
+                   "from": sender, "to": recipient, "refs": []}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            duty = peer_steward._schedule_message_obligation(message, "recipient", "fixture-pane")
+            self.assertIsNotNone(duty)
+            ensure.assert_called_once_with()
+
+        delay_row = {"ref": "c" * 32, "created": time.time(), "refs": [],
+                     "from": sender, "to": recipient}
+        prepared = {"ref": "d" * 32, "body_sha256": "e" * 64,
+                    "from": recipient, "to": sender, "refs": ["delay-notice:" + delay_row["ref"]]}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure, \
+             mock.patch.object(peer_steward.peer_message, "prepare_peer_message",
+                               return_value=("fixture text", prepared["ref"])), \
+             mock.patch.object(peer_steward.peer_message, "_read_pending",
+                               return_value=prepared):
+            duty = peer_steward._ensure_sender_delay_notice(delay_row)
+            self.assertIsNotNone(duty)
+            self.assertEqual(ensure.call_count, 2)
+
+    def test_retire_and_handoff_retire_producers_use_the_shared_binding_helper(self):
+        exact = self._exact_retire()
+        requester = {"session_id": "sid-requester", "harness": "codex",
+                     "pane": "requester-pane", "server": "default"}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            _store, duty = peer_steward._retire_request(
+                "retire-target", exact, requester=requester)
+            self.assertEqual(duty["intent"]["identity"], exact)
+            ensure.assert_called_once_with()
+
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            handoff_exact = {**exact, "pane": "handoff-pane"}
+            duty_id = peer_steward.reserve_handoff_retire(
+                "handoff-target", handoff_exact, requester)
+            self.assertTrue(duty_id.startswith("retire-"))
+            self.assertEqual(ensure.call_count, 2)
+
+
+class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
         for key in ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
                     "CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(key, None)
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        os.environ["HERDR_PANE_ID"] = "w1:pX"
-        self.harness, self.sid, self.status = "claude", "sid-child", "idle"
-        self.screen, self.messages, self.keys = CLAUDE_EMPTY, [], []
+        self.harness, self.sid = "claude", "sid-child"
+        self.readiness = type("Ready", (), {"state": "ready", "reason": ""})()
         self.enterContext(mock.patch.object(peer_steward.shutil, "which", return_value="/fixture/herdr"))
         self.enterContext(mock.patch.object(peer_steward.subprocess, "run", side_effect=self.run_herdr))
+        self.enterContext(mock.patch.object(peer_steward, "_read_screen",
+                                            side_effect=AssertionError("peer delivery read composer")))
+        self.enterContext(mock.patch.object(peer_steward, "_pane_readiness",
+                                            side_effect=lambda *a, **k: self.readiness))
+        self.enterContext(mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                                            return_value=False))
         self.enterContext(mock.patch("builtins.print"))
 
     def run_herdr(self, argv, **kwargs):
-        if argv[:3] in (["herdr", "agent", "get"], ["herdr", "agent", "wait"]):
-            return _herdr_json(_agent_json(self.harness, self.sid, "child", self.status))
-        if argv[:3] == ["herdr", "pane", "process-info"]:
-            pid = os.getpid()
-            return _herdr_json({"result": {"process_info": {
-                "pane_id": "w1:pX", "shell_pid": pid,
-                "foreground_process_group_id": os.getpgrp(),
-                "foreground_processes": [{"pid": pid, "argv": ["python3", "peer_steward.test"]}],
-            }}})
-        if argv[:3] == ["herdr", "agent", "read"]:
-            return subprocess.CompletedProcess(argv, 1 if self.screen is None else 0,
-                                               stdout=self.screen or "", stderr="")
-        if argv[:3] == ["herdr", "agent", "prompt"]:
-            self.messages.append(argv[4])
-        if argv[:3] == ["herdr", "agent", "send-keys"]:
-            self.keys.append(argv)
+        if argv[:3] == ["herdr", "agent", "get"]:
+            return _herdr_json(_agent_json(self.harness, self.sid, "child", status="working"))
         return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
 
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
 
-    def test_idle_parent_prompt_with_pending_or_unknown_children_accepts_input(self):
-        from dispatch_contract import ObservedAttemptLiveness
-        meta = ("attempt_id=att-bound,parent_sid=sid-child,parent_pane=w1:pX,"
-                "parent_harness=claude")
-        self.jobs_path.write_text(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
-        for state in ("live", "unverifiable"):
-            with self.subTest(process_state=state), mock.patch(
-                    "dispatch_contract.observed_attempt_liveness",
-                    return_value=ObservedAttemptLiveness(
-                        "alive" if state == "live" else "unverifiable", "fixture", state, "fixture")):
-                self.assertEqual(self.prompt("parent input: " + state), 0)
-                self.assertEqual(len(self.messages), 1)
-                self.messages.clear()
-
-    def test_idle_executor_with_pending_or_unknown_attempt_sends_no_input(self):
-        from dispatch_contract import ObservedAttemptLiveness
-        meta = "attempt_id=att-bound,harness=claude,parent_sid=other,parent_harness=claude"
-        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
-        for state, reason in (("live", "bound-registered-work-pending"),
-                              ("unverifiable", "bound-registered-work-unknown")):
-            with self.subTest(state=state), mock.patch(
-                    "peer_obligations.execution_attempts_for_processes", return_value=("att-bound",)), \
-                 mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                            ObservedAttemptLiveness("alive", "fixture", state, "fixture")):
-                self.assertEqual(self.prompt("executor input: " + state), 3)
-                self.assertEqual(self.messages, [])
-                ref = self._all_records()[-1]["transfer_ref"]
-                self.assertEqual(peer_steward.peer_message._read_pending(ref)["receipt"], reason)
-
-    def test_reconnect_delivers_existing_parent_duty_while_child_runs(self):
-        from dispatch_contract import ObservedAttemptLiveness
-        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
-        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
-        self.screen = CLAUDE_FORM
-        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
-            self.assertEqual(self.prompt("original queued body"), 3)
-            ref = self._all_records()[-1]["transfer_ref"]
-            self.screen = CLAUDE_EMPTY
-            peer_steward.cmd_ensure_obligations(SimpleNamespace())
-            self.assertEqual(len(self.messages), 1)
-            self.assertIn("original queued body", self.messages[0])
-            self.assertIn(ref, self.messages[0])
-            peer_steward.cmd_ensure_obligations(SimpleNamespace())
-            self.assertEqual(len(self.messages), 1)
-
-    def test_install_during_form_then_idle_delivers_with_old_runner_lock_held(self):
-        from dispatch_contract import ObservedAttemptLiveness
-        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
-        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
-        store = peer_steward.peer_obligations.ObligationStore()
-        store.root.mkdir(parents=True)
-        with (store.root / "runner.lock").open("w") as lock, \
-             mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.screen = CLAUDE_FORM
-            self.assertEqual(self.prompt("late original body"), 3)
-            ref = self._all_records()[-1]["transfer_ref"]
-            peer_steward.cmd_ensure_obligations(SimpleNamespace())
-            self.assertEqual(self.messages, [])
-            self.screen = CLAUDE_EMPTY
-            self.idle()
-            self.assertEqual(len(self.messages), 1)
-            self.assertIn(ref, self.messages[0])
-            self.assertIn("late original body", self.messages[0])
-            self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
-            self.idle()
-            self.assertEqual(len(self.messages), 1)
-
-    def test_current_runner_delivers_after_draft_clears_without_idle_callback(self):
-        from dispatch_contract import ObservedAttemptLiveness
-        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
-        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
-        self.screen = RULE + "\n❯ existing user draft\n" + RULE + "\n"
-        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
-            self.assertEqual(self.prompt("original event-free retry"), 3)
-            ref = self._all_records()[-1]["transfer_ref"]
-            original = peer_steward.peer_message._read_pending(ref)
-            store = peer_steward.peer_obligations.ObligationStore()
-            with (store.root / "runner.lock").open("w") as legacy, \
-                 (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as current:
-                fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(current, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                peer_steward.cmd_ensure_obligations(SimpleNamespace())
-                self.assertEqual(self.messages, [])
-
-                def clear_draft(_delay):
-                    self.assertEqual(self.keys, [])
-                    self.screen = CLAUDE_EMPTY
-
-                with mock.patch.object(peer_steward.time, "sleep", side_effect=clear_draft):
-                    self.assertEqual(peer_steward.cmd_obligation_runner(
-                        SimpleNamespace(state_root=self.tmp_root, lock_fd=current.fileno())), 0)
-            self.assertEqual(self.messages, [original["text"]])
-            received = peer_steward.peer_message._read_pending(ref)
-            self.assertEqual(received["state"], "received")
-            self.assertEqual(received["body_sha256"], original["body_sha256"])
-
-    def idle(self):
-        # Run the actual existing receive callback entry, with native identity
-        # isolated to this fixture. Its internal claims/acks are not mocked.
-        with mock.patch("fleet.herdr_projection.may_report", return_value=True):
-            peer_steward.peer_message.retry_receiver_idle({"harness": self.harness, "session_id": self.sid})
-
-    def test_task_runner_delivers_sealed_message_after_form_closes_without_sender_prompt(self):
-        self.screen = CLAUDE_FORM
-        self.assertEqual(self.prompt("sealed original body"), 3)
-        ref = self._all_records()[-1]["transfer_ref"]
-        original = peer_steward.peer_message._read_pending(ref)
-        duty_id = "message-" + ref
-        store = peer_steward.peer_obligations.ObligationStore()
-        duty = store.get(duty_id)
-        self.assertIsNotNone(duty)
-        self.assertEqual(duty["intent"]["body_digest"], original["body_sha256"])
-        self.assertNotIn("body", duty["intent"])
-        self.assertEqual(self.messages, [])
-
-        self.screen = CLAUDE_EMPTY
-        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            with mock.patch.object(peer_steward.time, "sleep"), mock.patch("builtins.print"):
-                self.assertEqual(peer_steward.cmd_obligation_runner(
-                    SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd)), 0)
-        finally:
-            os.close(lock_fd)
-
-        received = peer_steward.peer_message._read_pending(ref)
-        self.assertEqual(received["state"], "received")
-        self.assertEqual(received["body_sha256"], original["body_sha256"])
-        self.assertIsNone(received["text"], "acknowledgement retires the stored body")
-        self.assertEqual(self.messages, [original["text"]])
-        self.assertEqual(store.get(duty_id)["state"], "complete")
-
-    def test_today_two_collision_shapes_after_preparation_preserve_draft_and_deliver_once(self):
-        prepare = peer_steward.peer_message.prepare_peer_message
-        for draft in ("그리고 토큰 효율을 위해서 좀 50% 넘으면 작업 세션들 주기적으로",
-                      "산출물 이동 하나 하는게 왜이렇게 오래 걸리는거임?"):
-            with self.subTest(draft=draft):
-                self.screen = CLAUDE_EMPTY
-                before = len(self.messages)
-                def user_types(*args, **kwargs):
-                    result = prepare(*args, **kwargs)
-                    self.screen = RULE + "\n❯ " + draft + "\n" + RULE + "\n"
-                    return result
-                with mock.patch.object(peer_steward.peer_message, "prepare_peer_message", side_effect=user_types):
-                    self.assertEqual(self.prompt("peer " + draft), 3)
-                original = self.screen
-                ref = self._all_records()[-1]["transfer_ref"]
-                row = peer_steward.peer_message._read_pending(ref)
-                self.assertEqual((row["state"], row["receipt"]), ("pending", "target-draft"))
-                self.assertEqual(len(self.messages), before)
-                self.idle()                   # Still a draft: no input, no Enter.
-                self.assertEqual(self.screen, original)
-                self.assertEqual(self.keys, [])
-                self.assertEqual(len(self.messages), before)
-                self.screen = CLAUDE_EMPTY
-                self.idle()
-                self.idle()                   # No duplicate after acknowledgement.
-                self.assertEqual(self.messages[before:], [row["text"]])
-                self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
-
-    def test_claude_and_opencode_draft_or_unreadable_box_wait_but_empty_box_sends(self):
-        for harness, draft, empty in (("claude", CLAUDE_DRAFT, CLAUDE_EMPTY),
-                                      ("opencode", OPENCODE_DRAFT, OPENCODE_HOME)):
-            for screen in (draft, None, NO_BOX):
-                with self.subTest(harness=harness, screen=screen):
-                    self.harness, self.screen = harness, screen
-                    before = len(self.messages)
-                    body = harness + str(screen)
-                    self.assertEqual(self.prompt(body), 3)
-                    ref = self._all_records()[-1]["transfer_ref"]
-                    row = peer_steward.peer_message._read_pending(ref)
-                    self.assertEqual(row["state"], "pending")
-                    self.assertEqual(len(self.messages), before)
-                    self.screen = empty
-                    self.idle()
-                    self.assertEqual(self.messages[before:], [row["text"]])
-            self.screen = empty
-            before = len(self.messages)
-            self.assertEqual(self.prompt(harness + " direct"), 0)
-            self.assertEqual(len(self.messages), before + 1)
-
-    def test_draft_after_pending_claim_releases_only_unsent_claim(self):
-        self.screen = CLAUDE_DRAFT
-        self.assertEqual(self.prompt(), 3)
+    def test_non_codex_peer_prompt_retains_exact_ref_for_native_callback(self):
+        self.assertEqual(self.prompt("[steer] native callback body"), 3)
         ref = self._all_records()[-1]["transfer_ref"]
         row = peer_steward.peer_message._read_pending(ref)
-        claim = peer_steward.peer_message.claim_pending_herdr
-        self.screen = CLAUDE_EMPTY
-        def user_types(*args, **kwargs):
-            result = claim(*args, **kwargs)
-            self.screen = CLAUDE_DRAFT
-            return result
-        with mock.patch.object(peer_steward.peer_message, "claim_pending_herdr", side_effect=user_types):
-            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", self.sid, "idle")[0], 0)
-        held = peer_steward.peer_message._read_pending(ref)
-        self.assertEqual((held["state"], held["rpc_claim"]), ("pending", None))
-        self.assertEqual(self.messages, [])
-        self.screen = CLAUDE_EMPTY
-        self.idle()
-        self.assertEqual(self.messages, [row["text"]])
+        self.assertEqual(row["state"], "pending")
+        self.assertIn("native callback body", row["text"])
+        self.assertEqual(row["to"], {"harness": "claude", "session_id": self.sid,
+                                     "name": "child", "pane_id": "w1:pX"})
 
-    def test_foreign_callback_and_changed_sid_cannot_drain_pending(self):
-        self.screen = CLAUDE_DRAFT
-        self.assertEqual(self.prompt(), 3)
-        self.screen = CLAUDE_EMPTY
-        with mock.patch("fleet.herdr_projection.may_report", return_value=False):
-            peer_steward.peer_message.retry_receiver_idle({"harness": "claude", "session_id": self.sid})
-        self.sid = "another-session"
-        self.idle()
-        with mock.patch("fleet.herdr_projection.may_report", return_value=True):
-            peer_steward.peer_message.retry_receiver_idle({"harness": "claude", "session_id": "sid-child"})
-        self.assertEqual(self.messages, [])
+    def test_registered_work_readiness_withholds_queue_or_native_callback_delivery(self):
+        self.readiness = type("NotReady", (), {
+            "state": "pending", "reason": "bound-registered-work-pending"})()
+        queue = mock.Mock()
+        with mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", queue):
+            self.assertEqual(self.prompt("keep execution ownership"), 3)
+        queue.assert_not_called()
+        row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual((row["state"], row["receipt"]), ("pending", "bound-registered-work-pending"))
 
-    def test_existing_claude_stop_hook_waits_for_empty_box_and_delivers_once(self):
-        import io
-        path = _HERE.parent / "hooks" / "herdr-session-projection.py"
-        spec = importlib.util.spec_from_file_location("_draft_guard_stop_hook", path)
-        hook = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(hook)
-        payload = json.dumps({"session_id": self.sid, "hook_event_name": "Stop"})
-        self.screen = CLAUDE_DRAFT
-        self.assertEqual(self.prompt(), 3)
+    def test_codex_queue_does_not_read_or_type_into_composer(self):
+        self.harness, self.sid = "codex", "thread-exact"
+        accepted = []
+        def queue(ref):
+            accepted.append(peer_steward.peer_message._read_pending(ref))
+            return {"status": "queued", "reason": "native-queue-accepted"}
+        with mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=queue):
+            self.assertEqual(self.prompt("[steer] exact queue"), 3)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["to"]["session_id"], "thread-exact")
+        self.assertEqual(accepted[0]["state"], "pending")
+        self.assertEqual(accepted[0]["text"].splitlines()[0], "[steer] exact queue")
+
+    def test_reconnected_obligation_keeps_claude_payload_pending_without_ptysend(self):
+        self.assertEqual(self.prompt("parent duty stays sealed"), 3)
         ref = self._all_records()[-1]["transfer_ref"]
-        text = peer_steward.peer_message._read_pending(ref)["text"]
-        with mock.patch("fleet.herdr_projection.project"), \
-             mock.patch("fleet.herdr_projection.may_report", return_value=True):
-            for screen in (CLAUDE_DRAFT, CLAUDE_EMPTY, CLAUDE_EMPTY):
-                self.screen = screen
-                with mock.patch.object(sys, "stdin", io.StringIO(payload)):
-                    self.assertEqual(hook.main(), 0)
-                if screen == CLAUDE_DRAFT:
-                    self.assertEqual(self.messages, [])
-        self.assertEqual(self.messages, [text])
-        self.assertEqual(self.keys, [])
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.get("message-" + ref)
+        self.assertIsNotNone(duty)
+        with mock.patch.object(peer_steward, "_retire_target", return_value=("idle", {
+                "harness": "claude", "session_id": self.sid, "pane": "w1:pX", "name": "child"}, 0, None)), \
+             mock.patch.object(peer_steward, "_herdr_prompt",
+                               side_effect=AssertionError("obligation runner typed into pane")):
+            peer_steward._resume_message_obligation(duty, store)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+        self.assertEqual(store.get(duty["id"])["state"], "pending")
 
-    def test_codex_native_queue_is_not_subject_to_draft_reads(self):
-        self.harness, self.status, self.screen = "codex", "blocked", CLAUDE_DRAFT
-        with mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("native queue needs no box")), \
-             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
-                               return_value={"status": "queued", "reason": "native-queue-accepted"}) as queue:
-            self.assertEqual(self.prompt(), 3)
-            queue.assert_called_once()
-        self.assertEqual((self.messages, self.keys), ([], []))
+    def test_no_trailer_and_no_verify_arguments_cannot_reinstate_screen_transport(self):
+        parser = peer_steward.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["prompt", "child", "body", "--no-verify"])
+        self.assertEqual(self.prompt("ordinary native body"), 3)
+        row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual(row["state"], "pending")
 
 
 class F100cStewardModeTest(_TmpRootMixin, unittest.TestCase):
@@ -3497,7 +2860,8 @@ class CurrentSessionIdentityDelegationTest(unittest.TestCase):
 
     _ENV_KEYS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
                  "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "AGENT_SESSION_ID",
-                 "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
+                 "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
+                 "HERDR_PANE_ID")
 
     def _clean_env(self, **overrides):
         env = {key: None for key in self._ENV_KEYS}
@@ -3573,7 +2937,7 @@ NEW_T = "01a0fbf0-d65e-7041-9744-c8f5300f35a3"
 def codex_screen(footer):
     """A measured codex 0.160.0 bottom: the input box, one blank line, the status line, the hint line."""
     return ("• recap of the last turn\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  "
-            + footer + "\n  ← for agents · ? for shortcuts\n")
+            + footer + "\n  ? for shortcuts\n")
 
 
 class _ClearWorld:
@@ -3670,6 +3034,40 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(prompts, [["herdr", "agent", "prompt", "w1:pX", "/clear"]])   # no trailer, no wait
         self.assertEqual([c for c in world.calls if c[:3] == ["herdr", "agent", "send-keys"]], [])
 
+    def test_a_compact_booking_types_only_after_the_turn_ended_and_only_once(self):
+        st, clear = self.st, self.clear
+        transcript = self.tmp_root / "sid-A.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "uuid": "u-tool", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}) + "\n", encoding="utf-8")
+        info = transcript.stat()
+        context = {"trigger": "auto", "identity": "steward-compact", "transcript": str(transcript),
+                   "boundary_offset": info.st_size, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "claude", "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, "claude", "sid-A", "summary", prompt_seq=0, origin="runtime-compact",
+                                 compact_context=context)
+            clear._write_reservation({
+                "schema": 1, "nonce": "n0nce", "status": "reserved", "created": now, "deadline": now + 600,
+                "seat": {"kind": "pane", "key": seat.key, "pane": "w1:pX", "harness": "claude", "project_key": ""},
+                "harness": "claude", "sid": "sid-A", "cwd": str(self.tmp_root), "origin": "compact",
+                "compact": {**context}, "card_generation": card["generation"], "prompt_seq": 0})
+        self.path = clear.reservation_path(seat.key)
+        world = _ClearWorld(screens=[CLAUDE_EMPTY])
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("reason=compact-pending", line)
+        self.assertEqual(world.typed(), [])
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "a-end", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}) + "\n")
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 0, line)
+        self.assertEqual(len(world.typed()), 1)
+        rc, line = self.clear_cmd(world)            # the claim was consumed: nothing is typed again
+        self.assertEqual(rc, 3, line)
+        self.assertEqual(len(world.typed()), 1)
+
     def test_a_claude_suggestion_is_an_empty_box_but_typed_text_is_not(self):
         for screen, expect in ((CLAUDE_SUGGESTION, "cleared=true"), (CLAUDE_DRAFT, "reason=draft"),
                                (CLAUDE_DRAFT_SECOND_LINE, "reason=draft")):
@@ -3695,7 +3093,9 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.book(harness="opencode", sid="ses_A")
         world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                             home_after=OPENCODE_HOME)
-        rc, line = self.clear_cmd(world)
+        with mock.patch.object(peer_steward, "_process_session",
+                               side_effect=lambda *_args: None if world.sent else "ses_A"):
+            rc, line = self.clear_cmd(world)
         self.assertEqual((rc, "cleared=true" in line), (0, True), line)
         self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "/new"]])
         for after, expect in ((OPENCODE_HOME_BLANK, "cleared=true"), (OPENCODE_EMPTY, "cleared=unverified"),
@@ -3704,7 +3104,9 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                 self.book(harness="opencode", sid="ses_A")
                 world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                                     home_after=after)
-                with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                with mock.patch.object(peer_steward, "_process_session",
+                                       side_effect=lambda *_args: None if world.sent else "ses_A"), \
+                     mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
                     rc, line = self.clear_cmd(world)
                 self.assertIn(expect, line)
                 self.assertEqual(len(world.typed()), 1, line)
@@ -3713,14 +3115,18 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.book(harness="opencode", sid="ses_A")
         world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                             home_after=OPENCODE_EMPTY)
-        with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
+        with mock.patch.object(peer_steward, "_process_session",
+                               side_effect=lambda *_args: None if world.sent else "ses_A"), \
+             mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
             rc, line = self.clear_cmd(world)
         self.assertIn("cleared=unverified", line)
         self.assertEqual(len([c for c in world.calls if c[:3] == ["herdr", "pane", "wait-output"]]), 2)
         for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
             self.book(harness="opencode", sid="ses_A")
             world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)
-            rc, line = self.clear_cmd(world)
+            with mock.patch.object(peer_steward, "_process_session",
+                                   side_effect=lambda *_args: None if world.sent else "ses_A"):
+                rc, line = self.clear_cmd(world)
             self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
 
     # -- doubt is "not cleared": zero input ---------------------------------------------------
@@ -3800,7 +3206,7 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIn("reason=target-changed", line)
 
     def test_a_pane_record_without_a_session_id_is_cleared_only_when_the_process_names_the_booked_one(self):
-        # herdr names no session (`-`): not a confirmed match -- only the process can vouch for it.
+        # herdr names no session (`-`): only a current native pane proof can vouch for it.
         for harness, collector in (("claude", "claude"), ("codex", "codex")):
             for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
                 with self.subTest(harness=harness, process_says=proof):
@@ -3808,6 +3214,8 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                     screen = CLAUDE_EMPTY if harness == "claude" else CODEX_EMPTY
                     world = _ClearWorld(harness=harness, sid=None, new_sid=None, screens=[screen])
                     with mock.patch(f"fleet.collectors.{collector}.session_id_of_process", return_value=proof), \
+                            mock.patch("pane_ownership.current_codex_thread",
+                                       return_value=proof or ""), \
                             mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
                         rc, line = self.clear_cmd(world)
                     self.assertEqual(len(world.typed()), expect_typed, line)
@@ -3886,18 +3294,21 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((rc, f"new_session={NEW_T}" in line), (0, True), line)
         self.assertEqual(len(world.typed()), 1)
 
-    def test_a_status_line_id_that_was_there_before_is_cut_or_ambiguous_proves_nothing(self):
+    def test_only_the_complete_last_status_line_field_is_current_identity(self):
         other = "01a0fbf0-aaaa-7bbb-8ccc-dddddddddddd"
         st = self.st
         seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "codex", "")
         with st.seat_lock(seat.key):
             st.record_event(seat, "codex", other, "prompt", cwd="/w", now=time.time() - 300)
-        cases = ((f"proj · {NEW_T} · Fix it", f"proj · {NEW_T} · Fix it", "already shown"),
-                 ("proj · Fix it", f"proj · {NEW_T} · 01a0fbf0-eeee-7fff-8000-111111111111", "two new ids"),
-                 ("proj · Fix it", "proj · Context 0% used · 01a0fbf0-d65e-7041-9744-c8f5300f…", "cut id"),
-                 (f"proj · {OLD_T}", f"proj · {OLD_T} · {NEW_T}", "the cleared id still shown"),
-                 ("proj · Fix it", f"proj · {other}", "a session the seat already knows"))
-        for before, after, label in cases:
+        cases = ((f"proj · {NEW_T} · Fix it", f"proj · {NEW_T} · Fix it", "already shown", False),
+                 ("proj · Fix it", f"proj · {NEW_T} · 01a0fbf0-eeee-7fff-8000-111111111111",
+                  "earlier UUID does not override last", True),
+                 ("proj · Fix it", "proj · Context 0% used · 01a0fbf0-d65e-7041-9744-c8f5300f…",
+                  "cut id", False),
+                 (f"proj · {OLD_T}", f"proj · {OLD_T} · {NEW_T}",
+                  "last field wins over earlier UUID", True),
+                 ("proj · Fix it", f"proj · {other}", "a session the seat already knows", False))
+        for before, after, label, changed in cases:
             with self.subTest(label):
                 self.book(harness="codex", sid=OLD_T)
                 world = _ClearWorld(harness="codex", sid=OLD_T, new_sid=None, screens=[codex_screen(before)],
@@ -3905,7 +3316,36 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                 with mock.patch("fleet.collectors.codex.session_id_of_process", return_value=None), \
                         mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
                     rc, line = self.clear_cmd(world)
-                self.assertEqual((rc, "cleared=unverified" in line), (5, True), line)
+                self.assertEqual("cleared=true" in line, changed, line)
+                self.assertEqual(rc, 0 if changed else 5, line)
+
+    def test_a_user_opened_codex_location_menu_is_never_selected_by_clear(self):
+        self.book(harness="codex", sid=OLD_T)
+        menu = ("Where should the new conversation run?\n"
+                "❯ Use current Git worktree\n"
+                "Keep using the current working directory\n"
+                "Create new Git worktree\n")
+        world = _ClearWorld(harness="codex", sid=OLD_T, screens=[menu])
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("cleared=skipped", line)
+        self.assertIn("reason=form-open", line)
+        self.assertEqual(world.typed(), [])
+
+    def test_a_clear_opened_location_menu_is_not_reported_as_cleared_or_selected(self):
+        self.book(harness="codex", sid=OLD_T)
+        menu = ("Where should the new conversation run?\n"
+                "❯ Use current Git worktree\n"
+                "Keep using the current working directory\n"
+                "Create new Git worktree\n")
+        world = _ClearWorld(harness="codex", sid=OLD_T, new_sid=NEW_T,
+                            screens=[CODEX_EMPTY], home_after=menu)
+        with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+            rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 5, line)
+        self.assertIn("cleared=unverified", line)
+        self.assertEqual(len(world.typed()), 1)  # the authorized /clear only
+        self.assertEqual([c for c in world.calls if c[:3] == ["herdr", "agent", "send-keys"]], [])
 
     def test_every_judged_call_leaves_one_notice_ledger_row_with_the_action(self):
         self.book()
@@ -3950,12 +3390,94 @@ class _ContinueWorld(_ClearWorld):
         return super().run(argv, **kw)
 
 
+class IdleCardRequestTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        import session_tidy as st
+        import session_tidy_clear as clear
+        self.st, self.clear = st, clear
+
+    def booking(self, harness="claude", sid="sid-A", pane="w1:pX"):
+        st, clear = self.st, self.clear
+        seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, harness, sid, "prior card", prompt_seq=0)
+            clear._write_reservation({
+                "schema": 1, "nonce": "idle-nonce", "status": "reserved", "created": now - 60,
+                "deadline": now + 300, "seat": seat.as_dict(), "harness": harness,
+                "sid": sid, "cwd": str(self.tmp_root), "card_generation": card["generation"],
+                "prompt_seq": 0, "origin": "idle", "followup_kind": "status-only",
+                "snapshot_state": "ready", "idle": {"identity": "idle-event", "due_at": now - 1,
+                                                          "tokens": 200000, "min_tokens": 200000}})
+        return seat, clear.reservation_path(seat.key)
+
+    def invoke(self, req, *, looks=None, prompt_reply=None):
+        pane = req["seat"]["pane"]
+        args = SimpleNamespace(request=str(self.clear.reservation_path(req["seat"]["key"])),
+                               nonce=req["nonce"], target=pane)
+        agent = {"pane": pane, "harness": req["harness"], "session_id": req["sid"]}
+        result = {"accepted": "true"}
+
+        def prompt(_target, text, **_kwargs):
+            if prompt_reply:
+                return prompt_reply(text)
+            with mock.patch.object(self.st, "resolve_seat", return_value=self.seat_obj):
+                self.st.run_hook(req["harness"], "prompt", req["sid"], cwd=req["cwd"], prompt_text=text)
+            return 0, {}
+
+        self.seat_obj = self.st.seat_from_dict(req["seat"])
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_clear_look", side_effect=looks or [(None, agent, [])] * 3), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=prompt) as send, \
+             mock.patch.object(peer_steward, "_record"), mock.patch("builtins.print") as output:
+            rc = peer_steward.cmd_idle_card_request(args)
+        return rc, output.call_args[0][0], send
+
+    def test_claimed_request_sends_once_and_needs_the_exact_prompt_arrival_receipt(self):
+        seat, path = self.booking()
+        self.seat_obj = seat
+        req = self.clear.read_reservation(seat.key)
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_clear_look", return_value=(None,
+                 {"pane": seat.pane, "harness": "claude", "session_id": "sid-A"}, [])), \
+             mock.patch.object(peer_steward, "_record"), mock.patch("builtins.print") as output, \
+             mock.patch.object(peer_steward, "_herdr_prompt") as send:
+            def prompt(_target, text, **_kwargs):
+                with mock.patch.object(self.st, "resolve_seat", return_value=seat):
+                    self.st.run_hook("claude", "prompt", "sid-A", cwd=req["cwd"], prompt_text=text)
+                return 0, {}
+            send.side_effect = prompt
+            rc = peer_steward.cmd_idle_card_request(SimpleNamespace(request=str(path), nonce=req["nonce"],
+                                                                      target=seat.pane))
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted=true", output.call_args[0][0])
+        send.assert_called_once()
+        booking = self.clear.read_reservation(seat.key)
+        self.assertEqual(booking["idle_request"]["state"], "sent")
+        self.assertEqual(booking["idle_request"]["arrival"]["sid"], "sid-A")
+
+    def test_draft_or_other_opencode_session_sends_nothing(self):
+        seat, path = self.booking()
+        req = self.clear.read_reservation(seat.key)
+        blocked = ("draft", {"pane": seat.pane, "harness": "claude", "session_id": "sid-A"}, None)
+        rc, line, sent = self.invoke(req, looks=[blocked])
+        self.assertEqual((rc, line.split()[0]), (3, "accepted=queued"))
+        sent.assert_not_called()
+        self.assertNotIn("idle_request", self.clear.read_reservation(seat.key))
+
+        op_seat, op_path = self.booking(harness="opencode", sid="op-sid", pane="w1:pO")
+        op_req = self.clear.read_reservation(op_seat.key)
+        wrong = (None, {"pane": op_seat.pane, "harness": "opencode", "session_id": "foreign"}, [])
+        rc, line, sent = self.invoke(op_req, looks=[wrong])
+        self.assertEqual((rc, line), (3, "accepted=skipped target=w1:pO harness=opencode session=op-sid reason=target-changed"))
+        sent.assert_not_called()
+
+
 TIMEOUT_REPLY = (1, json.dumps({"error": {"code": "timeout"}}))
 
 
 class ContinueTest(_TmpRootMixin, unittest.TestCase):
-    """`continue`: the one prompt after a confirmed clear (fake herdr, real booking files)."""
-
     rows = ClearTest.rows
 
     def setUp(self):
@@ -3964,9 +3486,10 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
         import session_tidy_clear as clear
         self.st, self.clear = st, clear
 
-    def cleared(self, harness="claude", sid="sid-A", new="sid-B", pane="w1:pX", seq=0, receipt=True, window=120):
+    def cleared(self, harness="claude", sid="sid-A", new="sid-B", pane="w1:pX",
+                seq=0, receipt=True, window=120):
         st, clear = self.st, self.clear
-        shutil.rmtree(st.state_root(), ignore_errors=True)       # every case starts from an empty seat
+        shutil.rmtree(st.state_root(), ignore_errors=True)
         seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
         now = time.time()
         with st.seat_lock(seat.key):
@@ -3974,245 +3497,197 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             if receipt and harness == "claude":
                 st._write_consumed(seat, generation=card["generation"], receipts=[f"claude:{new}:0"])
             clear._write_reservation({
-                "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30, "deadline": now + 570,
-                "seat": {"kind": "pane", "key": seat.key, "pane": pane, "harness": harness, "project_key": ""},
+                "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30,
+                "deadline": now + 570,
+                "seat": {"kind": "pane", "key": seat.key, "pane": pane,
+                         "harness": harness, "project_key": ""},
                 "harness": harness, "sid": sid, "cwd": str(self.tmp_root), "new_session": new,
                 "card_generation": card["generation"], "prompt_seq": seq, "continue_off": False,
                 "continued": {"state": "pending", "deadline": now + window}})
         self.seat_obj, self.path = seat, clear.reservation_path(seat.key)
         return seat
 
-    def continue_cmd(self, world, nonce="n0nce", process=None):
-        argv = ["continue", world.pane, "--request", str(self.path), *(["--nonce", nonce] if nonce else [])]
+    def continue_cmd(self, nonce="n0nce"):
         printed = []
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
-             mock.patch("fleet.collectors.claude.session_id_of_process", return_value=process), \
-             mock.patch("fleet.collectors.codex.session_id_of_process", return_value=process), \
+             mock.patch.object(peer_steward, "_continue_look", return_value=None), \
              mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
-            rc = peer_steward.main(argv)
-        return rc, (printed[-1] if printed else "")
+            rc = peer_steward.main(["continue", self.seat_obj.pane, "--request", str(self.path),
+                                    *(["--nonce", nonce] if nonce else [])])
+        return rc, printed[-1] if printed else ""
 
     def booking(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
 
-    def rollout(self, thread):
-        path = self.tmp_root / "home" / ".codex" / "sessions" / "2026" / "10" / "02" / f"rollout-2026-10-02T18-27-39-{thread}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n", encoding="utf-8")
-
-    # -- the one prompt -----------------------------------------------------------------------
-
-    def test_a_cleared_claude_window_gets_the_continue_prompt_exactly_once(self):
+    def test_claude_continue_types_once_into_the_idle_tui(self):
         self.cleared()
-        world = _ContinueWorld()
-        rc, line = self.continue_cmd(world)
+        guard = mock.Mock(return_value=(None, {"pid": 202}))
+        with mock.patch.object(peer_steward, "_claude_idle_prompt_guard", guard), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as send:
+            rc, line = self.continue_cmd()
         self.assertEqual(rc, 0, line)
         self.assertIn("continued=true", line)
         self.assertIn("verify=state-flip", line)
-        self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "이어서해",
-                                          "--wait", "--until", "working", "--timeout", "8000"]])  # no trailer
-        self.assertEqual(self.booking()["continued"]["state"], "sending")     # the helper writes the end
-        rows = self.rows()
-        self.assertEqual(len(rows), 1)
-        self.assertIn("action=continue continued=true", rows[0]["delivery"]["receipt"])
-        rc, line = self.continue_cmd(world)                                  # asked again: nothing more
-        self.assertEqual((rc, "reason=superseded" in line, len(world.typed())), (3, True, 1), line)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args, ("w1:pX", self.clear.CONTINUE_TEXT))
+        self.assertEqual(guard.call_args_list[1].kwargs, {"expected_foreground": {"pid": 202}})
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        row = peer_steward.peer_message._read_pending(ref)
+        # Not pending: the new session's prompt hook must not deliver it a second time.
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(peer_steward.peer_message.claim_pending_herdr(
+            ref, {"harness": "claude", "session_id": "sid-B", "pane_id": "w1:pX"}))
 
-    def test_draft_after_continue_claim_stays_pending_then_idle_sends_once(self):
+    def test_claude_continue_send_without_state_flip_is_never_retyped(self):
         self.cleared()
-        world = _ContinueWorld()
-        claim = self.clear.claim_continue
-        def user_types(*args, **kwargs):
-            result = claim(*args, **kwargs)
-            world.screens = [CLAUDE_DRAFT]
-            return result
-        with mock.patch.object(self.clear, "claim_continue", side_effect=user_types):
-            rc, line = self.continue_cmd(world)
+        with mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                               return_value=(None, {"pid": 202})), \
+             mock.patch.object(peer_steward, "_herdr_prompt",
+                               return_value=(1, {"error": {"code": "timeout"}})):
+            rc, line = self.continue_cmd()
+        self.assertEqual(rc, 5, line)
+        self.assertIn("continued=unverified", line)
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "unverified")
+
+    def test_continue_keeps_exact_no_trailer_ref_pending_for_native_callback(self):
+        self.cleared()
+        refused = mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                                    return_value=("draft", None))
+        no_send = mock.patch.object(peer_steward, "_herdr_prompt",
+                                    side_effect=AssertionError("continue PTY send"))
+        with refused, no_send:
+            rc, line = self.continue_cmd()
         self.assertEqual(rc, 3, line)
         self.assertIn("continued=queued", line)
-        self.assertEqual(world.typed(), [])
-        self.assertEqual(self.booking()["continued"]["state"], "pending")
-        self.clear._finish_continue(self.seat_obj.key, "n0nce", "queued", "draft")
-        world.screens = [CLAUDE_EMPTY]
-        os.environ["HERDR_PANE_ID"] = world.pane
-        def resume(path, nonce, target):
-            code, receipt = self.continue_cmd(world)
-            return dict(part.split("=", 1) for part in receipt.split() if "=" in part)
-        with mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-B", "w")), \
-             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", world.pane)), \
-             mock.patch.object(peer_steward, "_retire_target", return_value=("idle", {
-                 "harness": "claude", "session_id": "sid-B", "pane": world.pane, "name": "child"}, 0, None)), \
-             mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 123}), \
-             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="777"), \
-             mock.patch.object(self.clear, "_run_continue", side_effect=resume):
-            peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
-            peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
-        self.assertEqual(len(world.typed()), 1)
+        self.assertIn("reason=draft", line)
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual((row["state"], row["text"], row["no_trailer"], row["receipt"]),
+                         ("pending", self.clear.CONTINUE_TEXT, True, "session-tidy-continue"))
+        self.assertEqual(row["to"], {"harness": "claude", "session_id": "sid-B",
+                                     "name": None, "pane_id": "w1:pX"})
+        claim_id = line.split("claim_id=", 1)[1].split()[0]
+        self.assertTrue(self.clear._finish_continue(
+            self.seat_obj.key, "n0nce", "queued", "awaiting-native-receiver",
+            claim_id=claim_id, transfer_ref=ref))
+        booked = self.booking()["continued"]
+        self.assertEqual((booked["state"], booked["transfer_ref"]), ("pending", ref))
+        with refused, no_send:
+            second_rc, second = self.continue_cmd()
+        self.assertEqual(second_rc, 3, second)
+        self.assertIn("transfer_ref=" + ref, second)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+
+    def test_codex_continue_uses_exact_queue_and_receipt_settles_same_booking(self):
+        self.cleared(harness="codex", sid="old-thread", new="new-thread")
+        observed = []
+        with mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                               side_effect=lambda ref: observed.append(ref)
+                               or {"status": "queued", "reason": "native-queue-accepted"}), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=AssertionError("continue PTY send")), \
+             mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
+            rc, line = self.continue_cmd()
+        self.assertEqual(rc, 3, line)
+        ref = line.split("transfer_ref=", 1)[1].split()[0]
+        self.assertEqual(observed, [ref])
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual((row["to"]["session_id"], row["text"], row["no_trailer"]),
+                         ("new-thread", self.clear.CONTINUE_TEXT, True))
+        claim_id = line.split("claim_id=", 1)[1].split()[0]
+        self.assertTrue(self.clear._finish_continue(
+            self.seat_obj.key, "n0nce", "queued", "native-queue-accepted",
+            claim_id=claim_id, transfer_ref=ref))
+
+        def consumed(ref_arg):
+            with peer_steward.peer_message.pending_lock(ref_arg):
+                current = peer_steward.peer_message._read_pending(ref_arg)
+                peer_steward.peer_message._save_pending(dict(
+                    current, state="received", text=None, receipt="exact-native-history"))
+            return {"status": "received", "reason": "exact-native-history"}
+
+        with mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=consumed):
+            rc, line = self.continue_cmd()
+        self.assertEqual(rc, 0, line)
+        self.assertIn("verify=exact-native-history", line)
+        self.assertEqual(self.booking()["continued"]["state"], "sending")
+        claim_id = line.split("claim_id=", 1)[1].split()[0]
+        self.assertTrue(self.clear._finish_continue(
+            self.seat_obj.key, "n0nce", "true", "", claim_id=claim_id, transfer_ref=ref))
         self.assertEqual(self.booking()["continued"]["state"], "sent")
 
-    def test_late_queued_result_cannot_rewind_a_newer_continue_claim(self):
+    def test_continue_claim_token_prevents_stale_queue_from_rewinding_newer_attempt(self):
         self.cleared()
-        claim, reason = self.clear.claim_continue(self.path, "n0nce")
+        first, reason = self.clear.claim_continue(self.path, "n0nce")
         self.assertEqual(reason, "")
-        self.assertFalse(self.clear._finish_continue(self.seat_obj.key, "n0nce", "queued", "draft"))
-        self.assertEqual(self.booking()["continued"], claim["continued"])
+        self.assertTrue(self.clear.release_unsent_continue(first))
+        second, reason = self.clear.claim_continue(self.path, "n0nce")
+        self.assertEqual(reason, "")
+        old_id = first["continued"]["claim_id"]
+        new_id = second["continued"]["claim_id"]
+        self.assertNotEqual(old_id, new_id)
+        self.assertFalse(self.clear._finish_continue(
+            self.seat_obj.key, "n0nce", "queued", "late", claim_id=old_id,
+            transfer_ref="1" * 32))
+        self.assertEqual(self.booking()["continued"]["claim_id"], new_id)
+        self.assertTrue(self.clear._finish_continue(
+            self.seat_obj.key, "n0nce", "queued", "native-pending", claim_id=new_id,
+            transfer_ref="2" * 32))
+        self.assertEqual(self.booking()["continued"]["transfer_ref"], "2" * 32)
+        self.assertEqual(self.booking()["continued"]["state"], "pending")
 
-    def test_the_claude_session_is_the_process_one_when_herdr_still_names_the_cleared_one(self):
-        for process, expect in (("sid-B", "continued=true"), ("sid-A", "reason=target-changed"),
-                                (None, "reason=target-changed")):
-            with self.subTest(process=process):
-                self.cleared()
-                world = _ContinueWorld(herdr_sid="sid-A")
-                rc, line = self.continue_cmd(world, process=process)
-                self.assertIn(expect, line)
-                self.assertEqual(len(world.typed()), 1 if expect == "continued=true" else 0)
+    def test_continue_requires_exact_new_sid_and_idle_without_screen_reads(self):
+        self.cleared()
+        req = self.booking()
+        info = {"pane_id": self.seat_obj.pane, "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        for sid, native_sid, state, expected in (("sid-B", "sid-B", "idle", None),
+                                                 ("sid-B", "old-sid", "idle", "target-changed"),
+                                                 ("sid-B", "sid-B", "blocked", "not-idle-blocked")):
+            ident = {"harness": "claude", "session_id": sid, "pane": self.seat_obj.pane, "name": "child"}
+            with self.subTest(sid=sid, state=state), \
+                 mock.patch.object(peer_steward, "_retire_target",
+                                   return_value=(state, ident, 0, None)), \
+                 mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+                 mock.patch.object(peer_steward, "_continue_native_session", return_value=native_sid), \
+                 mock.patch.object(peer_steward, "_pane_readiness",
+                                   return_value=type("Ready", (), {"state": "ready", "reason": ""})()), \
+                 mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
+                self.assertEqual(peer_steward._continue_look(self.seat_obj.pane, req), expected)
 
-    def test_claude_gets_a_bounded_while_for_its_start_hook_to_take_the_card(self):
-        st = self.st
-        seat = self.cleared(receipt=False)
-        world = _ContinueWorld()
-        waits = []
-
-        def hook_lands():
-            waits.append(1)
-            if len(waits) == 2:
-                with st.seat_lock(seat.key):
-                    st._write_consumed(seat, generation=1, receipts=["claude:sid-B:0"])
-        world.on_wait = hook_lands
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, len(world.typed())), (0, 1), line)
-        self.cleared(receipt=False)
-        world = _ContinueWorld()
-        with mock.patch.object(peer_steward, "_CONTINUE_LOOK_ROUNDS", 3):
-            rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "reason=card-not-delivered" in line, world.typed()), (3, True, []), line)
-
-    def test_a_busy_blocked_unreadable_form_or_draft_window_gets_nothing(self):
-        cases = (({"status": "working"}, "not-idle-working"), ({"status": "blocked"}, "form-open"),
-                 ({"screens": [None]}, "screen-unknown"), ({"screens": [CLAUDE_FORM]}, "form-open"),
-                 ({"screens": [CLAUDE_DRAFT]}, "draft"), ({"screens": [NO_BOX]}, "draft-unknown"),
-                 ({"screens": [CLAUDE_EMPTY, CLAUDE_DRAFT]}, "draft"))     # typing starts between the looks
-        for kwargs, reason in cases:
-            with self.subTest(reason=reason, kwargs=str(kwargs)[:40]):
-                self.cleared()
-                world = _ContinueWorld(**kwargs)
-                with mock.patch.object(peer_steward, "_CONTINUE_LOOK_ROUNDS", 2):
-                    rc, line = self.continue_cmd(world)
-                self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
-
-    def test_a_new_prompt_new_card_handoff_lapse_or_spent_booking_gets_nothing_and_no_row(self):
-        st, clear = self.st, self.clear
-
+    def test_user_prompt_card_handoff_and_expiry_still_stop_continue(self):
         def bump(seat):
-            with st.seat_lock(seat.key):
-                st.bump_prompt_seq(seat, "claude", "sid-B", time.time())
+            with self.st.seat_lock(seat.key):
+                self.st.bump_prompt_seq(seat, "claude", "sid-B", time.time())
 
         def rewrite(seat):
-            with st.seat_lock(seat.key):
-                st.write_card(seat, "claude", "sid-B", "new card")
+            with self.st.seat_lock(seat.key):
+                self.st.write_card(seat, "claude", "sid-B", "new card")
 
-        def edit(**fields):
-            def apply(_seat):
-                data = self.booking()
-                data.update(fields)
-                self.path.write_text(json.dumps(data), encoding="utf-8")
-            return apply
-        cases = ((bump, "new-input"), (rewrite, "card-changed"), (st.mark_card_handed_off, "handed-off"),
-                 (edit(continued={"state": "pending", "deadline": time.time() - 1}), "expired"),
-                 (edit(continued={"state": "sending"}), "superseded"), (edit(status="reserved"), "superseded"),
-                 (edit(continue_off=True), "off"))
-        for change, reason in cases:
+        def expired(_seat):
+            data = self.booking()
+            data["continued"]["deadline"] = time.time() - 1
+            self.path.write_text(json.dumps(data), encoding="utf-8")
+
+        for change, reason in ((bump, "new-input"), (rewrite, "card-changed"),
+                               (self.st.mark_card_handed_off, "handed-off"), (expired, "expired")):
             with self.subTest(reason=reason):
                 change(self.cleared())
-                world = _ContinueWorld()
-                rc, line = self.continue_cmd(world)
-                self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
-        self.cleared()
-        rc, line = self.continue_cmd(_ContinueWorld(), nonce="another")
-        self.assertEqual((rc, "reason=superseded" in line), (3, True))
-        self.assertEqual(self.rows(), [])                               # a dead request leaves no ledger row
+                with mock.patch.object(peer_steward, "_herdr_prompt",
+                                       side_effect=AssertionError("continued an invalid booking")):
+                    rc, line = self.continue_cmd()
+                self.assertEqual(rc, 3, line)
+                self.assertIn("reason=" + reason, line)
+                self.assertFalse(self.booking().get("continued", {}).get("transfer_ref"))
 
-    def test_codex_needs_its_new_thread_on_the_status_line_and_no_rollout_yet(self):
-        screen = codex_screen(f"proj · main · Context 0% used · {NEW_T}")
-        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
-        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[screen])
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, len(world.typed())), (0, 1), line)
-        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
-        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[codex_screen("proj · main · Fix it")])
-        rc, line = self.continue_cmd(world)                              # a title instead: not provably that thread
-        self.assertEqual((rc, "reason=target-changed" in line, world.typed()), (3, True, []), line)
-        rc, line = self.continue_cmd(world, process=NEW_T)               # ... unless the process names it
-        self.assertEqual((rc, len(world.typed())), (0, 1), line)
-        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
-        self.rollout(NEW_T)                                              # someone already wrote to it
-        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[screen])
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "reason=new-input" in line, world.typed()), (3, True, []), line)
-
-    def test_codex_and_opencode_skip_a_card_another_session_already_took(self):
-        st = self.st
-        seat = self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
-        with st.seat_lock(seat.key):
-            st._write_consumed(seat, generation=1, receipts=["codex:someone:0"])
-        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[codex_screen(NEW_T)])
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "reason=card-taken" in line, world.typed()), (3, True, []), line)
-
-    def test_opencode_types_only_on_its_home_screen(self):
-        for screen, typed in ((OPENCODE_HOME_BLANK, 1), (OPENCODE_HOME, 1), (OPENCODE_EMPTY, 0), (OPENCODE_DRAFT, 0)):
-            with self.subTest(screen=screen[:24]):
-                self.cleared(harness="opencode", sid="ses_A", new="-")
-                world = _ContinueWorld(harness="opencode", herdr_sid=None, screens=[screen], status="done")
-                rc, line = self.continue_cmd(world)
-                self.assertEqual(len(world.typed()), typed, line)
-                if not typed:
-                    self.assertIn("reason=draft" if screen == OPENCODE_DRAFT else "reason=target-changed", line)
-
-    # -- after the send: evidence, never a second one ------------------------------------------
-
-    def test_a_send_herdr_cannot_confirm_needs_the_prompt_hook_or_the_transcript(self):
-        st = self.st
-        seat = self.cleared()
-        world = _ContinueWorld(reply=TIMEOUT_REPLY)
-
-        def hook():
-            with st.seat_lock(seat.key):
-                st.bump_prompt_seq(seat, "claude", "sid-B", time.time())
-        world.on_prompt = hook
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "verify=prompt-hook" in line), (0, True), line)
-        self.cleared()
-        world = _ContinueWorld(reply=TIMEOUT_REPLY)
-        transcript = self.tmp_root / "home" / ".claude" / "projects" / "p" / "sid-B.jsonl"
-
-        def arrives():
-            transcript.parent.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 1))
-            transcript.write_text(json.dumps({"type": "user", "timestamp": stamp,
-                                              "message": {"content": "이어서해"}}) + "\n", encoding="utf-8")
-        world.on_prompt = arrives
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "verify=transcript-arrival" in line), (0, True), line)
-        transcript.unlink()
-        self.cleared()
-        world = _ContinueWorld(reply=TIMEOUT_REPLY)
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "continued=unverified" in line, len(world.typed())), (5, True, 1), line)  # no Enter
-        self.cleared()
-        world = _ContinueWorld(reply=(1, json.dumps({"error": {"code": "agent_prompt_stalled"}})))
-        rc, line = self.continue_cmd(world)
-        self.assertEqual((rc, "reason=agent-prompt-stalled" in line, len(world.typed())), (1, True, 1), line)
-
-    def test_herdr_missing_is_failed(self):
+    def test_herdr_missing_remains_a_typed_failure(self):
         self.cleared()
         printed = []
         with mock.patch.object(peer_steward.shutil, "which", return_value=None), \
              mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
-            rc = peer_steward.main(["continue", "w1:pX", "--request", str(self.path)])
+            rc = peer_steward.main(["continue", self.seat_obj.pane, "--request", str(self.path)])
         self.assertEqual((rc, printed[-1]), (1, "continued=failed reason=herdr-not-found"))
-
 
 
 class GridStartTest(_TmpRootMixin, unittest.TestCase):
@@ -4437,16 +3912,16 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                          mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
                          mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
                          mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
-                         mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+                         mock.patch.object(peer_steward, "_process_session", return_value=None), \
                          mock.patch.object(peer_steward, "_read_screen", return_value=None), \
                          mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), mock.patch("builtins.print"):
                         self.assertEqual(peer_steward.main(["start", "grid", "--kind", kind,
                                                            "--beside", "w1:p0", "--cwd", str(self.tmp_root)]), 0)
-                    launch = calls[-1]
+                    launch = next(a for a in calls if a[1:3] == ["agent", "start"])
                     self.assertEqual(launch[1:3], ["agent", "start"])
                     self.assertEqual(launch[launch.index("--pane") + 1], target if action == "reuse" else "w1:pNew")
                     if action == "reuse":
-                        self.assertEqual(len(calls), 2)  # layout and start, no creation/move
+                        self.assertEqual(sum(a[1:3] == ["agent", "start"] for a in calls), 1)
                     else:
                         create = next(a for a in calls if a[1:3] in (["pane", "split"], ["tab", "create"]))
                         self.assertIn("--no-focus", create)
@@ -4497,7 +3972,6 @@ class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
              mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
              mock.patch.object(peer_steward, "_read_screen", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
              mock.patch.object(peer_steward, "_mark_seat_successor") as successor, \
@@ -4607,7 +4081,6 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
              mock.patch.object(peer_steward, "_read_screen", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
              mock.patch("builtins.print") as printed:
@@ -4808,7 +4281,6 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                      mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
                      mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value="missing"), \
                      mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="stable prompt"), \
-                     mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
                      mock.patch.object(peer_steward, "_read_screen", return_value=None), \
                      mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
                      mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
@@ -5132,6 +4604,8 @@ class _RetireWorld:
         self.calls.append(list(argv))
         if argv[:3] == ["herdr", "agent", "get"]:
             return _herdr_json({"result": {"agent": self.agent()}})
+        if argv[:3] == ["herdr", "agent", "wait"]:
+            return _herdr_json({"result": {"agent": self.agent()}})
         if argv[:3] == ["herdr", "agent", "read"]:
             return subprocess.CompletedProcess(argv, 0 if self.screen else 1, stdout=self.screen or "", stderr="")
         if argv[:3] == ["herdr", "pane", "process-info"]:
@@ -5161,6 +4635,86 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                                     "execution_attempts_for_processes", return_value=())
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_retire_subject_treats_only_same_birth_same_namespace_zombie_as_gone(self):
+        def stat_row(state, start):
+            fields = [state, *(["0"] * 18), start]
+            return "4242 (opencode) " + " ".join(fields)
+
+        def readlink(path):
+            return "pid:[same]" if str(path) in {"/proc/4242/ns/pid", "/proc/self/ns/pid"} else ""
+
+        with mock.patch.object(peer_steward.Path, "read_text", return_value=stat_row("Z", "800")), \
+             mock.patch.object(peer_steward.os, "readlink", side_effect=readlink):
+            self.assertTrue(peer_steward._retire_zombie_matches(4242, "800"))
+            self.assertFalse(peer_steward._retire_zombie_matches(4242, "801"))
+
+        def foreign_namespace(path):
+            return "pid:[foreign]" if str(path) == "/proc/4242/ns/pid" else "pid:[same]"
+
+        with mock.patch.object(peer_steward.Path, "read_text", return_value=stat_row("Z", "800")), \
+             mock.patch.object(peer_steward.os, "readlink", side_effect=foreign_namespace):
+            self.assertFalse(peer_steward._retire_zombie_matches(4242, "800"))
+
+        duty = {"intent": {"identity": {"foreground": {"pid": 4242, "start": "800"}}}}
+        with mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+             mock.patch.object(peer_steward, "_retire_zombie_matches", return_value=True):
+            self.assertEqual(peer_steward._retire_subject_state(duty), "gone")
+
+    def test_exact_opencode_native_status_overrides_stale_herdr_state(self):
+        world = _RetireWorld(harness="opencode", status="working")
+        native = {"status": "idle"}
+        with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                               return_value=native) as read_status:
+            rc, line = self.retire(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("retired=true reason=normal-exit", line)
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+        self.assertTrue(any(call.args[0:4] == ("default", "w1:pOld", "opencode", "old-sid")
+                            and call.args[4:] == (4242, "800")
+                            for call in read_status.call_args_list))
+
+    def test_exact_opencode_native_busy_status_overrides_stale_herdr_idle(self):
+        world = _RetireWorld(harness="opencode", status="idle")
+        with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                               return_value={"status": "working"}):
+            rc, line = self.retire(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("reason=agent-working-opencode-session-status", line)
+        self.assertIn("pending=true", line)
+        self.assertEqual(world.actions(), [])
+
+    def test_normal_retire_requests_the_exact_watch_terminal_receipt(self):
+        root = peer_steward._watch_root()
+        root.mkdir(parents=True, exist_ok=True)
+        watch_id = "retire-watch"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "old",
+               "server": "default", "armed_ts": "then", "agent": {
+                   "harness": "opencode", "session_id": "old-sid", "name": "old",
+                   "pane": "w1:pOld"}, "foreground_identity": {"pid": 4242, "start": "800"},
+               "steward": {}, "watcher": {}, "refs": []}
+        paths = peer_steward._watch_paths(watch_id, root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        lock_fd = peer_steward._open_lock(paths.lock)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                                   return_value={"status": "idle"}):
+                rc, line = self.retire(_RetireWorld(harness="opencode", status="working"))
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(json.loads(paths.observation.read_text())["state"], "terminal_pending")
+            self.assertFalse(paths.receipt.exists())
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertTrue(peer_steward._settle_terminal_watch_if_unobserved(
+            watch_id, arm, root))
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "completed-retire"))
 
     def test_current_runner_leaves_retire_untouched_while_legacy_runner_is_live(self):
         world = _RetireWorld(status="working")
@@ -5269,7 +4823,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                             self.retire(world, clear_existing=False, resume_request_id=duty_id)
                     return stale
                 with mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
-                    self._run_retire_runner(world, crash_phase="checkpoint")
+                    if exits:
+                        self._run_retire_runner(world)
+                    else:
+                        self._run_retire_runner(world, crash_phase="checkpoint")
                 duty = store.get(duty_id)
                 if exits:
                     self.assertEqual((duty["state"], duty["observation"]["phase"]), ("complete", "complete"))
@@ -5325,6 +4882,21 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                 self.assertIn("pending=true", line)
                 self.assertEqual(world.actions(), [])
 
+    def test_retire_uses_bounded_agent_wait_and_one_final_process_observation(self):
+        world = _RetireWorld(harness="opencode", status="idle", exits=False)
+        with mock.patch.object(peer_steward, "_OPENCODE_RETIRE_SECONDS", 0.01):
+            rc, line = self.retire(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("reason=agent-still-running", line)
+        sent_at = next(index for index, argv in enumerate(world.calls)
+                       if argv[:3] == ["herdr", "pane", "send-keys"])
+        post_send_reads = [argv for argv in world.calls[sent_at + 1:]
+                           if argv[:3] == ["herdr", "pane", "process-info"]]
+        self.assertEqual(len(post_send_reads), 1)
+        wait_args = next(argv for argv in world.calls if argv[:3] == ["herdr", "agent", "wait"])
+        wait_states = [wait_args[index + 1] for index, value in enumerate(wait_args[:-1]) if value == "--until"]
+        self.assertEqual(wait_states, ["done"])
+
     def retire(self, world, record=None, *, clear_existing=True, resume_request_id=None):
         printed = []
         store = peer_steward.peer_obligations.ObligationStore()
@@ -5347,7 +4919,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_retire_process_record", return_value=(record if record is not None else
                               {"start": "800", "group": 4242, "argv": [world.harness]})), \
              mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False), \
              mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
              mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
              mock.patch.object(peer_steward.time, "sleep"), \
@@ -5741,18 +5313,42 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         for harness in ("opencode", "codex", "claude"):
             with self.subTest(harness=harness):
                 world = _RetireWorld(harness=harness, exits=False)
-                normal_info = world.info
+                if harness == "opencode":
+                    transports = []
 
-                def delayed_info():
-                    if world.sent and peer_steward.time.monotonic() >= 8:
-                        world.exits = True
-                    return normal_info()
+                    class EventTransport:
+                        def __init__(self, *_args, **_kwargs):
+                            self._state = SimpleNamespace(complete=True)
+                            self.snapshot_count = 0
+                            transports.append(self)
 
-                world.info = delayed_info
-                rc, line = self.retire(world)
+                        def observe(self):
+                            return SimpleNamespace(endpoint="default", complete=True, panes=())
+
+                        def resnapshot(self):
+                            self.snapshot_count += 1
+                            return SimpleNamespace(endpoint="default", complete=True, panes=())
+
+                        def wait_for_event(self, pane_id, _timeout, event_types=None):
+                            self.assert_target = pane_id
+                            self.assert_types = event_types
+                            world.exits = True
+                            return {"event": "pane.closed", "data": {"pane_id": pane_id}}
+
+                        def close(self):
+                            pass
+
+                    with mock.patch.object(peer_steward.herdr_observation,
+                                           "socket_path_for_endpoint", return_value="/fixture.sock"), \
+                         mock.patch.object(peer_steward.herdr_observation,
+                                           "ObservationTransport", EventTransport):
+                        rc, line = self.retire(world)
+                else:
+                    rc, line = self.retire(world)
                 if harness == "opencode":
                     self.assertEqual(rc, 0)
                     self.assertIn("retired=true reason=normal-exit", line)
+                    self.assertEqual(transports[0].snapshot_count, 1)
                     self.assertEqual(world.actions(), [
                         ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
                         ["herdr", "pane", "close", "w1:pOld"],
@@ -5937,18 +5533,14 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         self.registry_bytes = self.jobs_path.read_bytes()
         self.unrelated = unrelated
         peer_steward._mark_seat_successor("w1:pNew", "w1:pOld", successor, "")
-        marker = peer_steward._seat_successor_path("w1:pNew")
-        value = json.loads(marker.read_text()); value["at"] = 100
-        marker.write_text(json.dumps(value))
         requester = {"session_id": "new-sid", "harness": successor,
                      "pane": "w1:pNew", "server": "default"}
         foreground = {"pid": 4242, "start": "800", "shell_pid": 101, "shell_start": "700"}
         identity = {"session_id": "old-sid", "harness": predecessor,
                     "pane": "w1:pOld", "foreground": foreground, "server": "default", "name": "old"}
         store = peer_steward.peer_obligations.ObligationStore()
-        with mock.patch.object(peer_steward.peer_obligations.time, "time", return_value=200):
-            duty = store.create("retire-fixture", "retire", identity,
-                                {"target": "old", "requester": requester})
+        duty = store.create("retire-fixture", "retire", identity,
+                            {"target": "old", "requester": requester})
         return store, duty
 
     def assert_authority(self, successor="new-sid"):
@@ -6059,7 +5651,7 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         store, duty = self.booking()
         marker = peer_steward._seat_successor_path("w1:pNew")
         original = json.loads(marker.read_text())
-        for change in ({"at": 300}, {"server": "another-server"},
+        for change in ({"at": duty["accepted_at"] + 1}, {"server": "another-server"},
                        {"successor": {"harness": "claude", "session_id": "new-sid"}},
                        {"successor": {"harness": "opencode", "session_id": "later-sid"}}):
             with self.subTest(change=change):
@@ -6091,7 +5683,8 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         store, duty = self.booking()
         marker = peer_steward._seat_successor_path("w1:pNew")
         requested, replaced = threading.Event(), threading.Event()
-        original_read = Path.read_bytes
+        import opencode_session_runtime as runtime
+        original_read = runtime._read_native_record
         reads = 0
 
         def replace():
@@ -6102,9 +5695,9 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         writer = threading.Thread(target=replace)
         writer.start()
 
-        def read(path):
+        def read(path, *args, **kwargs):
             nonlocal reads
-            value = original_read(path)
+            value = original_read(path, *args, **kwargs)
             if path == marker:
                 reads += 1
                 if reads == 2:
@@ -6115,7 +5708,7 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
             return value
 
         try:
-            with mock.patch.object(Path, "read_bytes", read):
+            with mock.patch.object(runtime, "_read_native_record", read):
                 self.assertEqual(peer_steward._retire_handover(duty), "1")
         finally:
             requested.set()
@@ -6124,6 +5717,455 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(replaced.is_set())
         self.assertEqual(json.loads(marker.read_text())["successor"]["session_id"], "later-sid")
         self.assert_authority()
+
+
+class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
+    """Real native readers, resolver, writer and consumers in private state."""
+
+    PARENT, HEADLESS, SUCCESSOR = "ses_original", "ses_headless", "codex-successor"
+    SUCCESSOR_HARNESS = "codex"
+    PID, START = 99999991, "800"
+
+    def setUp(self):
+        super().setUp()
+        import dispatch_seat_handover as handover
+        import opencode_session_runtime as native
+        import owner_route_binding as owner
+        import session_tidy
+        self.handover, self.native, self.tidy = handover, native, session_tidy
+        self.route = owner.ROUTE.compile_route(
+            "autopilot-code", "debug", "quick", self.tmp_root, self.tmp_root / "artifacts",
+            predicates=[], transport=None, tracking="tracked",
+            tracked_gate_evidence={"spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                "artifact_guard": {"satisfied": True, "source": "conductor-prechecked"}},
+            registered_headless_evidence={"candidates": [
+                {"harness": h, "transport": "headless", "surface": "registered-headless",
+                 "status": "supported", "probe_source": "fixture", "probe_time": "2026-10-13T00:00:00Z"}
+                for h in ("claude", "codex", "opencode")]})
+        self.route_path = self.tmp_root / "original-route.json"
+        self.route_path.write_text(json.dumps(self.route))
+        self.meta = {"attempt_schema_version": "2", "dispatch_depth": "1", "worker_type": "owner",
+            "registered_worker": "1", "execution_surface": "registered-headless", "transport": "headless",
+            "attempt_id": "att-selected", "harness": "opencode", "parent_harness": "opencode",
+            "parent_sid": self.PARENT, "route_node": "owner", "note": "dead-worker-fail",
+            "failure_class": "fail", "owner_route_file": str(self.route_path),
+            "owner_route_id": self.route["route_id"], "owner_route_hash": self.route["route_hash"]}
+        self.rows = [("done", {**self.meta, "attempt_id": aid})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.foreign = {**self.meta, "attempt_id": "att-foreign", "harness": "codex",
+            "parent_sid": self.HEADLESS, "owner_route_id": "rt-foreign", "owner_route_hash": "sha256:foreign"}
+        self.rows.append(("running", self.foreign))
+        self.write_jobs()
+        self.native_args = SimpleNamespace(jobs=self.jobs_path, worktree=str(self.tmp_root),
+                                           parent_attempt_id="att-selected")
+        native.bind_session(self.native_args, self.HEADLESS)
+        self.binding_path = native.binding_path(self.native_args)
+        self.native_path = Path(os.environ["HOME"]) / ".local/state/hearting/tui-identity" / f"{self.PID}-{self.START}.json"
+        self.native_path.parent.mkdir(parents=True)
+        self.native_value = {"schema": "hearting-tui-selection-v1", "pid": self.PID, "start": self.START,
+            "sessionID": self.PARENT,
+            "writtenAt": peer_steward.datetime.datetime.now(peer_steward.datetime.timezone.utc).isoformat()}
+        self.native_path.write_text(json.dumps(self.native_value))
+        self.native_path.chmod(0o664)
+        self.identity = {"session_id": self.HEADLESS, "harness": "opencode", "pane": "w1:pOld",
+            "server": "default", "name": "old", "foreground": {"pid": self.PID, "start": self.START,
+                "argv": ["opencode"], "shell_pid": 99999992, "shell_start": "700"}}
+        self.store = peer_steward.peer_obligations.ObligationStore()
+        self.book(self.SUCCESSOR_HARNESS)
+        self.seat = session_tidy._pane_seat_of("w1:pNew")
+        # Existing route/runtime payloads survive replay byte for byte.
+        for name in ("resource.json", "completed-prefix.json", "owner.log"):
+            (self.tmp_root / name).write_text('{"completed":["plan"],"round_ceiling":1,"state":"retained"}')
+
+    def write_jobs(self):
+        self.jobs_path.write_text("".join("now\t" + status + "\t" + str(self.tmp_root) + "\t" +
+            str(self.tmp_root) + "\towner.log\t" + ",".join(f"{k}={v}" for k, v in meta.items()) + "\n"
+            for status, meta in self.rows))
+
+    def book(self, harness, duty_id="retire-native-fixture"):
+        peer_steward._mark_seat_successor("w1:pNew", "w1:pOld", harness, "")
+        self.mark = peer_steward._seat_successor_path("w1:pNew")
+        self.mark.chmod(0o664)
+        self.requester = {"session_id": self.SUCCESSOR, "harness": harness,
+                          "pane": "w1:pNew", "server": "default"}
+        self.accept(duty_id)
+
+    def accept(self, duty_id="retire-native-fixture"):
+        # Native and mark creation precede real acceptance, which precedes completion.
+        self.duty = self.store.create(duty_id, "retire", self.identity,
+                                      {"target": "w1:pOld", "requester": self.requester})
+        self.duty = self.store.update(self.duty["id"], state="complete", result="target-already-gone",
+            delivery="completed", cleanup="complete", observation={"phase": "complete"})
+
+    def protected(self):
+        paths = [self.store._record_path(self.duty["id"]), self.jobs_path, self.route_path,
+                 *(self.tmp_root / name for name in ("resource.json", "completed-prefix.json", "owner.log"))]
+        return {str(p): p.read_bytes() for p in paths}
+
+    def authority_bytes(self):
+        paths = (self.mark, self.tidy._ledger_path(self.seat), self.handover._snapshot_path(self.seat.key))
+        return {str(p): p.read_bytes() if p.exists() else None for p in paths}
+
+    def replay(self, duty=None):
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("external transport")), \
+             mock.patch.object(peer_steward, "_close_pane", side_effect=AssertionError("pane close")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value="w9:pObserver"):
+            return peer_steward._resume_retire_obligation(duty or self.duty, self.store)
+
+    def assert_refused(self, duty=None):
+        before, authority = self.protected(), self.authority_bytes()
+        self.replay(duty)
+        self.assertEqual(self.protected(), before)
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), self.PARENT)
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+
+    def test_real_recovery_preserves_history_and_hands_only_open_original_route_once(self):
+        before = self.protected()
+        self.replay()
+        self.assertEqual(self.protected(), before)
+        self.assertFalse(self.mark.exists())
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), self.SUCCESSOR)
+        self.assertEqual(self.handover.effective_parent_harness(self.meta, self.jobs_path), "codex")
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+        ledger = self.tidy._ledger_path(self.seat).read_bytes()
+        row = json.loads(ledger)
+        self.assertEqual({b["attempt"] for b in row["bindings"]}, {m["attempt_id"] for _, m in self.rows[:3]})
+        snapshot_bindings = self.handover.read_snapshot(self.seat.key)["bindings"]
+        self.assertEqual(len(snapshot_bindings), 3)
+        expected = {(meta["attempt_id"], meta["parent_sid"]) for _, meta in self.rows[:3]}
+        self.assertEqual({(binding["attempt"], binding["parent"]) for binding in snapshot_bindings}, expected)
+        current = self.handover.current_bindings("opencode", self.SUCCESSOR, self.jobs_path)
+        self.assertTrue(all(binding in current for binding in row["bindings"]))
+        self.replay()
+        self.assertEqual(self.tidy._ledger_path(self.seat).read_bytes(), ledger)
+        self.assertEqual(self.protected(), before)
+
+    def test_unrelated_closed_missing_sidecar_does_not_become_a_global_requirement(self):
+        unrelated = {**self.meta, "attempt_id": "att-unrelated", "parent_sid": "ses_unrelated",
+                     "owner_route_id": "rt-closed", "owner_route_hash": "sha256:closed"}
+        self.rows.append(("done", unrelated))
+        self.write_jobs()
+        self.replay()
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(unrelated, self.jobs_path), "ses_unrelated")
+
+    def test_failed_native_source_never_falls_back_to_open_foreign_parent_route(self):
+        for raw in (None, b"false", b"null", b"[]", b"{", b"{}", b" " * 1025):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    self.native_path.unlink(missing_ok=True)
+                else:
+                    self.native_path.write_bytes(raw)
+                self.assert_refused()
+
+    def test_false_native_fields_namesake_and_latest_guesses_grant_nothing(self):
+        for change in ({"sessionID": "ses_foreign"}, {"sessionID": False}, {"pid": self.PID + 1},
+                       {"pid": True}, {"start": "801"}, {"start": True}, {"schema": "other"},
+                       {"writtenAt": None}, {"writtenAt": "2026-10-13T00:00:00"}):
+            with self.subTest(change=change):
+                self.native_path.write_text(json.dumps({**self.native_value, **change}))
+                self.assert_refused()
+        self.native_path.unlink()
+        with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": self.PARENT, "AGENT_SESSION_ID": self.PARENT}):
+            self.assert_refused()
+
+    def test_original_birth_live_unknown_reused_and_wrong_argv(self):
+        real_stat = os.stat
+        def proc_stat(path, *args, **kw):
+            return object() if str(path) == f"/proc/{self.PID}" else real_stat(path, *args, **kw)
+        for birth in ("800", None):
+            with self.subTest(birth=birth), \
+                 mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", return_value=birth), \
+                 mock.patch.object(peer_steward.os, "stat", side_effect=proc_stat):
+                self.assert_refused()
+        for change in ({"pid": True}, {"pid": 0}, {"start": None}, {"start": "801"},
+                       {"argv": ["opencode", "run"]}, {"argv": ["namesake"]}, {"argv": []}):
+            with self.subTest(change=change):
+                duty = json.loads(json.dumps(self.duty))
+                duty["intent"]["identity"]["foreground"].update(change)
+                self.assert_refused(duty)
+        # Reuse is proof of the OLD lifetime's end, never a source for its SID.
+        with mock.patch.object(peer_steward, "_retire_process_record", return_value={"start": "801"}):
+            self.replay()
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_invalid_sidecar_and_unregistered_nonowner_relations_refuse(self):
+        original = self.binding_path.read_bytes()
+        for raw in (b"false", b"[]", b"{}", b"{", b" " * 4097,
+                    json.dumps({"attempt_id": "att-other", "worktree": str(self.tmp_root),
+                                "session_id": self.HEADLESS}).encode(),
+                    json.dumps({"attempt_id": "att-selected", "worktree": str(self.tmp_root / "other"),
+                                "session_id": self.HEADLESS}).encode()):
+            self.binding_path.write_bytes(raw)
+            self.assert_refused()
+        self.binding_path.unlink()
+        self.assert_refused()
+        self.binding_path.write_bytes(original)
+        for change in ({"dispatch_depth": "2"}, {"worker_type": "frame"}, {"registered_worker": "0"},
+                       {"execution_surface": "native-subagent"}, {"owner_route_hash": ""}):
+            self.rows[2] = ("done", {**self.meta, **change})
+            self.write_jobs()
+            self.assert_refused()
+
+    def test_native_parent_mismatch_and_multiple_matching_attempts_include_closed_foreign(self):
+        self.rows[2] = ("done", {**self.meta, "parent_sid": "ses_foreign"})
+        self.write_jobs()
+        self.assert_refused()
+        for parent in (self.PARENT, "ses_foreign"):
+            self.rows[2] = ("done", self.meta)
+            other = {**self.meta, "attempt_id": "att-duplicate", "parent_sid": parent,
+                     "owner_route_id": "rt-closed", "owner_route_hash": "sha256:closed"}
+            self.rows = self.rows[:4] + [("done", other)]
+            self.write_jobs()
+            self.native.bind_session(SimpleNamespace(jobs=self.jobs_path, worktree=str(self.tmp_root),
+                                                     parent_attempt_id="att-duplicate"), self.HEADLESS)
+            self.assert_refused()
+
+    def test_source_time_and_acceptance_are_real_not_backdated_payloads(self):
+        for stamp in (None, False, float("nan"), float("inf"), 0, self.native_path.stat().st_ctime - 1):
+            with self.subTest(stamp=stamp):
+                duty = {**self.duty, "accepted_at": stamp}
+                self.assert_refused(duty)
+        # An old payload in a new generation remains too late.
+        other = self.native_path.with_suffix(".new")
+        other.write_text(json.dumps(self.native_value))
+        os.replace(other, self.native_path)
+        self.assert_refused()
+
+    def test_late_sidecar_and_mark_with_old_payload_times_are_refused(self):
+        original = self.binding_path.read_bytes()
+        self.binding_path.write_bytes(original)
+        self.assert_refused()
+
+    def test_late_mark_with_old_payload_time_is_refused_independently(self):
+        self.mark.write_bytes(self.mark.read_bytes())
+        self.assert_refused()
+
+    def test_native_mark_and_sidecar_unsafe_reads_leave_all_authority_unchanged(self):
+        for number, path in enumerate((self.native_path, self.mark, self.binding_path)):
+            original = path.read_bytes()
+            path.unlink()
+            path.symlink_to(path.with_suffix(".missing"))
+            self.assert_refused()
+            path.unlink()
+            os.mkfifo(path)
+            # Authority snapshots do not read FIFO contents.
+            with mock.patch.object(self, "authority_bytes", return_value={"fixture": "unchanged"}):
+                self.assertEqual(peer_steward._retire_handover(self.duty),
+                                 "skipped:successor-unverified" if path == self.mark else None)
+            path.unlink()
+            path.write_bytes(original)
+            # A restored source is newer than that acceptance; only a later one may use it.
+            self.accept(f"retire-native-restored-{number}")
+        # UID and EACCES injections use the actual descriptor readers.
+        uid = os.getuid()
+        with mock.patch.object(os, "getuid", return_value=uid + 1):
+            self.assert_refused()
+        real_open = os.open
+        def denied(path, *args, **kwargs):
+            if Path(path) == self.native_path:
+                raise PermissionError()
+            return real_open(path, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=denied):
+            self.assert_refused()
+
+    def test_requester_mark_and_unsupported_completed_state_refuse(self):
+        for state, result in (("cancelled", "normal-exit"), ("complete", "unknown"),
+                              ("complete", "force-killed")):
+            self.assert_refused({**self.duty, "state": state, "result": result})
+        self.assertIsNone(peer_steward._retire_handover({**self.duty, "state": "pending"}))
+        for field, value in (("session_id", ""), ("harness", "unknown"), ("pane", "w1:pOther"), ("server", "foreign")):
+            duty = json.loads(json.dumps(self.duty))
+            duty["intent"]["requester"][field] = value
+            self.assert_refused(duty)
+        original = json.loads(self.mark.read_text())
+        for change in ({"schema": False}, {"pane": "other"}, {"beside": "other"}, {"server": "other"},
+                       {"successor": []}, {"successor": {"harness": "codex", "session_id": "other"}},
+                       {"at": False}, {"at": float("nan")}, {"at": self.duty["accepted_at"] + 1}):
+            self.mark.write_text(json.dumps({**original, **change}))
+            self.assert_refused()
+
+    def test_closed_route_and_another_successor_remain_authoritative(self):
+        outcome = self.route_path.with_suffix(".outcome.json")
+        outcome.write_text('{"state":"closed"}')
+        self.assert_refused()
+        outcome.unlink()
+        self.handover.record_retire_handover(self.PARENT, "opencode", "first-successor", "claude",
+            jobs=self.jobs_path, successor_seat=self.tidy._pane_seat_of("w1:pFirst"))
+        before = self.authority_bytes()
+        self.replay()
+        self.assertEqual(self.authority_bytes(), before)
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), "first-successor")
+
+    def test_selected_generation_is_rechecked_under_mark_lock_without_global_jobs_freeze(self):
+        real = peer_steward._retire_predecessor
+        calls = 0
+        def replaced(duty):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                other = self.binding_path.with_suffix(".new")
+                other.write_bytes(self.binding_path.read_bytes())
+                os.replace(other, self.binding_path)
+            return real(duty)
+        with mock.patch.object(peer_steward, "_retire_predecessor", side_effect=replaced):
+            self.assert_refused()
+
+    def test_same_normal_command_and_detached_callback_consume_original_requester(self):
+        with mock.patch.object(peer_steward, "_retire_target", return_value=("unknown", {
+                "harness": "-", "name": "old", "pane": "-", "session_id": "-"}, 1, "pane-unverified")), \
+             mock.patch.object(peer_steward, "_current_session_identity", return_value=(self.SUCCESSOR, "codex")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value="w1:pNew"), \
+             mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertEqual(peer_steward.cmd_retire(SimpleNamespace(target="w1:pOld")), 0)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_detached_lifecycle_needs_no_observer_native_identity(self):
+        before = self.protected()
+        with mock.patch.object(peer_steward, "_current_session_identity", return_value=("observer", "claude")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
+             mock.patch.object(peer_steward, "_ensure_watch_observers"), \
+             mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.protected(), before)
+
+    def test_real_start_correct_admission_and_retained_input_use_written_effective_parent(self):
+        import work_start
+        import dispatch_replacement as replacement
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import DispatchContractError
+        # Normal input admission exists before the owner ends.
+        self.rows[2] = ("running", self.meta)
+        self.write_jobs()
+        owner_input.initialize_owner_input(self.jobs_path, "att-selected", "opencode-next-turn")
+        self.rows[2] = ("done", self.meta)
+        self.write_jobs()
+        before = self.protected()
+        self.replay()
+        self.assertEqual(self.protected(), before)
+        rows = replacement._rows(self.jobs_path.read_text().splitlines())
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.SUCCESSOR,
+                                         "AGENT_DISPATCH_CALLER_HARNESS": "codex"}):
+            # This is the existing correct/start continuation admission, not a
+            # mocked owns=True or a new path. Input writes have their own baseline.
+            replacement._authorized(self.jobs_path, rows, self.meta)
+            input_path = owner_input._path(self.jobs_path, "att-selected")
+            initial = input_path.read_bytes()
+            result = owner_input.submit(self.jobs_path, "att-selected", "Continue approved work", "exact-answer")
+            self.assertTrue(result["retained"])
+            self.assertNotEqual(input_path.read_bytes(), initial)
+            value = json.loads(input_path.read_bytes())
+            self.assertEqual(value["requests"][0]["source_session"], self.SUCCESSOR)
+            self.assertEqual(self.meta["parent_sid"], self.PARENT)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "foreign-successor",
+                                         "AGENT_DISPATCH_CALLER_HARNESS": "codex"}):
+            with self.assertRaises(DispatchContractError):
+                replacement._authorized(self.jobs_path, rows, self.meta)
+        # Independent normal live start reuse consumes the SAME logical binding.
+        self.rows[2] = ("running", self.meta)
+        self.write_jobs()
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.SUCCESSOR}):
+            self.assertEqual(work_start._slot(self.route, "owner", work_start._rows(self.jobs_path), self.jobs_path),
+                             "att-selected")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "foreign-successor"}):
+            with self.assertRaises(DispatchContractError):
+                work_start._slot(self.route, "owner", work_start._rows(self.jobs_path), self.jobs_path)
+
+    def test_real_completion_storage_allowlist_lease_ack_and_no_redelivery(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+        # The synchronous Claude carrier reads the same written handover; native
+        # turn-proof support is not inferred for the other harnesses.
+        self.book("claude", "retire-native-claude")
+        self.replay()
+        root, kind = self.jobs_path.parent, "claude-parent-runtime"
+        delivery = "delivery-" + "a" * 32
+        receipt = {"schema_version": 2, "state": "delivered", "parent_attempt_id": "att-selected",
+            "job_registry": str(self.jobs_path), "delivery_classification": "attention",
+            "children": [{"attempt_id": "att-selected", "status": "done", "readiness": "ready",
+                          "reason": "terminal-failure-or-unclosed", "required_action": "inspect-done-failure",
+                          "harness": "opencode", "delivery_classification": "attention"}]}
+        pending.create(root, recipient_kind=kind, recipient_key=self.PARENT, delivery_id=delivery,
+            session_generation="", session_generation_supported="0", attempt_ids=["att-selected"],
+            parent_attempt_id="att-selected", route_id=self.route["route_id"], route_node="owner",
+            receipt=receipt, receipt_digest=pending._canonical_receipt_digest(receipt),
+            row_revisions={"att-selected": "original-revision"})
+        original = pending.read(root, self.PARENT, delivery)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pNew"}):
+            recipients = self.handover.storage_recipients(self.SUCCESSOR, harness="claude")
+            self.assertIn((self.PARENT, frozenset({"att-selected", "att-ancestor-one", "att-ancestor-two"})),
+                          recipients)
+            allowed = dict(recipients)[self.PARENT]
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": ["att-foreign"]}, allowed))
+            self.assertEqual(sweep.addressed_records(root, kind, "foreign-successor"), ([], 0))
+            records, _ = sweep.sweep_deliver(root, kind, self.SUCCESSOR)
+            self.assertEqual([r["delivery_id"] for r in records], [delivery])
+            claimed = pending.read(root, self.PARENT, delivery)
+            for key in ("delivery_id", "receipt_digest", "recipient_digest", "row_revisions"):
+                self.assertEqual(claimed[key], original[key])
+            self.assertEqual(sweep.ack_delivered(root, self.SUCCESSOR, records, acked_by="fixture-consumed"), 1)
+            self.assertEqual(pending.read(root, self.PARENT, delivery)["state"], "acked")
+            self.assertEqual(sweep.sweep_deliver(root, kind, self.SUCCESSOR)[0], [])
+            self.assertIsNone(pending.read(root, self.SUCCESSOR, delivery))
+
+    def test_pending_gone_settlement_defers_the_stale_label_to_the_completed_replay(self):
+        self.duty = self.store.create("retire-native-pending", "retire", self.identity,
+                                      {"target": "w1:pOld", "requester": self.requester})
+        authority = self.authority_bytes()
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertTrue(peer_steward._complete_gone_retire(self.store, self.duty))
+        # The pending path never forwards the stale headless label (route F stays).
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+        settled = self.store.get(self.duty["id"])
+        self.assertEqual((settled["state"], settled["result"]), ("complete", "target-already-gone"))
+        self.replay(settled)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+
+    def test_unrelated_registry_appends_do_not_freeze_the_selected_relation(self):
+        real = peer_steward._retire_predecessor
+        calls = 0
+        def appended(duty):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with self.jobs_path.open("a") as handle:
+                    handle.write("now\trunning\t/x\t/x\tlog\tattempt_id=att-later,dispatch_depth=2\n")
+            return real(duty)
+        with mock.patch.object(peer_steward, "_retire_predecessor", side_effect=appended):
+            self.replay()
+        self.assertEqual(calls, 2)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_ordinary_completed_opencode_booking_keeps_its_label_without_retained_source(self):
+        # A booked label that is no headless owner session is the ordinary path:
+        # a disposed TUI record does not block the missed-handover replay.
+        self.native_path.unlink()
+        self.binding_path.unlink()
+        self.rows = [("done", {**self.meta, "attempt_id": aid, "parent_sid": self.HEADLESS})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.write_jobs()
+        self.replay()
+        self.assertFalse(self.mark.exists())
+        self.assertEqual(self.handover.effective_parent(self.rows[2][1], self.jobs_path), self.SUCCESSOR)
+
+    def test_retained_selection_that_contradicts_an_ordinary_label_grants_nothing(self):
+        self.binding_path.unlink()
+        self.rows = [("done", {**self.meta, "attempt_id": aid, "parent_sid": self.HEADLESS})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.write_jobs()
+        authority = self.authority_bytes()
+        self.replay()
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.rows[2][1], self.jobs_path), self.HEADLESS)
 
 
 class RetireBackgroundDialogTest(unittest.TestCase):
@@ -6173,6 +6215,107 @@ class RetireBackgroundDialogTest(unittest.TestCase):
                  self._cells("❯ let me check the logs")]
         self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
 
+    def test_retire_rechecks_before_confirmation_enter_if_another_form_appears(self):
+        dialog = peer_steward._screen_lines(
+            "Background work is running\n❯ 1. Exit and stop tasks\n"
+            "2. Move to background and exit\n3. Stay\nEnter to confirm · Esc to cancel\n")
+        unrelated_form = peer_steward._screen_lines("Do you want to proceed?\nEnter to confirm\n")
+        for switch_at in (3, 5):
+            with self.subTest(switch_at=switch_at):
+                reads = [dialog] * (switch_at - 1) + [unrelated_form]
+                calls = []
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                with mock.patch.object(peer_steward, "_read_screen", side_effect=reads), \
+                     mock.patch.object(peer_steward, "_retire_foreground", return_value="same-process"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                     mock.patch.object(peer_steward, "_RETIRE_SECONDS", 0):
+                    result = peer_steward._retire_claude_background_confirm(
+                        "peer", "w1:pX", "claude", {}, "same-process",
+                        lambda reason, **kwargs: reason, None, None,
+                    )
+                self.assertEqual(result, "form-open")
+                keys = [argv[4:] for argv in calls if argv[:3] == ["herdr", "pane", "send-keys"]]
+                self.assertEqual(len(keys), 1 if switch_at == 5 else 0)
+                texts = [argv[-1] for argv in calls if argv[:3] == ["herdr", "pane", "send-text"]]
+                self.assertEqual(texts, ["1"] if switch_at == 3 else ["1", "3"])
+
+
+class BlockingScreenClassifierTest(unittest.TestCase):
+    @staticmethod
+    def cells(text):
+        return [(char, False) for char in text]
+
+    def test_codex_hook_review_is_recognized_at_top_for_normal_and_wrapped_views(self):
+        for screen in (
+            "Hooks need review\n1 hook is new or changed\nReview hooks\n"
+            "Trust all and continue\nContinue without trusting\nEnter to confirm · Esc to skip",
+            "Hooks need review\n2 hooks are new or changed\nChecking hooks…\n"
+            "1. Review hooks\n2. Trust all and continue\n"
+            "3. Continue without trusting (hooks\n   won't run)",
+        ):
+            with self.subTest(screen=screen):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", [self.cells(line) for line in screen.splitlines()]))
+
+    def test_real_codex_01621_captures_and_upstream_snapshots_are_recognized(self):
+        capture_names = (
+            "cap-alt80.txt", "cap-alt80.ansi", "cap-inline80.txt", "cap-inline80.ansi",
+            "cap-alt40.txt", "cap-alt40.ansi", "cap-inline40.txt", "cap-inline40.ansi",
+            "cap-80x40-noalt.txt",
+        )
+        for name in capture_names:
+            with self.subTest(capture=name):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", _codex_capture(name)))
+        for name in ("startup_hooks_review_prompt.snap", "startup_hooks_picker_progress_40.snap",
+                     "startup_hooks_review_prompt_with_trust_error.snap"):
+            with self.subTest(snapshot=name):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", _codex_snapshot(name)))
+
+    def test_codex_location_popup_under_transcript_blocks_but_quotes_do_not(self):
+        popup = _codex_snapshot("worktrees_new_choices.snap")
+        chat_popup = "banner: project · main\nPrior chat text\n" + popup
+        self.assertEqual("form-open", peer_steward._blocking_screen("codex", chat_popup))
+        quoted = [self.cells("● Working"), self.cells("Quoted: Where should the new conversation run?"),
+                  self.cells("› Use current Git worktree; Enter select · Esc back"),
+                  self.cells("❯ Continue with the requested change")]
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                self.assertIsNone(peer_steward._blocking_screen(harness, quoted))
+        # Codex 0.162.1's own composer glyph is `›`, usually followed by its
+        # status footer, so the composer is not necessarily the last row.
+        popup_rows = popup.strip("\n").splitlines()
+        for tail in (["› ordinary draft"],
+                     ["› ordinary draft", "", "  ? for shortcuts            100% context left"]):
+            with self.subTest(tail=tail):
+                quoted_popup = "\n".join(["• Earlier answer quoting the picker:"] + popup_rows + tail)
+                self.assertIsNone(peer_steward._blocking_screen("codex", quoted_popup))
+
+    def test_singular_count_with_period_matches_real_dialog_shape(self):
+        screen = ("Hooks need review\n1 hook is new or changed.\nReview hooks\n"
+                  "Trust all and continue\nContinue without trusting\n")
+        self.assertEqual("native-trust-wait", peer_steward._blocking_screen("codex", screen))
+
+    def test_codex_hook_review_quote_and_unknown_screen_do_not_block(self):
+        quote = [self.cells("● Reviewing documentation"),
+                 self.cells("+ Hooks need review 1 hook is new or changed"),
+                 self.cells("+ Review hooks / Trust all and continue / Continue without trusting"),
+                 self.cells("❯ let me inspect the implementation")]
+        self.assertIsNone(peer_steward._blocking_screen("codex", quote))
+        self.assertIsNone(peer_steward._blocking_screen("codex", None))
+        self.assertIsNone(peer_steward._blocking_screen("codex", []))
+
+    def test_hook_review_signature_is_codex_scoped(self):
+        lines = [self.cells(row) for row in (
+            "Hooks need review", "1 hook is new or changed", "Review hooks",
+            "Trust all and continue", "Continue without trusting")]
+        self.assertEqual("native-trust-wait", peer_steward._blocking_screen("codex", lines))
+        self.assertIsNone(peer_steward._blocking_screen("claude", lines))
+        self.assertIsNone(peer_steward._blocking_screen("opencode", lines))
+
 
 class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
     def invoke(self, kind, world):
@@ -6181,7 +6324,7 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
             for name, value in (("_herdr_missing", False), ("_ensure_pane_ingress", None),
                                 ("_export_opencode_tui_scoped", "missing"),
                                 ("_read_screen", None), ("_pane_is_managed", False),
-                                ("_codex_embedded_args", []),
+                                ("_process_session", "observed-sid" if kind == "codex" else None),
                                 ("_current_session_identity", ("parent-sid", "claude"))):
                 stack.enter_context(mock.patch.object(peer_steward, name, return_value=value))
             stack.enter_context(mock.patch.object(peer_steward.subprocess, "run", side_effect=world))
@@ -6240,7 +6383,9 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIn("start_verify=observed-pane", line)
                     self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in world.calls), 1)
                     self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 1)
-                    self.assertFalse(any(a[1] == "pane" for a in world.calls))
+                    pane_info_reads = [a for a in world.calls
+                                       if a[:3] == ["herdr", "pane", "process-info"]]
+                    self.assertEqual(pane_info_reads, [])  # this case stubs the shared resolver
                     marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
                     entry = marker["targets"]["observed-sid"]
                     self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))

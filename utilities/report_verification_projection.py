@@ -508,8 +508,12 @@ def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
                 or evidence_path.resolve(strict=False) != verdict_path.resolve(strict=False)
                 or _digest_value(evidence.get("sha256")) != output_rev["_sha256"]):
             raise ProjectionProblem("completion-marker-evidence-conflict")
-        currency = dispatch_contract.evidence_currency(route, dict(node), marker_path, marker, observe=True)
-        gate = dispatch_contract.gate_currency(route, dict(node), marker_path, marker, observe=True)
+        currency = dispatch_contract.evidence_currency(
+            route, dict(node), marker_path, marker, observe=True, jobs=jobs,
+        )
+        gate = dispatch_contract.gate_currency(
+            route, dict(node), marker_path, marker, observe=True, jobs=jobs,
+        )
         if currency.state != "current" or gate.state != "current":
             raise ProjectionProblem(getattr(currency if currency.state != "current" else gate,
                                             "reason", "completion-marker-not-current"))

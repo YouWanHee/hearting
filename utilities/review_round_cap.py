@@ -161,16 +161,15 @@ def _base_recovery_fields(node_kind, state="exhausted"):
     from route_authority import decide_continuation
     choice = decide_continuation(action="round-recovery", facts={"state": state, "node_kind": node_kind})
     review = node_kind == "review-worker"
-    fields = {"recovery_owner": "owner", "recovery_surface": "capability-route complete" + ("" if review else " --inline")}
+    fields = {"recovery_owner": "owner",
+              "recovery_surface": "owner-report" if review else "capability-route complete --inline"}
     if state == "verdictless-bound":
         fields.update(next_action=choice.next_action,
             recovery_hint="Continue the remaining work through the existing unregistered fallback; "
                 "preserve prior FAILs and publish completion only after verification. No new registered round is admitted.")
     else:
-        fields.update(required_action="resolve-review-findings" if review else "report-unresolved-verification",
-            recovery_hint="Preserve the prior results. " + ("Record dispositions in the existing .owner-closure.md evidence; "
-                "this is owner judgment, not independent PASS." if review else
-                "The round limit does not stop remaining owner work. Report any unresolved verification without inferring PASS."))
+        fields.update(required_action="report-unresolved-verification",
+            recovery_hint="Preserve prior results and report any unresolved verification without inferring PASS.")
     return fields
 
 
@@ -178,6 +177,7 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
     fields = _base_recovery_fields(node_kind, state)
     if state != "exhausted" or node_kind != "review-worker" or not route or not node or jobs is None:
         return fields
+    import base64
     from pathlib import Path
     import shlex
     from route_lineage import verified_route_lineage, canonical_route_path
@@ -196,33 +196,89 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
                     and (meta.get("route_node") or meta.get("node")) == node["id"]):
                 rows.append((cols, meta))
         rows = [(cols[1], meta) for cols, meta in logical_round_records(rows, jobs=jobs)]
+        source_digest = None
+        from review_source_subject import has_review_subject, observe, read_binding
+        if has_review_subject(route, node, jobs):
+            source_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
+            bound_rows = []
+            for status, meta in rows:
+                binding = read_binding(jobs, meta, required=False)
+                bound_rows.append((status, meta if binding is None else {
+                    **meta, "_review_subject_digest": binding["subject_digest"]
+                }))
+            rows = bound_rows
         verdicts = [(status, meta) for status, meta in rows
+                    if source_digest is None or meta.get("_review_subject_digest") == source_digest
                     if classify_round_row(status, meta, worker_type="review") == "verdict"]
         if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
             return fields
         latest = verdicts[-1][1]
+        encoded_review = latest.get("review_artifact_b64")
+        if not encoded_review:
+            return fields
+        try:
+            review_artifact = Path(base64.urlsafe_b64decode(
+                encoded_review + "=" * (-len(encoded_review) % 4)).decode("utf-8")).resolve()
+            review_artifact.relative_to(Path(route["artifact_root"]).resolve())
+        except (ValueError, OSError, UnicodeDecodeError):
+            return fields
+        if not review_artifact.is_file():
+            return fields
+        try:
+            from dispatch_contract import evidence_digest, observe_terminal_review_failure
+            attempt_route = next((generation for generation in lineage
+                if generation.get("route_id") == latest.get("route_id")
+                and generation.get("route_hash") == latest.get("route_hash")), None)
+            attempt_node = (next((item for item in attempt_route.get("nodes", [])
+                                  if item.get("id") == node["id"]), None)
+                            if attempt_route is not None else None)
+            if attempt_node is None:
+                return fields
+            observe_terminal_review_failure(
+                attempt_route, attempt_node, latest["attempt_id"], review_artifact,
+                evidence_digest(review_artifact), Path(jobs).read_text(encoding="utf-8").splitlines(),
+            )
+        except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
+            return fields
+        import route_authority
+        closure = route_authority.decide_continuation(route, action="owner-closure", node=node,
+            rows=rows, facts=({"source_subject_digest": source_digest}
+                              if source_digest is not None else None))
+        if not closure.allowed:
+            return fields
+        fields.update(recovery_surface="capability-route complete",
+            next_action="owner-closure",
+            required_action="resolve-review-findings",
+            recovery_hint="Record dispositions for the exact blocking review in existing owner-closure evidence; this is owner judgment, not independent PASS.")
         route_path = route_file or canonical_route_path(route["artifact_root"], route["route_id"])
         command = ["python3", str(Path(__file__).with_name("capability-route.py")), "complete",
                    "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
                    "--attempt-id", latest["attempt_id"], "--evidence", "<current-cycle-file.owner-closure.md>"]
         fields["recovery_check_command"] = shlex.join(command + ["--check"])
         fields["recovery_complete_command"] = shlex.join(command)
-        if review_input.is_review_node(node) and not review_input.has_plan_producer(route, node):
+        if (review_input.is_review_node(node) and not review_input.has_plan_producer(route, node)
+                and latest.get(review_input.KEY)):
             try:
-                review_input.read_binding(jobs, latest)
+                input_binding = review_input.read_binding(jobs, latest)
             except DispatchContractError as exc:
                 fields["revision_unavailable"] = exc.reason
             else:
-                import route_authority
-                answer = route_authority.decide_continuation(route, action="round", node=node,
-                    rows=rows, revisions=[{"answers": [latest["attempt_id"]]}])
-                if answer.allowed and answer.budget.round_kind == "closure-check":
-                    fields["recovery_revise_command"] = shlex.join([
-                        "python3", str(Path(__file__).with_name("capability-route.py")), "revise",
-                        "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
-                        "--basis", "review-findings", "--answers", latest["attempt_id"],
-                        "--evidence", "<current-cycle-corrected-plan-file>",
-                        "--author-attempt-id", "<current-owner-attempt-id>"])
+                if input_binding is None:
+                    fields["revision_unavailable"] = "review-input-binding-missing"
+                else:
+                    answer = route_authority.decide_continuation(route, action="round", node=node,
+                        rows=rows, revisions=[{"answers": [latest["attempt_id"]]}],
+                        facts=({"source_subject_digest": source_digest}
+                               if source_digest is not None else None))
+                    if answer.allowed and answer.budget.round_kind == "closure-check":
+                        fields["recovery_revise_command"] = shlex.join([
+                            "python3", str(Path(__file__).with_name("capability-route.py")), "revise",
+                            "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
+                            "--basis", "review-findings", "--answers", latest["attempt_id"],
+                            "--evidence", "<current-cycle-corrected-plan-file>",
+                            "--author-attempt-id", "<current-owner-attempt-id>"])
+        elif review_input.is_review_node(node) and not review_input.has_plan_producer(route, node):
+            fields["revision_unavailable"] = "review-input-binding-missing"
     except (OSError, ValueError, KeyError, TypeError):
         # Recovery hints carry no authority and cannot weaken the original refusal.
         return fields
@@ -300,9 +356,12 @@ class RoundBudget:
 
 
 
-def round_budget(route, node, rows, *, revisions=()):
+def round_budget(route, node, rows, *, revisions=(), source_subject_digest=None):
     from route_authority import decide_continuation
-    return decide_continuation(route, action="round", node=node, rows=rows, revisions=revisions).budget
+    facts = ({"source_subject_digest": source_subject_digest}
+             if source_subject_digest is not None else None)
+    return decide_continuation(route, action="round", node=node, rows=rows,
+                               revisions=revisions, facts=facts).budget
 
 
 def last_verdict_blocking(rows, worker_type):
@@ -354,12 +413,15 @@ def _last_round_blocking_verdict(rows, worker_type):
     )
 
 
-def marker_round_census(route, node, rows, *, site, revisions=(), independently_reviewed=False):
+def marker_round_census(route, node, rows, *, site, revisions=(), independently_reviewed=False,
+                        source_subject_digest=None):
     """Compatibility projection of the shared marker decision; no cap means no census."""
     from route_authority import decide_continuation
     try:
         return decide_continuation(route, action="marker", node=node, rows=rows, revisions=revisions,
-            facts={"site": site, "independently_reviewed": independently_reviewed}).census
+            facts={"site": site, "independently_reviewed": independently_reviewed,
+                   **({"source_subject_digest": source_subject_digest}
+                      if source_subject_digest is not None else {})}).census
     except ValueError as error:
         if str(error).startswith("unknown round-census site:"):
             raise

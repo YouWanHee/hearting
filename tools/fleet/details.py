@@ -107,6 +107,7 @@ def _enrich(snapshot):
     dispatch._fill_locations(jobs)
     dispatch._campaign_labels(jobs)
     for job in jobs:
+        job._details_error = False
         try:
             dispatch._enrich_claude_stream_session(job)
             dispatch._enrich_codex_attempt_session(job)
@@ -119,7 +120,7 @@ def _enrich(snapshot):
                     getattr(job, "capability_owner", None), job.worker_role,
                     artifact_root=job.artifact_root)
         except Exception:
-            pass
+            job._details_error = True
     _adopt_child_titles(sessions, jobs)
     titles.annotate(sessions + jobs)
     route_chain.enrich(sessions, jobs=jobs, node_evidence=value.node_evidence, now=time.time())
@@ -242,10 +243,20 @@ def merge(basic, detail):
             if not getattr(current, "title", None):
                 current.title = getattr(previous, "title", None)
                 current.title_ts = getattr(previous, "title_ts", None)
+            # Enrichment can advance its bounded native read (or fill summary
+            # timestamps). Compare with the captured input as well as output,
+            # so an unchanged basic tick does not reject its own detail result.
+            captured_activity = (detail.source_key.get("activity", {}).get(identity(row))
+                                 if isinstance(detail.source_key, dict) else None)
+            row_activity = _activity(row)
+            if isinstance(row, Session):
+                activity_current = row_activity in (captured_activity, _activity(previous))
+            else:
+                activity_current = (captured_activity is not None and
+                                    row_activity[0] == captured_activity[0]) or (
+                                    row_activity[0] == _activity(previous)[0])
             same_activity = (getattr(row, "liveness", None) == getattr(previous, "liveness", None)
-                             and getattr(row, "_detail_activity_key", None) ==
-                                 getattr(previous, "_detail_activity_key", None)
-                             and (not isinstance(row, Session) or _activity(row) == _activity(previous))
+                             and activity_current
                              and _child_activity_current(row, previous, basic, detail.source_key))
             if same_activity:
                 if current.subagents is None and getattr(previous, "subagents", None) is not None:
@@ -269,11 +280,11 @@ def merge(basic, detail):
                 # to an unchanged observation, but cannot erase current evidence.
                 if not isinstance(row, Session) and current.exec_tool is None:
                     current.exec_tool = getattr(previous, "exec_tool", None)
+            # Empty success means no summary is available yet, not detail failure.
+            # Route-neighbourhood changes gate projections separately from NOW.
+            current._details_pending = not same_activity
+            current._details_error = same_activity and getattr(previous, "_details_error", False)
             if projection_current(row, previous, current_state, detail.source_key):
-                has_now = any(getattr(current, field, None) for field in (
-                    "summary", "exec_child", "exec_tool", "resource_children"))
-                current._details_pending = (not same_activity or
-                    (current.liveness == "working" and not has_now))
                 current.work_projection = previous.work_projection
                 current.route_chain = getattr(previous, "route_chain", None)
                 current.cap_grounding = getattr(previous, "cap_grounding", None)
@@ -301,6 +312,15 @@ def merge(basic, detail):
         evidence = {"degradations": value.degradations,
                     "pending_delivery": value.pending_delivery,
                     "route_entities": value.route_entities}
+        try:
+            from .display_snapshot import merge as merge_display_snapshot
+            display_snapshot = merge_display_snapshot(
+                basic.display_snapshot, value.display_snapshot)
+        except Exception:
+            display_snapshot = basic.display_snapshot
+    else:
+        display_snapshot = basic.display_snapshot
     return replace(basic, sessions=sessions, jobs=jobs, resources=resources,
                    memory=value.memory, governor=value.governor,
-                   hearting=value.hearting or basic.hearting, **evidence)
+                   hearting=value.hearting or basic.hearting,
+                   display_snapshot=display_snapshot, **evidence)

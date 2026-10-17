@@ -34,7 +34,7 @@ class ReplacementTest(unittest.TestCase):
              'attempt_id':'att-source','route_id':'rt-test','route_hash':'sha256:test','route_node':'frame',
              'worker_type':'frame','parent_sid':'parent','harness':'codex','note':'dead-exact-pid',
              'failure_class':'contract','launch_outcome':'never-launched'}
-        self.args=args=SimpleNamespace(attempt_id='att-source',jobs_path=self.jobs,worktree=str(self.root),route_id='rt-test',route_node='frame',replacement_input_argv=['--start','--attempt-id','att-source','--prompt-text','the raw task'])
+        self.args=args=SimpleNamespace(attempt_id='att-source',jobs_path=self.jobs,worktree=str(self.root),route_id='rt-test',route_node='frame',launch_lifecycle='detached',replacement_input_argv=['--start','--attempt-id','att-source','--prompt-text','the raw task'])
         fragment=R.seal_launch_input(args,'codex','the raw task')
         self.meta.update(D.parse_registry_metadata(fragment));self.write(self.meta)
 
@@ -116,6 +116,18 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(registered['att-source'][1],before)
         self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),registered[candidate['attempt_id']][1]),record)
         effective,mapping=R.effective_attempts(self.jobs,{'att-source'})
+        self.assertEqual(effective, {'att-source'})
+        self.assertEqual(mapping, [])  # Registration alone is not execution.
+        self.assertTrue(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=True))
+        lines=self.jobs.read_text().splitlines()
+        for index,line in enumerate(lines):
+            fields=line.split('\t')
+            if D.row_has_attempt(fields[5], candidate['attempt_id']):
+                fields[5]=D._updated_attempt_metadata(fields[5], {'launch_started':'1'})
+                lines[index]='\t'.join(fields)
+        D._atomic_registry_replace(self.jobs, lines)
+        registered=R._rows(self.jobs.read_text().splitlines())
+        effective,mapping=R.effective_attempts(self.jobs,{'att-source'})
         self.assertEqual(effective,{candidate['attempt_id']})
         self.assertEqual(mapping[0]['replacement_attempt_id'],record['replacement_attempt_id'])
         projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
@@ -138,6 +150,41 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
         self.assertFalse(R.route_authority.replacement_parent_matches(registered['att-source'][1],candidate,self.jobs))
         self.assertEqual(self.claim(),record)
+
+    def test_confirmed_clear_refreshes_a_permitted_retry_registered_after_snapshot(self):
+        import dispatch_seat_handover as H
+        import session_tidy as S
+
+        self.bind_fixture_route()
+        self.bind_source_parent()
+        seat = S.Seat("pane", "replacement-race-seat", "wY:p5")
+        now = S.now_epoch()
+        with mock.patch.object(S, "resolve_seat", return_value=seat):
+            with S.seat_lock(seat.key):
+                S.record_event(seat, "codex", "parent", "start", cwd=str(self.root), now=now - 10)
+                self.assertEqual(H.write_snapshot_locked(
+                    seat, "codex", "parent", now=now - 5, jobs=self.jobs), 1)
+
+            # This follows the real replacement claim/admission/registry path and
+            # occurs strictly between the snapshot and the confirmed start hook.
+            record = self.claim()
+            candidate = self.replacement_candidate(record, parent="parent", harness="codex")
+            with mock.patch.dict(os.environ, self.parent_env("parent", "codex"), clear=True):
+                self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), candidate), record)
+            row = "now\topen\t" + str(self.root) + "\t" + str(self.root) + "\treplacement\t" + \
+                ",".join(k + "=" + v for k, v in candidate.items())
+            self.assertTrue(D.claim_attempt_row(self.jobs, candidate["attempt_id"], row, launch=False))
+
+            S.run_hook("codex", "start", "successor", source="clear", cwd=str(self.root), env={})
+
+        snapshot = H.read_snapshot(seat.key)
+        ledger = H.handover_rows(seat)
+        self.assertEqual(len(ledger), 1)
+        expected = {("att-source", "parent"), (candidate["attempt_id"], "parent")}
+        self.assertEqual({(b["attempt"], b["parent"]) for b in snapshot["bindings"]}, expected)
+        self.assertEqual({(b["attempt"], b["parent"]) for b in ledger[0]["bindings"]}, expected)
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())[candidate["attempt_id"]][1]["parent_sid"],
+                         "parent")
 
     def test_handover_replacement_admission_is_shared_by_all_parent_harnesses(self):
         self.bind_source_parent(carrier=True)
@@ -521,6 +568,20 @@ class ReplacementTest(unittest.TestCase):
                 or SimpleNamespace(returncode=0)))
         self.assertEqual(result['reason'],'replacement-launch-pending')
 
+    def test_a_plain_retry_already_continues_the_source_so_advance_claims_nothing(self):
+        # A fallback-hop retry has its own row with no replacement family; a claim would only
+        # compete with it, so a parked owner's checkpoint observes instead of looping on an error.
+        retry={k:v for k,v in self.meta.items() if k not in {'note','launch_outcome'}}
+        self.write({**retry,'attempt_id':'att-retry','automatic_retry_of':'att-source','harness':'claude',
+                    'failure_class':'pass'},append=True)
+        run=mock.Mock(side_effect=AssertionError('no replacement launch'))
+        with mock.patch.object(R,'_authorized'):
+            self.assertEqual(R.advance(self.jobs,'att-source',run=run),{'state':'not-applicable'})
+            effective,mapping,attention=R.advance_batch(self.jobs,{'att-source','att-retry'},run=run)
+        self.assertEqual((effective,mapping,attention),({'att-source','att-retry'},[],[]))
+        run.assert_not_called()
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
     def _launch_env(self,worker_type,prepare):
         self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
         seen={}
@@ -621,18 +682,23 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
     def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        import dispatch_lifecycle as L
         seen=[]
         def slow(command,**kwargs):
             seen.append((command,kwargs['timeout']))
             raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch('dispatch_lifecycle.reconcile_launch_lifecycle',
+                        return_value=SimpleNamespace(effective='detached')):
             first=R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(first['reason'],'replacement-launch-timeout')
         self.assertIn('waiting on disk',first['launcher_diagnostic'])
         self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
         self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
                     'note':'registered','launch_claimed':'0'},'open',append=True)
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch('dispatch_lifecycle.reconcile_launch_lifecycle',
+                        return_value=SimpleNamespace(effective='detached')):
             R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
 
@@ -1300,10 +1366,17 @@ class ReplacementTest(unittest.TestCase):
         replay=R.launch_input(self.jobs,record['original_attempt_id'],source)
         args=SimpleNamespace(**vars(self.args));args.attempt_id=aid
         args.replacement_input_argv=R._replacement_argv(record,source,replay)
-        meta={k:v for k,v in parent.items() if k not in ('note','failure_class','launch_outcome','replacement_input_digest')}
-        meta.update(attempt_id=aid,automatic_retry_of=record['original_attempt_id'],launch_claimed='1',
-                    replacement_family_id=record['family_id'],replacement_original_attempt_id=record['original_attempt_id'],
-                    replacement_ordinal='1',replacement_claim_digest=R._digest(record),**changes)
+        terminal_keys={'note','failure_class','launch_outcome','replacement_input_digest',
+                       'delivery_intent','delivery_id','delivery_recipient_digest',
+                       'delivery_recipient_kind','delivery_receipt_digest','delivery_receipt_b64',
+                       'delivery_row_revision','delivery_persistence_refused'}
+        meta={k:v for k,v in parent.items() if k not in terminal_keys}
+        meta.update({
+            'attempt_id':aid, 'automatic_retry_of':record['original_attempt_id'], 'launch_claimed':'1',
+            'replacement_family_id':record['family_id'],
+            'replacement_original_attempt_id':record['original_attempt_id'],
+            'replacement_ordinal':'1', 'replacement_claim_digest':R._digest(record), **changes,
+        })
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
         self.write(meta,status,append=True)
         return meta
@@ -1393,6 +1466,277 @@ class ReplacementTest(unittest.TestCase):
         last = R.claim(self.jobs, current['attempt_id'])
         self.assertEqual(last['original_attempt_id'], current['attempt_id'])
         self.assertEqual(len({record['family_id'] for record in records + [last]}), 6)
+
+    def test_multigeneration_projection_is_bounded_and_terminal_writer_delivery_waits_for_final_ack(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        self.meta.update(parent_sid='parent', parent_attempt_id='att-parent',
+                         parent_completion_delivery='claude-parent-runtime')
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args,'codex','the raw task')))
+        self.write(self.meta, status='open')
+        self.assertTrue(D.close_attempt_row(self.jobs, 'att-source', 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        original_path=JOIN.materialize_after_terminal_close(self.jobs, 'att-source')
+        self.assertIsNotNone(original_path)
+        original_record=PD.read(self.root, 'parent', original_path.stem)
+        self.assertEqual(original_record['receipt']['job_registry'], '')
+        import dispatch_session_sweep as SWEEP
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            early, early_count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertEqual((early, early_count), ([], 1))
+        self.assertEqual(PD.read(self.root, 'parent', original_record['delivery_id'])['state'], 'pending')
+        self.assertEqual(PD.read(self.root, 'parent', original_record['delivery_id'])['attempts'], 0)
+
+        current=self.meta
+        records=[original_record]
+        for index in range(3):
+            claim=R.claim(self.jobs, current['attempt_id'])
+            final=index == 2
+            current=self._successor(claim, current, status='running', launch_started='1')
+            note='completed-marker' if final else 'dead-exact-pid'
+            evidence={'failure_class':'pass'} if final else {'failure_class':'contract'}
+            self.assertTrue(D.close_attempt_row(self.jobs, current['attempt_id'], note, evidence=evidence))
+            path=JOIN.materialize_after_terminal_close(self.jobs, current['attempt_id'])
+            self.assertIsNotNone(path)
+            records.append(PD.read(self.root, 'parent', path.stem))
+
+        effective, lineage=R.effective_attempts(self.jobs, {'att-source'})
+        self.assertEqual(effective, {current['attempt_id']})
+        self.assertEqual(len(lineage), 1)
+        self.assertEqual((lineage[0]['original_attempt_id'], lineage[0]['replacement_attempt_id']),
+                         ('att-source', current['attempt_id']))
+        self.assertLessEqual(len(json.dumps(lineage)), 8192)
+        foreign_jobs=self.root/'foreign'/'jobs.log'
+        foreign_jobs.parent.mkdir();foreign_jobs.touch()
+        self.assertEqual(PD._replacement_disposition(self.root, 'parent',
+            {'attempt_ids':['att-source'], 'receipt':original_record['receipt']}, jobs=foreign_jobs), 'defer')
+
+        # A historical ack of B is not evidence that D was consumed.
+        old_intermediate=records[1]
+        PD.claim(self.root, 'parent', old_intermediate['delivery_id'],
+                 claim_owner='legacy-fixture', lease_seconds=30)
+        PD.ack(self.root, 'parent', old_intermediate['delivery_id'], acked_by='legacy-fixture')
+        self.assertEqual(PD._replacement_disposition(self.root, 'parent', original_record,
+                                                     jobs=self.jobs), 'defer')
+
+        for intermediate in (records[0], records[2]):
+            with self.subTest(delivery=intermediate['delivery_id']):
+                with self.assertRaises(PD.PendingDeliveryError) as refused:
+                    PD.claim(self.root, 'parent', intermediate['delivery_id'],
+                             claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+                self.assertIn('replacement-defer', refused.exception.detail)
+
+        final_record=records[-1]
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            delivered, count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertEqual(count, 4)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]['attempt_ids'], [current['attempt_id']])
+        context=SWEEP.delivery_context([(self.root, delivered)])
+        self.assertIn(current['attempt_id'], context)
+        self.assertNotIn('att-source', context)
+        self.assertEqual(SWEEP.ack_delivered(self.root, 'parent', delivered, acked_by='fixture-receiver'), 1)
+        self.assertEqual(PD.read(self.root, 'parent', final_record['delivery_id'])['state'], 'acked')
+        for intermediate in (records[0], records[2]):
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.claim(self.root, 'parent', intermediate['delivery_id'],
+                         claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+            self.assertEqual(PD.read(self.root, 'parent', intermediate['delivery_id'])['state'], 'rejected')
+        self.assertEqual(PD.read(self.root, 'parent', old_intermediate['delivery_id'])['state'], 'acked')
+        self.assertEqual(delivered[0]['state'], 'claimed')
+
+    def test_terminal_delivery_is_deferred_before_successor_registration(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        self.meta.update(parent_sid='parent', parent_attempt_id='att-parent',
+                         parent_completion_delivery='claude-parent-runtime')
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args,'codex','the raw task')))
+        self.write(self.meta, status='open')
+        self.assertTrue(D.close_attempt_row(self.jobs, 'att-source', 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        path=JOIN.materialize_after_terminal_close(self.jobs, 'att-source')
+        original=PD.read(self.root, 'parent', path.stem)
+        claim=R.claim(self.jobs, 'att-source')
+        with self.assertRaises(PD.PendingDeliveryError) as refused:
+            PD.claim(self.root, 'parent', original['delivery_id'],
+                     claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+        self.assertIn('replacement-defer', refused.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', original['delivery_id'])['state'], 'pending')
+        self._successor(claim, self.meta, status='open', launch_claimed='0',
+                        launch_outcome='never-launched')
+
+        effective, lineage=R.effective_attempts(self.jobs, {'att-source'})
+        self.assertEqual(effective, {'att-source'})
+        self.assertEqual(lineage, [])
+        with self.assertRaises(PD.PendingDeliveryError) as still_waiting:
+            PD.claim(self.root, 'parent', original['delivery_id'],
+                     claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+        self.assertIn('replacement-defer', still_waiting.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', original['delivery_id'])['receipt']['job_registry'], '')
+
+    def _materialize_parent_failure(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+        self.meta.update(parent_sid='parent', parent_attempt_id='att-parent',
+                         parent_completion_delivery='claude-parent-runtime')
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args, 'codex', 'the raw task')))
+        self.write(self.meta, status='open')
+        self.assertTrue(D.close_attempt_row(self.jobs, 'att-source', 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        path=JOIN.materialize_after_terminal_close(self.jobs, 'att-source')
+        self.assertIsNotNone(path)
+        return PD.read(self.root, 'parent', path.stem)
+
+    def _sweep_and_ack_one(self, expected_attempt):
+        import dispatch_pending_delivery as PD
+        import dispatch_session_sweep as SWEEP
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            delivered, count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertGreaterEqual(count, 1)
+        pending_rows=sorted((path.stem, PD.read(self.root, 'parent', path.stem)['state'])
+                            for path in PD.record_directory(self.root, 'parent').glob('delivery-*.json'))
+        self.assertEqual(len(delivered), 1, (count, pending_rows))
+        self.assertEqual(delivered[0]['attempt_ids'], [expected_attempt])
+        receiver=SWEEP.delivery_context([(self.root, delivered)])
+        self.assertIn(expected_attempt, receiver)
+        self.assertEqual(SWEEP.ack_delivered(self.root, 'parent', delivered, acked_by='fixture-receiver'), 1)
+        self.assertEqual(PD.read(self.root, 'parent', delivered[0]['delivery_id'])['state'], 'acked')
+        return delivered[0], receiver
+
+    def test_registration_refusal_and_unlaunched_successor_settle_to_one_source_failure(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        record=R.claim(self.jobs, 'att-source')
+        refused=SimpleNamespace(returncode=1, stdout='reason=replacement-registration-refused\n', stderr='')
+        with mock.patch.object(R, '_command', return_value=['launcher']), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None):
+            outcome=R.advance(self.jobs, 'att-source', authority_check=lambda *_: True,
+                              run=lambda *args, **kwargs: refused)
+        self.assertEqual(outcome['reason'], 'replacement-launch-pending')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'settled')
+
+        unstarted=self._successor(record, self.meta, status='open', launch_claimed='0',
+                                  launch_started='0', launch_outcome='never-launched')
+        self.assertTrue(D.close_attempt_row(self.jobs, unstarted['attempt_id'], 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        successor_path=JOIN.materialize_after_terminal_close(self.jobs, unstarted['attempt_id'])
+        self.assertIsNotNone(successor_path)
+        successor=PD.read(self.root, 'parent', successor_path.stem)
+
+        delivered, _receiver=self._sweep_and_ack_one('att-source')
+        self.assertEqual(delivered['delivery_id'], source['delivery_id'])
+        settled_source=PD.read(self.root, 'parent', source['delivery_id'])
+        self.assertEqual(settled_source['receipt'], source['receipt'])
+        self.assertEqual(settled_source['receipt_digest'], source['receipt_digest'])
+        source_row=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        self.assertEqual((source_row['note'], source_row['failure_class']),
+                         ('dead-exact-pid', 'contract'))
+        self.assertEqual(PD.read(self.root, 'parent', successor['delivery_id'])['state'], 'rejected')
+        self.assertEqual(PD.read(self.root, 'parent', successor['delivery_id'])['expiry_reason'],
+                         'replacement-successor-not-launched')
+
+    def test_launched_successor_launch_refusal_delivers_only_its_final_notice(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        first=R.claim(self.jobs, 'att-source')
+        launched=self._successor(first, self.meta, status='open', launch_claimed='1', launch_started='1')
+        self.assertTrue(D.close_attempt_row(self.jobs, launched['attempt_id'], 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        path=JOIN.materialize_after_terminal_close(self.jobs, launched['attempt_id'])
+        final=PD.read(self.root, 'parent', path.stem)
+        self.assertEqual(R.recovery_delivery_state(self.jobs, launched['attempt_id']), 'accepted')
+
+        refused=SimpleNamespace(returncode=1, stdout='reason=replacement-launch-refused\n', stderr='')
+        with mock.patch.object(R, '_command', return_value=['launcher']), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None):
+            outcome=R.advance(self.jobs, launched['attempt_id'], authority_check=lambda *_: True,
+                              run=lambda *args, **kwargs: refused)
+        self.assertEqual(outcome['reason'], 'replacement-launch-pending')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, launched['attempt_id']), 'settled')
+
+        delivered, _receiver=self._sweep_and_ack_one(launched['attempt_id'])
+        self.assertEqual(delivered['delivery_id'], final['delivery_id'])
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='after-final',
+                     lease_seconds=30, jobs=self.jobs)
+        self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'rejected')
+
+    def test_authority_loss_settles_once_and_unknown_registry_reenters_same_duty(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        no_spawn=mock.Mock(side_effect=AssertionError('unauthorized spawn'))
+        result=R.advance(self.jobs, 'att-source', authority_check=lambda *_: False, run=no_spawn)
+        self.assertEqual(result['reason'], 'replacement-parent-identity-unproven')
+        no_spawn.assert_not_called()
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'settled')
+        replay=R.advance(self.jobs, 'att-source', run=no_spawn)
+        self.assertEqual(replay['state'], 'not-applicable')
+        no_spawn.assert_not_called()
+        delivered, _receiver=self._sweep_and_ack_one('att-source')
+        self.assertEqual(delivered['delivery_id'], source['delivery_id'])
+
+    def test_unknown_registry_reenters_same_duty_without_false_ack_or_spawn(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        attention_path=R._directory(self.jobs)/'attention/by-source/att-source.json'
+        attention_path.parent.mkdir(parents=True, exist_ok=True)
+        attention_path.write_text(json.dumps({
+            'attention': {'source_attempt_id':'att-source','state':'needs-attention',
+                          'reason':'replacement-parent-identity-unproven','node':'frame',
+                          'failure':'dead-exact-pid'},
+            'proof': {'family_id':R.source_reservation(self.jobs,'att-source')['family_id'],
+                      'claim_digest':'tampered'},
+        }))
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'unknown')
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='tampered-settlement',
+                     lease_seconds=30, jobs=self.jobs)
+        attention_path.unlink()
+        missing=self.root/'jobs-shadow.log'
+        missing.write_text('')
+        with self.assertRaises(PD.PendingDeliveryError) as unknown:
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='unknown-registry',
+                     lease_seconds=30, jobs=missing)
+        self.assertIn('replacement-defer', unknown.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'pending')
+        slow=lambda command, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(command, kwargs['timeout'], output='uncertain', stderr=''))
+        with mock.patch.object(R, '_authorized'), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None), \
+             mock.patch('dispatch_lifecycle.reconcile_launch_lifecycle',
+                        return_value=SimpleNamespace(effective='detached')):
+            first=R.advance(self.jobs, 'att-source', run=slow)
+        self.assertEqual(first['reason'], 'replacement-launch-timeout')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='reentry-check',
+                     lease_seconds=30, jobs=self.jobs)
+        same=self._successor(first['record'], self.meta, status='open', launch_claimed='1',
+                             launch_started='1')
+        with mock.patch.object(R, '_authorized'):
+            resumed=R.advance(self.jobs, 'att-source', run=mock.Mock(side_effect=AssertionError('duplicate spawn')))
+        self.assertEqual((resumed['state'], resumed['attempt_id']), ('running', same['attempt_id']))
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))), 1)
+
+        self.assertTrue(D.close_attempt_row(self.jobs, same['attempt_id'], 'completed-marker',
+                                            evidence={'failure_class':'pass'}))
+        final_path=JOIN.materialize_after_terminal_close(self.jobs, same['attempt_id'])
+        final=PD.read(self.root, 'parent', final_path.stem)
+        delivered, _receiver=self._sweep_and_ack_one(same['attempt_id'])
+        self.assertEqual(delivered['delivery_id'], final['delivery_id'])
 
     def test_replacement_row_as_source_binds_through_index_not_row(self):
         self._capacity_owner()
@@ -1554,6 +1898,26 @@ class ReplacementTest(unittest.TestCase):
                          'do not ask for it again', '<owner-corrections>'):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
+
+    def test_format_only_contract_end_keeps_contract_proof_and_carries_answer(self):
+        meta = self._blocked_owner()
+        meta.update(note='dead-contract', failure_class='contract',
+                    classifier_source='supervisor-terminal-v1', process_exit='0',
+                    reconcile_reason='pass-blocker-not-none', terminal_event='turn.completed')
+        self.write(meta)
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+        fields, stored = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertTrue(R.route_authority.owner_result_format_only_end(fields[1], stored))
+        self.assertTrue(self._answer()['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'))
+        self.assertEqual(result['record']['proof']['source_result'], 'CONTRACT')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=result['record']['replacement_attempt_id']))
+        self.assertIn('handoff-format error and received an answer', text)
+        self.assertIn('final result had a handoff-format error', text)
+        self.assertIn('approved: start the full run', text)
+        self.assertNotIn('ended BLOCKED', text)
 
     def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
         meta = self._blocked_owner()
@@ -2205,22 +2569,22 @@ class ReplacementTest(unittest.TestCase):
         inventory.write_text(f'schema_version: 1\nrun_root: {self.root}/runs\nhosts:\n  fixture:\n    ssh_host: local\n')
         route = {'route_id': 'rt-compute', 'route_hash': 'sha256:' + 'a' * 64,
                  'artifact_root': str(self.root), 'cwd': str(self.root),
-                 'capability': 'autopilot-lab', 'nodes': [], 'work_request': {'text': 'GPU lab'}}
+                 'capability': 'autopilot-lab',
+                 'nodes': [{'id': 'full-run', 'kind': 'resource-runner'}],
+                 'work_request': {'text': 'GPU lab'}}
         with mock.patch.dict(os.environ, {'COMPUTE_HOSTS_CONFIG': str(inventory)}):
             old = EA.prepare_task_request(route, self.jobs, environment=False)
             old_bytes = old.read_bytes()
-            route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
             # No manual access-change row or extra parent input is required.
             access = R._access_in_force(self.jobs, route)
         request = json.loads(Path(access['request_path']).read_text())
         self.assertTrue(request['network']['required'])
         self.assertIn(str(inventory.parent), request['read_roots'])
-        self.assertEqual(access['source'], 'lab-runtime-defaults')
+        self.assertEqual(access['source'], 'compute-runtime-defaults')
         self.assertEqual(old.read_bytes(), old_bytes)
         replay = {'argv': ['--execution-access-file', str(old)], 'harness': 'opencode'}
         argv = R._replacement_argv({'execution_access': access}, {'worker_type': 'owner'}, replay)
         self.assertEqual(argv[argv.index('--execution-access-file') + 1], access['request_path'])
-        self.assertNotIn(str(old), argv)
 
     def test_a_sealed_pin_also_controls_the_replacement_launch(self):
         self._blocked_owner()

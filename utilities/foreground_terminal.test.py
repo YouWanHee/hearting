@@ -62,6 +62,7 @@ class SameResultSameCloseTest(unittest.TestCase):
             "blocked": ("artifact: -\nverdict: BLOCKED\nblocker: needs an answer", None),
             "malformed": ("done, all good", None),
             "crashed-after-pass": ("artifact: -\nverdict: PASS\nblocker: none", "nonzero-exit"),
+            "quiet-no-progress": ("artifact: -\nverdict: PASS\nblocker: none", "no-progress"),
         }
         for name, (text, failure) in cases.items():
             with self.subTest(case=name):
@@ -76,6 +77,8 @@ class SameResultSameCloseTest(unittest.TestCase):
                     self.assertEqual(detected_by, "foreground-terminal-handoff")
                 if name == "crashed-after-pass":
                     self.assertEqual((note, closed, detected_by), ("dead-nonzero-exit", True, "foreground-process-exit"))
+                if name == "quiet-no-progress":
+                    self.assertEqual((note, closed, detected_by), ("dead-no-progress", True, "foreground-process-exit"))
 
 
 class EveryWrapperUsesItTest(unittest.TestCase):

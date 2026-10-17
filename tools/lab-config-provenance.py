@@ -235,18 +235,25 @@ def _iter_porcelain_records(raw):
     return records
 
 def git_state(repo, rel_path):
-    root = Path(repo)
+    root = Path(repo).expanduser().absolute()
     check = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True,
     )
-    if check.returncode != 0:
+    if check.returncode != 0 or not check.stdout.strip():
         return "unknown-no-git", "unknown"
-    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+    git_root = Path(check.stdout.strip()).resolve()
+    head = subprocess.run(["git", "-C", str(git_root), "rev-parse", "HEAD"], capture_output=True, text=True)
     commit = head.stdout.strip() if head.returncode == 0 else "unknown"
-    rel_str = str(rel_path)
+    target = Path(rel_path)
+    if not target.is_absolute():
+        target = root / target
+    try:
+        rel_str = target.absolute().relative_to(git_root).as_posix()
+    except ValueError:
+        return "unknown-no-git", commit
     status = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain=v1", "-z",
+        ["git", "-C", str(git_root), "status", "--porcelain=v1", "-z",
          "--untracked-files=all", "--ignored=matching", "--", rel_str],
         capture_output=True,
     )
@@ -255,7 +262,10 @@ def git_state(repo, rel_path):
     # NOTE: files marked assume-unchanged/skip-worktree read as "clean" here;
     # that is git's own semantics for those flags and is out of scope.
     records = _iter_porcelain_records(status.stdout)
-    match = next((r for r in records if r[1] == rel_str or r[2] == rel_str), None)
+    def covers(record_path):
+        candidate = record_path.rstrip("/")
+        return candidate == rel_str or rel_str.startswith(candidate + "/")
+    match = next((r for r in records if covers(r[1]) or r[2] and covers(r[2])), None)
     if match is None:
         return "clean", commit
     code = match[0]
@@ -280,6 +290,32 @@ def _producer():
     if str(utilities) not in sys.path:
         sys.path.insert(0, str(utilities))
     return importlib.import_module("artifact_producer")
+
+def _route_context(*, artifact_root=None):
+    _producer()
+    import artifact_context
+    explicit = {"artifact_root": artifact_root} if artifact_root else None
+    return artifact_context.resolve_context(environ=os.environ, explicit=explicit)
+
+def _route_defaults(argv):
+    values = list(argv)
+    command = values[0] if values else ""
+    if command not in {"resolve", "seal"}:
+        return values
+    context = _route_context()
+    if not context.route or not context.node:
+        return values
+    insertion = 1
+    if not any(item == "--repo" or item.startswith("--repo=") for item in values):
+        if not context.source_worktree:
+            fail("route source worktree is unavailable")
+        values[insertion:insertion] = ["--repo", str(context.source_worktree)]
+        insertion += 2
+    if command == "seal" and not any(
+        item == "--artifact-root" or item.startswith("--artifact-root=") for item in values
+    ):
+        values[insertion:insertion] = ["--artifact-root", str(context.artifact_root)]
+    return values
 
 def _assert_manifest_location(manifest_path, snapshot_path):
     m = Path(manifest_path).resolve(strict=False)
@@ -331,28 +367,50 @@ def cmd_seal(a):
     if not artifact_root.is_absolute() or not artifact_root.is_dir():
         fail("--artifact-root must be an existing absolute directory")
     artifact_root = artifact_root.resolve(strict=True)
+    context = _route_context(artifact_root=artifact_root)
     # _manifest_chain_slug() recomputes the sealed run id from a slug it
     # recovers from this directory name -- that recomputation is only valid
     # because this uses the raw, unnormalized `a.slug` (not normalize(slug)).
     # W7C: `experiments/` resolves under the open producer cycle once the
     # write-cutover is active (AGENT_ARTIFACT_CYCLE_DIR); the legacy top-level
     # bucket is only reachable during the compatibility window.
-    try:
-        experiments_dir, _layout = _producer().resolve_output_dir(artifact_root, "experiments")
-    except Exception as exc:  # ProducerError or import failure: fail closed
-        fail(f"experiments bucket unavailable: {exc}")
-    out = experiments_dir / a.slug / "_internal" / "configs"
+    if context.route and context.node and context.output_dir:
+        try:
+            binding = context.resolve_output(
+                "config-seal", leaf=f"experiments/{a.slug}/_internal/configs")
+            out = binding.path
+        except Exception as exc:
+            fail(f"config seal output unavailable: {exc}")
+    else:
+        try:
+            experiments_dir, _layout = _producer().resolve_output_dir(artifact_root, "experiments")
+        except Exception as exc:  # ProducerError or import failure: fail closed
+            fail(f"experiments bucket unavailable: {exc}")
+        out = experiments_dir / a.slug / "_internal" / "configs"
     try:
         out.resolve(strict=False).relative_to(artifact_root)
     except ValueError:
         fail("derived output path escapes the artifact root")
+    snapshot = out / f"{digest}{source.suffix}"
+    if context.route and context.output_dir:
+        verdict = _producer().check_write(artifact_root, snapshot)
+        if verdict.get("verdict") != "allow":
+            fail(f"snapshot write refused: {verdict.get('reason')}")
     out.mkdir(parents=True, exist_ok=True)
     out = out.resolve(strict=True)
     snapshot = out / f"{digest}{source.suffix}"
     if snapshot.exists() and sha(snapshot) != digest: fail("snapshot filename/content mismatch")
     if not snapshot.exists(): snapshot.write_bytes(source.read_bytes())
     rel_source = source.relative_to(Path(resolved["root"]))
-    state, commit = git_state(resolved["root"], rel_source)
+    config_state, config_commit = git_state(resolved["root"], rel_source)
+    if context.route and context.source_worktree:
+        import artifact_context
+        state, commit = artifact_context.source_git_state(context.source_worktree)
+        if not commit:
+            commit = "unknown"
+    else:
+        # Preserve historical standalone provenance: its source is the config repository.
+        state, commit = config_state, config_commit
     computed_run_id = run_id(a.slug, resolved["config_ref"], digest)
     if a.run_id is not None:
         if not safe_run_id(a.run_id): fail("invalid --run-id")
@@ -376,7 +434,12 @@ def cmd_seal(a):
     target = out / f"{run_id_value}.manifest.json"
     _assert_manifest_location(target, snapshot)
     if target.exists() and json.loads(target.read_text()) != manifest: fail("manifest already exists with different inputs")
-    if not target.exists(): target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    if not target.exists():
+        if context.route and context.output_dir:
+            verdict = _producer().check_write(artifact_root, target)
+            if verdict.get("verdict") != "allow":
+                fail(f"manifest write refused: {verdict.get('reason')}")
+        target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(json.dumps(manifest, sort_keys=True))
 
 def cmd_verify(a):
@@ -478,7 +541,11 @@ def main():
     x = s.add_parser("seal"); x.add_argument("--repo", required=True); x.add_argument("--config", required=True); x.add_argument("--slug", required=True); x.add_argument("--run-id"); x.add_argument("--artifact-root", required=True); x.add_argument("--config-ref"); x.set_defaults(fn=cmd_seal)
     x = s.add_parser("verify"); x.add_argument("--manifest", required=True); x.set_defaults(fn=cmd_verify)
     x = s.add_parser("package-data"); x.add_argument("--repo", required=True); x.add_argument("--archive"); x.set_defaults(fn=cmd_package)
-    a = p.parse_args()
+    try:
+        argv = _route_defaults(sys.argv[1:])
+    except Exception as e:
+        fail(str(e))
+    a = p.parse_args(argv)
     try: a.fn(a)
     except (KeyError, json.JSONDecodeError, OSError, ValueError) as e: fail(str(e))
 if __name__ == "__main__": main()

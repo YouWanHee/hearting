@@ -141,6 +141,155 @@ class ParentCloseTest(unittest.TestCase):
     def close(self, **kwargs):
         return CLOSE.close(self.route, self.path, jobs=self.jobs, **kwargs)
 
+    def terminal_fail_stage(self, *, parent="att-owner", name="att-terminal-fail",
+                            status="done", foreground=True, cleanup=True,
+                            invalid_foreground=False, cleanup_overrides=None,
+                            cleanup_digest=None):
+        import base64
+
+        attempt_id = self.aid(name)
+        external_namespace = "pid:[999999999]"
+        metadata = {
+            "registered_worker": "1", "launch_claimed": "1", "launch_started": "1",
+            "pid_scope": "namespace-local", "pid": "99999996", "pid_start": "123456",
+            "pgid": "99999996", "pid_ns": external_namespace,
+            "pid_observer_ns": external_namespace,
+            "route_node": self.route["nodes"][0]["id"],
+            "failure_class": "fail", "note": "worker-failed",
+            "completion_marker": "fixture-marker", "delivery_receipt_b64": "fixture-delivery",
+        }
+        if foreground:
+            metadata.update(
+                launch_lifecycle="foreground-scoped",
+                launch_outcome=("unsealed-foreground-exit" if invalid_foreground
+                                else "governed-process-reaped"),
+                group_reap_proof=DC.GROUP_REAP_PROOF, group_reap_pgid="99999996")
+        child = self.row(name, parent=parent, status=status, **metadata)
+        self.assertEqual(child["attempt_id"], attempt_id)
+        self.assertEqual(DC._foreground_reap_receipt(child), foreground and not invalid_foreground)
+        if cleanup:
+            proof = DC.QuiescenceProof(
+                True, "cancellation-quiescence-proven", attempt_id, "exact-teardown",
+                int(child["pgid"]), "empty", "empty", True,
+                DC._cancellation_quiescence_binding_digest(child))
+            cleanup_record = DC._cancellation_quiescence_receipt_record(child, proof)
+            cleanup_record["receipt_type"] = DC.CLEANUP_RECEIPT_TYPE
+            cleanup_record.update(cleanup_overrides or {})
+            child.update(
+                cleanup_receipt_b64=base64.b64encode(
+                    json.dumps(cleanup_record, sort_keys=True).encode()).decode(),
+                cleanup_receipt_digest=cleanup_digest or DC._canonical_sha256(cleanup_record),
+            )
+            DC.annotate_attempt_row(self.jobs, attempt_id, {
+                "cleanup_receipt_b64": child["cleanup_receipt_b64"],
+                "cleanup_receipt_digest": child["cleanup_receipt_digest"],
+            })
+        child = CLOSE._rows(self.jobs)[attempt_id][1]
+        if cleanup and not cleanup_overrides and not cleanup_digest:
+            self.assertEqual(DC._cleanup_receipt_reason(child), "attempt-cleanup-proven")
+        if foreground and cleanup and not invalid_foreground:
+            self.assertEqual(DC.attempt_process_quiescence(child, terminal_receipt=True).state,
+                             "quiescent")
+        return child
+
+    def test_terminal_namespace_receipts_settle_fail_without_changing_result(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        child = self.terminal_fail_stage()
+        attempt_id = child["attempt_id"]
+
+        result = self.close()
+
+        self.assertNotEqual(result["state"], "termination-pending", result)
+        self.assertEqual(result["state"], "cancelled")
+        fields, settled = CLOSE._rows(self.jobs)[attempt_id]
+        self.assertEqual(fields[1], "done")
+        self.assertEqual(settled.get("parent_close_settled"), "1")
+        self.assertEqual(settled["failure_class"], "fail")
+        self.assertEqual(settled["note"], "worker-failed")
+        self.assertEqual(settled["completion_marker"], "fixture-marker")
+        self.assertEqual(settled["delivery_receipt_b64"], "fixture-delivery")
+        self.assertEqual(set(settled) - set(child), {"parent_close_settled"})
+        registry = self.jobs.read_bytes()
+        self.assertEqual(self.close(), result)
+        self.assertEqual(self.jobs.read_bytes(), registry)
+
+    def test_open_namespace_receipt_stays_pending(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        child = self.terminal_fail_stage(status="open", name="att-open-receipt")
+        result = self.close()
+        self.assertEqual(result["state"], "termination-pending")
+        self.assertIn(child["attempt_id"], result["pending_attempts"])
+        fields, current = CLOSE._rows(self.jobs)[child["attempt_id"]]
+        self.assertEqual(fields[1], "open")
+        self.assertNotIn("parent_close_settled", current)
+
+    def test_terminal_namespace_without_receipt_stays_pending(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        child = self.terminal_fail_stage(name="att-no-receipt", foreground=False, cleanup=False)
+        # The recorded namespace still exists: no extinction proof stands in
+        # for the missing receipt, on a host observer or inside a sandbox.
+        with mock.patch.object(DC, "namespace_gone", return_value="present"):
+            result = self.close()
+        self.assertEqual(result["state"], "termination-pending")
+        self.assertIn(child["attempt_id"], result["pending_attempts"])
+        self.assertNotIn("parent_close_settled", CLOSE._rows(self.jobs)[child["attempt_id"]][1])
+
+    def test_invalid_foreground_with_valid_exact_teardown_stays_pending(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        child = self.terminal_fail_stage(name="att-invalid-foreground",
+                                         invalid_foreground=True)
+        self.assertFalse(DC._foreground_reap_receipt(child))
+        self.assertEqual(DC._cleanup_receipt_reason(child), "attempt-cleanup-proven")
+        result = self.close()
+        self.assertEqual(result["state"], "termination-pending")
+        self.assertIn(child["attempt_id"], result["pending_attempts"])
+        self.assertNotIn("parent_close_settled", CLOSE._rows(self.jobs)[child["attempt_id"]][1])
+
+    def test_foreign_cleanup_receipt_without_foreground_stays_pending(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        variants = {
+            "att-foreign-attempt": {"cleanup_overrides": {"attempt_id": self.aid("att-other")}},
+            "att-foreign-route": {"cleanup_overrides": {"route_id": "rt-other"}},
+            "att-foreign-hash": {"cleanup_overrides": {"route_hash": "sha256:" + "1" * 64}},
+            "att-foreign-node": {"cleanup_overrides": {"node_or_group_leg": "other-node"}},
+            "att-foreign-binding": {"cleanup_overrides": {"binding_digest": "sha256:" + "2" * 64}},
+            "att-wrong-digest": {"cleanup_digest": "sha256:" + "0" * 64},
+        }
+        children = {}
+        for name, receipt in variants.items():
+            child = self.terminal_fail_stage(name=name, foreground=False, **receipt)
+            self.assertEqual(DC._cleanup_receipt_reason(child), "", name)
+            children[name] = child
+        with mock.patch.object(DC, "namespace_gone", return_value="present"):
+            result = self.close()
+        self.assertEqual(result["state"], "termination-pending")
+        for name, child in children.items():
+            with self.subTest(name):
+                self.assertIn(child["attempt_id"], result["pending_attempts"])
+                current = CLOSE._rows(self.jobs)[child["attempt_id"]][1]
+                self.assertNotIn("parent_close_settled", current)
+                self.assertEqual(current["failure_class"], "fail")
+
+    def test_bad_cleanup_digest_does_not_veto_valid_foreground_receipt(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        child = self.terminal_fail_stage(name="att-bad-cleanup-digest")
+        DC.annotate_attempt_row(self.jobs, child["attempt_id"], {
+            "cleanup_receipt_digest": "sha256:" + "0" * 64,
+        })
+        child = CLOSE._rows(self.jobs)[child["attempt_id"]][1]
+        self.assertTrue(DC._foreground_reap_receipt(child))
+        self.assertEqual(DC._cleanup_receipt_reason(child), "")
+        result = self.close()
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(CLOSE._rows(self.jobs)[child["attempt_id"]][1].get(
+            "parent_close_settled"), "1")
+
     def test_start_pin_receipt_closes_owner_preserves_resource_and_starts_current_pin(self):
         import shlex
         import route_authority as AUTH
@@ -159,6 +308,7 @@ class ParentCloseTest(unittest.TestCase):
                     child.path.write_text(json.dumps(child.route))
                     owner = child.process("att-owner")
                     child.row("att-owner", process=owner, harness=harness)
+                    failed_stage = child.terminal_fail_stage(name="att-terminal-fail")
                     resource = child.process("att-owner")
                     child.resource(resource)
                     sealed = child.path.read_bytes()
@@ -181,6 +331,9 @@ class ParentCloseTest(unittest.TestCase):
                     closed = json.loads(result.stdout)
                     self.assertEqual(closed["state"], "cancelled", closed)
                     self.assertIn("successor_route", closed, closed)
+                    settled = CLOSE._rows(child.jobs)[failed_stage["attempt_id"]][1]
+                    self.assertEqual(settled.get("parent_close_settled"), "1")
+                    self.assertEqual(settled["failure_class"], "fail")
                     owner.wait(timeout=5)
                     self.assertIsNone(resource.poll())
                     successor_path = Path(closed["successor_route"])

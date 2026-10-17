@@ -168,6 +168,8 @@ class AttachSummaryOwnerTest(unittest.TestCase):
     def args(self, attempt_id="att-1", review=None):
         return argparse.Namespace(
             attempt_id=attempt_id,
+            worktree="/worktree",
+            worker_runtime_env={"CLAUDE_CONFIG_DIR": "/prepared/home"},
             review_output_binding=review,
             review_governed_lease_nonce="n" * 8,
         )
@@ -178,12 +180,14 @@ class AttachSummaryOwnerTest(unittest.TestCase):
         identity = {"pid": "4242", "pid_start": "900"}
         result = C.attach_summary_owner(
             self.args(), Path("/t.jsonl"), Path("/p.txt"), identity,
-            harness="codex", summary_launcher=launcher)
+            harness="codex", summary_launcher=launcher, runtime_home="/prepared/home")
         self.assertEqual(result, {"summary_owner": "s"})
         kwargs = launcher.call_args.kwargs
         self.assertEqual((kwargs["harness"], kwargs["target_pid"], kwargs["target_start"]),
                          ("codex", 4242, "900"))
         self.assertIsNone(kwargs["review_artifact_root"])
+        self.assertEqual((kwargs["runtime_home"], kwargs["attempt_cwd"]),
+                         ("/prepared/home", "/worktree"))
         review = {"artifact_root": "/a", "cycle_id": "cyc", "producer_id": "p"}
         C.attach_summary_owner(
             self.args(review=review), Path("/t.jsonl"), Path("/p.txt"), identity,

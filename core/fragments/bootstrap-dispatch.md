@@ -1,9 +1,12 @@
-Ordinary execution is one command, the same in every harness:
-
 ```
 hearting run capability-route compose --start --prompt-file <task> \
-  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+  [--shape direct] [--campaign-key <stream>]
 ```
+
+Use `--shape direct` only for one atomic, reversible inline change; otherwise
+omit it and let the frame decide. Other shape-free flags are hints. Follow
+decided routes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the

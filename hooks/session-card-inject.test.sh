@@ -6,7 +6,12 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-TMP=$(mktemp -d /var/tmp/session-card-test.XXXXXX)
+TMP_BASE=${TMPDIR:-/tmp}
+TMP_BASE=${TMP_BASE%/}
+if ! mkdir -p "$TMP_BASE" 2>/dev/null || [ ! -w "$TMP_BASE" ]; then
+  TMP_BASE=/tmp
+fi
+TMP=$(mktemp -d "$TMP_BASE/session-card-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 FAILS=0
 ok() { printf 'ok - %s\n' "$1"; }
@@ -14,7 +19,8 @@ bad() { printf 'not ok - %s\n' "$1"; FAILS=$((FAILS + 1)); }
 
 # Hermetic environment: real state, memory store, remote setting and pane never
 # reach a case; worker markers and herdr identity are removed.
-unset AGENT_SESSION_ROLE AGENT_DISPATCH_CHILD AGENT_DISPATCH_DEPTH OPENCODE_DISPATCH_SLUG \
+unset AGENT_SESSION_ROLE AGENT_DISPATCH_CHILD AGENT_DISPATCH_DEPTH AGENT_DISPATCH_STAGE_AUTHORITY \
+  AGENT_DISPATCH_SUBSESSION_ID OPENCODE_DISPATCH_SLUG \
   FLEET_TITLE_REFRESH MEM_DISTILL HERDR_PANE_ID HERDR_ENV HERDR_SOCKET_PATH \
   CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID CODEX_SESSION_ID OPENCODE_SESSION_ID \
   CODEX_SESSION_MEMORY_INJECT
@@ -23,9 +29,34 @@ export HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/home/.config" XDG_DATA_HOME="$TMP/
   MEM_STORE="$TMP/mem" TMPDIR="$TMP/tmp" AGENT_HOME="$ROOT"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME/hearting" "$TMPDIR"
 printf '{"enabled": false}\n' > "$XDG_CONFIG_HOME/hearting/memory-sync.json"
-case "$XDG_STATE_HOME" in /var/tmp/session-card-test.*) ;; *) echo "isolation failed"; exit 2 ;; esac
+case "$XDG_STATE_HOME" in "$TMP_BASE"/session-card-test.*/*) ;; *) echo "isolation failed"; exit 2 ;; esac
 
 TIDY="$ROOT/utilities/session_tidy.py"
+REAL_PYTHON=$(command -v python3)
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/python3" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  */worker-state-hook.py)
+    if [ "${2:-}" = compact-after ]; then
+      # The compact payload arrives on stdin; record it ledger-only so no detached tidy starts.
+      exec "$REAL_PYTHON" -c '
+import json, subprocess, sys
+payload = json.load(sys.stdin)
+sid = payload.get("sessionID") or payload.get("session_id") or ""
+cwd = payload.get("cwd") or ""
+if sid:
+    subprocess.run([sys.executable, sys.argv[1], "hook", "--harness", "opencode",
+                    "--event", "compact", "--session-id", sid, "--cwd", cwd],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+' "$TIDY"
+    fi
+    ;;
+esac
+exec "$REAL_PYTHON" "$@"
+SH
+chmod 700 "$TMP/bin/python3"
+export REAL_PYTHON TIDY PATH="$TMP/bin:$PATH"
 CLAUDE_HOOK="$ROOT/hooks/session-card-inject.sh"
 CODEX_START="$ROOT/adapters/codex/hooks/sessionstart-lifecycle.py"
 CODEX_PROMPT="$ROOT/adapters/codex/hooks/userprompt-lifecycle.py"
@@ -215,7 +246,10 @@ write_card opencode op-A "$P" "CARD-MARK-open02"   # newest card; authored by op
 if node --input-type=module > "$TMP/o1.out" 2> "$TMP/o1.err" <<EOF
 import { AgentHarnessGuards } from "$PLUGIN"
 import { execFileSync } from "node:child_process"
-const plugin = await AgentHarnessGuards({ directory: "$P", worktree: "$P" })
+const plugin = await AgentHarnessGuards({ directory: "$P", worktree: "$P", client: { session: {
+  get: async (request) => ({ data: { id: request.path.id, parentID: null } }),
+  messages: async () => ({ data: [] }),
+} } })
 const call = async (sid, mark) => {
   const output = { system: [] }
   await plugin["experimental.chat.system.transform"]({ sessionID: sid, model: {} }, output)

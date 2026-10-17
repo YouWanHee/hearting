@@ -20,6 +20,11 @@ import review_input as R
 
 class ReviewInputTest(unittest.TestCase):
     def setUp(self):
+        # Refusal assertions exercise the opt-in integrity fence explicitly;
+        # gate-off continuation has its own tests that set `off` locally.
+        gates = mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'})
+        gates.start()
+        self.addCleanup(gates.stop)
         import opencode_context_window
         from fixtures.opencode_native_context import launch_context
         native = mock.patch.object(opencode_context_window, "prepare_launch_context", side_effect=launch_context)
@@ -376,6 +381,10 @@ class ReviewInputTest(unittest.TestCase):
         subprocess.run(['git','-C',str(self.root),'commit','-qm','fixture'],check=True)
         self.route.update(capability='autopilot-code',capability_mode='dev',cwd=str(self.root),artifact_root=str(self.root))
         self.node.update(dispatch_depth=1,completion_gate='code-plan-check',write_scope=['*'])
+        import route_identity
+        self.route['route_hash']=route_identity.route_hash(self.route)
+        self.route['route_id']=route_identity.route_id_from_hash(self.route['route_hash'])
+        self.meta.update(route_id=self.route['route_id'],route_hash=self.route['route_hash'])
         self.route_file.write_text(json.dumps(self.route))
         for harness in ('codex','claude','opencode'):
             with self.subTest(harness=harness),contextlib.ExitStack() as stack:
@@ -436,8 +445,10 @@ class ReviewInputTest(unittest.TestCase):
                 spec_node={'id':'review','kind':'review-worker','unit':'research/plan-review',
                     'completion_gate':'spec-review','depends_on':['research'],'dispatch_depth':1,
                     'commit_expected':False}
-                spec_route={**self.route,'capability':'autopilot-spec','route_id':'rt-spec-'+harness,
-                    'route_hash':'sha256:spec-'+harness,'nodes':[{'id':'research'},spec_node]}
+                spec_route={**self.route,'capability':'autopilot-spec',
+                    'nodes':[{'id':'research'},spec_node]}
+                spec_route['route_hash']=route_identity.route_hash(spec_route)
+                spec_route['route_id']=route_identity.route_id_from_hash(spec_route['route_hash'])
                 self.route_file.write_text(json.dumps(spec_route))
                 argv[argv.index('--start')]='--register'
                 argv[argv.index('--worker-mode')+1]='research/plan-review'

@@ -579,10 +579,10 @@
    "summary": "Compiler-internal framed front end: one frame leg (both top-tier legs for uncertain or hard-to-reverse work) and a model-less runtime terminal that fixes the route decision.",
    "invocation": {
     "class": "compiler-internal",
-    "use_when": "Use only as the route compiler's own framed shape (compose --shape framed); no person or model invokes it by name.",
+    "use_when": "Use only through compose with shape omitted or explicitly framed; no person or model invokes it by name.",
     "not_for": "Not for direct invocation, a user-facing Skill, a native command, or any owner persona."
    },
-   "argument_shape": "compose --shape framed --campaign-key <key> --start --prompt-file <task>",
+   "argument_shape": "compose --start --prompt-file <task> [--shape framed]",
    "requires": {
     "capabilities": [],
     "units": [

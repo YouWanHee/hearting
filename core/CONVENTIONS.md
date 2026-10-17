@@ -71,6 +71,8 @@ Rigor budgets assurance inside the selected graph. It creates no stages or dispa
 
 A correction in the retry budget is one **batched** pass that closes every blocking finding of the failing round together; the review that follows is a closure check of that list plus the delta (unit Round Protocol), never a fresh full audit. The budget unit is the **verdict round** — a round that renders an actual judgment (a recognized success note, a blocking review, or an explicit FAIL), not a crashed, capacity-dead, or invalid-envelope attempt that never reached one; the cap counts only verdict rounds, so a verdict-less round does not spend it. A run of verdict-less rounds is bounded on its own axis: after `B=2` consecutive verdict-less rounds on the same node, the node is `verdictless-bound` and routes through the sealed fallback chain's remaining unregistered hop (native subagent, then owner-inline) instead of a third silent registered attempt — a live gap in verdicts is a stall, not a budget the node can keep spending against. A review round that ends with blocking findings is a completed round, not a failed worker (`completed-review-blocking`); when the verdict-round budget is spent and the last round still reports blocking findings, the owner closes the gate itself with an owner-closure record (`round_{N}.owner-closure.md`) that names every blocking round and its disposition, and `OPERATIONS §5.10` owns the evidence contract that lets that record complete the node.
 
+For implementation reviews, the verdict budget is counted per automatically observed source-content subject. Reposting the same content, changing only reports or marker sequence, or returning to earlier content does not create a new budget; a different source subject gets its own ordinary independent review budget. A PASS remains bound to the subject recorded at launch and cannot satisfy a changed subject. A legacy PASS without a source binding remains unknown and is not assigned a subject from `launch_head`; if continuation reaches that marker, it resumes at the review for an ordinary independent judgment. The round number and verdict history remain node-lineage history. Owner-closure is available only for an eligible blocking review and cannot convert PASS into a new completion. A review the ship deploy node depends on is counted the same way once a parent deploy request exists: its subject is that request's hashed inputs inside the review's own input scope, so changed deploy inputs get one ordinary independent review and identical inputs stay capped.
+
 Two properties cut across every rigor tier and do not scale away at low intensity:
 
 1. **Adversarial stance is universal (all tiers, including `direct` and `quick`).** Any review or self-check that runs adopts a refute-by-default posture: it actively tries to falsify the artifact's correctness claims, enumerates the concrete failure modes it can substantiate, and treats inadequate evidence as *not proven* rather than a pass. This is a stance inside whatever check already runs, not an added stage, so it adds no dispatch at `direct`/`quick`. It is what makes review adversarial before any separate adversary *pass* exists.
@@ -531,6 +533,12 @@ target it. Transient locks and untracked markers remain ignored.
 
 Inputs come from persistent project artifacts. External raw material is first normalized through `analyze-project --mode paper|doc`; the family has no flag for arbitrary external artifact directories.
 
+For a routed invocation, the sealed route node's `outputs` and `write_scope`
+select the artifact locations. `AGENT_ARTIFACT_OUTPUT_DIR` is the cycle base;
+it does not imply a capability folder. Source scopes resolve in the route
+worktree. Explicit CLI paths retain their argument meaning, and route-free
+invocations keep the standalone defaults below.
+
 ### §5.2. Tier Definitions
 
 | Tier | Meaning | Location |
@@ -563,13 +571,13 @@ reuses one `v{N}` directory for every changed file in the same artifact.
 
 #### §5.4.1. Research
 
-`$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/` contains T1 `pipeline_summary.md`, `pipeline_state.yaml`, `00_briefing.md`, and numerically ordered report chapters; T2 `analysis_summary.md`, `cards/`, `code_resources/`, and `figures/`; and T3 search results, batches, access classification, chaining, code search, prefetch, reviews, and versions under `_internal/`. Keep chapters at root because numeric prefixes already group them.
+The standalone default `$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/` contains T1 `pipeline_summary.md`, `pipeline_state.yaml`, `00_briefing.md`, and numerically ordered report chapters; T2 `analysis_summary.md`, `cards/`, `code_resources/`, and `figures/`; and T3 search results, batches, access classification, chaining, code search, prefetch, reviews, and versions under `_internal/`. A routed invocation follows its node's declared outputs.
 
 #### §5.4.2. Documents
 
-`$AGENT_ARTIFACT_OUTPUT_DIR/documents/<date>_<name>/` contains T1 pipeline state and the latest `draft/`; T2 latest `strategy/`, `analysis/`, and `assets/`; and T3 metadata, strategy/draft reviews, audits, discarded variants, and major-refine snapshots under `_internal/versions/v{N}/`. Direct minor edits remain snapshot-free and are recorded in `pipeline_summary.md`. Retire sibling `_v{N}.md` files for new output but preserve them in legacy artifacts.
+The standalone default `$AGENT_ARTIFACT_OUTPUT_DIR/documents/<date>_<name>/` contains T1 pipeline state and the latest `draft/`; T2 latest `strategy/`, `analysis/`, and `assets/`; and T3 metadata, strategy/draft reviews, audits, discarded variants, and major-refine snapshots under `_internal/versions/v{N}/`. Direct minor edits remain snapshot-free and are recorded in `pipeline_summary.md`. Routed invocations follow their node's declared outputs and preserve the existing target binding.
 
-#### §5.4.3. Code Track — Flat `spec/` Plus Repeated `plans/`
+#### §5.4.3. Code Track — Flat `spec/` and Cycle Outputs
 
 One repository normally has one flat `spec/`. Only a monorepo with independently delivered components and separate PRDs uses `spec/<component>/` and `plans/<component>/<cycle>/`.
 
@@ -582,13 +590,17 @@ spec/
 ├── pipeline_state.yaml
 └── _internal/versions/v{N}/prd.md
 
-plans/<date>_<slug>/
+standalone code work-cycle/
 ├── pipeline_summary.md
-├── plan/                 # plan.md, optional localized variant, checklist.md
+├── plan.md
+├── checklist.md
 ├── dev_logs/
 ├── test_logs/
 └── _internal/            # plan, dev, and test reviews
 ```
+
+Routed code stages use the exact outputs declared by each route node; a plan
+stage may write `plan.md` and `checklist.md` at the cycle output root.
 
 `prd.md` is always current. Every transaction that changes an existing
 `prd.md` snapshots its exact pre-image before the transaction command can
@@ -740,20 +752,20 @@ When `spec/pipeline_state.yaml` exists, read it and activate every applicable ap
 
 | Capability | Output |
 |---|---|
-| research | `research/<topic>/` |
+| research | standalone default: `research/<topic>/` |
 | project analysis | `analysis_project/{code,paper,doc}/` |
 | spec | `spec/` |
 | ship | `spec/ship.md` plus runtime source config at project root |
 | standalone design | `designs/<name>/` decision record; live app file is the sole token contract |
 | spec-owned design | `spec/design/` decision record |
-| code | `plans/<date>_<slug>/` |
-| lab | `experiments/<date>_<slug>/` plus `_RUNLOG.md` |
+| code | standalone default: `plans/<date>_<slug>/` |
+| lab | standalone default: `experiments/<date>_<slug>/` plus `_RUNLOG.md` |
 | draft | `documents/<date>_<name>/` |
 | refine | Target artifact plus `_internal/versions/v{N}/` for a major refine; direct minor edits update history only |
 | note | Run logs in artifact root plus routed cards and digests under the configured notes target |
 | apply | Real source outside artifact root; git branch and commit provide versions, with apply logs under the cheatsheet artifact |
 
-**W7C cycle layout.** The output paths above are bucket-relative. While the producer cutover is inactive they resolve to the legacy top-level bucket; once active they resolve to `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` of the cycle issued by `utilities/artifact_producer.py begin`; the machine-managed `.cycle.json` beside `artifacts/` binds that renameable locator to its stable IDs and records its start time (see `core/CORE.md §3` and `producer_lifecycle` in `capabilities/topologies.json`). Only `spec`, `analysis`, and explicitly promoted `research` reach the immutable `shared/` tree, via `admit-shared` from a sealed cycle.
+**W7C cycle layout.** Standalone defaults above are bucket-relative. A routed invocation resolves the selected node's declared outputs under `campaigns/<campaign-locator>/<cycle-locator>/artifacts/`; it does not reconstruct a capability bucket. The machine-managed `.cycle.json` beside `artifacts/` binds that locator to stable IDs and records its start time (see `core/CORE.md §3` and `producer_lifecycle` in `capabilities/topologies.json`). Only `spec`, `analysis`, and explicitly promoted `research` reach the immutable `shared/` tree, via `admit-shared` from a sealed cycle.
 
 **Campaign or cycle.** A cycle is the deterministic D-23 unit of one route's work; a campaign is the agent's proposal for the work stream. `compose` takes that proposal from `--campaign-key <stream>` (a folder name or close spelling joins the matching active stream), else from this session's latest route in the same artifact root, else refuses with `compose-campaign-key-required` and the root's active keys; `--parent-cycle` inherits the predecessor's campaign and `--unassigned` opts out explicitly; the same `compile` option remains optional. The sealed route carries the choice to the owner's `begin`. Explicit `begin --campaign-key`/`--campaign` remains supported and must agree with the route and parent. With no selection, `begin` uses the root's `_unassigned` campaign with `degraded=true`; this container asserts no shared goal. A new campaign's locator, slug and title come from its key (`<date>_<key-slug>`, `slug_source=campaign-key`); the route slug names only the cycle under it. `--parent-cycle` may name an open or sealed cycle of the same active campaign and records its state at admission. It carries causality only, never permission to consume mutable inputs or skip completion gates. A partial `compose --graph` reuses same-named omitted outputs from the selected parent (else campaign history), sealing them as node `input_sources` on the `[경로]` card and stage brief; `AGENT_ARTIFACT_PARENT_OUTPUT_DIR` names their read location. A fresh frameless graph takes frame briefs only from an explicit parent or `--route-plan` proposal; locating an input approves no direction. Nothing found leaves the route unchanged. A borrowed `capability:stage` part seals `part`, `part_io` (original name → path in this route) and, when its catalog row declares one, `start_approval` on the node; a route that uses no catalog part carries none of them. A linked child may produce output while its parent is open, but final manifest admission waits for the parent to seal; use the shared key without a parent edge for independent work. Name the stream, such as `tts-v6-release`, in the key and the bounded task in the date-free slug; record the predecessor and exact input revision to preserve why the next cycle exists. Session, capability and route-family identity never imply one campaign. Existing campaigns are unchanged; artifact-path-contract §27.2 owns the complete contract. A cycle's work closes in the order `complete` → `close` → `finalize`; a cycle sealed before its route closed cannot become `completed`, and campaign closure discloses it as `sealed-unproven`.
 
@@ -761,9 +773,8 @@ When `spec/pipeline_state.yaml` exists, read it and activate every applicable ap
 
 ### §6.5-anchors. Anchor Resolution
 
-Every track's scopes above resolve against exactly one bucket domain:
-cycle-relative (code, lab, draft, research: relative to that capability's
-`<date>_<slug>` or `<topic>` cycle directory), artifact-root-relative
+Every routed node's scope resolves against its sealed output base:
+cycle-relative (under the current cycle's `artifacts/` directory), artifact-root-relative
 (project analysis, spec, and design: relative to a fixed sub-path under the
 artifact root), or outside the artifact root (apply's real source target,
 symbol tokens the compiler never substitutes). Standalone design anchors at
@@ -771,7 +782,10 @@ symbol tokens the compiler never substitutes). Standalone design anchors at
 byproducts (research shards, review shards) anchor at `spec/_internal/`
 (or `spec/<component>/_internal/` for a component spec). A parallel leg's
 suffix (e.g. `-alternative`) may only appear as a subdirectory inside the
-owning anchor, never by escaping it.
+owning anchor, never by escaping it. A terminal `artifact:` path from a routed
+node uses that same cycle output base only when the exact attempt, route, node,
+and producer binding authorize the declared output; absolute and existing
+artifact-root/worktree-relative handoffs retain their normal checks.
 
 route lifecycle records live in a single hidden runtime location:
 `<artifact-root>/.runtime/routes/<route_id>.json`, with the sole terminal

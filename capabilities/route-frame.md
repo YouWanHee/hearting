@@ -1,6 +1,6 @@
 # Capability: route-frame
 
-This is the portable contract for `route-frame`, the compiler-internal capability behind the framed route shape. It is not a Claude Skill file, not a native command, and not an owner persona: no person and no model invokes it by name. It is reached only through `capability-route.py compose --shape framed`.
+This is the portable contract for `route-frame`, the compiler-internal capability behind the framed route shape. It is not a Claude Skill file, not a native command, and not an owner persona: no person and no model invokes it by name. It is reached through `capability-route.py compose --start --prompt-file <task>` with `--shape` omitted or explicitly `framed`.
 
 ## Contract
 <!-- GENERATED: harness-manifest.json -->
@@ -11,7 +11,7 @@ This is the portable contract for `route-frame`, the compiler-internal capabilit
 | Group | `sub` |
 | Supported modes | `none` |
 | Portable meaning | Compiler-internal framed front end: one frame leg (both top-tier legs for uncertain or hard-to-reverse work) and a model-less runtime terminal that fixes the route decision. |
-| Argument shape | `compose --shape framed --campaign-key <key> --start --prompt-file <task>` |
+| Argument shape | `compose --start --prompt-file <task> [--shape framed]` |
 
 ## Shape
 

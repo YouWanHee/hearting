@@ -295,6 +295,18 @@ def main(argv=None):
     projected_collector.last_resource_diagnostics = []
     projected_collector.last_usage_snapshots = {}
 
+    def close_herdr_observation():
+        try:
+            if __package__ in (None, ""):
+                from fleet.collectors import herdr as herdr_collector
+            else:
+                from .collectors import herdr as herdr_collector
+            herdr_collector.close_observations()
+        except Exception:
+            pass
+
+    projected_collector.close = close_herdr_observation
+
     if args.json:
         observed = projected_collector(harness_filter=hfilter)
         sessions, jobs = observed
@@ -316,6 +328,7 @@ def main(argv=None):
                              hearting=hearting,
                              compute_host_snapshot=compute_host_snapshot,
                              resource_diagnostics=observed.resource_diagnostics))
+        projected_collector.close()
         return 0
 
     # curses / --once path (render module) — resolved lazily so --json needs no curses.
@@ -339,8 +352,11 @@ def main(argv=None):
     if view:
         render.set_process_view(view == "process")
     if args.once:
-        return render.render_once(projected_collector, hfilter, args.section,
-                                  compute_hosts_refresh=compute_hosts.collect)
+        try:
+            return render.render_once(projected_collector, hfilter, args.section,
+                                      compute_hosts_refresh=compute_hosts.collect)
+        finally:
+            projected_collector.close()
     render.reset_scroll()   # fresh launch starts scrolled to top (belt-and-suspenders)
     if viewer_state is not None:
         render.restore_viewer_state(viewer_state)
@@ -369,6 +385,7 @@ def main(argv=None):
     live_collector.last_resource_jobs = []
     live_collector.last_resource_diagnostics = []
     live_collector.last_usage_snapshots = {}
+    live_collector.close = projected_collector.close
     # Live-only metadata refresh. render's snapshot pump invokes this off the curses
     # thread; --once/--json never opt into remote release discovery.
     # Passive detail collection reuses exact rows; never performs a second

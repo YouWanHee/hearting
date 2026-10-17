@@ -22,16 +22,33 @@ from unittest import mock
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
+_UTILITIES_DIR = os.path.join(os.path.dirname(_TOOLS_DIR), "utilities")
+if _UTILITIES_DIR not in sys.path:
+    sys.path.insert(0, _UTILITIES_DIR)
 
 from fleet import render, titles                                  # noqa: E402
 from fleet.model import Session                                   # noqa: E402
 from fleet.session_handle import derived_tag                      # noqa: E402
 from fleet.collectors import herdr, procscan                      # noqa: E402
 from fleet.collectors import claude as claude_collector           # noqa: E402
+import pane_ownership                                             # noqa: E402
 
 
 def _text(segs):
     return "".join(t for t, _k in segs)
+
+
+class PaneObservationWaitTest(unittest.TestCase):
+    def test_only_explicit_callers_wait_for_the_bounded_observation(self):
+        panes = [{"pane_id": "w1:p1", "agent": "claude"}]
+        view = SimpleNamespace(panes=panes)
+        with mock.patch.object(herdr, "observation_view", return_value=view) as observe:
+            self.assertEqual(herdr.list_panes(), panes)
+            observe.assert_called_once_with()
+            observe.reset_mock()
+
+            self.assertEqual(herdr.list_panes(wait_timeout=0.75), panes)
+            observe.assert_called_once_with(wait_timeout=0.75)
 
 
 class DerivedTagTest(unittest.TestCase):
@@ -249,7 +266,7 @@ class HerdrCollectorTest(unittest.TestCase):
         self.assertEqual((shells, fg), ({3109434}, {3110298}))
         self.assertEqual(calls, [["herdr", "pane", "process-info", "--pane", "w2:p4"]])  # agent panes only
 
-    def test_codex_thread_requires_live_foreground_pid_not_stale_pane_metadata(self):
+    def test_codex_thread_uses_foreground_process_identity_not_pane_metadata(self):
         sid = "01a0e579-d313-7be1-af70-de4ed1194e49"
         panes = [
             {"pane_id": "wB:p0", "agent": None, "cwd": "/project",
@@ -266,7 +283,9 @@ class HerdrCollectorTest(unittest.TestCase):
                 "foreground_processes": [{"pid": 2438296, "name": "codex"}]}}}))
 
         tui = Session(harness="codex", pid=2438296, cwd="/project", proc_start="123")
-        with mock.patch.object(procscan, "read_proc_start", return_value="123"):
+        with mock.patch.object(procscan, "read_proc_start", return_value="123"), \
+                mock.patch.object(pane_ownership, "current_codex_thread",
+                                  side_effect=lambda pane, pid: sid if pane == "wB:p13" and pid == tui.pid else ""):
             found = herdr.codex_pane_sessions([tui], panes=panes, runner=runner)
         self.assertEqual(found, {2438296: sid})
         self.assertEqual(calls, ["wB:p13"])

@@ -31,6 +31,14 @@ class NativeSessionTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("AGENT_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_", "XDG_"))}
+        clean.update(HOME=str(self.root / "home"), XDG_STATE_HOME=str(self.root / "state"),
+                     XDG_CONFIG_HOME=str(self.root / "config"), XDG_DATA_HOME=str(self.root / "data"),
+                     XDG_CACHE_HOME=str(self.root / "cache"))
+        environment = unittest.mock.patch.dict(os.environ, clean, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.script = self.root / "native.py"
         self.args = SimpleNamespace(
             worktree=str(self.root), jobs=str(self.root / "jobs.log"),
@@ -114,6 +122,65 @@ event('step_finish', part={'reason':'stop'})
         self.program("event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})\n")
         with self.assertRaisesRegex(runtime.OpenCodeTransportError, 'final-stop-missing'):
             runtime.run_turn(self.args, 'start', emit=self.events.append)
+
+    def test_record_accessor_preserves_string_absence_and_source_metadata(self):
+        self.assertIsNone(runtime.read_binding_record(self.args))
+        self.assertEqual(runtime.read_binding(self.args), "")
+        runtime.bind_session(self.args, "ses_original")
+        path = runtime.binding_path(self.args)
+        path.chmod(0o664)
+        record = runtime.read_binding_record(self.args)
+        self.assertEqual(record["value"]["session_id"], runtime.read_binding(self.args))
+        self.assertEqual(record["source"]["ctime"], path.stat().st_ctime)
+        self.assertLessEqual(record["source"]["mtime"], time.time())
+
+    def test_unsafe_source_types_and_generation_never_become_bindings(self):
+        runtime.bind_session(self.args, "ses_original")
+        path = runtime.binding_path(self.args)
+        original = path.read_bytes()
+        for raw in (b"false", b"null", b"[]", b"{}", b"{", b"\xff"):
+            path.write_bytes(raw)
+            with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-invalid"):
+                runtime.read_binding(self.args)
+        path.write_bytes(b" " * 4097)
+        with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-unsafe"):
+            runtime.read_binding(self.args)
+        path.unlink()
+        os.mkfifo(path)
+        with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-unsafe"):
+            runtime.read_binding(self.args)
+        path.unlink()
+        path.write_bytes(original)
+        uid = os.getuid()
+        with unittest.mock.patch.object(runtime.os, "getuid", return_value=uid + 1):
+            with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-unsafe"):
+                runtime.read_binding(self.args)
+        with unittest.mock.patch.object(runtime.os, "open", side_effect=PermissionError()):
+            with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-invalid"):
+                runtime.read_binding(self.args)
+        real = os.fstat
+        calls = 0
+        def replace(fd):
+            nonlocal calls
+            calls += 1
+            result = real(fd)
+            if calls == 2:
+                other = path.with_suffix(".new")
+                other.write_bytes(original)
+                os.replace(other, path)
+            return result
+        with unittest.mock.patch.object(runtime.os, "fstat", side_effect=replace):
+            with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-unsafe"):
+                runtime.read_binding(self.args)
+
+    def test_expected_worktree_is_independent_of_native_payload(self):
+        runtime.bind_session(self.args, "ses_original")
+        path = runtime.binding_path(self.args)
+        row = json.loads(path.read_text())
+        row["worktree"] = str(self.root / "namesake")
+        path.write_text(json.dumps(row))
+        with self.assertRaisesRegex(runtime.OpenCodeTransportError, "binding-invalid"):
+            runtime.read_binding_record(self.args)
 
     def test_native_capacity_error_survives_process_exit(self):
         from dispatch_supervisor_terminal import classify_session_result

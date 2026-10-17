@@ -19,6 +19,41 @@ Write the handoff card yourself, queue the memory tidy, and let the window clear
 when it is safe; the new session then picks the work up from the card by itself. Nothing
 here is required input and nothing waits for a confirmation.
 
+When receiving a seat card, start the first reply before any tool call with one summary
+in the user's language, about five lines using the three headings
+`하던 일 · 남은 일 · 다음 할 일`, then continue. If the user first gives a different
+instruction instead of continuing, skip the summary and follow only that instruction.
+The card's fixed injection header carries this guidance even when its body is clipped
+or memory references accompany it; late memory-only injections and peer handoff
+messages do not carry it.
+
+Runtime compaction queues memory tidying for the main session. A nonempty automatic
+Claude/OpenCode summary saved to its own verified seat can use the existing handover
+snapshot → clear → `이어서해` flow after transcript evidence confirms turn completion. For
+explicitly automatic Codex remote-V2 compaction, the same helper waits for that exact main
+turn to end, then sends one claim-bound request through the verified pane so the main
+session writes a real card and enqueues the matching operation. No empty or fabricated
+summary is used. The helper requires matching card and durable queue evidence before clear.
+Compact-origin flow keeps its existing continuation; idle-origin flow remains status-only
+even if compaction occurs during it. Manual/unknown compaction, failed cards, project or
+outside-herdr seats, workers/sub-sessions, changed input/target/card, and uncertain sends
+never auto-clear. Do not enqueue a duplicate tidy for the same compaction; invoke this Skill
+for separate work.
+
+An idle tidy is separate from compaction and manual tidy. It is eligible only after a real
+main-session turn-end/idle signal with known latest-request context tokens at or above the
+configured threshold (default 200,000), followed by the configured wait (default 3,240
+seconds). The wait is not a promise about provider cache lifetime. Current adapter payloads
+do not expose a verified request cache expiry, so the configured wait is used and
+`cache_margin_seconds` is recorded but not applied. Provider/request cache expiry stays
+unknown unless the actual configuration and request evidence establish it.
+When the exact idle request arrives, use this conversation to write the normal session card
+and run the existing enqueue command. Do not resume the work: after clear, the successor is
+asked for a brief card-based status and to wait for the next user input. New input, a draft,
+form/approval, busy or unknown state, an unknown token count, or a different session cancels
+or withholds the automatic request. Duplicate events keep the original due time. Only a real
+user prompt after the status reply rearms another idle tidy.
+
 Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
@@ -87,10 +122,13 @@ For a new successor at this seat, replace the clear sequence below with `peer-st
    Report its one line as printed (`prompted=true|failed|queued|unverified` and the exit
    code); do not retry or send the card any other way. A failed handoff does not change the
    clear of this window; they are separate results. Confirmed/retained delivery marks this card handed off; failure retains it.
-   After reading the card and its referenced documents, the successor runs
-   `python3 "$AGENT_HOME/utilities/session_tidy.py" handoff accept <ref>` using
-   the exact trailer ref. That one explicit acceptance schedules its reply and
-   normal predecessor retire reservation. Delivery/queue/ACK alone never accepts.
+   Ordinary peer messages and cards have no session-tidy accept command or
+   successor authority. A confirmed same-seat clear uses the existing seat
+   handover automatically. For a valid typed cross-seat handoff, read the card
+   and referenced documents, then run only the exact receiver command supplied
+   by shared guidance; do not reconstruct its ref or receiver identity.
+   Explicit acceptance schedules its reply and normal predecessor retire
+   reservation. Delivery/queue/ACK alone never accepts.
 
 4. **Report one line**, from the `clear=` word of step 2 (do not start more work after a
    `clear=scheduled`):

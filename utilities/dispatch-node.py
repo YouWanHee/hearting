@@ -376,6 +376,7 @@ class RoundAdmission:
  physical_attempt_ids: frozenset[str] = frozenset()
  current_attempt_ids: frozenset[str] = frozenset()
  requires_next_round: bool = False
+ source_subject_digest: str | None = None
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -406,7 +407,7 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
   marker_path = directory / f"{dep}.json"
   if not marker_path.is_file():
    continue
-  currency = ROUTE.gate_currency(route, dep_node, marker_path)
+  currency = ROUTE.gate_currency(route, dep_node, marker_path, jobs=jobs)
   if currency.state != "revised-unrecorded":
    continue  # condition (1): only a revised-but-unrecorded upstream qualifies.
   try:
@@ -444,6 +445,22 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                              exclude_attempt=exclude_attempt,
                              route=route if node.get("kind") == "review-worker" else None)
  classified_rows = [(cols[1], meta) for cols, meta in rows]
+ source_subject_digest = None
+ if node.get("kind") == "review-worker":
+  from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding
+  if has_review_subject(route, node, jobs):
+   try:
+    source_subject_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
+    source_rows = []
+    for status, metadata in classified_rows:
+     binding = read_binding(jobs, metadata, required=False)
+     if binding is None:
+      source_rows.append((status, metadata))
+     else:
+      source_rows.append((status, {**metadata, "_review_subject_digest": binding["subject_digest"]}))
+    classified_rows = source_rows
+   except SourceSubjectError as exc:
+    raise DispatchNodeError(exc.reason, detail=exc.detail) from exc
  auto_revisions = _auto_record_revisions(
   route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id,
   record=record_auto_revisions,
@@ -484,7 +501,8 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   dependency_revisions.extend(item for item in auto_revisions
       if item.get("node_id")==node["id"]
       and item.get("evidence")=={k:reviewed_input[k] for k in ("path","sha256")})
- budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions,
+                                        source_subject_digest=source_subject_digest)
  def physical_members(meta):
   members = meta.get("logical_round_attempt_ids")
   # Raw registry metadata is strings. Only the ephemeral projection's typed
@@ -513,6 +531,7 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   # Supersession is selection authority even after its allowance is spent:
   # exhausted fresh work must not be mistaken for a current exact replay.
   requires_next_round=unmet or superseded or budget.closure_check_used,
+  source_subject_digest=source_subject_digest,
  )
 
 
@@ -529,6 +548,15 @@ def round_protocol_block(budget, rows, worker_type, node_id):
  history so a correction round can tell a real prior finding apart from a
  round that never reached one (SD-153 rule 5).
  """
+ if budget.round_kind == "first":
+  if budget.next_round <= 1 or not rows:
+   return ""
+  history = "; ".join(
+   f"{cols[4]} ({meta.get('note') or cols[1] or 'open'})" for cols, meta in rows
+  )
+  return ("\n\nImplementation source changed since earlier review history. This is a full independent review "
+          "of the current source subject, not a closure check. Earlier findings are context only; "
+          "report every current blocker and assess the full reviewed scope. Prior history: " + history + ".")
  if budget.next_round<2: return ""
  history_parts=[]
  for cols,meta in rows:
@@ -550,7 +578,7 @@ def round_protocol_block(budget, rows, worker_type, node_id):
         "- Record, in the stage artifact, each prior 🔴 with the change that closes it so the closure re-review can verify it item by item.\n")
  return "\n\n"+head+body
 
-def child_env(environ=None):
+def child_env(environ=None, *, source_subject_digest=None):
     """Return the node-wrapper environment without ancestor-only bindings.
 
     The wrapper receives this node's immutable route through explicit argv.
@@ -558,12 +586,16 @@ def child_env(environ=None):
     and makes the wrapper reject the otherwise valid node tuple.
     """
     environ = os.environ if environ is None else environ
-    return {
+    result = {
         key: value
         for key, value in environ.items()
         if not key.startswith("AGENT_OWNER_ROUTE_")
         and not key.startswith("AGENT_DISPATCH_BROKER_")
+        and key != "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"
     }
+    if source_subject_digest:
+        result["AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"] = source_subject_digest
+    return result
 
 
 def requested_launch_lifecycle(adapter_args, environ=None):
@@ -589,7 +621,7 @@ def dry_run_notice(action):
         print("next_step=dry run: nothing was registered or started; rerun with --start to launch", flush=True)
 
 
-def run_launcher(argv, action, lifecycle):
+def run_launcher(argv, action, lifecycle, *, source_subject_digest=None):
     """Run the wrapper (or owner selector) this node hands its launch to.
 
     A foreground-scoped ``start`` hosts the worker inside this call: a stop
@@ -597,9 +629,11 @@ def run_launcher(argv, action, lifecycle):
     worker and close the row, instead of killing it mid-cleanup. The receipt
     then says ``interrupted=1`` and the exit code is 128+signal.
     """
+    if source_subject_digest is None:
+        source_subject_digest = os.environ.get("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST")
     if action != "start" or lifecycle != FOREGROUND_SCOPED:
-        return subprocess.run(argv, env=child_env()).returncode
-    run = run_forwarding_termination(argv, env=child_env(), capture=False, timeout=None)
+        return subprocess.run(argv, env=child_env(source_subject_digest=source_subject_digest)).returncode
+    run = run_forwarding_termination(argv, env=child_env(source_subject_digest=source_subject_digest), capture=False, timeout=None)
     if run.received_signal is None:
         return run.returncode
     sys.stdout.flush()
@@ -986,5 +1020,19 @@ def main():
  if node.get("model_profile"):
   argv += ["--model-profile",node["model_profile"]]
  argv += strip_leading_separator(a.adapter_args)
- raise SystemExit(run_launcher(argv,a.action,lifecycle))
+ source_key = "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"
+ had_source_key = source_key in os.environ
+ previous_source = os.environ.get(source_key)
+ if admission.source_subject_digest:
+  os.environ[source_key] = admission.source_subject_digest
+ else:
+  os.environ.pop(source_key, None)
+ try:
+  result = run_launcher(argv,a.action,lifecycle)
+ finally:
+  if had_source_key:
+   os.environ[source_key] = previous_source or ""
+  else:
+   os.environ.pop(source_key, None)
+ raise SystemExit(result)
 if __name__=="__main__": main()

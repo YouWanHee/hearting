@@ -92,7 +92,10 @@ class EditTriggerTest(Fixture):
         self.assertIn("--campaign-key new-stream", line)
         self.assertIn("--slug engine --cwd", line)  # the cycle folder carries the date
         self.assertIn(f"--cwd {self.repo}", line)
-        self.assertIn("--shape solo, staged or framed", reason)
+        self.assertIn("For one atomic, reversible inline change", reason)
+        self.assertIn("For other new work, omit --shape", reason)
+        self.assertIn("the frame decides the route", reason)
+        self.assertIn("person-specified route", reason)
         self.assertIn("capability-route.py start --route", reason)
 
     def test_a_managed_release_is_printed_as_its_current_pointer(self):

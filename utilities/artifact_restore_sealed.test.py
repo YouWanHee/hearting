@@ -194,6 +194,24 @@ class RestoreTest(B.ProducerTestBase):
         self.assertEqual(r.returncode, 0, r.stderr.decode())
         self.unchanged()
 
+    def test_directory_bundle_selection_is_typed_unsupported_before_mutation(self):
+        selection = json.loads(self.selection_path.read_text())
+        selected = selection["selections"][0]
+        artifact = next(row for row in self.manifest["artifacts"]
+                        if row["artifact_id"] == selected["artifact_id"])
+        artifact["type"] = "directory-bundle"
+        raw = S.canonical(self.manifest)
+        self.manifest_path.write_bytes(raw)
+        record = B.P.read_cycle_record(self.root, self.output["cycle_id"])
+        record["manifest_digest"] = B.m.manifest_digest(self.manifest)
+        B.P._write_cycle_record(self.root, record, exclusive=False)
+        before = {path: path.exists() for path in self.files}
+        result = self.cli("plan", "--request", str(self.selection_path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"directory-bundle-restore-unsupported", result.stderr)
+        for path, exists in before.items():
+            self.assertEqual(path.exists(), exists)
+
     def test_last_target_foreign_preserves_all_before_mutation(self):
         self.plan()
         self.files[-1].parent.mkdir()

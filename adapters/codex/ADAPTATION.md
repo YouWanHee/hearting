@@ -33,12 +33,15 @@ and enabled plugins, and disable discovered system skills by documented path.
 The assigned contract remains in the prompt. Native or managed input outside
 these controls must be reported from actual runtime evidence.
 
-Hook trust is path-keyed in Codex. The invocation maps existing user decisions
-to the relocated copies of the same source definitions, including disabled
-states; it reads those decisions again when a resumed command is built. Native
-current-hash validation still rejects changed or unapproved definitions. No
-user trust record is written and no hook-trust bypass is used. Validate this
-with App Server `hooks/list`, rather than assuming a linked file is active.
+Hook trust is path-keyed in Codex. Worker projection maps existing user decisions
+to relocated copies of the same source definitions, including disabled states;
+it reads those decisions again when a resumed command is built. Global runtime
+activation attempts to record Codex's current hash only for Hearting's projected
+hook definitions. Disabled states and foreign hooks are preserved. If Codex or
+App Server is unavailable, or for hooks Hearting did not install, `/hooks` stays
+the user-facing fallback. Worker launch itself never writes trust. Validate
+active definitions with App Server `hooks/list`, rather than assuming a linked
+file is active.
 
 Official surfaces: [instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md),
 [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
@@ -736,3 +739,15 @@ filesystem sandbox, so they commit on a primary checkout unless launched inside 
 Codex owner sandbox, whose grant they inherit.
 
 Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.
+
+## Runtime compaction tidy
+
+- **Runtime support:** PreCompact/PostCompact run, but OpenAI remote V2 exposes no plaintext summary or compact-prompt override through them.
+- **Adapter realization:** explicitly automatic Codex remote-V2 PostCompact may join the shared tidy booking after transcript-confirmed turn completion. Since remote-V2 has no usable summary, the bounded helper requests a real card from the same verified main pane and waits for matching card/enqueue evidence. Manual/unknown events, workers, changed input/target, and uncertain sends stay queue-only; compact-origin continuation remains unchanged.
+- **Fallback:** six-field automatic summaries and automatic summary-card saving are unavailable. No provider switch, local compaction, user setting, or manual approval is introduced.
+
+## Idle tidy
+
+- **Runtime support:** the existing Stop hook receives the exact thread id and reads only the latest `last_token_usage.input_tokens` from that thread's rollout. If the Stop payload omits a transcript path, the bounded rollout finder must resolve the exact thread.
+- **Adapter realization:** the shared idle observer records a durable due time and requests a card from the same verified main pane once. It does not fabricate a remote-V2 compact summary. The card/enqueue receipt is required before clear, and the successor receives status-only guidance.
+- **Cache evidence:** the local config names `gpt-6.1-sol` but leaves `model_provider` unset and provides no request-level cache settings. The provider/cache lifetime is therefore unknown; no OpenAI API retention claim is applied to the Codex account path.

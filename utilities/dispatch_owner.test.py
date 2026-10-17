@@ -1770,6 +1770,124 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
         self.assertRegex(buf.getvalue(), r"(?m)^route_defaults=none$")
 
 
+class OwnerAllocationRouteChainTest(unittest.TestCase):
+    """Compose, seal, allocate, and launch from one real staged-route fixture."""
+
+    HARNESSES = ("claude", "codex", "opencode")
+
+    def test_caller_independent_allocation_and_owner_order_comparison(self):
+        import importlib.util
+
+        route_spec = importlib.util.spec_from_file_location(
+            "allocation_route_under_test", ROOT / "utilities" / "capability-route.py")
+        ROUTE = importlib.util.module_from_spec(route_spec)
+        route_spec.loader.exec_module(ROUTE)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            config = base / "dispatch-defaults.yaml"
+            config_text = ("schema_version: 4\nharnesses:\n  enabled: [claude, codex, opencode]\n"
+                "profiles:\n" + "".join(f"  {profile}:\n    primary: [claude, codex]\n"
+                    "    relief: [opencode]\n    last_resort: []\n    promote_relief_below: 0\n"
+                    for profile in ("deep", "balanced-deep", "balanced", "light", "mini"))
+                + "allocation:\n  strategy: balanced\n  window: 30\n  usage_gate_used_percent: 90\n")
+            config.write_text(config_text, encoding="utf-8")
+
+            # Attempts are valid registered rows so the production allocator
+            # sees deterministic recent-use counts: Claude=2, Codex=0, OpenCode=4.
+            def write_counts(counts):
+                rows = []
+                for harness, count in counts.items():
+                    for index in range(count):
+                        rows.append("2026-10-14\tdone\t/r\t/w\towner\t"
+                                    f"harness={harness},attempt_id=att-{harness}-{index},"
+                                    "attempt_schema_version=2,registered_worker=1")
+                jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            binding = SimpleNamespace(route_file="route.json", route_id="rt-chain",
+                route_hash="sha256:chain", route_node="owner", registry_digest="sha256:registry",
+                write_scope="source-scoped", completion_gate="standard-complete")
+
+            # Replace the probes after the eligibility module executes: its own
+            # definitions would otherwise overwrite them, and the route would
+            # then depend on real harness CLIs being on PATH.
+            module_from_spec = importlib.util.module_from_spec
+            def fixture_module(spec):
+                module = module_from_spec(spec)
+                if spec.name == "hearting_nested_dispatch_eligibility":
+                    exec_module = spec.loader.exec_module
+                    def exec_with_fixture_probes(target):
+                        exec_module(target)
+                        target.command_check = lambda child, worktree: ("supported", "fixture-command", "")
+                        target.prospective_owner_registry_check = lambda args: (True, "")
+                    spec.loader.exec_module = exec_with_fixture_probes
+                return module
+
+            cases = (("claude", "codex", {"claude": 2, "codex": 0, "opencode": 4}),
+                     ("codex", "claude", {"claude": 0, "codex": 2, "opencode": 4}),
+                     ("opencode", "codex", {"claude": 2, "codex": 0, "opencode": 4}))
+            for caller, expected, counts in cases:
+                with self.subTest(caller=caller):
+                    write_counts(counts)
+                    with mock.patch.dict(os.environ, _isolated_env({
+                            "AGENT_DISPATCH_JOBS": str(jobs),
+                            "DISPATCH_DEFAULTS_CONFIG": str(config),
+                            "AGENT_DISPATCH_CALLER_HARNESS": caller}), clear=True), \
+                         mock.patch.object(importlib.util, "module_from_spec", side_effect=fixture_module), \
+                         mock.patch.object(ROUTE, "_compose_default_children", return_value=self.HARNESSES):
+                        route = ROUTE.compose_route(capability="autopilot-code", capability_mode="dev",
+                            shape="staged", graph="execute,test,report", slug="chain-" + caller,
+                            cwd=ROOT, artifact_root=base, jobs=jobs, children=list(self.HARNESSES),
+                            parent_harness=caller, dispatch_evidence=None, unassigned=True)
+                    route_path = base / f"{caller}-route.json"
+                    route_path.write_text(json.dumps(route), encoding="utf-8")
+                    tuples = route["dispatch_evidence"]["tuples"]
+                    self.assertEqual(set(self.HARNESSES), {row["parent_harness"] for row in tuples
+                        if row["status"] == "supported"})
+                    output, calls = self._select(route_path, jobs, config, binding, caller)
+                    self.assertRegex(output, rf"(?m)^adapter={expected}$")
+                    self.assertTrue(calls[0][0].endswith(f"adapters/{expected}/bin/dispatch-headless.py"))
+                    self.assertNotEqual(expected, caller)
+
+            # Sealed owner_order intentionally reorders within its band; removing
+            # it returns to the same recent-attempt allocation result.
+            write_counts({"claude": 2, "codex": 0, "opencode": 4})
+            route_path = base / "d3-route.json"
+            with mock.patch.dict(os.environ, _isolated_env({
+                    "AGENT_DISPATCH_JOBS": str(jobs), "DISPATCH_DEFAULTS_CONFIG": str(config)}), clear=True), \
+                 mock.patch.object(importlib.util, "module_from_spec", side_effect=fixture_module), \
+                 mock.patch.object(ROUTE, "_compose_default_children", return_value=self.HARNESSES):
+                route = ROUTE.compose_route(capability="autopilot-code", capability_mode="dev",
+                    shape="staged", graph="execute,test,report", slug="chain-d3", cwd=ROOT,
+                    artifact_root=base, jobs=jobs, children=list(self.HARNESSES), parent_harness="opencode",
+                    dispatch_evidence=None, unassigned=True)
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            normal, _ = self._select(route_path, jobs, config, binding, "opencode")
+            doc = json.loads(route_path.read_text())
+            doc["dispatch_allocation"]["owner_order"] = ["claude", "opencode", "codex"]
+            route_path.write_text(json.dumps(doc), encoding="utf-8")
+            ordered, _ = self._select(route_path, jobs, config, binding, "opencode")
+            self.assertRegex(normal, r"(?m)^adapter=codex$")
+            self.assertRegex(ordered, r"(?m)^adapter=claude$")
+
+    def _select(self, route_path, jobs, config, binding, caller):
+        calls, out = [], io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw:
+                               (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
+             mock.patch.object(OWNER, "_usage", return_value={h: "ok" for h in self.HARNESSES}), \
+             mock.patch.object(OWNER._capacity, "capacity_report", return_value={
+                 "scores": {"claude": 80.0, "codex": 80.0, "opencode": 80.0}, "sources": {}}), \
+             mock.patch.object(OWNER, "validate_owner_route_binding", return_value=binding), \
+             mock.patch.object(OWNER, "export_owner_route_env", return_value=None), \
+             mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
+             mock.patch.dict(os.environ, _isolated_env({
+                 "AGENT_DISPATCH_JOBS": str(jobs), "DISPATCH_DEFAULTS_CONFIG": str(config),
+                 "AGENT_DISPATCH_CALLER_HARNESS": caller}), clear=True), \
+             contextlib.redirect_stdout(out):
+            rc = OWNER.main(["--dry-run", "--route-evidence", str(route_path), "--prompt-text", "fixture"])
+        self.assertEqual(rc, 0, out.getvalue())
+        return out.getvalue(), calls
+
+
 
 class TopProfileOwnerTupleTest(unittest.TestCase):
     """Field-level refusal only; the accepted path is exercised on a real

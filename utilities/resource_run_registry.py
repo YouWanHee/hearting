@@ -37,6 +37,11 @@ def default_index_path() -> Path:
     )
 
 
+def route_registry_path(output_dir: str | Path) -> Path:
+    """The route's existing detached-run journal beside its cycle outputs."""
+    return Path(output_dir) / "resource-runs.json"
+
+
 def proc_identity(pid) -> dict | None:
     try:
         pid = int(pid)

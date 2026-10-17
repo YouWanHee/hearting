@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -27,15 +28,272 @@ from dispatch_attempt_policy import (
 
 SCHEMA_VERSION = 1
 RUNNER_LOCK_NAME = "runner-current.lock"
+_RUNNER_CONTROL_SCHEMA = 1
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
 _RUNNERS: list[subprocess.Popen] = []
+_DISTRIBUTION_MODULES = {}
 
 
 class ObligationError(ValueError):
     pass
+
+
+def _code_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _distribution_module(root: Path):
+    path = root / "tools" / "install" / "distribution.py"
+    key = str(path.resolve(strict=True))
+    module = _DISTRIBUTION_MODULES.get(key)
+    if module is None:
+        spec = importlib.util.spec_from_file_location("_peer_runner_distribution", key)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _DISTRIBUTION_MODULES[key] = module
+    return module
+
+
+def _release_root(root: Path, releases: Path) -> Path | None:
+    try:
+        resolved = root.resolve(strict=True)
+        releases = releases.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if root.is_symlink() or resolved.parent != releases or not resolved.is_dir():
+        return None
+    required = (
+        "RELEASE_VERSION",
+        "harness-manifest.json",
+        "core/CORE.md",
+        "utilities/peer_obligations.py",
+        "utilities/peer-steward.py",
+    )
+    return resolved if all((resolved / relative).is_file() for relative in required) else None
+
+
+def _service_layout(root: Path):
+    """Resolve the exact installer current pointer for a managed release root."""
+    try:
+        root = root.resolve(strict=True)
+        distribution = _distribution_module(root)
+        if distribution is None:
+            return None
+        data_root = Path(distribution.data_root()).expanduser()
+        pointer = Path(distribution.current_path()).expanduser()
+        if not data_root.is_absolute() or not pointer.is_absolute():
+            return None
+        data_root = Path(os.path.abspath(os.fspath(data_root)))
+        pointer = Path(os.path.abspath(os.fspath(pointer)))
+        releases = data_root / "releases"
+        if pointer != data_root / "current" or releases.is_symlink():
+            return None
+        releases_real = releases.resolve(strict=True)
+        if root.parent != releases_real or _release_root(root, releases_real) is None:
+            return None
+        return root, data_root, releases_real, pointer
+    except (OSError, RuntimeError, ValueError, AttributeError):
+        return None
+
+
+def _service_environment_matches(root: Path, environ=None) -> bool:
+    environ = os.environ if environ is None else environ
+    for name in ("AGENT_HOME", "CLAUDE_HOME"):
+        raw = environ.get(name)
+        if not raw:
+            continue
+        try:
+            if Path(raw).expanduser().resolve(strict=True) != root:
+                return False
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return True
+
+
+def validate_service_binding(service_current: str | Path | None, *, root=None) -> str | None:
+    """Keep only this code root's lexical managed-current binding; never infer it."""
+    if not service_current:
+        return None
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root()
+        layout = _service_layout(code_root)
+        if layout is None or not _service_environment_matches(code_root):
+            return None
+        raw = Path(service_current).expanduser()
+        if not raw.is_absolute() or Path(os.path.abspath(os.fspath(raw))) != layout[3]:
+            return None
+        return str(layout[3])
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def managed_service_binding(source_root: str | Path | None) -> str | None:
+    """Issue an internal lifecycle binding only for this packaged managed root."""
+    if source_root is None:
+        return None
+    try:
+        source = Path(source_root).expanduser().resolve(strict=True)
+        if source != _code_root() or not _service_environment_matches(source):
+            return None
+        layout = _service_layout(source)
+        return str(layout[3]) if layout is not None else None
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def active_service_root(service_current: str | Path | None, *, root=None) -> Path | None:
+    """Resolve a validated binding's active release without comparing versions."""
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root()
+        binding = validate_service_binding(service_current, root=code_root)
+        if binding is None:
+            return None
+        layout = _service_layout(code_root)
+        if layout is None or layout[3] != Path(binding) or not layout[3].is_symlink():
+            return None
+        target = layout[3].resolve(strict=True)
+        return _release_root(target, layout[2])
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _service_exec_environment(source_root: Path, target_root: Path, environ=None) -> dict:
+    child_env = dict(os.environ if environ is None else environ)
+    source_root = source_root.resolve(strict=True)
+    target_root = target_root.resolve(strict=True)
+    layout = _service_layout(source_root)
+    releases_root = layout[2] if layout is not None else None
+    child_env["AGENT_HOME"] = str(target_root)
+    if child_env.get("CLAUDE_HOME"):
+        try:
+            if Path(child_env["CLAUDE_HOME"]).expanduser().resolve(strict=True) == source_root:
+                child_env["CLAUDE_HOME"] = str(target_root)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    pythonpath = child_env.get("PYTHONPATH")
+    if pythonpath is not None:
+        rewritten = []
+        for entry in pythonpath.split(os.pathsep):
+            if not entry:
+                rewritten.append(entry)
+                continue
+            try:
+                resolved = Path(entry).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                rewritten.append(entry)
+                continue
+            try:
+                relative = resolved.relative_to(source_root)
+            except ValueError:
+                if releases_root is None:
+                    rewritten.append(entry)
+                    continue
+                try:
+                    relative_release = resolved.relative_to(releases_root)
+                    if not relative_release.parts:
+                        raise ValueError("not a release code path")
+                    relative = Path(*relative_release.parts[1:]) if len(relative_release.parts) > 1 else Path()
+                except (OSError, RuntimeError, ValueError):
+                    rewritten.append(entry)
+                else:
+                    rewritten.append(str(target_root / relative))
+            else:
+                rewritten.append(str(target_root / relative))
+        child_env["PYTHONPATH"] = os.pathsep.join(rewritten)
+    return child_env
+
+
+def exec_service_runner(lock_fd: int, state_root: str | Path, service_current: str | Path,
+                        *, herdr_session: str | None = None) -> bool:
+    """Replace this process with the same-install runner while retaining its flock."""
+    was_inheritable = None
+    try:
+        source_root = _code_root().resolve(strict=True)
+        binding = validate_service_binding(service_current, root=source_root)
+        if binding is None:
+            return False
+        target_root = active_service_root(binding, root=source_root)
+        if target_root is None or target_root == source_root:
+            return False
+        runner = target_root / "utilities" / "peer-steward.py"
+        argv = [sys.executable, str(runner)]
+        if herdr_session:
+            argv.extend(("--herdr-session", herdr_session))
+        argv.extend(("__obligation-runner", "--lock-fd", str(lock_fd),
+                     "--state-root", str(Path(state_root).resolve(strict=True)),
+                     "--service-current", binding))
+        # Selection, strict root resolution and environment preparation are all
+        # pre-exec work. Any OSError here is the same unsuccessful handoff as an
+        # execve error: this process keeps its lock and retries on its next pass.
+        child_env = _service_exec_environment(source_root, target_root)
+        was_inheritable = os.get_inheritable(lock_fd)
+        os.set_inheritable(lock_fd, True)
+        os.execve(sys.executable, argv, child_env)
+    except OSError:
+        if was_inheritable is not None:
+            try:
+                os.set_inheritable(lock_fd, was_inheritable)
+            except OSError:
+                pass
+        return False
+    return True
+
+
+def _runner_control_payload(service_current: str | Path, *, root=None) -> bytes | None:
+    """Serialize only provenance freshly verified for this installed code root."""
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        binding = validate_service_binding(service_current, root=code_root)
+        layout = _service_layout(code_root)
+        if binding is None or layout is None or binding != str(layout[3]):
+            return None
+        return json.dumps({"schema": _RUNNER_CONTROL_SCHEMA,
+                           "install_data_root": str(layout[1]),
+                           "service_current": binding},
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _remembered_service_binding(lock_fd: int, *, root=None) -> str | None:
+    """Read a lock payload only while holding its lock; malformed data is fixed."""
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        raw = os.pread(lock_fd, 4097, 0)
+        if not raw or len(raw) > 4096:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+        if (not isinstance(value, dict) or set(value) !=
+                {"schema", "install_data_root", "service_current"}
+                or type(value.get("schema")) is not int
+                or value["schema"] != _RUNNER_CONTROL_SCHEMA
+                or not isinstance(value.get("install_data_root"), str)
+                or not isinstance(value.get("service_current"), str)):
+            return None
+        layout = _service_layout(code_root)
+        binding = validate_service_binding(value["service_current"], root=code_root)
+        if (layout is None or binding is None
+                or value["install_data_root"] != str(layout[1])
+                or binding != str(layout[3])):
+            return None
+        return binding
+    except (OSError, RuntimeError, ValueError, TypeError, UnicodeError):
+        return None
+
+
+def _write_runner_control(lock_fd: int, payload: bytes) -> None:
+    """Update the existing locked inode; never replace the runner lock file."""
+    os.ftruncate(lock_fd, 0)
+    view = memoryview(payload)
+    offset = 0
+    while offset < len(view):
+        offset += os.pwrite(lock_fd, view[offset:], offset)
+    os.fsync(lock_fd)
 
 
 def peer_state_root() -> Path:
@@ -134,18 +392,33 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     if duty.get("state") not in {"complete", "cancelled"}:
         if holder:
             store.update(duty["id"], observation={"holder": list(holder)})
-        ensure_runner(Path(jobs).parent)
+        ensure_normal_runner(Path(jobs).parent)
 
 
-def _registered_delivery_bindings(message, roots=None):
+def _registered_delivery_bindings(message, roots=None, *, received_only=False):
+    if (received_only and (message.get("state") != "received"
+            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
+        return
+    if message.get("state") not in {"pending", "queued", "unverified", "received"}:
+        return
     binding = message.get("dispatch_notice") or {}
-    if not binding or binding.get("duty_id") not in (message.get("refs") or []):
+    expected_binding = {"duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
+                        "storage_recipient", "delivery_id", "claim_owner"}
+    if (not isinstance(binding, dict) or set(binding) != expected_binding
+            or binding.get("duty_id") not in (message.get("refs") or [])
+            or not isinstance(message.get("ref"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", message["ref"])):
         return
     from dispatch_completion_join import current_attempt_row
     import dispatch_pending_delivery as pending
     recipient = message.get("to") or {}
     jobs = Path(binding["jobs"])
-    root = jobs.resolve().parent
+    if not jobs.is_absolute() or jobs.is_symlink() or not jobs.is_file():
+        return
+    try:
+        root = jobs.resolve(strict=True).parent
+    except (OSError, RuntimeError, ValueError):
+        return
     if roots is not None and root not in {Path(r).resolve() for r in roots}:
         return
     store = ObligationStore(root)
@@ -156,14 +429,33 @@ def _registered_delivery_bindings(message, roots=None):
             or identity.get("attempt_id") != binding.get("attempt_id")
             or identity.get("harness") != recipient.get("harness")
             or binding.get("recipient_sid") != recipient.get("session_id")
-            or intent.get("carrier") != binding.get("carrier")):
+            or intent.get("carrier") != binding.get("carrier")
+            or binding.get("claim_owner") != "retained-rewake:" + binding["duty_id"]):
         return
-    row = current_attempt_row(jobs, binding["attempt_id"])
-    storage, delivery_id = binding["storage_recipient"], binding["delivery_id"]
-    record = pending.read(root, storage, delivery_id)
-    if (row is None or not record or row.attempt_id not in record.get("attempt_ids", [])
-            or record.get("recipient_kind") != binding.get("carrier")
-            or row.metadata.get("parent_sid") != storage):
+    try:
+        row = current_attempt_row(jobs, binding["attempt_id"])
+        storage, delivery_id = binding["storage_recipient"], binding["delivery_id"]
+        record = pending.read(root, storage, delivery_id)
+        if (row is None or not record or record.get("delivery_id") != delivery_id
+                or row.attempt_id not in record.get("attempt_ids", [])
+                or record.get("recipient_kind") != binding.get("carrier")
+                or record.get("recipient_digest") != pending.recipient_digest(storage)
+                or row.metadata.get("parent_sid") != storage
+                or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
+            return
+        from dispatch_seat_handover import effective_parent
+        if effective_parent(row.metadata, jobs) != binding["recipient_sid"]:
+            return
+        if (row.metadata.get("delivery_intent") == "1"
+                and row.metadata.get("delivery_id") == delivery_id and (
+                not row.metadata.get("delivery_receipt_digest")
+                or record.get("receipt_digest") != row.metadata.get("delivery_receipt_digest")
+                or not row.metadata.get("delivery_row_revision")
+                or (record.get("row_revisions") or {}).get(row.attempt_id)
+                    != row.metadata.get("delivery_row_revision"))):
+            return
+        identity = pending.received_ack_identity(record, storage, delivery_id)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
     yield store, duty, row, record, root, storage, delivery_id
 
@@ -176,24 +468,37 @@ def registered_delivery_settled(message, *, roots=None):
 
 
 def acknowledge_registered_delivery(message, *, roots=None):
-    """Consume only the dispatch notice bound before this exact peer transfer was sent."""
+    """Settle only a delivery proven by this exact recipient-side peer receipt.
+
+    Return true when the receipt is bound to the current delivery, even if the
+    queue write needs a later retry. Callers use that fact to avoid preparing a
+    duplicate transfer while preserving the open delivery for recovery.
+    """
     if message.get("state") != "received":
-        return
+        return False
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import effective_parent
-    for store, duty, row, record, root, storage, delivery_id in _registered_delivery_bindings(message, roots):
-        binding = message["dispatch_notice"]
-        if (record.get("claim_owner") != binding.get("claim_owner")
-                or effective_parent(row.metadata, Path(binding["jobs"])) != binding["recipient_sid"]):
-            continue
-        if record["state"] in {"claimed", "sent-ambiguous"}:
-            pending.ack(root, storage, delivery_id, acked_by="peer-received:" + message["ref"])
-        elif record["state"] != "acked":
+    matched = False
+    for store, duty, row, record, root, storage, delivery_id in _registered_delivery_bindings(
+            message, roots, received_only=True):
+        matched = True
+        settled = record
+        if record["state"] in pending.OPEN_STATES:
+            try:
+                identity = pending.received_ack_identity(record, storage, delivery_id)
+                settled = pending.ack_received(root, storage, delivery_id,
+                    expected_identity=identity, acked_by="peer-received:" + message["ref"])
+            except (OSError, ValueError, RuntimeError):
+                continue
+        if settled["state"] != "acked":
             continue
         terminal = row.status == "done" and row.metadata.get("delivery_id") == delivery_id
         if duty.get("state") not in {"complete", "cancelled"}:
-            store.update(duty["id"], state="complete" if terminal else "pending",
-                         delivery="acknowledged", cleanup="complete" if terminal else "pending")
+            try:
+                store.update(duty["id"], state="complete" if terminal else "pending",
+                             delivery="acknowledged", cleanup="complete" if terminal else "pending")
+            except (OSError, ValueError, RuntimeError):
+                pass
+    return matched
 
 
 class ObligationStore:
@@ -370,14 +675,14 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
     return False
 
 
-def ensure_runner(root: str | Path | None = None) -> bool:
-    """Start the existing peer-steward task runner once for actual open duties."""
+def _ensure_runner(root, *, service_current=None, use_remembered=False,
+                   remember_binding=False):
     store = ObligationStore(root)
-    if not store.list():
-        return False
-    # Legacy runners can remain alive through a long registered child. Their
-    # message claims still serialize transport; do not interrupt an in-flight send.
+    duties = store.list()
     lock_path = store.root / RUNNER_LOCK_NAME
+    if not duties and not remember_binding:
+        if not use_remembered or not lock_path.exists():
+            return False
     store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if lock_path.is_symlink():
         raise ObligationError("peer-obligation-runner-lock-symlink")
@@ -397,14 +702,33 @@ def ensure_runner(root: str | Path | None = None) -> bool:
                     if time.monotonic() >= deadline:
                         return False
                     time.sleep(0.02)
+        code_root = _code_root()
+        binding = validate_service_binding(service_current, root=code_root)
+        if use_remembered:
+            binding = _remembered_service_binding(fd, root=code_root)
+        elif remember_binding and binding:
+            payload = _runner_control_payload(binding, root=code_root)
+            if payload is None:
+                binding = None
+            else:
+                _write_runner_control(fd, payload)
+        if not duties:
+            return False
         os.set_inheritable(fd, True)
-        runner = Path(__file__).with_name("peer-steward.py")
+        active_root = active_service_root(binding, root=code_root) if binding else None
+        runner_root = active_root or code_root
+        runner = runner_root / "utilities" / "peer-steward.py"
+        state_root = Path(root).resolve() if root else peer_state_root()
+        child_env = (_service_exec_environment(code_root, runner_root) if binding else None)
+        argv = [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
+                "--state-root", str(state_root)]
+        if binding:
+            argv.extend(("--service-current", binding))
         _RUNNERS[:] = [process for process in _RUNNERS if process.poll() is None]
         process = subprocess.Popen(
-            [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
-             "--state-root", str(Path(root).resolve()) if root else str(peer_state_root())],
+            argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            close_fds=True, pass_fds=(fd,), start_new_session=True,
+            close_fds=True, pass_fds=(fd,), start_new_session=True, env=child_env,
         )
         _RUNNERS.append(process)
         return True
@@ -412,6 +736,26 @@ def ensure_runner(root: str | Path | None = None) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+def ensure_runner(root: str | Path | None = None, *,
+                  service_current: str | Path | None = None) -> bool:
+    """Start a fixed-root runner unless an explicit internal binding is supplied."""
+    return _ensure_runner(root, service_current=service_current)
+
+
+def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None) -> bool:
+    """Ensure a producer runner using only verified lifecycle provenance.
+
+    Lifecycle callbacks may establish the binding while holding the existing
+    runner lock, including when no duty currently needs a process. Ordinary
+    producers reuse only a validated binding already in that lock's payload.
+    """
+    if lifecycle_root is not None:
+        binding = managed_service_binding(lifecycle_root)
+        return _ensure_runner(root, service_current=binding,
+                              remember_binding=binding is not None)
+    return _ensure_runner(root, use_remembered=True)
 
 
 @contextmanager
@@ -490,8 +834,13 @@ def execution_attempts_for_processes(processes: Iterable[dict]) -> tuple[str, ..
 def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
                         jobs: str | Path | None = None,
                         execution_attempt_ids: tuple[str, ...] = (),
+                        include_parent: bool = True,
                         ) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
-    """Read exact executor, registered-parent or handed-over attempt bindings."""
+    """Read exact executor, registered-parent or handed-over attempt bindings.
+
+    Input readiness considers executor bindings only, so it passes
+    ``include_parent=False`` and skips observing every parented attempt.
+    """
     from dispatch_contract import (
         observed_attempt_liveness,
         parse_registry_metadata,
@@ -521,7 +870,7 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         metadata = parse_registry_metadata(fields[5])
         executor = (metadata.get("attempt_id") in execution_attempt_ids
                     and metadata.get("harness") == harness)
-        parent = (owns(metadata, session_id, jobs_path)
+        parent = (include_parent and owns(metadata, session_id, jobs_path)
                   and (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
                        else effective_parent_harness(metadata, jobs_path)) in {None, "", harness})
         if not executor and not parent:

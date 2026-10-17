@@ -195,7 +195,26 @@ _RECOMMENDED = re.compile(r"\s*[(（](?:권장|recommended)[)）]\s*$", re.I)
 
 
 def _plain(text) -> str:
-    return " ".join(_RECOMMENDED.sub("", _text(text)).split())
+    value = _text(text)
+    while True:
+        cleaned = _RECOMMENDED.sub("", value)
+        if cleaned == value:
+            break
+        value = cleaned
+    return " ".join(value.split())
+
+
+def _native_option_index(value, labels):
+    """Match native display text without choosing the first normalized collision."""
+    raw = _text(value).strip()
+    exact = [index for index, label in enumerate(labels) if raw == _text(label).strip()]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    normalized = _plain(raw)
+    matches = [index for index, label in enumerate(labels) if normalized and normalized == _plain(label)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def answers_from_native(interview: dict, asked) -> dict | None:
@@ -213,13 +232,14 @@ def answers_from_native(interview: dict, asked) -> dict | None:
     restatement = find(interview.get("understanding"))
     if restatement is None:
         return None
-    options = [_plain(label) for label in restatement.get("options") or []]
-    reply = _plain(restatement.get("answer"))
-    if not reply:
+    options = list(restatement.get("options") or [])
+    reply = _text(restatement.get("answer")).strip()
+    if not _plain(reply):
         return None
-    if options and reply == options[0]:
+    restatement_index = _native_option_index(reply, options)
+    if options and restatement_index == 0:
         confirmed, correction = True, ""
-    elif reply in options:
+    elif restatement_index is not None:
         return None                                   # "no" without saying what is wrong: ask for it
     else:
         confirmed, correction = False, _text(restatement.get("answer")).strip()
@@ -228,10 +248,13 @@ def answers_from_native(interview: dict, asked) -> dict | None:
         row = find(question.get("question"))
         if row is None or not _plain(row.get("answer")):
             return None
-        labels = [_plain(label) for label in _labels(question)]
-        picked = _plain(row.get("answer"))
-        given[_text(question.get("id"))] = ({"choice": labels.index(picked), "note": ""} if picked in labels
-                                            else {"choice": NONE_SENTINEL, "note": _text(row.get("answer")).strip()})
+        labels = _labels(question)
+        picked = _text(row.get("answer")).strip()
+        option_index = _native_option_index(picked, labels)
+        if option_index is None and any(_plain(picked) == _plain(label) for label in labels):
+            return None
+        given[_text(question.get("id"))] = ({"choice": option_index, "note": ""} if option_index is not None
+                                            else {"choice": NONE_SENTINEL, "note": picked})
     return {"schema": ANSWERS_SCHEMA, "route_id": interview.get("route_id"), "round": interview.get("round", 1),
             "actor_kind": "user", "understanding_confirmed": confirmed, "correction": correction, "answers": given}
 

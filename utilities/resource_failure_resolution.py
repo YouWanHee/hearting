@@ -285,7 +285,10 @@ def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None)
             or judgment.get("route_id") != route["route_id"]
             or judgment.get("node", judgment.get("node_id")) != node_id):
         raise ValueError("resource-judgment-not-pass")
-    receipt_path = contained(base, "run.json")
+    import resource_run_evidence as RUN_EVIDENCE
+    receipt_path = Path(RUN_EVIDENCE.paths(armed)["runtime_output"]).resolve(strict=True)
+    if not receipt_path.is_relative_to(base):
+        raise ValueError("failed-output-receipt-outside-scope")
     receipt, receipt_sha = snapshot.document(receipt_path)
     if (receipt.get("route_id") != route["route_id"] or receipt.get("exit") != row["exit_code"]
             or receipt.get("config_sha256") != row.get("config_sha256")

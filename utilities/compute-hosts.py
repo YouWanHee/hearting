@@ -425,15 +425,9 @@ def _unique_session_owner(values):
 
 
 def _launcher_session_owner(values=None):
-    """The same canonical session reading the route-chain writer uses."""
-    from session_identity import identity
-    found = identity(os.environ if values is None else values)
-    sid = found.session_id
-    if (not found.known or found.harness not in CANONICAL_SESSION_KEY
-            or not isinstance(sid, str) or not sid or len(sid) > 256
-            or sid != sid.strip() or any(ord(char) < 32 or ord(char) == 127 for char in sid)):
-        return None
-    return {"kind": "session", "harness": found.harness, "id": sid}
+    """Compatibility wrapper for the shared launch-time session resolver."""
+    import gpu_leases
+    return gpu_leases.launcher_owner(environ=values)
 
 
 _LAUNCHER_OWNER_UNSET = object()
@@ -448,14 +442,15 @@ def _launcher_session_setup(values=None, *, owner=_LAUNCHER_OWNER_UNSET):
     keeps the SSH boundary allowlisted instead of forwarding arbitrary env.
     """
     values = os.environ if values is None else values
-    keys = tuple(key for key, _harness in SESSION_ENV_KEYS)
+    import gpu_leases
+    keys = gpu_leases.session_environment_keys()
     setup = ["unset " + " ".join(keys)]
     if owner is _LAUNCHER_OWNER_UNSET:
         owner = _launcher_session_owner(values)
-    if owner is None:
-        return setup
-    canonical_key = CANONICAL_SESSION_KEY[owner["harness"]]
-    setup.append("export %s=%s" % (canonical_key, shlex.quote(owner["id"])))
+    resolved = gpu_leases.launcher_session_environment({}, owner=owner)
+    for key in keys:
+        if key in resolved:
+            setup.append("export %s=%s" % (key, shlex.quote(resolved[key])))
     return setup
 
 
@@ -1101,7 +1096,7 @@ def host_uptime_s():
 
 ENV_KEYS = {
     "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_SELF_SLUG",
-    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+    "HEARTING_COMPUTE_RUN_ID", "HEARTING_RESOURCE_RUN_ID", "HEARTING_COMPUTE_HOST",
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
     "OPENCODE_SESSION_ID", "SSH_CONNECTION",
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
@@ -1153,12 +1148,21 @@ def process_owner(pid, expected_start):
     seen = set()
     current = pid
     depth = 0
+    gpu_pgid = None
+    run_boundary = False
     while current > 0 and current not in seen and depth < 128:
         seen.add(current)
         stat = proc_stat(current)
         if stat is None or not same_euid(current):
             break
-        env = identity_env(current)
+        if gpu_pgid is None and not run_boundary:
+            gpu_pgid = stat.get("pgid")
+        elif run_boundary and (gpu_pgid is None or stat.get("pgid") != gpu_pgid):
+            # The run root may be an exact claim target, but its outer shell or
+            # tmux server belongs to a different process group and is not evidence.
+            break
+
+        env = identity_env(current) if not run_boundary else {}
         attempt = env.get("AGENT_DISPATCH_ATTEMPT_ID")
         if attempt:
             slug = safe_label(env.get("AGENT_DISPATCH_SELF_SLUG"), attempt[:12])
@@ -1168,7 +1172,8 @@ def process_owner(pid, expected_start):
                 "evidence_start": stat["start"], "ancestry_depth": depth,
                 "source": "environment+ancestry",
             })
-        run_id = env.get("HEARTING_COMPUTE_RUN_ID")
+        run_id = (env.get("HEARTING_COMPUTE_RUN_ID")
+                  or env.get("HEARTING_RESOURCE_RUN_ID"))
         if run_id:
             candidates["run"].append({
                 "kind": "run", "id": run_id,
@@ -1176,32 +1181,33 @@ def process_owner(pid, expected_start):
                 "evidence_pid": current, "evidence_start": stat["start"],
                 "ancestry_depth": depth, "source": "environment+ancestry",
             })
-        sessions = []
-        for key, harness in (("CLAUDE_CODE_SESSION_ID", "claude"),
-                             ("CODEX_THREAD_ID", "codex"),
-                             ("CODEX_SESSION_ID", "codex"),
-                             ("OPENCODE_SESSION_ID", "opencode")):
-            sid = env.get(key)
-            if sid:
-                sessions.append((harness, sid))
-        for harness, sid in set(sessions):
-            candidates["session"].append({
-                "kind": "session", "id": sid,
-                "label": "%s:%s" % (harness, safe_label(sid[:8], "session")),
-                "harness": harness, "evidence_pid": current,
-                "evidence_start": stat["start"], "ancestry_depth": depth,
-                "source": "environment+ancestry",
-            })
-        for bridge_owner in ssh_connection_owners(env.get("SSH_CONNECTION")):
-            harness = bridge_owner["harness"]
-            sid = bridge_owner["id"]
-            candidates["session"].append({
-                "kind": "session", "id": sid,
-                "label": "%s:%s" % (harness, safe_label(sid[:8], "session")),
-                "harness": harness, "evidence_pid": current,
-                "evidence_start": stat["start"], "ancestry_depth": depth,
-                "source": "ssh-connection+ancestry",
-            })
+        if not run_boundary:
+            sessions = []
+            for key, harness in (("CLAUDE_CODE_SESSION_ID", "claude"),
+                                 ("CODEX_THREAD_ID", "codex"),
+                                 ("CODEX_SESSION_ID", "codex"),
+                                 ("OPENCODE_SESSION_ID", "opencode")):
+                sid = env.get(key)
+                if sid:
+                    sessions.append((harness, sid))
+            for harness, sid in set(sessions):
+                candidates["session"].append({
+                    "kind": "session", "id": sid,
+                    "label": "%s:%s" % (harness, safe_label(sid[:8], "session")),
+                    "harness": harness, "evidence_pid": current,
+                    "evidence_start": stat["start"], "ancestry_depth": depth,
+                    "source": "environment+ancestry",
+                })
+            for bridge_owner in ssh_connection_owners(env.get("SSH_CONNECTION")):
+                harness = bridge_owner["harness"]
+                sid = bridge_owner["id"]
+                candidates["session"].append({
+                    "kind": "session", "id": sid,
+                    "label": "%s:%s" % (harness, safe_label(sid[:8], "session")),
+                    "harness": harness, "evidence_pid": current,
+                    "evidence_start": stat["start"], "ancestry_depth": depth,
+                    "source": "ssh-connection+ancestry",
+                })
         for claim in OWNER_CLAIMS:
             if not isinstance(claim, dict):
                 continue
@@ -1224,25 +1230,23 @@ def process_owner(pid, expected_start):
                 "evidence_start": stat["start"], "ancestry_depth": depth,
                 "source": "persistent-claim+ancestry",
             })
-        harness = harness_process(current)
-        if harness:
-            candidates["harness"].append({
-                "kind": "harness", "id": "%s:%s" % (current, stat["start"]),
-                "label": "%s:pid%s" % (harness, current), "harness": harness,
-                "evidence_pid": current, "evidence_start": stat["start"],
-                "ancestry_depth": depth, "source": "process-ancestry",
-            })
+        if not run_boundary:
+            harness = harness_process(current)
+            if harness:
+                candidates["harness"].append({
+                    "kind": "harness", "id": "%s:%s" % (current, stat["start"]),
+                    "label": "%s:pid%s" % (harness, current), "harness": harness,
+                    "evidence_pid": current, "evidence_start": stat["start"],
+                    "ancestry_depth": depth, "source": "process-ancestry",
+                })
         verified = proc_stat(current)
         if verified is None or verified["start"] != stat["start"]:
             return None, "ancestor-reused-or-gone", None
-        # A managed run is an explicit attribution boundary.  Its command
-        # receives launcher-sanitized session evidence, while a tmux server or
-        # remote shell above it may retain unrelated identities in its original
-        # /proc environment.  Keep generic processes on the all-ancestry rule,
-        # but never let evidence outside this exact run override or contaminate
-        # the run's own job/run/session evidence.
+        # After the run boundary, ambient identities stay fenced, but an exact
+        # claim may connect the run's own pgid leader to descendants. The first
+        # ancestor in another pgid ends that claim walk as well.
         if run_id:
-            break
+            run_boundary = True
         current = stat["ppid"]
         depth += 1
 
@@ -1433,7 +1437,9 @@ def gpu_proc_fallback():
                     or after.get("state") in {"Z", "X"} or not same_euid(pid)
                     or identity_env(pid) != env):
                 continue
-            processes[pid] = (process, indexes, env.get("HEARTING_COMPUTE_RUN_ID"), before["ppid"])
+            run_id = (env.get("HEARTING_COMPUTE_RUN_ID")
+                      or env.get("HEARTING_RESOURCE_RUN_ID"))
+            processes[pid] = (process, indexes, run_id, before["ppid"])
     except OSError as exc:
         detail = str(exc)[:120]
     count = 0
@@ -1569,7 +1575,7 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
     bridges_json = json.dumps(list(ssh_session_bridges)[:SSH_BRIDGE_MAX_CONNECTIONS],
                               ensure_ascii=False, separators=(",", ":"))
     import gpu_leases
-    lease_source = Path(gpu_leases.__file__).read_text()
+    lease_source = gpu_leases.serialized_snapshot_source()
     lease_code = ("\ntry:\n    lease_api = {}\n    exec(%r, lease_api)\n"
                   "    payload['gpu_leases'] = lease_api['snapshot'](%r)\n"
                   "except Exception as exc:\n    payload['reservation_detail'] = str(exc)[:120]\n") % (
@@ -1927,6 +1933,13 @@ def cmd_run(args):
 
     provenance = _launcher_provenance()
     owner = _launcher_session_owner()
+    session = ({"harness": owner["harness"], "id": owner["id"]}
+               if owner else None)
+    run_provenance = {"agent_home": provenance.get("AGENT_HOME"),
+                      "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                      "session": session, "route": _launcher_route()}
+    if str(os.environ.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
+        run_provenance["notify"] = session
     # Provenance rides the same preamble as the compute identity, so it
     # crosses the local/SSH/tmux/setsid boundary together. Both keys are
     # always set -- to the validated value, or to "" when it is unknown here --
@@ -1969,7 +1982,7 @@ def cmd_run(args):
     requested = args.gpus if args.gpus is not None else gpu_leases.requested_devices(
         command, os.environ.get("CUDA_VISIBLE_DEVICES"))
     share = getattr(args, "share", False)
-    lease_owner = gpu_leases.launcher_owner() if owner else None
+    lease_owner = owner
     options = {"state_path": str(gpu_leases.state_path()), "observation": gpu_observation,
                "requested": requested, "share": share, "owner": lease_owner,
                "task": args.name or rendered, "run_id": run_id, "run_dir": str(run_dir), "inner": inner}
@@ -1987,8 +2000,10 @@ def cmd_run(args):
         return 0
 
     source = Path(gpu_leases.__file__).read_text()
+    payload_source = gpu_leases.serialized_payload_source()
     script = source + ("\ntry:\n    print(json.dumps(launch_compute(%r, %r)))\n"
-                       "except Exception as exc:\n    print(str(exc), file=sys.stderr)\n    raise SystemExit(2)\n") % (options, source)
+                       "except Exception as exc:\n    print(str(exc), file=sys.stderr)\n    raise SystemExit(2)\n") % (
+                           options, payload_source)
     launch = "python3 -c " + shlex.quote(script)
     result = remote(host, launch)
     if result.returncode != 0:
@@ -2003,11 +2018,7 @@ def cmd_run(args):
             "cwd": workdir, "env": env, "gpus": admission["gpus"],
             "gpu_lease": admission.get("gpu_lease"), "share": share,
             "gpu_observation": gpu_observation,
-            "provenance": {"agent_home": provenance.get("AGENT_HOME"),
-                           "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
-                           "session": ({"harness": owner["harness"], "id": owner["id"]}
-                                       if owner else None),
-                           "route": _launcher_route()},
+            "provenance": run_provenance,
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -2034,57 +2045,31 @@ COMPLETION_WATCH_SECONDS = 14 * 24 * 3600
 COMPLETION_POLL_SECONDS = 60
 
 
-def route_parent_session(route_id, jobs):
-    """`{harness, id}` of the session that started this route's owner (its newest owner row in
-    the jobs registry), or None when the registry names none."""
-    found = None
-    try:
-        from dispatch_contract import parse_registry_metadata
-        lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
-    except (OSError, ImportError):
-        return None
-    for line in lines:
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = parse_registry_metadata(fields[5])
-        if (meta.get("worker_type") == "owner" and route_id in (meta.get("owner_route_id"), meta.get("route_id"))
-                and meta.get("parent_harness") and meta.get("parent_sid")):
-            found = {"harness": meta["parent_harness"], "id": meta["parent_sid"]}
-    return found
-
-
 def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Popen):
     """Watch for this run's exit code and tell one session once (audit §4 #18, settlement I4).
 
-    An interactive (dispatch-depth-0) launch tells its own session. A registered owner or
-    worker's launch inside a route tells the session that started the route's owner (its
-    parent in the jobs registry), recorded in the run's meta as `notify`. Returns whether a
-    watch was started. Never refuses the launch.
+    An interactive (dispatch-depth-0) launch tells its own session. A registered worker uses
+    the same route-parent identity already fixed in the launch metadata; this function never
+    performs a second registry or handover lookup. Returns whether a watch was started.
+    Never refuses the launch.
     """
     env = os.environ if environ is None else environ
     provenance = meta.get("provenance") or {}
     session = provenance.get("session")
     if str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
-        route = provenance.get("route") or {}
-        jobs = env.get("AGENT_DISPATCH_JOBS")
-        if not jobs:
-            try:
-                from dispatch_contract import stable_state_root
-                jobs = stable_state_root(env) / "jobs.log"
-            except Exception:  # noqa: BLE001 -- no registry, no parent to tell
-                return False
-        session = route_parent_session(route.get("route_id"), jobs) if route.get("route_id") else None
+        session = provenance.get("notify")
         if not session:
             return False
-        provenance["notify"] = session
+    if (not isinstance(session, dict)
+            or session.get("harness") not in {"claude", "codex", "opencode"}
+            or not isinstance(session.get("id"), str) or not session.get("id")):
+        return False
+    if str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
         try:
             (Path(run_dir) / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         except OSError:
             return False
-    if not session:
-        return False
     try:
         with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as out:
             spawn([sys.executable, str(Path(__file__).resolve()), "watch-run", str(run_dir)],

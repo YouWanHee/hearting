@@ -522,3 +522,15 @@ per-launch `permission.external_directory` rules. This is
 `enforcement_required=os-sandbox` is refused before registration/model spawn.
 The adapter never reports `enforced`, edits global configuration, or weakens
 approval defaults. Cross-launch propagation is not implemented by this slice.
+
+## Runtime compaction tidy
+
+- **Runtime support:** compacting accepts context additions; the compacted event exposes the completed assistant summary and a v1 lookup of the matching parent compaction part identifies `auto=true` versus manual.
+- **Adapter realization:** shared instructions go into `output.context`; the compact summary id, parent/retained boundary and existing `session.status`/`session.idle` callbacks feed the shared card and clear helper. Only a successful auto summary card at the exact main pane can book clear. The helper requires a terminal ordinary assistant after its matching user plus native idle after compaction, waits at most three hours, and preserves a bounded recent tail and source DB path.
+- **Fallback:** missing matching part, unknown/manual trigger, missing/empty summary, card-write failure, project/outside-herdr seat, and worker/sub-session never auto-clear; known main sessions still queue memory. An unreadable session identity remains ledger-only. Status observations are limited to the pending compact sid; plugin failure never blocks compaction.
+
+## Idle tidy
+
+- **Runtime support:** the existing `session.idle` event carries a session id. The shared observer reads the latest completed assistant message for that exact id from the OpenCode database, using its reported context tokens, provider and model.
+- **Adapter realization:** a provider/session-qualified idle booking uses the same fixed due time, exact seat and one-send claim as the other adapters. The helper withholds a card request when the herdr session identity cannot be matched to the idle session. Clear follows only after the main session's card and queue receipt; the successor receives a status-only prompt.
+- **Cache evidence:** the local OpenCode config sets no explicit model or provider. The selected provider/model and cache lifetime come from the completed message only where reported; no generic OpenCode cache TTL is assumed, and the current idle event path uses the configured wait.

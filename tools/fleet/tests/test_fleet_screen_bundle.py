@@ -262,8 +262,7 @@ class BundleTest(unittest.TestCase):
                 for i in range(ids[parent] + 1, ids[end]):
                     if i in ids.values():
                         continue
-                    self.assertEqual(rows[i][render._STEWARD_LINE_COL],
-                                     "⚑" if i == ids[parent] + 1 else "┆", rows[i])
+                    self.assertEqual(rows[i][render._STEWARD_LINE_COL], "┆", rows[i])
                     self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "  ")
             self.assertTrue(any("┆" in r and "╭" in r for r in rows))
             box = [r for r in rows if "╭" in r or "╰" in r]
@@ -271,7 +270,8 @@ class BundleTest(unittest.TestCase):
                                 for r in box))
             self.assertNotIn("⚑ →", "\n".join(rows))
             self.assertNotIn("⚑ ←", "\n".join(rows))
-            self.assertIn("⚑", rows[ids["aa"] + 1])
+            self.assertIn("[aa] ⚑ ", rows[ids["aa"]])
+            self.assertNotIn("⚑", rows[ids["aa"] + 1])
         original = render._session_row_2line(session("aa", model="MODEL", effort="medium"))[1]
         joined = render._under_id_connector(original)
         self.assertIn("3h", render._plain(joined))
@@ -471,7 +471,7 @@ class BundleTest(unittest.TestCase):
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
             self.assertEqual([render._dw(row[:re.search(r"(?:\d+%|—) +(\S)", row).start(1)]) for row in where],
                              [render._NAME_COL] * 2)
-            self.assertEqual(where[0][render._STEWARD_LINE_COL], "⚑" if width == 168 else "┆")
+            self.assertEqual(where[0][render._STEWARD_LINE_COL], "┆")
             self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
             if width != 168:
                 elapsed = [row for row in rows if "3h 00m" in row and "MODEL" in row]
@@ -484,7 +484,9 @@ class BundleTest(unittest.TestCase):
         start = next(i for i, row in enumerate(rows) if "[aa]" in row)
         end = next(i for i, row in enumerate(rows) if "[bb]" in row)
         self.assertEqual(end - start, 2)
-        self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "⚑")
+        # The flag rides the identity row, so the one row between still shows the line.
+        self.assertIn("[aa] ⚑ ", rows[start])
+        self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "┆")
 
     def test_mixed_owner_frame_worker_columns_across_harnesses_and_widths(self):
         main = session("aa", model="MAINMODEL", effort="xhigh", ctx_pct=50,
@@ -517,8 +519,8 @@ class BundleTest(unittest.TestCase):
                             pos += render._dw(value)
                 self.assertEqual(starts, [anchor] * 6)
                 gauges = [render._dw(row[:row.index("━")]) for row in rows if "━" in row and "50%" in row]
-                self.assertEqual(gauges.count(4 + render._HW), 7)  # MAIN + three OWNER/FRAME pairs
-                self.assertEqual(gauges.count(17), 3)              # original worker detail column
+                # MAIN + three OWNER/FRAME pairs + three in-card workers on the owner's column
+                self.assertEqual(gauges.count(4 + render._HW), 10)
                 self.assertEqual(sum("frame 0/1" in row for row in rows if "╰" in row), 3)
                 self.assertFalse(any("frame 0/1" in row for row in rows if "╭" in row or "│" in row))
                 self.assertTrue(all(row.index("╭") == render._SESSION_DETAIL_COL

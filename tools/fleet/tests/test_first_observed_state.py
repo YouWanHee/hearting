@@ -202,17 +202,52 @@ class CampaignLabelsTest(unittest.TestCase):
     def record(self, name, rid, title):
         (self.cycles / name).write_text(json.dumps({'route_id': rid, 'title': title}))
 
-    def test_existing_admission_index_reads_one_exact_record_without_inventory(self):
+    def test_existing_producer_hint_reads_exact_record_without_admission_payload_or_inventory(self):
+        import directory_record_index
         self.record('cyc_exact.json', 'rt-exact', 'exact title')
         index = self.root / '.runtime/artifact-admission/v1/index.json'
         index.parent.mkdir(parents=True)
-        index.write_text(json.dumps({'artifact_root_id': 'root', 'routes': {
-            'foreign-root': {'rt-exact': {'cycle_id': 'cyc_foreign'}},
-            'root': {'rt-exact': {'cycle_id': 'cyc_exact'}}}}))
+        index.write_text('{a large admission payload not needed for a display label')
+        directory_record_index.select(self.cycles, {'rt-exact'}, kind='cycle-routes',
+                                      classify=directory_record_index.cycle_keys,
+                                      read_json=dispatch._read_cycle_record)
         job = model.DispatchJob(key='code', route_id='rt-exact', artifact_root=str(self.root))
-        with mock.patch.object(dispatch.os, 'listdir', side_effect=AssertionError('cycle inventory')):
+        original = dispatch._read_cycle_record
+        def read(path):
+            self.assertNotEqual(Path(path), index)
+            return original(path)
+        with mock.patch.object(dispatch.os, 'listdir', side_effect=AssertionError('cycle inventory')), \
+                mock.patch.object(dispatch, '_read_cycle_record', side_effect=read):
             dispatch._campaign_labels([job])
         self.assertEqual(job.campaign_label, 'exact title')
+        self.assertNotIn(str(index), dispatch._CYCLE_RECORD_CACHE)
+
+    def test_stale_or_corrupt_hint_uses_bounded_records_and_does_not_repair_disk(self):
+        import directory_record_index
+        self.record('first.json', 'rt-wanted', 'old title')
+        directory_record_index.select(self.cycles, {'rt-wanted'}, kind='cycle-routes',
+                                      classify=directory_record_index.cycle_keys,
+                                      read_json=dispatch._read_cycle_record)
+        hint = self.cycles / '.cycle-routes-index.json'
+        original_hint = hint.read_bytes()
+        self.record('first.json', 'rt-foreign', 'foreign title')
+        self.record('second.json', 'rt-wanted', 'current title')
+        job = model.DispatchJob(key='code', route_id='rt-wanted', artifact_root=str(self.root))
+        dispatch._campaign_labels([job])
+        self.assertEqual(job.campaign_label, 'current title')
+        self.assertEqual(hint.read_bytes(), original_hint)
+        hint.write_text('{broken')
+        dispatch._campaign_labels([job])
+        self.assertEqual(job.campaign_label, 'current title')
+        self.assertEqual(hint.read_text(), '{broken')
+
+    def test_retired_admission_payloads_are_removed_from_preserved_label_cache(self):
+        path = '/previous/root/.runtime/artifact-admission/v1/index.json'
+        dispatch._CYCLE_RECORD_CACHE[path] = (('old stamp',), {'unused': 'old payload'})
+        self.record('cycle.json', 'rt-exact', 'exact title')
+        dispatch._campaign_labels([model.DispatchJob(key='code', route_id='rt-exact',
+                                                    artifact_root=str(self.root))])
+        self.assertNotIn(path, dispatch._CYCLE_RECORD_CACHE)
 
     def test_open_cycle_fallback_continues_in_bounded_batches_without_stat_sort(self):
         for index in range(401):
@@ -226,7 +261,8 @@ class CampaignLabelsTest(unittest.TestCase):
         with mock.patch.object(dispatch, '_stat_stamp', side_effect=stamp):
             dispatch._campaign_labels([job])
         self.assertIsNone(job.campaign_label)
-        self.assertEqual(sum(Path(p).parent == self.cycles for p in observed), 200)
+        self.assertEqual(sum(Path(p).parent == self.cycles and not Path(p).name.startswith('.')
+                             for p in observed), 200)
         dispatch._campaign_labels([job])
         self.assertIsNone(job.campaign_label)
         dispatch._campaign_labels([job])
@@ -437,7 +473,7 @@ class DelayedJoinTest(unittest.TestCase):
         self.assertEqual(row.work_projection.stage_label, 'test')
         self.assertEqual(row.summary, 'fresh basic NOW')
 
-    def test_failed_native_now_read_keeps_active_work_explicitly_checking(self):
+    def test_successful_empty_native_now_read_says_no_summary_yet(self):
         source = self.source()
         source.jobs[0].summary, source.jobs[0].summary_ts = None, None
         detail = self.filled(source)
@@ -445,7 +481,8 @@ class DelayedJoinTest(unittest.TestCase):
         detail.snapshot.jobs[0].exec_tool = None
         row = details.merge(source, detail).jobs[0]
         text = render._plain(render._context_detail_row(row, term_width=168)[0])
-        self.assertIn('loading', text)
+        self.assertIn('no summary yet', text)
+        self.assertNotIn('loading', text)
         self.assertEqual(row.liveness, 'working')
 
 

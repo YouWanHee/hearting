@@ -22,8 +22,10 @@ from fleet.collectors import codex_companion as cc  # noqa: E402
 _SID = "201f59a8-21e7-4778-9f6f-c1b56c24e7ff"
 _THREAD = "019f8cac-25cd-7cc2-89fa-7ed97b2f3eb9"
 _WINDOW = 272000
-_ACTIVE = 92000                       # (92000-12000)/(272000-12000) → 31%
-_EXPECT_PCT = 31
+_ACTIVE = 92000
+# These legacy plugin rollouts have raw usage but no execution-bound native
+# compaction inputs; the former guessed 12K-reserve percentage is unknown.
+_EXPECT_PCT = None
 
 
 def _iso(minutes_ago):
@@ -114,8 +116,8 @@ class ThreadRolloutJoinTest(_Fixture):
         self.assertEqual(job.plugin_telemetry["context_used_pct"], _EXPECT_PCT)
         self.assertEqual(job.plugin_telemetry["active_context_tokens"], _ACTIVE)
         self.assertEqual(job.plugin_telemetry["context_window_tokens"], _WINDOW)
-        self.assertEqual(job.context.used_pct, _EXPECT_PCT)
-        self.assertEqual(job.context.source, "codex-rollout")
+        self.assertEqual(job.plugin_telemetry["context_policy"]["state"], "unknown")
+        self.assertIsNone(job.context)
 
     def test_no_matching_rollout_is_an_honest_gap(self):
         self.write_rollout(thread_id="019f8cac-0000-4000-8000-000000000999")
@@ -235,7 +237,8 @@ class PluginAgentDisplayTest(_Fixture):
     def test_plugin_agent_never_opens_a_context_detail_row(self):
         self.write_rollout()
         job = self.row()
-        self.assertIsNotNone(job.context)
+        self.assertIsNone(job.context)
+        self.assertEqual(job.plugin_telemetry["active_context_tokens"], _ACTIVE)
         self.assertEqual(render._dispatch_summary_detail_row(job), [])
 
     def test_plugin_agent_is_not_a_dispatch_pulse_count(self):
@@ -284,7 +287,9 @@ class JsonShapeTest(_Fixture):
         self.write_rollout()
         payload = self.row().to_dict()
         self.assertEqual(payload["plugin_telemetry"]["context_used_pct"], _EXPECT_PCT)
-        self.assertEqual(payload["context"]["used_pct"], _EXPECT_PCT)
+        self.assertIsNone(payload["context"])
+        self.assertEqual(payload["plugin_telemetry"]["active_context_tokens"], _ACTIVE)
+        self.assertEqual(payload["plugin_telemetry"]["context_window_tokens"], _WINDOW)
 
     def test_json_without_a_join_carries_no_invented_telemetry(self):
         payload = self.row().to_dict()

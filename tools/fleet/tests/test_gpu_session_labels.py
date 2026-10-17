@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import render
+from fleet import display_snapshot, render
 
 
 def owner(harness="codex", sid="sid-one"):
@@ -17,10 +17,13 @@ def owner(harness="codex", sid="sid-one"):
             "label": "run:vacant-shared-epoch99-long-run-id"}
 
 
-def session(harness="codex", sid="sid-one", name="TASLP 메인", alias=None):
+def session(harness="codex", sid="sid-one", name="TASLP 메인", alias=None,
+           session_aliases=None, gpu_aliases=None, tag=None):
     return SimpleNamespace(harness=harness, session_id=sid, runtime_name=name,
                            _herdr_name=alias, title="beta0 noaux epoch99",
-                           registry_name="vacant", slug="shared", cwd="/work/TASLP-wt/epoch99")
+                           registry_name="vacant", slug="shared", cwd="/work/TASLP-wt/epoch99",
+                           session_aliases=list(session_aliases or ()),
+                           _gpu_session_aliases=list(gpu_aliases or ()), session_tag=tag)
 
 
 class GPUSessionLabelsTest(unittest.TestCase):
@@ -96,6 +99,31 @@ class GPUSessionLabelsTest(unittest.TestCase):
         self.assertEqual(render._gpu_session_label(owner(), [session(sid="sid-two", name="foreign")])[0],
                          "[a1]")
 
+    def test_pre_clear_session_aliases_resolve_to_the_current_seat_name(self):
+        old_sid = "sid-before-clear"
+        cases = (
+            session(sid="sid-after-clear", name="Current seat",
+                    session_aliases=[old_sid], tag="new-a1"),
+            session(sid="sid-after-clear", name="Current GPU seat",
+                    gpu_aliases=[old_sid], tag="new-a1"),
+        )
+        for row, expected in zip(cases, ("Current seat [new-a1]", "Current GPU seat [new-a1]")):
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    render._gpu_session_label(owner(sid=old_sid), [row]),
+                    (expected, "[new-a1]"))
+
+    def test_pre_clear_alias_matching_keeps_harness_and_full_id_exact(self):
+        old_sid = "sid-before-clear"
+        foreign = session("claude", sid="sid-after-clear", name="Foreign",
+                          session_aliases=[old_sid], tag="foreign-tag")
+        self.assertEqual(render._gpu_session_label(owner(sid=old_sid), [foreign]),
+                         ("sid-befo", "sid-befo"))
+        current = session("codex", sid="sid-after-clear", name="Current",
+                          session_aliases=[old_sid], tag="new-a1")
+        self.assertEqual(render._gpu_session_label(owner(sid=old_sid), [current]),
+                         ("Current [new-a1]", "[new-a1]"))
+
     def test_repo_fallback_uses_exact_harness_identity_and_parent_worktree_repo(self):
         for harness, tag in (("claude", "c3"), ("codex", "a1"), ("opencode", "d4")):
             with self.subTest(harness=harness):
@@ -112,7 +140,10 @@ class GPUSessionLabelsTest(unittest.TestCase):
             (worktree / ".git").write_text("gitdir: %s\n" % gitdir)
             row = session(name=None)
             row.cwd = str(worktree)
-            self.assertEqual(render._gpu_session_label(owner(), [row])[0], "actual-repo [a1]")
+            observations = display_snapshot.build([row])
+            with mock.patch("fleet.model.project_of", side_effect=AssertionError("lookup during draw")):
+                self.assertEqual(render._gpu_session_label(owner(), [row], observations)[0],
+                                 "actual-repo [a1]")
 
     def test_no_tag_uses_short_id_and_observed_repo_not_harness(self):
         row = session(sid="abcdefgh-one", name=None)

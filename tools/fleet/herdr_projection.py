@@ -8,7 +8,7 @@ pane header, where the shape is ours to fix (user 2026-09-09: "그 바깥에 장
 맞겠다"). The header reads
 
     [3a] claude   통신 표시 일관성 수정
-    [b0] claude ⚑ 하팅 감독 — 네 세션 관리
+    [b0] ⚑ claude 하팅 감독 — 네 세션 관리
 
 Both halves go into `title`, because that is the only field herdr paints above the pane:
 `display_agent` is reported too and herdr stores it, but a pane whose `display_agent` said
@@ -23,9 +23,11 @@ pane belongs to the interactive session that owns it.
 Every herdr report from a hook — this projection and `hooks/herdr-agent-state.sh` — asks
 `may_report()` first. A process may report a session only when it IS that session's
 runtime, proven from the process itself, never from the payload or the environment
-(OpenCode proves the harness only — see `may_report`). Codex is proven by Fleet's own
-resolver: the rollout the process holds open, else the board's mutually unique
-process-start match; an ambiguous match proves nothing. Test suites run the real
+(OpenCode proves the harness only — see `may_report`). For Codex, process_identity
+proves the thread through the daemon loader's exact foreground PID. A visible footer
+confirms the thread and refuses a disagreement; an absent footer does not erase the
+process proof. Shared services use the caller's CODEX_THREAD_ID to locate that TUI.
+Ambiguous process ownership proves nothing. Test suites run the real
 hooks with fake session ids while inheriting the interactive pane's `HERDR_PANE_ID` and
 often strip the worker markers, so the worker check alone let `directpromptsid` repaint a
 live pane as `[0d] codex` and take over its `agent_session_id` (2026-09-24). When the
@@ -41,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 _TOOLS = str(Path(__file__).resolve().parents[1])
@@ -97,13 +100,9 @@ def runtime_identity():
       the statusline tap matched by pid + start time, for the hours a live process's
       registry file goes missing — F-25 tier 2);
     - Codex: a process named ``codex``/``codex-*`` is the runtime only once
-      `collectors.codex.session_id_of_process` proves its thread — the rollout it holds
-      open, else (a direct TUI holding none) the board's own `process_rollouts`
-      start-time match and then its same-cwd fallback over the live Codex processes,
-      scanned at most once per walk. A
-      Codex process proven neither way (the `--remote` TUI, `codex-code-mode-host`, an
-      ambiguous match) is passed over for the ancestor that is, and no proof anywhere
-      means ``("codex", None)``;
+      `collectors.codex.session_id_of_process` proves its thread through a held rollout
+      or the daemon loader's unique TUI PID. A process without either proof is passed
+      over for the ancestor that is, and no proof anywhere means ``("codex", None)``;
     - OpenCode: a process named ``opencode`` — its session id is the one its own TUI
       selection record proves, else ``("opencode", None)`` (a start-time ``--session``
       is not proof: the TUI may have switched since).
@@ -113,14 +112,8 @@ def runtime_identity():
     ``(None, None)`` when no runtime is found — CI, a detached helper, a test with a fake
     config dir.
     """
-    from fleet.collectors import procscan
     from fleet.process_identity import PROVEN, process_identity
-    pid, codex_seen, live = os.getpid(), False, []
-
-    def live_codex():
-        if not live:
-            live.append(procscan.scan(harness_filter={"codex"}))
-        return live[0]
+    pid, codex_seen = os.getpid(), False
 
     for _ in range(_MAX_ANCESTORS):
         if not pid or pid <= 1:
@@ -131,7 +124,7 @@ def runtime_identity():
         comm = _comm(pid)
         if comm == "codex" or comm.startswith("codex-"):
             codex_seen = True
-            found = process_identity(pid, "codex", live_codex=live_codex)
+            found = process_identity(pid, "codex")
             if found.confidence == PROVEN:
                 return "codex", found.session_id
         elif comm == "opencode":
@@ -149,13 +142,27 @@ def verified_pane(pane, harness, session_id=None, **kwargs):
     return verify(pane, harness, session_id, **kwargs)
 
 
+def _nearest_codex_pid():
+    """Return the nearest Codex process in this hook's ancestry, if any."""
+    pid = os.getpid()
+    for _ in range(_MAX_ANCESTORS):
+        if not pid or pid <= 1:
+            break
+        comm = _comm(pid)
+        if comm == "codex" or comm.startswith("codex-"):
+            return pid
+        pid = _parent(pid)
+    return None
+
+
 def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> bool:
     """The ONE decision whether this process may report ``session_id`` to herdr.
 
     - never for a registered/background worker (D-42);
-    - Claude and Codex: the nearest runtime above this process must be proven to be on
-      ``session_id`` (see `runtime_identity`); the payload and the environment
-      (``CODEX_THREAD_ID`` included) are never the proof;
+    - Claude: the nearest runtime above this process must be proven to be on
+      ``session_id`` (see `runtime_identity`); the payload and environment are never proof;
+    - Codex: process_identity must prove ``session_id`` for the foreground TUI in its
+      pane; a visible footer confirms it and rejects a different selection;
     - OpenCode: the nearest runtime must be OpenCode, and when that process proves its
       session (its TUI selection record) the id must match it. A process
       that proves none — an older TUI without the selection record — keeps the
@@ -170,9 +177,15 @@ def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> b
     runtime, own = runtime_identity()
     if runtime != harness:
         return False
+    pane = pane_id or os.environ.get("HERDR_PANE_ID")
+    if harness == "codex":
+        # The callback's exact thread id is checked against the TUI process identity;
+        # if a footer is visible, pane_ownership also rejects a conflicting selection.
+        pid = _nearest_codex_pid()
+        return bool(pid and verified_pane(pane, harness, session_id, pid=pid))
     if not (runtime == "opencode" and own is None) and own != session_id:
         return False
-    if not verified_pane(pane_id or os.environ.get("HERDR_PANE_ID"), harness, session_id):
+    if not verified_pane(pane, harness, session_id):
         return False
     return True
 
@@ -290,7 +303,7 @@ def refresh_tag_metadata(agents) -> None:
 
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
             label=None) -> tuple:
-    """→ ``(display_agent, title)`` in the fixed order number → harness → ⚑ → summary.
+    """→ ``(display_agent, title)`` in the fixed order number → ⚑ → harness → summary.
 
     ``label`` lets a user formatter rename the middle harness word; the badge and the
     steward mark stay ours, so a personal formatter cannot quietly delete the two things
@@ -304,9 +317,9 @@ def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None
     if title is None:
         title = session_title(harness, session_id)
     middle = sanitize_title(label) or harness or "agent"
-    agent = ("[%s] %s" % (tag, middle)) if tag else middle
     if steward:
-        agent += " " + _STEWARD_MARK
+        middle = _STEWARD_MARK + " " + middle
+    agent = ("[%s] %s" % (tag, middle)) if tag else middle
     return clip_cells(agent, _AGENT_W), clip_cells(sanitize_title(title), _TITLE_W)
 
 
@@ -314,7 +327,7 @@ _HEADER_W = 72           # herdr paints one string above the pane; give the summ
 
 
 def header_title(agent: str, title: str) -> str:
-    """`[6b] claude ⚑ 요약` — the ONE string herdr actually paints above the pane.
+    """`[6b] ⚑ claude 요약` — the ONE string herdr actually paints above the pane.
 
     `display_agent` is reported as well, but herdr does not paint it on the pane header.
     Measured 2026-09-10: four panes carried `[6b] claude` in `display_agent` for hours
@@ -322,7 +335,7 @@ def header_title(agent: str, title: str) -> str:
     something once `title` was filled — the user watched exactly that A/B happen and
     reported "제목은 뜨는데 id는 여전히 안뜨는데. 그게 중요한건데".
 
-    So the requested format — number, harness, steward mark, then the summary
+    So the requested format — number, steward mark, harness, then the summary
     (user 2026-09-09: "세션 번호를 herdr의 pane 상단 제목에 뜨게끔 하자 요약과 더불어서",
     "맨 앞에 harness 이름은 뜨게끔") — is joined here, into the field that reaches the
     header. The badge comes first and is never the part that gets clipped: a summary
@@ -373,6 +386,31 @@ _PROOF_WAIT_S = 90
 _THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def _codex_status_line_feasibility() -> str:
+    """Read only the current direct Codex frontend's known effective config."""
+    try:
+        from fleet.collectors import procscan
+        pid = _nearest_codex_pid()
+        if not pid or procscan.is_shared_codex_daemon(pid):
+            return "unknown"
+        argv = procscan._read_argv(pid)
+        if procscan.invocation_mode("codex", argv) != "session":
+            return "unknown"
+        env = procscan.read_environ(pid)
+        home = env.get("CODEX_HOME")
+        if not home and env.get("HOME"):
+            home = os.path.join(env["HOME"], ".codex")
+        if not home:
+            return "unknown"
+        utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        from codex_tui_config import status_line_capability_for_home
+        return status_line_capability_for_home(home, argv=argv)
+    except Exception:
+        return "unknown"
+
+
 def _in_shared_codex_service() -> bool:
     """True when this hook runs inside the shared background Codex service.
 
@@ -394,7 +432,8 @@ def _in_shared_codex_service() -> bool:
     return False
 
 
-def _defer_until_proven(session_id: str, report_session: bool) -> None:
+def _defer_until_proven(session_id: str, report_session: bool, *,
+                        session_seq=None, session_start_source=None) -> None:
     """Report a Codex session its own hook could not prove, once its TUI is proven.
 
     A Codex TUI started without the managed app-server attaches to the user's shared
@@ -406,10 +445,16 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
     """
     if not _THREAD_ID.fullmatch(session_id or ""):
         return
+    if _codex_status_line_feasibility() == "incapable":
+        return
     command = [sys.executable, str(Path(__file__).resolve()), "--harness", "codex",
                "--session-id", session_id, "--await-codex-tui"]
     if not report_session:
         command.append("--no-report-session")
+    if session_seq is not None:
+        command += ["--seq", str(session_seq)]
+    if session_start_source is not None:
+        command += ["--session-start-source", session_start_source]
     try:
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
@@ -417,29 +462,49 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
         pass
 
 
-def _codex_tui_pane(session_id: str):
-    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None.
+@contextmanager
+def _herdr_endpoint(socket_path):
+    """Use the proven frontend endpoint in this dedicated deferred reporter."""
+    inherited = os.environ.get("HERDR_SOCKET_PATH")
+    if socket_path:
+        os.environ["HERDR_SOCKET_PATH"] = socket_path
+    else:
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+    try:
+        yield
+    finally:
+        if inherited is None:
+            os.environ.pop("HERDR_SOCKET_PATH", None)
+        else:
+            os.environ["HERDR_SOCKET_PATH"] = inherited
 
-    Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
-    stay None: a badge on the wrong pane also misdirects peer messages.
+
+def _codex_tui_endpoint(session_id: str):
+    """The unique pane/socket pair whose live foreground Codex TUI proves ``session_id``."""
+    try:
+        from pane_ownership import codex_tui_pane_endpoint
+        return codex_tui_pane_endpoint(session_id)
+    except Exception:
+        return None
+
+
+def _codex_tui_pane(session_id: str, *, transport=None):
+    """The unique pane whose live foreground Codex TUI proves ``session_id``, or None.
+
+    Two panes resolving to one session stay unknown: a badge on the wrong pane
+    also misdirects peer messages.
     """
-    from fleet.collectors import procscan
-    panes = set()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or _comm(int(entry)) != "codex":
-            continue
-        pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
-        try:
-            if pane:
-                proven = verified_pane(pane, "codex", session_id, pid=int(entry))
-                if proven:
-                    panes.add(proven)
-        except Exception:
-            continue
-    return panes.pop() if len(panes) == 1 else None
+    pair = _codex_tui_endpoint(session_id)
+    if pair is None:
+        return None
+    pane, socket_path = pair
+    if transport is not None:
+        transport.update(socket_path=socket_path)
+    return pane
 
 
-def _await_tui_and_project(session_id: str, report_session: bool) -> None:
+def _await_tui_and_project(session_id: str, report_session: bool, *,
+                           session_seq=None, session_start_source=None) -> None:
     import fcntl
     import tempfile
     # One waiter per session: every later prompt's helper exits while one is waiting.
@@ -448,31 +513,78 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        lock.close()
         return
-    deadline = time.monotonic() + _PROOF_WAIT_S
-    while time.monotonic() < deadline:
-        pane = _codex_tui_pane(session_id)
-        if pane:
-            _report("codex", session_id, pane, report_session)
-            return
-        time.sleep(2)
+    try:
+        deadline = time.monotonic() + _PROOF_WAIT_S
+        while time.monotonic() < deadline:
+            endpoint = _codex_tui_endpoint(session_id)
+            if endpoint:
+                pane, socket_path = endpoint
+                with _herdr_endpoint(socket_path):
+                    _report("codex", session_id, pane, report_session,
+                            session_seq=session_seq, session_start_source=session_start_source,
+                            _proof=lambda: _codex_tui_endpoint(session_id) == endpoint)
+                return
+            time.sleep(2)
+    finally:
+        lock.close()
 
 
-def _session_lifecycle(harness, session_seq, session_start_source):
+def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None, *, session_id=None):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
-    if session_seq is None and session_start_source is None:
+    from .process_identity import native_resume_wire_argv
+
+    if session_seq is None and session_start_source is None and resume_argv is None:
         return {}
     max_seq = 9007199254740991 if harness == "opencode" else 18446744073709551615
     if (harness not in HARNESSES or type(session_seq) is not int
             or not 0 < session_seq <= max_seq
-            or session_start_source not in (None, "startup", "resume", "clear", "compact", "fork")):
+            or session_start_source not in (None, "startup", "resume", "select", "clear", "compact", "fork")):
         return None
-    return dict(session_seq=session_seq, session_start_source=session_start_source)
+    result = dict(session_seq=session_seq, session_start_source=session_start_source)
+    if resume_argv is not None:
+        wire_argv = (native_resume_wire_argv(resume_argv, harness, session_id)
+                     if session_start_source in {"resume", "select"}
+                     and isinstance(session_id, str) and session_id else None)
+        if wire_argv is None:
+            result.pop("resume_argv", None)
+        else:
+            result["resume_argv"] = wire_argv
+    return result
+
+
+def _native_opencode_lifecycle(session_id):
+    """Read lifecycle metadata only from this proven TUI's PID/birth selection record."""
+    try:
+        from fleet.process_identity import current_launch_context, is_native_resume_argv
+        from fleet.collectors import opencode
+        launch = current_launch_context("opencode", session_id)
+        if not launch:
+            return {}
+        record = opencode._tui_selection_record(launch["pid"], launch["proc_start"])
+        value = (record or {}).get("value") if isinstance(record, dict) else None
+        if not isinstance(value, dict) or value.get("sessionID") != session_id:
+            return {}
+        result = {}
+        sequence = value.get("sessionSeq")
+        source = value.get("sessionStartSource")
+        if type(sequence) is int and 0 < sequence <= 9007199254740991:
+            result["session_seq"] = sequence
+        if source in ("startup", "resume", "select", "clear", "compact", "fork"):
+            result["session_start_source"] = source
+        argv = launch.get("argv")
+        if (result.get("session_start_source") in {"resume", "select"}
+                and is_native_resume_argv(argv, "opencode", session_id)):
+            result["resume_argv"] = argv
+        return result
+    except Exception:
+        return {}
 
 
 def project(harness: str, session_id: str, *, pane_id=None, worker=None,
             report_session=True, observation=None, session_seq=None,
-            session_start_source=None) -> bool:
+            session_start_source=None, resume_argv=None) -> bool:
     """Report this session's pane metadata to herdr. Always returns True (fail-soft)."""
     harness = str(harness or "").lower()
     pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
@@ -491,13 +603,17 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if observation is not None:
             observation["reason"] = "pane-unavailable"
         if codex_main:
-            _defer_until_proven(session_id, report_session)
+            _defer_until_proven(session_id, report_session, session_seq=session_seq,
+                                session_start_source=session_start_source)
         return True
     if not may_report(harness, session_id, worker=worker, pane_id=pane):
         if observation is not None:
             observation["reason"] = "guard-refused"
-        if codex_main and runtime_identity() == ("codex", None):
-            _defer_until_proven(session_id, report_session)
+        if codex_main and runtime_identity()[0] == "codex":
+            pid = _nearest_codex_pid()
+            if pid and verified_pane(pane, "codex", pid=pid):
+                _defer_until_proven(session_id, report_session, session_seq=session_seq,
+                                    session_start_source=session_start_source)
         return True
     if report_session and session_seq is None and session_start_source is None:
         # A start may precede native process identity. The next existing callback
@@ -507,16 +623,41 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
             if utilities not in sys.path:
                 sys.path.insert(0, utilities)
             import session_tidy
-            session_start_source = session_tidy.session_start_source(harness, session_id, pane)
-            if session_start_source:
+            context = session_tidy.session_start_context(harness, session_id, pane)
+            session_seq = context.get("session_seq")
+            session_start_source = context.get("session_start_source")
+            resume_argv = context.get("resume_argv")
+            if harness == "opencode":
+                native = _native_opencode_lifecycle(session_id)
+                session_seq = native.get("session_seq", session_seq)
+                session_start_source = native.get("session_start_source", session_start_source)
+                resume_argv = native.get("resume_argv", resume_argv)
+            if session_start_source and session_seq is None:
                 session_seq = time.time_ns() if harness != "opencode" else time.time_ns() // 1000
+            if session_start_source == "resume" and resume_argv is None:
+                from fleet.process_identity import current_launch_context
+                from fleet.process_identity import is_native_resume_argv
+                launch = current_launch_context(harness, session_id)
+                argv = (launch or {}).get("argv")
+                if is_native_resume_argv(argv, harness, session_id):
+                    resume_argv = argv
         except Exception:
             session_start_source = None
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session, lifecycle = False, {}
+    if harness == "codex" and not may_report(harness, session_id, worker=worker, pane_id=pane):
+        # The start-source lookup above takes real time. A /new, resume or fork that landed
+        # meanwhile makes this callback historical: neither report may name the old session.
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-report"
+        return True
     if observation is not None:
         lifecycle["observation"] = observation
+    if harness == "codex":
+        lifecycle["_proof"] = lambda: may_report(
+            harness, session_id, worker=worker, pane_id=pane)
     _report(harness, session_id, pane, report_session, **lifecycle)
     return True
 
@@ -551,16 +692,27 @@ def _metadata_command(herdr, harness, session_id, pane):
 
 
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
-            observation=None, session_seq=None, session_start_source=None) -> None:
+            observation=None, session_seq=None, session_start_source=None, resume_argv=None,
+            _proof=None) -> None:
     herdr = shutil.which("herdr")
     if not herdr:
         if observation is not None:
             observation["reason"] = "herdr-unavailable"
         return
     source = "herdr:%s" % harness
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session = False
+    def current():
+        try:
+            return _proof is None or bool(_proof())
+        except Exception:
+            return False
+    if not current():
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-report"
+        return
     if report_session:
         session_command = [herdr, "pane", "report-agent-session", pane, "--source", source,
                            "--agent", harness, "--agent-session-id", session_id]
@@ -568,10 +720,16 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             session_command += ["--seq", str(session_seq)]
         if session_start_source is not None:
             session_command += ["--session-start-source", session_start_source]
+        if lifecycle.get("resume_argv"):
+            session_command += ["--", *lifecycle["resume_argv"]]
         # Publish the exact native identity before the number resolver observes
         # this new pane. Otherwise its first metadata report still uses the hash.
         _send_projection(session_command, observation)
     metadata = _metadata_command(herdr, harness, session_id, pane)
+    if not current():
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-metadata"
+        return
     if observation is not None and not report_session:
         observation["session_report"] = "skipped"
     _send_projection(metadata, observation)
@@ -599,7 +757,9 @@ def main(argv=None) -> int:
                         help="exit 0 when this process may report the session, else 1")
     args = parser.parse_args(argv)
     if args.await_codex_tui:
-        _await_tui_and_project(args.session_id, not args.no_report_session)
+        _await_tui_and_project(args.session_id, not args.no_report_session,
+                               session_seq=args.seq,
+                               session_start_source=args.session_start_source)
         return 0
     if args.may_report:
         return 0 if may_report(args.harness, args.session_id) else 1

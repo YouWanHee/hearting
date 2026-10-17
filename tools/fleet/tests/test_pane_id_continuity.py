@@ -1,6 +1,7 @@
 """Native same-pane resumes keep supervision, peer badges and current ID reporting."""
 import os
 import json
+import importlib.util
 from pathlib import Path
 import sys
 import tempfile
@@ -76,7 +77,7 @@ class PaneContinuityTest(unittest.TestCase):
                 self.assertEqual(child.steward_parents[0]["session_id"], "old")
             rows = render._build_lines([child, parent], [], "fleet", False, 0, term_width=100, layout="narrow")
             shown = "\n".join(render._plain(row) for row in rows if row)
-            self.assertIn("← " + self.repo.name + " [4d]", shown)
+            self.assertIn("← [4d]", shown)
             self.assertLess(shown.index("[4d]"), shown.index("[cb]"))
 
     def test_another_live_session_keeps_its_identity_and_pid_reuse_adds_no_alias(self):
@@ -123,6 +124,34 @@ class PaneContinuityTest(unittest.TestCase):
                  mock.patch.object(herdr_projection, "_report") as report:
                 herdr_projection.project(harness, "current", pane_id="w:p")
                 report.assert_not_called()
+
+    def test_codex_display_projection_keeps_resume_and_fork_lifecycle_out_of_metadata(self):
+        lifecycle_path = ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py"
+        lifecycle_spec = importlib.util.spec_from_file_location("codex_sessionstart_lifecycle_test",
+                                                                 lifecycle_path)
+        lifecycle = importlib.util.module_from_spec(lifecycle_spec)
+        lifecycle_spec.loader.exec_module(lifecycle)
+        projection_path = ROOT / "adapters/codex/hooks/herdr_session_projection.py"
+        projection_spec = importlib.util.spec_from_file_location("codex_herdr_projection_test",
+                                                                  projection_path)
+        projection = importlib.util.module_from_spec(projection_spec)
+        projection_spec.loader.exec_module(projection)
+        for source, current_thread in (("startup", "new-thread"),
+                                       ("resume", "resumed-thread"),
+                                       ("fork", "fork-current-thread")):
+            with self.subTest(source=source):
+                payload = {"hook_event_name": "SessionStart", "source": source,
+                           "session_id": current_thread}
+                self.assertEqual(lifecycle.session_id(payload), current_thread)
+                with mock.patch.object(projection, "_project", return_value=True) as publish, \
+                        mock.patch.object(projection.subprocess, "Popen"):
+                    self.assertTrue(projection.project(payload, current_thread))
+                args, kwargs = publish.call_args
+                self.assertEqual(args, ("codex", current_thread))
+                self.assertIs(kwargs["report_session"], False)
+                self.assertNotIn("session_seq", kwargs)
+                self.assertNotIn("session_start_source", kwargs)
+                self.assertNotIn("resume_argv", kwargs)
 
     def test_claude_pane_badge_survives_native_id_change(self):
         self.record("claude", "old", now=100)

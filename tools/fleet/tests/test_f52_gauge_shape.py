@@ -58,7 +58,8 @@ class F52bTrackLengthTest(unittest.TestCase):
 
     def _row(self, window, pct):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="idle",
-                          ctx_pct=pct, context_window_tokens=window)
+                          ctx_pct=pct, context_window_tokens=window,
+                          context_display_window_tokens=window)
         return render._context_detail_row(session, term_width=168)
 
     def test_row_track_follows_the_measured_window(self):
@@ -70,7 +71,8 @@ class F52bTrackLengthTest(unittest.TestCase):
     def test_no_depth_dependent_shrink_survives(self):
         """F-51a abolished the per-depth narrowing; length depends on the window only."""
         session = Session(harness="claude", pid=1, cwd="/x", liveness="idle", ctx_pct=50,
-                          context_window_tokens=1000000)
+                          context_window_tokens=1000000,
+                          context_display_window_tokens=1000000)
         for depth in (0, 1, 2, 3):
             row = render._context_detail_row(session, depth=depth, term_width=200)
             self.assertEqual(len(track_of(row)), 16)
@@ -119,7 +121,8 @@ class ContextDisplayRestraintTest(unittest.TestCase):
     def test_wide_detail_keeps_percent_but_hides_absolute_tokens(self):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="working",
                           ctx_pct=38, active_context_tokens=380000,
-                          context_window_tokens=1000000, summary="working now")
+                          context_window_tokens=1000000,
+                          context_display_window_tokens=1000000, summary="working now")
         row = render._context_detail_row(session, term_width=168)[0]
         text = "".join(value for value, _key in row)
         self.assertIn("38%", text)
@@ -130,7 +133,8 @@ class ContextDisplayRestraintTest(unittest.TestCase):
     def test_narrow_detail_also_hides_absolute_tokens(self):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="working",
                           ctx_pct=47, active_context_tokens=100000,
-                          context_window_tokens=200000, summary="working now")
+                          context_window_tokens=200000,
+                          context_display_window_tokens=200000, summary="working now")
         for width in (20, 22, 24, 60):
             with self.subTest(width=width):
                 text = "".join(value for value, _key in
@@ -141,7 +145,8 @@ class ContextDisplayRestraintTest(unittest.TestCase):
     def test_telemetry_remains_available_for_json_and_gauge_normalization(self):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="idle",
                           ctx_pct=38, active_context_tokens=380000,
-                          context_window_tokens=1000000)
+                          context_window_tokens=1000000,
+                          context_display_window_tokens=1000000)
         self.assertEqual(session.active_context_tokens, 380000)
         self.assertEqual(session.context_window_tokens, 1000000)
         self.assertEqual(len(track_of(render._context_detail_row(session, term_width=168))), 16)
@@ -170,7 +175,7 @@ class F100bLeadChipTest(unittest.TestCase):
 
     def _session(self, state="idle", **over):
         base = dict(harness="claude", pid=1, cwd="/x", liveness=state, ctx_pct=40,
-                    slug="s", elapsed_min=1)
+                    slug="s", elapsed_min=1, context_display_window_tokens=1000000)
         base.update(over)
         return Session(**base)
 
@@ -249,7 +254,8 @@ class F100bNarrowDegradeTest(unittest.TestCase):
 
     def _row(self, width, window=1000000, summary="NOW text here"):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="working", ctx_pct=63,
-                          context_window_tokens=window, summary=summary, herdr_attached=True)
+                          context_window_tokens=window, context_display_window_tokens=window,
+                          summary=summary, herdr_attached=True)
         return render._context_detail_row(session, term_width=width)[0]
 
     def _lead_text(self, row):
@@ -309,7 +315,8 @@ class F52WidthLedgerTest(unittest.TestCase):
 
     def test_row_starts_at_the_harness_name_column_and_fits_every_layout(self):
         session = Session(harness="claude", pid=1, cwd="/x", liveness="idle", ctx_pct=63,
-                          context_window_tokens=1000000, summary="NOW", herdr_attached=True)
+                          context_window_tokens=1000000, context_display_window_tokens=1000000,
+                          summary="NOW", herdr_attached=True)
         for width in (168, 138, 120, 100, 60):
             with self.subTest(width=width):
                 visible = "".join(v for v, _k in

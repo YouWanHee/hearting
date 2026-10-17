@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from fleet import gitinfo, render
+from fleet import display_snapshot, gitinfo, render
 from fleet import fleet as fleet_mod
 from fleet.collectors import procscan
 from fleet.model import DispatchJob, Session, project_of
@@ -364,8 +364,10 @@ class F51GitTelemetryTest(unittest.TestCase):
                         for harness in ("claude", "codex", "opencode"):
                             session = Session(harness=harness, pid=1, cwd=child)
                             job = DispatchJob(key="code", cwd=child, harness=harness)
-                            self.assertEqual(render._group_key_session(session), "home-os")
-                            self.assertEqual(render._group_key_job(job), "home-os")
+                            observations = display_snapshot.build([session], [job])
+                            with mock.patch("fleet.model.project_of", side_effect=AssertionError("lookup during draw")):
+                                self.assertEqual(render._group_key_session(session, observations), "home-os")
+                                self.assertEqual(render._group_key_job(job, display_snapshot=observations), "home-os")
 
     def test_project_path_fallback_keeps_worktree_precedence(self):
         cases = (("/x/home-os/.worktrees/foo", "home-os"),

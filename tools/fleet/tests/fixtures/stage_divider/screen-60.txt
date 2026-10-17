@@ -11,8 +11,8 @@
 
   SESSIONS   stack · press w to cycle
 ▾ ● bundle/
-▍ ⠋ [aa] claude     aa ▾4
-▍    ⚑  3h 00m      Opus (high)              -
+▍ ⠋ [aa] ⚑ claude   aa ▾4
+▍    ┆  3h 00m      Opus (high)              -
 ▍    ┆              ────────────────   —    … · age unknown
 ▍    ┆  ╭─  ⠋ claude   gpu-owner ─────────────────────────╮
 ▍    ┆  │  —        Opus (high)              code owner   │
@@ -27,7 +27,7 @@
 ▍    ┆  │   ⠋ codex    exec worker                        │
 ▍    ┆  │  3m       gpt-6.1-sol (medium)       code-exec… │
 ▍    ┆  │           running                               │
-▍    ┆  │        ────────────────   —                     │
+▍    ┆  │           ────────────────   —                  │
 ▍    ┆  ╰─────────────────────────────────────────────────╯
 ▍    ┆  ╭─  ⠋ opencode childless-owner ───────────────────╮
 ▍    ┆  │  —        gpt-6.1-sol (high)       code owner   │

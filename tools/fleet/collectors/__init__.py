@@ -263,6 +263,7 @@ def _adopt_child_titles(sessions, jobs):
         if not getattr(job, '_dispatch_context_owned', False):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
+                    'context_display_window_tokens', 'context_policy',
                     'session_input_tokens', 'session_cached_input_tokens',
                     'session_output_tokens', 'session_reasoning_output_tokens',
                     'session_total_tokens', 'exec_tool'):
@@ -419,7 +420,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     # match; additive enrichment that never touches liveness or row existence.
     try:
         from . import herdr as _herdr
-        observed = _herdr.enrich(sessions)
+        observed = _herdr.enrich(sessions, wait_timeout=0.0 if fast_first else 0.2)
         if isinstance(observed, dict):
             observations["herdr"] = _observation_health(
                 job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
@@ -455,6 +456,18 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         apply_session_aliases(sessions)
     except Exception:
         pass
+
+    # The journal wait joins after exact resume aliases and before the one liveness pass.
+    try:
+        from . import interaction as _interaction
+        for failed_session, reason in _interaction.enrich_human_gates(sessions, jobs_path=jobs_path) or ():
+            identity = "%s:%s" % (getattr(failed_session, "harness", "unknown"),
+                                   getattr(failed_session, "session_id", "unknown"))
+            observations["human-gates:" + identity] = _observation_health(
+                identity, "human-gates", reason)
+    except Exception as exc:
+        observations["human-gates"] = _observation_health(
+            job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
 
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
     tag_metadata = []
@@ -692,6 +705,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     observations["jobs"] = _observation_health(job_key, "jobs", job_error)
+    from ..display_snapshot import build as build_display_snapshot
+    display_snapshot = build_display_snapshot(sessions, jobs, resource_jobs)
     snapshot = LiveSnapshot(
         sessions=sessions, jobs=jobs, resources=resource_jobs,
         usage_snapshots=usage_snapshots, node_evidence=node_evidence,
@@ -699,6 +714,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         malformed=malformed,
         resource_diagnostics=copy.deepcopy(resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
+        display_snapshot=display_snapshot,
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities

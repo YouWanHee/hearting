@@ -22,6 +22,11 @@ Each tuple answers "may the parent of a dispatch-depth-2 node spawn that child?"
 readiness generator so the caller never has to reproduce the prospective-owner context or
 assemble the evidence schema by hand.
 
+Automatic `compose` and post-frame proposal assembly inspect every enabled prospective owner
+against the selected child pool and seal each actual owner/worktree probe. Keep a manual
+`--owner-harness` invocation scoped to diagnosing that exact target; automatic selection uses
+the sealed evidence and the existing allocation policy.
+
 ```bash
 python3 "$AGENT_HOME/utilities/dispatch-readiness.py" \
   --worktree "$WORKTREE" --jobs "$CANONICAL_JOBS" \
@@ -133,8 +138,8 @@ instead of degrading to an inline run of a node whose own recorded state, not ru
 what is blocking it — most often `capability-route.py revise --route <route> --node <node> --evidence
 <evidence-path> --basis review-findings|user-direction|owner-correction` when the gate's evidence
 changed after its marker published (opt-in gates only; with gates off, the default, the edit is
-kept as history and the node proceeds). For case 3, record reasoning in
-`plans/<slug>/_internal/metrics.md`; an unrecorded inline standard+ run violates the contract.
+kept as history and the node proceeds). For case 3, record reasoning in the
+selected node's declared output; an unrecorded inline standard+ run violates the contract.
 Still parallelize separable census or disjoint file groups. The Claude stage-dispatch hook
 only reminds you of this list; it does not deny the in-session run.
 
@@ -431,7 +436,7 @@ The boundary run is a separate step because `tools/sync-missing-projections.py` 
 
 ### Step 6: Pipeline Summary
 
-Before writing shared singleton files such as `pipeline_summary.md` or `pipeline_state.yaml`, acquire the OPERATIONS §5.8 `.pipeline-lock` and release it immediately after the write. Spec updates also use their owning Skill's lock. `plans/<cycle>/` remains path-separated. On lock exit 3, stop the write and report.
+Before writing shared singleton files such as `pipeline_summary.md` or `pipeline_state.yaml`, acquire the OPERATIONS §5.8 `.pipeline-lock` and release it immediately after the write. Spec updates also use their owning Skill's lock. Cycle ownership remains path-separated. On lock exit 3, stop the write and report.
 
 Write the dev-mode summary, then report its path and a two- or three-line verdict.
 

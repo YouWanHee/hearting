@@ -17,21 +17,22 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear | --no-continue]
         Queue the memory tidy and return at once (one line); the detached runner
         ``session_tidy_runner.py`` does the work and leaves a result notice.  Inside
-        herdr it also books the window's auto-clear and the continue prompt after it
+        herdr it also books the window's auto-clear and continuation after it
         (``session_tidy_clear.py``); ``--no-clear`` keeps the window and cancels a pending
-        booking, ``--no-continue`` clears without typing anything after it.
+        booking, ``--no-continue`` clears without a continuation action.
     session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
         Deliver this seat's card to a peer session through ``peer-steward.py prompt``
-        and report its typed verdict (``prompted=...``) and exit code on one line.  The
+        and report its structured delivery verdict and exit code on one line. The
         card is marked as handed off: this window is not continued from it.
 
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 (directories 0700, files 0600, temp file + rename, symlinks refused):
 
-    cards/<seat>.json|.md   latest card (canonical JSON + readable text)
-    card-history/<seat>/    bounded older cards
+    cards/<card>.json|.md latest card (canonical JSON + readable text)
+    card-history/<card>/   bounded older cards
+    consumed/<card>.json   receipts by card key: pane/native use the seat key; project seats use the author session
+    project-latest/<seat>.json  newest project-seat card's author
     sessions/<seat>.jsonl   seat ledger: one line per hook/card event
-    consumed/<seat>.json    who already received the latest card generation (+ the "참고할 기억" revision)
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
@@ -41,12 +42,9 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 
 The seat is the herdr pane only when ``pane_ownership`` verifies its live connection,
 else harness + project. ``HERDR_PANE_ID`` is only a lookup hint.
-A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
-pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
-caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
-a ``/clear``), else the one whose confirmed auto-clear named exactly this thread as its new session,
-else -- for the first hook after an auto-clear -- the one window waiting for its successor.  No
-match or several -> the project seat, quietly.
+A Codex caller's ``CODEX_THREAD_ID`` supplies its exact thread; pane_ownership maps that
+thread to the foreground TUI PID and confirms herdr's pane process info. If no unique pane
+can be proved, the project seat is used quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """
@@ -72,18 +70,42 @@ from typing import Callable, Iterator, Optional
 SCHEMA = 1
 HARNESSES = ("claude", "codex", "opencode")
 CARD_BODY_MAX_BYTES = 8 * 1024
+COMPACT_SUMMARY_MAX_BYTES = 256 * 1024
+COMPACT_RECENT_MAX_BYTES = 8 * 1024
+COMPACT_METADATA_MAX_BYTES = 1024
+COMPACT_CARD_BODY_MAX_BYTES = COMPACT_SUMMARY_MAX_BYTES + COMPACT_RECENT_MAX_BYTES + COMPACT_METADATA_MAX_BYTES
 INJECTION_MAX_BYTES = 2400
 MEMORY_REFS_MAX = 8                 # "참고할 기억" (card layer B): records listed
 MEMORY_REFS_BYTES = 1200            # ... and the bytes their lines may take
-CARD_MIN_WHEN_BUNDLED = 900         # the card keeps at least this much room when B rides along
+CARD_FIRST_REPLY_GUIDANCE = (
+    "[첫 답] 이 카드로 이어받은 첫 답 맨 앞에, 도구 호출 전에, 사용자의 언어로 "
+    "'하던 일 · 남은 일 · 다음 할 일' 세 머리말을 써서 5줄 안팎 요약을 한 번 보여 준 뒤 "
+    "이어서 하세요. 사용자가 이어서하기 대신 다른 지시를 먼저 주면 요약을 생략하고 그 지시만 따르세요."
+)
+# Keep the previous body allowance when memory references ride along.
+CARD_MIN_WHEN_BUNDLED = 900 + len(CARD_FIRST_REPLY_GUIDANCE.encode("utf-8")) + 1
 NOTICE_MAX_BYTES = 500
 CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
 LEDGER_KEEP_RAW = 100
 HANDOVER_KEEP_ROWS = 40
+TIDY_CLAIM_KEEP_ROWS = 64
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
+COMPACT_LOCK_WAIT_SEC = 1.0         # a compact hook waits this long for the seat lock, never longer
+COMPACT_HOOK_BUDGET_SEC = 3.5       # worker-state bridge has a hard 4 s timeout
+COMPACT_CARD_SEAT_KINDS = ("pane", "native")   # seats of one session; never the shared project seat
+# The runtime compaction summary doubles as the seat card (capabilities/session-tidy.md):
+# the card's fields and order, in the user's language.
+COMPACT_CARD_INSTRUCTIONS = (
+    "Write this summary as a session handoff card in the user's language, with these six "
+    "fields in this order: work in progress; waiting decisions; next actions; related "
+    "references (paths, PRs, sessions); today's work (with PR, installed version or result "
+    "file pointers); user instructions (brief quotes, each marked finished, remaining or "
+    "deferred). Keep the details needed to continue the work inside those fields, within "
+    "about 90 lines."
+)
 
 
 class StateError(Exception):
@@ -170,14 +192,29 @@ def read_json(path: Path):
 
 
 @contextlib.contextmanager
-def seat_lock(seat_key: str) -> Iterator[None]:
-    """Serialize hook consumption, ledger appends and card writes for one seat."""
+def seat_lock(seat_key: str, *, wait: Optional[float] = None) -> Iterator[None]:
+    """Serialize hook consumption, ledger appends and card writes for one seat.
+
+    ``wait`` bounds the wait in seconds (``None``: as long as it takes); a lock still
+    held after it raises ``BlockingIOError``.
+    """
     lock_dir = ensure_dir(state_root() / "locks")
     path = lock_dir / f"{seat_key}.lock"
     _reject_symlink(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
         yield
     finally:
         with contextlib.suppress(OSError):
@@ -195,6 +232,20 @@ def iso_utc(epoch: float) -> str:
 
 def _digest(*parts: str, size: int = 20) -> str:
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:size]
+
+
+def _endpoint_scope(env=None) -> str:
+    """A pane id is local to its Herdr endpoint; keep named sockets in separate seats."""
+    env = os.environ if env is None else env
+    server = str(env.get("AGENT_HERDR_SESSION") or "").strip()
+    socket_path = str(env.get("HERDR_SOCKET_PATH") or "").strip()
+    if socket_path:
+        # The socket is the concrete endpoint identity shared by direct and
+        # deferred reporters; a configured server name may be absent there.
+        return _digest("herdr-endpoint", "socket", os.path.realpath(socket_path))
+    if not server:
+        return ""                 # retain the original default-server key
+    return _digest("herdr-endpoint", "session", server)
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +270,18 @@ def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[
     Read by `session_identity`; with several harnesses' ids inherited and none
     named, the first in its claude, codex, opencode order answers.
     """
+    live_process = env is None
+    env = os.environ if env is None else env
     from session_identity import identity, session_ids
     sessions = session_ids(env)
+    if live_process and env.get("HERDR_PANE_ID"):
+        named = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
+        if (harness in (None, "codex") and (not named or named == "codex")
+                and sessions.get("codex")):
+            from pane_ownership import current_codex_thread_for_caller
+            current = current_codex_thread_for_caller(env.get("HERDR_PANE_ID"))
+            if current is not None:
+                return "codex", current or None
     if harness:
         session_id = sessions.get(harness, (None, None))[0]
         return harness, session_id.strip() if session_id else None
@@ -287,19 +348,26 @@ class Seat:
     harness: str = ""
     project_key: str = ""
     native: Optional[dict] = None
+    sid: str = ""
+    endpoint: str = ""
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
                   "harness": self.harness, "project_key": self.project_key}
         if self.native is not None:
             result["native"] = self.native
+        if self.sid:
+            result["sid"] = self.sid
+        if self.endpoint:
+            result["endpoint"] = self.endpoint
         return result
 
 
 def seat_from_dict(data: dict) -> Seat:
     return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
                 str(data.get("pane") or ""), str(data.get("harness") or ""),
-                str(data.get("project_key") or ""), data.get("native"))
+                str(data.get("project_key") or ""), data.get("native"),
+                str(data.get("sid") or ""), str(data.get("endpoint") or ""))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -324,7 +392,12 @@ def _herdr_codex_agents() -> Optional[list[dict]]:
     if not exe:
         return None
     try:
-        done = subprocess.run([exe, "agent", "list"], capture_output=True, text=True,
+        server = os.environ.get("AGENT_HERDR_SESSION")
+        command = [exe]
+        if server:
+            command += ["--session", server]
+        command += ["agent", "list"]
+        done = subprocess.run(command, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
         agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
@@ -346,7 +419,9 @@ def _real(path) -> str:
 
 
 def _pane_seat_of(pane: str) -> Seat:
-    return Seat("pane", _digest("pane", pane), pane, "codex", "")
+    endpoint = _endpoint_scope()
+    key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+    return Seat("pane", key, pane, "codex", "", endpoint=endpoint)
 
 
 def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
@@ -432,19 +507,31 @@ def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
 def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
                  source: str = "") -> Seat:
     env = os.environ if env is None else env
-    pane = (env.get("HERDR_PANE_ID") or "").strip()
-    if not pane and harness == "codex" and sid:
+    live_caller = env is os.environ
+    pane = ((env.get("HERDR_PANE_ID") or "").strip()
+            if live_caller or harness != "codex" else "")
+    server = env.get("AGENT_HERDR_SESSION") if live_caller else None
+    socket_value = env.get("HERDR_SOCKET_PATH", "") if live_caller else ""
+    endpoint_unproven = bool(harness == "codex" and server and not socket_value)
+    if live_caller and not endpoint_unproven and not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
     from pane_ownership import verified_pane
-    pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
+    socket_path = (env.get("HERDR_SOCKET_PATH", "")
+                   if live_caller and harness == "codex" else None)
+    if (live_caller or harness != "codex") and not endpoint_unproven:
+        pane = verified_pane(pane, harness, sid, executable=_herdr_executable(),
+                             server=server, socket_path=socket_path)
     if pane:
-        return Seat("pane", _digest("pane", pane), pane, harness or "", "")
+        endpoint = _endpoint_scope(env if live_caller else {})
+        key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+        return Seat("pane", key, pane, harness or "", "", endpoint=endpoint)
     from session_tidy_native import caller_target
     native = caller_target(harness, env)
     if native:
         return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
                     harness=harness or "", native=native)
-    return seat_for_project(harness or "unknown", project_key_for(cwd))
+    project = seat_for_project(harness or "unknown", project_key_for(cwd))
+    return dataclasses.replace(project, sid=sid or "")
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +555,108 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
     return entries
 
 
+def _append_ledger_entry(seat: Seat, entry: dict) -> None:
+    """Append a caller-locked ledger row and fold without dropping tidy provenance."""
+    path = _ledger_path(seat)
+    ensure_dir(path.parent)
+    _reject_symlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    _fold_ledger(seat)
+
+
+def record_tidy_claim(seat: Seat, *, harness: str, sid: str, claim_id: str, nonce: str,
+                      token: str, digest: str, origin: str, operation_id: str,
+                      sent_seq: int, state: str, now: Optional[float] = None,
+                      arrival_seq: Optional[int] = None, target_sid: str = "",
+                      acceptance: Optional[dict] = None) -> None:
+    """Persist one claim transition in the existing seat ledger (caller holds its lock)."""
+    if not claim_id or not nonce or not token or not digest or harness not in HARNESSES or not sid:
+        return
+    entry = {"ts": now_epoch() if now is None else now, "harness": harness, "sid": sid,
+             "event": "tidy-claim", "claim_id": claim_id[:96], "nonce": nonce[:64],
+             "token": token[:64], "digest": digest[:64], "origin": origin[:24],
+             "operation_id": operation_id[:96], "sent_seq": max(0, int(sent_seq)),
+             "state": state[:24]}
+    if target_sid:
+        entry["target_sid"] = target_sid[:160]
+    if arrival_seq is not None and not isinstance(arrival_seq, bool) and int(arrival_seq) >= 0:
+        entry["arrival_seq"] = int(arrival_seq)
+    if isinstance(acceptance, dict):
+        entry["acceptance"] = acceptance
+    _append_ledger_entry(seat, entry)
+
+
+def tidy_claim_by_id(seat: Seat, claim_id: str) -> Optional[dict]:
+    if not claim_id:
+        return None
+    return next((row for row in reversed(_read_ledger_lines(seat))
+                 if row.get("event") == "tidy-claim" and row.get("claim_id") == claim_id), None)
+
+
+def matching_tidy_claim(seat: Seat, harness: str, sid: str, prompt: str, sequence: int) -> Optional[dict]:
+    """Find an exact, still-classifiable request claim for this session and prompt boundary."""
+    if not prompt or harness not in HARNESSES or not sid:
+        return None
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    latest: dict[str, dict] = {}
+    for row in _read_ledger_lines(seat):
+        if row.get("event") == "tidy-claim" and row.get("claim_id"):
+            latest[str(row["claim_id"])] = row
+    candidates = [row for row in latest.values()
+                  if row.get("harness") == harness and row.get("digest") == digest
+                  and row.get("state") not in {"released", "superseded"}
+                  and int(row.get("sent_seq", sequence) or 0) < sequence
+                  and row.get("target_sid") in (None, "", sid)
+                  and (row.get("sid") == sid or row.get("target_sid") == sid
+                       or row.get("origin") in ("status-only", "continue") and row.get("sid") == "-")]
+    return max(candidates, key=lambda row: (int(row.get("sent_seq", 0) or 0), float(row.get("ts", 0) or 0)),
+               default=None)
+
+
+def real_prompt_frontier(seat: Seat, harness: str, sid: str) -> Optional[dict]:
+    """Latest actual user prompt for this exact session, independent of ledger throttling."""
+    rows = [row for row in _read_ledger_lines(seat)
+            if row.get("event") == "real-prompt" and row.get("harness") == harness and row.get("sid") == sid]
+    return max(rows, key=lambda row: int(row.get("sequence", 0) or 0), default=None)
+
+
+def record_real_prompt(seat: Seat, harness: str, sid: str, sequence: int, now: float) -> None:
+    """Persist user activity after prompt-source classification (caller holds the seat lock)."""
+    _append_ledger_entry(seat, {"ts": now, "harness": harness, "sid": sid,
+                                "event": "real-prompt", "sequence": max(0, int(sequence))})
+
+
+def mark_prompt_source(seat: Seat, harness: str, sid: str, sequence: int, source: str,
+                       claim_id: str = "") -> None:
+    """Tag the current physical prompt boundary after its exact source has been classified."""
+    path = _prompt_seq_path(seat)
+    current = read_json(path)
+    if (not isinstance(current, dict) or int(current.get("seq", -1)) != sequence
+            or current.get("harness") != harness or current.get("sid") != sid):
+        return
+    current["source"] = source
+    if claim_id:
+        current["claim_id"] = claim_id[:96]
+    else:
+        current.pop("claim_id", None)
+    atomic_write_json(path, current)
+
+
+def prompt_state(seat: Seat) -> Optional[dict]:
+    data = read_json(_prompt_seq_path(seat))
+    return data if isinstance(data, dict) else None
+
+
 def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") == "handover":     # a relation row (dispatch_seat_handover), not a session event
+        if item.get("event") in {"handover", "tidy-claim", "real-prompt"}:
+            # Relations and prompt provenance are not session activity timestamps.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
         row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
@@ -529,18 +713,49 @@ def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[st
 
 def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
     """The recorded native start source, not a new or inferred lifecycle event."""
+    return session_start_context(harness, sid, pane).get("session_start_source")
+
+
+def session_start_context(harness: str, sid: str, pane: str) -> dict:
+    """Return the latest native start details for this exact pane seat and session."""
     if harness not in HARNESSES or not sid or not pane:
-        return None
+        return {}
     for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
-        if row.get("harness") == harness and row.get("sid") == sid and row.get("event") == "start":
-            source = row.get("source")
-            return source if source in {"startup", "resume", "clear", "compact", "fork"} else None
-    return None
+        if row.get("harness") != harness or row.get("sid") != sid:
+            continue
+        if row.get("event") != "start" and not row.get("start_at"):
+            continue
+        source = (row.get("source") if row.get("event") == "start"
+                  else row.get("latest_start_source", row.get("start_source")))
+        context = {}
+        if source in {"startup", "resume", "select", "clear", "compact", "fork"}:
+            context["session_start_source"] = source
+        sequence = row.get("session_seq", row.get("latest_start_seq", row.get("start_seq")))
+        if sequence is None and context.get("session_start_source"):
+            started = (row.get("ts") if row.get("event") == "start"
+                       else row.get("latest_start_at", row.get("start_at")))
+            if isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0:
+                sequence = int(started * 1_000_000)
+        if type(sequence) is int and sequence > 0:
+            context["session_seq"] = sequence
+        transcript = row.get("transcript")
+        if isinstance(transcript, str) and transcript:
+            context["transcript"] = transcript
+        resume_argv = row.get("resume_argv")
+        if source in {"resume", "select"} and isinstance(resume_argv, list) and resume_argv:
+            context["resume_argv"] = resume_argv
+        launch_cwd = row.get("launch_cwd")
+        if isinstance(launch_cwd, str) and launch_cwd:
+            context["launch_cwd"] = launch_cwd
+        return context
+    return {}
 
 
 def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
-                 bump_epoch: bool = False) -> dict:
+                 bump_epoch: bool = False, compact_identity: str = "",
+                 resume_argv=None, launch_cwd: str = "",
+                 compact_context: Optional[dict] = None) -> dict:
     """Append one ledger line (caller holds the seat lock). Returns the session row."""
     now = now_epoch() if now is None else now
     summary = session_summary(seat).get((harness, sid))
@@ -553,21 +768,38 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
     entry = {"ts": now, "harness": harness, "sid": sid, "event": event, "epoch": epoch}
     if source:
         entry["source"] = source
+    if event == "start" and source in {"startup", "resume", "select", "clear", "compact", "fork"}:
+        entry["session_seq"] = max(1, int(now * 1_000_000))
+    if event == "start" and source in {"resume", "select"} and isinstance(resume_argv, list):
+        valid = (resume_argv and len(resume_argv) <= 64
+                 and resume_argv[0] in {"claude", "codex", "opencode"}
+                 and sid in resume_argv
+                 and all(isinstance(arg, str) and arg and "\0" not in arg for arg in resume_argv))
+        if valid and sum(len(arg.encode("utf-8", "surrogatepass")) for arg in resume_argv) <= 8192:
+            entry["resume_argv"] = list(resume_argv)
+            if isinstance(launch_cwd, str) and launch_cwd.startswith("/"):
+                entry["launch_cwd"] = launch_cwd
     if transcript:
         entry["transcript"] = transcript
     if cwd:
         entry["cwd"] = cwd
+    if event == "compact" and compact_identity:
+        entry["compact_identity"] = compact_identity
+    if event == "compact" and compact_context:
+        limits = {"identity": 64, "trigger": 8, "transcript": 440, "transcript_identity": 64,
+                  "turn_id": 96, "summary_id": 96, "parent_id": 96, "tail_start_id": 96,
+                  "compaction_part_id": 96}
+        compact = {key: _cut_bytes(str(compact_context[key]), limit)[0]
+                   for key, limit in limits.items() if compact_context.get(key) is not None}
+        for key in ("boundary_offset", "prompt_seq", "card_generation"):
+            value = compact_context.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                compact[key] = value
+        compact["card_request_required"] = compact_context.get("card_request_required") is True
+        entry["compact"] = compact
     if summary is None:
         entry["first_seen"] = now
-    path = _ledger_path(seat)
-    ensure_dir(path.parent)
-    _reject_symlink(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
-    _fold_ledger(seat)
+    _append_ledger_entry(seat, entry)
     return session_summary(seat).get((harness, sid), entry)
 
 
@@ -578,9 +810,21 @@ def _fold_ledger(seat: Seat) -> None:
         return
     # Handover rows (A -> B, with their bindings) are the seat's authority record: they stay raw.
     relations = [l for l in lines if l.get("event") == "handover"][-HANDOVER_KEEP_ROWS:]
-    lines = [l for l in lines if l.get("event") != "handover"]
-    recent = lines[-LEDGER_KEEP_RAW:]
-    older = lines[:-LEDGER_KEEP_RAW]
+    claims: dict[str, dict] = {}
+    real_frontiers: dict[tuple[str, str], dict] = {}
+    activity = [l for l in lines if l.get("event") not in {"handover", "tidy-claim", "real-prompt"}]
+    for item in lines:
+        if item.get("event") == "tidy-claim" and item.get("claim_id"):
+            claims[str(item["claim_id"])] = item
+        elif item.get("event") == "real-prompt":
+            key = (str(item.get("harness") or ""), str(item.get("sid") or ""))
+            prior = real_frontiers.get(key)
+            if prior is None or int(item.get("sequence", 0) or 0) >= int(prior.get("sequence", 0) or 0):
+                real_frontiers[key] = item
+    claim_rows = sorted(claims.values(), key=lambda row: float(row.get("ts", 0) or 0))[-TIDY_CLAIM_KEEP_ROWS:]
+    provenance = claim_rows + list(real_frontiers.values())
+    recent = activity[-LEDGER_KEEP_RAW:]
+    older = activity[:-LEDGER_KEEP_RAW]
     folded: dict[tuple[str, str], dict] = {}
     for item in older:
         key = (str(item.get("harness") or ""), str(item["sid"]))
@@ -589,15 +833,31 @@ def _fold_ledger(seat: Seat) -> None:
         row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
         row["ts"] = max(row["ts"], item.get("ts", 0))
         row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
-        start_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
-        start_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
-        if ("start_at" not in row and start_source in {"startup", "resume", "clear", "compact", "fork"}
-                and isinstance(start_at, (int, float)) and not isinstance(start_at, bool) and start_at > 0):
-            row.update(start_source=start_source, start_at=start_at)
+        origin_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
+        origin_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
+        if (origin_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(origin_at, (int, float)) and not isinstance(origin_at, bool) and origin_at > 0
+                and (not row.get("start_at") or origin_at < float(row["start_at"]))):
+            row.update(start_source=origin_source, start_at=origin_at)
+
+        latest_source = (item.get("source") if item.get("event") == "start"
+                         else item.get("latest_start_source", item.get("start_source")))
+        latest_at = (item.get("ts") if item.get("event") == "start"
+                     else item.get("latest_start_at", item.get("start_at")))
+        if (latest_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(latest_at, (int, float)) and not isinstance(latest_at, bool) and latest_at > 0
+                and latest_at >= float(row.get("latest_start_at", 0) or 0)):
+            row.update(latest_start_source=latest_source, latest_start_at=latest_at,
+                       start_seq=item.get("session_seq", item.get("start_seq")))
+            for field in ("resume_argv", "launch_cwd"):
+                row.pop(field, None)
+                if field in item:
+                    row[field] = item[field]
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
-    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + relations + recent)
+    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
+                    for r in list(folded.values()) + relations + provenance + recent)
     atomic_write(_ledger_path(seat), body.encode("utf-8"))
 
 
@@ -605,18 +865,68 @@ def _fold_ledger(seat: Seat) -> None:
 # Cards
 # ---------------------------------------------------------------------------
 
+def card_key(seat: Seat) -> str:
+    """Return the storage key for this author; sid-less project calls retain the shared legacy key."""
+    if seat.kind != "project" or not seat.sid:
+        return seat.key
+    keyed = _digest("project-card", seat.key, seat.sid)
+    if (state_root() / "cards" / f"{keyed}.json").exists():
+        return keyed
+    # Keep the old shared file and its history/receipts with its original author.
+    legacy = read_json(state_root() / "cards" / f"{seat.key}.json")
+    author = legacy.get("author") if isinstance(legacy, dict) else None
+    if isinstance(legacy, dict) and legacy.get("schema") == SCHEMA and isinstance(legacy.get("body"), str) \
+            and isinstance(author, dict) \
+            and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid):
+        return seat.key
+    return keyed
+
+
 def card_json_path(seat: Seat) -> Path:
-    return state_root() / "cards" / f"{seat.key}.json"
+    return state_root() / "cards" / f"{card_key(seat)}.json"
 
 
 def card_text_path(seat: Seat) -> Path:
-    return state_root() / "cards" / f"{seat.key}.md"
+    return state_root() / "cards" / f"{card_key(seat)}.md"
+
+
+def _project_latest_path(seat: Seat) -> Path:
+    return state_root() / "project-latest" / f"{seat.key}.json"
+
+
+def read_latest_project_card(seat: Seat) -> tuple[Optional[dict], Seat]:
+    """Read the pointed-to project card in constant time, or the pre-pointer shared card."""
+    path = _project_latest_path(seat)
+    pointer = read_json(path)
+    if path.exists() or path.is_symlink():
+        if not isinstance(pointer, dict):
+            return None, seat
+        harness, sid = pointer.get("harness"), pointer.get("sid")
+        if not isinstance(harness, str) or not harness or not isinstance(sid, str) or not sid:
+            return None, seat
+        chosen = dataclasses.replace(seat, harness=harness, sid=sid)
+        card = read_latest_card(chosen)
+        author = (card or {}).get("author") or {}
+        if not card or (author.get("harness"), author.get("sid")) != (harness, sid):
+            return None, seat
+        return card, chosen
+    # One fixed legacy path is the only fallback; never enumerate author card files.
+    card = read_latest_card(dataclasses.replace(seat, sid=""))
+    if not card:
+        return None, seat
+    author = card.get("author") or {}
+    harness, sid = author.get("harness") or seat.harness, author.get("sid") or ""
+    return card, dataclasses.replace(seat, harness=harness, sid=sid)
+
+
+def _normalize_body(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    text = "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
+    return text.strip()
 
 
 def sanitize_body(text: str) -> str:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
-    text = "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
-    return _cut_bytes(text.strip(), CARD_BODY_MAX_BYTES)[0]
+    return _cut_bytes(_normalize_body(text), CARD_BODY_MAX_BYTES)[0]
 
 
 def _cut_bytes(text: str, limit: int) -> tuple[str, bool]:
@@ -633,11 +943,54 @@ def read_latest_card(seat: Seat) -> Optional[dict]:
     return None
 
 
+def _write_card_pair(seat: Seat, card: dict, *, rollback_on_error: bool = False) -> None:
+    json_path, text_path = card_json_path(seat), card_text_path(seat)
+    old_json = read_bytes(json_path) if rollback_on_error else None
+    old_text = read_bytes(text_path) if rollback_on_error else None
+    try:
+        atomic_write_json(json_path, card)
+        atomic_write(text_path, render_card_text(card).encode("utf-8"))
+    except BaseException:
+        if rollback_on_error:
+            for path, old in ((json_path, old_json), (text_path, old_text)):
+                try:
+                    if old is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        atomic_write(path, old)
+                except OSError:
+                    pass
+        raise
+
+
 def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
-               now: Optional[float] = None, prompt_seq: Optional[int] = None) -> dict:
-    """Write the seat's newest card (caller holds the seat lock)."""
+               now: Optional[float] = None, prompt_seq: Optional[int] = None,
+               origin: Optional[str] = None, compact_context: Optional[dict] = None) -> dict:
+    """Write this author's newest card (caller holds the shared seat lock)."""
     now = now_epoch() if now is None else now
-    body = sanitize_body(body)
+    compact = None
+    if origin == "runtime-compact":
+        summary_text = _normalize_body(body)
+        if not summary_text:
+            raise ValueError("empty compact summary")
+        if len(summary_text.encode("utf-8")) > COMPACT_SUMMARY_MAX_BYTES:
+            raise ValueError("compact summary exceeds admission limit")
+        compact = dict(compact_context or {})
+        metadata_limits = {"trigger": 8, "transcript": 440, "summary_id": 96,
+                           "parent_id": 96, "tail_start_id": 96, "compaction_part_id": 96,
+                           "transcript_identity": 64, "identity": 64}
+        for key, limit in metadata_limits.items():
+            value = compact.get(key)
+            if value is not None:
+                compact[key] = _cut_bytes(str(value), limit)[0]
+        boundary = compact.get("boundary_offset")
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or boundary < 0:
+            compact.pop("boundary_offset", None)
+        compact.update(summary=summary_text, recent="", recent_partial=False)
+        compact["source"] = compact.get("transcript") or ""
+        body = _compact_body(compact)
+    else:
+        body = sanitize_body(body)
     summary = session_summary(seat).get((harness, sid))
     previous = read_latest_card(seat)
     generation = int(previous.get("generation", 0)) + 1 if previous else 1
@@ -651,19 +1004,61 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
         "cwd": cwd,
         "body": body,
     }
+    if compact is not None:
+        card["compact"] = compact
+    if origin:
+        card["origin"] = origin
     if prompt_seq is not None:
         card["prompt_seq"] = int(prompt_seq)    # lets enqueue notice a prompt typed after the card
     if previous and isinstance(previous.get("memory_refs"), dict):
         card["memory_refs"] = previous["memory_refs"]   # layer B outlives the card: only its revision moves it
+    _write_card_pair(seat, card, rollback_on_error=compact is not None)
     if previous:
-        history = ensure_dir(state_root() / "card-history" / seat.key)
-        atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
-        for old in sorted(history.glob("*.json"))[:-CARD_HISTORY_KEEP]:
-            with contextlib.suppress(OSError):
-                old.unlink()
-    atomic_write_json(card_json_path(seat), card)
-    atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
+        try:
+            history = ensure_dir(state_root() / "card-history" / card_key(seat))
+            atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
+            for old in sorted(history.glob("*.json"))[:-CARD_HISTORY_KEEP]:
+                with contextlib.suppress(OSError):
+                    old.unlink()
+        except (OSError, StateError):
+            if compact is None:
+                raise
+    if seat.kind == "project" and seat.sid:
+        atomic_write_json(_project_latest_path(seat), {"harness": seat.harness or harness, "sid": seat.sid})
     return card
+
+
+def _compact_body(compact: dict) -> str:
+    summary_text = str(compact.get("summary") or "")
+    recent = str(compact.get("recent") or "")
+    source = _cut_bytes(_normalize_body(str(compact.get("source") or compact.get("transcript") or "")),
+                        COMPACT_METADATA_MAX_BYTES)[0]
+    partial_note = "\n[최근 대화의 일부만 보존됨; 원본 기록을 확인하세요.]" if compact.get("recent_partial") else ""
+    footer = ("\n\n[압축 뒤 이어진 대화]" + partial_note + "\n" + recent) if recent \
+        else ("\n\n" + partial_note.strip()) if partial_note else ""
+    caution = "\n\n이 요약이 보지 못한 최근 대화가 있을 수 있습니다. 이어서 진행하기 전에 확인하세요."
+    path = f"\n원본 대화 기록: {source}" if source else "\n원본 대화 기록 경로를 확인할 수 없습니다."
+    result = summary_text + caution + path + footer
+    if len(result.encode("utf-8")) > COMPACT_CARD_BODY_MAX_BYTES:
+        raise ValueError("compact card exceeds bounded size")
+    return result
+
+
+def update_compact_card_locked(seat: Seat, generation: int, identity: str, *, recent: str,
+                               source: str = "", recent_partial: bool = False) -> bool:
+    """Idempotently add a bounded transcript tail without changing card identity."""
+    card = read_latest_card(seat)
+    compact = (card or {}).get("compact")
+    if (not card or int(card.get("generation", 0)) != int(generation)
+            or not isinstance(compact, dict) or compact.get("identity") != identity):
+        return False
+    compact["recent"] = _cut_bytes(_normalize_body(recent), COMPACT_RECENT_MAX_BYTES)[0]
+    compact["recent_partial"] = bool(recent_partial)
+    if source:
+        compact["source"] = _cut_bytes(_normalize_body(source), COMPACT_METADATA_MAX_BYTES)[0]
+    card["body"] = _compact_body(compact)
+    _write_card_pair(seat, card, rollback_on_error=True)
+    return True
 
 
 def mark_card_handed_off(seat: Seat) -> None:
@@ -756,7 +1151,7 @@ def update_memory_refs(seat: Seat, *, batch: str, status: str, refs: list, more:
 # ---------------------------------------------------------------------------
 
 def _consumed_path(seat: Seat) -> Path:
-    return state_root() / "consumed" / f"{seat.key}.json"
+    return state_root() / "consumed" / f"{card_key(seat)}.json"
 
 
 def _write_consumed(seat: Seat, **fields) -> None:
@@ -794,15 +1189,14 @@ def read_prompt_seq(seat: Seat) -> int:
 
 
 def bump_prompt_seq(seat: Seat, harness: str, sid: str, now: float) -> int:
-    """Count one real prompt (caller holds the seat lock).
+    """Count one physical prompt boundary before its source is classified (caller holds the seat lock).
 
     A file of its own, written for every prompt: the ledger throttles prompt lines and
-    folds old ones, and neither may lose a request that decides whether the window is
-    still safe to clear.
+    folds old ones. The source tag is filled immediately by the shared claim classifier.
     """
     seq = read_prompt_seq(seat) + 1
     atomic_write_json(_prompt_seq_path(seat), {"schema": SCHEMA, "seq": seq, "at": now,
-                                              "harness": harness, "sid": sid})
+                                              "harness": harness, "sid": sid, "source": "pending"})
     return seq
 
 
@@ -831,7 +1225,6 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
     if not items:
         return []
     sessions = summary if summary is not None else session_summary(seat)
-    me = sessions.get((harness, sid))
     out = []
     for item in items:
         author = item.get("author") or {}
@@ -840,14 +1233,24 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
             out.append(item)
             continue
         theirs = sessions.get(a_key)
+        replaced = _appeared_after(sessions, harness, sid, a_key)
         if theirs is None:
-            out.append(item)          # author unknown to the ledger: nobody else will show it
+            if replaced:
+                out.append(item)      # author unknown to the ledger: nobody else will show it
             continue
-        replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
         stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
         if replaced and (seat.kind in ("pane", "native") or stale):
             out.append(item)
     return out
+
+
+def _appeared_after(sessions: dict, harness: str, sid: str, author_key: tuple[str, str]) -> bool:
+    """Whether this session began after the author's last recorded activity."""
+    author = sessions.get(author_key)
+    if author is None:
+        return True
+    me = sessions.get((harness, sid))
+    return bool(me and me["first_seen"] > author["last_seen"])
 
 
 def _ago(seconds: float) -> str:
@@ -862,12 +1265,12 @@ def _ago(seconds: float) -> str:
 
 
 def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> str:
-    """Card text within ``cap`` UTF-8 bytes; header and the file path always survive."""
+    """Card text within ``cap`` UTF-8 bytes; guidance is part of the fixed header."""
     author = card.get("author") or {}
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(card.get("authored_at_epoch") or now)))
     header = (f"[세션 카드] 같은 자리에서 이어받는 작업 카드 — 작성 {stamp} "
               f"({_ago(now - float(card.get('authored_at_epoch') or now))}, {author.get('harness', '')} "
-              f"{str(author.get('sid', ''))[:8]})")
+              f"{str(author.get('sid', ''))[:8]})\n{CARD_FIRST_REPLY_GUIDANCE}")
     footer = f"카드 전문: {card_path}"
     cut_note = "…(이하 생략)"
     body = card.get("body", "")
@@ -888,7 +1291,9 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> s
 
 def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript: str = "",
              cwd: str = "", reread: bool = False, env=None, now: Optional[float] = None,
-             emit: Optional[Callable[[str], None]] = None) -> str:
+             emit: Optional[Callable[[str], None]] = None, phase: Optional[str] = None,
+             compact_summary: str = "", compact_context: Optional[dict] = None,
+             prompt_text: str = "") -> str:
     """Record the session, and print the card / notices it is due exactly once.
 
     Returns the text that was emitted ("" for none). The receipt is written only
@@ -896,10 +1301,43 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
     for the next start or prompt.
     """
     env = os.environ if env is None else env
-    if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact"):
+    if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact", "runtime-status"):
         return ""
+    if event == "runtime-status":
+        if harness == "opencode":
+            observed = False
+            with contextlib.suppress(BaseException):
+                import session_tidy_clear
+                observed = session_tidy_clear.observe_runtime_status(
+                    sid, str((compact_context or {}).get("status") or ""),
+                    observed_at=(compact_context or {}).get("observed_at"), cwd=cwd)
+            return "booking=pending" if observed else ""
+        return ""
+    if event == "compact" and phase == "before":
+        text = COMPACT_CARD_INSTRUCTIONS if harness in ("claude", "opencode") else ""
+        if text and emit:
+            emit(text)
+        return text
+    if event == "compact" and phase == "after":
+        booked = _run_compact_after(harness, sid, compact_summary, cwd=cwd, transcript=transcript,
+                                    compact_context=compact_context or {}, env=env, now=now)
+        return booked
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, source)
+    if event == "start":
+        with contextlib.suppress(BaseException):
+            import session_tidy_clear
+            req = session_tidy_clear.read_reservation(seat.key)
+            if req and req.get("harness") == harness and req.get("sid") == sid:
+                session_tidy_clear.reconcile_pending(seat)
+            else:
+                reconcile_compact_frontier(harness, sid, cwd, env=env, now=now)
+    if event in ("start", "prompt"):
+        with contextlib.suppress(BaseException):
+            import session_tidy_runner
+            session_tidy_runner.reconcile_queued(seat, harness, sid)
+            if event == "start":
+                session_tidy_runner.reconcile_reservation_queue(seat)
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -910,14 +1348,32 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 emit(text)
             return text
         if event == "prompt":
-            bump_prompt_seq(seat, harness, sid, now)
-        prior = session_summary(seat).get((harness, sid))
+            sequence = bump_prompt_seq(seat, harness, sid, now)
+            with contextlib.suppress(BaseException):
+                import session_tidy_clear as clear
+                if not clear.observe_prompt_locked(seat, harness, sid, prompt_text, now, sequence):
+                    clear.note_real_prompt_locked(seat, harness, sid, sequence, now)
+        sessions = session_summary(seat)
+        prior = sessions.get((harness, sid))
         # SessionStart(source=compact) and a separate compact event describe the same
         # compaction; count it once.
         compacting = (event == "compact" or source == "compact") and not (
             prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+        launch = None
+        if event == "start" and source == "resume":
+            try:
+                tools = str(Path(__file__).resolve().parents[1] / "tools")
+                if tools not in sys.path:
+                    sys.path.insert(0, tools)
+                from fleet.process_identity import current_launch_context
+                launch = current_launch_context(harness, sid)
+            except Exception:
+                launch = None
         row = record_event(seat, harness, sid, event, source=source, transcript=transcript,
-                           cwd=cwd, now=now, bump_epoch=compacting)
+                           cwd=cwd, now=now, bump_epoch=compacting,
+                           resume_argv=(launch or {}).get("argv"),
+                           launch_cwd=(launch or {}).get("cwd") or "")
+        sessions[(harness, sid)] = row
         if event == "compact":
             return ""
         if event == "start" and seat.kind in ("pane", "native"):
@@ -933,13 +1389,25 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
-        notices = pending_notices(seat, harness, sid, now=now)
+        notices = pending_notices(seat, harness, sid, now=now, summary=sessions)
         notice_block = ""
         if notices:
             notice_block = "\n".join(f"[정리 결과] {n['text']}" for n in notices)
             notice_block = _cut_bytes(notice_block, NOTICE_MAX_BYTES)[0]
             parts.append(notice_block)
-        card = read_latest_card(seat)
+        card_seat = seat
+        own_card = read_latest_card(seat) if seat.kind == "project" else None
+        own_author = (own_card or {}).get("author") or {}
+        own_card_due = bool(own_card
+                            and (own_author.get("harness"), own_author.get("sid")) == (harness, sid)
+                            and own_card.get("origin") != "runtime-compact"
+                            and epoch > int(own_author.get("epoch", 0) or 0))
+        if own_card_due:
+            card = own_card
+        elif seat.kind == "project":
+            card, card_seat = read_latest_project_card(seat)
+        else:
+            card = read_latest_card(seat)
         card_due = False
         memory_due = False
         memory = None
@@ -947,10 +1415,19 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
-            eligible = (not same_session) or epoch > int(author.get("epoch", 0) or 0)
-            consumed = read_json(_consumed_path(seat))
-            # One card generation is injected once for the whole seat: any receipt for it,
-            # from any session, means the card has already been handed over.
+            if seat.kind == "project" and own_card_due:
+                eligible = True
+            elif seat.kind == "project" and not same_session:
+                eligible = _appeared_after(sessions, harness, sid,
+                                           (author.get("harness") or "", author.get("sid") or ""))
+            elif seat.kind == "project":
+                eligible = (card.get("origin") != "runtime-compact"
+                            and epoch > int(author.get("epoch", 0) or 0))
+            else:
+                eligible = (not same_session) or (
+                    card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))
+            consumed = read_json(_consumed_path(card_seat))
+            # A card generation is consumed once within its author slot.
             taken = isinstance(consumed, dict) and consumed.get("generation") == card.get("generation") \
                 and bool(consumed.get("receipts"))
             card_due = eligible and not taken
@@ -965,7 +1442,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if handover is not None and (card_due or handed):
                 resume_text = handover.resume_line(seat, harness, sid)
                 used += len(resume_text.encode("utf-8")) + (1 if resume_text else 0)
-            room = INJECTION_MAX_BYTES - used
+            room = INJECTION_MAX_BYTES - used - 1  # reserve the CLI emitter's trailing newline
             memory_text = ""
             if memory_due:
                 wanted = build_memory_injection(memory, MEMORY_REFS_BYTES + 600)
@@ -975,7 +1452,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
             if card_due:
-                parts.append(build_card_injection(card, card_text_path(seat), now, room))
+                parts.append(build_card_injection(card, card_text_path(card_seat), now, room))
             if memory_text:
                 parts.append(memory_text)
         if not card and handed and handover is not None:
@@ -987,17 +1464,17 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             return ""
         (emit or (lambda t: None))(text)
         if card_due:
-            consumed = read_json(_consumed_path(seat))
+            consumed = read_json(_consumed_path(card_seat))
             receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
                 and consumed.get("generation") == card.get("generation") else []
             receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(seat, generation=card["generation"], receipts=receipts[-200:])
+            _write_consumed(card_seat, generation=card["generation"], receipts=receipts[-200:])
         if memory_due:
-            consumed = read_json(_consumed_path(seat))
+            consumed = read_json(_consumed_path(card_seat))
             same = isinstance(consumed, dict) and consumed.get("memory_revision") == memory["revision"]
             receipts = list(consumed.get("memory_receipts", [])) if same else []
             receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
+            _write_consumed(card_seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
         if notices:
             shown = {n["id"] for n in notices}
             data = read_json(_notices_path(seat))
@@ -1010,6 +1487,319 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         cached = _cut_bytes(kept + "\n" + text, 2 * INJECTION_MAX_BYTES)[0] if kept else text
         atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": cached, "at": now})
         return text
+
+
+def _compact_booking_result(booked: str) -> str:
+    """Keep compact-stage outcomes bounded and observable across the hook bridge."""
+    fields = str(booked or "").split()
+    outcome = fields[0] if fields else "clear=pending"
+    reason = next((field.split("=", 1)[1] for field in fields[1:] if field.startswith("reason=")), "")
+    if outcome == "clear=scheduled":
+        return "booking=scheduled" + (f" reason={reason}" if reason else "")
+    if outcome == "clear=pending":
+        return "booking=pending" + (f" reason={reason or 'unfinished'}")
+    if outcome == "clear=completed":
+        return "booking=completed" + (f" reason={reason or 'terminal'}")
+    if outcome == "clear=off":
+        return "booking=off"
+    if outcome == "clear=manual":
+        return "booking=manual" + (f" reason={reason or 'outside-herdr'}")
+    if outcome == "clear=skipped":
+        return "booking=skipped" + (f" reason={reason or 'ineligible'}")
+    return "booking=pending reason=unrecognized-outcome"
+
+
+def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transcript: str,
+                       compact_context: Optional[dict], env, now: Optional[float]) -> str:
+    """Record one compact event and preserve its card → queue → clear progress."""
+    now = now_epoch() if now is None else now
+    started = time.monotonic()
+    seat = resolve_seat(harness, cwd or None, env, sid, "compact")
+    prior_hint = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
+    transcript = transcript or prior_hint
+    context = dict(compact_context or {})
+    context["trigger"] = context.get("trigger") if context.get("trigger") in ("auto", "manual") else "unknown"
+    context["transcript"] = transcript or str(context.get("transcript") or "")
+    if not context["transcript"] and harness in ("codex", "opencode"):
+        with contextlib.suppress(BaseException):
+            import tidy_transcripts
+            found = tidy_transcripts.locate_transcript(harness, sid)
+            context["transcript"] = str(found or "")
+    if harness == "opencode" and not context["transcript"]:
+        with contextlib.suppress(BaseException):
+            import tidy_transcripts
+            context["transcript"] = str(tidy_transcripts.opencode_db_path())
+    context["source"] = context["transcript"]
+    if harness in ("claude", "codex") and context["transcript"] and "boundary_offset" not in context:
+        with contextlib.suppress(OSError):
+            path = Path(context["transcript"])
+            info = path.stat()
+            if path.is_file() and not path.is_symlink() and stat.S_ISREG(info.st_mode):
+                context["boundary_offset"] = int(info.st_size)
+                context["transcript_identity"] = f"{info.st_dev}:{info.st_ino}"
+    codex_auto = harness == "codex" and context["trigger"] == "auto"
+    if codex_auto:
+        context["card_request_required"] = True
+        if not context.get("transcript") or not isinstance(context.get("boundary_offset"), int)                 or not context.get("transcript_identity"):
+            context["card_request_required"] = False
+            context["turn_evidence_reason"] = "transcript-unavailable"
+        if not any(context.get(key) for key in
+                   ("turn_id", "summary_id", "compaction_part_id", "event_id")):
+            context["card_request_required"] = False
+            context["turn_evidence_reason"] = "turn-identity-unknown"
+    context["prompt_seq"] = read_prompt_seq(seat)
+    previous = read_latest_card(seat)
+    context["card_generation"] = int((previous or {}).get("generation", 0) or 0)
+    identity_fields = [harness, sid, context.get("trigger", "unknown"), context.get("summary_id", ""),
+                       context.get("parent_id", ""), context.get("tail_start_id", ""),
+                       context.get("compaction_part_id", ""), context.get("event_id", ""),
+                       context.get("turn_id", ""), context.get("transcript", ""),
+                       hashlib.sha256(_normalize_body(summary).encode("utf-8")).hexdigest()]
+    context["identity"] = hashlib.sha256("\0".join(map(str, identity_fields)).encode("utf-8")).hexdigest()
+    body = _normalize_body(summary)
+    prior = None
+    persisted = False
+    card_duplicate = False
+    ledger_event = None
+    record_error = ""
+    preserve_idle = False
+    compact_request_in_progress = False
+    expected_booking_nonce: Optional[str] = None
+    inherit_continue_off = False
+    try:
+        with seat_lock(seat.key, wait=COMPACT_LOCK_WAIT_SEC):
+            prior = session_summary(seat).get((harness, sid))
+            previous = read_latest_card(seat)
+            matching_events = [row for row in _read_ledger_lines(seat)
+                               if row.get("event") == "compact" and row.get("harness") == harness
+                               and row.get("sid") == sid and row.get("compact_identity") == context["identity"]]
+            ledger_event = max(matching_events, key=lambda row: float(row.get("ts", 0) or 0), default=None)
+            if ledger_event and isinstance(ledger_event.get("compact"), dict):
+                saved = ledger_event["compact"]
+                for key in ("prompt_seq", "card_generation", "boundary_offset", "transcript_identity",
+                            "transcript", "turn_id", "summary_id", "parent_id", "tail_start_id",
+                            "compaction_part_id", "event_id", "card_request_required"):
+                    if key in saved:
+                        context[key] = saved[key]
+            compact_meta = (previous or {}).get("compact")
+            card_duplicate = bool(compact_meta and compact_meta.get("identity") == context["identity"])
+            newer_card = bool(ledger_event and previous
+                              and float(previous.get("authored_at_epoch", 0) or 0)
+                              >= float(ledger_event.get("ts", 0) or 0)
+                              and not card_duplicate)
+            import session_tidy_clear as clear
+            held = clear.read_reservation(seat.key)
+            same_session = bool(held and (held.get("harness"), held.get("sid")) == (harness, sid))
+            if held and held.get("status") == "reserved":
+                expected_booking_nonce = str(held.get("nonce") or "")
+                prior_generation = int((previous or {}).get("generation", 0) or 0)
+                old_claim = held.get("clear_claim") if isinstance(held.get("clear_claim"), dict) else {}
+                inherit_continue_off = bool(
+                    same_session and float(held.get("deadline", 0) or 0) >= now
+                    and int(held.get("prompt_seq", -1)) == read_prompt_seq(seat)
+                    and int(held.get("card_generation", -1)) == prior_generation
+                    and held.get("continue_off") and old_claim.get("state") != "sending")
+            preserve_idle = bool(same_session and held.get("origin") == "idle"
+                                 and held.get("status") in ("reserved", "cleared")
+                                 and held.get("followup_kind") == "status-only"
+                                 and (held.get("status") == "reserved"
+                                      or not clear.idle_clear_armed(seat, harness, sid)))
+            compact_request_in_progress = bool(same_session and held.get("origin") == "compact"
+                                               and held.get("status") == "reserved"
+                                               and (held.get("compact") or {}).get("card_request_required"))
+            if not ledger_event:
+                compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+                record_event(seat, harness, sid, "compact", source="compact",
+                             transcript=context["transcript"] or (prior or {}).get("transcript", ""),
+                             cwd=cwd, now=now, bump_epoch=compacting,
+                             compact_identity=context["identity"], compact_context=context)
+            if not preserve_idle and not compact_request_in_progress and not codex_auto \
+                    and body and not card_duplicate and not newer_card and seat.kind in COMPACT_CARD_SEAT_KINDS:
+                try:
+                    card = write_card(seat, harness, sid, body, cwd=cwd, now=now,
+                                      prompt_seq=read_prompt_seq(seat), origin="runtime-compact",
+                                      compact_context=context)
+                    saved_card = read_latest_card(seat)
+                    persisted = bool(card and saved_card
+                                     and saved_card.get("generation") == card.get("generation")
+                                     and (saved_card.get("compact") or {}).get("identity") == context["identity"]
+                                     and card_text_path(seat).is_file())
+                except BaseException as exc:  # noqa: BLE001 - keep memory queueable, report no clear
+                    record_error = f"card-write-{type(exc).__name__}"
+            elif card_duplicate:
+                persisted = bool(previous and (previous.get("compact") or {}).get("identity") == context["identity"]
+                                 and card_text_path(seat).is_file())
+            with contextlib.suppress(BaseException):
+                reread_path = _reread_path(harness, sid)
+                _reject_symlink(reread_path)
+                with contextlib.suppress(FileNotFoundError):
+                    reread_path.unlink()
+    except BaseException as exc:  # noqa: BLE001 - retain memory work but do not claim clear acceptance
+        try:
+            import session_tidy_runner as runner
+            item = runner.enqueue_item(seat, harness, sid, cwd, context["transcript"],
+                                       operation_id=context["identity"], start=False)
+            item = runner._start_queued(item)
+            detail = f" runner-start={str(item.get('runner_start_error'))[:40]}" \
+                if item.get("runner_start_error") else ""
+            return f"booking=pending reason=compact-state-{type(exc).__name__}" + detail
+        except BaseException as queue_exc:  # noqa: BLE001
+            return (f"booking=pending reason=compact-state-{type(exc).__name__} "
+                    f"queue-write={type(queue_exc).__name__}")
+
+    compact_queue = None
+    if codex_auto:
+        try:
+            import session_tidy_runner as runner
+            queue_transcript = str(context.get("transcript") or (prior or {}).get("transcript", ""))
+            compact_queue = runner.enqueue_item(seat, harness, sid, cwd, queue_transcript,
+                                                operation_id=context["identity"], start=False)
+            context["queue_id"] = compact_queue["id"]
+            context["operation_id"] = context["identity"]
+            compact_queue = runner._start_queued(compact_queue)
+        except BaseException as exc:  # noqa: BLE001 - the ledger event lets an ordinary hook retry
+            return f"booking=pending reason=queue-write-{type(exc).__name__}"
+
+    if preserve_idle:
+        return "booking=skipped reason=idle-origin-preserved"
+    if compact_request_in_progress and not (ledger_event and
+            ledger_event.get("compact_identity") == context["identity"]):
+        return "booking=pending reason=card-request-in-progress"
+
+    import session_tidy_runner as runner
+    import session_tidy_clear as clear
+    operation_id = context["identity"]
+    transcript_path = str(context.get("transcript") or (prior or {}).get("transcript", ""))
+    if codex_auto:
+        if not context.get("card_request_required") or seat.kind != "pane" or not seat.pane:
+            launch_error = (compact_queue or {}).get("runner_start_error")
+            return f"booking=queue-only reason={context.get('turn_evidence_reason') or 'exact-pane-unavailable'}" + (
+                f" runner-start={str(launch_error)[:48]}" if launch_error else "")
+        try:
+            wait = max(0.0, min(COMPACT_LOCK_WAIT_SEC, started + COMPACT_HOOK_BUDGET_SEC - time.monotonic()))
+            booked = clear.schedule_compact_card_request(seat, harness, sid, cwd, context,
+                                                          now=now, lock_wait=wait)
+            return _compact_booking_result(booked)
+        except BaseException as exc:  # noqa: BLE001
+            return f"booking=pending reason=reservation-write-{type(exc).__name__}"
+
+    idle_clear_armed = clear.idle_clear_armed(seat, harness, sid)
+    if context.get("trigger") != "auto":
+        reason = "trigger-manual" if context.get("trigger") == "manual" else "trigger-unknown"
+    elif not body:
+        reason = "empty-summary"
+    elif not persisted:
+        reason = record_error or "card-not-persisted"
+    elif harness not in ("claude", "opencode") or seat.kind not in COMPACT_CARD_SEAT_KINDS:
+        reason = "compact-seat-ineligible"
+    elif not idle_clear_armed:
+        reason = "idle-not-rearmed"
+    else:
+        reason = ""
+    if reason:
+        try:
+            item = runner.enqueue_item(seat, harness, sid, cwd, transcript_path,
+                                       operation_id=operation_id, start=False)
+            started_item = runner._start_queued(item)
+            launch_error = started_item.get("runner_start_error")
+            return f"booking=queue-only reason={reason}" + (
+                f" runner-start={str(launch_error)[:48]}" if launch_error else "")
+        except BaseException as exc:  # noqa: BLE001
+            return f"booking=pending reason=queue-write-{type(exc).__name__}"
+    try:
+        item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript_path,
+                                     compact_context=context,
+                                     bounded_until=started + COMPACT_HOOK_BUDGET_SEC,
+                                     expected_booking_nonce=expected_booking_nonce,
+                                     compact_started_at=now,
+                                     inherit_continue_off=inherit_continue_off,
+                                     operation_id=operation_id, runner=runner)
+        launch_error = item.get("runner_start_error") if isinstance(item, dict) else ""
+        outcome = _compact_booking_result(booked)
+        return outcome + (f" runner-start={str(launch_error)[:40]}"
+                          if launch_error else "")
+    except BaseException as exc:  # noqa: BLE001 - queue/reservation intent may already be durable
+        return f"booking=pending reason=enqueue-{type(exc).__name__}"
+
+
+def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=None,
+                               now: Optional[float] = None,
+                               lock_wait: Optional[float] = None) -> str:
+    """Resume one automatic compact event from its seat ledger/card and stable queue identity."""
+    env = os.environ if env is None else env
+    if is_worker(env) or harness not in HARNESSES or not sid:
+        return ""
+    seat = resolve_seat(harness, cwd or None, env, sid, "compact")
+    events = [row for row in _read_ledger_lines(seat)
+              if row.get("event") == "compact" and row.get("harness") == harness
+              and row.get("sid") == sid and row.get("compact_identity")]
+    event = max(events, key=lambda row: float(row.get("ts", 0) or 0), default=None)
+    compact = (event or {}).get("compact") if isinstance((event or {}).get("compact"), dict) else {}
+    identity = str((event or {}).get("compact_identity") or compact.get("identity") or "")
+    if not event or not identity or compact.get("trigger") != "auto":
+        return ""
+    try:
+        import session_tidy_runner as runner
+        transcript = str(compact.get("transcript") or event.get("transcript") or "")
+        # Queue receipt and runner restart are independent of card request and clear state.
+        # The stable operation ID makes this safe after cancellation, timeout or partial booking.
+        queued = runner.enqueue_item(seat, harness, sid, cwd or str(event.get("cwd") or ""), transcript,
+                                     operation_id=identity, queue_id=runner.operation_queue_id(identity),
+                                     start=False)
+        context_queue_id = str(queued.get("id") or "")
+
+        def start_queue():
+            return runner._start_queued(queued)
+
+        import session_tidy_clear as clear
+        held = clear.read_reservation(seat.key)
+        if held and (held.get("compact") or {}).get("identity") == identity:
+            if held.get("status") == "reserved":
+                import session_tidy_runner as runner
+                runner.reconcile_reservation_queue(seat)
+                return "booking=scheduled" if clear.reconcile_pending(seat) else "booking=pending reason=helper-reconcile"
+            if read_prompt_seq(seat) == int(compact.get("prompt_seq", -1)):
+                start_queue()
+                return f"booking=completed reason={held.get('status') or 'terminal'}"
+            start_queue()
+            return ""
+        if held and held.get("status") == "reserved":
+            start_queue()
+            return "booking=pending reason=booking-pending"
+        if int(compact.get("prompt_seq", -1)) != read_prompt_seq(seat):
+            start_queue()
+            return "booking=skipped reason=new-input"
+        current_card = read_latest_card(seat)
+        generation = int((current_card or {}).get("generation", 0) or 0)
+        card_request_required = compact.get("card_request_required") is True
+        if card_request_required and generation != int(compact.get("card_generation", generation)):
+            start_queue()
+            return "booking=skipped reason=card-changed"
+        context = dict(compact)
+        context["identity"] = identity
+        context["trigger"] = "auto"
+        context["transcript"] = transcript
+        context["card_request_required"] = card_request_required
+        if context["card_request_required"]:
+            context["queue_id"] = context_queue_id
+            start_queue()
+            booked = clear.schedule_compact_card_request(
+                seat, harness, sid, cwd or str(event.get("cwd") or ""), context, now=now,
+                lock_wait=lock_wait)
+            return _compact_booking_result(booked)
+        if (not current_card or (current_card.get("compact") or {}).get("identity") != identity
+                or (current_card.get("author") or {}).get("harness") != harness
+                or (current_card.get("author") or {}).get("sid") != sid):
+            return "booking=skipped reason=card-changed"
+        import session_tidy_runner as runner
+        _item, booked = _enqueue_tidy(seat, harness, sid, cwd or str(event.get("cwd") or ""),
+                                      context["transcript"], compact_context=context,
+                                      bounded_until=(time.monotonic() + lock_wait if lock_wait is not None else None),
+                                      compact_started_at=float(event.get("ts", 0) or 0),
+                                      operation_id=identity, runner=runner)
+        return _compact_booking_result(booked)
+    except BaseException as exc:  # noqa: BLE001 - retain a bounded recovery result
+        return f"booking=pending reason=reconcile-{type(exc).__name__}"
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1828,8 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
 
 def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     """(seat, harness, session id) of the calling session; ids come from the arguments,
-    the harness variables, then the seat ledger, and as a last resort a fresh ``unknown-`` id."""
+    harness variables and, for pane/native seats, the seat ledger. Project ledger inference
+    selects only the shared seat and harness; an absent caller id gets a fresh ``unknown-`` id."""
     explicit_sid = bool(sid)
     if not sid:
         harness, sid = session_from_env(harness)
@@ -1053,10 +1844,19 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
             return None
         if record and not explicit_sid:
             sid = record["sessionId"]
-    if not sid or not harness:
+    if seat.kind == "project":
+        # Ledger inference still chooses the project seat and harness when neither
+        # was supplied, but a neighboring session is never evidence of this caller's id.
+        if not detected:
+            guessed_seat, ledger_row = _guess_seat_from_ledgers(cwd)
+            if guessed_seat is not None and ledger_row:
+                seat = guessed_seat
+                harness = ledger_row.get("harness") or ""
+        harness = harness or detected or "unknown"
+        sid = sid or f"unknown-{secrets.token_hex(4)}"
+        seat = dataclasses.replace(seat, harness=harness, sid=sid)
+    elif not sid or not harness:
         ledger_row = latest_session(seat, harness)
-        if ledger_row is None and seat.kind == "project" and not detected:
-            seat, ledger_row = _guess_seat_from_ledgers(cwd)
         if ledger_row:
             harness = harness or ledger_row["harness"]
             sid = sid or ledger_row["sid"]
@@ -1091,6 +1891,43 @@ def cmd_card(args) -> int:
     return 0
 
 
+def _enqueue_tidy(seat: Seat, harness: str, sid: str, cwd: str, transcript: str = "", *,
+                  opt_out: bool = False, no_continue: bool = False,
+                  compact_context: Optional[dict] = None, bounded_until: Optional[float] = None,
+                  expected_booking_nonce: Optional[str] = None,
+                  compact_started_at: Optional[float] = None,
+                  inherit_continue_off: bool = False,
+                  idle_context: Optional[dict] = None,
+                  operation_id: Optional[str] = None,
+                  runner=None):
+    """Durably queue one operation and book its helper; the helper snapshots outside the hook."""
+    import session_tidy_clear as clear
+    if runner is None:
+        import session_tidy_runner as runner
+
+    def lock_wait():
+        if bounded_until is None:
+            return None
+        return max(0.0, min(COMPACT_LOCK_WAIT_SEC, bounded_until - time.monotonic()))
+
+    operation_id = operation_id or (idle_context or {}).get("identity") or ((compact_context or {}).get("identity"))
+    item = runner.enqueue_item(seat, harness, sid, cwd, transcript,
+                               operation_id=operation_id, start=False)
+    try:
+        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=opt_out,
+                                            no_continue=no_continue, compact_context=compact_context,
+                                            lock_wait=lock_wait(),
+                                            expected_booking_nonce=expected_booking_nonce,
+                                            compact_started_at=compact_started_at,
+                                            inherit_continue_off=inherit_continue_off,
+                                            operation_id=operation_id, queue_id=item.get("id"),
+                                            idle_context=idle_context)
+    except BaseException as exc:  # noqa: BLE001 - retain the accepted queue and its unfinished booking
+        booked = f"clear=pending reason=reservation-write-{type(exc).__name__}"
+    item = runner._start_queued(item)
+    return item, booked
+
+
 def cmd_enqueue(args) -> int:
     if is_worker():
         print("enqueue=none reason=worker")
@@ -1101,19 +1938,13 @@ def cmd_enqueue(args) -> int:
         print("enqueue=none reason=no-seat")
         return 0
     seat, harness, sid = caller
-    import session_tidy_runner as runner
     transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
     import session_tidy_clear as clear
-    with contextlib.suppress(BaseException):    # the tidy goes ahead even if the snapshot cannot be taken
-        import dispatch_seat_handover as handover
-        with seat_lock(seat.key):
-            handover.write_snapshot_locked(seat, harness, sid)
-    item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
-    try:
-        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear),
-                                            no_continue=bool(args.no_continue))
-    except BaseException as exc:  # noqa: BLE001 - the tidy is queued; the window is left alone
-        booked = f"clear=manual reason=internal-{type(exc).__name__} hint={clear.CLEAR_COMMAND.get(harness, '/clear')}"
+    idle_context = clear.idle_context_for_enqueue(seat, harness, sid)
+    item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript,
+                                 opt_out=bool(args.no_clear), no_continue=bool(args.no_continue),
+                                 idle_context=idle_context,
+                                 operation_id=(idle_context or {}).get("identity"))
     print(f"enqueue={item['id']} seat={seat.key} status=queued {booked}")
     return 0
 
@@ -1143,10 +1974,37 @@ def cmd_handoff(args) -> int:
 def cmd_hook(args) -> int:
     try:
         sid = args.session_id or session_from_env(args.harness)[1] or ""
-        run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
-                 cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout)
-    except BaseException:  # noqa: BLE001 - a hook is silent on every failure
-        pass
+        summary = ""
+        prompt_text = ""
+        compact_context = {}
+        if args.phase == "after" or args.event in ("runtime-status", "prompt"):
+            try:
+                payload = json.load(sys.stdin)
+            except (EOFError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                if isinstance(payload.get("summary"), str):
+                    summary = payload["summary"]
+                if isinstance(payload.get("prompt"), str):
+                    prompt_text = payload["prompt"]
+                for key in ("trigger", "summary_id", "parent_id", "tail_start_id", "compaction_part_id",
+                            "turn_id", "event_id", "status", "observed_at"):
+                    value = payload.get(key)
+                    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                        compact_context[key] = value
+                transcript = payload.get("transcript") or payload.get("transcript_path")
+                if isinstance(transcript, str) and transcript:
+                    compact_context["transcript"] = transcript
+        result = run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
+                          cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout,
+                          phase=args.phase, compact_summary=summary, compact_context=compact_context,
+                          prompt_text=prompt_text)
+        if (args.event == "compact" and args.phase == "after" and result.startswith("booking=")) \
+                or (args.event == "runtime-status" and result == "booking=pending"):
+            _emit_stdout(result)
+    except BaseException as exc:  # noqa: BLE001 - keep compact failure visible without prompt text
+        if args.event == "compact" and args.phase == "after" and not is_worker():
+            _emit_stdout(f"booking=pending reason=hook-{type(exc).__name__}")
     return 0
 
 
@@ -1202,12 +2060,13 @@ def build_parser() -> argparse.ArgumentParser:
     card.set_defaults(func=cmd_card)
     hook = sub.add_parser("hook", help="record the session; print the card/notice it is due")
     hook.add_argument("--harness", required=True)
-    hook.add_argument("--event", required=True)
+    hook.add_argument("--event", required=True, choices=("start", "prompt", "compact", "runtime-status"))
     hook.add_argument("--session-id")
     hook.add_argument("--source")
     hook.add_argument("--transcript")
     hook.add_argument("--cwd")
     hook.add_argument("--reread", action="store_true")
+    hook.add_argument("--phase", choices=("before", "after"))
     hook.set_defaults(func=cmd_hook)
     enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")
     enqueue.add_argument("--harness", choices=HARNESSES)

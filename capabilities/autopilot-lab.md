@@ -51,21 +51,11 @@ W7C write-cutover contract (`utilities/artifact_producer.py`, registry table
 `producer_lifecycle` in `capabilities/topologies.json`). The same lifecycle
 binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
-1. **begin before the first write.** After the route is compiled and bound,
-   the owner (the inline session for `direct`, the dispatch-depth-1 owner for
-   `quick` and `standard+`) runs `artifact_producer.py begin --artifact-root
-   <root> --route <route file> --capability autopilot-lab --intensity <intensity>`.
-   While the cutover is inactive this returns `legacy-compat` and the legacy
-   `<artifact-root>/experiments/` layout stays writable; once active it
-   issues `campaign_id`/`cycle_id`/`producer_id` and the cycle directory
-   `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
-2. **write only inside the open cycle.** Every durable artifact goes under
-   `<cycle_dir>/artifacts/experiments/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
+1. The launcher prepares the route's cycle and carries its exact context.
+2. **write only inside the open cycle.** Every durable artifact uses the
+   selected node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.
    `artifact_producer.py` owns cycle output paths and shared revisions.
-3. **stage workers join, never fork.** `standard+` stage workers receive
-   `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
-   from the owner (dispatch env pass-through) and call `begin --node <id>`
-   on the same route, which resumes the owner's open cycle.
+3. The runtime carries the same producer context through stage dispatch.
 4. **runtime-owned closure.** A new registered owner returns its final report;
    the shared completion controller owns workflow/route closure and exact-cycle
    sealing after PASS and process cleanup. Interrupted closure retains the
@@ -87,10 +77,15 @@ Adapters must preserve the portable invariants relevant to this capability:
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
 - use DB memory paths, not runtime-native memory files.
 
-Lab owner start/resume prepares the existing execution access request with the
-initialized compute-hosts inventory's exact `run_root`, so normal resource work
-can write its run records. This default belongs to the lab owner, not frame
-sessions or ordinary code owners. External data roots come from the approved
+An owner route that contains a registered stage whose part catalog row declares
+the `compute-hosts` execution need prepares the existing execution access
+request with the initialized inventory's exact `run_root`. The declaration is
+on the origin stage's row in the `part_catalog` of
+`capabilities/topologies.json`; native and borrowed sealed nodes resolve it by
+stage identity. It is not copied into each sealed node. This covers the
+lab stages that execute or verify compute work, including when code borrows one.
+Frame sessions and routes without such a stage do not receive this default.
+External data roots come from the approved
 task: a folder the start card's `범위:` field names is the owner's write root, and
 other folders the task names are read roots. An explicit `execution_access_v1`
 file through `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` or the existing dispatch
@@ -319,11 +314,13 @@ Case-insensitive filesystems are an explicit non-goal (Linux-only harness).
 ### Sealing before a full run
 
 Before a full run, seal the resolved path, normalized `config_ref`, a required
-`--slug` and derived collision-safe run ID, config SHA256, source commit, and
-source-scoped git state (`source_git_state`; `source_dirty` is
-`source_git_state != "clean"`). `seal` derives its output directory from a
-required `--artifact-root` as
-`$AGENT_ARTIFACT_OUTPUT_DIR/experiments/<slug>/_internal/configs/` — there is no `--out`.
+`--slug` and derived collision-safe run ID, config SHA256, execution-worktree
+HEAD, and source git state (`source_git_state`; `source_dirty` is
+`source_git_state != "clean"`). Routed `seal` resolves its repository, artifact
+root, and config-support subtree from the validated dispatch context; standalone
+use retains explicit repository and artifact-root arguments. Config snapshots
+and manifests keep the `experiments/<slug>/_internal/configs/` suffix beneath
+that selected subtree.
 The manifest fields are named by `capabilities/lab-config-manifest.schema.json`
 (`schema_version` 2; v1 manifests are rejected without migration) and enforced
 by `tools/lab-config-provenance.py`. Same-input retries are idempotent; a
@@ -356,11 +353,8 @@ hash-named snapshot beside it), the exact `<run_id>.manifest.json` filename,
 and that the slug recovered from that chain, together with `config_ref` and
 `source_sha256`, recomputes the same `run_id`. The manifest and its snapshot
 directory must therefore move together *and* keep their `experiments/<slug>`
-parents intact. If `experiments` itself is a symlink to a real sibling
-directory, the manifest must be addressed via the documented derived path
-(`$AGENT_ARTIFACT_OUTPUT_DIR/experiments/<slug>/_internal/configs/<run_id>.manifest.json`)
-— addressing it via the fully-resolved path is rejected, since resolution
-collapses the `experiments` segment `seal` itself recorded.
+parents intact. Historical top-level manifests and routed support-subtree
+manifests retain this suffix and remain verifiable.
 
 ### Execution and evaluation lineage
 

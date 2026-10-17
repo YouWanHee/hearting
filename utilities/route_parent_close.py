@@ -464,14 +464,14 @@ def _drain_workflow(value, ledger, resources, grace, kill_wait):
         time.sleep(0.02)
 
 
-def _classify_agent_processes(meta, resources):
+def _classify_agent_processes(meta, resources, *, terminal=False):
     """Filter resource branches before selecting exact agent PID/start pairs."""
     if meta.get("launch_claimed") == "0" and not meta.get("pid"):
         return [], True, {}
     identities = DC.authoritative_process_identities(meta)
     identity = identities[0] if identities else None
     if identity is None:
-        return [], DC.attempt_process_quiescence(meta).state == "quiescent", {}
+        return [], DC.attempt_process_quiescence(meta, terminal_receipt=terminal).state == "quiescent", {}
     visibility, actual, leader_state = DC.process_observation(identity.pid)
     if visibility == "inaccessible":
         return [], False, {}
@@ -518,8 +518,8 @@ def _classify_agent_processes(meta, resources):
     return agents, group.state != "unverifiable" and tagged.state != "unverifiable", preserved
 
 
-def _agent_processes(meta, resources):
-    agents, observed, _ = _classify_agent_processes(meta, resources)
+def _agent_processes(meta, resources, *, terminal=False):
+    agents, observed, _ = _classify_agent_processes(meta, resources, terminal=terminal)
     return agents, observed
 
 
@@ -801,7 +801,8 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
         settled = False
         while True:
             try:
-                processes, observed = _agent_processes(meta, protected_resources)
+                processes, observed = _agent_processes(
+                    meta, protected_resources, terminal=fields[1] not in OPEN)
             except OSError:
                 processes, observed = [], False
             if not observed:

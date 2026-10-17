@@ -500,3 +500,15 @@ refusals. The adapter does not auto-select `bypassPermissions`, disable a
 sandbox, or edit user settings to satisfy access. Claude `sandbox.*` wiring,
 dependency fail-closed policy, and owner-to-worker propagation remain
 unimplemented follow-up work.
+
+## Runtime compaction tidy
+
+- **Runtime support:** PreCompact accepts successful stdout as summary instructions; PostCompact provides `compact_summary` and `trigger` for auto/idle and manual compaction.
+- **Adapter realization:** the shared compact hook requests six fields, records the epoch, saves the complete nonempty summary at the session's own verified pane/native seat, and queues memory tidying. Only `trigger=auto` with successful JSON and text card persistence can use the existing snapshot/clear/continue booking. The helper waits up to three hours for transcript evidence of actual turn completion, then stores bounded recent conversation and the transcript path before the clear.
+- **Fallback:** manual/unknown trigger, missing or empty summaries, card-write failure, project/outside-herdr seats, and workers/sub-sessions never auto-clear. Hook failures leave compaction running; summary admission is bounded at 256 KiB without truncation.
+
+## Idle tidy
+
+- **Runtime support:** the Stop payload carries the main session id and transcript path; the existing latest-request reader returns input plus cache creation/read tokens for that exact session.
+- **Adapter realization:** the shared idle observer uses the configured token threshold and fixed due time. The helper sends one claim-bound card request through `peer-steward` on the verified pane or the native Claude attachment; clear waits for the matching card and durable queue receipt. The status-only successor prompt does not restart work.
+- **Cache evidence:** the installed `opus[1m]` model name does not expose the actual request cache policy. No cache expiry is inferred from it; current Stop payloads do not carry a verified expiry, so the configured idle wait is used.

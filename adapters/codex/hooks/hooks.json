@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" worker-state-compact.py compact-before; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
+            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" worker-state-compact.py compact-before --harness codex; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" worker-state-compact.py compact-after; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
+            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" worker-state-compact.py compact-after --harness codex; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
             "timeout": 10
           }
         ]
@@ -31,6 +31,16 @@
             "type": "command",
             "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" sessionstart-lifecycle.py; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
             "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -f \"$root/adapters/codex/hooks/herdr-agent-state.sh\" ]; then exec bash \"$root/adapters/codex/hooks/herdr-agent-state.sh\" session; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69",
+            "timeout": 5
           }
         ]
       }

@@ -12,15 +12,18 @@ session has no such candidate and takes the older binding (most recently updated
 that directory) unchanged.
 
 Structurally missing (render '—', PRD §2/§4): rate-limit (no column). effort = model.variant.
-context% = last-request prompt size (input + cache.read + cache.write from the latest
-assistant message's tokens object) / model context window, the window read from opencode's
-own models.dev registry cache (~/.cache/opencode/models.json). The session-table column
-tokens_input is a cumulative cost-side aggregate, NOT the current context size.
+Active context is the latest request's input + cache.read + cache.write. Its display
+denominator requires the same process/session's observed native compaction policy; the
+session-table `tokens_input` is cumulative cost-side usage and a models.dev catalogue window
+does not prove the running policy.
 """
+import datetime
+import math
 import json
 import os
 import re
 import sqlite3
+import stat
 import time
 
 from ..model import ContextEvidence, SubAgent
@@ -212,29 +215,61 @@ def _argv_session(argv):
     return found
 
 
-def _tui_selection(pid, start, environ=None):
-    """The session the pane's own TUI says it shows (PR190 record), or None.
+def _tui_selection_record(pid, start, environ=None):
+    """Read the producer's exact lifetime record, including a retained dead one.
 
-    The TUI writes `<state>/hearting/tui-identity/<pid>-<start>.json` for its own
-    process and removes it on the home screen, so a record naming this exact pid
-    and start time is the current selection."""
+    No process, argv, cwd or expected-session lookup supplies this identity.
+    Source timestamps are observations; the retire consumer checks acceptance.
+    Live readers do not require a retirement timestamp or writtenAt."""
     env = os.environ if environ is None else environ
     home = env.get("HOME") or ""
     base = env.get("XDG_STATE_HOME") or (os.path.join(home, ".local", "state") if home else "")
-    if not base or not start:
+    if (not base or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or isinstance(start, bool) or not str(start).isdigit() or int(start) <= 0):
         return None
-    path = os.path.join(base, "hearting", "tui-identity", "%d-%s.json" % (int(pid), start))
+    path = os.path.join(base, "hearting", "tui-identity", "%d-%s.json" % (pid, start))
+    def generation(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_uid,
+                info.st_mtime_ns, info.st_ctime_ns)
     try:
-        with open(path, "rb") as handle:
-            raw = handle.read(TUI_SELECTION_MAX_BYTES + 1)
-        row = json.loads(raw.decode("utf-8")) if len(raw) <= TUI_SELECTION_MAX_BYTES else None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_size > TUI_SELECTION_MAX_BYTES):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                raw = handle.read(TUI_SELECTION_MAX_BYTES + 1)
+            if (len(raw) > TUI_SELECTION_MAX_BYTES or len(raw) != before.st_size
+                    or generation(before) != generation(os.fstat(fd))
+                    or generation(before) != generation(os.lstat(path))):
+                return None
+        finally:
+            os.close(fd)
+        row = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     if (not isinstance(row, dict) or row.get("schema") != TUI_SELECTION_SCHEMA
-            or row.get("pid") != int(pid) or str(row.get("start")) != str(start)
-            or not SESSION_ID_RE.match(str(row.get("sessionID") or ""))):
+            or type(row.get("pid")) is not int or row["pid"] != pid
+            or isinstance(row.get("start"), bool) or str(row.get("start")) != str(start)
+            or not isinstance(row.get("sessionID"), str)
+            or not SESSION_ID_RE.fullmatch(row["sessionID"])):
         return None
-    return row["sessionID"]
+    written = None
+    try:
+        timestamp = datetime.datetime.fromisoformat(row["writtenAt"].replace("Z", "+00:00"))
+        if timestamp.tzinfo is not None:
+            written = timestamp.timestamp()
+    except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+        pass
+    return {"value": row, "source": {"generation": generation(before),
+            "mtime": before.st_mtime, "ctime": before.st_ctime, "written_at": written}}
+
+
+def _tui_selection(pid, start, environ=None):
+    """The exact TUI selection SID or None; live callers check /proc separately."""
+    record = _tui_selection_record(pid, start, environ)
+    return record["value"]["sessionID"] if record is not None else None
 
 
 def session_of_process(pid, environ=None):
@@ -331,6 +366,8 @@ def _unbind_shadow(sess):
     sess.session_total_tokens = None
     sess.active_context_tokens = None
     sess.context_window_tokens = None
+    sess.context_display_window_tokens = None
+    sess.context_policy = None
     sess.ctx_pct = None
     sess._context_evidence = None
     sess._refresh_source = None
@@ -418,11 +455,18 @@ def _context_tokens_from_payload(payload):
     if not isinstance(tokens, dict):
         return None
     cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    total_tokens = tokens.get("total")
+    if (isinstance(total_tokens, (int, float)) and not isinstance(total_tokens, bool)
+            and math.isfinite(total_tokens) and total_tokens > 0):
+        return int(total_tokens)
     total = 0
-    for value in (tokens.get("input"), cache.get("read"), cache.get("write")):
-        if isinstance(value, (int, float)):
+    observed = False
+    for value in (tokens.get("input"), tokens.get("output"), cache.get("read"), cache.get("write")):
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
             total += value
-    return total or None
+            observed = True
+    return total if observed else None
 
 
 def _last_request_context(con, sid):
@@ -441,9 +485,21 @@ def _last_request_context(con, sid):
             except Exception:
                 continue
             ctx = _context_tokens_from_payload(payload)
-            if ctx:
+            if ctx == 0 and not _request_completed(payload):
+                continue         # a just-created assistant row starts at zero; not a reading
+            if ctx is not None:
                 return ctx
     return None
+
+
+def _request_completed(payload):
+    """True when an assistant row records that its request finished (finish or time.completed)."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("finish"):
+        return True
+    moment = payload.get("time")
+    return isinstance(moment, dict) and bool(moment.get("completed"))
 
 
 def _child_sessions(con, sid):
@@ -579,26 +635,52 @@ def enrich(sess, tick=None):
     sess.session_output_tokens = int(to) if isinstance(to, (int, float)) else None
     sess.session_reasoning_output_tokens = int(tr) if isinstance(tr, (int, float)) else None
     sess.session_total_tokens = toks or None
-    # context% = current-context size (last API request's prompt ~ what the model
-    # actually saw as context) / model window (registry). NOT session.tokens_input,
-    # which is cumulative API input across all requests in the session — cost-side,
-    # not context-side. The real last-request context size lives in the data JSON of
-    # the latest assistant message: tokens.input + tokens.cache.read +
-    # tokens.cache.write. Falls back to session.tokens_input only when per-message
-    # tokens are unavailable.
-    ctx_for_pct = last_ctx if last_ctx else (ti if isinstance(ti, (int, float)) else None)
-    if isinstance(ctx_for_pct, (int, float)) and ctx_for_pct:
-        sess.active_context_tokens = int(ctx_for_pct)
-        lim = _model_ctx_limit(sess.model, provider)
-        if lim:
-            sess.context_window_tokens = int(lim)
-            sess.ctx_pct = min(99, round(100 * ctx_for_pct / lim))
-            sess._context_evidence = ContextEvidence(
-                used_pct=sess.ctx_pct, source="opencode-db", sequence=(tupd or 0, sess._refresh_source.get("observed_cursor", 0) if sess._refresh_source else 0),
-                source_head_sequence=(tupd or 0, sess._refresh_source.get("observed_cursor", 0) if sess._refresh_source else 0),
-                observed_at=(tupd / 1000.0 if isinstance(tupd, (int, float)) else None),
-                fresh_until=(tupd / 1000.0 + 86400 if isinstance(tupd, (int, float)) else None),
-            )
+    # The latest assistant request alone describes current usage. Cumulative
+    # session input is cost telemetry; a catalogue window is not the applied
+    # compaction boundary. Preserve an observed zero without manufacturing a %.
+    if isinstance(last_ctx, (int, float)) and not isinstance(last_ctx, bool) and last_ctx >= 0:
+        sess.active_context_tokens = int(last_ctx)
+    from ..token_budget import context_policy_snapshot, context_policy_used_pct
+    from ..context_policy import read_policy
+    native_model = f"{provider or ''}/{sess.model or ''}"
+    policy_record = read_policy(
+        harness="opencode", session_id=sid, pid=sess.pid,
+        proc_start=sess.proc_start, model=native_model)
+    policy_data = policy_record.get("policy") if isinstance(policy_record, dict) else None
+    policy_fresh_for_request = bool(
+        policy_record and isinstance(tupd, (int, float))
+        and isinstance(policy_record.get("observed_at"), (int, float))
+        and policy_record["observed_at"] <= tupd / 1000.0 + 1.0)
+    if isinstance(policy_data, dict) and policy_fresh_for_request:
+        sess.context_policy = context_policy_snapshot(
+            source=policy_data.get("source") or "opencode-native-chat-params",
+            runtime_version=policy_data.get("runtime_version"),
+            configured_request_tokens=policy_data.get("configured_request_tokens"),
+            configured_request=policy_data.get("configured_request"),
+            effective_window_tokens=policy_data.get("effective_window_tokens"),
+            applied_trigger_tokens=policy_data.get("applied_trigger_tokens"),
+            output_allowance_tokens=policy_data.get("output_allowance_tokens"),
+            compaction_reserve_tokens=policy_data.get("compaction_reserve_tokens"),
+            disabled=policy_data.get("disabled"), enabled=policy_data.get("enabled"),
+            enforced=policy_data.get("enforced"), session_id=sid,
+            raw_percentage=policy_data.get("raw_percentage"),
+            reason=policy_data.get("reason"))
+        sess.context_window_tokens = sess.context_policy["effective_window_tokens"]
+    else:
+        sess.context_policy = context_policy_snapshot(
+            source="opencode-db", session_id=sid,
+            reason="selected-request-policy-not-observed-or-mismatched")
+    sess.context_display_window_tokens = (
+        sess.context_policy["applied_trigger_tokens"]
+        if sess.context_policy["state"] == "applied" else None)
+    sess.ctx_pct = context_policy_used_pct(sess.active_context_tokens, sess.context_policy)
+    if sess.ctx_pct is not None:
+        cursor = (sess._refresh_source or {}).get("observed_cursor", 0)
+        sess._context_evidence = ContextEvidence(
+            used_pct=sess.ctx_pct, source="opencode-db-native-policy",
+            sequence=(tupd or 0, cursor), source_head_sequence=(tupd or 0, cursor),
+            observed_at=(tupd / 1000.0 if isinstance(tupd, (int, float)) else None),
+            fresh_until=(tupd / 1000.0 + 86400 if isinstance(tupd, (int, float)) else None))
     if isinstance(tupd, (int, float)):
         sess.mtime = tupd / 1000.0                  # ms → s
     # rl_5h / rl_7d: the Go plan account quota rides the usage cache (collectors

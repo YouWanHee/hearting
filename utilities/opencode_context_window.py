@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Mapping
 
 try:
-    from model_config import parse_context_window
+    from model_config import parse_context_window, resolve_config, resolve_context_window
 except ImportError:  # package import in focused unit tests
-    from utilities.model_config import parse_context_window
+    from utilities.model_config import parse_context_window, resolve_config, resolve_context_window
 
 
 class OpenCodeContextError(ValueError):
@@ -61,6 +63,18 @@ def _installed_command(command: str | None = None) -> str:
     if command:
         return command
     return shutil.which("opencode") or "opencode"
+
+
+def _installed_version(command: str, *, cwd: str, env: Mapping[str, str]) -> str | None:
+    try:
+        result = subprocess.run([command, "--version"], cwd=cwd, env=dict(env),
+                                text=True, capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)", result.stdout or "")
+    return match.group(1) if match else None
 
 
 def _resolved_config(*, cwd: str, env: Mapping[str, str], command: str) -> dict[str, object]:
@@ -227,6 +241,129 @@ def apply_context_override(config_content: str, model: str, context_window: str 
     return json.dumps(config, ensure_ascii=False, separators=(",", ":")), result
 
 
+def apply_runtime_config(config: Mapping[str, object], *, environ: Mapping[str, str] | None = None) -> dict[str, object]:
+    """Apply the shared budget to providers already visible to OpenCode."""
+    env = dict(os.environ if environ is None else environ)
+    result = json.loads(json.dumps(config))
+    if not isinstance(result, dict):
+        raise OpenCodeContextError("OpenCode config hook input must be an object")
+    home = Path(env.get("HOME") or Path.home()).expanduser()
+    runtime = Path(env.get("OPENCODE_CONFIG_DIR") or
+                   Path(env.get("XDG_CONFIG_HOME") or home / ".config") / "opencode").expanduser()
+    values, _receipt = resolve_config("opencode", runtime=runtime, environ=env)
+    requested, _ = resolve_context_window(values)
+    providers = result.get("provider")
+    if providers is None:
+        providers = {}
+        result["provider"] = providers
+    if not isinstance(providers, dict):
+        raise OpenCodeContextError("OpenCode config hook provider must be an object")
+    known: set[str] = set(providers)
+    for field in ("model", "small_model"):
+        model = result.get(field)
+        if isinstance(model, str) and "/" in model:
+            known.add(model.split("/", 1)[0])
+
+    data_home = Path(env.get("XDG_DATA_HOME") or home / ".local/share")
+    auth = data_home / "opencode" / "auth.json"
+    try:
+        if auth.is_file() and not auth.is_symlink() and auth.stat().st_size <= 1024 * 1024:
+            auth_data = json.loads(auth.read_text(encoding="utf-8"))
+            if isinstance(auth_data, dict):
+                known.update(str(key) for key in auth_data if isinstance(key, str))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    state_home = Path(env.get("XDG_STATE_HOME") or home / ".local/state")
+    recent_path = state_home / "opencode" / "model.json"
+    try:
+        recent = json.loads(recent_path.read_text(encoding="utf-8"))
+        rows = recent.get("recent", []) if isinstance(recent, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            provider = row.get("providerID") if isinstance(row, dict) else None
+            if isinstance(provider, str):
+                known.add(provider)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    try:
+        catalog_path = _models_dev_cache_path(env)
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        catalog = {}
+    if isinstance(catalog, dict):
+        for provider, record in catalog.items():
+            names = record.get("env", []) if isinstance(record, dict) else []
+            if isinstance(names, str):
+                names = [names]
+            if isinstance(names, list) and any(isinstance(name, str) and env.get(name) for name in names):
+                known.add(provider)
+    disabled = result.get("disabled_providers", [])
+    enabled = result.get("enabled_providers")
+    disabled = set(disabled) if isinstance(disabled, list) else set()
+    enabled = set(enabled) if isinstance(enabled, list) else None
+    known -= disabled
+    if enabled is not None:
+        known &= enabled
+
+    content = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    applied = 0
+    for provider in sorted(known):
+        catalog_provider = catalog.get(provider) if isinstance(catalog, dict) else None
+        catalog_models = catalog_provider.get("models", {}) if isinstance(catalog_provider, dict) else {}
+        config_provider = providers.get(provider)
+        config_models = config_provider.get("models", {}) if isinstance(config_provider, dict) else {}
+        models = set(catalog_models) if isinstance(catalog_models, dict) else set()
+        models.update(config_models if isinstance(config_models, dict) else ())
+        for model_id in sorted(models):
+            model = f"{provider}/{model_id}"
+            native_record = catalog_models.get(model_id) if isinstance(catalog_models, dict) else None
+            native_limits = native_record.get("limit") if isinstance(native_record, dict) else None
+            native_limits = native_limits if isinstance(native_limits, dict) else {}
+            configured = config_models.get(model_id) if isinstance(config_models, dict) else None
+            configured_limits = configured.get("limit") if isinstance(configured, dict) else None
+            configured_limits = configured_limits if isinstance(configured_limits, dict) else {}
+            cap = native_limits.get("context", configured_limits.get("context"))
+            if type(cap) is not int:
+                continue
+            input_cap = native_limits.get("input", configured_limits.get("input"))
+            output_cap = native_limits.get("output", configured_limits.get("output"))
+            # A config entry makes OpenCode rebuild the catalog record (dropping
+            # e.g. tiered cost), so add one only where the budget lowers a limit.
+            if (model_id not in config_models and cap <= int(requested)
+                    and (type(input_cap) is not int or input_cap <= cap)):
+                continue
+            try:
+                content, _limits = apply_context_override(
+                    content, model, requested,
+                    {"context": cap, "input": input_cap if type(input_cap) is int else None,
+                     "output": output_cap if type(output_cap) is int else None})
+                applied += 1
+            except OpenCodeContextError:
+                continue
+    return json.loads(content) if applied else result
+
+
+def _hook_main() -> None:
+    try:
+        raw = sys.stdin.readline(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            return
+        payload = json.loads(raw)
+        config = payload.get("config") if isinstance(payload, dict) else None
+        if not isinstance(config, dict):
+            return
+        home = Path(os.environ.get("HOME") or Path.home()).expanduser()
+        runtime = Path(os.environ.get("OPENCODE_CONFIG_DIR") or
+                       Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+                       / "opencode").expanduser()
+        values, _receipt = resolve_config("opencode", runtime=runtime, environ=os.environ)
+        requested, _source = resolve_context_window(values)
+        print(json.dumps({"config": apply_runtime_config(config),
+                          "context_window_request": str(requested)}, ensure_ascii=False))
+    except Exception:
+        # The plugin retains its input config on any helper error.
+        return
+
+
 def prepare_launch_context(*, model: str, context_window: str | int,
                            config_content: str, cwd: str,
                            environ: Mapping[str, str] | None = None,
@@ -235,6 +372,7 @@ def prepare_launch_context(*, model: str, context_window: str | int,
     native_command = _installed_command(command)
     env = dict(os.environ if environ is None else environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
+    runtime_version = _installed_version(native_command, cwd=cwd, env=env)
     before_config = _resolved_config(cwd=cwd, env=env, command=native_command)
     selected_model = before_config.get("model") if model == "inherit" else model
     if not isinstance(selected_model, str) or selected_model.count("/") < 1:
@@ -259,6 +397,53 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         )
     final_limits = _model_limits(after_config, selected_model)
     _verify_final_limits(selected_model, applied, final_limits)
+    compaction = after_config.get("compaction") if isinstance(after_config, dict) else None
+    compaction = compaction if isinstance(compaction, dict) else {}
+    auto = compaction.get("auto")
+    configured_reserve = compaction.get("reserved")
+    context_limit = final_limits.get("context")
+    input_limit = final_limits.get("input")
+    output_limit = final_limits.get("output")
+    policy = {
+        "state": "unknown", "enabled": None, "trigger_tokens": None,
+        "context_tokens": _integer_limit(final_limits, "context", required=False),
+        "input_tokens": _integer_limit(final_limits, "input", required=False),
+        "output_allowance_tokens": _integer_limit(final_limits, "output", required=False),
+        "configured_reserve_tokens": None, "effective_reserve_tokens": None,
+        "source": "opencode-v1.19.0-session-overflow",
+        "reason": "native-compaction-input-unavailable",
+    }
+    if type(configured_reserve) is int and configured_reserve >= 0:
+        policy["configured_reserve_tokens"] = configured_reserve
+    if runtime_version != "1.19.0":
+        policy.update(reason="native-consumer-version-unverified")
+    elif auto is False or context_limit == 0:
+        policy.update(state="disabled", enabled=False, reason="native-auto-compaction-disabled")
+    elif auto in (None, True):
+        output_allowance = policy["output_allowance_tokens"]
+        if policy["configured_reserve_tokens"] is not None:
+            reserve = policy["configured_reserve_tokens"]
+        elif output_allowance is not None:
+            reserve = min(20_000, output_allowance)
+        else:
+            reserve = None
+        trigger = None
+        effective_reserve = None
+        if (type(input_limit) is int and input_limit > 0 and reserve is not None):
+            trigger = max(0, input_limit - reserve)
+            effective_reserve = reserve
+        elif ((input_limit is None or type(input_limit) is int and input_limit == 0)
+              and type(context_limit) is int and context_limit >= 0
+              and output_allowance is not None):
+            trigger = max(0, context_limit - output_allowance)
+            effective_reserve = output_allowance
+        if trigger is not None:
+            policy.update(state="applied", enabled=True, trigger_tokens=trigger,
+                          effective_reserve_tokens=effective_reserve, reason=None)
+        else:
+            policy.update(enabled=True, reason="native-output-or-input-limit-unavailable")
+    else:
+        policy.update(reason="invalid-native-compaction-auto-setting")
     return {
         "config_content": updated,
         "model": selected_model,
@@ -267,4 +452,10 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         "native_limits": limits,
         "applied_limits": applied,
         "final_limits": final_limits,
+        "compaction_policy": policy,
+        "runtime_version": runtime_version,
     }
+
+
+if __name__ == "__main__":
+    _hook_main()

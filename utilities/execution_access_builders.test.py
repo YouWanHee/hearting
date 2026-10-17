@@ -213,7 +213,9 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             f"schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: local\n")
         route = {"route_id": "rt-lab-builders", "route_hash": "sha256:" + "d" * 64,
                  "capability": "autopilot-lab", "cwd": str(self.worktree),
-                 "artifact_root": str(self.artifact), "work_request": {"text": "Run lab"}}
+                 "artifact_root": str(self.artifact), "nodes": [
+                     {"id": "full-run", "kind": "resource-runner"}],
+                 "work_request": {"text": "Run lab"}}
         with mock.patch.dict(os.environ, {
             **self.env, "COMPUTE_HOSTS_CONFIG": str(inventory),
             "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file),

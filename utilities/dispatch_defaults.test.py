@@ -615,5 +615,30 @@ class TopExceptionPolicyTest(DispatchDefaultsV3Tests):
         errors = D.validate(config, D.load_topology_capabilities(D.default_topology_path()))
         self.assertTrue(any("top" in str(e) for e in errors), errors)
 
+
+class NoProgressDefaultsTests(DispatchDefaultsV3Tests):
+    def test_no_progress_normalizer_default_clamp_and_invalid_values(self):
+        self.assertEqual(D.normalize_no_progress_minutes(None)[0], 30)
+        self.assertEqual(D.normalize_no_progress_minutes(0), (0.0, None))
+        self.assertEqual(D.normalize_no_progress_minutes(1.25), (1.25, None))
+        self.assertEqual(D.normalize_no_progress_minutes(-1)[0], 0)
+        self.assertEqual(D.normalize_no_progress_minutes(1441)[0], 1440)
+        for value in (True, "30", float("nan"), float("inf")):
+            normalized, warning = D.normalize_no_progress_minutes(value)
+            self.assertEqual(normalized, 30)
+            self.assertTrue(warning)
+
+    def test_no_progress_policy_is_optional_and_permission_shape_is_unchanged(self):
+        config = self.config()
+        self.assertEqual(D.query_no_progress_minutes(config), 30)
+        self.assertEqual(D.query_headless_policy(config), {
+            "claude_permission_mode": "bypass", "source": "shipped-default"
+        })
+        config["headless"] = {"no_progress_minutes": 0}
+        warnings = D.policy_warnings(config)
+        normalized = D.normalize_policy(config)
+        self.assertEqual(D.query_no_progress_minutes(normalized), 0)
+        self.assertFalse(any("no_progress_minutes" in w for w in warnings))
+
 if __name__ == "__main__":
     unittest.main()

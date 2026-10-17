@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from artifact_context import scope_matches
+
 
 OWNED_CONTAINERS={"documents","research"}
 EXCLUDED_NAMES={"pipeline_summary.md","pipeline_state.yaml"}
@@ -154,7 +156,7 @@ def declared_support_target(node: dict, relative: tuple[str,...]) -> bool:
         first=root.split("/",1)[0]
         if first in OWNED_CONTAINERS or first in WORKTREE_ONLY or first=="source":
             continue
-        if component_match(relative,re.sub(r"<[a-z_]+>","*",scope)):
+        if scope_matches("/".join(relative), (scope,)):
             return True
     return False
 
@@ -240,6 +242,14 @@ def prepare(args) -> int:
     if not target.is_absolute():
         target=Path.cwd()/target
     route,node=load_route(Path(args.route).expanduser().resolve(),args.route_id,args.node)
+    if (route.get("artifact_root") and route.get("route_hash")
+            and (os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_ROUTE_ID"))):
+        from artifact_context import resolve_context
+        context = resolve_context(
+            environ=os.environ, route=args.route, node_id=args.node,
+            explicit={"artifact_root": artifact_root},
+        )
+        route, node = context.route, context.node
     capability=route.get("capability")
     intensity=route.get("effective_intensity")
     if capability=="autopilot-refine" and intensity=="direct":
@@ -339,6 +349,38 @@ def prepare(args) -> int:
     return 0
 
 
+def _route_defaults(argv):
+    values = list(argv)
+    if not values or values[0] != "prepare":
+        return values
+    flags = ("--artifact-root", "--route", "--route-id", "--node")
+    if all(any(item == flag or item.startswith(flag + "=") for item in values) for flag in flags):
+        return values
+    from artifact_context import resolve_context
+    explicit_root = None
+    for index, item in enumerate(values):
+        if item == "--artifact-root" and index + 1 < len(values):
+            explicit_root = values[index + 1]
+        elif item.startswith("--artifact-root="):
+            explicit_root = item.split("=", 1)[1]
+    context = resolve_context(environ=os.environ,
+        explicit={"artifact_root": explicit_root} if explicit_root else None)
+    if not context.route or not context.node or not context.artifact_root:
+        return values
+    defaults = {
+        "--artifact-root": str(context.artifact_root),
+        "--route": str(context.artifact_root / ".runtime" / "routes" / f"{context.route['route_id']}.json"),
+        "--route-id": str(context.route["route_id"]),
+        "--node": str(context.node_id),
+    }
+    insertion = 1
+    for flag, value in defaults.items():
+        if not any(item == flag or item.startswith(flag + "=") for item in values):
+            values[insertion:insertion] = [flag, value]
+            insertion += 2
+    return values
+
+
 def main() -> int:
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="command",required=True)
@@ -348,10 +390,10 @@ def main() -> int:
     prepare_parser.add_argument("--route",required=True)
     prepare_parser.add_argument("--route-id",required=True)
     prepare_parser.add_argument("--node",required=True)
-    args=parser.parse_args()
+    args=parser.parse_args(_route_defaults(sys.argv[1:]))
     try:
         return prepare(args)
-    except (OSError,SnapshotError) as exc:
+    except (OSError,SnapshotError,ValueError) as exc:
         emit({"status":"blocked","reason":str(exc),"target":getattr(args,"target",None)},error=True)
         return 65
 

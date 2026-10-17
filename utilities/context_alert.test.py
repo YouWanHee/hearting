@@ -104,6 +104,100 @@ class ContextAlertTest(unittest.TestCase):
         self.state.write_text("cannot create directory")
         self.assertEqual(self.notice(703000), "")
 
+    def codex_rollout(self, sid="codex-session-id", count=703000, *, source=None, latest=True):
+        path = self.temp / "rollout.jsonl"
+        rows = [{"type": "session_meta", "payload": {"id": sid, "source": source or {"kind": "cli"}}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": count, "cached_input_tokens": 900000,
+                                          "output_tokens": 800000},
+                    "total_token_usage": {"input_tokens": 9999999}, "model_context_window": 1000000}}}]
+        if not latest:
+            rows.append({"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return path
+
+    def test_codex_latest_input_usage_bounded_head_tail_and_identity(self):
+        path = self.codex_rollout(count=703000)
+        data = path.read_bytes()
+        # The identity is only in the bounded head; the relevant event is in the tail.
+        path.write_bytes(data[:data.index(b"\n") + 1] + b"x" * 70000 + b"\n" + data[data.index(b"\n") + 1:])
+        self.assertEqual(alert.codex_usage(path, "codex-session-id"), 703000)
+        self.assertIsNone(alert.codex_usage(path, "other-session-id"))
+        self.assertIsNone(alert.codex_usage(self.codex_rollout(source={"subagent": "reviewer"}),
+                                            "codex-session-id"))
+        self.assertIsNone(alert.codex_usage(self.codex_rollout(latest=False), "codex-session-id"))
+        self.assertIsNone(alert.codex_usage(None, "codex-session-id"))
+        link = self.temp / "rollout-link.jsonl"
+        link.symlink_to(path)
+        self.assertIsNone(alert.codex_usage(link, "codex-session-id"))
+
+    def test_codex_notice_uses_shared_once_state_and_exact_rollout_only(self):
+        path = self.codex_rollout(count=703000)
+        payload = {"hook_event_name": "UserPromptSubmit", "session_id": "codex-session-id",
+                   "transcript_path": str(path)}
+        with patch.dict(os.environ, {**self.env, "HOME": str(self.temp)}, clear=True):
+            self.assertIn("지금", alert.codex_notice(payload))
+            self.assertEqual(alert.codex_notice(payload), "")
+            payload["session_id"] = "new-codex-session"
+            self.assertEqual(alert.codex_notice(payload), "")
+            payload["transcript_path"] = str(self.codex_rollout("new-codex-session", 500001))
+            self.assertIn("700K 전에", alert.codex_notice(payload))
+            self.assertEqual(alert.codex_notice({**payload, "hook_event_name": "SessionStart"}), "")
+            self.assertEqual(alert.codex_notice({**payload, "session_id": ""}), "")
+        with patch.dict(os.environ, {**self.env, "HOME": str(self.temp),
+                                    "CODEX_HOME": str(self.temp / "missing-codex")}, clear=True):
+            self.assertEqual(alert.codex_notice({"hook_event_name": "UserPromptSubmit",
+                "session_id": "valid-session-id"}), "")
+
+    def test_codex_lifecycle_places_only_alert_in_system_message_and_worker_is_quiet(self):
+        import importlib.util
+        hook_path = ROOT / "adapters/codex/hooks/userprompt-lifecycle.py"
+        spec = importlib.util.spec_from_file_location("context_alert_codex_hook", hook_path)
+        hook = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = hook
+        spec.loader.exec_module(hook)
+        transcript = self.codex_rollout("codex-main-session", 703000)
+        payload = {"hook_event_name": "UserPromptSubmit", "session_id": "codex-main-session",
+                   "transcript_path": str(transcript), "prompt": "hello", "cwd": str(self.temp)}
+        patches = [
+            patch.object(hook, "load_payload", return_value=payload),
+            patch.object(hook, "is_worker_session", return_value=False),
+            patch.object(hook, "cwd", return_value=str(self.temp)),
+            patch.object(hook, "interaction_session_id", return_value="codex-main-session"),
+            patch.object(hook, "session_id", return_value="codex-main-session"),
+            patch.object(hook, "launch_trigger"), patch.object(hook, "sd111_first_prompt_sweep"),
+            patch.object(hook, "card_context", return_value="existing card"),
+            patch.object(hook, "native_queue_prompt_receipts", return_value=([], [])),
+            patch.object(hook, "candidate_context", return_value="existing candidate"),
+            patch.object(hook, "run_preflight", return_value="existing briefing"),
+            patch.object(hook, "token_budget_context", return_value=""),
+            patch.object(hook, "peer_notice"), patch.object(hook, "retry_pending_peer"),
+        ]
+        with patch.dict(os.environ, {**self.env, "HOME": str(self.temp)}, clear=True):
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+                    patches[7], patches[8], patches[9], patches[10], patches[11], patches[12], patches[13]:
+                from contextlib import redirect_stdout
+                import io
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    self.assertEqual(hook.main(), 0)
+                emitted = json.loads(stdout.getvalue())
+                self.assertIn("지금", emitted["systemMessage"])
+                self.assertIn(emitted["systemMessage"], emitted["hookSpecificOutput"]["additionalContext"])
+                self.assertIn("existing card", emitted["hookSpecificOutput"]["additionalContext"])
+                self.assertNotIn("existing briefing", emitted["systemMessage"])
+                # Shared once-state survives a same-session compaction/next prompt.
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    self.assertEqual(hook.main(), 0)
+                self.assertNotIn("systemMessage", json.loads(stdout.getvalue()))
+            with patch.object(hook, "is_worker_session", return_value=True), \
+                    patch.object(hook, "load_payload", return_value=payload):
+                stdout = __import__("io").StringIO()
+                with __import__("contextlib").redirect_stdout(stdout):
+                    self.assertEqual(hook.main(), 0)
+                self.assertEqual(stdout.getvalue(), "")
+
     def test_claude_prompt_hook_visible_and_model_context_are_identical(self):
         path = self.transcript(512000)
         payload = {"hook_event_name": "UserPromptSubmit", "session_id": "sid",

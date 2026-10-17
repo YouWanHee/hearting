@@ -406,12 +406,13 @@ class RenderByteIdenticalTest(unittest.TestCase):
         s = Session(harness="claude", pid=1, session_id="sid-a", peer_sent_1h=3, peer_recv_1h=2,
                     peer_last_sent={"to_harness": "codex", "to_session_id": "sid-b",
                                     "to_name": "peer-b", "kind": "steer", "age_min": 1})
-        for segs in [render._session_row(s, narrow=False),
-                     *render._session_row_2line(s, term_width=120),
-                     *render._session_row_stack(s, term_width=60)]:
-            self.assertNotIn("✉ 3/2", "".join(t for t, _k in segs))
-        relation = render._peer_link_strip(sent=s.peer_last_sent, term_width=120)
-        self.assertIn("✉", "\n".join("".join(t for t, _k in row) for row in relation))
+        wide = render._session_row(s, narrow=False)
+        narrow = render._session_row_2line(s, term_width=120)[0]
+        stack = render._session_row_stack(s, term_width=60)[0]
+        for segs in (wide, narrow, stack):
+            text = "".join(t for t, _k in segs)
+            self.assertNotIn("✉ 3/2", text)
+            self.assertIn("→", text)
         self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (3, 2))
 
     def test_sessions_json_has_no_summary_field(self):
@@ -595,17 +596,23 @@ class PeerRepoLabelsTest(unittest.TestCase):
                 self.assertNotIn("codex", text)
                 self.assertLessEqual(render._dw(text), width)
 
-    def test_build_lines_passes_repo_for_exact_peer_and_resumed_alias(self):
+    def test_build_lines_uses_the_visible_resumed_peer_badge_inline(self):
         first = Session(harness="codex", pid=1, session_id="one", cwd="/work/hearting")
-        other = Session(harness="opencode", pid=2, session_id="two", cwd="/work/BC-wt/task")
+        other = Session(harness="opencode", pid=2, session_id="two", cwd="/work/BC-wt/task",
+                        session_tag="42")
         other.session_aliases = ["prior-two"]
         first.peer_last_sent = {"to_harness": "opencode", "to_session_id": "prior-two"}
-        with mock.patch.object(render, "_peer_link_strip", wraps=render._peer_link_strip) as strip, \
-                mock.patch.object(render, "_resolve_session_tag", return_value="42"):
-            render._build_lines([first, other], [], "both", False, 0, term_width=168)
-        repos = strip.call_args_list[0].kwargs["repo_by_key"]
-        self.assertEqual(repos["opencode", "prior-two"], "BC")
-        self.assertEqual(repos["codex", "one"], "hearting")
+        with mock.patch.object(render, "_peer_link_strip",
+                               side_effect=AssertionError("legacy peer strip rendered")), \
+                mock.patch.object(render, "_resolve_session_tag",
+                                  side_effect=AssertionError("peer tag resolver called")), \
+                mock.patch.object(render, "_gpu_session_resources", return_value={}), \
+                mock.patch.object(render, "_fresh_compute_hosts", return_value=({}, 0)):
+            lines = render._build_lines([first, other], [], "both", False, 0,
+                                        term_width=168, resources=[], usage_snapshots={})
+        text = "\n".join(render._plain(line or []) for line in lines)
+        self.assertIn("→ [42]", text)
+        self.assertNotIn("peerB", text)
 
 
 class PeerEndpointOneShapeTest(unittest.TestCase):

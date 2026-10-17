@@ -115,8 +115,14 @@ class ClickOnlyCurses:
 class FakeScreen:
     def __init__(self, values):
         self.values = list(values)
+        self.delay = 100
+        self.read_delays = []
+
+    def timeout(self, delay):
+        self.delay = delay
 
     def getch(self):
+        self.read_delays.append(self.delay)
         return self.values.pop(0) if self.values else FakeCurses.ERR
 
 
@@ -182,6 +188,37 @@ class InputConfigurationTest(unittest.TestCase):
 
 
 class IncrementalCursesInputTest(unittest.TestCase):
+    def test_buffered_arrow_decodes_once_without_consuming_the_next_action(self):
+        fake = FakeCurses()
+        reader = render._CursesInput(fake)
+        screen = FakeScreen([*b"\x1b[B", ord("x")])
+        screen.timeout(37)
+        self.assertEqual(reader.read(screen, timeout_ms=37), (fake.KEY_DOWN, None))
+        self.assertEqual(screen.read_delays, [37, 0, 0])
+        self.assertEqual(screen.delay, 37)
+        self.assertEqual(screen.values, [ord("x")])
+        self.assertEqual(reader.read(screen), (ord("x"), None))
+
+    def test_buffered_mouse_dispatches_one_event_and_preserves_confirmation_key(self):
+        fake = FakeCurses()
+        reader = render._CursesInput(fake)
+        screen = FakeScreen([*b"\x1b[<0;12;4M", ord("y")])
+        self.assertEqual(reader.read(screen),
+                         (fake.KEY_MOUSE, (11, 3, fake.BUTTON1_PRESSED)))
+        self.assertEqual(screen.values, [ord("y")])
+        self.assertEqual(screen.delay, 100)
+
+    def test_missing_tail_yields_and_malformed_stream_has_a_bounded_drain(self):
+        fake = FakeCurses()
+        for sequence in (b"\x1b[", b"\x1b[<" + b"1" * 1000):
+            with self.subTest(sequence_length=len(sequence)):
+                reader = render._CursesInput(fake)
+                screen = FakeScreen(sequence)
+                self.assertEqual(reader.read(screen), (fake.ERR, None))
+                self.assertLessEqual(len(screen.read_delays), reader._MAX_SEQUENCE + 1)
+                self.assertEqual(screen.delay, 100)
+                self.assertTrue(reader.has_buffered_input())
+
     def _read(self, reader, sequence):
         result = (FakeCurses.ERR, None)
         for value in sequence:

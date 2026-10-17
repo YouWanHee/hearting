@@ -215,7 +215,8 @@ class WorkStartTest(unittest.TestCase):
 
     def test_lab_owner_start_and_resume_pass_inventory_and_explicit_data_to_dispatch(self):
         root = Path(self.tmp.name)
-        inventory = root / "compute-hosts.yaml"
+        inventory = root / "configuration" / "compute-hosts.yaml"
+        inventory.parent.mkdir()
         run_root = root / "custom-runs"
         data_root = root / "approved-data"
         inventory.write_text(
@@ -229,7 +230,7 @@ class WorkStartTest(unittest.TestCase):
         original = explicit.read_bytes()
         route = {**self.route, "route_id": "rt-lab-data", "route_hash": "sha256:" + "c" * 64,
                  "capability": "autopilot-lab", "cwd": str(root / "worktree"),
-                 "artifact_root": str(root / "artifacts")}
+                 "artifact_root": str(root / "artifacts"), "nodes": [{"id": "full-run"}]}
         calls = []
 
         def run(command, **kwargs):
@@ -246,10 +247,43 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(paths[0], paths[1])
         request = json.loads(paths[0].read_text())
         self.assertEqual({str(data_root), str(run_root)}, set(request["writable_roots"]))
+        self.assertEqual([str(inventory.parent)], request["read_roots"])
+        self.assertFalse(request["network"]["required"])
         self.assertEqual("os-sandbox", request["enforcement_required"])
         self.assertEqual(original, explicit.read_bytes())
         self.assertFalse(data_root.exists())
         self.assertFalse(run_root.exists())
+
+        given_route = {**route, "route_id": "rt-lab-parent-given",
+                       "route_hash": "sha256:" + "f" * 64}
+        given_route_file = root / "parent-given-route.json"
+        given_route_file.write_text(json.dumps(given_route))
+        from execution_access import AccessContext, load_request, normalized_request
+        import route_authority as RA
+        given_data = root / "parent-given.json"
+        given_data.write_text(json.dumps({
+            "schema_version": 1, "writable_roots": [str(data_root)],
+            "read_roots": [], "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "any", "justification": {str(data_root): "parent-approved output"},
+        }))
+        context = AccessContext.build(
+            worktree=given_route["cwd"], artifact_root=given_route["artifact_root"],
+            dispatch_state_root=root, agent_home=W.ROOT,
+            environ={"HOME": str(root / "home")},
+        )
+        given_request = load_request(given_data, context=context)
+        RA.record_access_change(
+            given_route, request=normalized_request(given_request),
+            request_sha256=given_request.request_sha256,
+            by={"harness": "codex", "session_id": "fixture-parent"}, source="unattributed",
+        )
+        with mock.patch.dict(os.environ, {"HOME": str(root / "home"),
+                                           "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            W._start(given_route, given_route_file, self.jobs, "owner", "codex", run)
+        given_path = Path(calls[-1][calls[-1].index("--execution-access-file") + 1])
+        combined = json.loads(given_path.read_text())
+        self.assertEqual({str(data_root), str(run_root)}, set(combined["writable_roots"]))
+        self.assertFalse(combined["network"]["required"])
 
         explicit.write_text("{")
         calls.clear()
@@ -261,6 +295,60 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertEqual(69, result["exit_code"])
         self.assertIn("execution-access-invalid-json", result["execution_access_diagnostic"])
+
+    def test_real_start_prepares_equal_native_and_borrowed_compute_defaults_and_none_for_plain_routes(self):
+        root = Path(self.tmp.name)
+        inventory = root / "configuration" / "compute-hosts.yaml"
+        inventory.parent.mkdir()
+        run_root = root / "shared-runs"
+        inventory.write_text(
+            f"schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: local\n")
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "started=1\n", "")
+
+        native = {**self.route, "route_id": "rt-native", "route_hash": "sha256:" + "d" * 64,
+                  "capability": "autopilot-lab", "cwd": str(root / "native"),
+                  "artifact_root": str(root / "native-artifacts"), "nodes": [{"id": "full-run"}]}
+        borrowed = {**self.route, "route_id": "rt-borrowed", "route_hash": "sha256:" + "e" * 64,
+                    "capability": "autopilot-code", "cwd": str(root / "borrowed"),
+                    "artifact_root": str(root / "borrowed-artifacts"),
+                    "nodes": [{"id": "lab-full-run", "part": "autopilot-lab:full-run"}]}
+        with mock.patch.dict(os.environ, {"HOME": str(root / "home"),
+                                           "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            requests = []
+            for route in (native, borrowed):
+                route_file = root / f"{route['route_id']}.json"
+                route_file.write_text(json.dumps(route))
+                W._start(route, route_file, root / "jobs.log", "owner", "codex", run)
+                request_file = Path(calls[-1][calls[-1].index("--execution-access-file") + 1])
+                requests.append(json.loads(request_file.read_text()))
+            self.assertEqual(requests[0]["writable_roots"], requests[1]["writable_roots"])
+            self.assertEqual([str(run_root)], requests[0]["writable_roots"])
+            self.assertEqual(requests[0]["read_roots"], requests[1]["read_roots"])
+            self.assertEqual([str(inventory.parent)], requests[0]["read_roots"])
+            self.assertEqual(requests[0]["network"], requests[1]["network"])
+            self.assertTrue(requests[0]["network"]["required"])
+            from execution_access import COMPUTE_NETWORK_REASON
+            self.assertEqual(COMPUTE_NETWORK_REASON,
+                             requests[0]["network"]["reason"])
+
+            plain_routes = (
+                {"route_id": "rt-plain-code", "capability": "autopilot-code", "nodes": [{"id": "execute"}]},
+                {"route_id": "rt-frame", "capability": "route-frame", "nodes": [{"id": "frame"}]},
+            )
+            for index, partial in enumerate(plain_routes):
+                route = {**self.route, **partial,
+                         "route_hash": "sha256:" + str(index + 1) * 64,
+                         "cwd": str(root / partial["route_id"]),
+                         "artifact_root": str(root / (partial["route_id"] + "-artifacts"))}
+                route_file = root / f"{route['route_id']}.json"
+                route_file.write_text(json.dumps(route))
+                before = len(calls)
+                W._start(route, route_file, root / "jobs.log", "owner", "codex", run)
+                self.assertNotIn("--execution-access-file", calls[before])
 
     def observe(self, **kw):
         return {"state": "ready" if self.ready else "timeout", "children": []}
@@ -569,6 +657,11 @@ class WorkStartTest(unittest.TestCase):
                 stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
                 stack.enter_context(mock.patch.object(owner, "_authoritative_jobs", return_value=str(self.jobs)))
                 stack.enter_context(mock.patch.object(owner, "_sealed_owner_context", return_value=context))
+                # This case tests selector choice, while subprocess.run is the
+                # mocked wrapper boundary below; avoid running a real foreground
+                # owner lifecycle inside the isolated fixture.
+                stack.enter_context(mock.patch.object(owner, "select_launch_lifecycle",
+                                                      return_value="detached"))
                 stack.enter_context(mock.patch.object(owner, "_usage", return_value=dict.fromkeys(("claude", "codex", "opencode"), "ok")))
                 stack.enter_context(mock.patch.object(owner._capacity, "capacity_report", return_value={
                     "scores": {"claude": headroom, "codex": 50, "opencode": 0}, "sources": {}}))
@@ -1110,6 +1203,30 @@ class WorkStartTest(unittest.TestCase):
         for token in ('correction_command','--message-file','replacement owner','Do not close or recompose'):
             self.assertIn(token,result['next_step'])
         self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
+
+    def test_format_only_owner_end_waits_for_correction_without_launching(self):
+        owner = self._parked_owner_row()
+        original = next(line for line in self.jobs.read_text().splitlines()
+                        if 'attempt_id='+owner+',' in line)
+        additions = (",note=dead-contract,failure_class=contract"
+                     ",classifier_source=supervisor-terminal-v1,process_exit=0"
+                     ",reconcile_reason=final-handoff-invalid,terminal_event=claude-result"
+                     ",log_file=" + str(Path(self.tmp.name) / "owner.log"))
+        corrected = original.replace(",note=dead-worker-blocked,failure_class=blocked", "") + additions
+        self.jobs.write_text(self.jobs.read_text().replace(original, corrected))
+        stable = self.jobs.read_bytes()
+        with mock.patch('dispatch_replacement.owner_parked_gate', return_value=None):
+            results = [self.start() for _ in range(3)]
+        self.assertEqual([(r['state'], r['reason'], r['required_action']) for r in results],
+                         [('needs-attention', 'owner-blocked', 'answer-blocked-owner')] * 3)
+        self.assertIn('correction_command', results[0])
+        self.assertIn('--message-file', results[0]['next_step'])
+        self.assertIn('handoff-format error', results[0]['next_step'])
+        self.assertIn('owner_log_file ' + str(Path(self.tmp.name) / 'owner.log'), results[0]['next_step'])
+        self.assertEqual(results[0]['owner_log_file'], str(Path(self.tmp.name) / 'owner.log'))
+        self.assertNotIn('owner_report says', results[0]['next_step'])
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.jobs.read_bytes(), stable)
 
     def test_a_readable_fail_after_spent_replacement_points_to_the_working_correction(self):
         owner = self._parked_owner_row()
@@ -1813,8 +1930,8 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(asked["human_wait"], {"state": "pending", "fallback": "ordinary-conversation",
                                               "question_block": expected})
         self.assertNotIn("Confirm this understanding", asked["human_wait"]["question_block"])
-        self.assertIn("confirm or correct the understanding in their language", asked["next_step"])
-        self.assertIn("registered question and choices without changing their words", asked["next_step"])
+        self.assertIn("understanding sentence verbatim as the first question in the same native question batch", asked["next_step"])
+        self.assertIn("every registered question and its choices in that batch", asked["next_step"])
         registered = Path(asked["interview_file"])
         original = registered.read_bytes()
         answers_path = registered.parent / "answers.json"
@@ -2568,6 +2685,7 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         """Fake only native launch; preserve replacement admission and route validation."""
         self.assertEqual(Path(command[1]).name,"dispatch-owner.py")
         self.native_calls.append(command)
+        self.launch_env = dict(kwargs.get("env") or {})
         aid=command[command.index("--attempt-id")+1]
         source_id=command[command.index("--automatic-retry-of")+1]
         source=self.replacement._rows(self.jobs.read_text().splitlines())[source_id][1]
@@ -2694,6 +2812,7 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         import ship_parent_deploy
         env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
         env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
+        env.update(OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="danger-full-access")
         defaults=dict(W.start_work.__kwdefaults__)
         W.start_work.__kwdefaults__["run"]=self.native_owner_launch
         self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
@@ -2701,6 +2820,8 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         for index in range(2):
             receipt=self.cli(correct,env)[-1]
             self.assertEqual(receipt["state"],"running",receipt)
+            self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"), "direct-correct")
+            self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"), "danger-full-access")
             self.assertEqual(receipt["parent_next"],"bounded-wait")
             argv=shlex.split(receipt["parent_next_command"])
             self.assertEqual(Path(argv[1]).name,"capability-route.py")
@@ -2737,6 +2858,63 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         self.assertEqual(self.request_path.read_bytes(),self.request_bytes)
         for path,raw in self.f.preserved.items():
             if path!=self.jobs:self.assertEqual(path.read_bytes(),raw)
+
+    def test_format_only_replacement_waits_then_corrects_through_public_cli(self):
+        import dispatch_supervisor_terminal as terminal
+        import dispatch_replacement
+        env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off",
+                   OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="danger-full-access")
+        defaults=dict(W.start_work.__kwdefaults__)
+        W.start_work.__kwdefaults__["run"]=self.native_owner_launch
+        self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
+
+        first=self.cli(["correct","--jobs",str(self.jobs),"--attempt-id","att-owner",
+                        "--message-file",str(self.answer)],env)[-1]
+        self.assertEqual(first["state"],"running",first)
+        self.assertEqual(len(self.native_calls),1)
+        self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"),"direct-correct")
+        self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"),"danger-full-access")
+
+        malformed=(f"artifact: {self.f.output/'replacement-report.md'}\n"
+                   "verdict: BLOCKED — explanation\nblocker: format-only owner result")
+        classification=terminal.classify_codex_result(malformed)
+        self.assertEqual(classification.note,"dead-contract")
+        report=self.f.output/"replacement-report.md"
+        report.write_text("format-only owner result\n")
+        log=self.f.base/"format-only-owner.jsonl"
+        log.write_text(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":malformed}})+"\n"+
+                       json.dumps({"type":"turn.completed"})+"\n")
+        first_owner=self.cr._current_owner_attempt(self.jobs,"att-owner")
+        self.native_children[-1].communicate(timeout=5)
+        metadata=self.cr._find_attempt_row_metadata(self.jobs,first_owner)
+        metadata.update(note=classification.note,**classification.evidence(),log_file=str(log))
+        self.write_owner(metadata,"done")
+
+        starts=[self.cli(["start","--route",str(self.f.path),"--jobs",str(self.jobs)],env)[-1]
+                for _ in range(2)]
+        for receipt in starts:
+            self.assertEqual((receipt["state"],receipt["reason"],receipt["required_action"]),
+                             ("needs-attention","owner-blocked","answer-blocked-owner"),receipt)
+            self.assertIn("correction_command",receipt)
+        self.assertEqual(len(self.native_calls),1)
+
+        corrected=self.cli(["correct","--jobs",str(self.jobs),"--attempt-id",first_owner,
+                            "--message-file",str(self.answer)],env)[-1]
+        self.assertEqual(corrected["state"],"running",corrected)
+        self.assertEqual(len(self.native_calls),2)
+        self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"),"direct-correct")
+        self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"),"danger-full-access")
+        current=self.cr._current_owner_attempt(self.jobs,"att-owner")
+        source_meta=self.cr._find_attempt_row_metadata(self.jobs,first_owner)
+        family,_,_=dispatch_replacement.source_binding(self.jobs,source_meta)
+        record=dispatch_replacement._read(dispatch_replacement._record_path(self.jobs,family))
+        self.assertEqual(record["proof"]["source_result"],"CONTRACT")
+        recovery_args=SimpleNamespace(automatic_retry_of=first_owner,attempt_id=current,
+                                      jobs_path=str(self.jobs),worker_type="owner")
+        recovery=dispatch_replacement.recovery_instructions(recovery_args)
+        self.assertIn(self.answer.read_text().strip(),recovery)
+        self.assertEqual(self.cr._find_attempt_row_metadata(self.jobs,first_owner)["note"],"dead-contract")
 
     def test_actual_parent_only_normal_complete_and_strict_unchanged_32pins(self):
         import ship_parent_deploy

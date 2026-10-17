@@ -21,6 +21,7 @@ _SCRUB = {
     "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
     "CODEX_HOME",
+    "CODEX_HOOK_TRUST_APP_SERVER_COMMAND",
     "CLAUDE_CONFIG_DIR",
     "AGENT_HOME",
     "TMPDIR",
@@ -36,6 +37,8 @@ _SCRUB = {
     "MEM_RECALL_RECEIPTS",
     "HEARTING_SAFE_LOCK_ROOT",
     "HEARTING_FIXTURE_ROOT",
+    # A dispatched worker points this at the real runtime home; fixtures must not inherit it.
+    "HEARTING_MODEL_CONFIG_HOME",
 }
 _GIT_CONFIG_KEYS = {"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
 
@@ -77,6 +80,9 @@ def build_environment(
         "XDG_CACHE_HOME": str(cache),
         "XDG_RUNTIME_DIR": str(runtime),
         "CODEX_HOME": str(codex_home),
+        # A missing in-fixture executable: activation's best-effort hook trust
+        # skips instead of starting the host's real Codex App Server.
+        "CODEX_HOOK_TRUST_APP_SERVER_COMMAND": str(root / "no-codex-app-server"),
         "CLAUDE_CONFIG_DIR": str(home / ".claude"),
         "AGENT_HOME": str(source),
         "TMPDIR": str(temp),
@@ -116,8 +122,10 @@ def prepare_environment(env: Mapping[str, str]) -> None:
 
 def shell_exports(env: Mapping[str, str]) -> str:
     keys = sorted(_SCRUB | _GIT_CONFIG_KEYS | {"PYTHONDONTWRITEBYTECODE"})
+    # A scrubbed key the fixture does not set must also leave the calling shell.
     return "\n".join(
-        f"export {key}={shlex.quote(env[key])}" for key in keys if key in env
+        f"export {key}={shlex.quote(env[key])}" if key in env else f"unset {key}"
+        for key in keys
     )
 
 

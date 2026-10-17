@@ -53,7 +53,7 @@ preflight doctor path, without blurring the conformance/drill distinction above.
 | runtime hook output protocol | adapter hook bridges | `adapter-payload-wrapper` | Hook stdout must match the owning runtime's hook protocol exactly. Context-injection hooks emit the runtime's structured context object; side-effect-only lifecycle hooks keep stdout empty unless that runtime explicitly accepts a structured success object. Portable helper text is never forwarded as raw hook stdout. A valid pinned harness root keeps its bridge path even when the bridge is absent; root selection never replaces a missing pinned bridge with the current projection. | Each adapter must document its hook output contract, test the exact stdout shape for every native hook bridge, and route diagnostic/helper text to logs or stderr only when the runtime accepts it. |
 | Fleet interaction wait signal | `tools/fleet/interaction.py`, `hooks/fleet-interaction-state.py`, adapter-native lifecycle bridges | `adapter-payload-wrapper` | An unresolved user decision or approval is recorded only as an exact `harness`/`session_id` allowlisted sidecar (`schema_version`, `harness`, `session_id`, `kind`, `source`, `waiting_since`). Question text, answer choices, commands, arguments, denial reasons, model output, and tool payloads are structurally absent. Producers never own the response and keep stdout empty; loss of the observational sidecar must not affect the session. | Translate native question/approval events into the same allowlisted writer and clear them at exact resolution/turn/session boundaries. If no exact runtime event exists, report `unknown`; never infer a wait by parsing prompt prose. |
 | Herdr state integration | `hooks/herdr-agent-state.sh` | `external-integration` | Publish working/idle/blocked/release state to Herdr. | Optional external integration; not a core invariant. |
-| route presence | `utilities/route_presence_gate.py`; bridges `hooks/route-presence-gate.py` (Claude), `adapters/codex/hooks/route-presence-gate.py`, `adapters/opencode/plugins/hearting-guards.js` | `portable-check` | The one routing gate (`core/WORKFLOW.md` §0.4 participation invariant). Before a session's source edit inside a git work tree, `git commit` with non-artifact changes, or long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`), it checks one fact: does this session's route-chain ledger (`tools/fleet/route_chain.py`, keyed by the payload session id and the environment writer identity) name any route for the folder's canonical artifact root (`utilities/artifact-root.sh`)? If not, it refuses that call with one paste-ready `capability-route.py compose --shape direct --campaign-key <recent> --slug <stem-MMDD> --cwd <work-tree>` line; once any route exists there, open or closed, that session×folder passes for good. No route binding, freshness, lineage, stage or proof checks. Shell commands are matched only in plain forms; ambiguous ones pass. Registered owners/workers, artifact roots, the temp directory (scratchpad), runtime homes, paths outside git, CI, dev activation and every judgement failure pass; `HEARTING_ROUTE_GATE=off` disables it. | Call `utilities/route_presence_gate.py --codex` (Codex PreToolUse JSON) or `--opencode` (stdin `{tool,args,sessionID,cwd}`, exit 1 = refuse) from the runtime's pre-tool surface for edit and shell tools; a runtime without one records the gap in its ADAPTATION. |
+| route presence | `utilities/route_presence_gate.py`; bridges `hooks/route-presence-gate.py` (Claude), `adapters/codex/hooks/route-presence-gate.py`, `adapters/opencode/plugins/hearting-guards.js` | `portable-check` | The one routing gate (`core/WORKFLOW.md` §0.4 participation invariant). Before a session's source edit inside a git work tree, `git commit` with non-artifact changes, or long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`), it checks one fact: does this session's route-chain ledger (`tools/fleet/route_chain.py`, keyed by the payload session id and the environment writer identity) name any route for the folder's canonical artifact root (`utilities/artifact-root.sh`)? If not, it refuses that call with one paste-ready `capability-route.py compose --shape direct --campaign-key <recent> --slug <stem-MMDD> --cwd <work-tree>` line for one atomic, reversible inline change and points other new work to `compose --start --prompt-file <task>` without `--shape`, so the frame decides; once any route exists there, open or closed, that session×folder passes for good. No route binding, freshness, lineage, stage or proof checks. Shell commands are matched only in plain forms; ambiguous ones pass. Registered owners/workers, artifact roots, the temp directory (scratchpad), runtime homes, paths outside git, CI, dev activation and every judgement failure pass; `HEARTING_ROUTE_GATE=off` disables it. | Call `utilities/route_presence_gate.py --codex` (Codex PreToolUse JSON) or `--opencode` (stdin `{tool,args,sessionID,cwd}`, exit 1 = refuse) from the runtime's pre-tool surface for edit and shell tools; a runtime without one records the gap in its ADAPTATION. |
 | stage-dispatch reminder | `hooks/stage-dispatch-reminder.sh` | `portable-check` | SD-11: when a dispatch-depth-1 conductor at standard+ intensity is about to invoke a `code-{plan,execute,test,report}` sub-skill **in-session** (env `AGENT_DISPATCH_DEPTH=1`, `AGENT_DISPATCH_INTENSITY∈{standard,strong,thorough,adversarial}`), surface a reminder to dispatch the stage as a dispatch-depth-2 headless session instead. **Soft / non-deny** (fail-open) on every harness: emits `additionalContext` only, never blocks — the hook cannot tell a legitimate headless-unavailable fallback from a mistake (§8.5.2). | Run `hooks/stage-dispatch-reminder.sh --skill <name> [--dispatch-depth <n>] [--intensity <i>]` before a Skill call, or attach it to a pre-tool Skill event. |
 | native subagent default model | `hooks/subagent-model-default.sh` | `adapter-payload-wrapper` | Native subagent spawns carry the adapter-config-declared default model tier instead of silently inheriting the interactive session model (core/ADAPTATION.md §3). An explicit per-invocation choice, agent-definition pin, or intentional parent-inherit surface wins only when the resolved model is delegation-eligible. A config-declared interactive-main-only model, explicit `inherit`, fork inheritance, or an unavailable eligibility policy is a typed deny for a valid spawn request; malformed/non-actionable payloads remain silent. | Realize the same config-declared default and main-only eligibility guard through the runtime's native subagent model configuration or pre-spawn decision surface, or record the surface as unsupported; do not consume the Claude PreToolUse payload shape as configuration. |
 | registered-child completion delivery | adapter-owned session supervisor or checked single-ingress gateway | `adapter-coupled-automation` | Runtime-owned carriers per parent runtime (`core/ADAPTATION.md §7`); the parent sees one printed field. | The parent's model-visible contract is one field, not the carrier taxonomy: a launch receipt that spawned a child, and every steward line that reports an armed watch, carry `parent_next=end-turn` (a carrier owns it; yield) or `parent_next=bounded-wait` with the exact executable, bounded `parent_next_command`. A steward line claims a carrier only when the hook arms from that line *and* the watch's wake is the hook, so `wake=none` and a session-printed `rearm` are both waits, never `end-turn` (`utilities/parent_next_directive.py`), and an unrecognized delivery fails closed to `bounded-wait`. Carrier selection and requirements: `core/ADAPTATION.md §7.4`. |
@@ -85,6 +85,48 @@ may claim a pending or lease-expired record by `session_id`/`recipient_digest`
 match alone, inject a bounded receipt, and ack, with no judgment authority. The
 record must persist the grade actually used in its `claim_authority` field; a
 writer that cannot persist the field must not claim.
+
+## Current Session and Context Evidence
+
+Codex runtime activation (install, update, or refresh) may record the current native
+hash for Hearting's own projected hook definitions through App Server. It preserves
+disabled decisions, leaves foreign definitions to the user's `/hooks` review, and
+conditionally restores only trust leaves it still owns during deactivation. If Codex
+or App Server is unavailable, activation reports one skipped-trust line and `/hooks`
+remains the fallback. Claude and OpenCode have no corresponding trust-record step.
+peer-steward observes forms only and never writes trust or selects an option.
+
+A process lifetime or launch session is not necessarily the conversation selected
+now. A pane report names the current full native conversation only after the
+live foreground process, PID/start, tty, and foreground process group agree with
+that pane. For Codex, exactly one `thread-id` is the last `[tui].status_line`
+item; two fresh complete reads of the complete UUID in the last visible native
+footer field can prove the selected thread when an open rollout still names the
+previous conversation. An earlier UUID, title, transcript, partial or clipped
+field, or hidden footer is unknown. A late callback may report only while its
+session still matches this current proof. Registered workers and shared services
+never gain pane ownership from an inherited pane label. When current selection
+cannot be proved, leave it unknown.
+
+Context pressure is display-only. Keep raw active usage and model capacity
+separate from configured requests, the runtime's applied compaction trigger,
+and any output reserve. Interpret the exact consumer for the resolved runtime
+execution and account for reserve once. Disabled, unavailable, stale, or
+unbound policy is unknown. Known active usage of zero remains zero, and model
+capacity alone is not an applied trigger. Bind policy to the selected session
+or exact child attempt, preserve raw diagnostics, and show a gauge only when
+usage and applied policy share that scope. An adapter interprets a runtime's
+startup inputs only when they belong to that execution. Later user settings
+and another home’s catalogue cannot replace a retained startup snapshot.
+Missing startup evidence remains unknown, including an older rollout whose
+runtime version cannot be bound to the resumed execution. A registered
+worker's private native catalogue may be captured during its initialization,
+bounded by that same attempt's native session-start evidence.
+An adapter interprets a runtime's
+compaction policy only for runtime versions whose consumer it has verified from
+that runtime's own source or binary; any other version keeps raw telemetry and
+shows unknown. The same acquisition serves interactive sessions and registered
+workers through each runtime's existing callback, tap, plugin, or attempt stream.
 
 ## Adapter Rule
 

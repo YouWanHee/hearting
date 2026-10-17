@@ -320,7 +320,7 @@ class InstallFollowTest(unittest.TestCase):
                 screen.getmaxyx.return_value = 24, 100
                 screen.getch.side_effect = [-1, -1, ord("q")]
                 reader = mock.Mock()
-                reader.read.side_effect = lambda stdscr: (stdscr.getch(), None)
+                reader.read.side_effect = lambda stdscr, **kwargs: (stdscr.getch(), None)
                 reader.has_buffered_input.side_effect = [buffered, False]
 
                 def pump(_producer, *_args, **kwargs):

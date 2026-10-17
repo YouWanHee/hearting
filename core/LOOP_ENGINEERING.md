@@ -31,6 +31,12 @@ describe how to reach them; judge any structure or change against these first.
    execution. There are no per-harness exception branches or duplicated
    judgments. (See §3 and §5.)
 
+For durable completion delivery, an exact recipient-side receipt remains valid
+after the transport claim expires or changes owner. The shared delivery record
+may settle only the matching delivery from that verified receipt; receiving a
+notice does not mean its work or follow-up has completed. Emission remains
+recoverable when no receipt exists.
+
 ## 1. The unit of a feature is a responsibility carried to the end
 
 `intent → execution → observation → result settlement → follow-up or recovery → closure → handoff`
@@ -190,6 +196,10 @@ links: prefer the existing cycle easy title or one-line summary, then its
 recorded title and campaign title. Without a usable title, show a short readable
 name with locator dates and execution suffixes removed. Read titles in the
 existing detail pass; never wait for them before publishing basic observations.
+Display labels use existing compact route-to-cycle filename hints and the bounded
+cycle inventory. Validate the selected record's exact route and normal campaign
+metadata; do not deserialize or retain full artifact-admission documents for
+labels. Generic metadata readers retain their existing document contracts.
 The name does not repeat the same command or execution identity on its line.
 Keep technical terms, capability/stage identifiers and short keyboard actions
 in their original notation. Fleet's own labels and legends use short English
@@ -242,6 +252,10 @@ Terminal input decoding never waits inside the frame loop for the rest of a key
 or mouse packet. Incomplete sequences are consumed incrementally, and only
 complete valid events are dispatched; the mouse default, explicit opt-out,
 keyboard behavior, and click safety remain intact.
+Already buffered bytes of one incomplete event are drained with bounded,
+nonblocking reads before another full render. Missing bytes still yield to the
+frame loop, and decoding stops at the first complete event so queued actions
+retain their order and confirmation boundary.
 Once an SGR mouse prefix is recognized, malformed contents are consumed through
 their terminator or a short internal expiry and are never replayed as commands.
 Unsupported button, modifier, motion, and wheel combinations are inert. Pending,
@@ -285,11 +299,20 @@ Expanded GPU process and reservation rows omit task descriptions and run IDs;
 the session identity and observed command identify the occupation. Reservation
 times remain facts, while task/run metadata stays in structured output.
 When a session label has only its Fleet tag or short session ID, show its
-observed repository before that identifier instead of the harness name. The
-same repository-first order applies to peer relation labels. Resolve linked worktrees to
-their parent repository through the existing grouping resolver. Missing
-repository evidence leaves the identifier alone; another session or workload
-name never supplies it. Explicit session names and verified aliases keep priority.
+observed repository before that identifier instead of the harness name. Peer
+communication uses compact directional labels inline in the existing session
+rows: an on-board Fleet tag or harness-qualified short SID identifies the
+endpoint, while the exact full `(harness, session_id)` owns the join. Same-peer
+opposite directions may combine; different peers keep both directions visible
+at narrow widths. Colliding tags are harness-qualified and same-harness tag or
+SID-prefix collisions retain a distinguishing SID suffix. Peer labels do not
+add repository, name, kind or age detail;
+the existing structured output retains it. Role and same-repository supervisor
+meaning continue to come from the existing exact collector evidence. Resolve
+linked worktrees to their parent repository through the existing grouping
+resolver for session and GPU labels. Missing repository evidence leaves the
+identifier alone; another session or workload name never supplies it. Explicit
+session names and verified aliases keep priority.
 GPU sampling deadlines cover SSH connection, both bounded NVIDIA queries and
 process attribution, with room in the outer collection deadline. Slow sampling
 stays in the independent GPU refresh pump and does not delay basic refresh or

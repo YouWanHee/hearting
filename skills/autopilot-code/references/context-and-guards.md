@@ -1,4 +1,4 @@
-> **Artifact layout:** follow [CONVENTIONS §5](../../../core/CONVENTIONS.md#5-skill-output-convention--t1t2t3). Code artifacts normally live under `<artifact-root>/plans/<date>_<slug>/`, independent of spec presence. `direct` has no plan artifact. `quick` uses an inline micro-plan and writes a durable plan only when adapter or repository policy requires it. In standard+, `plan/` and checklist are T1, `dev_logs/` and `test_logs/` are T2, and reviewer logs live under `_internal/`. Monorepos may use component subdirectories.
+> **Artifact layout:** follow [CONVENTIONS §5](../../../core/CONVENTIONS.md#5-skill-output-convention--t1t2t3). `plans/<date>_<slug>/` is the standalone default. Routed stages use their sealed node outputs and write scope; the cycle output directory is only the base. `direct` has no plan artifact. `quick` uses an inline micro-plan and writes a durable plan only when policy requires one.
 >
 > **Artifact root:** resolve with `utilities/artifact-root.sh` (CONVENTIONS §5.1).
 
@@ -21,7 +21,7 @@ At invocation, inspect the current directory, artifact root, and spec. Read:
 | `<artifact-root>/spec/pipeline_state.yaml` exists | Read spec and activate every mode named in its `mode` array. |
 | Absent | Use normal dev/debug behavior with lightweight inference from project files. |
 
-Output remains `plans/<date>_<slug>/` in both cases. Report spec detection and mode in one localized line.
+Standalone output remains `plans/<date>_<slug>/`; routed output follows the sealed node. Report spec detection and mode in one localized line.
 
 ### Mode-Specific Logic
 

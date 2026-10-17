@@ -619,6 +619,7 @@ def carrier_terminal(row):
         worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"),
         worker_type=meta.get("worker_type"),
+        artifact_binding=meta,
     )
 
 
@@ -668,6 +669,7 @@ def _foreground_stage_terminal(row):
         return False
     terminal = inspect_terminal_attempt(
         log, worktree=row.get("worktree"), artifact_root_metadata=meta.get("artifact_root"),
+        artifact_binding=meta,
     )
     return bool(exact_boundary(terminal, runtime) and terminal.get("state") == "valid"
                 and terminal.get("verdict") == "PASS"
@@ -781,6 +783,7 @@ def _same_host_foreground_review_failure(row):
         log_file, worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"),
         worker_type="review",
+        artifact_binding=meta,
     )
     raw_terminal = inspect_terminal_log(log_file)
     if (terminal.get("state") != "invalid"
@@ -841,6 +844,7 @@ def _untrusted_foreground_review_failure(row):
     terminal = inspect_terminal_attempt(
         meta.get("log_file"), worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"), worker_type="review",
+        artifact_binding=meta,
     )
     harness = meta.get("harness") or "codex"
     return (terminal.get("state") == "invalid"
@@ -864,7 +868,7 @@ def _recorded_move_correction_proof(row, rows, args):
         node = next(node for node in route["nodes"] if node["id"] == meta.get("route_node"))
         terminal = inspect_terminal_attempt(
             meta.get("log_file"), worktree=row["worktree"],
-            artifact_root_metadata=meta.get("artifact_root"))
+            artifact_root_metadata=meta.get("artifact_root"), artifact_binding=meta)
         encoded = str(terminal.get("artifact_path_b64") or "")
         evidence = Path(base64.urlsafe_b64decode(
             encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
@@ -926,6 +930,7 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
     terminal_view = inspect_terminal_attempt(
         meta.get("log_file"), worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"), worker_type=meta.get("worker_type"),
+        artifact_binding=meta,
     )
     evidence = observe_attempt(
         row["status"], meta, worktree=row.get("worktree"), repo=row.get("repo"),
@@ -1023,7 +1028,8 @@ def observed_status_rows(rows, args):
             meta = row["meta"]
             inputs = proc_inputs(row, args.agent_home, args.jobs, rows, args)
             terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=row.get("worktree"),
-                                                artifact_root_metadata=meta.get("artifact_root"))
+                                                artifact_root_metadata=meta.get("artifact_root"),
+                                                artifact_binding=meta)
             evidence = observe_attempt(row["status"], meta, repo=row.get("repo"),
                                        worktree=row.get("worktree"), artifact_root=meta.get("artifact_root"),
                                        terminal=terminal, registry_rows=(item["raw"] for item in rows if item.get("raw")))
@@ -1813,6 +1819,7 @@ def _receiptless_namespace_cancel_reason(row, args):
         meta.get("log_file"),
         worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"),
+        artifact_binding=meta,
     )
     if terminal.get("state") != "absent":
         return f"terminal-envelope-{terminal.get('state') or 'unknown'}"
@@ -1922,6 +1929,7 @@ def _artifact_proof_seal_reason(row, args):
         meta.get("log_file"),
         worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"),
+        artifact_binding=meta,
     )
     if terminal.get("state") != "valid":
         return f"terminal-envelope-{terminal.get('state') or 'unknown'}", "", ""
