@@ -105,7 +105,7 @@ class CodexFooterBindingTest(unittest.TestCase):
     def runtime(self, pid):
         return ("codex", int(pid) in self.services) if int(pid) in self.records else ("", False)
 
-    def native_session(self, pid, harness):
+    def native_session(self, pid, harness, *, codex_observation=None):
         return self.native.get(int(pid), "") if harness == "codex" else ""
 
     def is_worker(self, pid):
