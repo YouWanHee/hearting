@@ -1284,6 +1284,60 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual(json.dumps(old_a, sort_keys=True), json.dumps(new_a, sort_keys=True))
         self.assertEqual(len(self.snapshot_names(result)), 3)
 
+    def test_marker_preserves_old_rows_until_actual_removal_across_full_and_bounded_refresh(self):
+        result = self.closed("b1-self-excluded", {
+            "plans/cache/edited.md": b"cache original\n",
+            "plans/cache/deleted.md": b"will be removed after marker goes\n",
+            "plans/sibling.md": b"sibling original\n",
+        })
+        cycle = Path(result["cycle_dir"])
+        marker = cycle / "artifacts/plans/cache/.gitignore"
+        marker.write_bytes(b"*\n")
+        before = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        before_rows = {row["locator"]["path"]: row for row in before["artifact_revisions"]}
+        self.edit(result, "plans/cache/edited.md", b"cache changed under marker\n")
+        (cycle / "artifacts/plans/cache/deleted.md").unlink()
+        self.edit(result, "plans/sibling.md", b"sibling changed\n")
+
+        full = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(full["refreshed"], full)
+        current = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        current_rows = {row["locator"]["path"]: row for row in current["artifact_revisions"]}
+        for rel in ("artifacts/plans/cache/edited.md", "artifacts/plans/cache/deleted.md"):
+            self.assertEqual(current_rows[rel], before_rows[rel])
+        self.assertNotEqual(current_rows["artifacts/plans/sibling.md"]["artifact_revision_id"],
+                            before_rows["artifacts/plans/sibling.md"]["artifact_revision_id"])
+        self.assertEqual([event["field"] for event in self.history.published],
+                         ["artifacts/plans/sibling.md"])
+
+        self.edit(result, "plans/cache/edited.md", b"cache changed again under marker\n")
+        self.edit(result, "plans/sibling.md", b"sibling changed again\n")
+        P._write_refresh_state(self.root, result["cycle_id"], cursor="plans/cache/deleted.md",
+                               files={}, observed_at=1.0)
+        bounded = self.refresh(result)
+        self.assertEqual(bounded["status"], "emitted", bounded)
+        self.assertEqual(bounded["changes"]["removed"], [])
+        after_bounded = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        rows_bounded = {row["locator"]["path"]: row for row in after_bounded["artifact_revisions"]}
+        self.assertEqual(rows_bounded["artifacts/plans/cache/edited.md"], current_rows[
+            "artifacts/plans/cache/edited.md"])
+        self.assertEqual(rows_bounded["artifacts/plans/cache/deleted.md"], current_rows[
+            "artifacts/plans/cache/deleted.md"])
+
+        marker.unlink()
+        settled = self.refresh(result)
+        self.assertEqual(settled["status"], "emitted", settled)
+        self.assertEqual(set(settled["changes"]["modified"]), {"artifacts/plans/cache/edited.md"})
+        self.assertEqual(settled["changes"]["removed"], ["artifacts/plans/cache/deleted.md"])
+        final = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        final_rows = {row["locator"]["path"]: row for row in final["artifact_revisions"]}
+        self.assertNotIn("artifacts/plans/cache/deleted.md", final_rows)
+        self.assertNotEqual(final_rows["artifacts/plans/cache/edited.md"]["artifact_revision_id"],
+                            current_rows["artifacts/plans/cache/edited.md"]["artifact_revision_id"])
+        self.assertEqual(final["events"][:len(before["events"])], before["events"])
+        self.assertEqual([event["operation"] for event in self.history.published[-2:]], ["update", "delete"])
+        self.assertTrue(L.verify_artifact_revisions(final, cycle) == ())
+
     def test_b1_off_switch_pauses_closed_cycle_refresh(self):
         result = self.closed("b1-off", {"plans/cycle/a.md": b"a\n"})
         self.edit(result, "plans/cycle/a.md", b"a, edited\n")

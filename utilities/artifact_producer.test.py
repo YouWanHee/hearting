@@ -28,6 +28,7 @@ import artifact_campaign as campaign_reader  # noqa: E402
 import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
+import artifact_payload  # noqa: E402
 import artifact_producer as P  # noqa: E402
 import artifact_reader as reader  # noqa: E402
 import dispatch_contract as D  # noqa: E402
@@ -1662,6 +1663,180 @@ class BrowserProfileCollectionTest(ProducerTestBase):
         invalid.write_bytes(b"invalid")
         self.assertEqual(P._enumerate_output(cycle)[1],
                          ["locator-invalid-component:artifacts/bad|name.txt"])
+
+
+class SelfExclusionPayloadTest(ProducerTestBase):
+    def test_marker_predicates_are_independent_exact_and_no_follow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "payload"
+            directory.mkdir()
+            cachedir = directory / "CACHEDIR.TAG"
+            cachedir.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            cachedir.write_bytes(artifact_payload.CACHEDIR_SIGNATURE + b"description\n")
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            for invalid in (artifact_payload.CACHEDIR_SIGNATURE[:-1], b"Signature: wrong" + b"x" * 32):
+                cachedir.write_bytes(invalid)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory))
+
+            cachedir.unlink()
+            (directory / "pyvenv.cfg").write_bytes(b"")
+            self.assertTrue(artifact_payload.self_excluded_directory(directory))
+            (directory / "pyvenv.cfg").unlink()
+            (directory / "pyvenv.cfg").mkdir()
+            self.assertFalse(artifact_payload.self_excluded_directory(directory))
+            (directory / "pyvenv.cfg").rmdir()
+
+            gitignore = directory / ".gitignore"
+            for allowed in (b"*", b"*\n", b"*\r\n"):
+                gitignore.write_bytes(allowed)
+                self.assertTrue(artifact_payload.self_excluded_directory(directory), allowed)
+            for invalid in (b"", b"* ", b"*\n\n", b"# comment\n*", b"*\n!keep", b"*\r"):
+                gitignore.write_bytes(invalid)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory), invalid)
+
+            gitignore.unlink()
+            marker_contents = {"CACHEDIR.TAG": artifact_payload.CACHEDIR_SIGNATURE,
+                               "pyvenv.cfg": b"", ".gitignore": b"*\n"}
+            target = Path(tmp) / "target"
+            for name, content in marker_contents.items():
+                target.write_bytes(content)
+                (directory / name).symlink_to(target)
+                self.assertFalse(artifact_payload.self_excluded_directory(directory), name)
+                (directory / name).unlink()
+            if hasattr(os, "mkfifo"):
+                for name in marker_contents:
+                    os.mkfifo(directory / name)
+                    self.assertFalse(artifact_payload.self_excluded_directory(directory), name)
+                    (directory / name).unlink()
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(directory, target_is_directory=True)
+            self.assertFalse(artifact_payload.self_excluded_directory(alias))
+
+    def test_payload_root_marker_is_scoped_and_does_not_hide_cycle_controls(self):
+        cycle = self.root / "cycle"
+        artifacts = cycle / "artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / "CACHEDIR.TAG").write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+        (artifacts / "bad|name.txt").write_bytes(b"excluded by root marker")
+        support = cycle / "_internal" / "support.md"
+        support.parent.mkdir()
+        support.write_bytes(b"still collected")
+        excluded = []
+        paths, violations = P._output_paths(cycle, excluded=excluded)
+        self.assertEqual(violations, [])
+        self.assertEqual([rel for rel, _path in paths], ["_internal/support.md"])
+        self.assertIn("artifacts/", excluded)
+
+        (cycle / "rogue.txt").write_bytes(b"outside payload")
+        _paths, violations = P._output_paths(cycle, excluded=[])
+        self.assertEqual(violations, ["file-outside-artifacts:rogue.txt"])
+
+    def test_marker_replacement_after_lstat_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "payload"
+            directory.mkdir()
+            marker = directory / "CACHEDIR.TAG"
+            marker.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            target = Path(tmp) / "target"
+            target.write_bytes(artifact_payload.CACHEDIR_SIGNATURE)
+            real_open = os.open
+            replaced = False
+
+            def replace_before_open(path, flags, *args, **kwargs):
+                nonlocal replaced
+                if path == "CACHEDIR.TAG" and kwargs.get("dir_fd") is not None and not replaced:
+                    marker.unlink()
+                    marker.symlink_to(target)
+                    replaced = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(artifact_payload.os, "open", side_effect=replace_before_open):
+                self.assertFalse(artifact_payload.self_excluded_directory(directory))
+            self.assertTrue(replaced)
+            self.assertTrue(marker.is_symlink())
+
+    def test_finalize_prunes_marker_tree_before_locator_and_bundle_checks(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        cache = cycle / "artifacts" / "cache"
+        cache.mkdir(parents=True)
+        marker = cache / ".gitignore"
+        marker.write_bytes(b"*\r\n")
+        (cache / "bad|locator.txt").write_bytes(b"must not be read")
+        invalid_raw = cache / "raw-results"
+        invalid_raw.symlink_to(self.root, target_is_directory=True)
+        self.write_output(result, "plans/report.md", b"report")
+        self.write_output(result, "run/raw-results/data.csv", b"kept,bundle\n")
+        support = cycle / "_internal" / "support.txt"
+        support.parent.mkdir(parents=True)
+        support.write_bytes(b"support")
+        self.assertEqual([tree.directory for tree in P._scan_directory_bundles(cycle)],
+                         ["artifacts/run/raw-results"])
+        invalid_raw.unlink()
+        marker_bytes = marker.read_bytes()
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/plans/report.md", paths)
+        self.assertIn("_internal/support.txt", paths)
+        artifacts_by_id = {item["artifact_id"]: item for item in document["artifacts"]}
+        bundle_rows = [row for row in document["artifact_revisions"]
+                       if artifacts_by_id[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundle_rows), 1)
+        bundle_artifact = artifacts_by_id[bundle_rows[0]["artifact_id"]]
+        self.assertEqual(bundle_artifact["title"], "run/raw-results")
+        self.assertNotIn("artifacts/cache/bad|locator.txt", paths)
+        self.assertIn("artifacts/cache/", sealed["excluded_hidden"])
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+
+    def test_marker_below_raw_results_prevents_bundle_bypass_but_keeps_sibling_leaf(self):
+        cycle = self.root / "cycle"
+        raw = cycle / "artifacts/raw-results"
+        cache = raw / "cache"
+        cache.mkdir(parents=True)
+        (cache / "pyvenv.cfg").write_bytes(b"")
+        (cache / "bad|locator.txt").write_bytes(b"excluded")
+        kept = raw / "result.csv"
+        kept.write_bytes(b"kept\n")
+
+        self.assertEqual(P._scan_directory_bundles(cycle), [])
+        excluded, links = [], []
+        paths, violations = P._output_paths(cycle, excluded=excluded, excluded_symlinks=links)
+        self.assertEqual(violations, [])
+        self.assertEqual([rel for rel, _path in paths], ["artifacts/raw-results/result.csv"])
+        self.assertIn("artifacts/raw-results/cache/", excluded)
+        self.assertEqual(links, [])
+
+    def test_adoption_reuses_marker_observations_without_reading_under_admission_lock(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        legacy = Path(result["cycle_dir"]) / "owner_brief.md"
+        legacy.write_text("owner brief\n", encoding="utf-8")
+        cache = Path(result["cycle_dir"]) / "artifacts/cache"
+        cache.mkdir(parents=True)
+        (cache / ".gitignore").write_bytes(b"*")
+        (cache / "bad|name.txt").write_bytes(b"excluded")
+        R.close_route(route, route_file, commit="a" * 40, summary="abandoned fixture")
+        original = artifact_payload.observe_directory
+
+        def guarded_observe(path):
+            P.dispatch_lock_order.assert_not_held("producer-admission", "marker-predicate-test")
+            return original(path)
+
+        with mock.patch.object(artifact_payload, "observe_directory", guarded_observe):
+            result_after = P.finalize(
+                self.root, cycle_id=result["cycle_id"], state="abandoned",
+                abandon_reason="route-unrecoverable", adopt_root_outputs=["owner_brief.md"])
+        self.assertEqual(result_after["status"], "sealed", result_after)
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/owner_brief.md", paths)
+        self.assertNotIn("artifacts/cache/bad|name.txt", paths)
 
 
 class DirectoryBundleFinalizeTest(ProducerTestBase):

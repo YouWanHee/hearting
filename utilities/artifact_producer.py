@@ -58,6 +58,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Opt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission  # noqa: E402
+import artifact_payload  # noqa: E402
 import artifact_cycle_titles  # noqa: E402
 import artifact_identity  # noqa: E402
 import artifact_index  # noqa: E402
@@ -314,6 +315,51 @@ def _walk_files(top: Path) -> List[Path]:
             if os.path.islink(os.path.join(current, name)):
                 out.append(Path(current) / name)
                 dirs.remove(name)
+    return out
+
+
+def _is_payload_directory(rel: str) -> bool:
+    return rel in {"artifacts", "_internal"} or rel.startswith(("artifacts/", "_internal/"))
+
+
+def _excluded_by_roots(rel: str, roots: Iterable[str]) -> bool:
+    return any(rel == root or rel.startswith(root + "/") for root in roots)
+
+
+def _walk_cycle_files(directory: Path, *, marker_observations: Optional[Dict[str, Any]] = None,
+                      excluded_roots: Optional[List[str]] = None,
+                      excluded: Optional[List[str]] = None,
+                      skip_directories: Sequence[str] = (), read_markers: bool = True) -> List[Path]:
+    """Walk cycle files while pruning self-excluded payload directories before descent."""
+    observations = marker_observations if marker_observations is not None else {}
+    roots = excluded_roots if excluded_roots is not None else []
+    excluded_paths = excluded if excluded is not None else []
+    skipped = set(skip_directories)
+    out: List[Path] = []
+    for current, dirs, files in os.walk(str(directory), followlinks=False):
+        dirs.sort()
+        for name in list(dirs):
+            path = Path(current) / name
+            rel = path.relative_to(directory).as_posix()
+            if os.path.islink(path):
+                out.append(path)
+                dirs.remove(name)
+                continue
+            if rel in skipped:
+                dirs.remove(name)
+                continue
+            if _is_payload_directory(rel):
+                observation = observations.get(rel)
+                if observation is None and read_markers:
+                    observation = artifact_payload.observe_directory(path)
+                    observations[rel] = observation
+                if observation is not None and observation[0]:
+                    if rel not in roots:
+                        roots.append(rel)
+                    if rel + "/" not in excluded_paths:
+                        excluded_paths.append(rel + "/")
+                    dirs.remove(name)
+        out.extend(Path(current) / name for name in sorted(files))
     return out
 
 
@@ -2876,7 +2922,10 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
 
 def _output_paths(directory: Path, *, exclude_hidden: bool = False,
                   excluded: Optional[List[str]] = None,
-                  excluded_symlinks: Optional[List[str]] = None) -> Tuple[List[Tuple[str, Path]], List[str]]:
+                  excluded_symlinks: Optional[List[str]] = None,
+                  marker_observations: Optional[Dict[str, Any]] = None,
+                  excluded_roots: Optional[List[str]] = None,
+                  skip_directories: Sequence[str] = (), read_markers: bool = True) -> Tuple[List[Tuple[str, Path]], List[str]]:
     """`_enumerate_output` without its reads: the kept `(path, file)` list and the violations.
 
     Nothing is opened here (links and kinds are `lstat`-ed), so a first close can list a cycle
@@ -2886,7 +2935,9 @@ def _output_paths(directory: Path, *, exclude_hidden: bool = False,
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
         raise ProducerError("artifacts-dir-missing", str(artifacts))
-    for entry in _walk_files(directory):
+    for entry in _walk_cycle_files(directory, marker_observations=marker_observations,
+                                   excluded_roots=excluded_roots, excluded=excluded,
+                                   skip_directories=skip_directories, read_markers=read_markers):
         rel = entry.relative_to(directory).as_posix()
         if rel == artifact_locator.CYCLE_BINDING:
             # Machine-owned locator binding, not user output or manifest data.
@@ -2921,9 +2972,33 @@ def _output_paths(directory: Path, *, exclude_hidden: bool = False,
     return ([], violations) if violations else (paths, violations)
 
 
-def _scan_directory_bundles(directory: Path, *, selected_out: Optional[List[str]] = None) -> List[artifact_directory_bundle.Tree]:
+def _observe_marker_directory(directory: Path, path: Path, marker_observations: Dict[str, Any],
+                             excluded_roots: List[str], excluded: List[str]) -> bool:
+    rel = path.relative_to(directory).as_posix()
+    observation = marker_observations.get(rel)
+    if observation is None:
+        observation = artifact_payload.observe_directory(path)
+        marker_observations[rel] = observation
+    if observation[0]:
+        if rel not in excluded_roots:
+            excluded_roots.append(rel)
+        if rel + "/" not in excluded:
+            excluded.append(rel + "/")
+    return observation[0]
+
+
+def _scan_directory_bundles(directory: Path, *, selected_out: Optional[List[str]] = None,
+                            marker_observations: Optional[Dict[str, Any]] = None,
+                            excluded_roots: Optional[List[str]] = None,
+                            excluded: Optional[List[str]] = None) -> List[artifact_directory_bundle.Tree]:
     try:
-        selected = artifact_directory_bundle.select_outermost(Path(directory) / "artifacts")
+        def prune(path: Path) -> bool:
+            return _observe_marker_directory(
+                directory, path, marker_observations if marker_observations is not None else {},
+                excluded_roots if excluded_roots is not None else [], excluded if excluded is not None else [])
+
+        selected = artifact_directory_bundle.select_outermost(
+            Path(directory) / "artifacts", prune_directory=prune)
         if selected_out is not None:
             selected_out[:] = selected
         trees = []
@@ -4124,7 +4199,8 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
         return {"skip": "artifacts-dir-missing"}
-    excluded = {"hidden": 0, "binary": 0, "oversize": 0, "non-regular": 0, "invalid-locator": 0}
+    excluded = {"hidden": 0, "binary": 0, "oversize": 0, "non-regular": 0,
+                "invalid-locator": 0, "self-excluded": 0}
     payload_roots = [("artifacts", artifacts)]
     internal = directory / "_internal"
     if internal.is_symlink():
@@ -4136,6 +4212,10 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
     visited = total = 0
     newest = 0.0
     for payload_root, top in payload_roots:
+        root_excluded, _root_snapshot = artifact_payload.observe_directory(top)
+        if root_excluded:
+            excluded["self-excluded"] += 1
+            continue
         for current, dirs, files in os.walk(str(top), followlinks=False):
             kept_dirs = []
             for name in sorted(dirs):
@@ -4148,7 +4228,12 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
                 elif os.path.islink(os.path.join(current, name)):
                     excluded["non-regular"] += 1
                 else:
-                    kept_dirs.append(name)
+                    child = Path(current) / name
+                    marker_excluded, _snapshot = artifact_payload.observe_directory(child)
+                    if marker_excluded:
+                        excluded["self-excluded"] += 1
+                    else:
+                        kept_dirs.append(name)
             dirs[:] = kept_dirs
             for name in sorted(files):
                 path = os.path.join(current, name)
@@ -5223,7 +5308,7 @@ def finalize(
     # has to confirm what was read (§45 D-124); a scan found out of date is read once more
     # (`_prescan` on that second call).
     prescan = _prescan if _last_try else _prescan_cycle(
-        root, cycle_id, unless_recorded=expected_binding, include_open=not adopt_root_outputs,
+        root, cycle_id, unless_recorded=expected_binding, include_open=True,
         exclude_hidden=exclude_hidden, budget=_scan_budget)
     lock_fd = _admission_lock_fd
     interim_guard = contextlib.ExitStack()
@@ -5252,6 +5337,9 @@ def finalize(
             misses = _prescan_misses(prescan.directory, prescan, prescan.paths)
             if misses and not _last_try:
                 raise _StaleScan(cycle_id)
+            if "@marker-selection" in misses:
+                _keep_prescan_digests(root, cycle_id, prescan)
+                return {"status": "deferred", "reason": "files-changed-during-read", "cycle_id": cycle_id}
             if misses and _scan_budget is not None:
                 _keep_prescan_digests(root, cycle_id, prescan)
                 return {"status": "deferred", "reason": "files-changed-during-read", "cycle_id": cycle_id}
@@ -5343,7 +5431,7 @@ def finalize(
                     "storage_state": "sealed", "cycle_state": published})
         if record.get("state") != "open":
             raise ProducerError("cycle-not-open", record.get("state", "?"))
-        first_close_read = prescan is not None and prescan.open_cycle
+        first_close_read = prescan is not None and prescan.open_cycle and not adopt_root_outputs
         if not first_close_read and not (_last_try or adopt_root_outputs):
             raise _StaleScan(cycle_id)  # the cycle was not open when it was read: read it, lock released
         # The open-cycle checkpoint assigns IDs under this lock; holding it until
@@ -5436,10 +5524,23 @@ def finalize(
         else:
             # Fallback after a just-completed adoption uses the same bounded
             # facts and raw-tree collector as the unlocked first-close scan.
-            bundle_trees = _scan_directory_bundles(directory)
+            # Marker bytes were observed before the admission lock; this pass
+            # reuses that snapshot after the controlled root-file moves.
+            if prescan is not None and prescan.open_cycle:
+                bundle_trees = prescan.bundles
+                marker_observations = prescan.marker_observations
+                excluded_roots = prescan.excluded_roots
+                marker_read = False
+            else:
+                bundle_trees = _scan_directory_bundles(directory)
+                marker_observations, excluded_roots, marker_read = None, None, True
             paths, violations = _output_paths(directory, exclude_hidden=exclude_hidden,
                                               excluded=excluded_hidden,
-                                              excluded_symlinks=excluded_symlinks)
+                                              excluded_symlinks=excluded_symlinks,
+                                              marker_observations=marker_observations,
+                                              excluded_roots=excluded_roots,
+                                              skip_directories=[tree.directory for tree in bundle_trees],
+                                              read_markers=marker_read)
             bundle_dirs = [tree.directory for tree in bundle_trees]
             journal = _read_json(journal_path(root, cycle_id)) or {}
             owned = {row.get("locator") for row in journal.get("directory_bundles", [])
@@ -5598,7 +5699,7 @@ def finalize(
         expected_binding=expected_binding, lock_timeout=lock_timeout, exclude_symlinks=exclude_symlinks,
         _recovery_scope=_recovery_scope, _last_try=True, _scan_budget=_scan_budget,
         _prescan=_prescan_cycle(root, cycle_id, unless_recorded=expected_binding,
-                                include_open=not adopt_root_outputs, exclude_hidden=exclude_hidden,
+                                include_open=True, exclude_hidden=exclude_hidden,
                                 budget=_scan_budget))
 
 
@@ -5874,7 +5975,9 @@ def _manifest_bundle_directories(document: Mapping[str, Any]) -> Set[str]:
 def _scan_cycle_facts(directory: Path, *, excluded: List[str],
                       excluded_symlinks: List[str],
                       known: Optional[Mapping[str, Sequence[Any]]] = None,
-                      fingerprints: Optional[Dict[str, List[int]]] = None) -> List[Tuple[str, str, int]]:
+                      fingerprints: Optional[Dict[str, List[int]]] = None,
+                      marker_observations: Optional[Dict[str, Any]] = None,
+                      excluded_roots: Optional[List[str]] = None) -> List[Tuple[str, str, int]]:
     """The manifest's file facts `(path, digest, size)` under the one inclusion rule.
 
     Same rule as `_enumerate_output`, read in chunks.  A path a manifest cannot
@@ -5890,7 +5993,9 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
         raise ProducerError("artifacts-dir-missing", str(artifacts))
     document = _read_json(directory / "manifest.json")
     bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
-    for entry in _walk_files(directory):
+    for entry in _walk_cycle_files(directory, marker_observations=marker_observations,
+                                   excluded_roots=excluded_roots, excluded=excluded,
+                                   skip_directories=tuple(bundle_directories)):
         rel = entry.relative_to(directory).as_posix()
         if rel == artifact_locator.CYCLE_BINDING or _payload_root(rel) is None:
             continue
@@ -5923,6 +6028,7 @@ def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping
                         facts: Sequence[Tuple[str, str, int]], *, allocator: artifact_identity.IdAllocator,
                         now: Optional[float],
                         removable: Optional[Iterable[str]] = None,
+                        excluded_roots: Sequence[str] = (),
                         ) -> Tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
     """The cycle's next document, or `None` when no file differs from `document`.
 
@@ -5946,6 +6052,7 @@ def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping
     removable_set = None if removable is None else set(removable)
     for rel in sorted(declared):
         if (rel not in present and not _outside_inclusion_rule(rel)
+                and not _excluded_by_roots(rel, excluded_roots)
                 and (removable_set is None or rel in removable_set)):
             changes["removed"].append(rel)
     if not any(changes.values()):
@@ -6246,6 +6353,8 @@ class _Prescan:
     fingerprints: Dict[str, List[int]]
     excluded: List[str]
     excluded_symlinks: List[str]
+    excluded_roots: List[str] = field(default_factory=list)
+    marker_observations: Dict[str, Any] = field(default_factory=dict)
     open_cycle: bool = False
     complete: bool = True
     directory: Optional[Path] = None
@@ -6291,10 +6400,14 @@ def _prescan_cycle(root: Path, cycle_id: str, *,
         scan = _Prescan(artifact_manifest.manifest_digest(document), [], {}, [], [])
         # A sealed cycle's current directory selection is only a race snapshot. Its
         # manifest decides whether those paths stay file rows or are bundle coverage.
-        scan.bundle_selection = list(artifact_directory_bundle.select_outermost(manifest_path.parent / "artifacts"))
+        scan.bundle_selection = list(artifact_directory_bundle.select_outermost(
+            manifest_path.parent / "artifacts",
+            prune_directory=lambda path: _observe_marker_directory(
+                manifest_path.parent, path, scan.marker_observations, scan.excluded_roots, scan.excluded)))
         scan.facts = _scan_cycle_facts(
             manifest_path.parent, excluded=scan.excluded, excluded_symlinks=scan.excluded_symlinks,
-            known=_read_refresh_state(root, cycle_id).get("files", {}), fingerprints=scan.fingerprints)
+            known=_read_refresh_state(root, cycle_id).get("files", {}), fingerprints=scan.fingerprints,
+            marker_observations=scan.marker_observations, excluded_roots=scan.excluded_roots)
         return scan
     except Exception:  # noqa: BLE001 -- only an optimisation
         return None
@@ -6314,11 +6427,16 @@ def _prescan_open_cycle(root: Path, record: Mapping[str, Any], *, exclude_hidden
         return None  # a close that stopped after its manifest is for recovery to finish
     scan = _Prescan("", [], {}, [], [], open_cycle=True, directory=directory, root=root, cycle_id=cycle_id)
     try:
-        scan.bundles = _scan_directory_bundles(directory, selected_out=scan.bundle_selection)
+        scan.bundles = _scan_directory_bundles(
+            directory, selected_out=scan.bundle_selection, marker_observations=scan.marker_observations,
+            excluded_roots=scan.excluded_roots, excluded=scan.excluded)
         for tree in scan.bundles:
             scan.bundle_fingerprints.update(_bundle_tree_fingerprints(tree))
-        paths, scan.violations = _output_paths(directory, exclude_hidden=exclude_hidden, excluded=scan.excluded,
-                                               excluded_symlinks=scan.excluded_symlinks)
+        bundle_dirs = [tree.directory for tree in scan.bundles]
+        paths, scan.violations = _output_paths(
+            directory, exclude_hidden=exclude_hidden, excluded=scan.excluded,
+            excluded_symlinks=scan.excluded_symlinks, marker_observations=scan.marker_observations,
+            excluded_roots=scan.excluded_roots, skip_directories=bundle_dirs)
     except ProducerError as error:
         scan.error = error  # raised where the locked close always raised it
         return scan
@@ -6401,12 +6519,15 @@ def _prescan_misses(directory: Path, prescan: _Prescan, rels: Sequence[str], *,
         except OSError:
             pass
         misses.append(rel)
-    try:
-        current_selection = list(artifact_directory_bundle.select_outermost(directory / "artifacts"))
-    except artifact_directory_bundle.DirectoryBundleError:
-        current_selection = ["!unsafe-selection!"]
-    if current_selection != prescan.bundle_selection:
-        misses.append("@bundle-selection")
+    for rel, observation in prescan.marker_observations.items():
+        directory_changed, marker_changed = artifact_payload.snapshot_differences(
+            directory / rel, observation[1])
+        if marker_changed:
+            misses.append("@marker-selection")
+            break
+        if directory_changed:
+            misses.append("@bundle-selection")
+            break
     if any(not _bundle_inventory_holds(directory, tree) for tree in prescan.bundles):
         misses.extend(tree.directory for tree in prescan.bundles
                       if tree.directory not in misses and not _bundle_inventory_holds(directory, tree))
@@ -6427,16 +6548,23 @@ def _reread_misses(prescan: _Prescan, misses: Sequence[str]) -> None:
     directory = prescan.directory
     read = {rel: (digest, size) for rel, digest, size in prescan.facts}
     gone = set()
-    if "@bundle-selection" in misses:
+    if "@bundle-selection" in misses or "@marker-selection" in misses:
         try:
-            prescan.bundles = _scan_directory_bundles(directory, selected_out=prescan.bundle_selection)
+            prescan.marker_observations.clear()
+            prescan.excluded_roots.clear()
+            prescan.excluded.clear()
+            prescan.bundles = _scan_directory_bundles(
+                directory, selected_out=prescan.bundle_selection, marker_observations=prescan.marker_observations,
+                excluded_roots=prescan.excluded_roots, excluded=prescan.excluded)
             prescan.bundle_fingerprints = {}
             for tree in prescan.bundles:
                 prescan.bundle_fingerprints.update(_bundle_tree_fingerprints(tree))
             prescan.fingerprints = {}
             prescan.paths = []
             paths, prescan.violations = _output_paths(
-                directory, excluded=prescan.excluded, excluded_symlinks=prescan.excluded_symlinks)
+                directory, excluded=prescan.excluded, excluded_symlinks=prescan.excluded_symlinks,
+                marker_observations=prescan.marker_observations, excluded_roots=prescan.excluded_roots,
+                skip_directories=[tree.directory for tree in prescan.bundles])
             bundle_dirs = [tree.directory for tree in prescan.bundles]
             journal = _read_json(journal_path(prescan.root, prescan.cycle_id)) or {}
             owned_paths = {row.get("locator") for row in journal.get("directory_bundles", [])
@@ -6532,7 +6660,9 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     if prescan is not None:
         excluded, excluded_symlinks = list(prescan.excluded), list(prescan.excluded_symlinks)
         facts = prescan.facts
-        refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
+        refreshed, changes = _refreshed_document(
+            root, record, document, facts, allocator=alloc, now=now,
+            excluded_roots=prescan.excluded_roots)
         deferred = refreshed is not None and not _prescan_holds(directory, prescan, changes)
     else:
         deferred = True
@@ -6761,6 +6891,8 @@ class _RefreshScan:
     visited: Set[str] = field(default_factory=set)
     excluded: List[str] = field(default_factory=list)
     excluded_symlinks: List[str] = field(default_factory=list)
+    excluded_roots: List[str] = field(default_factory=list)
+    marker_observations: Dict[str, Any] = field(default_factory=dict)
     complete: bool = True
     cursor: Optional[str] = None
     from_top: bool = True
@@ -6773,7 +6905,7 @@ def _pruned_directory(parts: Sequence[str]) -> bool:
 
 
 def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]],
-                 bundle_directories: Sequence[Tuple[str, ...]] = ()):
+                 bundle_directories: Sequence[Tuple[str, ...]] = (), marker_callback=None):
     """Entries under `top` in name order, depth first, as `(parts, DirEntry, is_dir)`.
 
     `after` is the last entry an earlier run finished: everything up to it is
@@ -6787,22 +6919,29 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
         parts = prefix + (entry.name,)
         is_dir = entry.is_dir(follow_symlinks=False)
         inside_bundle = any(parts[:len(bundle)] == bundle for bundle in bundle_directories)
-        enter = is_dir and not _pruned_directory(parts) and not inside_bundle
+        marker_excluded = False
+        if is_dir and not inside_bundle and not _pruned_directory(parts) and marker_callback is not None:
+            marker_excluded = bool(marker_callback(entry.path, parts))
+        enter = is_dir and not _pruned_directory(parts) and not inside_bundle and not marker_excluded
+        if marker_excluded:
+            # Record an excluded parent even when the resume cursor points inside it.
+            yield parts, entry, is_dir
+            continue
         if after is not None:
             head = after[:len(parts)]
             if parts < head:
                 continue
             if parts == after:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, None, bundle_directories)
+                    yield from _walk_sorted(entry.path, parts, None, bundle_directories, marker_callback)
                 continue
             if parts == head:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, after, bundle_directories)
+                    yield from _walk_sorted(entry.path, parts, after, bundle_directories, marker_callback)
                 continue
         yield parts, entry, is_dir
         if enter:
-            yield from _walk_sorted(entry.path, parts, None, bundle_directories)
+            yield from _walk_sorted(entry.path, parts, None, bundle_directories, marker_callback)
 
 
 def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str, Sequence[Any]],
@@ -6833,6 +6972,16 @@ def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str,
                 after = parts
     normalized_cursor = "/".join(after) if after else None
     scan = _RefreshScan(from_top=after is None)
+    roots_to_walk = []
+    for root_name, top in roots:
+        observation = artifact_payload.observe_directory(top)
+        scan.marker_observations[root_name] = observation
+        if observation[0]:
+            scan.excluded_roots.append(root_name)
+            scan.excluded.append(root_name + "/")
+        else:
+            roots_to_walk.append((root_name, top))
+    roots = roots_to_walk
     last_parts: Optional[Tuple[str, ...]] = None
     processed = 0
     document = _read_json(directory / "manifest.json")
@@ -6843,11 +6992,20 @@ def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str,
         (("artifacts", artifacts), ("_internal", internal)))}
     cursor_index = root_order.get(cursor_root, -1) if cursor_root else -1
 
+    def inspect_marker(path: str, parts: Tuple[str, ...]) -> bool:
+        rel = "/".join(parts)
+        observation = artifact_payload.observe_directory(Path(path))
+        scan.marker_observations[rel] = observation
+        if observation[0]:
+            scan.excluded_roots.append(rel)
+        return observation[0]
+
     for root_name, top in roots:
         if cursor_index >= 0 and root_order[root_name] < cursor_index:
             continue
         root_after = after if cursor_root == root_name else None
-        for parts, entry, is_dir in _walk_sorted(str(top), (root_name,), root_after, bundle_parts):
+        for parts, entry, is_dir in _walk_sorted(
+                str(top), (root_name,), root_after, bundle_parts, marker_callback=inspect_marker):
             if processed and budget.walk_exhausted():
                 scan.complete = False
                 scan.cursor = "/".join(last_parts) if last_parts else normalized_cursor
@@ -6863,7 +7021,7 @@ def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str,
                 last_parts = parts
                 continue
             if is_dir:
-                if _pruned_directory(parts):
+                if _pruned_directory(parts) or rel in scan.excluded_roots:
                     scan.excluded.append(rel + "/")
                 last_parts = parts
                 continue
@@ -6921,6 +7079,27 @@ def _confirmed_absent(directory: Path, document: Mapping[str, Any], scan: _Refre
         rel = row.get("locator", {}).get("path") if isinstance(row, dict) else None
         if (not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel)
                 or any(rel.startswith(path + "/") for path in bundle_directories)):
+            continue
+        parts = rel.split("/")
+        marker_excluded = False
+        if len(parts) > 1 and parts[0] in {"artifacts", "_internal"}:
+            for depth in range(1, len(parts)):
+                parent = "/".join(parts[:depth])
+                if parent not in scan.marker_observations:
+                    if allowance <= 0:
+                        return gone
+                    allowance -= 1
+                    budget.walked += 1
+                    observation = artifact_payload.observe_directory(directory / parent)
+                    scan.marker_observations[parent] = observation
+                    if observation[0]:
+                        scan.excluded_roots.append(parent)
+                observation = scan.marker_observations[parent]
+                if observation[0]:
+                    marker_excluded = True
+                    scan.excluded.append(parent + "/")
+                    break
+        if marker_excluded or _excluded_by_roots(rel, scan.excluded_roots):
             continue
         if allowance <= 0:
             break
@@ -7110,6 +7289,9 @@ def _recheck_candidate(directory: Path, manifest_path: Path, raw: bytes, scan: _
     try:
         if manifest_path.read_bytes() != raw:
             return False
+        for rel, observation in scan.marker_observations.items():
+            if not artifact_payload.snapshot_matches(directory / rel, observation[1]):
+                return False
         for rel in list(changes.get("added", [])) + list(changes.get("modified", [])):
             if _fingerprint(os.lstat(str(directory / rel))) != scan.facts[rel][2]:
                 return False
@@ -7215,8 +7397,9 @@ def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: f
     gone = _confirmed_absent(directory, document, scan, budget)
     alloc = allocator or artifact_identity.IdAllocator()
     facts = [(rel, digest_, size) for rel, (digest_, size, _fp) in sorted(scan.facts.items())]
-    refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=clock,
-                                             removable=gone)
+    refreshed, changes = _refreshed_document(
+        root, record, document, facts, allocator=alloc, now=clock,
+        removable=gone, excluded_roots=scan.excluded_roots)
     if scan.complete:
         revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
         provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
