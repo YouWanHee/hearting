@@ -447,10 +447,10 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
  classified_rows = [(cols[1], meta) for cols, meta in rows]
  source_subject_digest = None
  if node.get("kind") == "review-worker":
-  from review_source_subject import SourceSubjectError, is_implementation_review, observe, read_binding
-  if is_implementation_review(route, node):
+  from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding
+  if has_review_subject(route, node, jobs):
    try:
-    source_subject_digest = observe(route, node, worktree=route.get("cwd"))["digest"]
+    source_subject_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
     source_rows = []
     for status, metadata in classified_rows:
      binding = read_binding(jobs, metadata, required=False)
