@@ -8,11 +8,16 @@ import io
 import json
 import os
 from pathlib import Path
+import fcntl
+import hashlib
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -374,6 +379,272 @@ console.log(JSON.stringify(calls[0]));
             self.assertEqual(argv[-2:], ["--service-current", str(self.current)])
             self._point_current(self.b)
             self.assertEqual(obligations.active_service_root(binding), self.b)
+
+    def test_service_script_uses_only_the_verified_lifecycle_binding(self):
+        self._point_current(self.b)
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self._environment(self.a), clear=True):
+            binding = obligations.managed_service_binding(self.a)
+            script, environment, observed_binding = obligations.service_script(
+                "utilities/peer-steward.py", binding)
+            self.assertEqual(script, self.b / "utilities/peer-steward.py")
+            self.assertEqual(environment["AGENT_HOME"], str(self.b))
+            self.assertEqual(observed_binding, binding)
+
+            fixed_script, fixed_environment, fixed_binding = obligations.service_script(
+                "utilities/peer-steward.py")
+            self.assertEqual(fixed_script, self.a / "utilities/peer-steward.py")
+            self.assertIsNone(fixed_environment)
+            self.assertIsNone(fixed_binding)
+
+    def test_activation_reconnect_passes_binding_to_watch_and_batch_families(self):
+        from types import SimpleNamespace
+
+        self._point_current(self.b)
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self._environment(self.a), clear=True), \
+             mock.patch.object(peer_steward, "_watch_reconciliation_needed", return_value=True), \
+             mock.patch.object(peer_steward, "_ensure_watch_observers") as ensure_watches, \
+             mock.patch.object(peer_steward.dispatch_batch_obligations,
+                               "ensure_observers") as ensure_batches, \
+             mock.patch.object(obligations.subprocess, "Popen"):
+            self.assertEqual(peer_steward.cmd_ensure_obligations(
+                SimpleNamespace(lifecycle_root=str(self.a))), 0)
+        ensure_watches.assert_called_once_with(service_current=str(self.current))
+        ensure_batches.assert_called_once_with(service_current=str(self.current))
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_takeover_signals_only_an_exact_same_install_observer_holding_its_duty_lock(self):
+        self._point_current(self.b)
+        script = self.a / "utilities/peer-steward.py"
+        ready = self.base / "legacy-observer-ready"
+        script.write_text(
+            "import fcntl, os, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write('ready')\n"
+            "time.sleep(30)\n", encoding="utf-8")
+        lock_path = self.state / "watch.lease"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        required = ("__watch-run", "--watch-id", "watch-exact",
+                    "--target", "fixture-target", "--server", "default",
+                    "--expected-harness", "codex",
+                    "--expected-session-id", "sid-watch")
+        command = [sys.executable, str(script), *required, "--lock-fd", str(fd)]
+        env = dict(self._environment(self.a), FIXTURE_READY=str(ready))
+        process = subprocess.Popen(command, pass_fds=(fd,), env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        os.close(fd)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "legacy observer did not acquire its duty lock")
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, self._environment(self.a), clear=True):
+                binding = obligations.managed_service_binding(self.a)
+                with mock.patch.object(os, "pidfd_open", None):
+                    self.assertFalse(obligations.replace_managed_observer(
+                        process.pid, obligations._proc_start_identity(process.pid), lock_path,
+                        "utilities/peer-steward.py", required, binding,
+                        lock_fd_option="--lock-fd", root=self.a))
+                with mock.patch.object(signal, "pidfd_send_signal", None):
+                    self.assertFalse(obligations.replace_managed_observer(
+                        process.pid, obligations._proc_start_identity(process.pid), lock_path,
+                        "utilities/peer-steward.py", required, binding,
+                        lock_fd_option="--lock-fd", root=self.a))
+                self.assertIsNone(process.poll(), "unsupported pidfd must preserve the live duty")
+                result = obligations.replace_managed_observer(
+                    process.pid, obligations._proc_start_identity(process.pid), lock_path,
+                    "utilities/peer-steward.py", required, binding,
+                    lock_fd_option="--lock-fd", root=self.a)
+            self.assertEqual(result, "replaced")
+            self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_lifecycle_replaces_exact_legacy_runner_and_starts_current_under_same_lock(self):
+        self._point_current(self.b)
+        store = obligations.ObligationStore(self.state)
+        duty = store.create("legacy-runner-duty", "message", {"fixture": "legacy"},
+                            {"ref": "a" * 32})
+        script = self.a / "utilities/peer-steward.py"
+        ready = self.base / "legacy-runner-ready"
+        script.write_text(
+            "import fcntl, os, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write('ready')\n"
+            "time.sleep(30)\n", encoding="utf-8")
+        lock_path = store.root / obligations.RUNNER_LOCK_NAME
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        state_root = str(store.root.parents[1])
+        process = subprocess.Popen(
+            [sys.executable, str(script), "__obligation-runner", "--lock-fd", str(fd),
+             "--state-root", state_root], pass_fds=(fd,),
+            env=dict(self._environment(self.a), FIXTURE_READY=str(ready)),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.close(fd)
+        launched = {}
+
+        def capture_launch(*args, **kwargs):
+            lock_fd = kwargs["pass_fds"][0]
+            launched["lock_path"] = Path(os.path.realpath(f"/proc/self/fd/{lock_fd}"))
+            return SimpleNamespace(poll=lambda: None)
+
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "legacy runner did not acquire runner-current.lock")
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, self._environment(self.a), clear=True), \
+                 mock.patch.object(obligations, "_RUNNERS", []), \
+                 mock.patch.object(obligations.subprocess, "Popen",
+                                   side_effect=capture_launch) as launch:
+                self.assertTrue(obligations.ensure_normal_runner(
+                    self.state, lifecycle_root=self.a, reconciliation_required=True))
+            self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+            argv = launch.call_args.args[0]
+            self.assertEqual(Path(argv[1]), self.b / "utilities/peer-steward.py")
+            self.assertEqual(argv[-2:], ["--service-current", str(self.current)])
+            self.assertEqual(launch.call_args.kwargs["env"]["AGENT_HOME"], str(self.b))
+            self.assertEqual(launched["lock_path"], lock_path.resolve())
+            self.assertEqual(store.get(duty["id"]), duty)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_update_takes_over_live_batch_and_old_caller_cannot_duplicate_its_lease(self):
+        import dispatch_batch_obligations as batch
+
+        self._point_current(self.b)
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.write_text(
+            "t\tdone\t/repo\t/wt\tchild\tattempt_schema_version=2,attempt_id=att-child,"
+            "parent_sid=sid-parent,dispatch_depth=1,execution_surface=registered-headless,"
+            "registered_worker=1,launch_claimed=1\n", encoding="utf-8")
+        args = SimpleNamespace(jobs=self.jobs, sealed_batch_id="sealed-fixture",
+                               parent_attempt_id="att-parent", parent_session_id=None,
+                               attempt_id=["att-child"], control_socket=None,
+                               queue_socket=None, thread_id=None, interval=1.0, timeout=2.0)
+        duty_id, _created = batch.create(args)
+        batch.update(self.jobs, duty_id, state="delivery-pending", reason="observing",
+                     outcome={"state": "ready", "children": [{"attempt_id": "att-child"}]})
+        before = batch.read(self.jobs, duty_id)
+        jobs_digest = __import__("hashlib").sha256(self.jobs.read_bytes()).hexdigest()
+        state_root = batch._root(self.jobs)
+        lease_path = state_root / (duty_id + ".lease")
+        old_ready = self.base / "old-batch-ready"
+        current_ready = self.base / "current-batch-ready"
+        observer_source = (
+            "import fcntl, os, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--obligation-lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write('ready')\n"
+            "time.sleep(30)\n")
+        old_script = self.a / "utilities/codex-managed-completion.py"
+        current_script = self.b / "utilities/codex-managed-completion.py"
+        old_script.write_text(observer_source, encoding="utf-8")
+        current_script.write_text(
+            "import os, sys, time\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write('ready')\n"
+            "time.sleep(30)\n", encoding="utf-8")
+        fd = os.open(lease_path, os.O_CREAT | os.O_RDWR, 0o600)
+        old_command = [sys.executable, str(old_script), "--jobs", str(self.jobs),
+                       "--resume-obligation", duty_id, "--obligation-lock-fd", str(fd)]
+        old_environment = dict(self._environment(self.a), FIXTURE_READY=str(old_ready))
+        old_process = subprocess.Popen(
+            old_command, pass_fds=(fd,), env=old_environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.close(fd)
+        current_process = None
+        real_popen = subprocess.Popen
+        captured = {}
+
+        def launch_current(*command_args, **kwargs):
+            command = command_args[0]
+            captured["command"] = list(command)
+            captured["environment"] = dict(kwargs["env"])
+            captured["lease_path"] = Path(os.path.realpath(
+                f"/proc/self/fd/{kwargs['pass_fds'][0]}"))
+            nonlocal current_process
+            current_process = real_popen(
+                command, **kwargs)
+            return current_process
+
+        try:
+            deadline = time.monotonic() + 5
+            while not old_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(old_ready.exists(), "legacy batch observer did not acquire its lease")
+            batch.update(self.jobs, duty_id, observer={
+                "pid": old_process.pid, "pid_start": batch._pid_start(old_process.pid)})
+            before = batch.read(self.jobs, duty_id)
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ,
+                                 dict(self._environment(self.a), FIXTURE_READY=str(current_ready)),
+                                 clear=True), \
+                 mock.patch.object(obligations, "_RUNNERS", []), \
+                 mock.patch.object(batch.subprocess, "Popen", side_effect=launch_current):
+                binding = obligations.managed_service_binding(self.a)
+                self.assertEqual(batch.ensure_observers(
+                    self.jobs, service_current=binding), 1)
+            self.assertEqual(old_process.wait(timeout=5), -signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while not current_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(current_ready.exists(), "current batch observer did not acquire its lease")
+            self.assertEqual(Path(captured["command"][1]), current_script)
+            self.assertEqual(captured["command"][-2:], ["--service-current", str(self.current)])
+            self.assertEqual(captured["environment"]["AGENT_HOME"], str(self.b))
+            self.assertEqual(captured["lease_path"], lease_path.resolve())
+
+            # The old caller's existing lease-first path cannot spawn a sibling
+            # while the current observer owns the same duty.
+            def old_caller_ensure():
+                inherited = batch.acquire(self.jobs, duty_id)
+                if inherited is None:
+                    return 0
+                try:
+                    os.set_inheritable(inherited, True)
+                    subprocess.Popen(
+                        [sys.executable, str(old_script), "--jobs", str(self.jobs),
+                         "--resume-obligation", duty_id,
+                         "--obligation-lock-fd", str(inherited)],
+                        pass_fds=(inherited,))
+                    return 1
+                finally:
+                    os.close(inherited)
+
+            with mock.patch.object(batch.subprocess, "Popen") as old_launch:
+                self.assertEqual(old_caller_ensure(), 0)
+            old_launch.assert_not_called()
+            after = batch.read(self.jobs, duty_id)
+            for field in ("identity", "arguments", "outcome", "state", "delivery"):
+                self.assertEqual(after[field], before[field], field)
+            self.assertEqual(hashlib.sha256(self.jobs.read_bytes()).hexdigest(), jobs_digest)
+        finally:
+            if current_process is not None and current_process.poll() is None:
+                current_process.terminate()
+            if current_process is not None:
+                current_process.wait(timeout=5)
+            if old_process.poll() is None:
+                old_process.terminate()
+            old_process.wait(timeout=5)
 
     def test_exec_error_preserves_the_lock_duty_environment_and_retry_binding(self):
         import fcntl

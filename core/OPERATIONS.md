@@ -593,6 +593,15 @@ the accepted duty, transfer identity, recipient, and session authority.
 Release following uses self-exec and preserves the narrow legacy compatibility
 handoff.
 
+The same managed lifecycle binding may select current code for the shared
+completion, batch, watch, and runner observers. A lifecycle callback may replace
+a live legacy observer only after its release, namespace, PID/start identity,
+exact duty arguments, and held duty lock all match the same installation.
+Replacement transfers the existing duty under that lock; it does not settle,
+acknowledge, retarget, or reseal the work. Fixed invocations, checkouts,
+interactive sessions, and observers without verifiable provenance keep their
+existing runtime and pending state.
+
 The completion duty belongs to the outer controller and durable pending record,
 not to the lifetime of one model turn, watcher process, or tab location. A
 timeout or unavailable observation leaves the same exact duty pending for the

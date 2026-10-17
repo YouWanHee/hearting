@@ -4282,7 +4282,7 @@ def _watch_entries(root):
     return entries
 
 
-def _spawn_watch_observer(watch_id, arm):
+def _spawn_watch_observer(watch_id, arm, *, service_current=None):
     """Reattach the observer to accepted intent without changing its identity."""
     if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
         return False
@@ -4320,8 +4320,12 @@ def _spawn_watch_observer(watch_id, arm):
         os.set_inheritable(lock_fd, True)
         log_fd = os.open(str(paths.log), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         server = arm.get("server") or "default"
+        import peer_obligations
+        env = _herdr_env_for_server(server)
+        script, child_env, binding = peer_obligations.service_script(
+            "utilities/peer-steward.py", service_current, environ=env)
         argv = [
-            sys.executable, str(Path(__file__).resolve()), "__watch-run",
+            sys.executable, str(script), "__watch-run",
             "--watch-id", watch_id, "--target", arm["target"], "--server", server,
             "--expected-harness", agent["harness"], "--expected-session-id", agent["session_id"],
             "--expected-pane", agent["pane"],
@@ -4338,7 +4342,10 @@ def _spawn_watch_observer(watch_id, arm):
             argv.extend(("--ref", ref))
         if arm.get("timeout") is not None:
             argv.extend(("--timeout", str(arm["timeout"])))
-        env = _herdr_env_for_server(server)
+        if child_env is not None:
+            env = child_env
+        if binding:
+            argv.extend(("--service-current", binding))
         try:
             proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
@@ -4362,7 +4369,7 @@ def _spawn_watch_observer(watch_id, arm):
         os.close(lock_fd)
 
 
-def _ensure_watch_observers():
+def _ensure_watch_observers(*, service_current=None):
     root = _watch_root()
     transports = {}
     try:
@@ -4372,7 +4379,24 @@ def _ensure_watch_observers():
             if _settle_terminal_watch_if_unobserved(watch_id, arm, root):
                 continue
             if _watcher_present(arm):
-                continue
+                binding = peer_obligations.validate_service_binding(service_current)
+                watcher = arm.get("watcher") or {}
+                agent = arm.get("agent") or {}
+                if not binding or not watcher.get("pid_start"):
+                    continue
+                replaced = peer_obligations.replace_managed_observer(
+                    watcher.get("pid"), watcher.get("pid_start"),
+                    _watch_paths(watch_id, root).lock,
+                    "utilities/peer-steward.py",
+                    ("__watch-run", "--watch-id", watch_id,
+                     "--target", arm.get("target", ""),
+                     "--server", arm.get("server") or "default",
+                     "--expected-harness", agent.get("harness", ""),
+                     "--expected-session-id", agent.get("session_id", "")),
+                    binding, lock_fd_option="--lock-fd",
+                )
+                if replaced != "replaced":
+                    continue
             server = (arm.get("server") or "default")
             agent = arm.get("agent") or {}
             socket_path = herdr_observation.socket_path_for_endpoint(server)
@@ -4387,7 +4411,7 @@ def _ensure_watch_observers():
                     watch_id, arm, root, terminal_reason)):
                 continue
             if not _watcher_present(arm):
-                _spawn_watch_observer(watch_id, arm)
+                _spawn_watch_observer(watch_id, arm, service_current=service_current)
     finally:
         for transport in transports.values():
             transport.close()
@@ -5244,7 +5268,7 @@ def _resume_message_obligation(duty, store):
         _HERDR_SESSION = old_server
 
 
-def _resume_registered_obligation(duty, store):
+def _resume_registered_obligation(duty, store, *, read_context=None):
     """Wake an exact restored recipient through the existing durable peer courier."""
     intent = duty.get("intent") or {}
     from harness_capabilities import parent_completion
@@ -5267,7 +5291,7 @@ def _resume_registered_obligation(duty, store):
         spec.loader.exec_module(rewake)
     arm = rewake._read_arm(rewake.arm_path(jobs, identity["attempt_id"]))
     holder = (arm or {}).get("holder") or (duty.get("observation") or {}).get("holder")
-    row = current_attempt_row(jobs, identity["attempt_id"])
+    row = current_attempt_row(jobs, identity["attempt_id"], read_context=read_context)
     if row is None:
         return
     observation = duty.get("observation") or {}
@@ -5278,7 +5302,8 @@ def _resume_registered_obligation(duty, store):
         if transferred and transferred.get("state") == "received":
             bound_received = peer_obligations.acknowledge_registered_delivery(
                 transferred, roots=[jobs.parent])
-        if transferred and peer_obligations.registered_delivery_settled(transferred, roots=[jobs.parent]):
+        if transferred and peer_obligations.registered_delivery_settled(
+                transferred, roots=[jobs.parent], read_context=read_context):
             transferred = None
         elif transferred and transferred.get("state") == "received" and bound_received:
             # The exact recipient receipt is durable even when this ACK write
@@ -5293,8 +5318,22 @@ def _resume_registered_obligation(duty, store):
     # a replacement process after that runtime died. Unknown identity stays protected.
     # The duty follows confirmed handover; the signed queue stays under the
     # registered parent, even when its current recipient is a successor.
-    recipient_sid = effective_parent(row.metadata, jobs)
+    recipient_sid = effective_parent(row.metadata, jobs, read_context=read_context)
     storage_recipient = row.metadata.get("parent_sid", "")
+    identity_fields = ("parent_sid", "parent_harness", "parent_completion_delivery",
+                       "delivery_id", "delivery_receipt_digest", "delivery_row_revision",
+                       "delivery_intent", "route_id", "route_hash", "route_node",
+                       "owner_route_id", "owner_route_hash", "owner_route_node")
+
+    def fresh_recipient_row():
+        fresh = current_attempt_row(jobs, identity["attempt_id"])
+        if (fresh is None or fresh.status != row.status
+                or effective_parent(fresh.metadata, jobs) != recipient_sid
+                or any(fresh.metadata.get(key) != row.metadata.get(key)
+                       for key in identity_fields)):
+            return None
+        return fresh
+
     if row.status not in {"open", "running", "done"}:
         return
     if row.status == "done":
@@ -5314,11 +5353,17 @@ def _resume_registered_obligation(duty, store):
     old_server = _HERDR_SESSION
     globals()["_HERDR_SESSION"] = None if identity["server"] == "default" else identity["server"]
     try:
-        result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True, text=True, timeout=5)
-        agents = (json.loads(result.stdout).get("result") or {}).get("agents") or []
+        def list_agents():
+            result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True,
+                                   text=True, timeout=5)
+            return (json.loads(result.stdout).get("result") or {}).get("agents") or []
+        agents = (read_context.recipient_census(identity.get("server"), list_agents)
+                  if read_context is not None else list_agents())
         matches = [a for a in agents if a.get("agent") == harness
                    and (a.get("agent_session") or {}).get("value") == recipient_sid]
         if len(matches) != 1:
+            if fresh_recipient_row() is None:
+                return
             store.update(duty["id"], observation={"reason": "recipient-unavailable",
                                                   "session_id": recipient_sid})
             return
@@ -5326,6 +5371,8 @@ def _resume_registered_obligation(duty, store):
         if _resolve_target(pane)[:2] != (harness, recipient_sid):
             return
         if transferred and transferred.get("state") == "pending":
+            if fresh_recipient_row() is None:
+                return
             _schedule_message_obligation(transferred, pane, pane)
             return
         if row.status in {"open", "running"}:
@@ -5337,6 +5384,12 @@ def _resume_registered_obligation(duty, store):
                 return
             storage_recipient = record.get("_storage_key") or storage_recipient
             delivery_id = record["delivery_id"]
+        # Read-pass snapshots save parsing only. The exact identity and
+        # recipient are read again immediately before claiming the delivery.
+        fresh_row = fresh_recipient_row()
+        if fresh_row is None:
+            return
+        row = fresh_row
         owner = "retained-rewake:" + duty["id"]
         if record and record.get("state") in {"claimed", "sent-ambiguous"}:
             pending.reclaim(jobs.parent, storage_recipient, delivery_id,
@@ -5381,31 +5434,50 @@ def _resume_registered_obligation(duty, store):
         globals()["_HERDR_SESSION"] = old_server
 
 
-def _runner_duties(store):
-    return [duty for duty in store.list()
+def _runner_duties(store, duties=None):
+    if duties is None:
+        duties = store.list()
+    return [duty for duty in duties
             if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch"}
                 or duty.get("id", "").startswith(("message-", "delay-")))]
 
 
-def _watch_reconciliation_needed():
+def _runner_duty_signature(duties):
+    """Track meaningful duty changes while ignoring repeated observation timestamps."""
+    fields = ("reason", "phase", "ref", "session_id", "transfer_ref", "delivery_id",
+              "recipient_sid", "holder")
+    values = []
+    for duty in duties:
+        observation = duty.get("observation") or {}
+        values.append((
+            duty.get("id"), duty.get("state"), duty.get("delivery"),
+            duty.get("cleanup"), duty.get("result"), duty.get("reason"),
+            duty.get("observer_error"),
+            tuple((key, json.dumps(observation[key], sort_keys=True, default=str))
+                  for key in fields if key in observation),
+        ))
+    return tuple(sorted(values))
+
+
+def _watch_reconciliation_needed(*, service_current=None):
     root = _watch_root()
     for watch_id, arm in _watch_entries(root):
         if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
             continue
-        if not _watcher_present(arm):
+        if not _watcher_present(arm) or service_current:
             return True
     return False
 
 
-def _reconcile_external_obligations(store):
+def _reconcile_external_obligations(store, *, service_current=None):
     """Reconnect independent recovery owners from the existing lifecycle callback."""
     try:
-        needs_watch = _watch_reconciliation_needed()
+        needs_watch = _watch_reconciliation_needed(service_current=service_current)
     except Exception:
         needs_watch = True
     if needs_watch:
         try:
-            _ensure_watch_observers()
+            _ensure_watch_observers(service_current=service_current)
         except Exception:
             pass
     for duty in store.list(states={"complete"}):
@@ -5418,19 +5490,21 @@ def _reconcile_external_obligations(store):
             except Exception:
                 pass
     try:
-        needs_batch = dispatch_batch_obligations.has_unowned_work()
+        needs_batch = bool(service_current) or dispatch_batch_obligations.has_unowned_work()
     except Exception:
         needs_batch = True
     if needs_batch:
         try:
-            dispatch_batch_obligations.ensure_observers()
+            dispatch_batch_obligations.ensure_observers(service_current=service_current)
         except Exception:
             pass
 
 
-def _reconcile_obligations(store):
+def _reconcile_obligations(store, duties=None, *, read_context=None):
     """Advance only the accepted duties owned by this runner."""
-    for duty in store.list():
+    if duties is None:
+        duties = store.list()
+    for duty in duties:
         try:
             kind = duty.get("intent", {}).get("kind")
             if kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
@@ -5440,7 +5514,7 @@ def _reconcile_obligations(store):
                     if acquired:
                         _resume_retire_obligation(duty, store)
             elif kind == "registered-batch":
-                _resume_registered_obligation(duty, store)
+                _resume_registered_obligation(duty, store, read_context=read_context)
         except Exception:
             try:
                 store.update(duty["id"], observer_error="observer-unavailable")
@@ -5460,38 +5534,50 @@ def cmd_obligation_runner(args):
         return 70
     service_current = getattr(args, "service_current", None)
     delay = 1.0
+    previous_signature = None
     while True:
-        _reconcile_obligations(store)
+        duties = store.list()
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext()
+        _reconcile_obligations(store, duties, read_context=read_context)
         if service_current:
             peer_obligations.exec_service_runner(
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
-        if not _runner_duties(store):
+        current_duties = store.list()
+        if not _runner_duties(store, current_duties):
             # A producer that saw our held lock may already have accepted work.
             # Release before the final read: later producers can start a runner,
             # and work accepted before release is either reclaimed here or owned
             # by the new lock holder.
             fcntl.flock(args.lock_fd, fcntl.LOCK_UN)
-            if not _runner_duties(store):
+            if not _runner_duties(store, store.list()):
                 return 0
             try:
                 fcntl.flock(args.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return 0
             continue
+        signature = _runner_duty_signature(current_duties)
+        if previous_signature is None or signature != previous_signature:
+            delay = 1.0
+        else:
+            delay = min(15.0, delay * 1.7)
+        previous_signature = signature
         time.sleep(delay)
-        delay = min(15.0, delay * 1.7)
 
 
 def cmd_ensure_obligations(_args):
     """Reconnect existing recovery owners from one shared runner entry."""
     store = peer_obligations.ObligationStore()
     try:
+        lifecycle_root = getattr(_args, "lifecycle_root", None)
+        service_current = (peer_obligations.managed_service_binding(lifecycle_root)
+                           if lifecycle_root is not None else None)
         # An already-running peer runner does not own watch/batch recovery.
         # Check those families on this callback even while a peer duty is pending.
-        _reconcile_external_obligations(store)
-        lifecycle_root = getattr(_args, "lifecycle_root", None)
+        _reconcile_external_obligations(store, service_current=service_current)
         if not _runner_duties(store):
             if lifecycle_root is not None:
                 # Preserve the existing managed-current binding for later
@@ -6706,6 +6792,7 @@ def build_parser():
     p_run.add_argument("--rearmed-from", default=None)
     p_run.add_argument("--rearm-count", type=int, default=0)
     p_run.add_argument("--lock-fd", type=int, default=None)
+    p_run.add_argument("--service-current", default=None, help=argparse.SUPPRESS)
     p_run.set_defaults(func=cmd_watch_run)
 
     p_join = sub.add_parser("join")

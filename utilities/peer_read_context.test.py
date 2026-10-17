@@ -75,6 +75,21 @@ class PeerReadContextTest(unittest.TestCase):
         self.assertEqual(PeerReadContext().handover_rows(seat, other_scan_loader), ())
         other_scan_loader.assert_called_once_with()
 
+    def test_recipient_census_is_memoized_per_endpoint_and_per_scan(self):
+        context = PeerReadContext()
+        agents = [{"agent": "codex", "agent_session": {"value": "sid-a"}}]
+        loader = mock.Mock(return_value=agents)
+        self.assertIs(context.recipient_census("server-a", loader), agents)
+        self.assertIs(context.recipient_census("server-a", loader), agents)
+        loader.assert_called_once_with()
+
+        other_endpoint = mock.Mock(return_value=[])
+        self.assertEqual(context.recipient_census("server-b", other_endpoint), [])
+        other_endpoint.assert_called_once_with()
+        next_scan = mock.Mock(return_value=agents)
+        self.assertIs(PeerReadContext().recipient_census("server-a", next_scan), agents)
+        next_scan.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

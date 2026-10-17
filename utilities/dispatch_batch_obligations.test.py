@@ -66,6 +66,44 @@ class BatchObligationTest(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], str(self.jobs))
         self.assertEqual(obligations.read(self.jobs, duty_id)["identity"]["attempt_ids"], ["att-child"])
 
+    def test_verified_service_replaces_exact_live_observer_and_passes_control_binding(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           observer={"pid": 321, "pid_start": "654"})
+        root = obligations._root(self.jobs)
+        lock_fd = os.open(root / (duty_id + ".lease"), os.O_RDWR | os.O_CREAT, 0o600)
+        binding = "/fixture/managed/current"
+        target = Path("/fixture/releases/B/utilities/codex-managed-completion.py")
+        environment = {"AGENT_HOME": "/fixture/releases/B"}
+        calls = []
+
+        class Launched:
+            pid = 9002
+
+        try:
+            with mock.patch("peer_obligations.service_script",
+                            return_value=(target, environment, binding)) as service_script, \
+                 mock.patch("peer_obligations.replace_managed_observer",
+                            return_value="replaced") as replace, \
+                 mock.patch.object(obligations, "acquire", side_effect=[None, lock_fd]), \
+                 mock.patch.object(obligations.subprocess, "Popen",
+                                   side_effect=lambda *a, **kw: calls.append((a, kw)) or Launched()):
+                self.assertEqual(obligations.ensure_observers(self.jobs, service_current=binding), 1)
+            service_script.assert_called_once_with(
+                "utilities/codex-managed-completion.py", binding)
+            replace.assert_called_once()
+            self.assertEqual(replace.call_args.args[0:2], (321, "654"))
+            argv = calls[0][0][0]
+            self.assertEqual(Path(argv[1]), target)
+            self.assertEqual(argv[-2:], ["--service-current", binding])
+            self.assertEqual(calls[0][1]["env"], environment)
+            self.assertNotIn("service_current", obligations.read(self.jobs, duty_id)["arguments"])
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
     def test_complete_duty_is_not_replayed(self):
         duty_id, _record = obligations.create(self.args)
         obligations.update(self.jobs, duty_id, state="complete", outcome={"state": "ready"},

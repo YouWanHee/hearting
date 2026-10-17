@@ -86,7 +86,8 @@ def _write(path: Path, record: dict) -> None:
 def _plain_arguments(args) -> dict:
     output = {}
     for key, value in vars(args).items():
-        if key in {"resume_obligation", "ensure_obligations", "obligation_lock_fd"}:
+        if key in {"resume_obligation", "ensure_obligations", "obligation_lock_fd",
+                   "service_current"}:
             continue
         output[key] = str(value) if isinstance(value, Path) else value
     return output
@@ -285,10 +286,12 @@ def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     return False
 
 
-def ensure_observers(jobs: str | Path | None = None) -> int:
+def ensure_observers(jobs: str | Path | None = None, *, service_current=None) -> int:
     """Resume unfinished exact batches through the existing completion sidecar."""
     launched = 0
-    script = Path(__file__).with_name("codex-managed-completion.py")
+    import peer_obligations
+    script, child_env, binding = peer_obligations.service_script(
+        "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
     if jobs_paths:
         _resume_owner_settlements(jobs_paths[0])
@@ -310,18 +313,34 @@ def ensure_observers(jobs: str | Path | None = None) -> int:
                 duty_id = record["id"]
                 fd = acquire(jobs_path, duty_id)
                 if fd is None:
-                    continue
+                    observer = record.get("observer") or {}
+                    if not binding or not observer.get("pid") or not observer.get("pid_start"):
+                        continue
+                    replaced = peer_obligations.replace_managed_observer(
+                        observer["pid"], observer["pid_start"],
+                        root / (duty_id + ".lease"),
+                        "utilities/codex-managed-completion.py",
+                        ("--jobs", str(jobs_path), "--resume-obligation", duty_id),
+                        binding, lock_fd_option="--obligation-lock-fd",
+                    )
+                    if replaced != "replaced":
+                        continue
+                    fd = acquire(jobs_path, duty_id)
+                    if fd is None:
+                        continue
                 os.set_inheritable(fd, True)
                 command = [
                     sys.executable, str(script), "--jobs", str(jobs_path),
                     "--resume-obligation", duty_id,
                     "--obligation-lock-fd", str(fd),
                 ]
+                if binding:
+                    command.extend(("--service-current", binding))
                 try:
                     process = subprocess.Popen(
                         command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,),
-                        start_new_session=True, cwd=str(jobs_path.parent),
+                        start_new_session=True, cwd=str(jobs_path.parent), env=child_env,
                     )
                     update(jobs_path, duty_id, observer={
                         "pid": process.pid,

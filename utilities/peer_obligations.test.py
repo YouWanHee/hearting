@@ -298,9 +298,10 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     spawned.assert_not_called()
                 else:
-                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
-                    spawned.assert_called_once()
-                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+                    # A caller without a verified managed lifecycle binding
+                    # cannot replace a live process, even if it looks legacy.
+                    self.assertIsNone(process.poll())
+                    spawned.assert_not_called()
             self.assertEqual(self.store.get(duty["id"]), duty)
             self.assertEqual(self.store.get(prior["id"]), prior)
         finally:

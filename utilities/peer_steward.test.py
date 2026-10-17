@@ -2835,6 +2835,39 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                 peer_steward._ensure_watch_observers()
                 spawn.assert_not_called()
 
+    def test_update_replaces_only_the_exact_live_watch_and_rearms_same_duty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            watch_id = "legacy-watch"
+            arm = {"schema_version": 1, "watch_id": watch_id, "target": "fixture-target",
+                   "server": "named", "armed_ts": "then", "until": ["idle"],
+                   "agent": {"harness": "codex", "session_id": "sid-watch", "pane": "w1:p9"},
+                   "steward": {"harness": "claude", "session_id": "sid-steward"},
+                   "watcher": {"pid": 321, "pid_start": "654"}, "refs": ["attempt-one"]}
+            paths = peer_steward._watch_paths(watch_id, root)
+            binding = "/fixture/managed/current"
+            required = ("__watch-run", "--watch-id", watch_id,
+                        "--target", "fixture-target", "--server", "named",
+                        "--expected-harness", "codex", "--expected-session-id", "sid-watch")
+            with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+                 mock.patch.object(peer_steward, "_watch_entries", return_value=[(watch_id, arm)]), \
+                 mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_watcher_present", side_effect=[True, False]), \
+                 mock.patch.object(peer_steward.peer_obligations, "validate_service_binding",
+                                   return_value=binding), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "replace_managed_observer", return_value="replaced") as replace, \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(peer_steward, "_spawn_watch_observer") as spawn:
+                peer_steward._ensure_watch_observers(service_current=binding)
+            replace.assert_called_once_with(
+                321, "654", paths.lock, "utilities/peer-steward.py", required,
+                binding, lock_fd_option="--lock-fd")
+            spawn.assert_called_once_with(watch_id, arm, service_current=binding)
+
 
 class JoinTest(_WatchMixin, unittest.TestCase):
     """A56-3."""
@@ -3774,6 +3807,28 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         for operation in (watches, watch_probe, batches, batch_probe):
             operation.assert_not_called()
+
+    def test_runner_idle_backoff_ignores_repeated_observation_writes_and_resets_on_change(self):
+        store, duty = self.pending_message()
+        ticks = []
+
+        def resume(row, current):
+            ticks.append(row["id"])
+            if len(ticks) <= 2:
+                current.update(row["id"], observer_error="same-unavailable")
+            elif len(ticks) == 3:
+                current.update(row["id"], observation={"reason": "recipient-returned"})
+            else:
+                current.update(row["id"], state="complete")
+
+        with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock, \
+             mock.patch.object(peer_steward, "_resume_message_obligation", side_effect=resume), \
+             mock.patch.object(peer_steward.time, "sleep") as sleep:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(peer_steward.cmd_obligation_runner(
+                SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+        self.assertEqual(ticks, [duty["id"]] * 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 1.7, 1.0])
 
     def test_work_accepted_at_unlock_is_reclaimed_before_runner_exit(self):
         store = peer_steward.peer_obligations.ObligationStore()

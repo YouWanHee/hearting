@@ -208,6 +208,150 @@ def _service_exec_environment(source_root: Path, target_root: Path, environ=None
     return child_env
 
 
+def service_script(relative_script: str | Path, service_current: str | Path | None = None,
+                   *, root=None, environ=None):
+    """Resolve a service script only through an explicitly validated binding.
+
+    Fixed callers receive a script beneath their current code root. Lifecycle
+    callers may pass the verified managed-current binding to select the active
+    release and rebuild its service environment.
+    """
+    code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+    relative = Path(relative_script)
+    if relative.is_absolute():
+        relative = relative.resolve(strict=True).relative_to(code_root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("service-script-path-invalid")
+    binding = validate_service_binding(service_current, root=code_root)
+    target_root = active_service_root(binding, root=code_root) if binding else None
+    target_root = target_root or code_root
+    script = target_root / relative
+    if not script.is_file():
+        raise FileNotFoundError(script)
+    environment = (_service_exec_environment(code_root, target_root, environ=environ)
+                   if binding and target_root != code_root else None)
+    return script, environment, binding
+
+
+def _proc_start_identity(pid: int):
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2:].split()
+        if not fields or fields[0] in {"Z", "X"}:
+            return None
+        return fields[19]
+    except (OSError, ValueError, TypeError, IndexError):
+        return None
+
+
+def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
+    """Require the exact duty lock to be attached to this process's open fd."""
+    try:
+        info = lock_path.stat()
+        device = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}"
+        inode = str(info.st_ino)
+        fdinfo = Path(f"/proc/{pid}/fdinfo/{fd_number}").read_text(encoding="ascii")
+        for line in fdinfo.splitlines():
+            fields = line.split()
+            if (len(fields) >= 7 and fields[0] == "lock:" and fields[2] == "FLOCK"
+                    and fields[6] == device + ":" + inode):
+                return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return False
+
+
+def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
+                             relative_script: str | Path, required_arguments: Iterable[str],
+                             service_current: str | Path, *, lock_fd_option: str,
+                             root=None, timeout: float = 2.0):
+    """Stop one exact old observer after proving its same-install duty lock.
+
+    Returns ``current`` for an already-current observer, ``replaced`` after
+    that exact process exits, and ``False`` when any part of the proof is
+    unavailable. No duty data is changed here.
+    """
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        binding = validate_service_binding(service_current, root=code_root)
+        target_root = active_service_root(binding, root=code_root) if binding else None
+        if target_root is None or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            return False
+        pid = int(pid)
+        expected_start = str(pid_start)
+        lock = Path(lock_path).resolve(strict=True)
+        relative = Path(relative_script)
+        expected_args = list(map(str, required_arguments))
+        pidfd = os.pidfd_open(pid)
+        try:
+            def inspect():
+                if _proc_start_identity(pid) != expected_start:
+                    return None
+                namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
+                if namespace != os.stat("/proc/self/ns/pid").st_ino:
+                    return None
+                proc = Path("/proc") / str(pid)
+                argv = proc.joinpath("cmdline").read_bytes().decode().rstrip("\0").split("\0")
+                if len(argv) < 3:
+                    return None
+                script = Path(argv[1]).resolve(strict=True)
+                source_root = script.parent.parent
+                if (script != source_root / relative or _release_root(
+                        source_root, _service_layout(code_root)[2]) is None):
+                    return None
+                source_layout = _service_layout(source_root)
+                target_layout = _service_layout(code_root)
+                if (source_layout is None or target_layout is None
+                        or source_layout[1] != target_layout[1]
+                        or source_layout[3] != target_layout[3]):
+                    return None
+                if not any(argv[i:i + len(expected_args)] == expected_args
+                           for i in range(2, len(argv) - len(expected_args) + 1)):
+                    return None
+                try:
+                    env = {}
+                    for item in proc.joinpath("environ").read_bytes().split(b"\0"):
+                        if b"=" in item:
+                            key, value = item.split(b"=", 1)
+                            env[key.decode()] = value.decode(errors="replace")
+                    if Path(env.get("AGENT_HOME", "")).expanduser().resolve(strict=True) != source_root:
+                        return None
+                except (OSError, RuntimeError, ValueError):
+                    return None
+                try:
+                    fd_index = argv.index(lock_fd_option)
+                    fd_number = argv[fd_index + 1]
+                    held_path = Path(os.path.realpath(proc / "fd" / fd_number))
+                except (ValueError, IndexError, OSError):
+                    return None
+                if held_path != lock or not _process_holds_flock(pid, lock, fd_number):
+                    return None
+                if source_root == target_root:
+                    return ("current", None)
+                return ("legacy", None)
+
+            status = inspect()
+            if status is None:
+                return False
+            if status[0] == "current":
+                return "current"
+            # Recheck all evidence immediately before signaling the pidfd-bound
+            # process. A stale PID or changed duty lock cannot authorize this.
+            if inspect() is None:
+                return False
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            deadline = time.monotonic() + max(0.0, timeout)
+            while time.monotonic() < deadline:
+                if _proc_start_identity(pid) != expected_start:
+                    return "replaced"
+                time.sleep(0.02)
+            return False
+        finally:
+            os.close(pidfd)
+    except (OSError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
+
+
 def exec_service_runner(lock_fd: int, state_root: str | Path, service_current: str | Path,
                         *, herdr_session: str | None = None) -> bool:
     """Replace this process with the same-install runner while retaining its flock."""
@@ -640,7 +784,7 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
 
 
 def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
-                          reconciliation_required=False):
+                          reconciliation_required=False, service_current=None):
     """Replace only an exact observer whose old code cannot process this duty.
 
     Accepted work stays in the existing store; the same flock fences its next
@@ -649,7 +793,7 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
     has_batch = any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list())
     if not has_batch and not reconciliation_required:
         return False
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    if not service_current:
         return False
     state_root = str(store.root.parents[1])
     for proc in Path("/proc").iterdir():
@@ -666,15 +810,15 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
             lock_fd = argv[argv.index("--lock-fd") + 1]
             if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
                 continue
-            source = Path(argv[1]).read_text()
-            if "def _reconcile_obligations(" in source:
-                return "current"
-            if (not reconciliation_required
-                    and "def _resume_registered_obligation(" in source
-                    and "from dispatch_session_sweep import addressed_records" in source):
-                return "current"
-            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-            return "replaced"
+            result = replace_managed_observer(
+                int(proc.name), _proc_start_identity(int(proc.name)) or "", lock_path,
+                "utilities/peer-steward.py",
+                ("__obligation-runner", "--lock-fd", lock_fd,
+                 "--state-root", state_root),
+                service_current, lock_fd_option="--lock-fd",
+            )
+            if result in {"current", "replaced"}:
+                return result
         except (OSError, ValueError, IndexError, UnicodeError):
             continue
         finally:
@@ -700,7 +844,8 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             handoff = _handoff_legacy_runner(
-                store, lock_path, reconciliation_required=reconciliation_required)
+                store, lock_path, reconciliation_required=reconciliation_required,
+                service_current=service_current)
             if handoff == "current":
                 return True
             if handoff != "replaced":
