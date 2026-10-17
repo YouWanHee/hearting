@@ -124,8 +124,8 @@ def outer_subprocess_timeout(
     parent blocks on its child, indefinite is never safe here, so the non-positive
     sentinel is clamped to a finite ceiling via ``bounded_foreground_timeout``
     (mirrored inside ``wait_foreground`` so the wrapper self-bounds too). A
-    no-progress watchdog that tells slow-but-progressing from wedged is the planned
-    follow-up. Boundary coverage: utilities/dispatch_liveness_matrix.test.py.
+    foreground launcher also samples worker activity; this outer bound remains
+    the hard fallback. Boundary coverage: utilities/dispatch_liveness_matrix.test.py.
     """
     if lifecycle != FOREGROUND_SCOPED:
         return direct_timeout
@@ -147,13 +147,18 @@ def run_wrapper(args: argparse.Namespace, command: list[str]):
         lifecycle,
         args.direct_timeout,
     )
+    env = direct_env()
+    env.pop("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST", None)
+    source_subject_digest = getattr(args, "review_source_subject_digest", None)
+    if source_subject_digest:
+        env["AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"] = source_subject_digest
     if getattr(args, "action", None) == "start" and lifecycle == FOREGROUND_SCOPED:
         return run_forwarding_termination(
-            command, cwd=ROOT, env=direct_env(), capture=True, timeout=timeout,
+            command, cwd=ROOT, env=env, capture=True, timeout=timeout,
         )
     return subprocess.run(
         command, cwd=ROOT, text=True, capture_output=True, check=False,
-        timeout=timeout, env=direct_env(),
+        timeout=timeout, env=env,
     )
 
 
@@ -1696,7 +1701,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p.add_argument("--broker-root", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--broker-timeout", type=float, help=argparse.SUPPRESS)
     p.add_argument("--direct-timeout", type=float, default=DIRECT_TIMEOUT_DEFAULT)
-    p.add_argument("--foreground-timeout", type=float, default=3600.0)
+    p.add_argument("--foreground-timeout", type=float, default=FOREGROUND_TIMEOUT_DEFAULT)
     p.add_argument("--progress-window-seconds", type=float, default=300.0)
     p.add_argument("--watchdog-max-windows", type=int, default=12)
     p.add_argument("--native-attempt-id")
@@ -1849,6 +1854,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # keeps its own `len(prior)+1 > max_round` comparison, or its own
     # auto-revision copy, any more.
     node_round_admission = None
+    args.review_source_subject_digest = None
     if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
         own_registration = own_registered_attempt(args, route, node)
         round_rows = DISPATCH_NODE.prior_round_attempts(
@@ -1864,6 +1870,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 **admission_options,
             )
             node_round_budget = node_round_admission.budget
+            args.review_source_subject_digest = node_round_admission.source_subject_digest
         except (DispatchContractError, ValueError) as exc:
             return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
         choice = decide_continuation(route, action="round", node=node, facts={"budget": node_round_budget})

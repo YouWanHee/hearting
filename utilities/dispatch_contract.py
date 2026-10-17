@@ -479,7 +479,7 @@ FOREGROUND_OUTCOME_SOURCE = "wait-foreground-v1"
 # stays `signal-N`.
 FOREGROUND_FAILURES = frozenset({
     "none", "timeout", "parent-terminated", "process-identity-unavailable",
-    "interrupted",
+    "interrupted", "no-progress",
 })
 # The fixed failure words; `exit-N`/`signal-N` are validated separately.
 _FOREGROUND_FIXED_FAILURES = FOREGROUND_FAILURES - {"none"}
@@ -5006,6 +5006,11 @@ def spawn_claimed_attempt(
         replacement_admission(jobs, lines, child_meta)
         from review_input import validate_launch as validate_review_input
         validate_review_input(jobs, child_meta)
+        from review_source_subject import SourceSubjectError, validate_attempt as validate_review_subject
+        try:
+            validate_review_subject(jobs, child_fields, child_meta)
+        except SourceSubjectError as exc:
+            raise DispatchContractError(exc.reason, exc.detail) from exc
         if preclaim is not None:
             preclaim(lines)
 
@@ -6016,6 +6021,11 @@ def launch_mismatch_annotation(detail: str) -> dict[str, str]:
     return annotation
 
 
+def git_optional_locks_env() -> dict[str, str]:
+    """Disable Git's optional index refreshes in the dispatched worker."""
+    return {"GIT_OPTIONAL_LOCKS": "0"}
+
+
 def bytecode_cache_env(
     environ: dict[str, str] | os._Environ[str] | None = None,
 ) -> dict[str, str]:
@@ -6795,7 +6805,7 @@ def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home, *, in_
              for r in dispatch_state_roots(Path(agent_home), Path(jobs))]
     marker_path = next(p for p in paths if p.is_file())
     marker = json.loads(marker_path.read_text())
-    if not completion_marker_is_current(route, predecessor, marker_path, marker):
+    if not completion_marker_is_current(route, predecessor, marker_path, marker, jobs=jobs):
         raise ValueError("preview-marker-unverified")
     ready = completion_attempt_readiness(route, predecessor, marker, Path(jobs))
     if ready.state != "ready":
@@ -6880,7 +6890,7 @@ def _frame_capacity_failures(route: dict, lines: list[str], harnesses: set[str])
         if attempt_process_quiescence(meta, terminal_receipt=True).state != "quiescent":
             continue
         terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
-            artifact_root_metadata=meta.get("artifact_root"))
+            artifact_root_metadata=meta.get("artifact_root"), artifact_binding=meta)
         if terminal.get("failure_class") == "capacity":
             unavailable[harness] = meta["attempt_id"]
     return unavailable
@@ -7128,8 +7138,8 @@ def completion_marker_gate(
         # tests mock it directly); `gate_currency` only runs -- and only
         # distinguishes "revised-unrecorded" from a harder failure -- once
         # that boolean says not-current.
-        if not completion_marker_is_current(route, dep_node, marker_path, marker):
-            currency = gate_currency(route, dep_node, marker_path, marker)
+        if not completion_marker_is_current(route, dep_node, marker_path, marker, jobs=jobs):
+            currency = gate_currency(route, dep_node, marker_path, marker, jobs=jobs)
             if currency.state == "revised-unrecorded":
                 if action == "dry-run" and dep in planned_revision_nodes:
                     # Round admission proved the same review basis that the
@@ -7155,6 +7165,12 @@ def completion_marker_gate(
                     next_action=currency.next_action,
                 )
             if currency.state == "superseded":
+                if (not gates_on()
+                        and currency.reason.startswith(("completion-source", "completion-review-source"))):
+                    # Gates-off execution may continue, but the old marker is
+                    # omitted from the admitted observations so no consumer
+                    # can treat its source-bound PASS as current.
+                    continue
                 superseded_by = marker.get("superseded_by") or {}
                 upstream = superseded_by.get("node") if isinstance(superseded_by, dict) else None
                 sequence = superseded_by.get("sequence") if isinstance(superseded_by, dict) else None
@@ -7774,7 +7790,8 @@ def review_self_disposition_subject(route, node, prior, marker_path, *, jobs, au
         raise ValueError("review-self-disposition-subject-superseded")
     from codex_dispatch_terminal import inspect_terminal_attempt
     terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
-                    artifact_root_metadata=meta.get("artifact_root"), worker_type="review")
+                    artifact_root_metadata=meta.get("artifact_root"), worker_type="review",
+                    artifact_binding=meta)
     if (terminal.get("state") != "valid" or terminal.get("verdict") not in {"PASS", "BLOCKED"}
             or terminal.get("artifact_state") != "readable" or terminal.get("review_verdict_conflict")):
         raise ValueError("review-self-disposition-terminal-unverified")
@@ -8179,7 +8196,8 @@ def evidence_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
-    *, observe: bool = False,
+    *, observe: bool = False, check_source: bool = True,
+    jobs: str | Path | None = None,
 ) -> GateCurrency:
     """The schema/identity/tombstone/evidence-digest half of `gate_currency`.
 
@@ -8217,6 +8235,17 @@ def evidence_currency(
         if observe or gates_on():
             return GateCurrency("superseded", "completion-evidence-superseded", action)
         same_work_or_refuse("completion-evidence-superseded", str(detail))
+    if check_source:
+        from review_source_subject import marker_currency as source_marker_currency
+        source_currency = source_marker_currency(
+            route, node, marker, marker_path.parent, jobs=jobs,
+        )
+        if source_currency is not None:
+            state, reason = source_currency
+            if state != "current":
+                return GateCurrency(state, reason,
+                                    route_state_next_action(reason, str(node.get("id")), None, node)
+                                    if state == "superseded" else None)
     evidence_record = marker.get("evidence")
     if not isinstance(evidence_record, dict):
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
@@ -8275,7 +8304,8 @@ def gate_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
-    *, observe: bool = False,
+    *, observe: bool = False, allow_source_transition: bool = False,
+    jobs: str | Path | None = None,
 ) -> GateCurrency:
     """Prove one completion marker current, superseded, or needing `revise`.
 
@@ -8295,8 +8325,24 @@ def gate_currency(
         marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
-    base = evidence_currency(route, node, marker_path, marker, observe=observe)
-    return _marker_provenance_currency(route, node, marker_path, marker, base, observe=observe)
+    base = evidence_currency(
+        route, node, marker_path, marker, observe=observe, check_source=False,
+        jobs=jobs,
+    )
+    provenance = _marker_provenance_currency(route, node, marker_path, marker, base, observe=observe)
+    if (not allow_source_transition and provenance.state in {"current", "revised-unrecorded"}):
+        from review_source_subject import marker_currency as source_marker_currency
+        source_currency = source_marker_currency(
+            route, node, marker, marker_path.parent, jobs=jobs,
+        )
+        if source_currency is not None:
+            state, reason = source_currency
+            if state != "current":
+                return GateCurrency(state, reason,
+                    route_state_next_action(reason, str(node.get("id")), None, node)
+                    if state == "superseded" else None,
+                    provenance.evidence_digest)
+    return provenance
 
 
 def _marker_provenance_currency(route, node, marker_path, marker, base, *, observe=False):
@@ -8498,7 +8544,8 @@ def observe_terminal_review_failure(
         raise ValueError("terminal-review-not-quiescent")
     terminal = inspect_terminal_attempt(
         metadata.get("log_file"), worktree=fields[3],
-        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review")
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review",
+        artifact_binding=metadata)
     if (terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL"
             or terminal.get("artifact_state") != "readable"
             or terminal.get("failure_note") != "completed-review-blocking"
@@ -8517,14 +8564,16 @@ def completion_marker_is_current(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, jobs: str | Path | None = None,
 ) -> bool:
     """Prove one schema-v2 marker and its immutable history/attempt linkage.
 
     One-line delegate (SD-154 rule 5): `gate_currency` is the only place that
-    recomputes an evidence sha256 or walks the revision chain; this keeps its
-    ten existing boolean call sites unchanged.
+    recomputes an evidence sha256 or walks the revision chain. Callers that
+    already resolved a registry can pin source currency to that exact path;
+    callers using the legacy shape remain compatible.
     """
-    return gate_currency(route, node, marker_path, marker).state == "current"
+    return gate_currency(route, node, marker_path, marker, jobs=jobs).state == "current"
 
 
 def completion_conflict_attempt(marker: Mapping[str, object], registry_lines: list[str]) -> str:
@@ -10175,6 +10224,44 @@ def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> boo
                     for key in keys))
 
 
+def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadata: dict[str, str], *,
+                                      new_attempt: bool) -> tuple[list[str], dict[str, str]]:
+    """Bind implementation-review source once and verify it at registration."""
+    from review_source_subject import SourceSubjectError, has_review_subject, seal_attempt, validate_attempt
+    require_binding = False
+    try:
+        if new_attempt and metadata.get("route_file") and metadata.get("route_node"):
+            route_path = Path(metadata["route_file"])
+            route = json.loads(route_path.read_text(encoding="utf-8"))
+            node = next((item for item in route.get("nodes", [])
+                         if item.get("id") == metadata.get("route_node")), None)
+            if node is not None and has_review_subject(route, node, jobs):
+                predecessor = (metadata.get("automatic_retry_of")
+                               or metadata.get("replacement_original_attempt_id"))
+                if not predecessor and metadata.get("capacity_retry") == "1":
+                    predecessor = metadata.get("prior_attempt_id")
+                values = seal_attempt(jobs, route, node, metadata["attempt_id"],
+                                      worktree=row_fields[3], predecessor_attempt_id=predecessor,
+                                      expected_subject_digest=os.environ.get(
+                                          "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"))
+                for key, value in values.items():
+                    prior = metadata.get(key)
+                    if prior and prior != value:
+                        raise SourceSubjectError("review-source-binding-conflict", metadata["attempt_id"])
+                    if not prior:
+                        row_fields[5] += f",{key}={value}"
+                        metadata[key] = value
+                require_binding = bool(values)
+        elif new_attempt and metadata.get("completion_gate") == "code-impl-review":
+            raise SourceSubjectError("review-source-route-unavailable", metadata.get("route_node", ""))
+        validate_attempt(jobs, row_fields, metadata, require_new=require_binding)
+    except SourceSubjectError as exc:
+        raise DispatchContractError(exc.reason, exc.detail) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise DispatchContractError("review-source-route-unavailable", str(exc)) from exc
+    return row_fields, metadata
+
+
 def claim_attempt_row(
     jobs: Path,
     attempt_id: str,
@@ -10233,6 +10320,15 @@ def claim_attempt_row(
         row, automatic_replacement = replacement_row(jobs, lines, row)
         row_fields = row.split("\t")
         row_metadata = parse_registry_metadata(row_fields[5])
+        existing_attempt = any(
+            len(existing.split("\t")) == 6
+            and row_has_attempt(existing.split("\t")[5], attempt_id)
+            for existing in lines
+        )
+        row_fields, row_metadata = _review_source_registration_fence(
+            jobs, row_fields, row_metadata, new_attempt=not existing_attempt,
+        )
+        row = "\t".join(row_fields)
         from review_input import validate_launch as validate_review_input
         validate_review_input(jobs, row_metadata)
         if mutation_precheck is not None:

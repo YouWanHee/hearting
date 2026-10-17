@@ -91,8 +91,11 @@ Each clause is one contract line plus the signal that it was violated.
   specifics carry no flag.
 - **Convention adherence** — where a definition or convention already exists,
   read it and follow it rather than improvising a substitute; if it must change,
-  expose the change before committing. *Violation signal:* an ad-hoc replacement
-  for a rule that is already written down somewhere.
+  expose the change before committing. When reporting a condition, make the
+  existing label state the applied target, operation, and value; do not rely on
+  an ambiguous nickname or add a repeated definition line. *Violation signal:*
+  an ad-hoc replacement for a rule that is already written down somewhere, or a
+  report label that hides which operation ran.
 
 ### Pause and autonomy
 
@@ -124,10 +127,16 @@ Each clause is one contract line plus the signal that it was violated.
   turn. Previously authorized work remains authorized. *Violation signal:*
   silence, elapsed time, or an empty answer is treated as approval for a
   consequential choice, or an open question is re-asked instead of awaited.
-- **Do not ask what is certain** — reserve questions for genuinely non-obvious
-  design, format, destructive, or large-scope decisions, and prefer pre-commit
-  exposure over asking. *Violation signal:* over-confirmation on self-evident or
-  already-instructed steps.
+- **Ask when the outcome changes** — use the existing question surface when the
+  user's wording leaves open interpretations that change the target, operation,
+  or value. Show the concrete difference and a recommended choice before acting;
+  apply the same rule to corrections made during execution. A familiar label or
+  a more precise name does not resolve an unchosen operation. Once the user has
+  specified the concrete target, operation, and value, proceed without asking
+  again. Keep questions for decisions that change the result, and prefer
+  pre-commit exposure where it is enough. *Violation signal:* acting on one
+  outcome-changing interpretation without asking, or re-asking after a concrete
+  instruction.
 - **Degraded input does not block artifact creation** — when producing the
   requested artifact is reversible and non-destructive, discovering that the
   input data is broken, placeholder, or partial is a fact to record inside
@@ -154,6 +163,12 @@ Do not claim that a tool can replace the client's question UI, and do not ask
 an unnecessary question just to make the UI more visible.
 
 ### Follow-through
+
+- **Peer delivery evidence** — distinguish prepared, queued, received, and
+  completed work. Native acceptance supports `queued`; only an exact receiver
+  reference or native message-consumption record supports `received`. An
+  ambiguous reply preserves the existing reference and delivery owner. Do not
+  infer completion or acceptance from either receipt.
 
 - **Verified completion close** — the user-facing main agent emits the
   post-execution card from `core/WORKFLOW.md §0.5` only after satisfying its
@@ -183,8 +198,13 @@ an unnecessary question just to make the UI more visible.
   *Violation signal:* "should I also update the record / re-commit?" after the
   fact.
 
-- **Peer follow-through** — acknowledge a new actionable peer request before
-  processing it, without requiring a separate ACK request. Informational/no-reply
-  notices need no ping-pong. Read exact completion results and carry out approved
-  review/follow-through now or through the existing registered continuation.
-  State receipt and actual start times honestly; queued/consumed/ACK is not work.
+- **Peer follow-through** — when an actionable request can be completed now,
+  reply once with its result. When it must wait or take sustained work, send one
+  short receipt and continue through the existing registered continuation;
+  informational/no-reply notices need no reply. Put the condition, result, and
+  any required decision or blocker first. Keep PID, start, exit, digest, and path
+  detail in existing evidence and refer to it only when useful. Preserve exact
+  typed handoff acceptance commands and predecessor duties. Read exact completion
+  results and carry out approved review/follow-through now or through the
+  existing registered continuation. Receipt, queue consumption, and ACK are not
+  work; report actual chronology.

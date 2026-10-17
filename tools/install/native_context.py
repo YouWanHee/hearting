@@ -295,6 +295,10 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
                 "native_context": result.get("native_context"),
                 "report_lines": list(result.get("report_lines", []))}
     path = runtime_home / "config.toml"
+    try:
+        write_path = path.resolve(strict=False) if path.is_symlink() else path
+    except (OSError, RuntimeError) as exc:
+        raise NativeContextError(f"cannot resolve Codex config target: {exc}") from exc
     config_existed = path.exists()
     try:
         original = path.read_bytes() if path.exists() else b""
@@ -345,7 +349,7 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
     else:
         record["file_created"] = not config_existed
     candidate = _edit_codex(original, number)
-    changed = _publish(path, candidate, source=original,
+    changed = _publish(write_path, candidate, source=original,
                        owner="native-context:codex-root-window",
                        already_locked=native_locked)
     lines = [] if old == desired and not changed else [

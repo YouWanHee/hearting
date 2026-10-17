@@ -10,7 +10,6 @@ its two lifecycle hooks already call.
 from __future__ import annotations
 
 import sys
-import time
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,17 +22,14 @@ from fleet.herdr_projection import project as _project  # noqa: E402
 
 
 def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = False) -> bool:
-    lifecycle = {}
-    if isinstance(payload, dict) and payload.get("hook_event_name") == "SessionStart":
-        source = payload.get("source")
-        if source in {"startup", "resume", "clear", "compact", "fork"}:
-            lifecycle = dict(session_seq=time.time_ns(), session_start_source=source)
-    projected = _project("codex", session_id, worker=worker, **lifecycle)
+    # The v10 hook owns exact session reporting at SessionStart. This existing
+    # Hearting projection continues to own display metadata without duplicating it.
+    projected = _project("codex", session_id, worker=worker, report_session=False)
     if not worker and session_id:
         try:
             subprocess.Popen(
                 [sys.executable, str(ROOT / "utilities" / "peer-steward.py"),
-                 "__ensure-obligations"],
+                 "__ensure-obligations", "--lifecycle-root", str(ROOT)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
             )

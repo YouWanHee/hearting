@@ -68,7 +68,8 @@ class PeerReconnectTest(unittest.TestCase):
                  mock.patch.object(runtime_activation.subprocess, "Popen") as launch:
                 self.assertTrue(runtime_activation.reconnect_peer_obligations(root))
                 args, kwargs = launch.call_args
-                self.assertEqual(args[0], [sys.executable, str(utility), "__ensure-obligations"])
+                self.assertEqual(args[0], [sys.executable, str(utility), "__ensure-obligations",
+                                           "--lifecycle-root", str(root)])
                 self.assertEqual(kwargs["env"]["AGENT_HOME"], str(root))
                 self.assertEqual(kwargs["env"]["AGENT_DISPATCH_JOBS"], "/fixture/jobs.log")
 

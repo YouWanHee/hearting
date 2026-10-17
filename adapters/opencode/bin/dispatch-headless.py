@@ -35,6 +35,7 @@ from dispatch_contract import (
     DispatchContractError,
     foreground_review_launch_identity,
     bytecode_cache_env,
+    git_optional_locks_env,
     GROUP_REAP_PROOF,
     GOVERNOR_RESERVATION_ENV,
     REPLICA_RESERVATION_ROW_KEYS,
@@ -295,7 +296,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--foreground-timeout",
         type=float,
-        default=float(os.environ.get("OPENCODE_DISPATCH_FOREGROUND_TIMEOUT", "3600")),
+        default=float(os.environ.get("OPENCODE_DISPATCH_FOREGROUND_TIMEOUT", "14400")),
         help="maximum child lifetime for foreground-scoped launch",
     )
     p.add_argument(
@@ -1514,6 +1515,19 @@ def main(argv: list[str]) -> int:
             "context_window_final_limit_context": "absent" if final_limits["context"] is None else str(final_limits["context"]),
             "context_window_final_limit_input": "absent" if final_limits["input"] is None else str(final_limits["input"]),
             "context_window_final_limit_output": "absent" if final_limits["output"] is None else str(final_limits["output"]),
+            "context_policy_state": context_capture["compaction_policy"]["state"],
+            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
+                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
+            "context_policy_trigger": ("absent" if context_capture["compaction_policy"]["trigger_tokens"] is None
+                                       else str(context_capture["compaction_policy"]["trigger_tokens"])),
+            "context_policy_output_allowance": ("absent" if context_capture["compaction_policy"]["output_allowance_tokens"] is None
+                                                 else str(context_capture["compaction_policy"]["output_allowance_tokens"])),
+            "context_policy_configured_reserve": ("absent" if context_capture["compaction_policy"]["configured_reserve_tokens"] is None
+                                                  else str(context_capture["compaction_policy"]["configured_reserve_tokens"])),
+            "context_policy_effective_reserve": ("absent" if context_capture["compaction_policy"]["effective_reserve_tokens"] is None
+                                                 else str(context_capture["compaction_policy"]["effective_reserve_tokens"])),
+            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
+            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
         })
     log_dir = (
         Path(args.log_dir)
@@ -1809,6 +1823,19 @@ def main(argv: list[str]) -> int:
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("opencode", dispatch_env))
+        launch_metadata["opencode_context_window_request"] = str(
+            args.resolved_model_settings.get("context_window", ""))
+        for key in (
+                "context_window_native_model",
+                "context_window_final_limit_context", "context_window_final_limit_input",
+                "context_window_final_limit_output", "context_policy_state",
+                "context_policy_runtime_version",
+                "context_policy_enabled", "context_policy_trigger",
+                "context_policy_output_allowance", "context_policy_configured_reserve",
+                "context_policy_effective_reserve", "context_policy_reason"):
+            value = args.resolved_model_settings.get(key)
+            if value is not None:
+                launch_metadata["opencode_" + key] = str(value)
         grant_route_id, grant_route_hash = args.route_id, args.route_hash
         if not grant_route_id and not grant_route_hash and args.owner_route_binding:
             grant_route_id = args.owner_route_binding.route_id
@@ -1827,6 +1854,8 @@ def main(argv: list[str]) -> int:
         launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
+        # Nested runtime and worker-home overlays are already applied above.
+        dispatch_env.update(git_optional_locks_env())
         try:
             proc, launch_metadata = spawn_claimed_attempt(
                 jobs,
@@ -2018,12 +2047,25 @@ def main(argv: list[str]) -> int:
         args.child_pid = proc.pid
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
+        activity_context = None
+        if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":
+            try:
+                from foreground_activity import build_activity_context
+                activity_context = build_activity_context(
+                    worker_type=args.worker_type, harness="opencode", log_path=log_path,
+                    jobs=jobs, launch_metadata=launch_metadata, attempt_id=args.attempt_id,
+                    route_id=args.route_id, route_node=args.route_node,
+                    environment=dispatch_env, worktree=args.worktree,
+                )
+            except Exception as exc:
+                print(f"warning=foreground activity context unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
             binding = args.parent_binding
             try:
                 outcome = wait_foreground(
                     proc, args.foreground_timeout,
                     watchdog_budget=args.watchdog_budget,
+                    activity_context=activity_context,
                     parent_pid=binding.observed_pid if binding else None,
                     parent_pid_start=binding.observed_pid_start if binding else None,
                     parent_is_live=(
@@ -2070,6 +2112,7 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 watchdog_budget=args.watchdog_budget,
+                activity_context=activity_context,
             )
             annotate_attempt_row(
                 jobs,

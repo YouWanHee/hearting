@@ -13,13 +13,15 @@ import unittest
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
+CLEAN_ENV = {key: value for key, value in os.environ.items() if not key.startswith((
+    "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_", "AGENT_MODEL_GOVERNOR_"))}
 
 
 def run(argv: list[str], cwd: Path, env: dict[str, str] | None = None):
     result = subprocess.run(
         argv,
         cwd=str(cwd),
-        env=env,
+        env={**CLEAN_ENV, **(env or {})},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -73,12 +75,13 @@ class DispatchArtifactRootTests(unittest.TestCase):
         )
         route_dir = Path(self.canonical) / ".runtime" / "routes"
         route_dir.mkdir(parents=True)
-        self.route_file = route_dir / "quick-route.json"
-        run(
+        compiled = run(
             [
                 sys.executable,
                 str(ROOT / "utilities" / "capability-route.py"),
                 "compile",
+                "--slug",
+                "artifact-root-fixture",
                 "--capability",
                 "autopilot-code",
                 "--capability-mode",
@@ -101,13 +104,13 @@ class DispatchArtifactRootTests(unittest.TestCase):
                 "tracked",
                 "--artifact-guard",
                 "artifact-root-fixture",
-                "--output",
-                str(self.route_file),
             ],
             ROOT,
         )
-        self.route = json.loads(self.route_file.read_text(encoding="utf-8"))
-        self.route_node = self.route["nodes"][0]
+        self.route = json.loads(compiled.stdout)
+        self.route_file = route_dir / f"{self.route['route_id']}.json"
+        self.assertTrue(self.route_file.is_file())
+        self.route_node = next(node for node in self.route["nodes"] if node["id"] == "one-shot")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -153,7 +156,10 @@ class DispatchArtifactRootTests(unittest.TestCase):
         return args
 
     def assert_registered(self, adapter: str, extra_command: str | None = None):
-        result = run(self.wrapper_args(adapter), ROOT)
+        env={**CLEAN_ENV,"AGENT_ARTIFACT_ROOT":self.canonical,
+             "AGENT_ROUTE_FILE":str(self.route_file),"AGENT_ROUTE_ID":self.route["route_id"],
+             "AGENT_ROUTE_NODE":"one-shot","AGENT_DISPATCH_WORKTREE":str(self.worktree)}
+        result = run(self.wrapper_args(adapter), ROOT, env=env)
         self.assertIn(f"artifact_root={self.canonical}", result.stdout)
         self.assertIn("artifact_write_scope=canonical-only", result.stdout)
         if extra_command:
@@ -171,7 +177,7 @@ class DispatchArtifactRootTests(unittest.TestCase):
         self.assert_registered("claude", f"--add-dir {self.canonical}")
 
     def test_codex_scopes_add_dir_and_metadata(self):
-        self.assert_registered("codex", f"--add-dir {self.canonical}")
+        self.assert_registered("codex", f"--writable-root {self.canonical}")
 
     def test_opencode_scopes_external_directory_and_preserves_config(self):
         existing = {
@@ -181,7 +187,10 @@ class DispatchArtifactRootTests(unittest.TestCase):
             },
             "theme": "system",
         }
-        env = {**os.environ, "OPENCODE_CONFIG_CONTENT": json.dumps(existing)}
+        env = {**CLEAN_ENV, "AGENT_ARTIFACT_ROOT":self.canonical,
+               "AGENT_ROUTE_FILE":str(self.route_file),"AGENT_ROUTE_ID":self.route["route_id"],
+               "AGENT_ROUTE_NODE":"one-shot","AGENT_DISPATCH_WORKTREE":str(self.worktree),
+               "OPENCODE_CONFIG_CONTENT": json.dumps(existing)}
         result = run(self.wrapper_args("opencode"), ROOT, env=env)
         self.assertIn(f"artifact_root={self.canonical}", result.stdout)
         self.assertIn("external_directory_permission=scoped-allow", result.stdout)

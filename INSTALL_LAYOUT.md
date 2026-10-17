@@ -383,13 +383,16 @@ harness install codex
 | Codex-native skills/agents/modes | symlink fan-out (`skills/*`, `agents/*.toml`) | Generated from `capabilities/` and `roles/` into `codex_setting/codex-{skills,agents,modes}`; do not reimplement |
 | packaged activation | repo-local immutable bundle → same native surfaces | Does not use plugin marketplace, config, or cache state |
 | hooks | `codex_setting/codex-hooks` → `hooks.json` | Adapter-owned hook bridge; executes only `type:"command"` entries |
-| `config.toml` used by `/statusline` | not copied; fragment only | `config.toml` remains runtime-owned (see statusline below) |
+| `config.toml` | not copied; narrow managed leaves | Runtime-owned config remains intact; activation owns recorded Codex hook `trusted_hash` leaves and statusline/identity fragments, with conditional restoration. |
 
 - **Runtime activation:** both linked and packaged modes use Codex-native
   skills, agents, modes, and hooks. Existing harness plugin enable entries are
   preserved but set to `false`; their caches are isolated under
   `.harness/disabled-plugins/`. Activation does not register a marketplace or
   invoke plugin installation.
+- **Hook trust:** global activation records the current hash only for Hearting's
+  installed hooks. Disabled decisions and foreign hooks stay intact; `/hooks` is
+  the fallback when Codex/App Server is unavailable or for foreign hooks.
 - **Statusline:** `config.toml` remains runtime-owned because the TUI rewrites it
   directly. The harness keeps only
   `codex_setting/codex-config/tui-statusline.toml`; applying it through

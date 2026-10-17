@@ -55,7 +55,7 @@ Run the `qa/test` unit. Select one prompt form:
 Always include this requirement in the `qa/test` unit test prompt:
 
 ```text
-Write a detailed test log to: {log_dir}/test_logs/test_report.md
+Write a detailed test log to: the code-test node's declared report output
 ```
 
 The report structure is owned by the `qa/test` unit persona (`roles/units/qa/test.md`): exact command, full stdout/stderr (or the last 50 lines when long), and a per-test PASS/FAIL verdict with the error reason. Do not restate a competing format in the prompt.
@@ -82,7 +82,7 @@ This is the concrete final verify stage. Derive rigor from plan frontmatter or c
 | `thorough` | Broaden target coverage and add behavioral runtime observation for changed user-facing surfaces | Parallel or dispatch-depth-2 review only when selected by `intensity=thorough` |
 | `adversarial` | Thorough verification plus applicable security, failure-mode, and external-adversary evidence | Prove every claimed adversary or security pass ran |
 
-After the `qa/test` unit returns, read `test_logs/test_report.md`. Run a separate adequacy review only when the selected assurance budget requires it, and append its findings to the report. Otherwise return the concrete verification verdict directly.
+After the `qa/test` unit returns, read the supplied report path. Run a separate adequacy review only when the selected assurance budget requires it, and append its findings to the report. Otherwise return the concrete verification verdict directly.
 
 Do not modify source or invoke a hotfix worker from this stage. Any repair belongs to the caller's bounded retry/fix path.
 
@@ -97,7 +97,7 @@ Return the report path, executed commands, skipped levels and reasons, blockers,
 
 ## Log Directory
 
-- Plan path: use the task root above `plan/`; for example, `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor/plan.md` → `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor/`.
+- Plan path: use the directory containing the supplied `plan.md`.
 - No plan: use a date-stamped directory under `<artifact-root>/tests/`.
 
 ## Task

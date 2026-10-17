@@ -3,8 +3,9 @@
 # default $HOME/.codex) to the portable harness projection under
 # codex_setting/. Idempotent: re-running only refreshes harness-owned symlinks.
 #
-# It NEVER touches Codex-owned credentials, sessions, history, logs, caches,
-# config.toml, or local databases. It creates/refreshes the harness `agent-*`
+# It never touches Codex-owned credentials, sessions, history, logs, caches,
+# trust/plugin/model settings, or local databases. It applies only the managed
+# TUI status-line preference to config.toml and creates/refreshes harness `agent-*`
 # pointers, `hooks.json`, selected per-skill / per-agent symlinks, and the
 # one-time user model default, and the manifest-backed interactive launcher in
 # the user's harness bin directory. A
@@ -90,6 +91,17 @@ fi
 vendor_codex_command=$(command -v codex 2>/dev/null || true)
 
 mkdir -p "$CODEX_HOME"
+
+# Keep the exact same status-line merge on projection install/update as the
+# explicit preflight command. A malformed or unsupported user config is left
+# untouched and does not prevent the rest of the projection from installing.
+tui_config_result=$(AGENT_HOME="$AGENT_HOME" CODEX_HOME="$CODEX_HOME" \
+  "$AGENT_HOME/adapters/codex/bin/apply-tui-config.sh" 2>&1) || {
+    printf 'tui_config=skipped reason=merge-unavailable\n'
+    printf '%s\n' "$tui_config_result" >&2
+    tui_config_result=""
+  }
+[ -z "$tui_config_result" ] || printf '%s\n' "$tui_config_result"
 
 # link <target> <linkpath>: refresh a harness-owned symlink. Refuses to clobber a
 # real (non-symlink) file or directory, except hooks.json which is backed up.

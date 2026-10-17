@@ -1,4 +1,4 @@
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["./tui/hearting-tui-identity.ts"]
+  "plugin": ["./tui/hearting-tui-identity.ts", "./tui/herdr-tui-session.js"]
 }

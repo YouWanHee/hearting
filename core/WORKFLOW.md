@@ -425,10 +425,16 @@ defaults before execution. Input/output, explicit human gates, and terminal proo
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
 to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
-non-direct `--start` whose stages change source from a primary checkout, the worktree
-`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused, unless the
-checkout holds work the base lacks; a framed
-decision's first such leg does the same under the frame's slug), artifact root
+source-changing `--start` from a primary checkout, the worktree
+`<repo>-wt/<slug>` on a collision-free branch and path, based on the commit SHA
+resolved by a successful fetch of the current remote default; this applies
+regardless of shape, explicit cwd, or supplied dispatch evidence. An explicitly
+approved task linked worktree is reused with its changes, and exact saved route
+snapshots/cursors/receipts and official continuations resume before any new
+preparation. A framed first leg and each new successor use the same preparation
+contract; an existing plan cursor wins over allocation. A preparation failure
+leaves the start unpublished and retryable through the same request. Preview,
+explain, non-start `compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
@@ -454,10 +460,13 @@ the write, spec, and core gates, the dispatch-depth-3 ban, and every
 completion gate are unchanged, and a preset-free route is still a route the
 §0.4 gate and the route-participation invariant apply to.
 
-`compose` runs the same probe an owner launch re-checks, so it is called from
-the dispatch-depth-0 session in the final worktree; inside a registered owner
-(`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence` or
-`--registered-headless-evidence` from the parent, exactly like `compile`.
+For an approved source-changing `--start`, the shared preparation boundary
+resolves the selected graph first, prepares a new independent worktree when the
+caller is in a primary checkout, then collects eligibility and launch evidence
+from that final cwd before sealing or publishing. `compose` runs the same probe an owner launch re-checks,
+so it is called from the dispatch-depth-0 session in the final worktree; inside
+a registered owner (`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence`
+or `--registered-headless-evidence` from the parent, exactly like `compile`.
 The stderr `[경로]` notice (§0.4) keeps the campaign choice observed before
 compose starts, and accompanies an admitted first leg. A no-wait snapshot is
 pending; only an elapsed bounded wait is a timeout.
@@ -593,6 +602,13 @@ route, its freshness, lineage, stage or proof. Registered owners and workers,
 artifact roots, the temp directory, runtime homes, CI and dev activation pass;
 any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
 `capability-route.py verify`/`status` still only inspect a route that exists.
+
+Compute-host storage access follows the `execution_needs` declaration on the
+registered part catalog row in `capabilities/topologies.json`. Native and
+borrowed route nodes resolve the same row from their sealed stage identity;
+the need is not copied into sealed nodes or inferred from the outer
+capability, node name, or task text. Routes without a declared compute stage
+retain their ordinary execution access.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
@@ -776,6 +792,13 @@ Supply a readable, nonempty artifact from the route's exact open cycle and the
 final summary; the command records terminal proof, closes the route, finalizes
 that cycle and returns a receipt only after rechecking all three. A partial
 transaction remains `finish-pending` and is resumed with the same intent.
+The synthetic `source-scoped` authority does not make unrelated tracked edits
+a finish veto; concrete declared files, directories and path patterns remain
+guarded, with tracked status read again under the finish lock. The returned
+result may report unscoped tracked dirt as an observation, without attributing
+authorship or changing the stored receipt. Finish preserves the worktree and
+index, while its evidence, route/session identity, commit lineage and replay
+checks remain in force.
 
 ```text
 python3 utilities/capability-route.py finish [--route <route.json|rt-id>] --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]

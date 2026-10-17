@@ -8,6 +8,7 @@ across collectors and is therefore not a valid policy signal.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -41,9 +42,74 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 
 
 def _counter(value) -> Optional[int]:
-    if isinstance(value, (int, float)) and value >= 0:
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
         return int(value)
     return None
+
+
+def _policy_tokens(value):
+    """Native policy counts are exact non-negative integers; bool/float are not evidence."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def context_policy_snapshot(*, source, runtime_version=None, configured_request_tokens=None,
+                            configured_request=None,
+                            effective_window_tokens=None, applied_trigger_tokens=None,
+                            output_allowance_tokens=None, compaction_reserve_tokens=None,
+                            disabled=None, enabled=None, enforced=None, session_id=None,
+                            attempt_id=None, raw_percentage=None, reason=None):
+    """Keep a runtime's request, resolved limit, applied trigger, and reserve distinct."""
+    requested = _policy_tokens(configured_request_tokens)
+    effective = _policy_tokens(effective_window_tokens)
+    trigger = _policy_tokens(applied_trigger_tokens)
+    output = _policy_tokens(output_allowance_tokens)
+    reserve = _policy_tokens(compaction_reserve_tokens)
+    if disabled is True or enabled is False or enforced is False:
+        state = "disabled"
+    elif enabled is True and enforced is True and trigger is not None:
+        state = "applied"
+    else:
+        state = "unknown"
+        if reason is None:
+            reason = "native-policy-not-observed"
+    if state == "applied" and trigger is None:
+        state = "unknown"
+        reason = reason or "invalid-applied-trigger"
+    return {
+        "state": state,
+        "source": str(source or "unknown"),
+        "runtime_version": runtime_version if isinstance(runtime_version, str) else None,
+        "configured_request": (configured_request[:128] if isinstance(configured_request, str)
+                               else None),
+        "configured_request_tokens": requested,
+        "effective_window_tokens": effective,
+        "applied_trigger_tokens": trigger,
+        "output_allowance_tokens": output,
+        "compaction_reserve_tokens": reserve,
+        "disabled": True if state == "disabled" else False if state == "applied" else None,
+        "enabled": enabled if type(enabled) is bool else None,
+        "enforced": enforced if type(enforced) is bool else None,
+        "raw_percentage": (raw_percentage if isinstance(raw_percentage, (int, float))
+                           and not isinstance(raw_percentage, bool)
+                           and 0 <= raw_percentage <= 100 else None),
+        "session_id": session_id if isinstance(session_id, str) and session_id else None,
+        "attempt_id": attempt_id if isinstance(attempt_id, str) and attempt_id else None,
+        "reason": reason if state != "applied" else None,
+    }
+
+
+def context_policy_used_pct(active_context_tokens, policy):
+    """Percent of the exact applied trigger; unknown/disabled and zero trigger stay undefined."""
+    active = _policy_tokens(active_context_tokens)
+    trigger = _policy_tokens(policy.get("applied_trigger_tokens")) if isinstance(policy, dict) else None
+    if (active is None or trigger is None or trigger == 0
+            or policy.get("state") != "applied"):
+        return None
+    if active >= trigger:
+        return 100
+    return min(99, (200 * active + trigger) // (2 * trigger))
 
 
 @dataclass

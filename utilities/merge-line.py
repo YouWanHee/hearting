@@ -7,14 +7,19 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import locale
 import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import quote, urlparse
 import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import git_index_lock
 
 
 class MergeError(RuntimeError):
@@ -35,6 +40,45 @@ class Withdrawn(MergeError):
 
 def one_line(value):
     return " ".join(str(value).split())
+
+
+class GitCommandFailure(MergeError):
+    """A failed Git subprocess with a lossless byte side channel."""
+
+    def __init__(self, result, cwd, *, precomputed=False):
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        self.returncode = result.returncode
+        self.stdout_bytes = getattr(result, "raw_stdout", result.stdout) or b""
+        self.stderr_bytes = getattr(result, "raw_stderr", result.stderr) or b""
+        self.encoding = getattr(result, "encoding", encoding)
+        self.stdout = git_index_lock.compatibility_text(
+            self.stdout_bytes, self.encoding, failed=True)
+        self.stderr = git_index_lock.compatibility_text(
+            self.stderr_bytes, self.encoding, failed=True)
+        if precomputed:
+            self.git_failure = result.git_failure
+            self.diagnosis = result.git_diagnosis
+        else:
+            self.git_failure = git_index_lock.failure_record(
+                self.returncode, self.stdout_bytes, self.stderr_bytes, self.encoding)
+            diagnosis = git_index_lock.diagnose_failure(
+                result.args, cwd, self.returncode, self.stdout_bytes, self.stderr_bytes)
+            self.diagnosis = diagnosis if diagnosis and diagnosis.get("state") != "unbound" else None
+        super().__init__(one_line(self.stderr or self.stdout or f"git exited {self.returncode}"))
+
+    @classmethod
+    def from_completed(cls, result, cwd):
+        return cls(result, cwd, precomputed=True)
+
+    def report(self):
+        lines = [f"Original Git return code: {self.returncode}"]
+        if self.stdout:
+            lines.extend(("Original Git stdout:", self.stdout.rstrip("\n")))
+        if self.stderr:
+            lines.extend(("Original Git stderr:", self.stderr.rstrip("\n")))
+        if self.diagnosis:
+            lines.append(self.diagnosis["message"])
+        return "\n".join(lines)
 
 
 def pid_start(pid):
@@ -231,12 +275,23 @@ class Integration:
         self.temp = None
 
     def git(self, *args, check=True):
-        result = subprocess.run(["git", "-C", self.temp.name,
-                                 "-c", "user.name=Hearting merge-line",
-                                 "-c", "user.email=merge-line@hearting.local", *args],
-                                capture_output=True, text=True, timeout=300)
-        if check and result.returncode:
-            raise MergeError(one_line(result.stderr or result.stdout))
+        argv = ["git", "-C", self.temp.name,
+                "-c", "user.name=Hearting merge-line",
+                "-c", "user.email=merge-line@hearting.local", *args]
+        raw = subprocess.run(argv, capture_output=True, text=False, timeout=300)
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        result = subprocess.CompletedProcess(
+            raw.args, raw.returncode,
+            git_index_lock.compatibility_text(raw.stdout, encoding, failed=raw.returncode != 0),
+            git_index_lock.compatibility_text(raw.stderr, encoding, failed=raw.returncode != 0))
+        result.raw_stdout, result.raw_stderr = raw.stdout, raw.stderr
+        result.encoding = encoding
+        if raw.returncode:
+            failure = GitCommandFailure(raw, self.temp.name)
+            result.git_failure = failure.git_failure
+            result.git_diagnosis = failure.diagnosis
+            if check:
+                raise failure
         return result
 
     def save(self):
@@ -264,6 +319,8 @@ class Integration:
                     # A real content conflict alone goes to the single-PR path.
                     conflicts = self.git("diff", "--name-only", "--diff-filter=U").stdout
                     if not conflicts:
+                        if hasattr(result, "git_failure"):
+                            raise GitCommandFailure.from_completed(result, self.temp.name)
                         raise MergeError(one_line(result.stderr or result.stdout))
                     self.git("merge", "--abort")
                     if self.git("rev-parse", "HEAD").stdout.strip() != before:
@@ -469,7 +526,13 @@ def merge_pr(client, pr, emit=print, sleep=time.sleep, interval=10, admitted=lam
 
 
 def outcome(pr, ok, detail):
-    return {"ok": ok, "message": f"merge-line: {'merged' if ok else 'failed'} PR=#{pr}: {one_line(detail)}"}
+    result = {"ok": ok, "message": f"merge-line: {'merged' if ok else 'failed'} PR=#{pr}: {one_line(detail)}"}
+    if isinstance(detail, GitCommandFailure):
+        result["git_failure"] = detail.git_failure
+        if detail.diagnosis:
+            result["git_diagnosis"] = detail.diagnosis
+        result["message"] += "\n" + detail.report()
+    return result
 
 
 def merge_batch(client, prs, settle, emit=print, sleep=time.sleep, admitted=lambda _: True):
@@ -643,14 +706,19 @@ def main():
     signal.signal(signal.SIGHUP, interrupted)
     try:
         client = GitHub()
-        emit = lambda line: print(one_line(line), flush=True)
+        def emit(line):
+            value = str(line)
+            print(value if "\nOriginal Git " in value else one_line(value), flush=True)
         with MergeTurn(state_directory(client.identity), args.pr, emit=emit) as turn:
             return 0 if run_turn(client, turn, emit=emit) else 1
     except KeyboardInterrupt:
         print(f"merge-line: stopped PR=#{args.pr}; turn released", flush=True)
         return 130
     except (MergeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-        print(f"merge-line: failed PR=#{args.pr}: {one_line(exc)}; turn released", flush=True)
+        if isinstance(exc, GitCommandFailure):
+            print(f"merge-line: failed PR=#{args.pr}: {one_line(exc)}; turn released\n{exc.report()}", flush=True)
+        else:
+            print(f"merge-line: failed PR=#{args.pr}: {one_line(exc)}; turn released", flush=True)
         return 1
     return 0
 

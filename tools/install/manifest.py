@@ -217,7 +217,7 @@ def _three_way_merge(ours, base, theirs):
     return (ok, merged_bytes, conflict_markers, False)
 
 
-def record(runtime, files, scope="global", version=None):
+def record(runtime, files, scope="global", version=None, integration_assets=None):
     """Record each copied file's hash after installation.
 
     ``files`` contains projector ``copy_once`` actions. Create pristine
@@ -249,6 +249,10 @@ def record(runtime, files, scope="global", version=None):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "files": files_map,
     }
+    if integration_assets is not None:
+        manifest["integration_assets"] = integration_assets
+    elif isinstance(existing.get("integration_assets"), dict):
+        manifest["integration_assets"] = existing["integration_assets"]
     _write_manifest(manifest_path, manifest)
     return manifest
 
@@ -277,6 +281,23 @@ def check_drift(runtimes, scope="global"):
             current_hash = _sha256(dest_abs)
             if current_hash != recorded_hash:
                 drift.append({"runtime": rt, "path": relpath, "detail": "hash mismatch"})
+
+        integration_assets = manifest.get("integration_assets", {})
+        assets = integration_assets.get("assets", []) if isinstance(integration_assets, dict) else []
+        for item in assets if isinstance(assets, list) else []:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            relpath = _safe_relpath(item["path"])
+            dest_abs = paths.runtime_home(rt, scope) / relpath
+            if not dest_abs.is_file():
+                drift.append({"runtime": rt, "path": relpath, "detail": "integration asset missing"})
+                continue
+            try:
+                current_hash = _sha256(dest_abs)
+            except OSError:
+                current_hash = None
+            if current_hash != item.get("sha256"):
+                drift.append({"runtime": rt, "path": relpath, "detail": "integration asset hash mismatch"})
 
     return drift
 

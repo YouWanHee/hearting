@@ -51,6 +51,7 @@ HOOK_ADOPT = [
     "core-write-guard.py",
     "spec-read-marker.sh",
     "spec-sync-nudge.sh",
+    "session-tidy-idle.py",
 ]
 
 # Same-directory helper modules a HOOK_ADOPT script imports/execs at runtime
@@ -64,16 +65,19 @@ _HOOK_EVENTS = {
     "core-write-guard.py": "PreToolUse",
     "spec-read-marker.sh": "PostToolUse",
     "spec-sync-nudge.sh": "PostToolUse",
+    "session-tidy-idle.py": "Stop",
 }
 _HOOK_MATCHERS = {
     "core-write-guard.py": "Edit|Write|MultiEdit|NotebookEdit",
     "spec-read-marker.sh": "Read",
     "spec-sync-nudge.sh": "Edit|Write|MultiEdit",
+    "session-tidy-idle.py": "*",
 }
 _HOOK_SHELLS = {
     "core-write-guard.py": "python3",
     "spec-read-marker.sh": "sh",
     "spec-sync-nudge.sh": "bash",
+    "session-tidy-idle.py": "python3",
 }
 # spec-pipeline trio: rebase state (`.spec-grounding` markers) onto the
 # plugin's persistent, update-surviving data dir instead of the default

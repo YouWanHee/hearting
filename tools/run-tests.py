@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "utilities") not in sys.path:
+    sys.path.insert(0, str(ROOT / "utilities"))
 DEFAULT_TIMEOUT = 600
 DEFAULT_JOBS = 4
 
@@ -286,8 +288,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     xdg_data = tmpdir / "xdg-data"
     xdg_cache = tmpdir / "xdg-cache"
     runner_tmp = tmpdir / "tmp"
+    tidy_test_isolation = runner_tmp / "tidy-isolation"
     tmux_tmp = tmpdir / "tmux"
-    for d in (home, xdg_state, xdg_data, xdg_cache, runner_tmp, tmux_tmp):
+    for d in (home, xdg_state, xdg_data, xdg_cache, runner_tmp, tidy_test_isolation, tmux_tmp):
         d.mkdir(parents=True, exist_ok=True)
 
     env: dict[str, str] = {}
@@ -313,6 +316,10 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["XDG_DATA_HOME"] = str(xdg_data)
     env["XDG_CACHE_HOME"] = str(xdg_cache)
     env["TMPDIR"] = str(runner_tmp)
+    # Session-tidy tests create their own nested isolated roots. Keep those
+    # beneath this suite's already-selected and registered temp root so the
+    # tests work when the host's traditional /var/tmp is read-only.
+    env["HEARTING_TIDY_TEST_ISOLATION_BASE"] = str(tidy_test_isolation)
     # tmux picks its socket from TMUX_TMPDIR (default /tmp), not TMPDIR, so a
     # suite that starts tmux would otherwise create sessions on the
     # developer's live default server and fire its plugins. TMUX/TMUX_PANE
@@ -1793,6 +1800,31 @@ def run_profile(
 
 def main(argv: list[str]) -> int:
     args = build_arg_parser().parse_args(argv)
+    import artifact_context
+    context = artifact_context.resolve_context(environ=os.environ)
+    mode_flags = {"--census", "--report-only", "--fingerprint", "--fingerprint-explain",
+                  "--compare-baseline", "--verify-shards"}
+    route_test = (context.route and context.node
+                  and context.route.get("capability") == "autopilot-code"
+                  and (context.node_id in {"test", "verification"}
+                       or context.node.get("completion_gate") == "code-test"))
+    if route_test:
+        # Explicit routed paths remain subject to the same declared node scope.
+        for role, value in (("test-report", args.report), ("test-diagnostics", args.diagnostics_dir)):
+            if value is not None:
+                context.resolve_output(role, explicit=value)
+        if not mode_flags.intersection(argv):
+            if "--root" not in argv and not any(value.startswith("--root=") for value in argv):
+                if context.source_worktree:
+                    args.root = context.source_worktree
+            if args.report is None:
+                binding = context.resolve_output("test-report")
+                if binding and binding.path:
+                    args.report = binding.path
+            if args.diagnostics_dir is None:
+                binding = context.resolve_output("test-diagnostics")
+                if binding and binding.path:
+                    args.diagnostics_dir = binding.path
 
     if args.compare_baseline:
         if not args.base_report or not args.head_report:

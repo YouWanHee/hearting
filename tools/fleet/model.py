@@ -296,6 +296,8 @@ class Session:
     # cross-harness comparable (Codex=current context; Claude/OpenCode=cumulative).
     active_context_tokens: Optional[int] = None
     context_window_tokens: Optional[int] = None
+    context_display_window_tokens: Optional[int] = None
+    context_policy: Optional[dict] = None
     session_input_tokens: Optional[int] = None
     session_cached_input_tokens: Optional[int] = None
     session_output_tokens: Optional[int] = None
@@ -580,6 +582,8 @@ class DispatchJob:
     ctx_pct: Optional[int] = None
     active_context_tokens: Optional[int] = None
     context_window_tokens: Optional[int] = None
+    context_display_window_tokens: Optional[int] = None
+    context_policy: Optional[dict] = None
     session_input_tokens: Optional[int] = None
     session_cached_input_tokens: Optional[int] = None
     session_output_tokens: Optional[int] = None

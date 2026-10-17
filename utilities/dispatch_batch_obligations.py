@@ -287,6 +287,53 @@ def _resume_owner_settlements(jobs: Path) -> None:
             continue
 
 
+def has_unowned_work(jobs: str | Path | None = None) -> bool:
+    """Read-only check for batch or owner settlement work without a live owner."""
+    from dispatch_contract import (
+        SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
+    )
+
+    for jobs_path in _jobs_paths(jobs):
+        try:
+            lines = jobs_path.read_text().splitlines()
+        except OSError:
+            lines = ()
+        for raw in lines:
+            fields = raw.split("\t")
+            if len(fields) != 6 or fields[1] not in {"open", "running"}:
+                continue
+            meta = parse_registry_metadata(fields[5])
+            if (meta.get("worker_type") == "owner" and meta.get("launch_started") == "1"
+                    and meta.get("supervisor_lease") == SUPERVISOR_LEASE_KIND
+                    and meta.get("supervisor_lease_file") and meta.get("log_file")
+                    and meta.get("attempt_id")):
+                try:
+                    if not supervisor_lease_is_held(jobs_path, meta):
+                        return True
+                except (OSError, ValueError):
+                    continue
+
+        try:
+            root = _root(jobs_path)
+            records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
+        except (OSError, BatchObligationError):
+            continue
+        for path in records:
+            try:
+                record = _read(path)
+                if not record or record.get("state") not in _PENDING:
+                    continue
+                observer = record.get("observer") or {}
+                pid = observer.get("pid")
+                start = observer.get("pid_start")
+                if (not isinstance(pid, int) or not isinstance(start, str) or not start
+                        or _pid_start(pid) != start):
+                    return True
+            except (OSError, ValueError, BatchObligationError):
+                continue
+    return False
+
+
 def _pid_start(pid: int) -> str:
     try:
         from dispatch_contract import process_start_ticks

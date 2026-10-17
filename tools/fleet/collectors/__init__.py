@@ -263,6 +263,7 @@ def _adopt_child_titles(sessions, jobs):
         if not getattr(job, '_dispatch_context_owned', False):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
+                    'context_display_window_tokens', 'context_policy',
                     'session_input_tokens', 'session_cached_input_tokens',
                     'session_output_tokens', 'session_reasoning_output_tokens',
                     'session_total_tokens', 'exec_tool'):
@@ -419,7 +420,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     # match; additive enrichment that never touches liveness or row existence.
     try:
         from . import herdr as _herdr
-        observed = _herdr.enrich(sessions)
+        observed = _herdr.enrich(sessions, wait_timeout=0.0 if fast_first else 0.2)
         if isinstance(observed, dict):
             observations["herdr"] = _observation_health(
                 job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)

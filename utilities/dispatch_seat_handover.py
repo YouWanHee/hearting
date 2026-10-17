@@ -56,6 +56,8 @@ ROW_EVENT = "handover"
 WORKER_TYPES = frozenset({"owner", "frame", "review"})
 OPEN_ROW_STATUSES = frozenset({"open", "running"})
 LINE_MAX_BYTES = 520
+# Maximum distinct logical jobs carried by one handover.  A selected job can
+# contribute multiple flat attempt/parent bindings.
 MAX_BINDINGS = 12
 KEEP_ROWS = 40
 
@@ -129,7 +131,13 @@ def read_snapshot(seat_key: str) -> Optional[dict]:
     return None
 
 
-def _all_snapshots() -> list[dict]:
+def _all_snapshots(read_context=None) -> list[dict]:
+    if read_context is not None:
+        return list(read_context.handover_snapshots(_all_snapshots_uncached))
+    return _all_snapshots_uncached()
+
+
+def _all_snapshots_uncached() -> list[dict]:
     out = []
     try:
         names = sorted(p for p in _snapshot_dir().glob("*.json") if p.is_file() and not p.is_symlink())
@@ -142,9 +150,13 @@ def _all_snapshots() -> list[dict]:
     return out
 
 
-def handover_rows(seat) -> list[dict]:
+def handover_rows(seat, *, read_context=None) -> list[dict]:
     """The seat ledger's handover rows, oldest first."""
-    rows = [e for e in _st()._read_ledger_lines(seat) if e.get("event") == ROW_EVENT and e.get("from")]
+    def load():
+        return [e for e in _st()._read_ledger_lines(seat)
+                if e.get("event") == ROW_EVENT and e.get("from")]
+
+    rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
 
 
@@ -186,7 +198,7 @@ def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
                and b.get("node") == node for b in bindings if isinstance(b, dict))
 
 
-def _effective(meta: dict, jobs=None) -> tuple[str, str]:
+def _effective(meta: dict, jobs=None, *, read_context=None) -> tuple[str, str]:
     """``(session, harness)`` answering for ``meta``'s attempt now.  The chain may cross panes
     and harnesses (a seat change hands a Codex parent's route to a Claude successor), so the
     rows of every seat whose snapshot binds the attempt are read together, oldest first."""
@@ -195,7 +207,8 @@ def _effective(meta: dict, jobs=None) -> tuple[str, str]:
     if not registered or jobs is None or not eligible_row(meta):
         return registered, harness
     try:
-        rows = sorted((row for seat in _seats_for_binding(jobs, meta) for row in handover_rows(seat)),
+        rows = sorted((row for seat in _seats_for_binding(jobs, meta, read_context=read_context)
+                       for row in handover_rows(seat, read_context=read_context)),
                       key=lambda r: float(r.get("ts", 0) or 0))
         current, seen = registered, {registered}
         for row in rows:
@@ -209,15 +222,15 @@ def _effective(meta: dict, jobs=None) -> tuple[str, str]:
         return registered, str(meta.get("parent_harness") or "")
 
 
-def effective_parent(meta: dict, jobs=None) -> str:
+def effective_parent(meta: dict, jobs=None, *, read_context=None) -> str:
     """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
     the end of its A -> B (-> C) handover chain.  Any failure answers the registered parent."""
-    return _effective(meta, jobs)[0]
+    return _effective(meta, jobs, read_context=read_context)[0]
 
 
-def effective_parent_harness(meta: dict, jobs=None) -> str:
+def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str:
     """The harness of :func:`effective_parent` (the registered ``parent_harness`` without a handover)."""
-    return _effective(meta, jobs)[1]
+    return _effective(meta, jobs, read_context=read_context)[1]
 
 
 def owns(meta: dict, session: str, jobs=None) -> bool:
@@ -227,11 +240,12 @@ def owns(meta: dict, session: str, jobs=None) -> bool:
     return meta.get("parent_sid") == session or (jobs is not None and effective_parent(meta, jobs) == session)
 
 
-def _seats_for_binding(jobs, meta: dict) -> list:
+def _seats_for_binding(jobs, meta: dict, *, read_context=None) -> list:
     """Every seat whose snapshot binds this exact registry/route/node.  No recency, cwd or pane
     name decides it: only an exact binding.  A snapshot is written only by a session that
     answered for the attempt, so each one belongs to the same chain."""
-    return [_seat_of(str(s["seat"].get("key") or ""), s) for s in _all_snapshots()
+    return [_seat_of(str(s["seat"].get("key") or ""), s)
+            for s in _all_snapshots(read_context)
             if isinstance(s.get("seat"), dict) and _binds(s["bindings"], jobs, meta)]
 
 
@@ -338,38 +352,141 @@ def _route_open(jobs, meta: dict) -> bool:
         return False
 
 
+def _logical_key(binding: dict) -> tuple:
+    """The stable logical-job key shared by all attempt and parent bindings."""
+    return (_jobs_key(binding.get("jobs") or ""), str(binding.get("route") or ""),
+            str(binding.get("hash") or ""), str(binding.get("node") or ""))
+
+
+def _binding_identity(binding: dict) -> tuple:
+    """Exact flat identity: only identical attempt/parent rows are duplicates."""
+    return (*_logical_key(binding), str(binding.get("attempt") or ""), str(binding.get("parent") or ""))
+
+
+def _deduplicate_bindings(bindings: Iterable[dict]) -> list[dict]:
+    seen = set()
+    result = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        identity = _binding_identity(binding)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(binding)
+    return result
+
+
+def _select_binding_rows(rows: Iterable[tuple[dict, Optional[str]]]) -> list[dict]:
+    """Select at most ``MAX_BINDINGS`` logical jobs, then retain their full flat history.
+
+    Group priority is the last candidate position for that logical key.  Active
+    groups are ranked first, then eligible finished groups; ties therefore need
+    no clock or external ordering input.
+    """
+    candidates = list(rows)
+    groups: dict[tuple, dict] = {}
+    seen = set()
+    unique: list[tuple[dict, Optional[str]]] = []
+    for index, (binding, status) in enumerate(candidates):
+        key = _logical_key(binding)
+        group = groups.setdefault(key, {"last": index, "active": False})
+        group["last"] = index
+        group["active"] = group["active"] or status in OPEN_ROW_STATUSES
+        identity = _binding_identity(binding)
+        if identity not in seen:
+            seen.add(identity)
+            unique.append((binding, status))
+
+    ranked = sorted(groups, key=lambda key: groups[key]["last"], reverse=True)
+    active = [key for key in ranked if groups[key]["active"]]
+    finished = [key for key in ranked if not groups[key]["active"]]
+    selected = set(active[:MAX_BINDINGS])
+    selected.update(finished[:max(0, MAX_BINDINGS - len(selected))])
+    return [binding for binding, _status in unique if _logical_key(binding) in selected]
+
+
+def _handover_candidates(harness: str, sid: str, jobs, rows=None) -> list[tuple[dict, str]]:
+    """Collect every candidate still allowed by the existing route authority."""
+    rows = latest_rows(jobs) if rows is None else rows
+    found = []
+    import route_authority
+    for status, meta in rows.values():
+        choice = route_authority.decide_continuation(action="handover", status=status, metadata=meta, jobs=jobs,
+            facts={"actor": sid, "eligible": eligible_row(meta)})
+        if choice.allowed:
+            found.append((binding_of(jobs, meta), status))
+    return found
+
+
+def _bindings_with_current_status(bindings: Iterable[dict]) -> list[tuple[dict, Optional[str]]]:
+    """Attach status only when the current registry row exactly matches a kept binding."""
+    cache: dict[str, dict] = {}
+    result = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        jobs = str(binding.get("jobs") or "")
+        if jobs not in cache:
+            cache[jobs] = latest_rows(jobs) if jobs else {}
+        current = cache[jobs].get(str(binding.get("attempt") or ""))
+        status = None
+        if current:
+            current_status, meta = current
+            try:
+                if _binding_identity(binding) == _binding_identity(binding_of(jobs, meta)):
+                    status = current_status
+            except (KeyError, TypeError):
+                pass
+        result.append((binding, status))
+    return result
+
+
 def current_bindings(harness: str, sid: str, jobs=None) -> list:
-    """The depth-1 attempts ``sid`` answers for, whatever harness registered them.
-    A finished one counts while its route or completion record is still open.
+    """The selected depth-1 attempts ``sid`` answers for, whatever harness registered them.
+    The cap is on distinct logical jobs; each selected job keeps all eligible flat bindings.
+    A finished attempt counts while its route or completion record is still open.
     ``harness`` is kept for callers; ownership alone decides."""
     jobs = jobs or _default_jobs()
     if jobs is None or not Path(jobs).is_file():
         return []
-    found = []
-    for aid, (status, meta) in latest_rows(jobs).items():
-        import route_authority
-        choice = route_authority.decide_continuation(action="handover", status=status, metadata=meta, jobs=jobs,
-            facts={"actor": sid, "eligible": eligible_row(meta)})
-        if not choice.allowed:
-            continue
-        found.append(binding_of(jobs, meta))
-    return found[-MAX_BINDINGS:]
+    return _select_binding_rows(_handover_candidates(harness, sid, jobs))
 
 
 def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
-    """Take (or drop) the seat's snapshot at enqueue; returns the number of bindings.  Caller holds the seat lock."""
+    """Take (or drop) the snapshot; return its flat binding count.  Caller holds the seat lock."""
+    bindings = collect_snapshot_bindings(harness, sid, jobs=jobs)
+    return publish_snapshot_locked(seat, harness, sid, bindings, now=now, jobs=jobs)
+
+
+def collect_snapshot_bindings(harness: str, sid: str, jobs=None) -> list[dict]:
+    """Read the registry outside a seat lock; publication performs the identity recheck."""
+    return current_bindings(harness, sid, jobs)
+
+
+def publish_snapshot_locked(seat, harness: str, sid: str, bindings: list[dict], *,
+                            now: Optional[float] = None, expected_prompt_seq: Optional[int] = None,
+                            expected_card_generation: Optional[int] = None, jobs=None) -> int:
+    """Publish a previously collected snapshot only if the seat's card/input window still matches."""
     st = _st()
     now = st.now_epoch() if now is None else now
     if seat.kind not in ("pane", "native"):
         return 0
-    bindings = current_bindings(harness, sid, jobs)
+    if expected_prompt_seq is not None and st.read_prompt_seq(seat) != expected_prompt_seq:
+        raise RuntimeError("snapshot-input-changed")
+    card = st.read_latest_card(seat)
+    generation = int(card.get("generation", 0) or 0) if card else 0
+    if expected_card_generation is not None and generation != expected_card_generation:
+        raise RuntimeError("snapshot-card-changed")
     if not bindings:
         with contextlib.suppress(OSError):
             os.unlink(_snapshot_path(seat.key))
         return 0
+    path = _snapshot_path(seat.key)
+    st._reject_symlink(path)
     st.atomic_write_json(_snapshot_path(seat.key), {
         "schema": SCHEMA, "seat": seat.as_dict(), "from": {"harness": harness, "sid": sid},
-        "at": now, "bindings": bindings})
+        "at": now, "prompt_seq": st.read_prompt_seq(seat), "card_generation": generation,
+        "bindings": bindings})
     return len(bindings)
 
 
@@ -396,10 +513,32 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
         return None
     taken = {(b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) for r in rows
              if r.get("from") == old for b in r.get("bindings") or () if isinstance(b, dict)}
-    bindings = [b for b in snap["bindings"] if isinstance(b, dict)
-                and (b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) not in taken]
+    snapshot_bindings = [b for b in snap["bindings"] if isinstance(b, dict)]
+    bindings = [b for b in snapshot_bindings
+                if (b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) not in taken]
     if not bindings or len(bindings) != len(snap["bindings"]):
         return None                                    # A -> C while A -> B stands: refused
+
+    # A selected job can acquire a permitted retry after enqueue but before the
+    # confirmed clear hook.  Refresh only those selected logical keys, retaining
+    # the snapshot rows as the original authority boundary.
+    selected_keys = {_logical_key(binding) for binding in snapshot_bindings}
+    refreshed = []
+    for jobs_path in dict.fromkeys(str(binding.get("jobs") or "") for binding in snapshot_bindings):
+        if not jobs_path or not Path(jobs_path).is_file():
+            continue
+        try:
+            # Only attempts the snapshot does not bind yet are asked about: the bound ones are
+            # kept anyway, and each answer may verify a whole route inside this start hook.
+            jobs_key = _jobs_key(jobs_path)
+            bound = {str(b.get("attempt") or "") for b in snapshot_bindings
+                     if _jobs_key(b.get("jobs") or "") == jobs_key}
+            fresh = {aid: row for aid, row in latest_rows(jobs_path).items()
+                     if aid not in bound and (jobs_key, *route_identity(row[1])) in selected_keys}
+            refreshed.extend(binding for binding, _status in _handover_candidates(harness, old, jobs_path, rows=fresh))
+        except Exception:  # noqa: BLE001 - the original snapshot remains a safe fallback
+            continue
+    bindings = _deduplicate_bindings([*bindings, *refreshed])
     row = {"ts": now, "harness": harness, "sid": sid, "event": ROW_EVENT, "from": old,
            "source": source or ("first-message" if harness == "opencode" else "reservation"),
            "bindings": bindings, "epoch": int((summary or {}).get("epoch", 0) or 0)}
@@ -411,6 +550,12 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
         os.write(fd, (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
     finally:
         os.close(fd)
+    refreshed_snapshot = dict(snap)
+    refreshed_snapshot["bindings"] = bindings
+    try:
+        st.atomic_write_json(_snapshot_path(seat.key), refreshed_snapshot)
+    except Exception:  # noqa: BLE001 - the durable ledger row still carries the refreshed bindings
+        pass
     return row
 
 
@@ -445,22 +590,29 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
         # Only what the predecessor answers for now: a registered parent that already handed an
         # attempt on keeps its name but no longer answers for it (never A -> B and A -> C).
         rows = latest_rows(jobs) if jobs else {}
-        bindings = [b for b in current_bindings(predecessor_harness, predecessor_sid, jobs)
-                    if b["attempt"] in rows and effective_parent(rows[b["attempt"]][1], jobs) == predecessor_sid]
-        if not bindings:
+        predecessor_rows = [
+            (binding, status) for binding, status in _handover_candidates(
+                predecessor_harness, predecessor_sid, jobs, rows=rows)
+            if binding["attempt"] in rows
+            and effective_parent(rows[binding["attempt"]][1], jobs) == predecessor_sid
+        ]
+        if not predecessor_rows:
             return None
         # The seat's snapshot names the session now at it (the successor), so its own later
         # /clear hands everything on; what its own snapshot already bound is kept.
         own = read_snapshot(seat.key)
         kept = own["bindings"] if own and (own["from"].get("sid") == successor_sid) else []
-        merged: dict = {}
-        for binding in [*kept, *bindings]:
-            if isinstance(binding, dict):
-                merged[(binding.get("jobs"), binding.get("route"), binding.get("hash"), binding.get("node"))] = binding
+        union = _select_binding_rows([*_bindings_with_current_status(kept), *predecessor_rows])
+        selected_keys = {_logical_key(binding) for binding in union}
+        bindings = _deduplicate_bindings(
+            binding for binding, _status in predecessor_rows if _logical_key(binding) in selected_keys
+        )
+        if not bindings:
+            return None
         st.atomic_write_json(_snapshot_path(seat.key), {
             "schema": SCHEMA, "seat": seat.as_dict(),
             "from": {"harness": successor_harness, "sid": successor_sid}, "at": now,
-            "bindings": list(merged.values())[-MAX_BINDINGS:]})
+            "bindings": union})
         row = {"ts": now, "harness": successor_harness, "sid": successor_sid, "event": ROW_EVENT,
                "from": predecessor_sid, "source": "retire", "bindings": bindings}
         path = st._ledger_path(seat)
@@ -500,15 +652,28 @@ def resume_line(seat, harness: str, sid: str) -> str:
         if not rows:
             return ""
         wanted = [b for r in rows for b in r.get("bindings") or () if isinstance(b, dict)]
+        # Each registry is read once and each logical job looked at once: the card hook has
+        # seconds, and a handover carries one binding per attempt of the same job.
+        registries: dict = {}
+        looked: set = set()
         shown: dict = {}
         for b in wanted:
             jobs = b.get("jobs")
-            if not jobs or not Path(jobs).is_file():
+            identity = (b.get("route"), b.get("hash"), b.get("node"))
+            if not jobs or (jobs, identity) in looked or not Path(jobs).is_file():
                 continue
-            for aid, (status, meta) in latest_rows(jobs).items():
-                if not eligible_row(meta) or not _binds([b], jobs, meta) or not owns(meta, sid, jobs):
+            looked.add((jobs, identity))
+            if jobs not in registries:
+                grouped: dict = {}
+                if _jobs_key(jobs) == jobs:            # a binding names its registry by resolved path
+                    for status, meta in latest_rows(jobs).values():
+                        if eligible_row(meta):
+                            grouped.setdefault(route_identity(meta), []).append((status, meta))
+                registries[jobs] = grouped
+            for status, meta in registries[jobs].get(identity, ()):
+                if status not in OPEN_ROW_STATUSES and status != "done":
                     continue
-                if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
+                if not owns(meta, sid, jobs) or (status == "done" and not _delivery_open(jobs, meta)):
                     continue
                 shown.setdefault((jobs, route_identity(meta)[0]), meta.get("route_file", ""))
         parts = []

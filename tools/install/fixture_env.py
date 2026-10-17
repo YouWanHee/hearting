@@ -21,6 +21,7 @@ _SCRUB = {
     "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
     "CODEX_HOME",
+    "CODEX_HOOK_TRUST_APP_SERVER_COMMAND",
     "CLAUDE_CONFIG_DIR",
     "AGENT_HOME",
     "TMPDIR",
@@ -79,6 +80,9 @@ def build_environment(
         "XDG_CACHE_HOME": str(cache),
         "XDG_RUNTIME_DIR": str(runtime),
         "CODEX_HOME": str(codex_home),
+        # A missing in-fixture executable: activation's best-effort hook trust
+        # skips instead of starting the host's real Codex App Server.
+        "CODEX_HOOK_TRUST_APP_SERVER_COMMAND": str(root / "no-codex-app-server"),
         "CLAUDE_CONFIG_DIR": str(home / ".claude"),
         "AGENT_HOME": str(source),
         "TMPDIR": str(temp),
