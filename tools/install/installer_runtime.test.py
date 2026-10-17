@@ -26,6 +26,8 @@ import installer  # noqa: E402
 import codex_launcher  # noqa: E402
 import runtime_activation  # noqa: E402
 import fixture_env  # noqa: E402
+import manifest  # noqa: E402
+import paths  # noqa: E402
 
 
 def _write_executable(path: Path) -> None:
@@ -347,6 +349,126 @@ class StatusVersionSkewTest(unittest.TestCase):
              mock.patch.object(runtime_activation, "surface_skew") as fake_skew:
             installer.cmd_status(args)
             fake_skew.assert_not_called()
+
+    def _activation_unless(self, missing):
+        def activation(rt, scope):
+            if rt == missing:
+                return {"freshness": "missing", "mode": None, "source_root": None}
+            return self._fake_activation(f"/src/{rt}")
+        return activation
+
+    def test_status_ignores_a_runtime_that_was_never_installed(self):
+        args = self._status_args(["claude", "codex", "opencode"])
+        drivers = {"claude": self._fake_driver("1.0.0"), "codex": self._fake_driver("1.0.0"),
+                   "opencode": self._fake_driver("not-installed")}
+        with mock.patch.object(runtime_activation, "status",
+                               side_effect=self._activation_unless("opencode")), \
+             mock.patch.object(installer, "get_driver", side_effect=lambda rt: drivers[rt]):
+            result = installer.cmd_status(args)
+        self.assertIn("opencode: channel=dev version=not-installed drift=0 projection=not-activated",
+                      result["lines"])
+        self.assertFalse(any(line.startswith("version-skew:") for line in result["lines"]))
+        self.assertNotIn("version_skew", result)
+
+    def test_status_still_compares_a_copy_install_without_activation(self):
+        args = self._status_args(["claude", "opencode"])
+        drivers = {"claude": self._fake_driver("1.0.0"), "opencode": self._fake_driver("0.9.0")}
+        with mock.patch.object(runtime_activation, "status",
+                               side_effect=self._activation_unless("opencode")), \
+             mock.patch.object(installer, "get_driver", side_effect=lambda rt: drivers[rt]):
+            result = installer.cmd_status(args)
+        self.assertEqual(result["version_skew"]["versions"], ["0.9.0", "1.0.0"])
+
+
+class InstalledRuntimeTargetsTest(unittest.TestCase):
+    """No target, or ``all``, names the runtimes installed here, not every known one."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        environment = fixture_env.patched_environment(
+            self._tmp.name,
+            Path(__file__).resolve().parents[2],
+            base={"PATH": os.environ.get("PATH", "")},
+        )
+        environment.__enter__()
+        self.addCleanup(environment.__exit__, None, None, None)
+
+    def _write_record(self, record):
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("{}", encoding="utf-8")
+
+    def _activate(self, runtime):
+        self._write_record(paths.harness_state_dir(runtime, "global") / "activation.json")
+
+    def _copy_install(self, runtime):
+        self._write_record(manifest._manifest_path(runtime, "global"))
+
+    def _args(self, target=None, runtimes=None):
+        return Namespace(runtimes=runtimes, target=target, scope="global")
+
+    def test_verify_default_names_the_installed_runtimes(self):
+        self._activate("claude")
+        self._copy_install("codex")
+        for target in (None, "all"):
+            self.assertEqual(
+                installer.resolve_runtimes(self._args(target), installed_only=True),
+                ["claude", "codex"],
+            )
+
+    def test_verify_default_names_every_runtime_when_none_is_installed(self):
+        self.assertEqual(installer.resolve_runtimes(self._args(), installed_only=True),
+                         list(installer.RUNTIMES))
+
+    def test_named_runtime_is_kept_even_when_not_installed(self):
+        self._activate("claude")
+        self.assertEqual(installer.resolve_runtimes(self._args("opencode"), installed_only=True),
+                         ["opencode"])
+        self.assertEqual(
+            installer.resolve_runtimes(self._args(runtimes=["opencode"]), installed_only=True),
+            ["opencode"],
+        )
+
+    def test_other_commands_keep_every_runtime_by_default(self):
+        self._activate("claude")
+        self.assertEqual(installer.resolve_runtimes(self._args()), list(installer.RUNTIMES))
+
+    def test_verify_does_not_check_a_runtime_that_was_never_installed(self):
+        self._activate("claude")
+        self._activate("codex")
+        args = installer.build_parser().parse_args(["verify"])
+        report = {"ok": True, "status": "ok", "freshness": "fresh", "next_action": "none"}
+        with mock.patch.object(runtime_activation, "doctor", return_value=report) as doctor, \
+             mock.patch.object(installer.verifier, "run") as legacy_checks, \
+             mock.patch.object(installer.bootstrap, "compute_hosts_status",
+                               return_value={"status": "missing", "target": "x"}), \
+             mock.patch.object(installer.bootstrap, "compute_hosts_expected", return_value=False):
+            result = installer.cmd_verify(args)
+        self.assertEqual(result["runtime"], ["claude", "codex"])
+        self.assertEqual([call.args[0] for call in doctor.call_args_list], ["claude", "codex"])
+        legacy_checks.assert_not_called()
+        self.assertFalse(any(check["id"].startswith("opencode.") for check in result["checks"]))
+
+    def test_runtime_all_names_the_activated_runtimes(self):
+        self._activate("claude")
+        self._activate("codex")
+        self._copy_install("opencode")  # a copy install has no activation to refresh
+        for command in ("status", "doctor", "refresh"):
+            self.assertEqual(installer._runtime_targets("all", command, "global"),
+                             ["claude", "codex"])
+            self.assertEqual(installer._runtime_targets(["all"], command, "global"),
+                             ["claude", "codex"])
+        self.assertEqual(installer._runtime_targets(["all"], "activate", "global"),
+                         list(runtime_activation.RUNTIMES))
+
+    def test_runtime_all_keeps_a_runtime_named_beside_it(self):
+        self._activate("claude")
+        self.assertEqual(installer._runtime_targets(["all", "opencode"], "refresh", "global"),
+                         ["claude", "opencode"])
+
+    def test_runtime_all_names_every_runtime_when_none_is_activated(self):
+        self.assertEqual(installer._runtime_targets(["all"], "refresh", "global"),
+                         list(runtime_activation.RUNTIMES))
 
 
 class UpdateSkipHintTest(unittest.TestCase):

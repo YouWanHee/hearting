@@ -480,6 +480,12 @@ smoke). This avoids mixing activation's per-file discovery paths with the old
 installer layout while retaining verification for installations that have not
 migrated to activation yet.
 
+With no runtime named, or `all`, `verify` covers the runtimes installed in this
+scope (an activation record or a legacy copy-install manifest), and
+`runtime status|doctor|refresh --runtime all` cover the activated ones, so a
+runtime that was never installed here is not reported as broken. When none is
+installed every runtime is covered, and a named runtime is always checked.
+
 **Contract-level invariants that remain true regardless of implementation**
 (kept as prose, not runnable steps):
 
