@@ -89,6 +89,7 @@ utility-deferred	artifact_cross_root_move.py
 utility-deferred	artifact_history.py
 utility-deferred	artifact_identity.py
 utility-deferred	artifact_index.py
+utility-deferred	artifact_payload.py
 utility-deferred	artifact_lifecycle.py
 utility-deferred	artifact_locator.py
 utility-deferred	artifact_manifest.py
