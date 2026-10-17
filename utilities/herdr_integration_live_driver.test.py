@@ -39,6 +39,157 @@ class NativeDriverContractTest(unittest.TestCase):
         self.assertNotIn("user:pass", text)
         self.assertNotIn("token=secret", text)
 
+    def test_codex_start_submits_one_bounded_input_and_redacts_durable_argv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            captured_argv = root / "private-start-argv.json"
+            fake_herdr = root / "herdr-fixture"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                f"capture = pathlib.Path({str(captured_argv)!r})\n"
+                "if args[args.index('agent') + 1] == 'start':\n"
+                "    capture.write_text(json.dumps(args))\n"
+                "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', "
+                "'agent_status': 'idle'}}}))\n"
+                "elif args[args.index('agent') + 1] == 'get':\n"
+                "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', "
+                "'pane_id': 'private-pane', 'agent_session': {'value': 'typed-native-sid'}, "
+                "'agent_status': 'idle'}}}))\n"
+                "else:\n"
+                "    print(json.dumps({'error': {'code': 'unexpected-command'}}))\n"
+                "    raise SystemExit(1)\n",
+                encoding="utf-8")
+            fake_herdr.chmod(0o700)
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10", "--herdr", str(fake_herdr),
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+
+            native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+
+            self.assertTrue(native["start_ok"])
+            self.assertTrue(native["session_confirmed_by_get"])
+            self.assertEqual(native["session_id"], "typed-native-sid")
+            actual_argv = json.loads(captured_argv.read_text(encoding="utf-8"))
+            start_at = actual_argv.index("start")
+            self.assertEqual(actual_argv[start_at - 1], "agent")
+            delimiter = actual_argv.index("--", start_at)
+            self.assertEqual(actual_argv[delimiter + 1:], [live.CODEX_START_PROMPT])
+            self.assertEqual(actual_argv.count(live.CODEX_START_PROMPT), 1)
+
+            rows = [json.loads(line) for line in driver.commands_path.read_text().splitlines()]
+            start_row = next(row for row in rows if row["step"] == "native-codex-session-start")
+            self.assertEqual(start_row["argv"].count("[redacted]"), 1)
+            self.assertNotIn(live.CODEX_START_PROMPT, driver.commands_path.read_text())
+
+    def test_non_codex_start_does_not_receive_codex_positional_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            for runtime in ("claude", "opencode"):
+                with self.subTest(runtime=runtime):
+                    driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                        "--case", "callbacks", "--output-dir", str(root / runtime),
+                        "--project", str(project), "--timeout", "10",
+                    ]))
+                    self.addCleanup(driver.runtime_dir.cleanup)
+                    start = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
+                    get = json.dumps({"result": {"agent": {
+                        "name": "fixture-agent", "agent_session": {"value": "typed-sid"}}}})
+                    with mock.patch.object(driver, "herdr_command",
+                            side_effect=[(0, start, ""), (0, get, "")]) as command:
+                        driver._agent_start(runtime, "private-pane", name="fixture-agent")
+                    start_args = command.call_args_list[0].args[1]
+                    self.assertNotIn("--", start_args)
+                    self.assertNotIn(live.CODEX_START_PROMPT, start_args)
+
+    def test_native_session_id_requires_successful_start_and_typed_get(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            start_ok = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
+            typed_get = json.dumps({"result": {"agent": {
+                "name": "fixture-agent", "pane_id": "private-pane",
+                "agent_session": {"value": "typed-native-sid"}}}})
+            metadata_only = json.dumps({"result": {"agent": {
+                "name": "fixture-agent", "pane_id": "private-pane",
+                "session_id": "metadata-sid"}}})
+            typed_start = json.dumps({"result": {"agent": {
+                "name": "fixture-agent", "agent_session": {"value": "start-only-sid"}}}})
+            scenarios = (
+                ("typed-get", (0, start_ok, ""), (0, typed_get, ""),
+                 "typed-native-sid", True, True),
+                ("name-pane-metadata", (0, typed_start, ""), (0, metadata_only, ""),
+                 None, False, True),
+                ("get-command-failed", (0, start_ok, ""), (1, typed_get, "not accepted"),
+                 None, False, True),
+                ("start-command-failed", (1, start_ok, "failed"), (0, typed_get, ""),
+                 None, False, False),
+                ("start-error-envelope", (0, '{"error":{"code":"start-rejected"}}', ""),
+                 (0, typed_get, ""), None, False, False),
+                ("get-error-envelope", (0, start_ok, ""),
+                 (0, '{"error":{"code":"get-rejected"}}', ""), None, False, True),
+            )
+            for label, start_response, get_response, expected_sid, confirmed, expected_start_ok in scenarios:
+                with self.subTest(scenario=label), mock.patch.object(
+                        driver, "herdr_command", side_effect=[start_response, get_response]):
+                    native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+                    self.assertEqual(native["start_ok"], expected_start_ok)
+                    self.assertEqual(native["session_confirmed_by_get"], confirmed)
+                    self.assertEqual(native["session_id"], expected_sid)
+
+    def test_callback_measurement_keeps_start_identity_and_callback_evidence_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver.transport = mock.Mock()
+            driver.transport.observe.return_value.complete = True
+            native = {"name": "fixture-agent", "session_id": "typed-native-sid",
+                      "start_exit": 0, "start_ok": True,
+                      "session_confirmed_by_get": True}
+
+            def start_fixture(runtime, _pane):
+                (Path(driver.env["HOME"]) / f"callback-{runtime}.log").write_text(
+                    f"{runtime}\\n", encoding="utf-8")
+                return native
+
+            event = {"session_id": "typed-native-sid", "session_start_source": "startup",
+                     "source": "herdr:codex"}
+            with mock.patch.object(live, "RUNTIMES", ("codex",)), \
+                    mock.patch.object(driver, "_install_and_reinstall",
+                                      return_value={"codex": {"status_current": True}}), \
+                    mock.patch.object(driver, "create_pane", return_value="private-pane"), \
+                    mock.patch.object(driver, "_start_event_tap", return_value=True), \
+                    mock.patch.object(driver, "_agent_start", side_effect=start_fixture), \
+                    mock.patch.object(driver, "_matching_native_events", return_value=[event]), \
+                    mock.patch.object(driver, "_stop_event_tap"):
+                result = driver._install_callbacks()
+
+            callback = result["runtimes"]["codex"]
+            self.assertEqual(callback["outcome"], "measured")
+            self.assertTrue(callback["native_start_ok"])
+            self.assertTrue(callback["native_session_confirmed_by_get"])
+            self.assertEqual(callback["native_callback_report_count"], 1)
+            self.assertEqual(callback["user_sentinel_count"], 1)
+
     def test_isolation_drops_inherited_credentials_and_keeps_output_private(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

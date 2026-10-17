@@ -32,6 +32,9 @@ MAX_TIMEOUT = 900
 CASES = ("callbacks", "codex-async-local-skip", "codex-busy",
          "opencode-busy", "booked-seat", "events-lost")
 RUNTIMES = ("claude", "codex", "opencode")
+CODEX_START_PROMPT = (
+    "This is an isolated native-session startup probe. Reply with READY, then stop."
+)
 _SECRET_ENV = re.compile(r"(?:API[_-]?KEY|ACCESS[_-]?TOKEN|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)", re.I)
 
 _LIVE_PATH = Path(__file__).with_name("herdr_opencode_live.py")
@@ -123,10 +126,20 @@ def _session_id(value):
 def _redact_argv(argv):
     """Keep exact safe argv while blanking URLs and free-form payloads."""
     raw = [str(item) for item in argv]
-    sensitive_positions = {
-        index + 3 for index in range(max(0, len(raw) - 3))
-        if raw[index:index + 2] == ["agent", "prompt"]
-    }
+    sensitive_positions = set()
+    for index in range(max(0, len(raw) - 1)):
+        if raw[index:index + 2] == ["agent", "prompt"] and index + 3 < len(raw):
+            sensitive_positions.add(index + 3)
+        if raw[index:index + 2] != ["agent", "start"]:
+            continue
+        try:
+            delimiter = raw.index("--", index + 2)
+            kind = raw.index("--kind", index + 2, delimiter)
+        except ValueError:
+            continue
+        if (kind + 1 < delimiter and raw[kind + 1] == "codex"
+                and delimiter + 1 < len(raw)):
+            sensitive_positions.add(delimiter + 1)
     out, redact_next = [], False
     payload_flags = {"--prompt", "--message", "--text", "--body", "--input"}
     for index, value in enumerate(raw):
@@ -546,27 +559,34 @@ class HerdrIntegrationLive:
     def _agent_start(self, runtime, pane, *, name=None):
         name = name or ("live-" + runtime + "-" + uuid.uuid4().hex[:6])
         timeout_ms = max(1000, min(60_000, int(self._remaining(60) * 1000)))
+        start_args = ["agent", "start", name, "--kind", runtime, "--pane", pane,
+                      "--timeout", str(timeout_ms)]
+        if runtime == "codex":
+            start_args.extend(("--", CODEX_START_PROMPT))
         rc, stdout, stderr = self.herdr_command(
             f"native-{runtime}-session-start",
-            ["agent", "start", name, "--kind", runtime, "--pane", pane,
-             "--timeout", str(timeout_ms)], timeout=min(65, self._remaining(65)),
+            start_args, timeout=min(65, self._remaining(65)),
         )
         start_payload = _json(stdout) or _json(stderr)
         start_error = _error_envelope(start_payload) or _error_envelope(_json(stderr))
+        start_ok = rc == 0 and not start_error
         rc_get, get_stdout, get_stderr = self.herdr_command(
             f"native-{runtime}-session-get", ["agent", "get", name], timeout=10)
         get_payload = _json(get_stdout) or _json(get_stderr)
         get_result = _result(get_payload)
         agent = get_result.get("agent") if isinstance(get_result, dict) else None
         get_error = _error_envelope(get_payload) or _error_envelope(_json(get_stderr))
-        sid = (_session_id(get_payload) if rc == 0 and not start_error
-               and rc_get == 0 and not get_error else None)
-        return {"name": name, "pane_id": pane, "start_exit": rc, "get_exit": rc_get,
+        get_ok = rc_get == 0 and not get_error
+        reported_sid = _session_id(get_payload) if get_ok else None
+        sid = reported_sid if start_ok else None
+        return {"name": name, "pane_id": pane, "start_exit": rc, "start_ok": start_ok,
+                "get_exit": rc_get, "get_ok": get_ok,
                 "session_id": sid, "start_reason": _failure_reason(stderr, rc),
                 "get_reason": _failure_reason(get_stderr, rc_get),
                 "start_error_code": start_error, "get_error_code": get_error,
+                "get_session_id_present": bool(reported_sid),
                 "agent_status": (agent or {}).get("agent_status") if isinstance(agent, dict) else None,
-                "session_confirmed_by_get": bool(sid and rc_get == 0 and not get_error)}
+                "session_confirmed_by_get": bool(sid)}
 
     def _wait_for_native_state(self, runtime, name, state, timeout_ms=30_000):
         rc, stdout, stderr = self.herdr_command(f"native-{runtime}-wait-{state}",
@@ -903,6 +923,7 @@ class HerdrIntegrationLive:
                 "status_current": status.get(runtime, {}).get("status_current", False),
                 "native_session_id": native.get("session_id"),
                 "native_start_exit": native.get("start_exit"),
+                "native_start_ok": native.get("start_ok", False),
                 "native_session_confirmed_by_get": native.get("session_confirmed_by_get", False),
                 "native_callback_report_count": len(exact_events),
                 "native_callback_reports": [{key: event.get(key) for key in
