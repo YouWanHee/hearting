@@ -5200,7 +5200,7 @@ def _continue_look(target, req):
 
 
 def cmd_continue(args):
-    """Queue the booked no-trailer continue through the exact native receiver."""
+    """Deliver the booked no-trailer continue to the exact native receiver."""
     import session_tidy_clear as clear
     req, why = clear.validate_continue(args.request, args.nonce)
     if req and (req.get("seat") or {}).get("kind") == "native":
@@ -5322,14 +5322,48 @@ def cmd_continue(args):
             verify, outcome, reason = "native-queue-accepted", "queued", result.get("reason")
         else:
             verify, outcome, reason = "native-queue-unverified", "queued", result.get("reason")
+    elif harness == "claude":
+        verify, outcome, reason = _continue_claude_prompt(target, pane, new_sid, transfer_ref, text)
     else:
-        # The Claude hook or OpenCode idle plugin owns the next native delivery.
+        # The OpenCode idle plugin owns the next native delivery.
         # It will retain this exact no-trailer ref until the booked SID consumes it.
         verify, outcome, reason = "native-pending", "queued", "awaiting-native-receiver"
 
-    if outcome == "queued" and _booked_seat(req)[0].read_prompt_seq(seat) > seq_before:
+    if (outcome in ("queued", "unverified")
+            and _booked_seat(req)[0].read_prompt_seq(seat) > seq_before):
         verify, outcome, reason = "prompt-hook", "true", None
     return finish(outcome, reason, native_ref=transfer_ref)
+
+
+def _continue_claude_prompt(target, pane, sid, ref, text):
+    """Type the booked continue once into the exact idle Claude TUI.
+
+    A fresh Claude session after /clear reaches no hook boundary until something is
+    typed, so leaving the ref for the hook leaves the window empty. The guards are the
+    idle Claude prompt path of `cmd_prompt`; any refusal keeps the ref pending for the
+    hook. A sent ref is never released, so the hook cannot deliver it a second time.
+    """
+    reason, proof = _claude_idle_prompt_guard(target, sid, pane)
+    if reason:
+        return "native-pending", "queued", reason
+    try:
+        claimed = peer_message.claim_pending_herdr(
+            ref, {"harness": "claude", "session_id": sid, "pane_id": pane},
+            receipt="claude-pty-prompt-inflight")
+    except (OSError, ValueError):
+        claimed = None
+    if claimed is None:
+        return "native-pending", "queued", "peer-delivery-already-claimed"
+    reason, _proof = _claude_idle_prompt_guard(pane, sid, pane, expected_foreground=proof)
+    if reason:
+        peer_message.release_unsent_herdr_claim(claimed, receipt=reason)
+        return "native-pending", "queued", reason
+    rc, payload = _herdr_prompt(pane, text, wait=True, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+    if rc == 0:
+        peer_message.mark_pending_queued(ref, receipt="claude-pty-continue-submitted")
+        return "state-flip", "true", None
+    reason = _herdr_error_reason(payload, rc) if rc is not None else "herdr-invocation-failed"
+    return "native-prompt-unverified", "unverified", reason
 
 def _herdr_error_reason(payload, rc):
     error = payload.get("error") if isinstance(payload, dict) else None
