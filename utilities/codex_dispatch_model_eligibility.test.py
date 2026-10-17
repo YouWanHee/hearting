@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
@@ -48,36 +49,46 @@ def shipped_policy() -> dict[str, str]:
 
 class CodexDispatchModelEligibilityTest(unittest.TestCase):
     def setUp(self):
+        self.runtime_home = tempfile.TemporaryDirectory(prefix="hearting-codex-model-home-")
+        self.addCleanup(self.runtime_home.cleanup)
         patcher = mock.patch.object(WRAPPER, "_model_policy", side_effect=shipped_policy)
         patcher.start()
         self.addCleanup(patcher.stop)
         env = mock.patch.dict(os.environ, {
             "AGENT_HOME": str(ROOT),
+            "HOME": self.runtime_home.name,
             "CODEX_HOME": str(ROOT / "adapters" / "codex" / "no-such-runtime-home"),
+            "HEARTING_MODEL_CONFIG_HOME": "",
         })
         env.start()
         self.addCleanup(env.stop)
 
-    def test_shipped_default_declares_astra_main_session_only(self):
+    def test_shipped_default_declares_its_main_session_only_models(self):
         policy = shipped_policy()
-        self.assertEqual(policy["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["gpt-6-astra"])
-        self.assertTrue(WRAPPER._main_session_only_model("gpt-6-astra"))
+        restricted = policy["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertTrue(restricted)
+        for model in restricted:
+            self.assertTrue(WRAPPER._main_session_only_model(model))
         self.assertFalse(WRAPPER._main_session_only_model(policy["CFG_TIER_DEEP_MODEL"]))
 
-    def test_explicit_astra_is_refused_and_an_eligible_explicit_model_passes(self):
+    def test_explicit_main_only_model_is_refused_and_an_eligible_model_passes(self):
+        restricted = shipped_policy()["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertTrue(restricted)
         with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-            WRAPPER.resolve_model_settings(selection(model="gpt-6-astra", reasoning="xhigh"))
+            WRAPPER.resolve_model_settings(selection(model=restricted[0], reasoning="xhigh"))
         self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
         result = WRAPPER.resolve_model_settings(selection(model="gpt-5.6-sol", reasoning="high"))
         self.assertEqual((result["source"], result["model"]), ("explicit", "gpt-5.6-sol"))
 
-    def test_a_role_mapped_to_astra_is_refused(self):
-        with mock.patch.object(WRAPPER, "role_map", return_value={"exact_model_id": "gpt-6-astra", "reasoning": "high"}):
+    def test_a_role_mapped_to_a_main_only_model_is_refused(self):
+        restricted = shipped_policy()["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertTrue(restricted)
+        with mock.patch.object(WRAPPER, "role_map", return_value={"exact_model_id": restricted[0], "reasoning": "high"}):
             with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
                 WRAPPER.resolve_model_settings(selection(role="deep maker"))
         self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
 
-    def test_the_sealed_top_profile_is_the_one_door_to_astra(self):
+    def test_the_sealed_top_profile_is_the_configured_exception(self):
         import tempfile
         tmp = Path(tempfile.mkdtemp())
         route = top_route(tmp)
@@ -85,6 +96,7 @@ class CodexDispatchModelEligibilityTest(unittest.TestCase):
         result = WRAPPER.resolve_model_settings(selection(profile="top", route_file=route))
         self.assertEqual((result["model"], result["reasoning"], result["source"], result["tier"]),
                          (policy["CFG_TIER_TOP_MODEL"], policy["CFG_TIER_TOP_EFFORT"], "profile-top", "top"))
+        self.assertTrue(WRAPPER._main_session_only_model(policy["CFG_TIER_TOP_MODEL"]))
         with self.assertRaises(WRAPPER.ModelSelectionError) as no_route:
             WRAPPER.resolve_model_settings(selection(profile="top"))
         self.assertEqual(no_route.exception.reason, "profile-top-route-required")
@@ -154,7 +166,9 @@ class CodexDispatchModelEligibilityTest(unittest.TestCase):
     def test_a_user_copy_without_the_key_carries_no_restriction(self):
         without = {k: v for k, v in shipped_policy().items() if k != "CFG_MAIN_SESSION_ONLY_MODELS"}
         with mock.patch.object(WRAPPER, "_model_policy", return_value=without):
-            self.assertFalse(WRAPPER._main_session_only_model("gpt-6-astra"))
+            restricted = shipped_policy()["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+            self.assertTrue(restricted)
+            self.assertFalse(WRAPPER._main_session_only_model(restricted[0]))
 
     def test_the_receipt_reports_whether_the_key_is_declared(self):
         self.assertEqual(WRAPPER._main_session_only_policy_state(), "declared")

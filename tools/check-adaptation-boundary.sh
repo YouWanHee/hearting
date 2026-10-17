@@ -1751,8 +1751,31 @@ PY
     esac
   done
 
-  if ! grep -Fq 'model = "gpt-6-luna"' adapters/codex/agents/memory-scout.toml \
-    || ! grep -Fq 'model_reasoning_effort = "low"' adapters/codex/agents/memory-scout.toml \
+  if python3 - "$ROOT" adapters/codex/agents/memory-scout.toml <<'PY'
+import importlib.util
+import sys
+import tomllib
+from pathlib import Path
+
+root = Path(sys.argv[1])
+agent_path = root / sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    "codex_native_agent_resolver", root / "adapters/codex/bin/sync-native-agents.py")
+resolver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(resolver)
+expected_model, expected_effort, expected_sandbox = resolver.codex_config("memory-scout")
+agent = tomllib.loads(agent_path.read_text(encoding="utf-8"))
+if agent.get("model") != expected_model:
+    raise SystemExit(f"memory-scout model {agent.get('model')!r} != configured {expected_model!r}")
+if (expected_effort, expected_sandbox) != ("low", "read-only"):
+    raise SystemExit("memory-scout shipped profile must remain low-effort and read-only")
+PY
+  then
+    :
+  else
+    fail_msg "Codex memory-scout model must match its configured native profile"
+  fi
+  if ! grep -Fq 'model_reasoning_effort = "low"' adapters/codex/agents/memory-scout.toml \
     || ! grep -Fq 'sandbox_mode = "read-only"' adapters/codex/agents/memory-scout.toml \
     || ! grep -Fq 'Never run memory mutation commands' adapters/codex/agents/memory-scout.toml; then
     fail_msg "Codex memory-scout must be low-cost read-only custom agent projection"

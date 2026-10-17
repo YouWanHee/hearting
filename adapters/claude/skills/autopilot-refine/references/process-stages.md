@@ -13,12 +13,13 @@ ls -d <artifact-root>/research/*<keyword>* <artifact-root>/documents/*<keyword>*
 - **One match:** use it as the artifact root and infer type from the path prefix.
 - **Multiple matches:** list candidates and ask the user to choose.
 - **No match:** ask the user to include an artifact identifier in the prompt. Preserve the compatibility example: `어느 산출물에 대한 작업인가요? prompt에 식별자(speech-enhancement-trends, 2026-05-06_se-seminar-tfrestormer 같은) 포함 부탁`. Apply the adapter's pause/autonomy rule. In Claude Code, schedule a ten-minute wakeup at the same time; if no answer arrives, continue with the most recently modified artifact.
+- An existing tracked repository document is also a valid target when the approved route already binds its exact path in `target-artifact` scope. Use that path and its assigned worktree; do not search the repository for a replacement target.
 
 Infer type:
 
 - `<artifact-root>/research/*` → **research**
 - `<artifact-root>/documents/*` → **doc**
-- Any other path → error. Preserve the compatibility message `autopilot-refine은 research/documents 산출물 전용`.
+- Any other path outside those scopes → error. Preserve the compatibility message `autopilot-refine은 research/documents 산출물 전용`.
 
 ## Process details
 
@@ -160,10 +161,19 @@ With **`--review-only`**, print Stage C and stop without Stage D.
 
 ### Stage D — Apply
 
+For an existing tracked repository-document target, keep its pre-change snapshot
+in the route cycle and run the applicable document check after applying the
+approved change. When that check passes, the same acting modifier commits only
+the exact validated owned path or paths in the assigned worktree. Do not include
+unrelated staged or unstaged paths. Report/review-only, artifact-only, no-op,
+and no-source-diff work create no source commit. The direct inline and registered
+owner authority paths remain those defined by the capability and
+`core/OPERATIONS.md`; this reference adds no permission or stage.
+
 1. **Prepare snapshots mechanically.** For every existing file that Stage C will change, the existing snapshot helper captures the exact current bytes, and reuses one `_internal/versions/v{N}/` receipt for the whole route. Do not calculate `N`, run `mkdir`/`cp`, or accept an empty version directory. Existing legacy sibling layouts are preserved by the same helper; new layouts are modern.
 2. **Apply exact-string edits** with the Edit tool. Never use `replace_all` unless the proposal explicitly says so.
 3. **Clean inline memos in memo mode.** When every memo from `--memo <file>` or `<!-- memo: ... -->` is applied, remove the inline memo and adjacent blank lines while preserving `---` separators. Preserve a memo only when the user requests it or it contains unresolved out-of-scope metadata worth surfacing.
-4. **Update `pipeline_summary.md` as the only history file:**
+4. **Update `pipeline_summary.md` as the only history file for research and documents artifacts:**
 
    **Metadata:** update or add:
 

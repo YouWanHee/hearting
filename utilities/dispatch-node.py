@@ -539,24 +539,34 @@ max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds
 review_budget_recovery_fields = REVIEW_ROUND_CAP.recovery_fields
 
 def round_protocol_block(budget, rows, worker_type, node_id):
- """Render the assignment block that scopes a correction round.
+ """Render the shared attempt history and role-specific retry guidance.
 
  `budget` is the `RoundBudget` `admit_round` already computed for this
  launch; `rows` is the same `(cols, metadata)` census it was built from. A
  verdict-less row (crashed, capacity-dead, invalid envelope -- never an
  actual PASS/FAIL/blocking review) renders as "판정 없음(<note>)" in the
- history so a correction round can tell a real prior finding apart from a
- round that never reached one (SD-153 rule 5).
+ history and does not create a correction obligation (SD-153 rule 5).
  """
  if budget.round_kind == "first":
   if budget.next_round <= 1 or not rows:
    return ""
-  history = "; ".join(
-   f"{cols[4]} ({meta.get('note') or cols[1] or 'open'})" for cols, meta in rows
-  )
-  return ("\n\nImplementation source changed since earlier review history. This is a full independent review "
-          "of the current source subject, not a closure check. Earlier findings are context only; "
-          "report every current blocker and assess the full reviewed scope. Prior history: " + history + ".")
+  history_parts=[]
+  for cols,meta in rows:
+   slug=cols[4]; status=cols[1]; note=meta.get("note","")
+   kind=REVIEW_ROUND_CAP.classify_round_row(status,meta,worker_type=meta.get("worker_type") or worker_type)
+   label=f"판정 없음({note or status or 'open'})" if kind=="verdict-less" else (note or "open")
+   history_parts.append(f"{slug} ({label})")
+  history="; ".join(history_parts)
+  head=(f"Round protocol (round {budget.next_round} of route node `{node_id}`; prior attempts: {history}):\n")
+  if worker_type=="review":
+   body=("- This is a full independent review of the current review subject, not a correction or closure check. "
+         "Report every current blocker and assess the full assigned scope.\n"
+         "- Earlier findings are context only; verdict-less attempts provide execution context only.\n")
+  else:
+   body=("- This is a full execution of the original assigned task and scope, not a correction or closure check.\n"
+         "- Earlier findings are context only; verdict-less attempts provide execution context only. "
+         "Complete the assigned task and assess its full original scope.\n")
+  return "\n\n"+head+body
  if budget.next_round<2: return ""
  history_parts=[]
  for cols,meta in rows:

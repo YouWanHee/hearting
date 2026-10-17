@@ -64,6 +64,8 @@ def restricted_policy(*aliases: str) -> dict[str, str]:
 
 class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
     def setUp(self):
+        self.runtime_home = tempfile.TemporaryDirectory(prefix="hearting-claude-model-home-")
+        self.addCleanup(self.runtime_home.cleanup)
         # Pin the policy to the shipped file: the user's runtime copy
         # ($CLAUDE_CONFIG_DIR/agent-config/models.conf) must not steer these tests.
         patcher = mock.patch.object(WRAPPER, "_model_policy", side_effect=shipped_policy)
@@ -74,20 +76,22 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         # cannot leak into the expected/actual comparison (review B2).
         env = mock.patch.dict(os.environ, {
             "AGENT_HOME": str(ROOT),
+            "HOME": self.runtime_home.name,
             "CLAUDE_CONFIG_DIR": str(ROOT / "adapters" / "claude" / "no-such-runtime-home"),
+            "HEARTING_MODEL_CONFIG_HOME": "",
         })
         env.start()
         self.addCleanup(env.stop)
         for key in ("CLAUDE_MODEL_DEEP", "CLAUDE_EFFORT_DEEP"):
             os.environ.pop(key, None)
 
-    def test_shipped_default_reserves_the_top_model_for_the_main_session(self):
-        # 2026-09-09 user rule: shipped default == user runtime mapping. Fable is
-        # main-session-only; the deep tier runs the next model down at max effort.
+    def test_shipped_default_reserves_its_configured_top_model(self):
         policy = shipped_policy()
-        self.assertEqual(policy["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["fable"])
-        self.assertEqual(policy["CFG_TIER_DEEP_MODEL"], "opus")
-        self.assertTrue(WRAPPER._main_session_only_model("claude-fable-5"))
+        restricted = policy["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertTrue(restricted)
+        for model in restricted:
+            self.assertTrue(WRAPPER._main_session_only_model(model))
+        self.assertTrue(WRAPPER._main_session_only_model(policy["CFG_TIER_TOP_MODEL"]))
         self.assertFalse(WRAPPER._main_session_only_model(policy["CFG_TIER_DEEP_MODEL"]))
 
     def test_deep_role_resolves_to_config_deep_tier_and_is_dispatch_eligible(self):
@@ -98,9 +102,11 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         self.assertEqual(result["effort"], policy["CFG_TIER_DEEP_EFFORT"])
         self.assertFalse(WRAPPER._main_session_only_model(result["model"]))
 
-    def test_shipped_default_refuses_explicit_fable_headless(self):
+    def test_shipped_default_refuses_an_explicit_main_only_model(self):
+        restricted = shipped_policy()["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertTrue(restricted)
         with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-            WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
+            WRAPPER.resolve_model_settings(selection(model=restricted[0], effort="high"))
         self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
 
     def test_explicit_and_role_override_of_a_main_only_model_are_rejected(self):
@@ -225,6 +231,7 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             logs = root / "logs"
             env = {key: value for key, value in os.environ.items() if key != "CLAUDE_MODEL_DEEP"}
             env["CLAUDE_CONFIG_DIR"] = str(runtime_home)
+            env["HEARTING_MODEL_CONFIG_HOME"] = ""
             env["AGENT_HOME"] = str(ROOT)
             result = subprocess.run(
                 [
@@ -341,10 +348,11 @@ class TopExceptionProfileTest(ClaudeDispatchModelEligibilityTest):
             self.assertEqual(refused.exception.reason, "invalid-dispatch-model-profile")
 
     def test_explicit_and_role_selection_of_the_top_model_stay_refused(self):
+        top_model = shipped_policy()["CFG_TIER_TOP_MODEL"]
         with self.assertRaises(WRAPPER.ModelSelectionError) as explicit:
-            WRAPPER.resolve_model_settings(selection(model="fable", effort="max"))
+            WRAPPER.resolve_model_settings(selection(model=top_model, effort="max"))
         self.assertEqual(explicit.exception.reason, "headless-main-session-only-model")
-        with mock.patch.dict(os.environ, {"CLAUDE_MODEL_DEEP": "fable"}):
+        with mock.patch.dict(os.environ, {"CLAUDE_MODEL_DEEP": top_model}):
             with self.assertRaises(WRAPPER.ModelSelectionError) as mapped:
                 WRAPPER.resolve_model_settings(selection(role="deep maker"))
         self.assertEqual(mapped.exception.reason, "headless-main-session-only-model")

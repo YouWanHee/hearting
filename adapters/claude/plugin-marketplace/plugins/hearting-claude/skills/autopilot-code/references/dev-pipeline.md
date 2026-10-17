@@ -29,7 +29,7 @@ the sealed evidence and the existing allocation policy.
 
 ```bash
 python3 "$AGENT_HOME/utilities/dispatch-readiness.py" \
-  --worktree "$WORKTREE" --jobs "$CANONICAL_JOBS" \
+  --worktree "$WORKTREE" \
   --owner-harness "$OWNER_HARNESS" \
   --child-harness claude --child-harness codex \
   --output "$DISPATCH_EVIDENCE"
@@ -84,9 +84,10 @@ exact parent generation, profile, perspective, leg index, and required/realized 
 axes. On an idempotent repeat it consumes no capacity for exact active/completed legs. A
 single missing-leg recovery proves every other N-1 member; any larger partial launch is denied.
 
-Keep `ROUTE_FILE`, `CANONICAL_JOBS`, `NODE_ID`, and the captured `ATTEMPT_ID` together until
-that node's completion transaction succeeds. Never dispatch standard+ with a raw wrapper
-command that omits the route record.
+Keep `ROUTE_FILE`, `NODE_ID`, and the captured `ATTEMPT_ID` together until that node's
+completion transaction succeeds. Dispatch tools inherit the immutable canonical registry
+through `AGENT_DISPATCH_JOBS`; do not reconstruct or cache a second registry path. Never
+dispatch standard+ with a raw wrapper command that omits the route record.
 
 The runtime adds the node's declared scope and the absolute paths of inputs compose took from an earlier cycle to every stage assignment, with or without `--prompt-file`; a prompt file carries only subskill name, input paths, output contract, intensity, and slug. It never carries plan bodies or prior-stage conversation. Each stage reads files; the conductor reads only verdict and gate state. Register every stage in the sealed registry; the model-worker governor, not the conductor, bounds how many run at once. Runtime-owned completion observes exact liveness outside the model; the conductor never adds a recurring monitor. One-line or no-artifact micro-stages stay inline.
 
