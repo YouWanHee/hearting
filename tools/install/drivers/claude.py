@@ -130,6 +130,12 @@ def install(scope="global", plugin=False, dry_run=False):
             )
             continue
 
+        if action == "copy_managed":
+            actions.append(herdr_integration.project_asset(
+                Path(entry["source"]), Path(entry["dest"]), entry["integration_id"],
+                dry_run=dry_run, allowed_root=paths.runtime_home(RUNTIME, scope)))
+            continue
+
         if action == "symlink":
             source = Path(entry["source"])
             dest = Path(entry["dest"])
@@ -339,6 +345,15 @@ def checks(scope="global"):
             dest = entry["dest"]
             name = Path(dest).name
             check_list.append(verifier.check_file_exists(f"claude.file.{name}", dest))
+        elif action == "copy_managed":
+            dest = Path(entry["dest"])
+            integration_id = entry["integration_id"]
+            check_list.append({
+                "id": f"claude.herdr.installed.{integration_id}",
+                "ok": herdr_integration.version_marker(
+                    dest, integration_id, herdr_integration.VERSIONS[RUNTIME]),
+                "detail": f"{dest} carries the current {integration_id} integration",
+            })
         elif action == "seed_once":
             check_list.append(
                 user_model_config.verification_check(

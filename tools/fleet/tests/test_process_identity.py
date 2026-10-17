@@ -131,6 +131,13 @@ class OpenCodeProcessTest(unittest.TestCase):
         with unittest.mock.patch("fleet.collectors.claude.session_id_of_process", return_value="c-1"):
             found = P.process_identity(self.pid, "claude")
         self.assertEqual((found.harness, found.session_id, found.confidence), ("claude", "c-1", P.PROVEN))
+        observation = object()
+        with unittest.mock.patch("fleet.collectors.codex.session_id_of_process",
+                                 return_value="c-1") as codex_identity:
+            found = P.process_identity(self.pid, "codex", codex_observation=observation)
+        codex_identity.assert_called_once_with(self.pid, None, observation=observation)
+        self.assertEqual((found.harness, found.session_id, found.confidence),
+                         ("codex", "c-1", P.PROVEN))
         with unittest.mock.patch("fleet.collectors.codex.session_id_of_process", return_value=None):
             found = P.process_identity(self.pid, "codex")
         self.assertEqual((found.harness, found.session_id, found.confidence), ("codex", "", P.HARNESS_ONLY))

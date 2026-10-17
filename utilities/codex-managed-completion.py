@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter, deque
 import errno
 import hashlib
@@ -21,7 +22,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import WRAPPER_PARENT_HARNESSES
+from dispatch_contract import WRAPPER_PARENT_HARNESSES, process_namespace_identity
 from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
     CompletionDeferred,
@@ -53,6 +54,129 @@ from dispatch_receipt_identity import COMPLETION_REASONS as ALLOWED_REASONS, COM
 
 class CompletionError(RuntimeError):
     """The exact batch or gateway control contract is invalid."""
+
+
+PARENT_SESSION_ENDED = "parent-session-ended"
+JOIN_CHECKPOINT_SECONDS = 5.0
+
+
+def _parent_proc_state(pid):
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return "gone", None
+    except (OSError, TypeError, ValueError):
+        return "unknown", None
+    try:
+        fields = raw[raw.rfind(")") + 2:].split()
+        if fields[0] in {"Z", "X"}:
+            return "gone", None
+        return "live", fields[19]
+    except (IndexError, ValueError):
+        return "unknown", None
+
+
+def capture_parent_lifetime(args):
+    """Bind an interactive Codex recipient to its exact native TUI process."""
+    session_id = getattr(args, "parent_session_id", None)
+    if not session_id or getattr(args, "thread_id", None) != session_id:
+        return None
+    try:
+        from pane_ownership import codex_tui_process_bindings
+        bindings = codex_tui_process_bindings(
+            session_id,
+            pane_hint=os.environ.get("HERDR_PANE_ID") or None,
+        )
+        namespace = process_namespace_identity()
+        matches = [item for item in bindings
+                   if item.get("session_id") == session_id
+                   and namespace and process_namespace_identity(item.get("pid")) == namespace]
+        return {**matches[0], "pid_namespace": namespace} if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _confirmed_parent_successor(args, attempts, *, current_session=None):
+    """Use only the exact seat-handover bindings already sealed to these attempts."""
+    try:
+        import dispatch_seat_handover as handover
+        rows = handover.latest_rows(args.jobs)
+        for attempt in attempts:
+            row = rows.get(attempt)
+            if row is None:
+                continue
+            successor = handover.effective_parent(row[1], args.jobs)
+            if (successor and successor != args.parent_session_id
+                    and (current_session is None or successor == current_session)):
+                return successor
+    except Exception:
+        return ""
+    return ""
+
+
+def parent_session_stop_reason(args, attempts):
+    """Return a stop reason only after the exact parent lifetime is disproved.
+
+    Missing process/session evidence remains unknown. A current same-seat
+    successor with exact attempt bindings keeps the delivery obligation alive.
+    """
+    binding = getattr(args, "parent_lifetime", None)
+    if not isinstance(binding, dict) or not args.parent_session_id:
+        return ""
+    namespace = binding.get("pid_namespace")
+    if not namespace or process_namespace_identity() != namespace:
+        return ""
+    try:
+        pid = int(binding.get("pid"))
+        start = str(binding.get("pid_start") or "")
+    except (TypeError, ValueError):
+        return ""
+    state, observed_start = _parent_proc_state(pid)
+    if state == "unknown":
+        return ""
+    if state == "live" and observed_start == start and start:
+        try:
+            from pane_ownership import _native_session
+            current_session = _native_session(pid, "codex")
+        except Exception:
+            return ""
+        if not current_session or current_session == args.parent_session_id:
+            return ""
+        if _confirmed_parent_successor(args, attempts, current_session=current_session):
+            return ""
+        return PARENT_SESSION_ENDED
+
+    # The recorded PID/start no longer names the original TUI. A new live TUI
+    # for the same native session is a normal resume and retains the duty.
+    try:
+        from pane_ownership import codex_tui_processes_for_session
+        bindings = codex_tui_processes_for_session(args.parent_session_id)
+        matches = [item for item in bindings
+                   if item.get("session_id") == args.parent_session_id
+                   and process_namespace_identity(item.get("pid")) == namespace]
+    except Exception:
+        return ""
+    if len(matches) == 1:
+        args.parent_lifetime = {**matches[0], "pid_namespace": namespace}
+        return ""
+    if len(matches) > 1:
+        return ""
+    if _confirmed_parent_successor(args, attempts):
+        return ""
+    return PARENT_SESSION_ENDED
+
+
+def _join_checkpoint(args, attempts):
+    """Run the existing exact join with a short bounded checkpoint for supervision."""
+    if not getattr(args, "parent_lifetime", None):
+        return run_join(args, attempts)
+    bounded = copy.copy(args)
+    bounded.timeout = min(
+        max(float(args.interval), 0.05), JOIN_CHECKPOINT_SECONDS,
+        max(float(args.timeout), 0.05),
+    )
+    bounded.interval = min(max(float(args.interval), 0.05), 2.0)
+    return run_join(bounded, attempts)
 
 
 class NoticeWatcher:
@@ -583,11 +707,11 @@ def delivery_parent_id(args: argparse.Namespace) -> str:
     return args.parent_attempt_id or ""
 
 
-def gateway_request(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+def gateway_request(path: Path, value: dict[str, Any], *, timeout: float = 130.0) -> dict[str, Any]:
     if not path.is_absolute() or path.is_symlink():
         raise CompletionError("control-socket-path-unsafe")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(130.0)
+    connection.settimeout(max(0.05, float(timeout)))
     try:
         connection.connect(str(path))
         connection.sendall((canonical(value) + "\n").encode("utf-8"))
@@ -618,6 +742,7 @@ def gateway_request(path: Path, value: dict[str, Any]) -> dict[str, Any]:
 def deliver_with_retry(
     args: argparse.Namespace,
     request: dict[str, Any],
+    *, stop_check=None,
 ) -> dict[str, Any]:
     """Retry only a provably unsent/retryable delivery.
 
@@ -629,8 +754,13 @@ def deliver_with_retry(
     deadline = time.monotonic() + max(0.0, args.delivery_retry_window)
     last_reason = "control-socket-unavailable"
     while True:
+        if stop_check is not None:
+            stopped = stop_check() or ""
+            if stopped:
+                return {"schema_version": 1, "status": "retryable", "reason": stopped}
         try:
-            result = gateway_request(args.control_socket, request)
+            result = gateway_request(args.control_socket, request,
+                                     timeout=5.0 if stop_check is not None else 130.0)
         except CompletionError as exc:
             if str(exc) != "control-socket-unavailable":
                 raise
@@ -643,6 +773,10 @@ def deliver_with_retry(
         if status != "retryable":
             return result
         last_reason = str(result.get("reason") or "gateway-retryable")
+        if stop_check is not None:
+            stopped = stop_check() or ""
+            if stopped:
+                return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return {
@@ -816,11 +950,15 @@ def _native_queue_delivery_once(
             pending_delivery.release_claim(root, args.thread_id, delivery_id, claim_owner=claim_owner)
 
 
-def deliver_to_native_queue(args, receipt, attempts):
+def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
     deadline = time.monotonic() + max(0.0, args.timeout)
     result = {"schema_version": 1, "status": "retryable", "reason": "native-queue-timeout"}
     submitted = False
     while time.monotonic() < deadline:
+        if stop_check is not None:
+            stopped = stop_check() or ""
+            if stopped:
+                return {"schema_version": 1, "status": "retryable", "reason": stopped}
         session = None
         try:
             path = args.queue_socket or resolve_queue_socket()
@@ -843,10 +981,33 @@ def deliver_to_native_queue(args, receipt, attempts):
         finally:
             if session is not None:
                 session.close()
+        if stop_check is not None:
+            stopped = stop_check() or ""
+            if stopped:
+                return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
     return result
+
+
+def _record_parent_session_ended(args, attempts, duty_id, outcome=None):
+    from dispatch_supervision import materialize
+    try:
+        materialize(args.jobs, attempts, reason=PARENT_SESSION_ENDED)
+    except (OSError, ValueError, pending_delivery.PendingDeliveryError):
+        pass
+    if not duty_id:
+        return
+    current = batch_obligations.read(args.jobs, duty_id) or {}
+    changes = {
+        "state": "unknown", "reason": PARENT_SESSION_ENDED,
+        "delivery": "pending", "effective_attempts": sorted(attempts),
+        "parent_lifetime": getattr(args, "parent_lifetime", None),
+    }
+    if current.get("outcome") is None and outcome is not None:
+        changes["outcome"] = outcome
+    batch_obligations.update(args.jobs, duty_id, **changes)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1043,12 +1204,29 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
             resume = bool(getattr(args, "_resume_execution", False))
             deadline = time.monotonic() + (max(30.0, args.timeout) if resume else max(0.0, args.timeout))
+
+            previous_parent_lifetime = getattr(args, "parent_lifetime", None)
+
+            def supervision_stop_check():
+                nonlocal previous_parent_lifetime
+                reason = parent_session_stop_reason(args, monitored)
+                if reason:
+                    return reason
+                current_lifetime = getattr(args, "parent_lifetime", None)
+                if duty_id and current_lifetime != previous_parent_lifetime:
+                    batch_obligations.update(
+                        args.jobs, duty_id, parent_lifetime=current_lifetime)
+                    previous_parent_lifetime = current_lifetime
+                if resume:
+                    return ""
+                return _receiver_unavailable_reason(args, monitored)
+
             receipt = wait_for_batch(
-                join=lambda selected: run_join(args, selected),
+                join=lambda selected: _join_checkpoint(args, selected),
                 attempts=attempts, jobs=args.jobs,
                 parent_attempt_id=delivery_parent_id(args),
                 deadline=deadline,
-                stop_check=None if resume else lambda: _receiver_unavailable_reason(args, monitored),
+                stop_check=supervision_stop_check,
                 replacement_checkpoint=replacement_checkpoint,
             )
             from dispatch_replacement import adopt_receipt
@@ -1095,7 +1273,8 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             return projected
         normalized = wait_for_batch(join=project, attempts=attempts, jobs=args.jobs,
             parent_attempt_id=delivery_parent, deadline=deadline,
-            stop_check=None if resume else lambda: _receiver_unavailable_reason(args, attempts))
+            stop_check=lambda: (parent_session_stop_reason(args, attempts)
+                                or ("" if resume else _receiver_unavailable_reason(args, attempts))))
         if normalization_error:
             raise normalization_error[0]
         if normalized.get("state") == "watch-expired":
@@ -1117,8 +1296,23 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     else:
         attempts = set(obligation.get("effective_attempts") or attempts)
         delivery_parent = delivery_parent_id(args)
+    parent_reason = parent_session_stop_reason(args, attempts)
+    if parent_reason:
+        _record_parent_session_ended(args, attempts, duty_id, normalized)
+        return {"schema_version": 1, "status": "retryable", "reason": parent_reason}, 75
+
+    def delivery_stop_check():
+        reason = parent_session_stop_reason(args, attempts)
+        if reason:
+            _record_parent_session_ended(args, attempts, duty_id, normalized)
+        return reason
+
     if args.queue_socket:
-        result = deliver_to_native_queue(args, normalized, attempts)
+        if delivery_stop_check():
+            return {"schema_version": 1, "status": "retryable",
+                    "reason": PARENT_SESSION_ENDED}, 75
+        result = deliver_to_native_queue(args, normalized, attempts,
+                                         stop_check=delivery_stop_check)
         status = result.get("status")
         return result, {
             "accepted": 0,
@@ -1138,7 +1332,7 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         request["gateway_epoch"] = args.gateway_epoch
     if args.binding_generation is not None:
         request["binding_generation"] = args.binding_generation
-    result = deliver_with_retry(args, request)
+    result = deliver_with_retry(args, request, stop_check=delivery_stop_check)
     status = result.get("status")
     return result, {
         "accepted": 0,
@@ -1223,6 +1417,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         attempts = list(args.attempt_id or [])
         if not attempts or len(set(attempts)) != len(attempts) or len(attempts) > 4:
             raise CompletionError("attempt-set-invalid")
+        args.parent_lifetime = capture_parent_lifetime(args)
         duty_id, _record = batch_obligations.create(args)
         args._obligation_id = duty_id
         args._resume_execution = False
@@ -1247,6 +1442,11 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if status == "accepted":
                 batch_obligations.update(args.jobs, args._obligation_id,
                     state="complete", delivery="accepted", reason="delivered")
+            elif status == "retryable" and isinstance(result, dict) \
+                    and result.get("reason") == PARENT_SESSION_ENDED:
+                batch_obligations.update(args.jobs, args._obligation_id,
+                    state="unknown", delivery="pending", reason=PARENT_SESSION_ENDED,
+                    parent_lifetime=getattr(args, "parent_lifetime", None))
             else:
                 batch_obligations.update(args.jobs, args._obligation_id,
                     state="delivery-pending", delivery=status or "unknown",

@@ -622,18 +622,25 @@ stamp path in `core/HOOKS.md`.
 ### 7.3. Detached steward watch carrier (SD-122)
 
 **Detached watch realization.** `peer-steward.py watch <target>` persists one logical
-obligation with exact herdr server, pane, harness, session and until-set identity before
-starting its observer. Each herdr wait has a finite budget; timeout and unavailable
-are checkpoints, not fulfillment. The existing observer continues after those checkpoints
-with capped backoff until the exact condition is met or the process stops. Existing command,
-session-start and reconnect paths claim the same duty and replace only observer identity,
-so tab moves do not require manual rearm and same-name pane/session reuse cannot inherit
-the old duty. A tab is a current location hint. The duty remains pending until its exact
-observable condition is satisfied, explicitly canceled, or safely handed through its
-recorded identity lineage. `join`, `status`, and Fleet report the duty separately from an
+obligation with exact Herdr endpoint, target pane, harness, session and until-set identity
+before starting its observer. One logical watch invokes `herdr agent wait` once. An explicit
+timeout is one absolute deadline recorded when the duty is armed; reaching it writes the
+terminal timeout receipt and exit 3. Observer restart does not grant another wait or a
+fresh timeout. The supervisor listens for its own wait child's exit, the endpoint event
+stream, its exact steward lifetime, and terminal requests for that watch. It may stop only
+that watch's exact wait child. A complete target-pane census or matching closed event
+settles target disappearance; a proven steward exit or a successful arm by a new native
+session in the same verified seat settles the old observer duty without rewriting the
+target result. A different seat's watch remains independent. Unavailable, partial, or
+ambiguous observations remain unknown; they are not converted into death or a second native
+wait. Reattachment adopts a recorded exact wait child when possible and continues lifecycle
+observation when its consumed wait result is unknown. Existing command, session-start and
+reconnect paths claim the same duty and replace only observer identity, so tab moves do not
+require manual rearm and same-name pane/session reuse cannot inherit the old duty. A tab is a
+current location hint. `join`, `status`, and Fleet report the duty separately from an
 observer receipt. Wake remains adapter-specific and any unmeasured native receipt remains
-unmeasured; no always-on daemon or model polling loop is introduced. Watch observations
-continue to use bounded herdr calls. Idle/done receipts require the shared
+unmeasured; no always-on daemon or model polling loop is introduced. Idle/done receipts
+require the shared
 completion-readiness policy: exact registered-parent session or confirmed handover
 bindings take precedence over native idle, without requiring a parent-pane field.
 Peer input uses the same policy with an input purpose: a parent's idle native
@@ -838,8 +845,8 @@ event matches the exact session, pane, foreground PID birth, and PID namespace,
 and was observed within 15 seconds. Missing, stale, or mismatched status stays
 unknown for retire decisions.
 
-An exact pane exit, exact closed-pane event, complete absence census, or
-completed retire settles the existing watch duty before its observer exits.
-Terminal receipts prevent lifecycle reconciliation from recreating observers.
-Pane closure, agent release, goal completion, and successful work are distinct
-outcomes.
+An exact pane exit, exact closed-pane event, complete absence census, completed retire,
+confirmed steward exit/replacement, or the original explicit deadline settles the existing
+watch duty before its observer exits. A terminal receipt prevents lifecycle reconciliation
+from recreating an observer. Pane closure, steward closure, agent release, goal completion,
+and successful work are distinct outcomes.

@@ -21,7 +21,7 @@ from dispatch_registry_cache import registry_lines
 import dispatch_pending_delivery as pending_delivery
 
 KIND = "supervision"
-REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable", "answer-awaiting-parent"})
+REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable", "answer-awaiting-parent", "parent-session-ended"})
 # Another session answered a BLOCKED owner; only the route's parent launches the continuation.
 ANSWER_AWAITING_PARENT = "answer-awaiting-parent"
 
@@ -383,6 +383,11 @@ def render_text(receipt: dict, *, continued: dict | None = None) -> str:
                 "ordinary in-flight wait. Retrying this attempt's closure will not help. Explain this to the "
                 "user and inspect the exact gate reason before deciding a recovery path (a fresh dispatch of "
                 "the same route node, or manual repair of the marker/evidence). Read-only diagnosis: " + command)
+    if receipt["reason"] == "parent-session-ended":
+        return ("The exact Codex parent session ended. The recorded child attempts continue unchanged, "
+                "and their completion and delivery obligations remain in the durable batch record. "
+                "The existing controller resumes them automatically when that parent or a confirmed "
+                "same-seat successor is active; nothing was cancelled or retried.")
     if receipt["reason"] in {"watch-deadline", "receiver-unavailable"}:
         utility = _printed("dispatch_terminal_commit.py")
         command = (f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(receipt['job_registry'])} "

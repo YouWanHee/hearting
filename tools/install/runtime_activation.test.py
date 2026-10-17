@@ -17,6 +17,18 @@ import codex_hook_trust  # noqa: E402
 
 
 class CodexHookTrustTest(unittest.TestCase):
+    def test_codex_projection_binds_the_herdr_home_consumer_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "codex"
+            with mock.patch.object(activation.paths, "runtime_home", return_value=home):
+                entries = activation._linked_entries("codex", REPO_ROOT, "global")
+        integration = [entry for entry in entries
+                       if Path(entry["dest"]).name == "herdr-agent-state.sh"]
+        self.assertEqual(len(integration), 1, integration)
+        self.assertEqual(Path(integration[0]["source"]),
+                         REPO_ROOT / "adapters/codex/hooks/herdr-agent-state.sh")
+        self.assertEqual(Path(integration[0]["dest"]), home / "herdr-agent-state.sh")
+
     def test_activation_publishes_the_receipt_and_deactivation_restores_its_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1703,6 +1715,25 @@ class OpencodeTuiSeedTest(unittest.TestCase):
 
 
 class HerdrIntegrationAdoptionTest(unittest.TestCase):
+    def test_official_herdr_assets_are_copied_to_runtime_homes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "runtime-home"
+            with mock.patch.object(activation.paths, "runtime_home", return_value=home):
+                expected = {
+                    "claude": {"hooks/herdr-agent-state.sh"},
+                    "codex": {"herdr-agent-state.sh"},
+                    "opencode": {"plugins/herdr-agent-state.js", "herdr-tui-session.js",
+                                 "herdr-opencode/tui.js"},
+                }
+                for runtime, dests in expected.items():
+                    entries = activation._linked_entries(runtime, REPO_ROOT, "global")
+                    assets = [entry for entry in entries
+                              if Path(entry["dest"]).relative_to(home).as_posix() in dests]
+                    self.assertEqual({Path(entry["dest"]).relative_to(home).as_posix()
+                                      for entry in assets}, dests)
+                    self.assertEqual(len(assets), len(dests), assets)
+                    self.assertTrue(all(entry["kind"] == "copy" for entry in assets), assets)
+
     def _write(self, path, *lines):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines) + "\n")

@@ -573,11 +573,14 @@ def _children(
     surface: str,
     pattern: str = "*",
     allowed: Optional[set[str]] = None,
+    exclude: Optional[set[str]] = None,
 ) -> List[dict]:
     if not source.is_dir():
         return []
     entries = []
     for item in sorted(source.glob(pattern)):
+        if exclude is not None and item.name in exclude:
+            continue
         identifier = item.stem if item.is_file() else item.name
         if allowed is not None and identifier not in allowed:
             continue
@@ -654,9 +657,17 @@ def _linked_entries(
             (source_root / "roles", home / "agent-roles", "instructions"),
             (source_root / "adapters/codex/bin", home / "agent-bin", "hook_config"),
             (source_root / "adapters/codex/hooks", home / "agent-hooks", "hook_config"),
-            (source_root / "adapters/codex/hooks/hooks.json", home / "hooks.json", "hook_config"),
         ]
         entries.extend(_entry(src, dst, surface) for src, dst, surface in fixed)
+        entries.append(_entry(source_root / "adapters/codex/hooks/herdr-agent-state.sh",
+                              home / "herdr-agent-state.sh", "hook_config", kind="copy"))
+        # A real hooks.json is user-owned. The Codex driver and Herdr migration
+        # merge their exact owned entries in place; projecting a whole-file
+        # symlink would discard unrelated callbacks and comments.
+        hooks_json = home / "hooks.json"
+        if not (hooks_json.exists() and not hooks_json.is_symlink()):
+            entries.append(_entry(source_root / "adapters/codex/hooks/hooks.json",
+                                  hooks_json, "hook_config"))
         entries.extend(
             _mode_entries(
                 source_root / "adapters/codex/modes",
@@ -726,8 +737,11 @@ def _linked_entries(
             _children(source_root / "adapters/claude/commands", home / "commands", "skill", "*.md")
         )
         entries.extend(
-            _children(source_root / "adapters/claude/hooks", home / "hooks", "hook_config")
+            _children(source_root / "adapters/claude/hooks", home / "hooks", "hook_config",
+                      exclude={"herdr-agent-state.sh"})
         )
+        entries.append(_entry(source_root / "hooks/herdr-agent-state.sh",
+                              home / "hooks/herdr-agent-state.sh", "hook_config", kind="copy"))
 
     elif runtime == "opencode":
         fixed = [
@@ -762,13 +776,13 @@ def _linked_entries(
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
         herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
-        entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config"))
+        entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
         entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
         herdr_tui = source_root / "adapters/opencode/tui/herdr-tui-session.js"
-        entries.append(_entry(herdr_tui, home / "tui/herdr-tui-session.js", "hook_config"))
+        entries.append(_entry(herdr_tui, home / "herdr-tui-session.js", "hook_config", kind="copy"))
         herdr_tui_v2 = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
-        entries.append(_entry(herdr_tui_v2, home / "tui/herdr-opencode/tui.js", "hook_config"))
+        entries.append(_entry(herdr_tui_v2, home / "herdr-opencode/tui.js", "hook_config", kind="copy"))
         # Owned scoped TUI config: dormant until an owned launch points
         # OPENCODE_TUI_CONFIG at it. Never auto-read (the loader only reads
         # tui.json/tui.jsonc by name), never merged into user files.
@@ -2878,6 +2892,21 @@ def _apply_transaction(
             if item["kind"] == "copytree":
                 _remove_path(dest)
                 shutil.copytree(source, dest, symlinks=False)
+            elif item["kind"] == "copy":
+                current = safe_fs.capture_state(dest)
+                try:
+                    auth = safe_fs.authority(
+                        dest,
+                        owner=f"runtime-activation:{runtime}:{item['surface']}:copy",
+                        allowed_paths=(dest,), allow_leaf_symlink=True,
+                        expected=current,
+                    )
+                    safe_fs.atomic_write_bytes(
+                        auth, source.read_bytes(), source.stat().st_mode & 0o777,
+                        expected=current, create_parents=True,
+                    )
+                except (OSError, safe_fs.SafetyError) as exc:
+                    raise ActivationError(str(exc)) from exc
             else:
                 current = safe_fs.capture_state(dest)
                 try:
