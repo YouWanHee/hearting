@@ -105,6 +105,12 @@ consumption but never overwrites a past result. Follow-up work connects exact
 lineage and current evidence instead of rewriting the original. Reusing existing
 work is distinct from producing a new verification PASS.
 
+An observation can establish that an exact input was consumed, or expose a
+concrete conflict. An unavailable or incomplete observation establishes neither
+consumption nor absence. First-send eligibility comes from the existing pending
+record and its claim boundary; after an attempt, the existing delivery lineage
+owns further observation. Do not turn uncertain history into a new retry rule.
+
 ## 5. Remove duplicated decisions before stacking exceptions
 
 A repair does not end at letting the one failing branch pass. Find the writers,
