@@ -834,8 +834,13 @@ def execution_attempts_for_processes(processes: Iterable[dict]) -> tuple[str, ..
 def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
                         jobs: str | Path | None = None,
                         execution_attempt_ids: tuple[str, ...] = (),
+                        include_parent: bool = True,
                         ) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
-    """Read exact executor, registered-parent or handed-over attempt bindings."""
+    """Read exact executor, registered-parent or handed-over attempt bindings.
+
+    Input readiness considers executor bindings only, so it passes
+    ``include_parent=False`` and skips observing every parented attempt.
+    """
     from dispatch_contract import (
         observed_attempt_liveness,
         parse_registry_metadata,
@@ -865,7 +870,7 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         metadata = parse_registry_metadata(fields[5])
         executor = (metadata.get("attempt_id") in execution_attempt_ids
                     and metadata.get("harness") == harness)
-        parent = (owns(metadata, session_id, jobs_path)
+        parent = (include_parent and owns(metadata, session_id, jobs_path)
                   and (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
                        else effective_parent_harness(metadata, jobs_path)) in {None, "", harness})
         if not executor and not parent:

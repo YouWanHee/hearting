@@ -359,6 +359,16 @@ class ObligationStoreTest(unittest.TestCase):
             self.assertEqual(state, "observed")
             self.assertEqual([(w.attempt_id, w.pane_relation) for w in work],
                              [("att-exec", "executor"), ("att-child", "parent")])
+            # Input readiness ignores parent rows, so it never observes them.
+            with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("alive", "fixture", "live", "fixture")), \
+                 mock.patch("dispatch_terminal_commit.owner_completion_state",
+                            wraps=__import__("dispatch_terminal_commit").owner_completion_state) as closure:
+                work, state = obligations.bound_work_for_pane(
+                    "pane", harness, "sid", jobs=jobs, execution_attempt_ids=("att-exec",),
+                    include_parent=False)
+            self.assertEqual([(w.attempt_id, w.pane_relation) for w in work], [("att-exec", "executor")])
+            self.assertEqual(closure.call_count, 1)
 
     def test_foreground_tag_read_is_birth_checked_and_does_not_use_parent_tag(self):
         with mock.patch("dispatch_contract._runtime_ancestry_proc_stat", return_value={"start": 7}), \
