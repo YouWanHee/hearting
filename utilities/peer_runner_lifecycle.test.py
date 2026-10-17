@@ -646,6 +646,210 @@ console.log(JSON.stringify(calls[0]));
                 old_process.terminate()
             old_process.wait(timeout=5)
 
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_base_source_finally_respawn_is_reconciled_in_both_activation_orders(self):
+        import contextlib
+        import dispatch_batch_obligations as batch
+
+        base_commit = "414a76bec4963e3e22d6f89766282cdf5f6b739b"
+        old_batch_source = subprocess.run(
+            ["git", "show", f"{base_commit}:utilities/dispatch_batch_obligations.py"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+        old_completion_source = subprocess.run(
+            ["git", "show", f"{base_commit}:utilities/codex-managed-completion.py"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+
+        self._point_current(self.b)
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.write_bytes(b"")
+        args = SimpleNamespace(
+            jobs=self.jobs, sealed_batch_id="sealed-old-caller-fixture",
+            parent_attempt_id="att-parent", parent_session_id=None,
+            attempt_id=["att-child"], control_socket=None, queue_socket=None,
+            thread_id=None, interval=1.0, timeout=2.0,
+        )
+        duty_id, _ = batch.create(args)
+        batch.update(self.jobs, duty_id, state="delivery-pending", reason="observing",
+                     outcome={"state": "done", "attempt_ids": ["att-child"]},
+                     delivery="pending")
+        before = batch.read(self.jobs, duty_id)
+        jobs_digest = hashlib.sha256(self.jobs.read_bytes()).hexdigest()
+        lease_path = batch._root(self.jobs) / (duty_id + ".lease")
+
+        old_ready = [self.base / "old-first-ready", self.base / "old-after-release-ready"]
+        current_ready = [self.base / "current-activation-ready", self.base / "current-reconcile-ready"]
+        old_script = self.a / "utilities/codex-managed-completion.py"
+        current_script = self.b / "utilities/codex-managed-completion.py"
+        old_script.write_text(
+            "import fcntl, os, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--obligation-lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write(str(os.getpid()))\n"
+            "while True: time.sleep(60)\n", encoding="utf-8")
+        current_script.write_text(
+            "import fcntl, os, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--obligation-lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write(str(os.getpid()))\n"
+            "while True: time.sleep(60)\n", encoding="utf-8")
+        (self.a / "utilities/dispatch_batch_obligations.py").write_text(
+            old_batch_source, encoding="utf-8")
+        legacy_caller = self.a / "utilities/legacy-completion-caller.py"
+        legacy_caller.write_text(old_completion_source, encoding="utf-8")
+        driver = self.base / "run-old-caller.py"
+        driver.write_text(
+            "import importlib.util, sys\n"
+            "batch_spec = importlib.util.spec_from_file_location(\n"
+            "    'dispatch_batch_obligations', sys.argv[5])\n"
+            "batch_module = importlib.util.module_from_spec(batch_spec)\n"
+            "sys.modules['dispatch_batch_obligations'] = batch_module\n"
+            "batch_spec.loader.exec_module(batch_module)\n"
+            "spec = importlib.util.spec_from_file_location('legacy_completion', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "print(module.batch_obligations.__file__, flush=True)\n"
+            "def interrupted(_args): raise RuntimeError('fixture-interruption')\n"
+            "module._execute_once = interrupted\n"
+            "args = module.parser().parse_args(['--jobs', sys.argv[2], '--resume-obligation',\n"
+            "    sys.argv[3], '--obligation-lock-fd', sys.argv[4]])\n"
+            "try: module.execute(args)\n"
+            "except RuntimeError as exc:\n"
+            "    if str(exc) != 'fixture-interruption': raise\n",
+            encoding="utf-8")
+
+        launched = []
+        old_pids = []
+        real_popen = subprocess.Popen
+
+        def wait_ready(path, seconds=5):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not path.exists():
+                time.sleep(0.01)
+            self.assertTrue(path.exists(), f"fixture observer did not start: {path}")
+
+        def launch_old_finally(ready_path):
+            fd = batch.acquire(self.jobs, duty_id)
+            self.assertIsNotNone(fd, "released duty lease should be available to the old caller")
+            os.set_inheritable(fd, True)
+            fixture_env = dict(self._environment(self.a),
+                               FIXTURE_READY=str(ready_path),
+                               PYTHONPATH=os.pathsep.join((
+                                   str(self.a / "utilities"), str(ROOT / "utilities"),
+                                   str(self.external_python))))
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(driver), str(legacy_caller), str(self.jobs),
+                     duty_id, str(fd),
+                     str(self.a / "utilities/dispatch_batch_obligations.py")],
+                    env=fixture_env, pass_fds=(fd,),
+                    capture_output=True, text=True, timeout=20)
+            finally:
+                os.close(fd)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(Path(result.stdout.strip()),
+                             self.a / "utilities/dispatch_batch_obligations.py")
+            wait_ready(ready_path)
+            record = batch.read(self.jobs, duty_id)
+            observer = record["observer"]
+            old_pids.append((observer["pid"], observer["pid_start"]))
+            return observer
+
+        def launch_current(*command_args, **kwargs):
+            process = real_popen(command_args[0], **kwargs)
+            launched.append((process, list(command_args[0]), dict(kwargs["env"])))
+            return process
+
+        runner_store = obligations.ObligationStore(self.state)
+        runner_lock = runner_store.root / obligations.RUNNER_LOCK_NAME
+        runner_lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        runner_fd = os.open(runner_lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            # Caller first: the unchanged 414a source runs its actual execute/finally
+            # path and starts its sibling from A; the normal activation then takes it
+            # over with B under the same lease.
+            first_old = launch_old_finally(old_ready[0])
+            activation_env = dict(self._environment(self.a), FIXTURE_READY=str(current_ready[0]))
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, activation_env, clear=True), \
+                 mock.patch.object(batch.subprocess, "Popen", side_effect=launch_current):
+                binding = obligations.managed_service_binding(self.a)
+                self.assertEqual(batch.ensure_observers(self.jobs, service_current=binding), 1)
+            self.assertEqual(launched[0][1][1], str(current_script))
+            wait_ready(current_ready[0])
+            self.assertFalse(peer_steward._pid_identity_ok(
+                first_old["pid"], first_old["pid_start"]))
+
+            # Activation first: release B's lease, then run the unchanged old
+            # caller's real finally/re-ensure path again. It respawns A as before.
+            activation_process = launched[0][0]
+            activation_process.terminate()
+            activation_process.wait(timeout=5)
+            second_old = launch_old_finally(old_ready[1])
+            self.assertEqual(batch.read(self.jobs, duty_id)["observer"]["pid"],
+                             second_old["pid"])
+
+            fcntl.flock(runner_fd, fcntl.LOCK_EX)
+            runner_env = dict(self._environment(self.a),
+                              FIXTURE_READY=str(current_ready[1]))
+
+            class StopAfterTakeover(Exception):
+                pass
+
+            def after_reconcile(_delay):
+                wait_ready(current_ready[1])
+                self.assertFalse(peer_steward._pid_identity_ok(
+                    second_old["pid"], second_old["pid_start"]))
+                raise StopAfterTakeover()
+
+            runner_clock = SimpleNamespace(
+                sleep=after_reconcile, monotonic=time.monotonic, time=time.time)
+
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, runner_env, clear=True), \
+                 mock.patch.object(obligations, "exec_service_runner"), \
+                 mock.patch.object(batch.subprocess, "Popen", side_effect=launch_current), \
+                 mock.patch.object(peer_steward, "time", runner_clock):
+                binding = obligations.managed_service_binding(self.a)
+                with self.assertRaises(StopAfterTakeover):
+                    peer_steward.cmd_obligation_runner(SimpleNamespace(
+                        state_root=self.state, lock_fd=runner_fd,
+                        service_current=binding))
+
+            reconciled_process, reconciled_command, reconciled_env = launched[-1]
+            self.assertEqual(Path(reconciled_command[1]), current_script)
+            self.assertEqual(reconciled_env["AGENT_HOME"], str(self.b))
+            self.assertEqual(Path(os.path.realpath(
+                f"/proc/{reconciled_process.pid}/fd/{reconciled_command[
+                    reconciled_command.index('--obligation-lock-fd') + 1]}")), lease_path.resolve())
+            after = batch.read(self.jobs, duty_id)
+            for field in ("id", "identity", "arguments", "outcome", "state", "delivery",
+                          "effective_attempts", "replacement_lineage"):
+                self.assertEqual(after.get(field), before.get(field), field)
+            self.assertNotIn("service_current", after["arguments"])
+            self.assertEqual(hashlib.sha256(self.jobs.read_bytes()).hexdigest(), jobs_digest)
+            self.assertEqual(after["delivery"], "pending", "observer takeover is not an ACK")
+        finally:
+            try:
+                fcntl.flock(runner_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(runner_fd)
+            for process, _command, _environment in launched:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=5)
+            for pid, pid_start in old_pids:
+                if peer_steward._pid_identity_ok(pid, pid_start):
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGTERM)
+                    deadline = time.monotonic() + 5
+                    while peer_steward._pid_identity_ok(pid, pid_start) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+
     def test_exec_error_preserves_the_lock_duty_environment_and_retry_binding(self):
         import fcntl
 

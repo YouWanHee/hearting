@@ -533,7 +533,23 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self._wait_for_death(pid)
 
         self._apply_fixture_env(mode="held")
-        peer_steward._ensure_watch_observers()
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def tracked_spawn(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def reap_spawned():
+            for process in spawned:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=5)
+
+        self.addCleanup(reap_spawned)
+        with mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_spawn):
+            peer_steward._ensure_watch_observers()
 
         resumed = json.loads(arm_path.read_text(encoding="utf-8"))
         self.assertEqual(resumed["watch_id"], watch_id,
@@ -541,7 +557,6 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(resumed.get("observer_generation", 1), 2)
         new_pid = int((resumed.get("watcher") or {})["pid"])
         self.assertNotEqual(new_pid, pid)
-        self._children.append(new_pid)
         try:
             os.kill(new_pid, 0)
         except OSError:

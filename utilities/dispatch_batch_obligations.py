@@ -437,6 +437,37 @@ def has_unowned_work(jobs: str | Path | None = None) -> bool:
     return False
 
 
+def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, ...]:
+    """Describe pending completion duties for the existing managed reconciler.
+
+    This is read-only liveness input. It carries no delivery or execution
+    authority and deliberately excludes sealed arguments and route identity.
+    """
+    signature = []
+    for jobs_path in _jobs_paths(jobs):
+        try:
+            root = _root(jobs_path)
+            records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
+        except (OSError, BatchObligationError):
+            signature.append((str(jobs_path), "unavailable"))
+            continue
+        for path in records:
+            try:
+                record = _read(path)
+            except (OSError, ValueError, BatchObligationError):
+                signature.append((str(jobs_path), path.name, "unreadable"))
+                continue
+            if not record or record.get("state") not in _PENDING:
+                continue
+            observer = record.get("observer") or {}
+            signature.append((
+                str(jobs_path), record.get("id", path.stem), record.get("state"),
+                record.get("delivery"), observer.get("pid"),
+                observer.get("pid_start"),
+            ))
+    return tuple(sorted(signature))
+
+
 def _pid_start(pid: int) -> str:
     try:
         from dispatch_contract import process_start_ticks

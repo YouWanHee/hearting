@@ -5469,6 +5469,29 @@ def _watch_reconciliation_needed(*, service_current=None):
     return False
 
 
+def _external_obligation_signature():
+    """Read pending watch/batch identities for the existing outer runner.
+
+    The signature exists only to keep that runner alive and reset its bounded
+    backoff when external work changes. It is not delivery or mutation authority.
+    """
+    watches = []
+    try:
+        root = _watch_root()
+        for watch_id, arm in _watch_entries(root):
+            if _watch_paths(watch_id, root).receipt.exists():
+                continue
+            watcher = (arm or {}).get("watcher") or {}
+            watches.append((watch_id, watcher.get("pid"), watcher.get("pid_start")))
+    except Exception:
+        watches.append(("watch-state-unavailable",))
+    try:
+        batches = dispatch_batch_obligations.pending_observer_signature()
+    except Exception:
+        batches = (("batch-state-unavailable",),)
+    return tuple(sorted(watches)), batches
+
+
 def _reconcile_external_obligations(store, *, service_current=None):
     """Reconnect independent recovery owners from the existing lifecycle callback."""
     try:
@@ -5545,21 +5568,33 @@ def cmd_obligation_runner(args):
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
+            # This already-owned runner is the retry path for managed external
+            # duties too. It closes the activation/old-caller respawn window
+            # without creating a second monitor or changing any duty identity.
+            _reconcile_external_obligations(store, service_current=service_current)
         current_duties = store.list()
+        external_signature = (_external_obligation_signature()
+                              if service_current else ((), ()))
         if not _runner_duties(store, current_duties):
             # A producer that saw our held lock may already have accepted work.
             # Release before the final read: later producers can start a runner,
             # and work accepted before release is either reclaimed here or owned
             # by the new lock holder.
             fcntl.flock(args.lock_fd, fcntl.LOCK_UN)
-            if not _runner_duties(store, store.list()):
+            latest_duties = store.list()
+            latest_external = (_external_obligation_signature()
+                               if service_current else ((), ()))
+            if not _runner_duties(store, latest_duties) and not any(latest_external):
                 return 0
             try:
                 fcntl.flock(args.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return 0
-            continue
-        signature = _runner_duty_signature(current_duties)
+            if _runner_duties(store, latest_duties):
+                continue
+            current_duties = latest_duties
+            external_signature = latest_external
+        signature = (_runner_duty_signature(current_duties), external_signature)
         if previous_signature is None or signature != previous_signature:
             delay = 1.0
         else:
@@ -5582,7 +5617,12 @@ def cmd_ensure_obligations(_args):
             if lifecycle_root is not None:
                 # Preserve the existing managed-current binding for later
                 # producers even while no recovery work needs a runner.
-                peer_obligations.ensure_normal_runner(lifecycle_root=lifecycle_root)
+                external_pending = (any(_external_obligation_signature())
+                                    if service_current else False)
+                peer_obligations.ensure_normal_runner(
+                    lifecycle_root=lifecycle_root,
+                    reconciliation_required=external_pending,
+                )
             return 0
         if lifecycle_root is None:
             started = peer_obligations.ensure_runner(reconciliation_required=True)
