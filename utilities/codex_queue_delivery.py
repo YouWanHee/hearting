@@ -2,9 +2,10 @@
 """At-least-once completion delivery through Codex's native per-thread queue.
 
 The app-server queue API is used directly so Hearting can supply a stable
-``clientUserMessageId`` and inspect only its own pending item. The interactive
-TUI remains the only subscriber and approval owner. No thread/turn events are
-subscribed to and no user-owned queue item is edited, deleted, or reordered.
+``clientUserMessageId`` and inspect only its own pending item. One completion
+observation pass may reuse a bounded queue-only connection. The interactive
+TUI remains the only subscriber and approval owner; no events are subscribed
+to and no user-owned queue item is edited, deleted, or reordered.
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ class _WebSocket:
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise QueueDeliveryError("queue-endpoint-permissions-unsafe")
         self.path = path
+        self.timeout = timeout
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(timeout)
         try:
@@ -143,37 +145,45 @@ class _WebSocket:
         masked = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
         self.socket.sendall(header + mask + masked)
 
-    def _recv_exact(self, size: int) -> bytes:
+    def _recv_exact(self, size: int, *, deadline: float | None = None) -> bytes:
         while len(self.buffer) < size:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise QueueDeliveryError("queue-websocket-timeout",
+                                             ambiguous=getattr(self, "request_sent", False))
+                self.socket.settimeout(remaining)
             chunk = self.socket.recv(max(4096, size - len(self.buffer)))
             if not chunk:
-                raise QueueDeliveryError("queue-websocket-disconnected")
+                raise QueueDeliveryError("queue-websocket-disconnected",
+                                         ambiguous=getattr(self, "request_sent", False))
             self.buffer.extend(chunk)
         value = bytes(self.buffer[:size])
         del self.buffer[:size]
         return value
 
-    def _recv_message(self) -> tuple[int, bytes]:
+    def _recv_message(self, *, deadline: float | None = None) -> tuple[int, bytes]:
         parts = bytearray()
         initial_opcode = None
         while True:
-            first, second = self._recv_exact(2)
+            first, second = self._recv_exact(2, deadline=deadline)
             final = bool(first & 0x80)
             opcode = first & 0x0F
             masked = bool(second & 0x80)
             size = second & 0x7F
             if size == 126:
-                size = struct.unpack("!H", self._recv_exact(2))[0]
+                size = struct.unpack("!H", self._recv_exact(2, deadline=deadline))[0]
             elif size == 127:
-                size = struct.unpack("!Q", self._recv_exact(8))[0]
+                size = struct.unpack("!Q", self._recv_exact(8, deadline=deadline))[0]
             if size > MAX_FRAME_BYTES:
                 raise QueueDeliveryError("queue-websocket-message-oversized")
-            mask = self._recv_exact(4) if masked else b""
-            data = self._recv_exact(size)
+            mask = self._recv_exact(4, deadline=deadline) if masked else b""
+            data = self._recv_exact(size, deadline=deadline)
             if masked:
                 data = bytes(byte ^ mask[index & 3] for index, byte in enumerate(data))
             if opcode == 0x8:
-                raise QueueDeliveryError("queue-websocket-closed")
+                raise QueueDeliveryError("queue-websocket-closed",
+                                         ambiguous=getattr(self, "request_sent", False))
             if opcode == 0x9:
                 self._send_frame(0xA, data)
                 continue
@@ -182,7 +192,8 @@ class _WebSocket:
             if opcode == 0x1:
                 initial_opcode = opcode
             elif opcode != 0x0 or initial_opcode is None:
-                raise QueueDeliveryError("queue-websocket-frame-invalid")
+                raise QueueDeliveryError("queue-websocket-frame-invalid",
+                                         ambiguous=getattr(self, "request_sent", False))
             parts.extend(data)
             if len(parts) > MAX_FRAME_BYTES:
                 raise QueueDeliveryError("queue-websocket-message-oversized")
@@ -191,6 +202,7 @@ class _WebSocket:
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.request_sent = False
+        deadline = time.monotonic() + self.timeout
         request_id = self.next_id
         self.next_id += 1
         self.request_sent = True  # A partial send also has an ambiguous outcome.
@@ -199,7 +211,19 @@ class _WebSocket:
         }, separators=(",", ":")).encode("utf-8"))
         self.request_sent = True
         while True:
-            opcode, raw = self._recv_message()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent)
+            try:
+                opcode, raw = self._recv_message(deadline=deadline)
+            except QueueDeliveryError as exc:
+                if (not exc.ambiguous and method in {"thread/queue/add", "thread/queue/start"}
+                        and exc.reason in {"queue-websocket-message-oversized",
+                                           "queue-websocket-frame-invalid"}):
+                    raise QueueDeliveryError(exc.reason, ambiguous=True) from exc
+                raise
+            except (OSError, TimeoutError) as exc:
+                raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent) from exc
             if opcode != 0x1:
                 continue
             try:
@@ -208,9 +232,12 @@ class _WebSocket:
                 raise QueueDeliveryError("queue-websocket-json-invalid", ambiguous=self.request_sent) from exc
             if not isinstance(value, dict):
                 continue
+            # A server request is never an RPC response, even when the numeric
+            # id collides. This queue-only client does not answer server requests.
+            if isinstance(value.get("method"), str):
+                continue
             if value.get("id") != request_id:
-                # Notifications and unrelated server requests are not consumed
-                # or answered by this queue-only client.
+                # Notifications and unrelated responses do not affect delivery.
                 continue
             if "error" in value:
                 error = value["error"]
@@ -244,7 +271,71 @@ def _connect(path: Path, timeout: float) -> _WebSocket:
         raise
 
 
-def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+class DeliverySession:
+    """Reuse one queue-only WebSocket for a bounded completion observation pass."""
+
+    def __init__(self, path: Path, *, timeout: float = 5.0):
+        self.path: Path | None = None
+        self.timeout = timeout
+        self.client: _WebSocket | None = None
+
+    def __enter__(self) -> "DeliverySession":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        client = self.client
+        self.client = None
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def request(self, path: Path, method: str, params: dict[str, Any], *,
+                timeout: float | None = None) -> dict[str, Any]:
+        timeout = self.timeout if timeout is None else timeout
+        try:
+            endpoint = resolve_endpoint(path)
+        except QueueDeliveryError:
+            self.close()
+            raise
+        if self.path is None:
+            self.path = endpoint
+        elif endpoint != self.path:
+            self.close()
+            # Rebind only on the next RPC, after the caller has observed this
+            # endpoint change and restarted its exact-state check.
+            self.path = endpoint
+            raise QueueDeliveryError("queue-session-endpoint-changed")
+        if self.client is None:
+            self.client = _connect(endpoint, timeout)
+        client = self.client
+        client.timeout = timeout
+        client.socket.settimeout(timeout)
+        try:
+            return client.request(method, params)
+        except QueueDeliveryError as exc:
+            if not exc.reason.startswith("queue-rpc-refused:"):
+                self.close()
+            raise
+        except (OSError, TimeoutError) as exc:
+            ambiguous = client.request_sent
+            self.close()
+            raise QueueDeliveryError(f"queue-rpc-transport-failed:{method}",
+                                     ambiguous=ambiguous) from exc
+
+
+def _session_kwargs(session):
+    return {"session": session} if session is not None else {}
+
+
+def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
+         session: DeliverySession | None = None) -> dict[str, Any]:
+    if session is not None:
+        return session.request(path, method, params, timeout=timeout)
     client = _connect(path, timeout)
     try:
         return client.request(method, params)
@@ -259,7 +350,8 @@ def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float) -> 
         client.close()
 
 
-def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0) -> list[dict[str, Any]]:
+def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
+               session: DeliverySession | None = None) -> list[dict[str, Any]]:
     if not thread_id:
         raise QueueDeliveryError("queue-thread-id-missing")
     cursor = None
@@ -268,7 +360,8 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0) -> list[dict
         params: dict[str, Any] = {"threadId": thread_id, "limit": MAX_PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        response = _rpc(path, "thread/queue/list", params, timeout=timeout)
+        response = _rpc(path, "thread/queue/list", params, timeout=timeout,
+                        **_session_kwargs(session))
         page = response.get("data")
         if not isinstance(page, list):
             raise QueueDeliveryError("queue-list-response-invalid")
@@ -279,29 +372,32 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0) -> list[dict
     raise QueueDeliveryError("queue-list-page-limit-exceeded")
 
 
-def _latest_turn(path: Path, thread_id: str, *, timeout: float) -> dict[str, Any] | None:
+def _latest_turn(path: Path, thread_id: str, *, timeout: float,
+                 session: DeliverySession | None = None) -> dict[str, Any] | None:
     result = _rpc(path, "thread/turns/list", {
         "threadId": thread_id, "limit": 1, "sortDirection": "desc",
-    }, timeout=timeout)
+    }, timeout=timeout, **_session_kwargs(session))
     turns = result.get("data")
     if not isinstance(turns, list) or not turns:
         return None
     return turns[0] if isinstance(turns[0], dict) else None
 
 
-def _latest_turn_status(path: Path, thread_id: str, *, timeout: float) -> str | None:
-    turn = _latest_turn(path, thread_id, timeout=timeout)
+def _latest_turn_status(path: Path, thread_id: str, *, timeout: float,
+                        session: DeliverySession | None = None) -> str | None:
+    turn = _latest_turn(path, thread_id, timeout=timeout, **_session_kwargs(session))
     status = turn.get("status") if turn else None
     return status if isinstance(status, str) else None
 
 
 def find_turn_by_client_message_id(
     path: Path, thread_id: str, client_message_id: str, *, timeout: float = 5.0,
-    strict_history: bool = False,
+    strict_history: bool = False, session: DeliverySession | None = None,
 ) -> dict[str, Any] | None:
     """Find the turn that consumed an exact queued client message id."""
     if strict_history:
-        return _find_peer_turn(path, thread_id, client_message_id, timeout=timeout)
+        return _find_peer_turn(path, thread_id, client_message_id, timeout=timeout,
+                               **_session_kwargs(session))
     cursor = None
     for _ in range(MAX_QUEUE_PAGES):
         params: dict[str, Any] = {
@@ -310,7 +406,8 @@ def find_turn_by_client_message_id(
         }
         if cursor:
             params["cursor"] = cursor
-        response = _rpc(path, "thread/turns/list", params, timeout=timeout)
+        response = _rpc(path, "thread/turns/list", params, timeout=timeout,
+                        **_session_kwargs(session))
         turns = response.get("data")
         if not isinstance(turns, list):
             raise QueueDeliveryError("queue-turns-response-invalid")
@@ -330,7 +427,7 @@ def find_turn_by_client_message_id(
     return None
 
 
-def _find_peer_turn(path, thread_id, client_message_id, *, timeout):
+def _find_peer_turn(path, thread_id, client_message_id, *, timeout, session=None):
     """Read complete peer history in small pages; a summary miss proves nothing.
 
     v0.160 summary includes only the first user item. Full turn pages are reduced
@@ -347,7 +444,8 @@ def _find_peer_turn(path, thread_id, client_message_id, *, timeout):
         remaining = deadline - time.monotonic()
         if requests > MAX_PEER_HISTORY_REQUESTS or remaining <= 0:
             raise QueueDeliveryError("queue-peer-history-budget-exhausted")
-        return _rpc(path, method, params, timeout=min(timeout, remaining))
+        return _rpc(path, method, params, timeout=min(timeout, remaining),
+                    **_session_kwargs(session))
 
     def page(method, params, limit):
         while True:
@@ -447,18 +545,20 @@ def _find_peer_turn(path, thread_id, client_message_id, *, timeout):
 
 def _start_interrupted_owned_item(
     path: Path, *, thread_id: str, client_message_id: str, item_id: str,
-    timeout: float,
+    timeout: float, session: DeliverySession | None = None,
 ) -> bool:
     # Never start a thread merely because the queue contains user input. This
     # code reaches queue/start only for the exact Hearting clientUserMessageId.
-    queued = list_queue(path, thread_id, timeout=timeout)
+    queued = list_queue(path, thread_id, timeout=timeout, **_session_kwargs(session))
     pending, current_id = _pending_item(queued, client_message_id)
     if not pending or current_id != item_id:
         return False
-    if _latest_turn_status(path, thread_id, timeout=timeout) != "interrupted":
+    if _latest_turn_status(path, thread_id, timeout=timeout,
+                           **_session_kwargs(session)) != "interrupted":
         return False
     params = {"threadId": thread_id, "queuedSubmissionId": item_id}
-    result = _rpc(path, "thread/queue/start", params, timeout=timeout)
+    result = _rpc(path, "thread/queue/start", params, timeout=timeout,
+                  **_session_kwargs(session))
     turn = result.get("turn")
     if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
         raise QueueDeliveryError("queue-start-response-invalid", ambiguous=True)
@@ -476,12 +576,15 @@ def _pending_item(items, client_message_id):
     return True, item_id if isinstance(item_id, str) and item_id else None
 
 
-def _known_consumed(path, thread_id, client_message_id, *, timeout, strict_history=False):
+def _known_consumed(path, thread_id, client_message_id, *, timeout, strict_history=False,
+                    session: DeliverySession | None = None):
     try:
         if strict_history:
             return find_turn_by_client_message_id(path, thread_id, client_message_id,
-                                                 timeout=timeout, strict_history=True)
-        return find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout)
+                                                 timeout=timeout, strict_history=True,
+                                                 **_session_kwargs(session))
+        return find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout,
+                                              **_session_kwargs(session))
     except QueueDeliveryError as exc:
         if strict_history:
             # A read failure permits a later normal read, never an add now.
@@ -515,6 +618,7 @@ def send_at_least_once(
     timeout: float = 5.0, allow_restart: bool = True,
     retry_ambiguous: bool = True, allow_add: bool = True,
     require_message_match: bool = False, before_add=None,
+    session: DeliverySession | None = None,
 ) -> dict[str, Any]:
     """Inspect exact history and pending input before every at-least-once send."""
     if not thread_id or not client_message_id.startswith("delivery-"):
@@ -523,13 +627,14 @@ def send_at_least_once(
         raise QueueDeliveryError("queue-message-invalid")
     for retry in range(2):
         consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout,
-                                   strict_history=require_message_match)
+                                   strict_history=require_message_match,
+                                   **_session_kwargs(session))
         if consumed is not None:
             if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
                 raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
             return {"status": "consumed", "queued_submission_id": None,
                     "already_pending": False, "started_after_interrupt": False}
-        queued = list_queue(path, thread_id, timeout=timeout)
+        queued = list_queue(path, thread_id, timeout=timeout, **_session_kwargs(session))
         pending, item_id = _pending_item(queued, client_message_id)
         if pending:
             if require_message_match:
@@ -539,13 +644,14 @@ def send_at_least_once(
                     raise QueueDeliveryError("queue-peer-pending-mismatch", ambiguous=True)
             started = allow_restart and bool(item_id) and _start_interrupted_owned_item(
                 path, thread_id=thread_id, client_message_id=client_message_id,
-                item_id=item_id, timeout=timeout)
+                item_id=item_id, timeout=timeout, **_session_kwargs(session))
             return {"status": "queued", "queued_submission_id": item_id,
                     "already_pending": True, "started_after_interrupt": started}
         # Close the common consume-between-history-and-list race. Another
         # writer may still win after this read; accepted duplicates are benign.
         consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout,
-                                   strict_history=require_message_match)
+                                   strict_history=require_message_match,
+                                   **_session_kwargs(session))
         if consumed is not None:
             if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
                 raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
@@ -553,14 +659,15 @@ def send_at_least_once(
                     "already_pending": False, "started_after_interrupt": False}
         if not allow_add:
             raise QueueDeliveryError("queue-add-previously-unconfirmed", ambiguous=True)
-        interrupted = allow_restart and _latest_turn_status(path, thread_id, timeout=timeout) == "interrupted"
+        interrupted = allow_restart and _latest_turn_status(
+            path, thread_id, timeout=timeout, **_session_kwargs(session)) == "interrupted"
         try:
             if before_add is not None:
                 before_add()
             result = _rpc(path, "thread/queue/add", {
                 "threadId": thread_id, "clientUserMessageId": client_message_id,
                 "input": [{"type": "text", "text": message}],
-            }, timeout=timeout)
+            }, timeout=timeout, **_session_kwargs(session))
         except QueueDeliveryError as exc:
             if not exc.ambiguous or retry or not retry_ambiguous:
                 raise
@@ -574,7 +681,7 @@ def send_at_least_once(
         if interrupted and item_id:
             started = _start_interrupted_owned_item(
                 path, thread_id=thread_id, client_message_id=client_message_id,
-                item_id=item_id, timeout=timeout)
+                item_id=item_id, timeout=timeout, **_session_kwargs(session))
         return {"status": "queued", "queued_submission_id": item_id,
                 "already_pending": False, "started_after_interrupt": started}
     raise QueueDeliveryError("queue-add-unconfirmed", ambiguous=True)
@@ -582,12 +689,14 @@ def send_at_least_once(
 
 def poll_owned_item(
     path: Path, *, thread_id: str, client_message_id: str, timeout: float = 5.0,
+    session: DeliverySession | None = None,
 ) -> dict[str, Any]:
     """Restart exactly one Hearting item; human-only/ambiguous queues stay put."""
-    pending, item_id = _pending_item(list_queue(path, thread_id, timeout=timeout), client_message_id)
+    pending, item_id = _pending_item(
+        list_queue(path, thread_id, timeout=timeout, **_session_kwargs(session)), client_message_id)
     if not pending:
         return {"pending": False, "started": False}
     started = bool(item_id) and _start_interrupted_owned_item(
         path, thread_id=thread_id, client_message_id=client_message_id,
-        item_id=item_id, timeout=timeout)
+        item_id=item_id, timeout=timeout, **_session_kwargs(session))
     return {"pending": True, "started": started, "queued_submission_id": item_id}

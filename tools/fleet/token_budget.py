@@ -222,8 +222,16 @@ def parse_codex_token_count(line: str, *, session_id=None,
     if not isinstance(info, dict):
         unknown.reason = "missing-token-info"
         return unknown
-    last = info.get("last_token_usage") or {}
-    total = info.get("total_token_usage") or {}
+    last = info.get("last_token_usage")
+    total = info.get("total_token_usage")
+    if last is not None and not isinstance(last, dict):
+        unknown.reason = "malformed-token-usage"
+        return unknown
+    if total is not None and not isinstance(total, dict):
+        unknown.reason = "malformed-token-usage"
+        return unknown
+    last = last if isinstance(last, dict) else {}
+    total = total if isinstance(total, dict) else {}
     telemetry = telemetry_from_explicit(
         adapter="codex",
         session_id=session_id,

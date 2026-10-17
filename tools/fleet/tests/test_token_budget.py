@@ -137,6 +137,52 @@ class PureTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry.session_reasoning_output_tokens, 10_000)
         self.assertEqual(telemetry.session_total_tokens, 150_000)
 
+    def test_native_incomplete_keeps_context_baseline_and_advances_cumulative_usage(self):
+        event = json.loads(token_line(active=12_250, window=258_400, total=13_490))
+        info = event["payload"]["info"]
+        info["last_token_usage"] = {
+            "input_tokens": 12_000, "cached_input_tokens": 3_000,
+            "output_tokens": 250, "reasoning_output_tokens": 30,
+            "total_tokens": 12_250,
+        }
+        info["total_token_usage"] = {
+            "input_tokens": 13_200, "cached_input_tokens": 3_400,
+            "output_tokens": 290, "reasoning_output_tokens": 35,
+            "total_tokens": 13_490,
+        }
+        telemetry = parse_codex_token_count(json.dumps(event), session_id=SID)
+        self.assertEqual((telemetry.status, telemetry.active_context_tokens), ("observed", 12_250))
+        self.assertEqual(telemetry.context_used_pct, 0)
+        self.assertEqual((telemetry.session_input_tokens, telemetry.session_total_tokens),
+                         (13_200, 13_490))
+
+    def test_first_native_incomplete_keeps_zero_context_separate_from_recorded_usage(self):
+        event = json.loads(token_line(active=0, window=258_400, total=1_240))
+        info = event["payload"]["info"]
+        info["last_token_usage"] = {
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": 0,
+        }
+        info["total_token_usage"] = {
+            "input_tokens": 1_200, "cached_input_tokens": 400, "output_tokens": 40,
+            "reasoning_output_tokens": 5, "total_tokens": 1_240,
+        }
+        telemetry = parse_codex_token_count(json.dumps(event), session_id=SID)
+        self.assertEqual((telemetry.status, telemetry.active_context_tokens,
+                          telemetry.session_input_tokens, telemetry.session_total_tokens),
+                         ("observed", 0, 1_200, 1_240))
+        self.assertEqual(telemetry.context_used_pct, 0)
+
+    def test_truthy_non_object_usage_is_unknown_instead_of_raising(self):
+        for field in ("last_token_usage", "total_token_usage"):
+            for malformed in ("not-an-object", [1], 7):
+                with self.subTest(field=field, malformed=malformed):
+                    event = json.loads(token_line())
+                    event["payload"]["info"][field] = malformed
+                    telemetry = parse_codex_token_count(json.dumps(event), session_id=SID)
+                    self.assertEqual((telemetry.status, telemetry.reason),
+                                     ("unknown", "malformed-token-usage"))
+
     def test_malformed_and_missing_are_unknown(self):
         self.assertEqual(parse_codex_token_count("not-json").status, "unknown")
         missing = parse_codex_token_count(json.dumps({"payload": {}}))

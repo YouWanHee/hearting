@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -30,6 +31,102 @@ ITEM = {"id": ITEM_ID, "clientUserMessageId": CLIENT_ID,
 
 
 class QueueDeliveryTest(unittest.TestCase):
+    def test_rpc_server_request_id_collision_is_not_mistaken_for_a_reply(self):
+        client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
+        client.timeout = 1.0
+        client.socket = mock.Mock()
+        client.next_id = 1
+        client.request_sent = False
+        client._send_frame = mock.Mock()
+        client._recv_message = mock.Mock(side_effect=[
+            (1, json.dumps({"jsonrpc": "2.0", "id": 1,
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"threadId": THREAD}}).encode()),
+            (1, json.dumps({"jsonrpc": "2.0", "method": "turn/completed",
+                            "params": {"threadId": THREAD}}).encode()),
+            (1, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}).encode()),
+        ])
+
+        result = QUEUE._WebSocket.request(client, "thread/queue/list", {"threadId": THREAD})
+
+        self.assertEqual(result, {"ok": True})
+        # Only the outgoing queue request was written; the server request was not answered.
+        client._send_frame.assert_called_once()
+
+    def test_delivery_session_reuses_and_closes_one_initialized_connection(self):
+        client = mock.Mock()
+        client.request.side_effect = [{"first": True}, {"second": True}]
+        with mock.patch.object(QUEUE, "resolve_endpoint", return_value=SOCKET), \
+             mock.patch.object(QUEUE, "_connect", return_value=client) as connect:
+            with QUEUE.DeliverySession(SOCKET) as session:
+                self.assertEqual(QUEUE._rpc(SOCKET, "thread/read", {}, timeout=1, session=session),
+                                 {"first": True})
+                self.assertEqual(QUEUE._rpc(SOCKET, "thread/queue/list", {}, timeout=1, session=session),
+                                 {"second": True})
+        connect.assert_called_once_with(SOCKET, 1)
+        self.assertEqual(client.request.call_count, 2)
+        client.close.assert_called_once()
+
+    def test_delivery_session_rebind_requires_a_new_exact_state_pass(self):
+        client = mock.Mock()
+        client.request.return_value = {"ok": True}
+        with mock.patch.object(QUEUE, "resolve_endpoint", side_effect=[SOCKET, Path("/tmp/other.sock")]), \
+             mock.patch.object(QUEUE, "_connect", return_value=client):
+            session = QUEUE.DeliverySession(SOCKET)
+            self.assertEqual(session.request(SOCKET, "thread/read", {}, timeout=1), {"ok": True})
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "queue-session-endpoint-changed"):
+                session.request(SOCKET, "thread/queue/list", {}, timeout=1)
+        client.request.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_notification_flood_cannot_extend_one_rpc_deadline(self):
+        client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
+        client.timeout = 0.01
+        client.socket = mock.Mock()
+        client.next_id = 1
+        client.request_sent = False
+        client._send_frame = mock.Mock()
+        client._recv_message = mock.Mock(return_value=(1, json.dumps({
+            "jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": THREAD},
+        }).encode()))
+
+        with self.assertRaises(QUEUE.QueueDeliveryError) as caught:
+            QUEUE._WebSocket.request(client, "thread/read", {"threadId": THREAD})
+
+        self.assertEqual(caught.exception.reason, "queue-websocket-timeout")
+        self.assertTrue(caught.exception.ambiguous)
+
+    def test_add_disconnect_after_send_is_ambiguous(self):
+        client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
+        client.timeout = 1.0
+        client.socket = mock.Mock()
+        client.socket.recv.return_value = b""
+        client.buffer = bytearray()
+        client.next_id = 1
+        client.request_sent = False
+        client._send_frame = mock.Mock()
+
+        with self.assertRaises(QUEUE.QueueDeliveryError) as caught:
+            QUEUE._WebSocket.request(client, "thread/queue/add", {"threadId": THREAD})
+
+        self.assertTrue(caught.exception.ambiguous)
+
+    def test_read_response_overflow_remains_definite_for_peer_history_paging(self):
+        client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
+        client.timeout = 1.0
+        client.socket = mock.Mock()
+        client.socket.recv.return_value = b"\x81\x7f" + struct.pack("!Q", QUEUE.MAX_FRAME_BYTES + 1)
+        client.buffer = bytearray()
+        client.next_id = 1
+        client.request_sent = False
+        client._send_frame = mock.Mock()
+
+        with self.assertRaises(QUEUE.QueueDeliveryError) as caught:
+            QUEUE._WebSocket.request(client, "thread/turns/list", {"threadId": THREAD})
+
+        self.assertEqual(caught.exception.reason, "queue-websocket-message-oversized")
+        self.assertFalse(caught.exception.ambiguous)
+
     def test_idle_queue_add_does_not_race_with_tui_wakeup(self):
         with mock.patch.object(QUEUE, "list_queue", return_value=[]), \
              mock.patch.object(QUEUE, "_latest_turn_status", return_value="completed"), \
