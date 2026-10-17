@@ -84,6 +84,84 @@ class NativeDriverContractTest(unittest.TestCase):
             self.assertTrue(row["stdout_hmac"])
             self.assertTrue(row["stderr_reason"] == "exit-0")
 
+    def test_busy_probe_uses_command_wrapper_and_records_redacted_native_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            fake_herdr = root / "herdr-fixture"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "args = sys.argv[1:]\n"
+                "if 'prompt' in args:\n"
+                "    state = 'working'\n"
+                "else:\n"
+                "    state = args[args.index('--until') + 1]\n"
+                "print(json.dumps({'result': {'agent': {'agent_status': state}}}))\n",
+                encoding="utf-8")
+            fake_herdr.chmod(0o700)
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "codex-busy", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10", "--herdr", str(fake_herdr),
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver.herdr = str(fake_herdr)
+
+            outcome = driver._busy_probe("codex", "private-pane", {
+                "name": "private-agent", "pane_id": "private-pane", "session_id": "native-sid",
+                "get_reason": "exit-0", "session_confirmed_by_get": True,
+            })
+
+            self.assertTrue(outcome["working_wait"]["matched_requested_state"])
+            self.assertTrue(outcome["idle_wait"]["matched_requested_state"])
+            self.assertTrue(outcome["native_metadata"]["working_observed"])
+            self.assertFalse(outcome["native_metadata"]["stream_metadata_observed"])
+            self.assertFalse(outcome["advisory_enqueue"]["accepted"])
+            self.assertEqual(outcome["outcome"], "unavailable")
+            rows = [json.loads(line) for line in driver.commands_path.read_text().splitlines()]
+            prompt = next(row for row in rows if row["step"] == "native-codex-busy-probe")
+            self.assertTrue(prompt["native_output_not_recorded"])
+            self.assertIn("[redacted]", prompt["argv"])
+            self.assertTrue(prompt["stdout_hmac"])
+            rendered = driver.commands_path.read_text(encoding="utf-8")
+            self.assertNotIn("Run one bounded shell command", rendered)
+            self.assertNotIn('"agent_status": "working"', rendered)
+
+    def test_zero_exit_error_envelope_does_not_count_as_native_working(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            fake_herdr = root / "herdr-fixture"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "if 'prompt' in sys.argv:\n"
+                "    print(json.dumps({'error': {'code': 'native_auth_required'}}))\n"
+                "else:\n"
+                "    print(json.dumps({'result': {'agent': {'agent_status': 'working'}}}))\n",
+                encoding="utf-8")
+            fake_herdr.chmod(0o700)
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "codex-busy", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10", "--herdr", str(fake_herdr),
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver.herdr = str(fake_herdr)
+
+            outcome = driver._busy_probe("codex", "private-pane", {
+                "name": "private-agent", "pane_id": "private-pane", "session_id": "native-sid",
+                "get_reason": "exit-0", "session_confirmed_by_get": True,
+            })
+
+            self.assertFalse(outcome["prompt"]["accepted"])
+            self.assertEqual(outcome["prompt"]["error_code"], "native_auth_required")
+            self.assertFalse(outcome["native_metadata"]["working_observed"])
+            self.assertIsNone(outcome["working_wait"])
+            self.assertIsNone(outcome["idle_wait"])
+            self.assertEqual(outcome["outcome"], "unavailable")
+
     def test_seeded_native_callback_redirect_keeps_a_spaced_private_path_as_one_target(self):
         with tempfile.TemporaryDirectory(prefix="hearting callback ") as temporary:
             root = Path(temporary)
