@@ -2865,12 +2865,12 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                    "server": "named", "armed_ts": "then", "until": ["idle"],
                    "agent": {"harness": "codex", "session_id": "sid-watch", "pane": "w1:p9"},
                    "steward": {"harness": "claude", "session_id": "sid-steward"},
-                   "watcher": {"pid": 321, "pid_start": "654"}, "refs": ["attempt-one"]}
+                   "watcher": {"pid": 321, "pid_start": "654"}, "refs": ["attempt-one"],
+                   "rearm_count": 0, "observer_generation": 1}
             paths = peer_steward._watch_paths(watch_id, root)
             binding = "/fixture/managed/current"
-            required = ("__watch-run", "--watch-id", watch_id,
-                        "--target", "fixture-target", "--server", "named",
-                        "--expected-harness", "codex", "--expected-session-id", "sid-watch")
+            required = peer_steward._watch_observer_duty_argv(
+                watch_id, arm, rearm_generation=0, timeout_before_refs=True)
             with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
                  mock.patch.object(peer_steward, "_watch_entries", return_value=[(watch_id, arm)]), \
                  mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
@@ -2887,7 +2887,8 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                 peer_steward._ensure_watch_observers(service_current=binding)
             replace.assert_called_once_with(
                 321, "654", paths.lock, "utilities/peer-steward.py", required,
-                binding, lock_fd_option="--lock-fd")
+                binding, lock_fd_option="--lock-fd", exact_arguments=True,
+                argument_variants=[])
             spawn.assert_called_once_with(watch_id, arm, service_current=binding)
 
 

@@ -3385,26 +3385,6 @@ def cmd_watch(args):
             return _unavailable("watch-lock-contended")
         os.set_inheritable(lock_fd, True)
 
-        argv = [
-            sys.executable, str(Path(__file__).resolve()), "__watch-run",
-            "--watch-id", watch_id, "--target", target,
-            "--server", server,
-            "--expected-harness", agent["harness"], "--expected-session-id", agent["session_id"],
-            "--expected-pane", agent["pane"],
-            "--steward-harness", steward_harness, "--steward-session-id", steward_sid,
-            "--steward-project", steward_project, "--armed-ts", armed_ts,
-            "--rearm-count", str(args.rearm_count or 0),
-            "--lock-fd", str(lock_fd),
-        ]
-        for state_name in until:
-            argv += ["--until", state_name]
-        if args.timeout is not None:
-            argv += ["--timeout", str(args.timeout)]
-        for ref in args.ref or []:
-            argv += ["--ref", ref]
-        if getattr(args, "rearmed_from", None):
-            argv += ["--rearmed-from", args.rearmed_from]
-
         arm = {
             "schema_version": _WATCH_SCHEMA,
             "watch_id": watch_id,
@@ -3431,6 +3411,9 @@ def cmd_watch(args):
             "observer_generation": 1,
             "foreground_identity": foreground_identity,
         }
+        argv = [sys.executable, str(Path(__file__).resolve()), *_watch_observer_duty_argv(
+            watch_id, arm, rearm_generation=args.rearm_count or 0,
+            lock_fd=lock_fd, timeout_before_refs=True)]
         _write_json_atomic(paths.arm, arm)
         # Acceptance and the stable claim precede the observer side effect.
         _write_watch_claim(logical_fd, watch_id)
@@ -3458,36 +3441,7 @@ def cmd_watch(args):
         # descriptor for the same open file description.
         os.close(lock_fd)
 
-        # Spawn first, then the immutable arm record already carrying the real
-        # watcher identity. The reverse order would need a mutable record or a
-        # second write. It is safe because the watcher takes target, until,
-        # timeout and steward identity from argv and never reads the arm record.
-        arm = {
-            "schema_version": _WATCH_SCHEMA,
-            "watch_id": watch_id,
-            "target": target,
-            "claim_key": logical_key,
-            "until": until,
-            "timeout": args.timeout,
-            "refs": list(args.ref or []),
-            "server": server,
-            "agent": {key: agent.get(key, "-") for key in ("harness", "session_id", "name", "pane")},
-            "steward": {
-                "harness": steward_harness,
-                "session_id": steward_sid,
-                "project": steward_project,
-            },
-            "steward_seat": steward_seat,
-            "armed_ts": armed_ts,
-            "deadline": deadline,
-            "observer_protocol": 2,
-            "wake": wake,
-            "watcher": {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""},
-            "rearmed_from": getattr(args, "rearmed_from", None) or None,
-            "rearm_count": int(args.rearm_count or 0),
-            "observer_generation": 1,
-            "foreground_identity": foreground_identity,
-        }
+        arm["watcher"] = {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""}
         _write_json_atomic(paths.arm, arm)
 
         for old_id, old_arm in superseded:
@@ -4282,6 +4236,46 @@ def _watch_entries(root):
     return entries
 
 
+def _watch_observer_duty_argv(watch_id, arm, *, rearm_generation, lock_fd=None,
+                              service_current=None, timeout_before_refs=False,
+                              include_rearmed_from=True):
+    """Build the accepted watch contract, with service controls kept separate."""
+    agent = arm.get("agent") or {}
+    steward = arm.get("steward") or {}
+    argv = [
+        "__watch-run", "--watch-id", str(watch_id),
+        "--target", str(arm.get("target", "")),
+        "--server", str(arm.get("server") or "default"),
+        "--expected-harness", str(agent.get("harness", "-")),
+        "--expected-session-id", str(agent.get("session_id", "-")),
+        "--expected-pane", str(agent.get("pane", "-")),
+        "--steward-harness", str(steward.get("harness", "unknown")),
+        "--steward-session-id", str(steward.get("session_id", "")),
+        "--steward-project", str(steward.get("project", "")),
+        "--armed-ts", str(arm.get("armed_ts", "")),
+        "--rearm-count", str(int(rearm_generation)),
+    ]
+    if lock_fd is not None:
+        argv.extend(("--lock-fd", str(lock_fd)))
+    until = list(arm.get("until") or [])
+    refs = list(arm.get("refs") or [])
+    timeout = arm.get("timeout")
+    for state in until:
+        argv.extend(("--until", str(state)))
+    if timeout_before_refs and timeout is not None:
+        argv.extend(("--timeout", str(timeout)))
+    for ref in refs:
+        argv.extend(("--ref", str(ref)))
+    if not timeout_before_refs and timeout is not None:
+        argv.extend(("--timeout", str(timeout)))
+    rearmed_from = arm.get("rearmed_from")
+    if include_rearmed_from and rearmed_from:
+        argv.extend(("--rearmed-from", str(rearmed_from)))
+    if service_current:
+        argv.extend(("--service-current", str(service_current)))
+    return argv
+
+
 def _spawn_watch_observer(watch_id, arm, *, service_current=None):
     """Reattach the observer to accepted intent without changing its identity."""
     if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
@@ -4324,28 +4318,11 @@ def _spawn_watch_observer(watch_id, arm, *, service_current=None):
         env = _herdr_env_for_server(server)
         script, child_env, binding = peer_obligations.service_script(
             "utilities/peer-steward.py", service_current, environ=env)
-        argv = [
-            sys.executable, str(script), "__watch-run",
-            "--watch-id", watch_id, "--target", arm["target"], "--server", server,
-            "--expected-harness", agent["harness"], "--expected-session-id", agent["session_id"],
-            "--expected-pane", agent["pane"],
-            "--steward-harness", (arm.get("steward") or {}).get("harness", "unknown"),
-            "--steward-session-id", (arm.get("steward") or {}).get("session_id", ""),
-            "--steward-project", (arm.get("steward") or {}).get("project", ""),
-            "--armed-ts", arm.get("armed_ts", ""),
-            "--rearm-count", str(int(arm.get("observer_generation", 1))),
-            "--lock-fd", str(lock_fd),
-        ]
-        for state in arm.get("until") or []:
-            argv.extend(("--until", state))
-        for ref in arm.get("refs") or []:
-            argv.extend(("--ref", ref))
-        if arm.get("timeout") is not None:
-            argv.extend(("--timeout", str(arm["timeout"])))
+        argv = [sys.executable, str(script), *_watch_observer_duty_argv(
+            watch_id, arm, rearm_generation=int(arm.get("observer_generation", 1)),
+            lock_fd=lock_fd, service_current=binding)]
         if child_env is not None:
             env = child_env
-        if binding:
-            argv.extend(("--service-current", binding))
         try:
             proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
@@ -4369,6 +4346,40 @@ def _spawn_watch_observer(watch_id, arm, *, service_current=None):
         os.close(lock_fd)
 
 
+def _watch_observer_takeover_argvs(watch_id, arm):
+    """Return exact argv layouts supported by the recorded watch generation."""
+    generation = arm.get("observer_generation") if isinstance(arm, dict) else None
+    if (not isinstance(generation, int) or isinstance(generation, bool)
+            or generation < 1):
+        return None
+    try:
+        if generation == 1:
+            accepted_generation = arm.get("rearm_count")
+            if (not isinstance(accepted_generation, int)
+                    or isinstance(accepted_generation, bool) or accepted_generation < 0):
+                return None
+            return [_watch_observer_duty_argv(
+                watch_id, arm, rearm_generation=accepted_generation,
+                timeout_before_refs=True)]
+
+        # A successful restart records the next observer_generation only after
+        # spawning. The live process therefore carries the preceding value.
+        accepted_generation = generation - 1
+        current = _watch_observer_duty_argv(
+            watch_id, arm, rearm_generation=accepted_generation)
+        variants = [current]
+        # v3.35.28/.33 restart builders omitted this lineage-only option even
+        # when the arm retained it. Keep that exact historical argv readable.
+        legacy = _watch_observer_duty_argv(
+            watch_id, arm, rearm_generation=accepted_generation,
+            include_rearmed_from=False)
+        if legacy != current:
+            variants.append(legacy)
+        return variants
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _ensure_watch_observers(*, service_current=None):
     root = _watch_root()
     transports = {}
@@ -4384,16 +4395,16 @@ def _ensure_watch_observers(*, service_current=None):
                 agent = arm.get("agent") or {}
                 if not binding or not watcher.get("pid_start"):
                     continue
+                accepted_argvs = _watch_observer_takeover_argvs(watch_id, arm)
+                if not accepted_argvs:
+                    continue
                 replaced = peer_obligations.replace_managed_observer(
                     watcher.get("pid"), watcher.get("pid_start"),
                     _watch_paths(watch_id, root).lock,
                     "utilities/peer-steward.py",
-                    ("__watch-run", "--watch-id", watch_id,
-                     "--target", arm.get("target", ""),
-                     "--server", arm.get("server") or "default",
-                     "--expected-harness", agent.get("harness", ""),
-                     "--expected-session-id", agent.get("session_id", "")),
+                    accepted_argvs[0],
                     binding, lock_fd_option="--lock-fd",
+                    exact_arguments=True, argument_variants=accepted_argvs[1:],
                 )
                 if replaced != "replaced":
                     continue

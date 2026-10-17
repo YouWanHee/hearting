@@ -264,7 +264,10 @@ def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
 def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                              relative_script: str | Path, required_arguments: Iterable[str],
                              service_current: str | Path, *, lock_fd_option: str,
-                             root=None, timeout: float = 2.0):
+                             root=None, timeout: float = 2.0,
+                             exact_arguments: bool = False,
+                             argument_variants: Iterable[Iterable[str]] = (),
+                             service_current_option: str = "--service-current"):
     """Stop one exact old observer after proving its same-install duty lock.
 
     Returns ``current`` for an already-current observer, ``replaced`` after
@@ -273,18 +276,26 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
     """
     try:
         code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
-        binding = validate_service_binding(service_current, root=code_root)
-        target_root = active_service_root(binding, root=code_root) if binding else None
-        if target_root is None or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
             return False
         pid = int(pid)
         expected_start = str(pid_start)
         lock = Path(lock_path).resolve(strict=True)
         relative = Path(relative_script)
         expected_args = list(map(str, required_arguments))
+        expected_variants = [expected_args]
+        if exact_arguments:
+            expected_variants.extend(list(map(str, variant)) for variant in argument_variants)
         pidfd = os.pidfd_open(pid)
         try:
             def inspect():
+                # Resolve the managed target for every inspection. Activation
+                # may change the current release between the initial check and
+                # the pidfd signal boundary.
+                binding = validate_service_binding(service_current, root=code_root)
+                target_root = active_service_root(binding, root=code_root) if binding else None
+                if target_root is None:
+                    return None
                 if _proc_start_identity(pid) != expected_start:
                     return None
                 namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
@@ -305,8 +316,36 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                         or source_layout[1] != target_layout[1]
                         or source_layout[3] != target_layout[3]):
                     return None
-                if not any(argv[i:i + len(expected_args)] == expected_args
-                           for i in range(2, len(argv) - len(expected_args) + 1)):
+                lock_fd_number = None
+                if exact_arguments:
+                    duty_arguments = []
+                    control_values = {}
+                    control_options = {lock_fd_option, service_current_option}
+                    index = 2
+                    while index < len(argv):
+                        option = argv[index]
+                        if option in control_options:
+                            if option in control_values or index + 1 >= len(argv):
+                                return None
+                            value = argv[index + 1]
+                            if not value or value.startswith("--"):
+                                return None
+                            control_values[option] = value
+                            index += 2
+                            continue
+                        duty_arguments.append(option)
+                        index += 1
+                    if duty_arguments not in expected_variants:
+                        return None
+                    lock_fd_number = control_values.get(lock_fd_option)
+                    if lock_fd_number is None or not lock_fd_number.isdecimal():
+                        return None
+                    observed_binding = control_values.get(service_current_option)
+                    if observed_binding is not None and (
+                            validate_service_binding(observed_binding, root=code_root) != binding):
+                        return None
+                elif not any(argv[i:i + len(expected_args)] == expected_args
+                             for i in range(2, len(argv) - len(expected_args) + 1)):
                     return None
                 try:
                     env = {}
@@ -319,12 +358,13 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                 except (OSError, RuntimeError, ValueError):
                     return None
                 try:
-                    fd_index = argv.index(lock_fd_option)
-                    fd_number = argv[fd_index + 1]
-                    held_path = Path(os.path.realpath(proc / "fd" / fd_number))
+                    if lock_fd_number is None:
+                        fd_index = argv.index(lock_fd_option)
+                        lock_fd_number = argv[fd_index + 1]
+                    held_path = Path(os.path.realpath(proc / "fd" / lock_fd_number))
                 except (ValueError, IndexError, OSError):
                     return None
-                if held_path != lock or not _process_holds_flock(pid, lock, fd_number):
+                if held_path != lock or not _process_holds_flock(pid, lock, lock_fd_number):
                     return None
                 if source_root == target_root:
                     return ("current", None)
@@ -337,8 +377,11 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                 return "current"
             # Recheck all evidence immediately before signaling the pidfd-bound
             # process. A stale PID or changed duty lock cannot authorize this.
-            if inspect() is None:
+            status = inspect()
+            if status is None:
                 return False
+            if status[0] == "current":
+                return "current"
             signal.pidfd_send_signal(pidfd, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, timeout)
             while time.monotonic() < deadline:
