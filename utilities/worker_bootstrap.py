@@ -257,6 +257,8 @@ class NodeScope(NamedTuple):
 
 def resolve_node_scope(
     route, node_id: str | None, environ, *, parent_attempt_id: str | None = None,
+    route_file: str | Path | None = None, source_worktree: str | Path | None = None,
+    source_worktree_verified: bool = False,
 ) -> NodeScope:
     """One resolver for "what is this node's write scope, as an absolute path".
 
@@ -268,6 +270,43 @@ def resolve_node_scope(
     Neither source available means the caller must say so, not guess a
     root-relative path that the write oracle then refuses.
     """
+    # Sealed routes go through the shared resolver. Keep the small legacy
+    # projection below for pre-route callers and minimal import fixtures only.
+    if route.get("route_id") and route.get("route_hash") and route.get("artifact_root"):
+        import artifact_context
+        context = artifact_context.resolve_context(
+            environ=environ, route=route, node_id=node_id,
+            parent_attempt_id=parent_attempt_id,
+            route_file=route_file,
+            explicit=({"source_worktree": source_worktree,
+                       "source_worktree_verified": source_worktree_verified}
+                      if source_worktree is not None else None),
+        )
+        node = context.node
+        outputs = tuple((node or {}).get("outputs", []))
+        write_scope = tuple((node or {}).get("write_scope", []))
+        if (route.get("capability") == "autopilot-code"
+                and route.get("effective_intensity") == "quick" and node_id == "one-shot"
+                and (node or {}).get("kind") == "capability-owner"
+                and (node or {}).get("unit") == "_kernel/owner"
+                and set(write_scope) == {"source-scoped", "plans/<cycle>/**"}):
+            write_scope = ("source-scoped", "**")
+        has_matching_env = bool(context.cycle_record and environ.get("AGENT_ARTIFACT_OUTPUT_DIR")) and all(
+            not environ.get(key) or environ.get(key) == expected
+            for key, expected in (
+                ("AGENT_ARTIFACT_CYCLE_ID", context.cycle_record.get("cycle_id")),
+                ("AGENT_ARTIFACT_CAMPAIGN_ID", context.cycle_record.get("campaign_id")),
+                ("AGENT_ARTIFACT_PRODUCER_ID", context.cycle_record.get("producer_id")),
+            )
+        ) and not context.inherited_cycle_mismatch
+        source = ("env" if has_matching_env else
+                  "producer-binding" if context.output_dir else "unbound")
+        return NodeScope(
+            str(context.output_dir) if context.output_dir else None,
+            str(context.source_worktree) if context.source_worktree else None,
+            outputs, write_scope, source,
+        )
+
     node = None
     if node_id:
         node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
@@ -309,7 +348,8 @@ def resolve_node_scope(
 
 
 def _resolved_paths(output_dir: str, paths) -> list[str]:
-    return [str(Path(output_dir) / path) for path in paths]
+    import artifact_context
+    return artifact_context.render_outputs(output_dir, paths)
 
 
 def route_node_commit_expected(route, node_id: str | None, worker_type: str,
@@ -350,15 +390,19 @@ def stage_commit_enabled(args) -> bool:
 
 def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
     """Resolve repository mutation vocabulary separately from artifact scopes."""
+    import artifact_context
     artifact, source = [], []
     for value in scope.write_scope:
         path = Path(value)
         if path.is_absolute():
             (source if scope.worktree_dir and path.is_relative_to(scope.worktree_dir) else artifact).append(str(path))
-        elif value in ("source-scoped", "source/**", "source-alternative/**"):
+        elif artifact_context.classify_scope(value) == "source" and value in (
+                "source-scoped", "source/**", "source-alternative/**"):
             source.append(str(Path(scope.worktree_dir) / "**") if scope.worktree_dir else value)
-        elif value.startswith("tests/"):
+        elif artifact_context.classify_scope(value) == "source":
             source.append(str(Path(scope.worktree_dir) / value) if scope.worktree_dir else value)
+        elif artifact_context.classify_scope(value) == "target":
+            artifact.append(value)
         elif scope.output_dir:
             artifact.append(str(Path(scope.output_dir) / value))
         else:
@@ -631,6 +675,44 @@ def owner_close_prompt(args) -> str:
     return "\n".join(lines) + ("\n\n" if lines else "")
 
 
+def _child_scope_environment(args, route, environ, source_worktree=None):
+    """Project validated launch identity over the caller's context for scope lookup.
+
+    Prompt construction runs before adapters build the child environment. Keep
+    inherited producer-cycle and review bindings intact, while replacing the
+    parent-specific route node/worktree with the child values already checked
+    by the wrapper. The linked-slice worktree is supplied only by
+    ``_linked_slice_source_worktree`` after its parent and repository checks.
+    """
+    child = dict(environ or {})
+    route_file = getattr(args, "route_file", None)
+    route_id = getattr(args, "route_id", None) or route.get("route_id")
+    artifact_root = getattr(args, "artifact_root", None) or route.get("artifact_root")
+    node_id = getattr(args, "route_node", None)
+    binding = getattr(args, "review_output_binding", None)
+    worktree = (source_worktree
+                or (binding or {}).get("worktree")
+                or getattr(args, "worktree", None)
+                or route.get("cwd"))
+
+    if route_file:
+        child["AGENT_ROUTE_FILE"] = str(route_file)
+    if route_id:
+        child["AGENT_ROUTE_ID"] = str(route_id)
+    child["AGENT_ROUTE_NODE"] = str(node_id or "")
+    if artifact_root:
+        child["AGENT_ARTIFACT_ROOT"] = str(artifact_root)
+    if worktree:
+        child["AGENT_DISPATCH_WORKTREE"] = str(worktree)
+    parent_attempt_id = getattr(args, "parent_attempt_id", None)
+    if parent_attempt_id:
+        child["AGENT_DISPATCH_PARENT_ATTEMPT_ID"] = str(parent_attempt_id)
+    attempt_id = getattr(args, "attempt_id", None)
+    if attempt_id:
+        child["AGENT_DISPATCH_ATTEMPT_ID"] = str(attempt_id)
+    return child
+
+
 def assignment_prompt(args, task: str, environ) -> str:
     """Project the route's input/output boundary, rather than ask a caller to copy it.
 
@@ -643,9 +725,14 @@ def assignment_prompt(args, task: str, environ) -> str:
         if not route_file:
             return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        source_worktree = _linked_slice_source_worktree(args, route)
+        scope_environment = _child_scope_environment(args, route, environ, source_worktree)
         scope = resolve_node_scope(
-            route, getattr(args, "route_node", None), environ,
+            route, getattr(args, "route_node", None), scope_environment,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            route_file=route_file,
+            source_worktree=source_worktree,
+            source_worktree_verified=source_worktree is not None,
         )
         return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
@@ -655,9 +742,14 @@ def assignment_prompt(args, task: str, environ) -> str:
     route_file = getattr(args, "route_file", None)
     if route_file:
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        source_worktree = _linked_slice_source_worktree(args, route)
+        scope_environment = _child_scope_environment(args, route, environ, source_worktree)
         scope = resolve_node_scope(
-            route, getattr(args, "route_node", None), environ,
+            route, getattr(args, "route_node", None), scope_environment,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            route_file=route_file,
+            source_worktree=source_worktree,
+            source_worktree_verified=source_worktree is not None,
         )
         outputs = (
             _resolved_paths(scope.output_dir, scope.outputs) if scope.output_dir else list(scope.outputs)
@@ -671,6 +763,43 @@ def assignment_prompt(args, task: str, environ) -> str:
         + ("This frame's declared output: " + json.dumps(outputs, ensure_ascii=False) + "\n" if outputs else "")
         + "\n"
     )
+
+
+def _linked_slice_source_worktree(args, route) -> Path | None:
+    """Reuse the wrapper's exact live-parent validation for a declared slice.
+
+    Only a stage-authority-zero sub-session with the exact resolved parent may
+    use its linked execution worktree for source provenance. Ordinary children,
+    incomplete bindings, and review-bound launches keep the route/environment
+    worktree check unchanged.
+    """
+    candidate = getattr(args, "worktree", None)
+    parent = getattr(args, "parent_binding", None)
+    parent_attempt_id = getattr(args, "parent_attempt_id", None)
+    if (not candidate or not parent or not parent_attempt_id
+            or getattr(parent, "attempt_id", None) != parent_attempt_id
+            or getattr(args, "review_output_binding", None)):
+        return None
+    metadata = {
+        "subsession_id": getattr(args, "subsession_id", None),
+        "stage_authority": str(getattr(args, "stage_authority", 1)),
+    }
+    import dispatch_contract
+    if not dispatch_contract.is_linked_worktree_slice(metadata):
+        return None
+    sealed = route.get("cwd")
+    parent_worktree = getattr(parent, "worktree", None)
+    if not sealed or not parent_worktree:
+        return None
+    sealed_path = Path(str(sealed)).expanduser().resolve(strict=False)
+    parent_path = Path(str(parent_worktree)).expanduser().resolve(strict=False)
+    source_path = Path(str(candidate)).expanduser().resolve(strict=False)
+    if parent_path != sealed_path or source_path == sealed_path:
+        return None
+    if (dispatch_contract.canonical_repository_identity(source_path)
+            != dispatch_contract.canonical_repository_identity(sealed_path)):
+        return None
+    return source_path
 
 
 def worker_ending_prompt(*, supervised_owner: bool = False) -> str:

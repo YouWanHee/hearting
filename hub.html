@@ -449,7 +449,7 @@
   "manifest_version": "2.0.0",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:d370c7e65b9938c660e7cb811fc8cc35ca568cd75bcf2c860f92930e116f1497",
+    "digest": "sha256:67471577db7a8f65d3c1ae24df920d33031882ae214c938db8d1a628b26bfc2a",
     "capabilities": 13,
     "recipes": 29
   },
@@ -836,13 +836,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__herdr-agent-state__PermissionRequest",
-      "name": "herdr-agent-state blocked",
-      "mono": "herdr-agent-state",
-      "event": "PermissionRequest",
-      "hard_block": false
-    },
-    {
       "slug": "hook__worker-state-compact.py__PostCompact",
       "name": "worker-state-compact.py compact-after",
       "mono": "worker-state-compact.py",
@@ -881,6 +874,13 @@
       "slug": "hook__frame-native-answer.py__PostToolUse",
       "name": "frame-native-answer.py",
       "mono": "frame-native-answer.py",
+      "event": "PostToolUse",
+      "hard_block": false
+    },
+    {
+      "slug": "hook__git-index-lock-context.py__PostToolUse",
+      "name": "git-index-lock-context.py claude",
+      "mono": "git-index-lock-context.py",
       "event": "PostToolUse",
       "hard_block": false
     },
@@ -927,6 +927,13 @@
       "hard_block": false
     },
     {
+      "slug": "hook__git-index-lock-context.py__PostToolUseFailure",
+      "name": "git-index-lock-context.py claude",
+      "mono": "git-index-lock-context.py",
+      "event": "PostToolUseFailure",
+      "hard_block": false
+    },
+    {
       "slug": "hook__worker-state-compact.py__PreCompact",
       "name": "worker-state-compact.py compact-before",
       "mono": "worker-state-compact.py",
@@ -944,13 +951,6 @@
       "slug": "hook__fleet-interaction-state.py__PreToolUse",
       "name": "fleet-interaction-state.py set",
       "mono": "fleet-interaction-state.py",
-      "event": "PreToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__herdr-agent-state__PreToolUse",
-      "name": "herdr-agent-state working",
-      "mono": "herdr-agent-state",
       "event": "PreToolUse",
       "hard_block": false
     },
@@ -983,13 +983,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__herdr-agent-state__SessionEnd",
-      "name": "herdr-agent-state release",
-      "mono": "herdr-agent-state",
-      "event": "SessionEnd",
-      "hard_block": false
-    },
-    {
       "slug": "hook__-c__SessionStart",
       "name": "-c",
       "mono": "-c",
@@ -1005,7 +998,7 @@
     },
     {
       "slug": "hook__herdr-agent-state__SessionStart",
-      "name": "herdr-agent-state idle",
+      "name": "herdr-agent-state session",
       "mono": "herdr-agent-state",
       "event": "SessionStart",
       "hard_block": false
@@ -1046,13 +1039,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__herdr-agent-state__Stop",
-      "name": "herdr-agent-state idle",
-      "mono": "herdr-agent-state",
-      "event": "Stop",
-      "hard_block": false
-    },
-    {
       "slug": "hook__herdr-session-projection.py__Stop",
       "name": "herdr-session-projection.py",
       "mono": "herdr-session-projection.py",
@@ -1067,6 +1053,13 @@
       "hard_block": false
     },
     {
+      "slug": "hook__session-tidy-idle.py__Stop",
+      "name": "session-tidy-idle.py",
+      "mono": "session-tidy-idle.py",
+      "event": "Stop",
+      "hard_block": false
+    },
+    {
       "slug": "hook__dispatch-session-sweep.py__UserPromptSubmit",
       "name": "dispatch-session-sweep.py",
       "mono": "dispatch-session-sweep.py",
@@ -1077,13 +1070,6 @@
       "slug": "hook__fleet-interaction-state.py__UserPromptSubmit",
       "name": "fleet-interaction-state.py clear",
       "mono": "fleet-interaction-state.py",
-      "event": "UserPromptSubmit",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__herdr-agent-state__UserPromptSubmit",
-      "name": "herdr-agent-state working",
-      "mono": "herdr-agent-state",
       "event": "UserPromptSubmit",
       "hard_block": false
     },

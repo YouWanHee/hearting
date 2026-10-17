@@ -638,6 +638,34 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertTrue(receipt['replayed'])
         self.assertEqual(SUP.read_armed(ledger)['full-run'], final_armed)
 
+    def test_watch_armed_before_node_scope_keys_admits_next_run_and_replays(self):
+        # f7 2026-10-17: a watch armed by a release before write_scope/part_io existed refused
+        # the next run (`__a2`) after an update as resource-watch-binding-conflict.
+        route, path, jobs, registry, output, ledger = self.fixture()
+        SUP.poll_once(route, ledger)
+        arm_file = ledger.root / 'armed/full-run.json'
+        def strip():
+            legacy = json.loads(arm_file.read_text())
+            for key in ('write_scope', 'part_io'):
+                legacy.pop(key, None)
+            arm_file.write_text(json.dumps(legacy))
+            return legacy
+        legacy = strip()
+        body = self.next_body(registry, 'next', output)
+        procs, receipt = self.launch(route, path, jobs, registry, output, body)
+        self.assertEqual(len(procs), 1)
+        self.assertTrue(receipt['payload_spawned'])
+        armed = SUP.read_armed(ledger)['full-run']
+        self.assertEqual(armed['predecessor_id'], 'next')
+        self.assertTrue('write_scope' in armed and 'part_io' in armed)
+        self.assertTrue(any((entry.get('evidence') or {}).get('previous_resource') == legacy
+                            for entry in ledger.journal()))
+        legacy = strip()
+        procs, receipt = self.launch(route, path, jobs, registry, output, body)
+        self.assertEqual(procs, [])
+        self.assertTrue(receipt['replayed'])
+        self.assertEqual(SUP.read_armed(ledger)['full-run'], legacy)
+
     def test_new_registry_can_follow_but_live_or_unverifiable_prior_cannot(self):
         for invalid in (None, 'live', 'reused', 'sentinel', 'failed'):
             with self.subTest(invalid=invalid), self.subfixture():

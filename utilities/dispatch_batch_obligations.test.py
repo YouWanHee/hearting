@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -72,6 +73,19 @@ class BatchObligationTest(unittest.TestCase):
         with mock.patch.object(obligations.subprocess, "Popen") as launch:
             self.assertEqual(obligations.ensure_observers(self.jobs), 0)
         launch.assert_not_called()
+
+    def test_unowned_work_probe_is_read_only_and_uses_exact_observer_identity(self):
+        duty_id, _record = obligations.create(self.args)
+        path = obligations._record_path(self.jobs, duty_id)
+        before = path.read_bytes()
+        self.assertTrue(obligations.has_unowned_work(self.jobs))
+        self.assertEqual(path.read_bytes(), before)
+
+        obligations.update(self.jobs, duty_id, observer={
+            "pid": os.getpid(), "pid_start": obligations._pid_start(os.getpid())})
+        self.assertFalse(obligations.has_unowned_work(self.jobs))
+        obligations.update(self.jobs, duty_id, state="complete")
+        self.assertFalse(obligations.has_unowned_work(self.jobs))
 
 
 if __name__ == "__main__":

@@ -58,9 +58,20 @@ class RuntimeProjectionTest(unittest.TestCase):
         fixture = root / "python-fixture"
         fixture.mkdir(exist_ok=True)
         (fixture / "sitecustomize.py").write_text(
-            f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
+            f"import os, sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
             "import pane_ownership\n"
             "def admitted(pane,harness,sid=None,*,pid=None,**kw):\n"
+            "    if harness == 'codex':\n"
+            "        # Stand-in for the two-read footer proof: the footer names the thread the\n"
+            "        # pane has selected (HERDR_CURRENT_FOOTER), by default the one this\n"
+            "        # process holds open.\n"
+            "        current = os.environ.get('HERDR_CURRENT_PID')\n"
+            "        if pid is None or (current is not None and str(pid) != current):\n"
+            "            return ''\n"
+            "        footer = os.environ.get('HERDR_CURRENT_FOOTER')\n"
+            "        if footer is None:\n"
+            "            footer = pane_ownership._native_session(pid, 'codex')\n"
+            "        return (pane or '') if sid and sid == footer else ''\n"
             "    if pid is not None and sid and pane_ownership._native_session(pid,harness)!=sid:\n"
             "        return ''\n"
             "    return pane or ''\n"
@@ -189,18 +200,19 @@ class RuntimeProjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _, rows = self.project(root, sid, title="A title")
-            self.assertEqual(rows, [["pane","report-agent-session","pane-7","--source","herdr:codex","--agent","codex","--agent-session-id",sid], ["pane","report-metadata","pane-7","--source","herdr:codex","--display-agent",agent,"--title",agent + " A title"]])
+            self.assertEqual(rows, [["pane","report-metadata","pane-7","--source","herdr:codex","--display-agent",agent,"--title",agent + " A title"]])
+            self.assertNotIn("report-agent-session", [row[1] for row in rows])
             _, rows = self.project(root, sid, title="{")
             # No summary is not "no header": the number still has to reach the pane.
-            self.assertEqual(rows[1][rows[1].index("--title") + 1], agent)
+            self.assertEqual(rows[0][rows[0].index("--title") + 1], agent)
             _, rows = self.project(root, sid, title="가" * 60)
-            projected = rows[1][rows[1].index("--title") + 1]
+            projected = rows[0][rows[0].index("--title") + 1]
             # Identity first and whole; the summary is what yields to the budget.
             self.assertTrue(projected.startswith(agent + " "), projected)
             self.assertTrue(projected.endswith("…"), projected)
             for mode in ("nonzero", "timeout"):
                 _, rows = self.project(root, sid, mode=mode)
-                self.assertEqual(len(rows), 2)
+                self.assertEqual(len(rows), 1)
             before = root / "codex/config.toml"
             self.assertFalse(before.exists())
             _, rows = self.project(root, sid, worker=True)
@@ -225,21 +237,21 @@ class RuntimeProjectionTest(unittest.TestCase):
             # A personal formatter renames the middle harness word only: the `[tag]` badge
             # and the steward mark are hearting's, composed OUTSIDE the formatter result,
             # so a formatter cannot quietly delete the two things that identify a session.
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Session summary" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nprint('{')\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Fallback", formatter=formatter)
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Fallback" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nimport time;time.sleep(.5)\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Timeout", formatter=formatter)
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Timeout" % minted_tag(sid)])
 
@@ -267,7 +279,7 @@ class RuntimeProjectionTest(unittest.TestCase):
                     self.assertIn(expected, self.statusline(root, sid, title).stdout)
                 else:
                     _, rows = self.project(root, sid, title=title)
-                    self.assertEqual(rows[1][-1], "[%s] codex %s" % (minted_tag(sid), title))
+                    self.assertEqual(rows[0][-1], "[%s] codex %s" % (minted_tag(sid), title))
 
     def test_pane_header_order_is_number_then_steward_then_harness(self):
         """User-fixed format `[번호] (⚑) 하네스 요약` (2026-09-09; ⚑ moved before the harness
@@ -285,8 +297,8 @@ class RuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(agent, "[3a] ⚑ codex")
         self.assertLess(len(title), 80)
 
-    def test_claude_hook_reports_current_session_and_metadata_together(self):
-        """The common publisher repairs native ID continuity and paints its header."""
+    def test_claude_display_hook_publishes_metadata_without_duplicate_session_lifecycle(self):
+        """The native SessionStart integration owns lifecycle; Hearting paints metadata."""
         with tempfile.TemporaryDirectory() as td:
             root, sid = Path(td), "abcdefgh-claude"
             sidecar = root / "titles/claude" / (sid + ".json")
@@ -295,11 +307,9 @@ class RuntimeProjectionTest(unittest.TestCase):
             result, rows = self.claude_hook(root, sid)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
-            self.assertEqual([row[1] for row in rows], ["report-agent-session", "report-metadata"])
-            self.assertEqual(rows[0][4:], ["herdr:claude", "--agent", "claude",
-                                         "--agent-session-id", sid])
-            self.assertEqual(rows[1][4:], ["herdr:claude", "--display-agent", "claude",
-                                           "--title", "claude Claude pane title"])
+            self.assertEqual([row[1] for row in rows], ["report-metadata"])
+            self.assertEqual(rows[0][4:], ["herdr:claude", "--display-agent", "claude",
+                                          "--title", "claude Claude pane title"])
 
     def test_claude_hook_skips_a_registered_worker(self):
         with tempfile.TemporaryDirectory() as td:
@@ -329,11 +339,13 @@ class RuntimeProjectionTest(unittest.TestCase):
                                        worker=True)
                 self.assertEqual(rows, [], harness)
 
-    def test_codex_prompt_hook_with_a_fake_session_never_reaches_the_live_pane(self):
+    def test_codex_prompt_hook_never_reports_a_fake_session_and_projects_only_current_metadata(self):
         """The 2026-09-24 leak: `portable-guards.test.sh` fed `directpromptsid` to the Codex
         prompt hook while inheriting the pane's HERDR_*, and a live header read
         `[0d] codex`. The hook's process is not that session's runtime, so nothing is sent
-        — neither the header nor `report-agent-session`. Asserted in every case, whatever
+        for a fake session. The active native SessionStart hook owns session reporting;
+        this prompt hook may publish metadata only for the exact current thread. Asserted
+        in every case, whatever
         runtime happens to run this suite: a Codex hook gets no `CODEX_THREAD_ID`
         (measured 2026-09-25), and when one is set it proves nothing either."""
         hook = ROOT / "adapters/codex/hooks/userprompt-lifecycle.py"
@@ -368,7 +380,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                                env=env, capture_output=True, timeout=90, check=True)
                 case = (session, thread, held)
                 if reported:
-                    self.assertIn("report-agent-session", log.read_text(), case)
+                    rows = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual([row[1] for row in rows], ["report-metadata"], case)
                 else:
                     self.assertEqual(log.read_text(), "", case)
 
@@ -403,9 +416,14 @@ class RuntimeProjectionTest(unittest.TestCase):
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "wB:pN",
                     "HERDR_SOCKET_PATH": str(root / "live.sock"),
                     "HERDR_LOG": str(log), "HERDR_MODE": "ok", "HERDR_EXIT": "0"})
-        runner = prelude + ("import subprocess,sys;subprocess.run([%r,%r],input=sys.argv[1],"
-                            "text=True,capture_output=True,timeout=60)"
-                            % (sys.executable, str(hook)))
+        # The footer names one thread only for one rollout and no competing sibling; an
+        # ambiguous pair leaves it unreadable, which proves nothing.
+        footer = sids[0] if len(sids) == 1 and not sibling else ""
+        runner = prelude + ("import os,subprocess,sys;os.environ['HERDR_CURRENT_PID']=str(os.getpid());"
+                            "os.environ['HERDR_CURRENT_FOOTER']=%r;"
+                            "subprocess.run([%r,%r],input=sys.argv[1],text=True,"
+                            "capture_output=True,timeout=60)"
+                            % (footer, sys.executable, str(hook)))
         payload = json.dumps({"prompt": "deterministic recall", "session_id": payload_sid,
                               "turn_id": "directturnid", "cwd": ""})
         other = None
@@ -427,416 +445,40 @@ class RuntimeProjectionTest(unittest.TestCase):
                 other.wait()
         return "report-agent-session" in log.read_text()
 
-    def start_match_fixture(self, root, starts, created_offsets, edges_order=None):
-        """Build fake process/root observations and call the production shared resolver."""
-        from fleet.collectors import codex, procscan
 
-        cwd = os.path.realpath(root / "repo")
-        Path(cwd).mkdir(parents=True, exist_ok=True)
-        home = root / "codex-home"
-        sessions = [SimpleNamespace(
-            harness="codex", pid=71000 + i, proc_start=str(1000 + i), cwd=cwd,
-            app_server=False, managed_dir=None, is_child=False, elapsed_min=0)
-            for i in range(len(starts))]
-        sids = ["01a0%04x-0000-4000-8000-%012x" % (i + 1, i + 1)
-                for i in range(len(created_offsets))]
-        root_paths = []
-        import datetime
-        for i, sid in enumerate(sids):
-            path = home / "sessions" / "2026" / "10" / "04" / ("rollout-2026-10-04T00-00-%02d-%s.jsonl" % (i, sid))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            created = datetime.datetime.fromtimestamp(
-                starts[0] + created_offsets[i], datetime.timezone.utc).isoformat()
-            payload = {"id": sid, "session_id": sid, "cwd": cwd, "timestamp": created}
-            path.write_text(json.dumps({"type": "session_meta", "payload": payload}) + "\n")
-            root_paths.append(str(path))
-        if edges_order is not None:
-            root_paths = [root_paths[i] for i in edges_order]
-        started_by_pid = {sess.pid: starts[i] for i, sess in enumerate(sessions)}
-        with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-             unittest.mock.patch.object(codex, "_process_started_at",
-                                        side_effect=lambda sess: started_by_pid.get(sess.pid)), \
-             unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-             unittest.mock.patch.object(procscan, "read_environ",
-                                        return_value={"CODEX_HOME": str(home)}), \
-             unittest.mock.patch.object(procscan, "read_proc_start",
-                                        side_effect=lambda pid: str(1000 + pid - 71000)):
-            paths, claimed = codex.process_rollouts(sessions, str(home))
-        return codex, procscan, sessions, root_paths, sids, paths, claimed, cwd, str(home)
 
-    def test_start_match_solves_triangles_chains_and_is_order_independent(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            # p1 sees r1/r2; p2 sees only r2. Delays mirror the observed incident.
-            result = self.start_match_fixture(root, [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, _rp, sids, paths, claimed, *_ = result
-            self.assertEqual({pid: Path(path).name for pid, path in paths.items()},
-                             {sessions[0].pid: Path(next(p for p in _rp if sids[0] in p)).name,
-                              sessions[1].pid: Path(next(p for p in _rp if sids[1] in p)).name})
-            self.assertEqual(claimed, set(sids))
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            # Three-step unique chain: the last process can only take the last root.
-            result = self.start_match_fixture(root, [2000.0, 2018.0, 2036.0],
-                                              [1.0, 19.0, 37.0])
-            sessions, sids, paths, claimed = result[2], result[4], result[5], result[6]
-            self.assertEqual([codex_sid(paths.get(s.pid, "")) for s in sessions], sids)
-            self.assertEqual(claimed, set(sids))
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            result = self.start_match_fixture(root, [1000.0, 1018.23], [1.306, 19.499], [1, 0])
-            sessions, sids, paths = result[2], result[4], result[5]
-            self.assertEqual([codex_sid(paths.get(s.pid, "")) for s in sessions], sids)
-
-    def test_triangle_shared_resolver_and_may_report_keep_exact_identity(self):
+    def test_a_selection_change_during_the_report_window_suppresses_both_reports(self):
         from fleet import herdr_projection as hp
-        from fleet.collectors import codex, procscan
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
-            start_by_pid = {sessions[0].pid: 1000.0, sessions[1].pid: 1018.23}
-            def readlink(path):
-                if path == "/proc/%d/cwd" % sessions[0].pid:
-                    return cwd
-                raise FileNotFoundError(path)
-            env = {"CODEX_HOME": home}
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                 unittest.mock.patch.object(codex, "_process_started_at",
-                    side_effect=lambda sess: start_by_pid.get(sess.pid)), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(codex, "_proc_rollout", return_value=None), \
-                 unittest.mock.patch.object(codex.os, "readlink", side_effect=readlink), \
-                 unittest.mock.patch.object(procscan, "read_environ", return_value=env), \
-                 unittest.mock.patch.object(procscan, "codex_effective_cwd", return_value=cwd), \
-                 unittest.mock.patch.object(procscan, "is_shared_codex_daemon", return_value=False), \
-                 unittest.mock.patch.object(procscan, "_comm_of", return_value="codex"), \
-                 unittest.mock.patch.object(procscan, "scan", return_value=sessions), \
-                 unittest.mock.patch.object(procscan, "read_proc_start",
-                    side_effect=lambda pid: str(1000 + pid - sessions[0].pid)), \
-                 unittest.mock.patch("fleet.collectors.claude.session_id_of_process", return_value=None), \
-                 unittest.mock.patch.object(hp, "_parent",
-                    side_effect=lambda pid: sessions[0].pid if pid == os.getpid() else 0), \
-                 unittest.mock.patch.object(hp, "_comm",
-                    side_effect=lambda pid: "codex" if pid == sessions[0].pid else "python"):
-                own = codex.session_id_of_process(sessions[0].pid, lambda: sessions)
-                self.assertEqual(own, sids[0])
-                self.assertTrue(hp.may_report("codex", sids[0], worker=False))
-                self.assertFalse(hp.may_report("codex", sids[1], worker=False))
-                self.assertFalse(hp.may_report("codex", sids[0], worker=True))
-                with unittest.mock.patch.object(procscan, "read_environ", return_value={}):
-                    self.assertFalse(hp.may_report("codex", sids[0], worker=False))
+        decisions = iter([True, False])
+        sent = []
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="/usr/bin/herdr"), \
+             unittest.mock.patch.object(hp, "may_report",
+                side_effect=lambda *a, **k: next(decisions)), \
+             unittest.mock.patch.object(hp, "_report", side_effect=lambda *a, **k: sent.append(a)), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=("codex", None)):
+            observation = {}
+            self.assertTrue(hp.project("codex", CODEX_SID, pane_id="pane-9", worker=False,
+                                       report_session=False, observation=observation))
+        self.assertEqual(sent, [])
+        self.assertEqual(observation["reason"], "guard-refused-before-report")
 
-    def test_start_match_refuses_ambiguous_deficient_and_surplus_components(self):
-        from fleet.collectors import codex
-        for starts, offsets in (
-                ([1000.0, 1000.0], [1.0, 1.0]),  # K2,2
-                ([1000.0, 1004.0], [1.0]),        # deficient: both processes see one root
-                ([1000.0], [1.0, 19.0]),          # surplus
-                ):
-            with self.subTest(starts=starts, offsets=offsets), tempfile.TemporaryDirectory() as td:
-                result = self.start_match_fixture(Path(td), starts, offsets)
-                self.assertEqual(result[5], {})
-                self.assertEqual(result[6], set())
-        self.assertIsNone(codex._unique_full_matching({1: {"a", "b"}, 2: {"a", "b"}}))
-        self.assertIsNone(codex._unique_full_matching(
-            {1: {"r1"}, 2: {"r1"}, 3: {"r1", "r2", "r3"}}))
 
-    def test_start_match_keeps_disjoint_control_when_another_component_exceeds_budget(self):
-        from fleet.collectors import codex, procscan
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            cwd = os.path.realpath(root / "repo")
-            home = root / "codex-home"
-            Path(cwd).mkdir(parents=True, exist_ok=True)
-            starts = [1000.0, 1018.0, 1036.0, 5000.0]
-            sessions = [SimpleNamespace(harness="codex", pid=72000 + i,
-                proc_start=str(2000 + i), cwd=cwd, app_server=False,
-                managed_dir=None, is_child=False) for i in range(4)]
-            sids = ["01a0%04x-0000-4000-8000-%012x" % (i + 1, i + 1) for i in range(4)]
-            created_at = [1001.0, 1019.0, 1037.0, 5001.0]
-            import datetime
-            paths = []
-            for i, sid in enumerate(sids):
-                path = home / "sessions" / "2026" / "10" / "04" / ("rollout-2026-10-04T00-00-%02d-%s.jsonl" % (i, sid))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                ts = datetime.datetime.fromtimestamp(created_at[i], datetime.timezone.utc).isoformat()
-                path.write_text(json.dumps({"type": "session_meta", "payload":
-                    {"id": sid, "cwd": cwd, "timestamp": ts}}) + "\n")
-                paths.append(str(path))
-            started = {72000 + i: starts[i] for i in range(4)}
-            with unittest.mock.patch.object(codex, "_START_MATCH_MAX_VERTICES", 4), \
-                 unittest.mock.patch.object(codex, "_index", return_value={cwd: paths}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", side_effect=lambda s: started[s.pid]), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": str(home)}), \
-                 unittest.mock.patch.object(procscan, "read_proc_start", side_effect=lambda pid: str(2000 + pid - 72000)):
-                found, claimed = codex.process_rollouts(sessions, str(home))
-            self.assertEqual(codex._sid(found[sessions[3].pid]), sids[3])
-            self.assertEqual(claimed, {sids[3]})
 
-    def test_start_match_budget_boundary_and_unknown_home_or_stale_pid(self):
-        from fleet.collectors import codex
-        at_limit = {pid: ({"r%d" % pid} if pid == 127 else {"r%d" % pid, "r%d" % (pid + 1)})
-                    for pid in range(128)}
-        self.assertEqual(len(codex._unique_full_matching(at_limit)), 128)
-        over_limit = {pid: ({"r%d" % pid} if pid == 128 else {"r%d" % pid, "r%d" % (pid + 1)})
-                      for pid in range(129)}
-        self.assertIsNone(codex._unique_full_matching(over_limit))
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.0], [1.0, 19.0])
-            procscan, sessions = result[1], result[2]
-            with unittest.mock.patch.object(procscan, "read_environ", return_value={}):
-                # Rerun same graph with unavailable home; the multi-process component stays unknown.
-                codex, _procscan, sessions, root_paths, _sids, _paths, _claimed, cwd, home = result
-                with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                     unittest.mock.patch.object(codex, "_process_started_at", side_effect=lambda s: 1000.0 if s.pid == sessions[0].pid else 1018.0), \
-                     unittest.mock.patch.object(codex, "_registered_thread", return_value=None):
-                    paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(paths, {})
-            self.assertEqual(claimed, set())
 
-    def test_start_match_preserves_fd_claims_and_read_only_registry_ownership(self):
-        from fleet.collectors import codex
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, _cwd, home = result
-            with unittest.mock.patch.object(codex, "_proc_rollout",
-                    side_effect=lambda pid, _cwd, _home: root_paths[0] if pid == sessions[0].pid else None), \
-                 unittest.mock.patch.object(codex, "_process_started_at",
-                    side_effect=lambda sess: 1000.0 if sess.pid == sessions[0].pid else 1018.23), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(codex, "_index", return_value={sessions[0].cwd: root_paths}):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(paths[sessions[0].pid], root_paths[0])
-            self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-            self.assertEqual(claimed, set(sids))
 
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
-            with unittest.mock.patch.object(codex, "_proc_rollout", return_value=None), \
-                 unittest.mock.patch.object(codex, "_process_started_at",
-                    side_effect=lambda sess: 1000.0 if sess.pid == sessions[0].pid else 1018.23), \
-                 unittest.mock.patch.object(codex, "_registered_thread",
-                    side_effect=lambda pid: sids[0] if pid == sessions[0].pid else None), \
-                 unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(codex._sid(paths[sessions[0].pid]), sids[0])
-            self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-            self.assertEqual(claimed, set(sids))
 
-    def test_duplicate_registry_sid_stays_reserved_without_blocking_unrelated_control(self):
-        from fleet.collectors import codex
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(
-                Path(td), [1000.0, 1018.0, 5000.0], [1.0, 1019.0, 4001.0])
-            _codex, procscan, sessions, _roots, sids, _paths, _claimed, cwd, home = result
-            registry = {sessions[0].pid: sids[0], sessions[1].pid: sids[0]}
-            starts = {sessions[0].pid: 1000.0, sessions[1].pid: 1018.0,
-                      sessions[2].pid: 5000.0}
-            with unittest.mock.patch.object(codex, "_registered_thread",
-                    side_effect=lambda pid: registry.get(pid)), \
-                 unittest.mock.patch.object(codex, "_process_started_at",
-                    side_effect=lambda sess: starts[sess.pid]), \
-                 unittest.mock.patch.object(procscan, "read_environ",
-                    return_value={"CODEX_HOME": home}), \
-                 unittest.mock.patch.object(procscan, "read_proc_start",
-                    side_effect=lambda pid: str(1000 + pid - sessions[0].pid)):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertNotIn(sessions[0].pid, paths)
-            self.assertNotIn(sessions[1].pid, paths)
-            self.assertEqual(codex._sid(paths[sessions[2].pid]), sids[2])
-            self.assertEqual(claimed, {sids[0], sids[2]})
 
-    def test_registry_owner_does_not_duplicate_an_independent_fd_claim(self):
-        from fleet.collectors import codex
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.0], [1.0, 19.0])
-            _codex, procscan, sessions, roots, sids, _paths, _claimed, cwd, home = result
-            with unittest.mock.patch.object(codex, "_proc_rollout",
-                    side_effect=lambda pid, _cwd, _home: roots[0]
-                    if pid == sessions[0].pid else None), \
-                 unittest.mock.patch.object(codex, "_registered_thread",
-                    side_effect=lambda pid: sids[0] if pid == sessions[1].pid else None), \
-                 unittest.mock.patch.object(codex, "_process_started_at",
-                    side_effect=lambda sess: 1000.0 if sess.pid == sessions[0].pid else 1018.0), \
-                 unittest.mock.patch.object(codex, "_index", return_value={cwd: roots}), \
-                 unittest.mock.patch.object(procscan, "read_environ",
-                    return_value={"CODEX_HOME": home}):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(paths, {sessions[0].pid: roots[0]})
-            self.assertEqual(claimed, {sids[0]})
 
-    def test_malformed_declared_identity_values_are_component_local_unknown(self):
-        from fleet.collectors import codex, procscan
-        malformed_values = ([], {}, ["not-a-full-sid"], {"id": "not-a-full-sid"}, "")
-        for field in ("id", "session_id"):
-            for value in malformed_values:
-                with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as td:
-                    result = self.start_match_fixture(
-                        Path(td), [1000.0, 1100.0], [1.0, 101.0])
-                    _codex, _procscan, sessions, roots, sids, _paths, _claimed, cwd, home = result
-                    payload = json.loads(Path(roots[0]).read_text())
-                    payload["payload"][field] = value
-                    Path(roots[0]).write_text(json.dumps(payload) + "\n")
-                    starts = {sessions[0].pid: 1000.0, sessions[1].pid: 1100.0}
-                    with unittest.mock.patch.object(codex, "_index",
-                            return_value={cwd: roots}), \
-                         unittest.mock.patch.object(codex, "_process_started_at",
-                            side_effect=lambda sess: starts[sess.pid]), \
-                         unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                         unittest.mock.patch.object(procscan, "read_environ",
-                            return_value={"CODEX_HOME": home}):
-                        paths, claimed = codex.process_rollouts(sessions, home)
-                    self.assertNotIn(sessions[0].pid, paths)
-                    self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-                    self.assertEqual(claimed, {sids[1]})
 
-    def test_start_match_rechecks_pid_and_refuses_incomplete_or_colliding_roots(self):
-        from fleet.collectors import codex, procscan
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, _sids, _paths, _claimed, cwd, home = result
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", side_effect=lambda s: 1000.0 if s.pid == sessions[0].pid else 1018.23), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": home}), \
-                 unittest.mock.patch.object(procscan, "read_proc_start", return_value="stale"):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(paths, {})
-            self.assertEqual(claimed, set())
 
-        for malformed in ("wrong-cwd", "missing-timestamp", "sid-conflict", "duplicate-sid"):
-            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as td:
-                result = self.start_match_fixture(Path(td), [1000.0], [1.0])
-                codex, procscan, sessions, root_paths, _sids, _paths, _claimed, cwd, home = result
-                if malformed == "duplicate-sid":
-                    alias = Path(root_paths[0]).parent / ("rollout-duplicate-%s.jsonl" % codex._sid(root_paths[0]))
-                    alias.write_text(Path(root_paths[0]).read_text())
-                    root_paths = root_paths + [str(alias)]
-                else:
-                    payload = json.loads(Path(root_paths[0]).read_text())
-                    if malformed == "wrong-cwd":
-                        payload["payload"]["cwd"] = str(Path(td) / "elsewhere")
-                    elif malformed == "missing-timestamp":
-                        payload["payload"].pop("timestamp")
-                    else:
-                        payload["payload"]["id"] = "01a0ffff-0000-4000-8000-000000000001"
-                    Path(root_paths[0]).write_text(json.dumps(payload) + "\n")
-                with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                     unittest.mock.patch.object(codex, "_process_started_at", return_value=1000.0), \
-                     unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                     unittest.mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": home}):
-                    paths, claimed = codex.process_rollouts(sessions, home)
-                self.assertEqual(paths, {})
-                self.assertEqual(claimed, set())
 
-    def test_start_match_ignores_repeated_realpath_alias(self):
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0], [1.0])
-            codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths * 2}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", return_value=1000.0), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(codex._sid(paths[sessions[0].pid]), sids[0])
-            self.assertEqual(claimed, set(sids))
 
-    def test_start_match_respects_incoming_claim_and_process_local_home(self):
-        from fleet.collectors import codex, procscan
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
-            starts = {sessions[0].pid: 1000.0, sessions[1].pid: 1018.23}
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", side_effect=lambda s: starts[s.pid]), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": home}), \
-                 unittest.mock.patch.object(procscan, "read_proc_start", side_effect=lambda pid: str(1000 + pid - sessions[0].pid)):
-                found, claimed = {}, {sids[1]}
-                codex._reserve_start_matched_rollouts(sessions, home, found, claimed)
-            self.assertEqual(codex._sid(found[sessions[0].pid]), sids[0])
-            self.assertNotIn(sessions[1].pid, found)
-            self.assertEqual(claimed, set(sids))
 
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
-            starts = {sessions[0].pid: 1000.0, sessions[1].pid: 1018.23}
-            other_home = str(Path(td) / "other-codex-home")
-            def process_env(pid):
-                return {"CODEX_HOME": other_home if pid == sessions[0].pid else home}
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", side_effect=lambda s: starts[s.pid]), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None), \
-                 unittest.mock.patch.object(procscan, "read_environ", side_effect=process_env), \
-                 unittest.mock.patch.object(procscan, "read_proc_start", side_effect=lambda pid: str(1000 + pid - sessions[0].pid)):
-                found, claimed = {}, set()
-                codex._reserve_start_matched_rollouts(sessions, home, found, claimed)
-            self.assertEqual(codex._sid(found[sessions[1].pid]), sids[1])
-            self.assertNotIn(sessions[0].pid, found)
 
-    def test_start_match_window_edges_and_subagent_exclusion(self):
-        from fleet.collectors import codex
-        for offset, accepted in ((-5.0, True), (30.0, True), (-5.001, False), (30.001, False)):
-            with self.subTest(offset=offset), tempfile.TemporaryDirectory() as td:
-                result = self.start_match_fixture(Path(td), [1000.0], [offset])
-                codex, _procscan, sessions, _roots, sids, _paths, _claimed, _cwd, _home = result
-                self.assertEqual(codex_sid(result[5].get(sessions[0].pid, "")) == sids[0], accepted)
-        with tempfile.TemporaryDirectory() as td:
-            result = self.start_match_fixture(Path(td), [1000.0], [1.0])
-            codex, _procscan, sessions, roots, _sids, _paths, _claimed, cwd, home = result
-            payload = json.loads(Path(roots[0]).read_text())
-            payload["payload"]["source"] = {"subagent": {"thread_spawn": {}}}
-            Path(roots[0]).write_text(json.dumps(payload) + "\n")
-            with unittest.mock.patch.object(codex, "_index", return_value={cwd: roots}), \
-                 unittest.mock.patch.object(codex, "_process_started_at", return_value=1000.0), \
-                 unittest.mock.patch.object(codex, "_registered_thread", return_value=None):
-                paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(paths, {})
-            self.assertEqual(claimed, set())
 
-    def test_a_direct_codex_tui_without_a_rollout_fd_reports_by_its_start_time(self):
-        """F5: a Codex TUI started outside the managed launcher holds no rollout fd. The
-        board names it by the mutually unique process-start match, and so does the gate —
-        the same `process_rollouts` — so its own thread reports and a foreign one does not."""
-        sid = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47"
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertTrue(self.direct_codex_reports(root, [sid], sid))
-            self.assertFalse(self.direct_codex_reports(root, [sid], "directpromptsid"))
-
-    def test_an_ambiguous_start_time_match_proves_nothing(self):
-        """Two root rollouts for one process, or one rollout for two processes: no unique
-        pair, so no identity and no report — the header keeps its previous text."""
-        sid, other = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47", "1e6c2b8f-6a2d-4e3f-8a4b-3c7d9e1f2a58"
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertFalse(self.direct_codex_reports(root, [sid, other], sid))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertFalse(self.direct_codex_reports(root, [sid], sid, sibling=True))
-
-    def test_a_thread_created_after_the_start_window_reports_by_the_board_fallback(self):
-        """Codex creates the thread 35 s to minutes after the TUI starts, past the start
-        match. The board then names the TUI by its same-cwd fallback, and so does the
-        gate, so the pane gets the badge Fleet shows; a foreign id still never reports."""
-        sid = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47"
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertTrue(self.direct_codex_reports(root, [sid], sid, created_offset=60))
-            self.assertFalse(self.direct_codex_reports(
-                root, [sid], "directpromptsid", created_offset=60))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertFalse(self.direct_codex_reports(
-                root, [sid], sid, sibling=True, created_offset=60))
-
-    def test_the_gate_and_the_board_name_a_direct_tui_with_one_resolver(self):
-        """The board's `prepare_tick` and the gate's `session_id_of_process` must give a
-        fd-less direct TUI the same thread; a second copy of the match would drift."""
+    def test_fdless_embedded_tui_without_daemon_loader_stays_unknown(self):
         from fleet.collectors import codex, procscan
         sid = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47"
         with tempfile.TemporaryDirectory() as td:
@@ -855,8 +497,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                 with unittest.mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "codex")}):
                     codex._INDEX.update(ts=0.0, map=None)
                     tick = codex.prepare_tick(procscan.scan(harness_filter={"codex"}))
-                    self.assertEqual(codex._sid(tick.proc_paths.get(proc.pid, "")), sid)
-                    self.assertEqual(codex.session_id_of_process(proc.pid), sid)
+                    self.assertIsNone(tick.proc_paths.get(proc.pid))
+                    self.assertIsNone(codex.session_id_of_process(proc.pid))
             finally:
                 proc.kill()
                 proc.wait()
@@ -1099,6 +741,34 @@ class ProjectionObservationTest(unittest.TestCase):
                 self.assertTrue(all(call.kwargs["stdout"] == subprocess.DEVNULL and
                                     call.kwargs["stderr"] == subprocess.DEVNULL for call in run.call_args_list))
 
+    def test_known_old_runtime_sid_can_wait_for_the_new_foreground_footer(self):
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(hp, "may_report", return_value=False), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=("codex", "old")), \
+             unittest.mock.patch.object(hp, "_nearest_codex_pid", return_value=42), \
+             unittest.mock.patch.object(hp, "verified_pane", return_value="pane"), \
+             unittest.mock.patch.object(hp, "_defer_until_proven") as defer, \
+             unittest.mock.patch.object(hp, "_report") as report:
+            hp.project("codex", "new", pane_id="pane", worker=False,
+                       session_seq=7, session_start_source="clear")
+            defer.assert_called_once_with("new", True, session_seq=7,
+                                          session_start_source="clear")
+            report.assert_not_called()
+
+    def test_a_switch_during_metadata_formatting_suppresses_the_old_metadata(self):
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(hp, "_metadata_command", return_value=["metadata"]), \
+             unittest.mock.patch.object(hp, "_send_projection") as send:
+            observation = {}
+            proof = iter((True, False))
+            hp._report("codex", "old", "pane", True, observation=observation,
+                       _proof=lambda: next(proof))
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[0][2], "report-agent-session")
+            self.assertEqual(observation["reason"], "guard-refused-before-metadata")
+
     def test_unavailable_and_no_report_session_observation_never_promote_identity(self):
         from tools.fleet import herdr_projection as hp
         with unittest.mock.patch.object(hp.shutil, "which", return_value=None), \
@@ -1148,6 +818,45 @@ class ProjectionObservationTest(unittest.TestCase):
                 self.assertEqual(commands[-1], ["/fixture/herdr", "pane", "report-metadata", "fixture-pane",
                     "--source", "herdr:opencode", "--display-agent", "opencode", "--title", "opencode title"])
                 self.assertEqual(observation["session_report"], "exit0" if report_session else "skipped")
+
+    def test_absolute_native_resume_argv_is_canonicalized_only_at_wire_boundary(self):
+        from tools.fleet import herdr_projection as hp
+        for harness in ("claude", "codex", "opencode"):
+            sid = "ses_A"
+            argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
+                    "--resume", sid, "--model", "fixture", "--setting-sources", "user"]
+            with self.subTest(harness=harness):
+                lifecycle = hp._session_lifecycle(harness, 1000001, "resume", argv, session_id=sid)
+                self.assertEqual(lifecycle["resume_argv"], [harness, *argv[1:]])
+                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
+                self.assertNotIn("resume_argv", hp._session_lifecycle(
+                    harness, 1000002, "clear", argv, session_id=sid))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/usr/bin/env", "claude", "--resume", "ses_A"],
+            session_id="ses_A"))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/opt/claude", "--resume", "other-session"],
+            session_id="ses_A"))
+
+    def test_python_opencode_lifecycle_keeps_only_the_process_bound_selection_argv(self):
+        from fleet import process_identity
+        from fleet import herdr_projection as hp
+        from fleet.collectors import opencode
+        sid = "ses_A"
+        argv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"]
+        selection = {"value": {"sessionID": sid, "sessionSeq": 1000001,
+                               "sessionStartSource": "resume"}}
+        launch = {"pid": 4321, "proc_start": "123", "argv": argv}
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            lifecycle = hp._native_opencode_lifecycle(sid)
+        self.assertEqual(lifecycle["resume_argv"], argv)
+        self.assertEqual(lifecycle["session_seq"], 1000001)
+
+        selection["value"]["sessionID"] = "ses_other"
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            self.assertEqual(hp._native_opencode_lifecycle(sid), {})
 
     def test_invalid_bootstrap_fields_never_promote_or_bypass_original_guard(self):
         from tools.fleet import herdr_projection as hp

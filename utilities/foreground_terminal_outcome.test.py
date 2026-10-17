@@ -27,7 +27,9 @@ def foreground_cell(harness):
     # preceding model/auth launch and subsequent delivery transport are omitted.
     cells = [node for node in ast.walk(ast.parse(path.read_text()))
              if isinstance(node, ast.If)
-             and ast.unparse(node.test) == "args.launch_lifecycle == FOREGROUND_SCOPED"]
+             and ast.unparse(node.test) == "args.launch_lifecycle == FOREGROUND_SCOPED"
+             and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                     and call.func.id == "wait_foreground" for call in ast.walk(node))]
     if len(cells) != 1:
         raise AssertionError(f"foreground consumer changed: {path}")
     return module, compile(ast.Module(body=cells[0].body, type_ignores=[]), str(path), "exec")
@@ -85,10 +87,11 @@ class ForegroundOutcomeTest(unittest.TestCase):
                      "Path(sys.argv[1]).write_text(sys.argv[2]); "
                      "print('READY',flush=True); sys.stdin.readline(); sys.exit(int(sys.argv[3]))")
             with mock.patch.dict(os.environ, env, clear=True):
-                proc = subprocess.Popen([sys.executable, "-c", child, str(log_path),
+                proc = subprocess.Popen([harness, "-c", child, str(log_path),
                                          "\n".join(map(json.dumps, rows)) + "\n",
                                          "7" if ending == "exit7" else "0"],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+                                        executable=sys.executable, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, start_new_session=True)
                 try:
                     self.assertEqual(proc.stdout.readline(), b"READY\n")
                     if ending == "parent-exit":
@@ -97,7 +100,7 @@ class ForegroundOutcomeTest(unittest.TestCase):
                         timer = threading.Timer(.05, parent.stdin.close)
                     elif ending == "signal":
                         timer = threading.Timer(.05, lambda: proc.send_signal(signal.SIGTERM))
-                    elif ending != "timeout":
+                    elif ending not in {"timeout", "no-progress"}:
                         def finish():
                             proc.stdin.write(b"go\n")
                             proc.stdin.flush()
@@ -112,7 +115,13 @@ class ForegroundOutcomeTest(unittest.TestCase):
 
                     args.watchdog_budget = module.begin_finite_watchdog(args.foreground_timeout)
                     namespace = dict(vars(module), args=args, proc=proc, jobs=jobs,
-                                     log_path=log_path, wait_foreground=wait)
+                                     log_path=log_path, wait_foreground=wait,
+                                     activity_context=None)
+                    if ending == "no-progress":
+                        from foreground_activity import ForegroundActivityContext
+                        namespace["activity_context"] = ForegroundActivityContext(
+                            0.12, harness, log_path, {}, runtime_executable="/bin/false"
+                        )
                     with mock.patch.object(module, "materialize_after_terminal_close") as delivery:
                         namespace["materialize_after_terminal_close"] = delivery
                         if timer:
@@ -134,7 +143,8 @@ class ForegroundOutcomeTest(unittest.TestCase):
             self.assertEqual(len(observed), 1)
             outcome = observed[0]
             expected = {"exit0": "", "exit7": "exit-7", "signal": "signal-15",
-                        "timeout": "timeout", "parent-exit": "parent-terminated"}[ending]
+                        "timeout": "timeout", "parent-exit": "parent-terminated",
+                        "no-progress": "no-progress"}[ending]
             self.assertEqual(outcome.failure, expected)
             if ending in {"exit0", "exit7", "signal"}:
                 self.assertEqual(outcome.exit_code, {"exit0": 0, "exit7": 7, "signal": -15}[ending])
@@ -151,7 +161,7 @@ class ForegroundOutcomeTest(unittest.TestCase):
 
     def test_actual_failure_dominates_every_envelope_across_adapters(self):
         for harness in self.cells:
-            for ending in ("exit7", "signal", "timeout", "parent-exit"):
+            for ending in ("exit7", "signal", "timeout", "parent-exit", "no-progress"):
                 for verdict in ("PASS", "FAIL", "BLOCKED", "invalid"):
                     with self.subTest(adapter=harness, ending=ending, envelope=verdict):
                         r = self.run_cell(harness, ending, verdict)

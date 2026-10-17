@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import dispatch_completion_join as JOIN  # noqa: E402
+import dispatch_registry_cache as CACHE  # noqa: E402
+from peer_read_context import PeerReadContext  # noqa: E402
+
+
+def row(attempt, status="open", schema="2", slug="worker"):
+    return f"job\t{status}\towner\t2026-10-17T00:00:00Z\t{slug}\tattempt_id={attempt},attempt_schema_version={schema}"
+
+
+class PeerReadContextTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name) / "jobs.log"
+        CACHE._CACHE.clear()
+
+    def test_attempt_rows_are_indexed_once_and_keep_latest_exact_row(self):
+        self.jobs.write_text("\n".join((row("att-a", "queued"), row("att-b"),
+                                          row("att-a", "running", slug="latest"))) + "\n")
+        context = PeerReadContext()
+        with mock.patch.object(CACHE, "registry_lines", wraps=CACHE.registry_lines) as read:
+            first = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+            second = JOIN.current_attempt_row(self.jobs, "att-b", read_context=context)
+            again = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+        self.assertEqual((first.status, first.slug, first.order), ("running", "latest", 2))
+        self.assertEqual(second.attempt_id, "att-b")
+        self.assertEqual(again.raw, first.raw)
+        read.assert_called_once_with(self.jobs)
+
+    def test_unrelated_invalid_schema_is_ignored_and_exact_invalid_schema_fails(self):
+        self.jobs.write_text(row("att-good") + "\n" + row("att-bad", schema="1") + "\n")
+        context = PeerReadContext()
+        self.assertEqual(JOIN.current_attempt_row(
+            self.jobs, "att-good", read_context=context).attempt_id, "att-good")
+        with self.assertRaisesRegex(JOIN.JoinContractError, "attempt-row-schema-invalid"):
+            JOIN.current_attempt_row(self.jobs, "att-bad", read_context=context)
+
+    def test_new_context_observes_appends_without_refreshing_an_existing_scan(self):
+        self.jobs.write_text(row("att-old") + "\n")
+        first_scan = PeerReadContext()
+        self.assertIsNone(first_scan.current_attempt_row(self.jobs, "att-new"))
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(row("att-new") + "\n")
+        self.assertIsNone(first_scan.current_attempt_row(self.jobs, "att-new"))
+        self.assertEqual(PeerReadContext().current_attempt_row(
+            self.jobs, "att-new").attempt_id, "att-new")
+
+    def test_equal_attempt_names_in_distinct_jobs_remain_separate(self):
+        other = Path(self.tmp.name) / "other-jobs.log"
+        self.jobs.write_text(row("att-same", "running", slug="first") + "\n")
+        other.write_text(row("att-same", "done", slug="second") + "\n")
+        context = PeerReadContext()
+        first = context.current_attempt_row(self.jobs, "att-same")
+        second = context.current_attempt_row(other, "att-same")
+        self.assertEqual((first.status, first.slug), ("running", "first"))
+        self.assertEqual((second.status, second.slug), ("done", "second"))
+
+    def test_handover_reads_are_memoized_only_in_this_context(self):
+        context = PeerReadContext()
+        seat = type("Seat", (), {"kind": "pane", "key": "pane-a"})()
+        loader = mock.Mock(return_value=[{"from": "sid-a", "sid": "sid-b"}])
+        self.assertEqual(context.handover_rows(seat, loader), context.handover_rows(seat, loader))
+        loader.assert_called_once_with()
+        other_scan_loader = mock.Mock(return_value=[])
+        self.assertEqual(PeerReadContext().handover_rows(seat, other_scan_loader), ())
+        other_scan_loader.assert_called_once_with()
+
+
+if __name__ == "__main__":
+    unittest.main()

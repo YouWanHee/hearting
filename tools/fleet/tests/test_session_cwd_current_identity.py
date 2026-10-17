@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "utilities"))
 from fleet import model, process_identity, session_cwd
-from fleet.collectors import claude, codex, opencode, procscan
+from fleet.collectors import claude, codex, herdr, opencode, procscan
 from fleet.model import Session
 
 
@@ -54,6 +54,24 @@ class NativeCurrentTest(unittest.TestCase):
                 mock.patch.object(procscan, "_read_cwd", return_value=("/home/user", False)):
             return process_identity.process_identity(self.pid, "claude")
 
+    def test_one_shot_claude_identity_waits_for_bounded_exact_pane_observation(self):
+        pane = {"pane_id": "w1:p1", "agent": "claude", "cwd": "/repo",
+                "agent_session": {"agent": "claude", "value": "current"}}
+
+        def bind_observed_pane(selected, bindings):
+            self.assertEqual(selected, [pane])
+            bindings[self.pid] = {"w1:p1"}
+            return herdr.PaneEvidence((), complete=True)
+
+        with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(procscan, "_comm_of", return_value="claude"), \
+                mock.patch.object(procscan, "_read_cwd", return_value=("/repo", False)), \
+                mock.patch.object(herdr, "list_panes", return_value=[pane]) as list_panes, \
+                mock.patch.object(herdr, "pane_evidence", side_effect=bind_observed_pane):
+            self.assertEqual(claude.session_id_of_process(self.pid, str(self.home)), "current")
+
+        list_panes.assert_called_once_with(wait_timeout=0.75)
+
     def test_resume_ignores_both_empty_and_messaged_previous_taps(self):
         identity = self.identity()
         self.assertEqual((identity.session_id, identity.confidence), ("current", process_identity.PROVEN))
@@ -91,34 +109,68 @@ class NativeCurrentTest(unittest.TestCase):
         (self.home / "sessions" / f"{self.pid}.json").unlink()
         self.assertEqual(self.identity().confidence, process_identity.HARNESS_ONLY)
 
-    def test_continue_consumer_accepts_current_and_refuses_changed_session(self):
+    def test_continue_uses_exact_native_current_identity_over_stale_herdr_for_all_harnesses(self):
         spec = importlib.util.spec_from_file_location("cwd_fixture_peer", ROOT / "utilities/peer-steward.py")
         peer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(peer)
-        req = {"harness": "claude", "new_session": "current", "seat": {"pane": "fixture-pane"}}
-        agent = {"harness": "claude", "session_id": "previous", "pane": "fixture-pane"}
-        with mock.patch.object(peer, "_run_herdr_get", return_value={}), \
-                mock.patch.object(peer, "_interpret_payload", return_value=("idle", agent, 0, None)), \
-                mock.patch.object(peer, "_process_session", side_effect=lambda *_: self.identity().session_id), \
-                mock.patch.object(peer, "_continue_card_reason", return_value=None), \
-                mock.patch.object(peer, "_read_screen", return_value=["fixture empty box"]), \
-                mock.patch.object(peer, "_screen_ready", return_value=None):
-            self.assertIsNone(peer._continue_look("fixture-pane", req))
-            agent["session_id"] = "current"
-            self.record["sessionId"] = "other"
-            self.write_registry()
-            self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
-            with mock.patch.object(peer, "_process_session", return_value=None):
+        class Ready:
+            state = "ready"
+            reason = ""
+
+        info = {"pane_id": "fixture-pane", "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        for harness in ("claude", "codex", "opencode"):
+            req = {"harness": harness, "new_session": "current", "seat": {"pane": "fixture-pane"}}
+            stale_herdr = {"harness": harness, "session_id": "previous", "pane": "fixture-pane"}
+            with self.subTest(harness=harness), \
+                    mock.patch.object(peer, "_retire_target", return_value=("idle", stale_herdr, 0, None)), \
+                    mock.patch.object(peer, "_continue_card_reason", return_value=None), \
+                    mock.patch.object(peer, "_retire_pane_info", return_value=info), \
+                    mock.patch.object(peer, "_continue_native_session", return_value="current") as native, \
+                    mock.patch.object(peer, "_pane_readiness", return_value=Ready()) as readiness:
                 self.assertIsNone(peer._continue_look("fixture-pane", req))
-                agent["session_id"] = "previous"
+                native.assert_called_once_with("fixture-pane", harness, process_info=info)
+                kwargs = readiness.call_args.kwargs
+                self.assertEqual(kwargs["expected_sid"], "current")
+                self.assertEqual(kwargs["native_session_id"], "current")
+                self.assertIs(kwargs["pane_info"], info)
+                self.assertEqual(kwargs["target_observation"], ("idle", stale_herdr))
+
+        for native_sid, expected in (("changed", "target-changed"), (None, "new-session-unknown")):
+            req = {"harness": "claude", "new_session": "current", "seat": {"pane": "fixture-pane"}}
+            stale_herdr = {"harness": "claude", "session_id": "current", "pane": "fixture-pane"}
+            with self.subTest(native_sid=native_sid), \
+                    mock.patch.object(peer, "_retire_target", return_value=("idle", stale_herdr, 0, None)), \
+                    mock.patch.object(peer, "_continue_card_reason", return_value=None), \
+                    mock.patch.object(peer, "_retire_pane_info", return_value=info), \
+                    mock.patch.object(peer, "_continue_native_session", return_value=native_sid), \
+                    mock.patch.object(peer, "_pane_readiness") as readiness:
+                self.assertEqual(peer._continue_look("fixture-pane", req), expected)
+                readiness.assert_not_called()
+
+        for wrong in ({"harness": "codex", "session_id": "current", "pane": "fixture-pane"},
+                      {"harness": "claude", "session_id": "current", "pane": "different-pane"}):
+            req = {"harness": "claude", "new_session": "current", "seat": {"pane": "fixture-pane"}}
+            with mock.patch.object(peer, "_retire_target", return_value=("idle", wrong, 0, None)), \
+                    mock.patch.object(peer, "_continue_native_session") as native:
                 self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
-            agent["harness"] = req["harness"] = "codex"
-            agent["session_id"] = "current"
-            with mock.patch.object(peer, "_codex_rollout_exists", return_value=False), \
-                    mock.patch.object(peer, "_codex_footer_threads", return_value={"current"}):
-                self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
-            agent["pane"] = "different-pane"
-            self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
+                native.assert_not_called()
+
+    def test_continue_native_identity_fails_closed_on_missing_birth_and_codex_selection(self):
+        spec = importlib.util.spec_from_file_location("cwd_fixture_peer_birth", ROOT / "utilities/peer-steward.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        info = {"pane_id": "fixture-pane", "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        with mock.patch.object(peer, "_retire_foreground", return_value=None):
+            self.assertIsNone(peer._continue_native_session("fixture-pane", "claude", process_info=info))
+
+        foreground = {"pid": 202, "start": "birth-1"}
+        with mock.patch.object(peer, "_retire_foreground", return_value=foreground), \
+                mock.patch.object(peer.shutil, "which", return_value="/fixture/herdr"), \
+                mock.patch("pane_ownership.current_codex_thread", return_value="") as current:
+            self.assertIsNone(peer._continue_native_session("fixture-pane", "codex", process_info=info))
+            current.assert_called_once_with("fixture-pane", 202, executable="/fixture/herdr", server=None)
 
 
 class SessionDirectoryTest(unittest.TestCase):

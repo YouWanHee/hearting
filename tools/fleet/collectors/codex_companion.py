@@ -170,7 +170,7 @@ def _rollout_for_thread(thread_id, home=None):
 
 
 def _telemetry(record, home=None):
-    """F-50f — (telemetry dict, ContextEvidence) for the joined rollout, or (None, None).
+    """F-50f — raw counters plus the verified applied policy for the joined exact rollout.
 
     Display-layer additive ONLY: this runs after `classify_job` and feeds nothing back into
     the F-50b lifecycle judgement — a job's state is decided by the plugin's own status word
@@ -183,26 +183,37 @@ def _telemetry(record, home=None):
     if not line:
         return None, None
     tel = parse_codex_token_count(line, session_id=record.get("threadId"))
-    if tel.context_used_pct is None and tel.active_context_tokens is None:
+    if tel.context_window_tokens is None and tel.active_context_tokens is None:
         return None, None                    # parsed but empty → still an honest gap
+    from ..context_policy import codex_applied_policy
+    from ..token_budget import context_policy_used_pct
+    policy = codex_applied_policy(
+        runtime_version=codex._rollout_cli_version(path),
+        model=codex._rollout_model_effort(path)[0],
+        usable_window_tokens=tel.context_window_tokens,
+        session_id=record.get("threadId"), home=codex._rollout_home(path))
+    used = context_policy_used_pct(tel.active_context_tokens, policy)
     payload = {
         "source": "codex-rollout",
         "thread_id": record.get("threadId"),
         "rollout": path,
-        "context_used_pct": tel.context_used_pct,
+        "context_used_pct": used,
+        "context_policy": policy,
         "active_context_tokens": tel.active_context_tokens,
         "context_window_tokens": tel.context_window_tokens,
+        "context_display_window_tokens": (
+            policy["applied_trigger_tokens"] if policy["state"] == "applied" else None),
         "session_total_tokens": tel.session_total_tokens,
     }
     evidence = None
-    if tel.context_used_pct is not None:
+    if used is not None:
         try:
             st = os.stat(path)
         except OSError:
             return payload, None
         sequence = (st.st_mtime_ns, st.st_size)
         evidence = ContextEvidence(
-            used_pct=tel.context_used_pct, source="codex-rollout",
+            used_pct=used, source="codex-rollout",
             sequence=sequence, source_head_sequence=sequence,
             observed_at=st.st_mtime, fresh_until=st.st_mtime + 900)
     return payload, evidence
@@ -284,6 +295,13 @@ def _row(record, state_dir, now, codex_home=None):
     # F-50f — additive display telemetry, attached AFTER the state verdict is settled so the
     # join can never move a row between states.
     job.plugin_telemetry, job._context_evidence = _telemetry(record, home=codex_home)
+    if job.plugin_telemetry:
+        telemetry = job.plugin_telemetry
+        job.active_context_tokens = telemetry.get("active_context_tokens")
+        job.context_window_tokens = telemetry.get("context_window_tokens")
+        job.context_display_window_tokens = telemetry.get("context_display_window_tokens")
+        job.context_policy = telemetry.get("context_policy")
+        job.ctx_pct = telemetry.get("context_used_pct")
     return job
 
 

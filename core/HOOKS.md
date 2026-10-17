@@ -86,6 +86,48 @@ match alone, inject a bounded receipt, and ack, with no judgment authority. The
 record must persist the grade actually used in its `claim_authority` field; a
 writer that cannot persist the field must not claim.
 
+## Current Session and Context Evidence
+
+Codex runtime activation (install, update, or refresh) may record the current native
+hash for Hearting's own projected hook definitions through App Server. It preserves
+disabled decisions, leaves foreign definitions to the user's `/hooks` review, and
+conditionally restores only trust leaves it still owns during deactivation. If Codex
+or App Server is unavailable, activation reports one skipped-trust line and `/hooks`
+remains the fallback. Claude and OpenCode have no corresponding trust-record step.
+peer-steward observes forms only and never writes trust or selects an option.
+
+A process lifetime or launch session is not necessarily the conversation selected
+now. A pane report names the current full native conversation only after the
+live foreground process, PID/start, tty, and foreground process group agree with
+that pane. For Codex, exactly one `thread-id` is the last `[tui].status_line`
+item; two fresh complete reads of the complete UUID in the last visible native
+footer field can prove the selected thread when an open rollout still names the
+previous conversation. An earlier UUID, title, transcript, partial or clipped
+field, or hidden footer is unknown. A late callback may report only while its
+session still matches this current proof. Registered workers and shared services
+never gain pane ownership from an inherited pane label. When current selection
+cannot be proved, leave it unknown.
+
+Context pressure is display-only. Keep raw active usage and model capacity
+separate from configured requests, the runtime's applied compaction trigger,
+and any output reserve. Interpret the exact consumer for the resolved runtime
+execution and account for reserve once. Disabled, unavailable, stale, or
+unbound policy is unknown. Known active usage of zero remains zero, and model
+capacity alone is not an applied trigger. Bind policy to the selected session
+or exact child attempt, preserve raw diagnostics, and show a gauge only when
+usage and applied policy share that scope. An adapter interprets a runtime's
+startup inputs only when they belong to that execution. Later user settings
+and another home’s catalogue cannot replace a retained startup snapshot.
+Missing startup evidence remains unknown, including an older rollout whose
+runtime version cannot be bound to the resumed execution. A registered
+worker's private native catalogue may be captured during its initialization,
+bounded by that same attempt's native session-start evidence.
+An adapter interprets a runtime's
+compaction policy only for runtime versions whose consumer it has verified from
+that runtime's own source or binary; any other version keeps raw telemetry and
+shows unknown. The same acquisition serves interactive sessions and registered
+workers through each runtime's existing callback, tap, plugin, or attempt stream.
+
 ## Adapter Rule
 
 Adapters may reuse scripts directly only when they can supply the expected input

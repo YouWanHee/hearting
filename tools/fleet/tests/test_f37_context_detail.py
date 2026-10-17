@@ -7,6 +7,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -174,6 +175,24 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     worker_type="worker", liveness="working", summary="NOW", ctx_pct=20,
                     context=ContextProjection(20, "ok", "claude"))
                 self.assertEqual(gauge_col(worker, depth), gauge_col(owner, 1))
+
+    def test_unapplied_policy_keeps_the_native_gauge(self):
+        # An unverified runtime has no applied trigger, but its measured window and usage
+        # still draw the gauge they drew before applied triggers existed.
+        claude_row = render._context_detail_row(self._idle(
+            context_window_tokens=1_000_000, active_context_tokens=262_312,
+            context_policy={"state": "unknown", "raw_percentage": 26}), term_width=168)
+        self.assertIn("26%", text(claude_row))
+        self.assertIn(FULL * 4 + EMPTY * 12, text(claude_row))
+        codex_row = render._context_detail_row(self._idle(
+            harness="codex", context_window_tokens=475_000, active_context_tokens=317_769,
+            context_policy={"state": "unknown", "raw_percentage": None}), term_width=168)
+        self.assertIn(FULL * 5 + EMPTY * 3 + " 66%", text(codex_row))  # 12k baseline, 8-cell track
+        applied_row = render._context_detail_row(self._idle(
+            context_window_tokens=1_000_000, active_context_tokens=262_312, ctx_pct=34,
+            context_display_window_tokens=767_000,
+            context_policy={"state": "applied", "raw_percentage": 26}), term_width=168)
+        self.assertIn("34%", text(applied_row))
 
     def test_malformed_legacy_percentage_is_unavailable_not_clamped(self):
         for malformed in (-1, 101, True, "63"):
@@ -466,6 +485,29 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         }
 
     @staticmethod
+    def _init(sid, model_id="claude-fable-5", version="2.1.299"):
+        return {"type": "system", "subtype": "init", "session_id": sid,
+                "claude_code_version": version, "model": model_id}
+
+    def _launch_metadata(self, env=None, settings_env=None, **extra):
+        """Metadata produced by the real Claude wrapper function for this launch env."""
+        home = os.path.join(self.tmp.name, "launch-home-%d" % len(os.listdir(self.tmp.name)))
+        os.makedirs(home)
+        with open(os.path.join(home, "settings.json"), "w", encoding="utf-8") as stream:
+            json.dump({"env": settings_env or {}}, stream)
+        import importlib.util
+        root = Path(__file__).resolve().parents[3]
+        for entry in (root / "utilities", root / "adapters" / "claude" / "bin"):
+            if str(entry) not in sys.path:
+                sys.path.insert(0, str(entry))
+        spec = importlib.util.spec_from_file_location(
+            "claude_wrapper_for_policy_test", root / "adapters" / "claude" / "bin" / "dispatch-headless.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        launch_env = {"CLAUDE_CONFIG_DIR": home, **(env or {})}
+        return {**module.claude_compaction_inputs(launch_env), **extra}
+
+    @staticmethod
     def _agent_use(sid, agent_type="explore"):
         return {
             "type": "assistant", "session_id": sid,
@@ -476,7 +518,7 @@ class ClaudeStreamSessionTest(unittest.TestCase):
             }]},
         }
 
-    def test_attempt_stream_uses_one_million_window_default_while_live(self):
+    def test_attempt_stream_without_native_policy_keeps_window_and_percent_unknown(self):
         job = self._job()
         self._write_log(job, [
             {"type": "system", "session_id": "sid-child"},
@@ -486,24 +528,95 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         dispatch_collector._enrich_claude_stream_session(job)
         self.assertEqual(job._runtime_session_id, "sid-child")
         self.assertEqual(job.active_context_tokens, 160)
-        self.assertEqual(job.context_window_tokens, 1_000_000)
-        self.assertEqual(job.ctx_pct, 0)
+        self.assertIsNone(job.context_window_tokens)
+        self.assertIsNone(job.context_display_window_tokens)
+        self.assertEqual(job.context_policy["state"], "unknown")
+        self.assertIsNone(job.ctx_pct)
         self.assertTrue(job._dispatch_context_owned)
         self.assertIsNone(job.context)
-        self.assertIsNotNone(job._context_evidence)
+        self.assertIsNone(job._context_evidence)
         visible = text(render._dispatch_summary_detail_row(job, depth=2, term_width=168))
-        self.assertIn("0%", visible)
+        self.assertNotIn("0%", visible)
 
-    def test_explicit_runtime_window_overrides_one_million_default(self):
+    def test_launch_window_and_native_consumer_give_the_applied_trigger(self):
         job = self._job()
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000"})
         self._write_log(job, [
-            self._assistant("sid-child", "claude-fable-5", 160),
+            self._init("sid-child"),
+            self._assistant("sid-child", "claude-fable-5", 183500),
             {"type": "result", "session_id": "sid-child",
-             "modelUsage": {"claude-fable-5": {"contextWindow": 2000}}},
+             "modelUsage": {"claude-fable-5": {"contextWindow": 1000000,
+                                                 "maxOutputTokens": 128000}}},
         ])
         dispatch_collector._enrich_claude_stream_session(job)
-        self.assertEqual(job.context_window_tokens, 2000)
-        self.assertEqual(job.ctx_pct, 8)
+        self.assertEqual(job.context_window_tokens, 1000000)
+        # 400000 window - min(128000, 20000) output reserve - 13000 buffer.
+        self.assertEqual(job.context_display_window_tokens, 367000)
+        self.assertEqual(job.context_policy["state"], "applied")
+        self.assertEqual(job.context_policy["runtime_version"], "2.1.299")
+        self.assertEqual(job.ctx_pct, 50)
+
+    def test_registered_policy_stays_unknown_until_the_raw_window_is_observed(self):
+        job = self._job()
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"})
+        self._write_log(job, [self._init("sid-child"),
+                              self._assistant("sid-child", "claude-fable-5", 400000)])
+        dispatch_collector._enrich_claude_stream_session(job)
+        self.assertEqual(job.active_context_tokens, 400000)
+        self.assertEqual(job.context_policy["state"], "unknown")
+        self.assertEqual(job.context_policy["reason"], "raw-model-window-not-observed")
+        self.assertIsNone(job.ctx_pct)
+        self.assertIsNone(job.context_display_window_tokens)
+
+    def test_small_configured_window_applies_without_a_terminal_window(self):
+        job = self._job()
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000"})
+        self._write_log(job, [self._init("sid-child"),
+                              self._assistant("sid-child", "claude-fable-5", 58500)])
+        dispatch_collector._enrich_claude_stream_session(job)
+        self.assertEqual(job.context_display_window_tokens, 117000)
+        self.assertEqual(job.ctx_pct, 50)
+
+    def test_disabled_missing_and_conflicting_launch_inputs_are_unknown(self):
+        cases = (
+            ("disabled", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000",
+                          "DISABLE_AUTO_COMPACT": "1"}, None, "native-auto-compaction-disabled"),
+            ("no-env-window", {}, None, "native-window-source-not-env"),
+            ("conflict", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000"},
+             {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "300000"},
+             "launch-env-and-settings-env-disagree"),
+            ("unverified-version", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000"}, None,
+             "native-consumer-version-unverified"),
+        )
+        for name, env, settings_env, reason in cases:
+            with self.subTest(name):
+                job = self._job("att-" + name)
+                job._registry_metadata = self._launch_metadata(env, settings_env)
+                version = "9.9.9" if name == "unverified-version" else "2.1.299"
+                self._write_log(job, [self._init("sid-child", version=version),
+                                      self._assistant("sid-child", "claude-fable-5", 1000),
+                                      {"type": "result", "session_id": "sid-child",
+                                       "modelUsage": {"claude-fable-5": {"contextWindow": 1000000}}}])
+                dispatch_collector._enrich_claude_stream_session(job)
+                self.assertEqual(job.active_context_tokens, 1000)
+                self.assertEqual(job.context_policy["reason"], reason)
+                self.assertIsNone(job.ctx_pct)
+                self.assertIsNone(job.context_display_window_tokens)
+
+    def test_known_zero_active_is_zero_percent(self):
+        job = self._job()
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000"})
+        row = self._assistant("sid-child", "claude-fable-5", 30)
+        row["message"]["usage"].update(input_tokens=0, cache_creation_input_tokens=0,
+                                       cache_read_input_tokens=0)
+        self._write_log(job, [self._init("sid-child"), row])
+        dispatch_collector._enrich_claude_stream_session(job)
+        self.assertEqual(job.active_context_tokens, 0)
+        self.assertEqual(job.ctx_pct, 0)
 
     def test_owner_and_worker_show_the_model_recorded_in_the_exact_attempt(self):
         for depth, alias, model, shown in (
@@ -539,20 +652,24 @@ class ClaudeStreamSessionTest(unittest.TestCase):
 
     def test_stream_usage_and_same_attempt_model_window_create_context(self):
         job = self._job()
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000"})
         self._write_log(job, [
-            self._assistant("sid-child", "claude-fable-5", 160),
+            self._init("sid-child"),
+            self._assistant("sid-child", "claude-fable-5", 73400),
             {"type": "result", "session_id": "sid-child",
              "usage": {"input_tokens": 10, "cache_read_input_tokens": 300,
                        "output_tokens": 40},
-             "modelUsage": {"claude-fable-5": {"contextWindow": 1000}}},
+             "modelUsage": {"claude-fable-5": {"contextWindow": 1000000}}},
         ])
         dispatch_collector._enrich_claude_stream_session(job)
         projection.attach_projections([], [job], now=100.0)
         self.assertEqual(job._runtime_session_id, "sid-child")
         self.assertIsNone(job.model)
-        self.assertEqual(job.ctx_pct, 16)
-        self.assertEqual(job.context.used_pct, 16)
-        self.assertEqual(job.context_window_tokens, 1000)
+        self.assertEqual(job.ctx_pct, 20)
+        self.assertEqual(job.context.used_pct, 20)
+        self.assertEqual(job.context_window_tokens, 1000000)
+        self.assertEqual(job.context_display_window_tokens, 367000)
         self.assertEqual(job.session_output_tokens, 40)
 
     def test_attempt_stream_attaches_native_subagents_without_inventing_window(self):
@@ -620,23 +737,26 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         job = self._job("att-supervised")
         job.cwd = cwd
         self._write_log(job, [self._supervisor(sid, cwd)])
-        assistant = self._assistant(sid, "claude-fable-5", 240)
+        job._registry_metadata = self._launch_metadata(
+            {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000"})
+        assistant = self._assistant(sid, "claude-fable-5", 91750)
         assistant["sessionId"] = assistant.pop("session_id")
         assistant["message"]["content"] = [{
             "type": "tool_use", "name": "Bash", "id": "toolu-exact",
             "input": {"command": "python3 exact.py"},
         }]
-        self._write_transcript(cwd, sid, [assistant, {
+        self._write_transcript(cwd, sid, [self._init(sid), assistant, {
             "type": "result", "sessionId": sid,
-            "modelUsage": {"claude-fable-5": {"contextWindow": 1200}},
+            "modelUsage": {"claude-fable-5": {"contextWindow": 1000000}},
         }])
 
         dispatch_collector._enrich_claude_stream_session(job)
 
         self.assertEqual(job._runtime_session_id, sid)
-        self.assertEqual(job.active_context_tokens, 240)
-        self.assertEqual(job.context_window_tokens, 1200)
-        self.assertEqual(job.ctx_pct, 20)
+        self.assertEqual(job.active_context_tokens, 91750)
+        self.assertEqual(job.context_window_tokens, 1000000)
+        self.assertEqual(job.ctx_pct, 25)
+        self.assertEqual(job.context_display_window_tokens, 367000)
         self.assertEqual(job.exec_tool, {"name": "python3"})
         self.assertEqual(job._context_evidence.source, "claude-session-transcript")
         self.assertEqual(job.resolved_model, "claude-fable-5")
@@ -665,24 +785,27 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         job = self._job("att-isolated-owner")
         job.cwd = cwd
         worker_home = os.path.join(self.tmp.name, "isolated-worker")
-        job._registry_metadata = {"runtime_home": worker_home}
+        job._registry_metadata = {
+            **self._launch_metadata({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000"}),
+            "runtime_home": worker_home}
         self._write_log(job, [self._supervisor(sid, cwd)])
         self._write_transcript(cwd, sid, [
             self._assistant(sid, "claude-fable-5", 999),
         ])
         self._write_transcript(cwd, sid, [
-            self._assistant(sid, "claude-opus-5-5", 240),
+            self._init(sid, "claude-opus-5-5"),
+            self._assistant(sid, "claude-opus-5-5", 91750),
             {"type": "result", "sessionId": sid,
-             "modelUsage": {"claude-opus-5-5": {"contextWindow": 1200}}},
+             "modelUsage": {"claude-opus-5-5": {"contextWindow": 1000000}}},
         ], home=worker_home)
 
         dispatch_collector._enrich_claude_stream_session(job)
 
         self.assertEqual(job._runtime_session_id, sid)
         self.assertEqual(job.resolved_model, "claude-opus-5-5")
-        self.assertEqual(job.active_context_tokens, 240)
-        self.assertEqual(job.context_window_tokens, 1200)
-        self.assertEqual(job.ctx_pct, 20)
+        self.assertEqual(job.active_context_tokens, 91750)
+        self.assertEqual(job.context_window_tokens, 1000000)
+        self.assertEqual(job.ctx_pct, 25)
         self.assertEqual(job._context_evidence.source, "claude-session-transcript")
 
     def test_supervisor_missing_recorded_home_does_not_borrow_global_transcript(self):
@@ -954,7 +1077,8 @@ class CodexAttemptTelemetryTest(unittest.TestCase):
         self.assertEqual(rows[1]["token_usage"]["total"]["total_tokens"], 156000)
         dispatch_collector._enrich_codex_attempt_session(job)
         projection.attach_projections([], [job], now=100.0)
-        self.assertEqual(job.context.used_pct, 47)  # Codex 12k reserve formula
+        self.assertIsNone(job.context)  # app-server tokenUsage omits the resolved native trigger
+        self.assertEqual(job.context_policy["state"], "unknown")
         self.assertEqual(job.active_context_tokens, 100000)
         self.assertEqual(job.session_total_tokens, 156000)
         self.assertEqual(job.context_window_tokens, 200000)
@@ -1000,7 +1124,8 @@ for line in sys.stdin:
         projection.attach_projections([], [job], now=100.0)
         self.assertEqual(job.active_context_tokens, 50000)
         self.assertEqual(job.context_window_tokens, 100000)
-        self.assertEqual(job.context.used_pct, 43)  # reserve is subtracted from numerator and window
+        self.assertIsNone(job.context)
+        self.assertEqual(job.context_policy["state"], "unknown")
         self.assertNotIn("PRIVATE_SENTINEL", json.dumps(job.to_dict()))
 
     def test_cumulative_only_and_invalid_window_stay_unknown(self):
@@ -1026,7 +1151,8 @@ for line in sys.stdin:
         dispatch_collector._enrich_codex_attempt_session(job)
         projection.attach_projections([], [job], now=100.0)
         self.assertIsNone(job.association_ambiguity)
-        self.assertEqual(job.context.used_pct, 47)
+        self.assertIsNone(job.context)
+        self.assertEqual(job.context_policy["state"], "unknown")
         self.assertEqual(job.session_total_tokens, 156000)
 
     def test_mixed_thread_usage_activity_and_exec_are_all_unknown(self):
@@ -1110,8 +1236,9 @@ for line in sys.stdin:
         self.assertEqual(job._runtime_session_id, thread_id)
         self.assertEqual(job.context_window_tokens, 200000)
         self.assertEqual(job.active_context_tokens, 100000)
-        self.assertEqual(job.context.used_pct, 47)
-        self.assertEqual(job._context_evidence.source, "codex-attempt-rollout")
+        self.assertIsNone(job.context)
+        self.assertEqual(job.context_policy["state"], "unknown")
+        self.assertIsNone(job._context_evidence)
 
     def test_depth2_duplicate_projected_rollouts_fail_closed(self):
         thread_id = "019fd56f-1e8a-77f0-9964-dc8cba43d344"

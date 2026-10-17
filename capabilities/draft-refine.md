@@ -29,9 +29,8 @@ Artifact root: `core/CONVENTIONS.md §5.1`; output placement: `§5`.
 cycle. It receives the owner's open cycle through
 `AGENT_ARTIFACT_CAMPAIGN_ID`/`AGENT_ARTIFACT_CYCLE_ID`/`AGENT_ARTIFACT_PRODUCER_ID`/
 `AGENT_ARTIFACT_CYCLE_DIR`/`AGENT_ARTIFACT_OUTPUT_DIR` (dispatch env
-pass-through), may call `utilities/artifact_producer.py begin --node <node id>`
-on the same route to resume that cycle, and writes only inside
-`<cycle_dir>/artifacts/<bucket>/...` within its node `write_scope`.
+pass-through); the resolver applies the selected node's declared outputs and
+write scope while preserving the existing draft target.
 `artifact_producer.py` owns the open cycle and its output paths; `finalize` and
 `admit-shared` belong to the owner, never to a stage worker. See
 `producer_lifecycle` in `capabilities/topologies.json`.

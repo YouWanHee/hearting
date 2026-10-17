@@ -681,6 +681,17 @@ class StagesTest(unittest.TestCase):
             "designs/<cycle>/01_refs/frame/direction-brief.md",
             "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"])
 
+    def test_compute_execution_needs_live_only_on_the_part_catalog_rows(self):
+        registry = TOPO.load_registry()
+        parts = registry["part_catalog"]["parts"]
+        expected = {f"autopilot-lab:{stage}" for stage in (
+            "smoke", "full-run", "run-verify", "eval-run", "eval-smoke", "resume-run")}
+        actual = {part for part, row in parts.items() if row.get("execution_needs")}
+        self.assertEqual(actual, expected)
+        for recipe in registry["recipes"]:
+            for node in recipe["standard_plus"]["nodes"]:
+                self.assertNotIn("execution_needs", node)
+
     def test_text_form_keeps_the_stage_line_prefix(self):
         text = self.blocks("--capability", "autopilot-lab")
         self.assertIn("  full-run unit=_kernel/resource "

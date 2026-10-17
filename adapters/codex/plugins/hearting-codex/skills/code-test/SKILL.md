@@ -44,8 +44,7 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 Artifact root: `core/CONVENTIONS.md §5.1`.
 
 When invoked from a `standard+` `autopilot-code` stage cycle, write verification
-evidence only under `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/test_logs/` and
-`_internal/test_reviews/`. Return the final verdict to `code-report`, which owns
+evidence only to the test node's declared outputs and write scope. Return the final verdict to `code-report`, which owns
 `pipeline_summary.md`; the `code-test` stage must not write that report-owned
 artifact. Standalone invocations should create or reuse an appropriate
 `plans/<date>_<slug>/` work-cycle directory and may update their own standalone
@@ -64,9 +63,8 @@ Required evidence:
 cycle. It receives the owner's open cycle through
 `AGENT_ARTIFACT_CAMPAIGN_ID`/`AGENT_ARTIFACT_CYCLE_ID`/`AGENT_ARTIFACT_PRODUCER_ID`/
 `AGENT_ARTIFACT_CYCLE_DIR`/`AGENT_ARTIFACT_OUTPUT_DIR` (dispatch env
-pass-through), may call `utilities/artifact_producer.py begin --node <node id>`
-on the same route to resume that cycle, and writes only inside
-`<cycle_dir>/artifacts/<bucket>/...` within its node `write_scope`.
+pass-through); the resolver applies the test node's declared outputs and
+write scope.
 `artifact_producer.py` owns the open cycle and its output paths; `finalize` and
 `admit-shared` belong to the owner, never to a stage worker. See
 `producer_lifecycle` in `capabilities/topologies.json`.

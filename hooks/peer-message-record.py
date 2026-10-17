@@ -304,7 +304,10 @@ def main():
                 )
         mod = _peer_message_module()
         if mod and ("peer-from:" in (payload.get("prompt") or "") or "cross-session-message" in (payload.get("prompt") or "")):
-            extra = "\n".join(filter(None, [extra, mod.receiver_guidance()]))
+            extra = "\n".join(filter(None, [extra, mod.receiver_guidance(
+                payload.get("prompt") or "",
+                {"harness": "claude", "session_id": payload.get("session_id")},
+                cwd=payload.get("cwd") or os.getcwd())]))
         if mod:
             mod.emit_peer_context({"harness": "claude", "session_id": payload.get("session_id")},
                                   "UserPromptSubmit", extra_context=extra)

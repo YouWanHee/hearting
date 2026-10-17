@@ -1,51 +1,47 @@
-"""Mirror-drift guard: adapters/claude/tools/fleet must byte-match tools/fleet.
+"""Guard the production files exposed by the Claude Fleet runtime projection.
 
-The Claude adapter surface (~/.claude/tools/fleet) is a deliberate *concrete*
-projection of the canonical runtime-neutral tools/fleet (commit 8d00b7f chose a
-copy over a symlink for Windows Git Bash support). A copy drifts silently the
-moment canonical changes without a resync — observed 2026-07-11: the mirror was
-stale from F-16 through F-19 (last sync e872ad0). This suite runs in every
-fleet dev cycle, so the cycle that edits canonical fails here until it resyncs:
-
-    rsync -a --delete --exclude='__pycache__' tools/fleet/ adapters/claude/tools/fleet/
+The adapter uses per-file symlinks to the canonical runtime. Fleet's test
+inventory is maintained and run from tools/fleet/tests, not projected into the
+adapter, so parity covers production files and does not require duplicate tests.
 """
 import unittest
 from pathlib import Path
 
 CANONICAL = Path(__file__).resolve().parents[1]           # tools/fleet
-MIRROR = CANONICAL.parents[1] / "adapters" / "claude" / "tools" / "fleet"
+ADAPTER_RUNTIME = CANONICAL.parents[1] / "adapters" / "claude" / "tools" / "fleet"
 SKIP_DIRS = {"__pycache__"}
 
 
-def _tree(root: Path) -> dict:
+def _runtime_tree(root: Path) -> dict:
     files = {}
     for p in root.rglob("*"):
-        if p.is_dir() or any(part in SKIP_DIRS for part in p.relative_to(root).parts):
+        relative = p.relative_to(root)
+        if (p.is_dir() or relative.parts[0] == "tests"
+                or any(part in SKIP_DIRS for part in relative.parts)):
             continue
-        files[str(p.relative_to(root))] = p.read_bytes()
+        files[str(relative)] = p.read_bytes()
     return files
 
 
 class TestMirrorParity(unittest.TestCase):
-    def test_mirror_matches_canonical(self):
-        if not MIRROR.is_dir():
-            self.skipTest("adapter mirror absent (non-repo install layout)")
-        canon, mirror = _tree(CANONICAL), _tree(MIRROR)
-        missing = sorted(set(canon) - set(mirror))
-        extra = sorted(set(mirror) - set(canon))
-        differing = sorted(k for k in set(canon) & set(mirror) if canon[k] != mirror[k])
+    def test_adapter_runtime_matches_canonical_production_files(self):
+        if not ADAPTER_RUNTIME.is_dir():
+            self.skipTest("adapter runtime projection absent (non-repo install layout)")
+        canon = _runtime_tree(CANONICAL)
+        adapter = _runtime_tree(ADAPTER_RUNTIME)
+        missing = sorted(set(canon) - set(adapter))
+        extra = sorted(set(adapter) - set(canon))
+        differing = sorted(k for k in set(canon) & set(adapter) if canon[k] != adapter[k])
         problems = []
         if missing:
-            problems.append(f"mirror에 없음: {missing}")
+            problems.append(f"adapter runtime missing canonical production files: {missing}")
         if extra:
-            problems.append(f"mirror에만 있음: {extra}")
+            problems.append(f"adapter runtime has unexpected production files: {extra}")
         if differing:
-            problems.append(f"내용 상이: {differing}")
+            problems.append(f"adapter runtime differs from canonical production files: {differing}")
         self.assertFalse(
             problems,
-            "adapter fleet mirror drift — 재동기 필요 "
-            "(rsync -a --delete --exclude='__pycache__' tools/fleet/ adapters/claude/tools/fleet/): "
-            + "; ".join(problems),
+            "Claude Fleet runtime projection mismatch: " + "; ".join(problems),
         )
 
 

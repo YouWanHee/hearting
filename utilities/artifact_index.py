@@ -474,17 +474,18 @@ def apply(
             "cycle_id": cycle_id,
         }
 
+    # One pass over the events, not one per stream: a cycle can declare tens of
+    # thousands of single-event streams. The last matching row wins, as before.
+    event_at: Dict[Tuple[Any, Any], Any] = {}
+    for row in document.get("events", []) or []:
+        if (isinstance(row, dict) and isinstance(row.get("stream_id"), str)
+                and isinstance(row.get("stream_sequence"), (int, float))):
+            event_at[(row["stream_id"], row["stream_sequence"])] = row.get("event_id")
     for stream_id, (min_seq, max_seq) in declared_streams(document).items():
-        last_event_id = None
-        for row in document.get("events", []) or []:
-            if isinstance(row, dict) and row.get("stream_id") == stream_id and row.get(
-                "stream_sequence"
-            ) == max_seq:
-                last_event_id = row.get("event_id")
         streams[stream_id] = {
             "last_sequence": max_seq,
             "cycle_id": cycle_id,
-            "last_event_id": last_event_id,
+            "last_event_id": event_at.get((stream_id, max_seq)),
         }
 
     manifests[idempotency_key] = {
@@ -586,14 +587,17 @@ def build(
                 (document.get("cycle") or {}).get("cycle_id") if isinstance(document.get("cycle"), dict) else None, ())
             if old.get("manifest_revision_id") != document.get("manifest_revision_id")
         ]
-        for stream_id, (min_seq, max_seq) in declared_streams(document).items():
-            bucket = stream_sequences.setdefault(stream_id, {})
-            for row in document.get("events", []) or []:
-                if not isinstance(row, dict) or row.get("stream_id") != stream_id:
-                    continue
-                seq = row.get("stream_sequence")
-                if isinstance(seq, int) and not isinstance(seq, bool):
-                    bucket[seq] = bucket.get(seq, 0) + 1
+        declared = declared_streams(document)
+        for stream_id in declared:
+            stream_sequences.setdefault(stream_id, {})
+        for row in document.get("events", []) or []:
+            if (not isinstance(row, dict) or not isinstance(row.get("stream_id"), str)
+                    or row["stream_id"] not in declared):
+                continue
+            seq = row.get("stream_sequence")
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                bucket = stream_sequences[row["stream_id"]]
+                bucket[seq] = bucket.get(seq, 0) + 1
         for old in earlier_documents:
             index = apply(
                 index,

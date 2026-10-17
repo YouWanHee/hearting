@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Project this Claude session's identity into its Herdr pane header.
 
-Claude Code's own herdr integration (`herdr-agent-state.sh`, installed and overwritten by
-herdr) reports lifecycle STATE and the session id. It reports no title, so a Claude pane
-header stayed anonymous while Codex panes already carried one. This hearting-owned hook
-adds the display-only half through the shared projector, so all three harnesses put the
-same thing in the same order: `[<tag>] [⚑ ]<harness>` and the summary Fleet's title
-worker already computed.
+Claude's pinned Herdr v11 hook reports the native session at SessionStart, but no title
+or ongoing lifecycle state. This Hearting-owned hook adds display metadata through the
+shared projector, so Claude, Codex, and OpenCode put the same tag, steward mark, harness,
+and summary in the pane header.
 
 Fail-soft by construction: reads stdin, never writes stdout, and exits 0 on every path.
 A registered worker projects nothing — the pane belongs to the interactive session.
@@ -38,9 +36,9 @@ def main() -> int:
             if str(tools) not in sys.path:
                 sys.path.insert(0, str(tools))
             from fleet.herdr_projection import project
-            # Native herdr owns liveness; the common projector owns the current
-            # session ID and header, including a recorded native resume source.
-            project("claude", session_id)
+            # The v11 SessionStart hook reports the exact session once. This
+            # Hearting hook owns display metadata and never duplicates that report.
+            project("claude", session_id, report_session=False)
             if (payload.get("hook_event_name") in {"SessionStart", "UserPromptSubmit", "Stop"}
                     and os.environ.get("AGENT_SESSION_ROLE", "").lower() != "worker"
                     and os.environ.get("AGENT_DISPATCH_CHILD") != "1"
@@ -48,7 +46,8 @@ def main() -> int:
                 import subprocess
                 subprocess.Popen(
                     [sys.executable, str(tools.parent / "utilities" / "peer-steward.py"),
-                     "__ensure-obligations"],
+                     "__ensure-obligations", "--lifecycle-root",
+                     str(Path(__file__).resolve().parents[1])],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     close_fds=True, start_new_session=True,
                 )

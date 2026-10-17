@@ -5,8 +5,9 @@ translation stays in its collector:
 
 - Claude: `~/.claude/sessions/<pid>.json`, else the statusline tap matched by
   pid and start time (`collectors.claude.session_id_of_process`);
-- Codex: the rollout the process holds open, the managed registry, or the
-  start-time match (`collectors.codex.session_id_of_process`);
+- Codex: the rollout the process holds open, or the root thread whose
+  `codex_tui` MCP origin is listening on that TUI PID
+  (`collectors.codex.session_id_of_process`);
 - OpenCode: the pane's own TUI selection record
   (`collectors.opencode.session_of_process`). The `--session` a pane was
   started with is reported as `started-on`, not proof: the TUI can switch
@@ -229,3 +230,113 @@ def process_identity(pid, harness, *, live_codex=None):
     if session_id:
         return record(harness, session_id, source, _UNPROVEN_SOURCES.get(source, PROVEN))
     return record(harness, "", "", HARNESS_ONLY)
+
+
+def _proc_stat(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            raw = handle.read(8192)
+        fields = raw[raw.rindex(b") ") + 2:].split()
+        return int(fields[1]), fields[19].decode("ascii")
+    except (OSError, ValueError, IndexError, UnicodeDecodeError):
+        return None, None
+
+
+def _proc_argv(pid, *, max_bytes=32768):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except (OSError, ValueError):
+        return None
+    if not raw or len(raw) > max_bytes:
+        return None
+    argv = [os.fsdecode(value) for value in raw.rstrip(b"\0").split(b"\0")]
+    if not argv or not argv[0] or any(not value or "\0" in value for value in argv):
+        return None
+    return argv
+
+
+def is_native_resume_argv(argv, harness, session_id=None):
+    """Validate a native launcher's original resume argv without rewriting it.
+
+    An absolute launcher path is accepted only by basename; callers must still
+    obtain the argv from the process-bound native session identity below.
+    """
+    if (harness not in {"claude", "codex", "opencode"} or not isinstance(argv, list)
+            or not argv or len(argv) > 64):
+        return False
+    if any(not isinstance(arg, str) or not arg or "\0" in arg for arg in argv):
+        return False
+    if sum(len(arg.encode("utf-8", "surrogatepass")) for arg in argv) > 8192:
+        return False
+    executable = argv[0]
+    if not (executable == harness or
+            os.path.isabs(executable) and os.path.basename(executable) == harness):
+        return False
+    return session_id is None or isinstance(session_id, str) and session_id in argv
+
+
+def native_resume_wire_argv(argv, harness, session_id=None):
+    """Translate proven raw argv to Herdr's plain-command resume wire form."""
+    if not is_native_resume_argv(argv, harness, session_id):
+        return None
+    return [harness, *argv[1:]]
+
+
+def launch_context(pid, harness, session_id):
+    """Read argv and cwd only while the exact native session and PID birth agree."""
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1
+            or harness not in {"claude", "codex", "opencode"}
+            or not isinstance(session_id, str) or not session_id):
+        return None
+    _parent, before = _proc_stat(pid)
+    identity = process_identity(pid, harness)
+    if not before or identity.confidence != PROVEN or identity.session_id != session_id:
+        return None
+    argv = _proc_argv(pid)
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = None
+    _parent, after = _proc_stat(pid)
+    final = process_identity(pid, harness)
+    if (after != before or final.confidence != PROVEN or final.session_id != session_id
+            or argv is None):
+        return None
+    return {"pid": pid, "proc_start": before, "harness": harness,
+            "session_id": session_id, "argv": argv, "cwd": cwd}
+
+
+def current_session_identity(harness, *, max_ancestors=32):
+    """Return a proven session from the current runtime ancestry, else unknown."""
+    if harness not in {"claude", "codex", "opencode"}:
+        return None
+    pid = os.getpid()
+    for _ in range(max(1, min(int(max_ancestors), 64))):
+        if not pid or pid <= 1:
+            break
+        parent, before = _proc_stat(pid)
+        if not before:
+            break
+        found = process_identity(pid, harness)
+        _parent, after = _proc_stat(pid)
+        if after != before:
+            return None
+        if found.confidence == PROVEN and found.session_id:
+            return found.session_id
+        pid = parent
+    return None
+
+
+def current_launch_context(harness, session_id, *, max_ancestors=32):
+    """Find the nearest ancestor that proves this exact session and retain its birth."""
+    pid = os.getpid()
+    for _ in range(max(1, min(int(max_ancestors), 64))):
+        if not pid or pid <= 1:
+            break
+        context = launch_context(pid, harness, session_id)
+        if context is not None:
+            return context
+        parent, _start = _proc_stat(pid)
+        pid = parent
+    return None

@@ -167,7 +167,9 @@ def _locator_error(path_value: Any) -> Optional[Tuple[str, str]]:
     if len(path_value) > _MAX_LOCATOR_LENGTH:
         return "locator-too-long", "path too long"
     components = path_value.split("/")
-    payload = len(components) > 1 and components[0] == "artifacts"
+    if len(components) == 1 and components[0] in {"artifacts", "_internal"}:
+        return "locator-empty-tail", "payload root requires a non-empty locator"
+    payload = len(components) > 1 and components[0] in {"artifacts", "_internal"}
     if len(components) > _MAX_LOCATOR_COMPONENTS:
         return "locator-too-many-components", "too many components"
     component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
@@ -242,8 +244,11 @@ def classify_artifact_path(
         return ArtifactPathClassification("unclassified", False, "control-path-unrecognized")
     if namespace != "payload":
         return ArtifactPathClassification("invalid", False, "namespace-invalid")
-    prefix = (cycle + "/artifacts/") if cycle else "artifacts/"
-    if not root_relative_path.startswith(prefix):
+    payload_prefixes = ((cycle + "/artifacts/", cycle + "/_internal/") if cycle
+                        else ("artifacts/", "_internal/"))
+    prefix = next((candidate for candidate in payload_prefixes
+                   if root_relative_path.startswith(candidate)), None)
+    if prefix is None:
         return ArtifactPathClassification("unclassified", False, "outside-cycle-artifacts")
     locator = root_relative_path[len(cycle) + 1:] if cycle else root_relative_path
     error = _locator_error(locator)

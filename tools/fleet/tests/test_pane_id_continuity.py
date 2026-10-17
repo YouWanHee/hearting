@@ -125,7 +125,7 @@ class PaneContinuityTest(unittest.TestCase):
                 herdr_projection.project(harness, "current", pane_id="w:p")
                 report.assert_not_called()
 
-    def test_codex_new_resume_and_fork_keep_the_hook_current_thread_and_source(self):
+    def test_codex_display_projection_keeps_resume_and_fork_lifecycle_out_of_metadata(self):
         lifecycle_path = ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py"
         lifecycle_spec = importlib.util.spec_from_file_location("codex_sessionstart_lifecycle_test",
                                                                  lifecycle_path)
@@ -148,7 +148,10 @@ class PaneContinuityTest(unittest.TestCase):
                     self.assertTrue(projection.project(payload, current_thread))
                 args, kwargs = publish.call_args
                 self.assertEqual(args, ("codex", current_thread))
-                self.assertEqual(kwargs["session_start_source"], source)
+                self.assertIs(kwargs["report_session"], False)
+                self.assertNotIn("session_seq", kwargs)
+                self.assertNotIn("session_start_source", kwargs)
+                self.assertNotIn("resume_argv", kwargs)
 
     def test_claude_pane_badge_survives_native_id_change(self):
         self.record("claude", "old", now=100)
