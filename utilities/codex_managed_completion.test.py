@@ -866,6 +866,46 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
 
 
 class NativeQueueDeliveryTest(unittest.TestCase):
+    def test_each_exact_observation_pass_owns_and_closes_one_queue_session(self):
+        module = load_completion_module()
+
+        class Session:
+            def __init__(self, path, *, timeout):
+                self.path = path
+                self.timeout = timeout
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        sessions = []
+
+        def new_session(path, *, timeout):
+            value = Session(path, timeout=timeout)
+            sessions.append(value)
+            return value
+
+        args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
+                               jobs=Path("/tmp/jobs.log"), timeout=2.0,
+                               delivery_retry_interval=0.01)
+        with mock.patch.object(module, "queue_target", side_effect=[SESSION, "successor-thread"]), \
+             mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=new_session), \
+             mock.patch.object(module, "_native_queue_delivery_once", side_effect=[
+                 {"status": "sent-ambiguous", "submitted": True},
+                 {"status": "accepted"},
+             ]) as deliver, \
+             mock.patch.object(module.time, "sleep"):
+            result = module.deliver_to_native_queue(args, {"receipt": True}, {"att-one"})
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(sessions), 2)
+        self.assertIsNot(sessions[0], sessions[1])
+        self.assertEqual([session.close_count for session in sessions], [1, 1])
+        self.assertEqual([call.kwargs["delivery_target"] for call in deliver.call_args_list],
+                         [SESSION, "successor-thread"])
+        self.assertEqual([call.kwargs["allow_enqueue"] for call in deliver.call_args_list],
+                         [True, False])
+
     def test_standalone_stage_close_creates_the_real_ledger_then_queue_delivery_acks_it(self):
         # Exercise the real close, materializer, session-row lookup and ledger;
         # stub only the native queue transport, never the delivery record.
@@ -1002,7 +1042,11 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         self.assertEqual(rpc.call_args.args[2], {"threadId": "successor-thread"})
         self.assertEqual(send.call_args.kwargs["thread_id"], "successor-thread")
         self.assertEqual(send.call_args.kwargs["client_message_id"], client_id)       # the same stable id
-        consumed.assert_called_with(Path("/tmp/app-server.sock"), SESSION, client_id, timeout=5.0)  # asked of the old thread first
+        consumed.assert_called_once()
+        self.assertEqual(consumed.call_args.args[:3],
+                         (Path("/tmp/app-server.sock"), SESSION, client_id))
+        self.assertEqual(consumed.call_args.kwargs["timeout"], 5.0)
+        self.assertIsNotNone(consumed.call_args.kwargs["session"])
         self.assertEqual({call.args[1] for call in read.call_args_list}, {SESSION})
         self.assertEqual(claim.call_args.args[1], SESSION)
         self.assertEqual(ack.call_args.args[1], SESSION)

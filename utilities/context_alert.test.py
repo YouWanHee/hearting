@@ -131,6 +131,32 @@ class ContextAlertTest(unittest.TestCase):
         link.symlink_to(path)
         self.assertIsNone(alert.codex_usage(link, "codex-session-id"))
 
+    def test_codex_incomplete_uses_context_baseline_not_cumulative_input(self):
+        path = self.temp / "incomplete-rollout.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "codex-session-id", "source": {"kind": "cli"}}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 12000, "total_tokens": 12250},
+                "total_token_usage": {"input_tokens": 13200, "total_tokens": 13490},
+                "model_context_window": 258400,
+            }}},
+        ]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.assertEqual(alert.codex_usage(path, "codex-session-id"), 12000)
+
+    def test_codex_first_incomplete_does_not_substitute_cumulative_input(self):
+        path = self.temp / "first-incomplete-rollout.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "codex-session-id", "source": {"kind": "cli"}}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 0, "total_tokens": 0},
+                "total_token_usage": {"input_tokens": 1200, "total_tokens": 1240},
+                "model_context_window": 258400,
+            }}},
+        ]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.assertEqual(alert.codex_usage(path, "codex-session-id"), 0)
+
     def test_codex_notice_uses_shared_once_state_and_exact_rollout_only(self):
         path = self.codex_rollout(count=703000)
         payload = {"hook_event_name": "UserPromptSubmit", "session_id": "codex-session-id",

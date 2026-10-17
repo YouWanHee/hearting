@@ -678,14 +678,19 @@ def _native_queue_delivery_once(
     receipt: dict[str, Any],
     attempts: set[str],
     *, allow_enqueue: bool = True,
+    session: codex_queue_delivery.DeliverySession | None = None,
+    delivery_target: str | None = None,
 ) -> dict[str, Any]:
     """Queue one stable completion item through its durable per-child ledger."""
     path = args.queue_socket or resolve_queue_socket()
     if not path.is_absolute():
         raise CompletionError("native-queue-endpoint-path-invalid")
     target = queue_target(args.jobs, attempts, args.thread_id)
+    if delivery_target is not None and target != delivery_target:
+        raise CompletionError("native-queue-target-changed")
+    transport = {"session": session} if session is not None else {}
     thread = codex_queue_delivery._rpc(
-        path, "thread/read", {"threadId": target}, timeout=5.0
+        path, "thread/read", {"threadId": target}, timeout=5.0, **transport
     ).get("thread")
     if not isinstance(thread, dict) or thread.get("id") != target:
         raise CompletionError("native-queue-thread-identity-invalid")
@@ -772,21 +777,23 @@ def _native_queue_delivery_once(
                                    jobs=args.jobs)
             claimed.append(delivery_id)
         if target != args.thread_id and codex_queue_delivery._known_consumed(
-                path, args.thread_id, client_message_id, timeout=5.0) is not None:
+                path, args.thread_id, client_message_id, timeout=5.0,
+                **transport) is not None:
             # The item already reached the cleared window's thread before the handover.
             result = {"status": "consumed"}
         elif allow_enqueue:
             result = codex_queue_delivery.send_at_least_once(
                 path, thread_id=target, client_message_id=client_message_id,
-                message=context, timeout=5.0)
+                message=context, timeout=5.0, **transport)
         elif codex_queue_delivery._known_consumed(
-                path, target, client_message_id, timeout=5.0) is not None:
+                path, target, client_message_id, timeout=5.0, **transport) is not None:
             result = {"status": "consumed"}
         else:
             # An item still waiting in the old thread's queue cannot be moved (the local queue API
             # has no move/remove): it is never restarted there; the successor gets the same record.
             result = codex_queue_delivery.poll_owned_item(
-                path, thread_id=target, client_message_id=client_message_id, timeout=5.0)
+                path, thread_id=target, client_message_id=client_message_id, timeout=5.0,
+                **transport)
             result["status"] = "queued"
 
         if result["status"] == "consumed":
@@ -814,8 +821,15 @@ def deliver_to_native_queue(args, receipt, attempts):
     result = {"schema_version": 1, "status": "retryable", "reason": "native-queue-timeout"}
     submitted = False
     while time.monotonic() < deadline:
+        session = None
         try:
-            result = _native_queue_delivery_once(args, receipt, attempts, allow_enqueue=not submitted)
+            path = args.queue_socket or resolve_queue_socket()
+            target = queue_target(args.jobs, attempts, args.thread_id)
+            session = codex_queue_delivery.DeliverySession(path, timeout=5.0)
+            result = _native_queue_delivery_once(
+                args, receipt, attempts, allow_enqueue=not submitted,
+                session=session, delivery_target=target,
+            )
             # Positive queue acceptance is not ambiguous. Keep observing until
             # consumed, but do not repeatedly enqueue during a history outage.
             # A crashed courier may retry with the same id (at-least-once).
@@ -826,6 +840,9 @@ def deliver_to_native_queue(args, receipt, attempts):
                 CompletionError) as exc:
             result = {"schema_version": 1, "status": "retryable", "reason": str(exc),
                       "thread_id": args.thread_id}
+        finally:
+            if session is not None:
+                session.close()
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
