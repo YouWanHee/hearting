@@ -120,7 +120,54 @@ def _session_id(value):
     agent = result.get("agent") if isinstance(result, dict) else None
     session = agent.get("agent_session") if isinstance(agent, dict) else None
     sid = session.get("value") if isinstance(session, dict) else None
-    return sid if isinstance(sid, str) and sid else None
+    if not isinstance(sid, str):
+        return None
+    sid = sid.strip()
+    if not sid or sid.casefold() in {
+            "-", "unknown", "none", "null", "undefined", "n/a", "<sid>"}:
+        return None
+    return sid
+
+
+def _native_agent_identity_reason(agent, *, name, runtime, pane, require_complete):
+    """Check Herdr's reported agent tuple without guessing the SID's spelling."""
+    if not isinstance(agent, dict):
+        return "native-agent-tuple-missing" if require_complete else None
+
+    for field, expected, label in (
+            ("name", name, "name"),
+            ("agent", runtime, "runtime"),
+            ("pane_id", pane, "pane")):
+        value = agent.get(field)
+        if value is None:
+            if require_complete:
+                return f"native-agent-{label}-missing"
+        elif value != expected:
+            return f"native-agent-{label}-mismatch"
+
+    # `agent` is the current API's runtime field. If an API response also
+    # supplies `kind`, keep that duplicate runtime identity consistent.
+    if "kind" in agent and agent["kind"] != runtime:
+        return "native-agent-kind-mismatch"
+
+    session = agent.get("agent_session")
+    if session is None:
+        return "native-agent-session-missing" if require_complete else None
+    if not isinstance(session, dict):
+        return "native-agent-session-malformed"
+
+    if "agent" in session and session["agent"] != runtime:
+        return "native-agent-session-runtime-mismatch"
+    session_kind = session.get("kind")
+    if "kind" in session and session_kind != "id":
+        return "native-agent-session-kind-mismatch"
+
+    if require_complete:
+        if "value" not in session:
+            return "native-agent-session-id-missing"
+        if _session_id({"result": {"agent": agent}}) is None:
+            return "native-agent-session-id-unusable"
+    return None
 
 
 def _redact_argv(argv):
@@ -572,6 +619,11 @@ class HerdrIntegrationLive:
         start_payload = _json(stdout) or _json(stderr)
         start_error = _error_envelope(start_payload) or _error_envelope(_json(stderr))
         start_ok = rc == 0 and not start_error
+        start_result = _result(start_payload)
+        start_agent = start_result.get("agent") if isinstance(start_result, dict) else None
+        start_identity_reason = (_native_agent_identity_reason(
+            start_agent, name=name, runtime=runtime, pane=pane, require_complete=False)
+            if start_ok else None)
         rc_get, get_stdout, get_stderr = self.herdr_command(
             f"native-{runtime}-session-get", ["agent", "get", name], timeout=10)
         get_payload = _json(get_stdout) or _json(get_stderr)
@@ -580,7 +632,17 @@ class HerdrIntegrationLive:
         get_error = _error_envelope(get_payload) or _error_envelope(_json(get_stderr))
         get_ok = rc_get == 0 and not get_error
         reported_sid = _session_id(get_payload) if get_ok else None
-        sid = reported_sid if start_ok else None
+        get_identity_reason = (_native_agent_identity_reason(
+            agent, name=name, runtime=runtime, pane=pane, require_complete=True)
+            if get_ok else None)
+        if not start_ok:
+            identity_reason = "native-agent-start-unavailable"
+        elif not get_ok:
+            identity_reason = "native-agent-get-unavailable"
+        else:
+            identity_reason = start_identity_reason or get_identity_reason
+        confirmed = bool(start_ok and get_ok and identity_reason is None and reported_sid)
+        sid = reported_sid if confirmed else None
         return {"name": name, "pane_id": pane, "start_exit": rc, "start_ok": start_ok,
                 "get_exit": rc_get, "get_ok": get_ok,
                 "session_id": sid, "start_reason": _failure_reason(stderr, rc),
@@ -588,7 +650,8 @@ class HerdrIntegrationLive:
                 "start_error_code": start_error, "get_error_code": get_error,
                 "get_session_id_present": bool(reported_sid),
                 "agent_status": (agent or {}).get("agent_status") if isinstance(agent, dict) else None,
-                "session_confirmed_by_get": bool(sid)}
+                "session_identity_reason": identity_reason,
+                "session_confirmed_by_get": confirmed}
 
     def _wait_for_native_state(self, runtime, name, state, timeout_ms=30_000):
         rc, stdout, stderr = self.herdr_command(f"native-{runtime}-wait-{state}",
@@ -902,12 +965,14 @@ class HerdrIntegrationLive:
             tap_ok = self._start_event_tap()
             native = self._agent_start(runtime, pane)
             view = self.transport.observe() if self.transport else None
-            exact_events = [event for event in self._matching_native_events(
-                pane, native.get("session_id"))
-                if event.get("session_id") == native.get("session_id")
-                and event.get("session_start_source")
-                and isinstance(event.get("source"), str)
-                and event["source"].startswith("herdr:")]
+            confirmed_sid = (native.get("session_id")
+                             if native.get("session_confirmed_by_get") else None)
+            exact_events = ([event for event in self._matching_native_events(pane, confirmed_sid)
+                             if event.get("session_id") == confirmed_sid
+                             and event.get("session_start_source")
+                             and isinstance(event.get("source"), str)
+                             and event["source"].startswith("herdr:")]
+                            if confirmed_sid else [])
             sentinel_path = sentinels[runtime]
             sentinel_count = None
             if sentinel_path.exists():
@@ -926,6 +991,10 @@ class HerdrIntegrationLive:
                 "native_session_id": native.get("session_id"),
                 "native_start_exit": native.get("start_exit"),
                 "native_start_ok": native.get("start_ok", False),
+                "native_get_exit": native.get("get_exit"),
+                "native_get_ok": native.get("get_ok", False),
+                "native_get_reason": native.get("get_reason"),
+                "native_session_identity_reason": native.get("session_identity_reason"),
                 "native_session_confirmed_by_get": native.get("session_confirmed_by_get", False),
                 "native_callback_report_count": len(exact_events),
                 "native_callback_reports": [{key: event.get(key) for key in

@@ -21,6 +21,15 @@ sys.modules[SPEC.name] = live
 SPEC.loader.exec_module(live)
 
 
+def _native_agent(*, name="fixture-agent", runtime="codex", pane="private-pane",
+                  sid="typed-native-sid", session_kind="id", session_runtime="codex"):
+    agent = {"name": name, "agent": runtime, "pane_id": pane,
+             "agent_session": {"agent": session_runtime, "kind": session_kind}}
+    if sid is not None:
+        agent["agent_session"]["value"] = sid
+    return agent
+
+
 class NativeDriverContractTest(unittest.TestCase):
     def test_case_set_matches_the_native_measurement_matrix(self):
         self.assertEqual(set(live.CASES), {
@@ -56,8 +65,9 @@ class NativeDriverContractTest(unittest.TestCase):
                 "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', "
                 "'agent_status': 'idle'}}}))\n"
                 "elif args[args.index('agent') + 1] == 'get':\n"
-                "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', "
-                "'pane_id': 'private-pane', 'agent_session': {'value': 'typed-native-sid'}, "
+                "    print(json.dumps({'result': {'agent': {'name': 'fixture-agent', 'agent': 'codex', "
+                "'pane_id': 'private-pane', 'agent_session': {'agent': 'codex', 'kind': 'id', "
+                "'value': 'typed-native-sid'}, "
                 "'agent_status': 'idle'}}}))\n"
                 "else:\n"
                 "    print(json.dumps({'error': {'code': 'unexpected-command'}}))\n"
@@ -105,8 +115,9 @@ class NativeDriverContractTest(unittest.TestCase):
                 "'agent_status': 'idle'}}}))\n"
                 "elif args[args.index('agent') + 1] == 'get':\n"
                 "    print(json.dumps({'result': {'agent': {"
-                "'name': 'fixture-agent', 'pane_id': 'private-pane', "
-                "'agent_session': {'value': 'typed-native-sid'}, 'agent_status': 'idle'}}}))\n"
+                "'name': 'fixture-agent', 'agent': 'opencode', 'pane_id': 'private-pane', "
+                "'agent_session': {'agent': 'opencode', 'kind': 'id', "
+                "'value': 'typed-native-sid'}, 'agent_status': 'idle'}}}))\n"
                 "else:\n"
                 "    print(json.dumps({'error': {'code': 'unexpected-command'}}))\n"
                 "    raise SystemExit(1)\n",
@@ -155,10 +166,13 @@ class NativeDriverContractTest(unittest.TestCase):
             self.addCleanup(driver.runtime_dir.cleanup)
             start = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
             get = json.dumps({"result": {"agent": {
-                "name": "fixture-agent", "agent_session": {"value": "typed-sid"}}}})
+                "name": "fixture-agent", "agent": "claude", "pane_id": "private-pane",
+                "agent_session": {"agent": "claude", "kind": "id", "value": "typed-sid"}}}})
             with mock.patch.object(driver, "herdr_command",
                     side_effect=[(0, start, ""), (0, get, "")]) as command:
-                driver._agent_start("claude", "private-pane", name="fixture-agent")
+                native = driver._agent_start("claude", "private-pane", name="fixture-agent")
+            self.assertTrue(native["session_confirmed_by_get"])
+            self.assertEqual(native["session_id"], "typed-sid")
             start_args = command.call_args_list[0].args[1]
             self.assertEqual(start_args[:6], [
                 "agent", "start", "fixture-agent", "--kind", "claude", "--pane",
@@ -178,35 +192,105 @@ class NativeDriverContractTest(unittest.TestCase):
             ]))
             self.addCleanup(driver.runtime_dir.cleanup)
             start_ok = json.dumps({"result": {"agent": {"name": "fixture-agent"}}})
-            typed_get = json.dumps({"result": {"agent": {
-                "name": "fixture-agent", "pane_id": "private-pane",
-                "agent_session": {"value": "typed-native-sid"}}}})
-            metadata_only = json.dumps({"result": {"agent": {
-                "name": "fixture-agent", "pane_id": "private-pane",
-                "session_id": "metadata-sid"}}})
-            typed_start = json.dumps({"result": {"agent": {
-                "name": "fixture-agent", "agent_session": {"value": "start-only-sid"}}}})
-            scenarios = (
-                ("typed-get", (0, start_ok, ""), (0, typed_get, ""),
-                 "typed-native-sid", True, True),
-                ("name-pane-metadata", (0, typed_start, ""), (0, metadata_only, ""),
-                 None, False, True),
-                ("get-command-failed", (0, start_ok, ""), (1, typed_get, "not accepted"),
-                 None, False, True),
-                ("start-command-failed", (1, start_ok, "failed"), (0, typed_get, ""),
-                 None, False, False),
-                ("start-error-envelope", (0, '{"error":{"code":"start-rejected"}}', ""),
-                 (0, typed_get, ""), None, False, False),
-                ("get-error-envelope", (0, start_ok, ""),
-                 (0, '{"error":{"code":"get-rejected"}}', ""), None, False, True),
+            valid_agent = _native_agent()
+            wrong_name = _native_agent(name="other-agent")
+            wrong_pane = _native_agent(pane="other-pane")
+            wrong_runtime = _native_agent(runtime="opencode", session_runtime="opencode")
+            wrong_session_runtime = _native_agent(session_runtime="opencode")
+            wrong_outer_kind = _native_agent()
+            wrong_outer_kind["kind"] = "opencode"
+            wrong_session_kind = _native_agent(session_kind="session")
+            metadata_only = {"name": "fixture-agent", "agent": "codex",
+                             "pane_id": "private-pane", "session_id": "metadata-sid"}
+            missing_name = _native_agent()
+            del missing_name["name"]
+            missing_runtime = _native_agent()
+            del missing_runtime["agent"]
+            missing_pane = _native_agent()
+            del missing_pane["pane_id"]
+            missing_session = _native_agent()
+            del missing_session["agent_session"]
+            missing_session_id = _native_agent(sid=None)
+            optional_session_kind = _native_agent()
+            del optional_session_kind["agent_session"]["kind"]
+            identity_scenarios = (
+                ("valid-documented-tuple", valid_agent, None, "typed-native-sid", True),
+                ("optional-session-kind-omitted", optional_session_kind,
+                 None, "typed-native-sid", True),
+                ("wrong-requested-name", wrong_name, "native-agent-name-mismatch", None, False),
+                ("wrong-pane", wrong_pane, "native-agent-pane-mismatch", None, False),
+                ("wrong-runtime", wrong_runtime, "native-agent-runtime-mismatch", None, False),
+                ("wrong-session-runtime", wrong_session_runtime,
+                 "native-agent-session-runtime-mismatch", None, False),
+                ("wrong-runtime-kind", wrong_outer_kind,
+                 "native-agent-kind-mismatch", None, False),
+                ("invalid-session-kind", wrong_session_kind,
+                 "native-agent-session-kind-mismatch", None, False),
+                ("missing-name", missing_name, "native-agent-name-missing", None, False),
+                ("missing-runtime", missing_runtime, "native-agent-runtime-missing", None, False),
+                ("missing-pane", missing_pane, "native-agent-pane-missing", None, False),
+                ("missing-session", missing_session,
+                 "native-agent-session-missing", None, False),
+                ("missing-session-id", missing_session_id,
+                 "native-agent-session-id-missing", None, False),
+                ("metadata-id-substitute", metadata_only,
+                 "native-agent-session-missing", None, False),
+                ("placeholder-dash", _native_agent(sid="-"),
+                 "native-agent-session-id-unusable", None, False),
+                ("unknown-id", _native_agent(sid="unknown"),
+                 "native-agent-session-id-unusable", None, False),
+                ("template-id", _native_agent(sid="<sid>"),
+                 "native-agent-session-id-unusable", None, False),
             )
-            for label, start_response, get_response, expected_sid, confirmed, expected_start_ok in scenarios:
+            for label, agent, reason, expected_sid, confirmed in identity_scenarios:
+                with self.subTest(scenario=label), mock.patch.object(
+                        driver, "herdr_command", side_effect=[
+                            (0, start_ok, ""),
+                            (0, json.dumps({"result": {"agent": agent}}), "")]):
+                    native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+                    self.assertTrue(native["start_ok"])
+                    self.assertTrue(native["get_ok"])
+                    self.assertEqual(native["session_confirmed_by_get"], confirmed)
+                    self.assertEqual(native["session_id"], expected_sid)
+                    self.assertEqual(native["session_identity_reason"], reason)
+
+            start_mismatch = json.dumps({"result": {"agent": {"name": "other-agent"}}})
+            with self.subTest(scenario="start-name-mismatch"), mock.patch.object(
+                    driver, "herdr_command", side_effect=[
+                        (0, start_mismatch, ""),
+                        (0, json.dumps({"result": {"agent": valid_agent}}), "")]):
+                native = driver._agent_start("codex", "private-pane", name="fixture-agent")
+                self.assertTrue(native["start_ok"])
+                self.assertTrue(native["get_ok"])
+                self.assertFalse(native["session_confirmed_by_get"])
+                self.assertIsNone(native["session_id"])
+                self.assertEqual(native["session_identity_reason"], "native-agent-name-mismatch")
+
+            for label, start_response, get_response, start_ok_expected, get_ok_expected, reason in (
+                    ("get-command-failed", (0, start_ok, ""),
+                     (1, json.dumps({"result": {"agent": valid_agent}}), "not accepted"),
+                     True, False, "native-agent-get-unavailable"),
+                    ("start-command-failed", (1, start_ok, "failed"),
+                     (0, json.dumps({"result": {"agent": valid_agent}}), ""),
+                     False, True, "native-agent-start-unavailable"),
+                    ("start-error-envelope", (0, '{"error":{"code":"start-rejected"}}', ""),
+                     (0, json.dumps({"result": {"agent": valid_agent}}), ""),
+                     False, True, "native-agent-start-unavailable"),
+                    ("get-error-envelope", (0, start_ok, ""),
+                     (0, '{"error":{"code":"get-rejected"}}', ""),
+                     True, False, "native-agent-get-unavailable")):
                 with self.subTest(scenario=label), mock.patch.object(
                         driver, "herdr_command", side_effect=[start_response, get_response]):
                     native = driver._agent_start("codex", "private-pane", name="fixture-agent")
-                    self.assertEqual(native["start_ok"], expected_start_ok)
-                    self.assertEqual(native["session_confirmed_by_get"], confirmed)
-                    self.assertEqual(native["session_id"], expected_sid)
+                    self.assertEqual(native["start_ok"], start_ok_expected)
+                    self.assertEqual(native["get_ok"], get_ok_expected)
+                    self.assertFalse(native["session_confirmed_by_get"])
+                    self.assertIsNone(native["session_id"])
+                    self.assertEqual(native["session_identity_reason"], reason)
+
+    def test_native_session_id_accepts_opaque_non_placeholder_values(self):
+        payload = {"result": {"agent": {"agent_session": {"value": "session:opaque/3"}}}}
+        self.assertEqual(live._session_id(payload), "session:opaque/3")
 
     def test_callback_measurement_keeps_start_identity_and_callback_evidence_distinct(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -247,6 +331,48 @@ class NativeDriverContractTest(unittest.TestCase):
             self.assertTrue(callback["native_session_confirmed_by_get"])
             self.assertEqual(callback["native_callback_report_count"], 1)
             self.assertEqual(callback["user_sentinel_count"], 1)
+
+    def test_unconfirmed_native_identity_cannot_attribute_a_sessionless_callback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            native = {"name": "fixture-agent", "session_id": None,
+                      "start_exit": 0, "start_ok": True, "get_exit": 0, "get_ok": True,
+                      "session_confirmed_by_get": False,
+                      "session_identity_reason": "native-agent-session-id-unusable"}
+
+            def start_fixture(runtime, _pane):
+                (Path(driver.env["HOME"]) / f"callback-{runtime}.log").write_text(
+                    "codex\n", encoding="utf-8")
+                return native
+
+            unbound_event = {"session_id": None, "session_start_source": "startup",
+                             "source": "herdr:codex"}
+            with mock.patch.object(live, "RUNTIMES", ("codex",)), \
+                    mock.patch.object(driver, "_install_and_reinstall",
+                                      return_value={"codex": {"status_current": True}}), \
+                    mock.patch.object(driver, "create_pane", return_value="private-pane"), \
+                    mock.patch.object(driver, "_start_event_tap", return_value=True), \
+                    mock.patch.object(driver, "_agent_start", side_effect=start_fixture), \
+                    mock.patch.object(driver, "_matching_native_events",
+                                      return_value=[unbound_event]) as matching_events, \
+                    mock.patch.object(driver, "_stop_event_tap"):
+                result = driver._install_callbacks()
+
+            callback = result["runtimes"]["codex"]
+            self.assertEqual(callback["outcome"], "unavailable")
+            self.assertFalse(callback["native_session_confirmed_by_get"])
+            self.assertEqual(callback["native_session_identity_reason"],
+                             "native-agent-session-id-unusable")
+            self.assertEqual(callback["native_callback_report_count"], 0)
+            self.assertEqual(callback["native_callback_reports"], [])
+            matching_events.assert_not_called()
 
     def test_isolation_drops_inherited_credentials_and_keeps_output_private(self):
         with tempfile.TemporaryDirectory() as temporary:
