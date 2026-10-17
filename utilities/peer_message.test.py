@@ -1244,6 +1244,17 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
         self.assertEqual(errors.getvalue(), "")
 
+    def test_scan_skips_received_rows_without_verifying_them(self):
+        # Delivered history piles up; verifying every row on each prompt cost seconds.
+        text, received_ref = self.pending("delivered body")
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        _text, open_ref = self.pending("still open body")
+        real = peer_message._read_transfer_record
+        with mock.patch.object(peer_message, "_read_transfer_record", side_effect=real) as reads:
+            self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [open_ref])
+        self.assertEqual([c.args[0] for c in reads.call_args_list], [open_ref])
+        self.assertEqual(peer_message._read_pending(received_ref)["state"], "received")
+
     def test_every_quarantined_row_is_diagnosed_once_in_a_batch(self):
         _text, healthy_ref = self.pending()
         originals = {}

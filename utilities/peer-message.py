@@ -120,14 +120,16 @@ def _transfer_path(ref):
     return peer_state_root() / "peer-messages" / "transfers" / f"{ref}.json"
 
 
-def _read_transfer_record(ref):
+def _read_transfer_record(ref, *, roots=None):
     """Read Fleet's trusted ledger roots; a message never supplies a path.
 
     Each writer keeps its canonical jobs root. Multiple records for one ref
     are ambiguous, even when one of them would match the recipient.
+    ``roots`` lets one pending scan resolve the roots once, not per row.
     """
     own_path = _transfer_path(ref)  # Validate before querying any roots.
-    roots, _source = steward_marker_roots()
+    if roots is None:
+        roots, _source = steward_marker_roots()
     paths = [own_path, *(Path(root) / "peer-messages" / "transfers" / own_path.name for root in roots)]
     record, found, seen = None, False, set()
     for path in paths:
@@ -596,7 +598,7 @@ def _pending_target_matches(row, recipient):
     return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
 
 
-def _read_pending(ref):
+def _read_pending(ref, *, roots=None):
     path = _pending_path(ref)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -610,7 +612,7 @@ def _read_pending(ref):
     if len(raw) > 65536:
         raise ValueError("peer-pending-oversized")
     row = json.loads(raw)
-    transfer = _read_transfer_record(ref)
+    transfer = _read_transfer_record(ref, roots=roots)
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
             or row.get("ref") != ref or row.get("from") != transfer.get("from")
@@ -741,11 +743,19 @@ def _quarantine_pending(path, expected):
 
 
 def _pending_rows():
+    # Every row of one scan reads the same ledger roots; resolving them per row
+    # cost seconds on each prompt once a few thousand rows had accumulated.
+    try:
+        roots, _source = steward_marker_roots()
+    except (OSError, ValueError):
+        roots = None  # each row then resolves (and fails) on its own, as before
     for path in sorted(_pending_dir().glob("*.json")):
+        if _received_on_disk(path):
+            continue
         expected = None
         try:
             expected = path.lstat()
-            row = _read_pending(path.stem)
+            row = _read_pending(path.stem, roots=roots)
         except (OSError, ValueError) as exc:
             if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
                 # A lock or temporary I/O failure proves no damage; the next
@@ -759,6 +769,25 @@ def _pending_rows():
             continue
         if row and row["state"] != "received" and not _registered_delivery_settled(row):
             yield row
+
+
+def _received_on_disk(path):
+    """A well-formed row already received: the scan drops it, so it need not verify it.
+
+    Most rows are delivered history; checking each one's transfer record on every
+    prompt cost seconds. Anything unreadable or malformed takes the full read below,
+    which quarantines it as before.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            row = json.loads(fh.read(65537))
+    except (OSError, ValueError):
+        return False
+    return isinstance(row, dict) and row.get("state") == "received"
 
 
 def _registered_delivery_settled(row):
