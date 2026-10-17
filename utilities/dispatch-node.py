@@ -545,18 +545,21 @@ def round_protocol_block(budget, rows, worker_type, node_id):
  launch; `rows` is the same `(cols, metadata)` census it was built from. A
  verdict-less row (crashed, capacity-dead, invalid envelope -- never an
  actual PASS/FAIL/blocking review) renders as "판정 없음(<note>)" in the
- history so a correction round can tell a real prior finding apart from a
- round that never reached one (SD-153 rule 5).
+ history and does not create a correction obligation (SD-153 rule 5).
  """
  if budget.round_kind == "first":
   if budget.next_round <= 1 or not rows:
    return ""
-  history = "; ".join(
-   f"{cols[4]} ({meta.get('note') or cols[1] or 'open'})" for cols, meta in rows
-  )
-  return ("\n\nImplementation source changed since earlier review history. This is a full independent review "
-          "of the current source subject, not a closure check. Earlier findings are context only; "
-          "report every current blocker and assess the full reviewed scope. Prior history: " + history + ".")
+  history_parts=[]
+  for cols,meta in rows:
+   slug=cols[4]; status=cols[1]; note=meta.get("note","")
+   kind=REVIEW_ROUND_CAP.classify_round_row(status,meta,worker_type=meta.get("worker_type") or worker_type)
+   label=f"판정 없음({note or status or 'open'})" if kind=="verdict-less" else (note or "open")
+   history_parts.append(f"{slug} ({label})")
+  history="; ".join(history_parts)
+  return ("\n\nThis is a full independent review of the current review subject, not a correction or closure check. "
+          "Earlier findings are context only; verdict-less attempts provide execution context only. "
+          "Report every current blocker and assess the full assigned scope. Prior history: " + history + ".")
  if budget.next_round<2: return ""
  history_parts=[]
  for cols,meta in rows:

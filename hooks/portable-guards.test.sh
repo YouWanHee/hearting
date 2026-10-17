@@ -1678,7 +1678,32 @@ if grep -q '^role: fast reviewer$' "$ROOT/roles/units/qa/test.md" \
 else
   bad "codex native agent projection should preserve mixed role sets"
 fi
-if grep -q 'model = "gpt-6-luna"' "$TMP/codex_agent_home/agents/memory-scout.toml" \
+memory_scout_model_ok=0
+if python3 - "$ROOT" "$TMP/codex_agent_home/agents/memory-scout.toml" <<'PY'
+import importlib.util
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+agent_path = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location(
+    "codex_native_agent_resolver", root / "adapters/codex/bin/sync-native-agents.py")
+resolver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(resolver)
+expected_model, expected_effort, expected_sandbox = resolver.codex_config("memory-scout")
+text = agent_path.read_text(encoding="utf-8")
+fields = dict(re.findall(r'^(model|model_reasoning_effort|sandbox_mode) = "([^"]+)"$',
+                         text, re.MULTILINE))
+if fields.get("model") != expected_model:
+    raise SystemExit(f"memory-scout model {fields.get('model')!r} != configured {expected_model!r}")
+if (expected_effort, expected_sandbox) != ("low", "read-only"):
+    raise SystemExit("memory-scout shipped profile must remain low-effort and read-only")
+PY
+then
+  memory_scout_model_ok=1
+fi
+if [ "$memory_scout_model_ok" -eq 1 ] \
   && grep -q 'model_reasoning_effort = "low"' "$TMP/codex_agent_home/agents/memory-scout.toml" \
   && grep -q 'sandbox_mode = "read-only"' "$TMP/codex_agent_home/agents/memory-scout.toml" \
   && grep -q 'Never run memory mutation commands' "$TMP/codex_agent_home/agents/memory-scout.toml"; then

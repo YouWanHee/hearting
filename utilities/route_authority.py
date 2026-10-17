@@ -655,9 +655,11 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             any(last_id in (r.get("supersedes") or ()) for r in budget_revisions)))
         if closure:
             state = "admit"
-        round_kind = ("closure-check" if closure else
-                      "correction" if verdicts else "first" if source_aware else
-                      "correction" if rows else "first")
+        # Attempt history does not establish a prior judgment. A crash,
+        # capacity death, or invalid envelope may advance the lineage's round
+        # number, but until a substantive verdict exists for this subject the
+        # next admitted pass is still a full first review.
+        round_kind = "closure-check" if closure else "correction" if verdicts else "first"
         budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
             len(rows) + 1, len(rows) + 1 if rows else 0,
             round_kind,

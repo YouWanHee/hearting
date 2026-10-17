@@ -138,10 +138,9 @@ class CapacityTest(unittest.TestCase):
   claude=F.capacity_cascade("claude")
   self.assertEqual(claude,[d for d in declared if d[0] not in restricted])
   self.assertGreaterEqual(len(claude),2)
-  # 2026-09-09 shipped default == user runtime: fable is main-session-only, so the
-  # cascade head is the deep tier model (opus) and the walk is opus->sonnet.
-  self.assertEqual(claude[0][0],conf["CFG_TIER_DEEP_MODEL"]);self.assertEqual(restricted,["fable"])
-  self.assertEqual([m for m,_ in claude],["opus","sonnet"])
+  self.assertTrue(restricted)
+  self.assertTrue(set(restricted).isdisjoint({model for model,_effort in declared}))
+  self.assertEqual(claude[0][0],conf["CFG_TIER_DEEP_MODEL"])
   for i,(model,paired) in enumerate(claude):
    nxt=claude[i+1] if i+1<len(claude) else None
    self.assertEqual(F.capacity_cascade_next("claude",model),nxt)
@@ -150,21 +149,25 @@ class CapacityTest(unittest.TestCase):
    self.assertTrue(F.allowed_capacity_settings("claude",model,paired))
    self.assertFalse(F.allowed_capacity_settings("claude",model,"not-a-real-effort"))
  def test_main_only_model_never_enters_cascade_or_capacity_settings(self):
-  # A config that declares a main-only model keeps it out of the cascade and out
-  # of every capacity setting. The shipped default declares fable too, so the
-  # second block pins another alias: the filter reads the config, not a name.
-  conf={**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable"};self.pin_conf(conf)
+  # Pin a cascade member as main-only so the fixture proves the configured
+  # restriction changes both eligibility and the next-candidate walk.
+  conf=self.shipped_conf("claude")
+  declared=[tuple(e.split(":",1)) for e in conf["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+  blocked=declared[0][0];blocked_alias=f"claude-{blocked}-5"
+  conf={**conf,"CFG_MAIN_SESSION_ONLY_MODELS":blocked};self.pin_conf(conf)
   claude=F.capacity_cascade("claude");models=[m for m,_ in claude]
-  self.assertNotIn("fable",models);self.assertEqual(models,["opus","sonnet"])
-  self.assertEqual(F.capacity_cascade_next("claude","fable"),claude[0])  # legacy row: first eligible
-  self.assertEqual(F.capacity_cascade_next("claude","claude-fable-5"),claude[0])
-  self.assertFalse(F.allowed_capacity_settings("claude","fable","xhigh"))
-  self.assertFalse(F.allowed_capacity_settings("claude","claude-fable-5","xhigh"))
+  self.assertNotIn(blocked,models);self.assertEqual(claude,[entry for entry in declared if entry[0]!=blocked])
+  self.assertEqual(F.capacity_cascade_next("claude",blocked),claude[0])  # legacy row: first eligible
+  self.assertEqual(F.capacity_cascade_next("claude",blocked_alias),claude[0])
+  self.assertFalse(F.allowed_capacity_settings("claude",blocked,"xhigh"))
+  self.assertFalse(F.allowed_capacity_settings("claude",blocked_alias,"xhigh"))
   self.assertTrue(F.allowed_capacity_settings("claude",*claude[0]))
-  self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable opus"})
+  second=declared[1][0]
+  self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":f"{blocked} {second}"})
   narrowed=F.capacity_cascade("claude")
-  self.assertEqual([m for m,_ in narrowed],["sonnet"])
-  self.assertFalse(F.allowed_capacity_settings("claude","opus","xhigh"))
+  self.assertEqual(narrowed,[entry for entry in declared if entry[0] not in {blocked,second}])
+  self.assertFalse(F.allowed_capacity_settings("claude",blocked,"xhigh"))
+  self.assertFalse(F.allowed_capacity_settings("claude",second,"xhigh"))
  def test_unset_capacity_model_derives_alternative_from_cascade(self):
   self.args.capacity_model=None  # no explicit alternative -> derive from config cascade
   cascade=F.capacity_cascade("codex")  # the exhausted model is the cascade head, whatever it is
@@ -210,7 +213,7 @@ class CapacityTest(unittest.TestCase):
    {"claude":0,"codex":0,"opencode":0}, ["claude","codex","opencode"],
    {"claude":9,"codex":4,"opencode":1}, strategy="balanced")
   self.assertEqual((chosen,band),("claude","primary"))
- def test_top_profile_never_fails_over_and_astra_never_enters_capacity_settings(self):
+ def test_top_profile_never_fails_over_and_main_only_models_never_enter_capacity(self):
   # SD-59 keeps the top exception profile out of the cascade in both directions.
   self.args.capacity_model=None;self.args.capacity_reasoning=None
   node={**self.node,"model_profile":"top"};attempts=[]
@@ -218,9 +221,12 @@ class CapacityTest(unittest.TestCase):
    state,fields,reason=F.capacity_retry(self.args,self.route,node,self.row,1,self.failed,attempts)
   self.assertEqual((state,fields,reason),("descend",{},"capacity-alternative-top-profile"))
   self.assertTrue(attempts and attempts[0].endswith("capacity-alternative-top-profile"));launched.assert_not_called()
-  # the codex key (parity, 2026-09-10) keeps a hyphenated top model out of every capacity setting
-  conf=self.shipped_conf("codex");self.assertEqual(conf["CFG_MAIN_SESSION_ONLY_MODELS"].split(),["gpt-6-astra"])
-  self.assertNotIn("gpt-6-astra",[m for m,_ in F.capacity_cascade("codex")])
-  self.assertFalse(F.allowed_capacity_settings("codex","gpt-6-astra","xhigh"))
-  self.assertEqual(F.capacity_cascade_next("codex","gpt-6-astra"),F.capacity_cascade("codex")[0])
+  # The shipped restriction is resolved from the adapter policy, not a model ID.
+  conf=self.shipped_conf("codex");restricted=conf["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+  self.assertTrue(restricted)
+  cascade=F.capacity_cascade("codex")
+  for model in restricted:
+   self.assertNotIn(model,[m for m,_ in cascade])
+   self.assertFalse(F.allowed_capacity_settings("codex",model,"xhigh"))
+   self.assertEqual(F.capacity_cascade_next("codex",model),cascade[0])
 if __name__=="__main__":unittest.main()

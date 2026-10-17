@@ -137,6 +137,16 @@ scope resolves to `documents/<artifact>/**` and `research/<artifact>/**`, or to
 an existing document in the route's own working-tree repository (a README, for
 example), whose pre-change copy is kept in the route's cycle under
 `artifacts/_internal/versions/v{N}/`.
+For a complete, approved repository-document target, the existing acting
+modifier verifies the changed document and commits only its validated owned
+path or paths in that assigned worktree. A direct inline modifier uses the
+already approved start and its existing native filesystem/Git access; a
+registered quick or standard+ owner uses the existing owner commit policy and
+its narrow Git metadata grant. These are the existing authority paths, not a
+new modifier, stage, permission, or topology flag. Artifact-only and no-op
+work, report or `--review-only` scope, and any pass with no tracked target diff
+produce no source commit. Stage `commit_expected` and declared sub-session
+no-commit rules remain unchanged.
 It never owns new empirical work: under `WORKFLOW §0.2`, a request
 that also requires reevaluation, new metrics, or figures/media from new empirical analysis
 routes that work to `autopilot-lab` (or the owning execution capability) as

@@ -13,7 +13,7 @@ Post-creation refinement entrypoint for existing document and research artifacts
 
 ## Routing: Major vs Minor
 
-Limit this capability to `<artifact-root>/research/*` and `<artifact-root>/documents/*`. Use direct editing for ordinary project Markdown, and use `code-refine`, `code-execute`, or `autopilot-code` for plan or code artifacts.
+Targets include `<artifact-root>/research/*`, `<artifact-root>/documents/*`, and an existing tracked project document explicitly named by the approved route's `target-artifact` scope (for example, a repository README). Ordinary project Markdown can still use a direct minor edit when no refine route is requested. Use `code-refine`, `code-execute`, or `autopilot-code` for plan or code artifacts.
 
 Route a change through the major refinement flow when any of these conditions holds:
 
@@ -76,7 +76,7 @@ After artifact resolution, run Stages A-E. Read `process-stages.md` for complete
 3. **Stage B — Plan changes**: read only affected files, build a per-file change list, and classify each change as `MECH`, `SEM`, or `STRUCT`. Halt on STRUCT and recommend the owning heavier flow.
 4. **Stage B.5 — Factual and style detectors**: run for every change, including quick. Compare factual claims against artifact-local ground truth and run the style lint. Mark unresolved findings as `⚠ Unverified` or `⚠ Style`. Only the two explicit opt-out flags may skip these checks.
 5. **Stage C — Diff preview**: show the proposed change. A start-time `report` choice finishes after the preview without source mutation; `complete` proceeds through the existing review and verification without another entry approval. `--review-only` follows report. `--confirm` retains its explicit meaning and cannot create missing start approval. Older sealed routes retain `preview-disposition` and user-only release.
-6. **Stage D — Apply**: obtain the deterministic route-bound snapshot receipt before editing, apply the change, and update all five `pipeline_summary.md` sections: metadata, version history, changes, migrated minor log, and in-file changelog. Never choose the version or copy the snapshot manually.
+6. **Stage D — Apply**: obtain the deterministic route-bound snapshot receipt before editing, apply the change, and update all five `pipeline_summary.md` sections for a research or documents artifact: metadata, version history, changes, migrated minor log, and in-file changelog. Never choose the version or copy the snapshot manually. For an approved existing tracked project document, the same modifier runs its document check and then commits only the exact validated owned path or paths in the assigned worktree. Direct inline uses its already approved native Git access and existing git-state guard; a registered quick or standard+ owner uses the existing owner commit policy and narrow metadata grant. Report/review-only, artifact-only, no-op, and no-source-diff work make no source commit; stage and declared sub-session no-commit rules are unchanged.
 7. **Stage E — Memo form**: when `--memo <file>` is present, use the memo as proposal input before running Stages B-D.
 
 ## Reference Index

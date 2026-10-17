@@ -228,6 +228,31 @@ class RoundBudgetTest(unittest.TestCase):
         self.assertEqual(budget.verdict_rounds, 0)
         self.assertEqual(budget.cap, 2)
 
+    def test_verdictless_attempts_do_not_turn_the_first_review_into_a_correction(self):
+        for note, failure_class in (("dead-worker-blocked", "blocked"),
+                                    ("dead-invalid-envelope", "contract"),
+                                    ("dead-capacity", "capacity")):
+            with self.subTest(note=note):
+                budget = CAP.round_budget(
+                    route("standard", cap=2), review_node(),
+                    [row("done", note, failure_class=failure_class,
+                         extra={"attempt_id": "att-" + note})],
+                )
+                self.assertEqual((budget.state, budget.verdict_rounds,
+                                  budget.round_kind, budget.next_round),
+                                 ("admit", 0, "first", 2))
+
+        # A verdict remains the boundary: a later dead attempt does not erase
+        # the correction obligation established by the earlier blocking review.
+        budget = CAP.round_budget(
+            route("standard", cap=2), review_node(),
+            [row("done", "completed-review-blocking", extra={"attempt_id": "att-block"}),
+             row("done", "dead-capacity", failure_class="capacity",
+                 extra={"attempt_id": "att-capacity"})],
+        )
+        self.assertEqual((budget.state, budget.verdict_rounds, budget.round_kind),
+                         ("admit", 1, "correction"))
+
     def test_a_sd153_1_envelope_death_then_fail_admits_round_three(self):
         # A-SD153-1 (test node): r1 dead-invalid-envelope (verdict-less), r2
         # dead-worker-fail/failure_class=fail (a real FAIL verdict) -- only
