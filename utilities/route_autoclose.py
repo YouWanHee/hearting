@@ -907,8 +907,13 @@ def _campaign_members(root: Path, records: list[dict], campaign_id: str | None, 
     return members
 
 
-def _decision_unfinished(route: Mapping[str, Any], home, root: Path, now: float) -> bool:
-    """A recent decision protects its frame only while its first leg remains open."""
+def _decision_unfinished(route: Mapping[str, Any], home, root: Path | None = None,
+                         now: float | None = None) -> bool:
+    """A framed route whose decision record is fixed while the route is still open: the
+    runtime is between fixing the decision and closing (the same start resumes it), so
+    the sweep leaves it alone -- while that record is recent.  A decision older than
+    the idle limit, or one whose recorded first leg has already closed, no longer
+    protects the frame (it protected forever and kept decided frames open for weeks)."""
     import route_plan
     if not route_plan.is_framed_route(route):
         return False
@@ -916,19 +921,22 @@ def _decision_unfinished(route: Mapping[str, Any], home, root: Path, now: float)
     if not directory:
         return False
     record_path = Path(directory) / "artifacts" / route_plan.RECORD_RELATIVE
+    if not record_path.is_file():
+        return False
+    if (time.time() if now is None else now) - _mtime(record_path) >= IDLE_SECONDS:
+        return False
+    if root is None:
+        return True
     try:
         record = route_plan.read_record(record_path)
     except (OSError, ValueError):
-        return False
-    first_leg = record.get("first_leg")
+        return True
+    first_leg = record.get("first_leg") if isinstance(record, dict) else None
     leg = first_leg.get("route") if isinstance(first_leg, dict) else None
     leg_id = leg.get("route_id") if isinstance(leg, dict) else None
     if not isinstance(leg_id, str) or not re.fullmatch(r"rt-[0-9a-f]{8,64}", leg_id):
-        return False
-    leg_path = Path(root) / ".runtime" / "routes" / f"{leg_id}.json"
-    if not leg_path.is_file() or leg_path.with_name(f"{leg_id}.outcome.json").exists():
-        return False
-    return now - _mtime(record_path) < IDLE_SECONDS
+        return True
+    return not (Path(root) / ".runtime" / "routes" / f"{leg_id}.outcome.json").exists()
 
 
 class _Evidence:
