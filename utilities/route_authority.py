@@ -558,10 +558,10 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             source_digest = None
             current_history = history
             if candidate.get("kind") == "review-worker":
-                from review_source_subject import SourceSubjectError, annotate_rows, is_implementation_review, observe
-                if is_implementation_review(route, candidate):
+                from review_source_subject import SourceSubjectError, annotate_rows, has_review_subject, observe
+                if has_review_subject(route, candidate, jobs):
                     try:
-                        source_digest = observe(route, candidate, worktree=route.get("cwd"))["digest"]
+                        source_digest = observe(route, candidate, worktree=route.get("cwd"), jobs=jobs)["digest"]
                         current_history = [(status, metadata) for status, metadata in
                             annotate_rows(jobs, history)
                             if metadata.get("_review_subject_digest") == source_digest
