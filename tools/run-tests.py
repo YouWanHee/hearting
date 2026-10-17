@@ -890,7 +890,7 @@ def reap_process_group(proc: subprocess.Popen) -> tuple[str, str]:
 def reap_suite_tmp_processes(tmp_root: Path, *, timeout: float = 5.0) -> list[int]:
     """Reap detached suite fixtures only when procfs positively names this temp root."""
     marker = os.fsencode(str(tmp_root))
-    own_pid, own_group = os.getpid(), os.getpgrp()
+    own_pid = os.getpid()
     killed: dict[int, str] = {}
     deadline = time.monotonic() + timeout
     for _ in range(2):
@@ -914,11 +914,10 @@ def reap_suite_tmp_processes(tmp_root: Path, *, timeout: float = 5.0) -> list[in
                 ticks = fields[19].decode()
                 if (base / "stat").read_bytes().rsplit(b")", 1)[1].split()[19].decode() != ticks:
                     continue
-                group = os.getpgid(pid)
-                if group != own_group:
-                    os.killpg(group, signal.SIGKILL)
-                else:
-                    os.kill(pid, signal.SIGKILL)
+                # Only the process that carries the marker: a group it shares
+                # may hold processes this run never started. Descendants inherit
+                # the suite environment and are matched on their own.
+                os.kill(pid, signal.SIGKILL)
                 killed[pid] = ticks
             except (OSError, IndexError):
                 continue

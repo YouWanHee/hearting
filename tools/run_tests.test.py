@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import re
 import subprocess
 import sys
@@ -1276,6 +1277,31 @@ class TimeoutDescendantReclaimFixture(RunTestsFixtureBase):
             time.sleep(.02)
         else:
             self.fail(f"setsid fixture {pid} survived suite temp-root cleanup")
+
+    def test_reaper_spares_an_unmarked_process_in_the_same_group(self):
+        pidfile, bystander_file = self.root / "marked.pid", self.root / "bystander.pid"
+        write_suite(self.root, "grouped.test.py", f"""
+            import os, subprocess, sys, time
+            spawn_bystander = (
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], env={{}}, "
+                "cwd='/', stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                "open(sys.argv[1], 'w').write(str(p.pid)); time.sleep(120)")
+            child = subprocess.Popen([sys.executable, '-c', spawn_bystander, {str(bystander_file)!r}],
+                cwd=os.environ['TMPDIR'], start_new_session=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            open({str(pidfile)!r}, 'w').write(str(child.pid))
+            deadline = time.monotonic() + 10
+            while not os.path.exists({str(bystander_file)!r}) and time.monotonic() < deadline:
+                time.sleep(.02)
+        """)
+        result, rows = self.run_fixture([], extra_args=["--timeout", "20"])
+        bystander = int(bystander_file.read_text())
+        self.addCleanup(lambda: os.kill(bystander, signal.SIGKILL) if Path(f"/proc/{bystander}").exists() else None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(rows[0]["verdict"], "PASS")
+        state = Path(f"/proc/{bystander}/stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+        self.assertNotEqual(state, b"Z", "an unmarked process in the marked group was killed")
 
 
 class FingerprintFixture(unittest.TestCase):
