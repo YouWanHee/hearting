@@ -680,7 +680,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def pending(self, body="original peer body", **kwargs):
         return self.prepare_reference(body, defer=True, **kwargs)
 
-    def install_native_observation(self, ref, text):
+    def install_native_observation(self, ref, text, *, item_json=None):
         home = Path(os.environ["CODEX_HOME"])
         control = home / "app-server-control"
         sessions = home / "sessions"
@@ -704,6 +704,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
 
         item = {"type": "userMessage", "clientId": "delivery-peer-" + ref,
                 "content": [{"type": "text", "text": text, "text_elements": []}]}
+        serialized_item = item_json if item_json is not None else json.dumps(item)
         history_path = home / "thread_history_1.sqlite"
         history = sqlite3.connect(history_path)
         history.executescript("""
@@ -726,7 +727,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         thread_id = self.recipient["session_id"]
         history.execute("INSERT INTO thread_turns VALUES (?, 'turn-1', 'completed')", (thread_id,))
         history.execute("INSERT INTO thread_items VALUES (?, 'turn-1', 'item-1', ?, 'userMessage', 1)",
-                        (thread_id, json.dumps(item)))
+                        (thread_id, serialized_item))
         history.execute("INSERT INTO thread_history_projection_state VALUES (?, 0, 2)",
                         (thread_id,))
         history.commit()
@@ -1463,6 +1464,49 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(row["state"], "unverified")
         self.assertEqual(row["receipt"], "native-queue-accepted")
         self.assertEqual(row["text"], text)
+        self.assertFalse(self._ledger_file("sender").exists())
+
+    def test_json5_observation_unknown_uses_exact_claimed_add_once_without_ack(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending("json5 parser disagreement")
+        client_id = "delivery-peer-" + ref
+        item_json = ("{type: 'userMessage', clientId: '" + client_id
+                     + "', content: [{type: 'text', text: 'json5 parser disagreement', "
+                     + "text_elements: []}]}")
+        self.install_native_observation(ref, text, item_json=item_json)
+        calls = []
+
+        def rpc(_path, method, params, *, timeout):
+            calls.append((method, params))
+            if method == "thread/queue/list":
+                return {"data": [], "nextCursor": None}
+            if method == "thread/queue/add":
+                self.assertEqual(params["threadId"], self.recipient["session_id"])
+                self.assertEqual(params["clientUserMessageId"], client_id)
+                row = peer_message._read_pending(ref)
+                self.assertEqual(row["state"], "unverified")
+                self.assertEqual(row["receipt"], "native-queue-inflight")
+                claim = row.get("rpc_claim")
+                self.assertIsInstance(claim, dict)
+                self.assertEqual(claim.get("pid"), os.getpid())
+                self.assertTrue(claim.get("token"))
+                return {"queuedSubmission": {"id": "native-item"}}
+            self.fail(f"unexpected native RPC: {method}")
+
+        with mock.patch.object(queue, "_rpc", side_effect=rpc):
+            first = peer_message.deliver_pending_codex(ref)
+            replay = peer_message.deliver_pending_codex(ref)
+
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(replay["status"], "unverified")
+        self.assertEqual([method for method, _params in calls],
+                         ["thread/queue/list", "thread/queue/add", "thread/queue/list"])
+        self.assertTrue(all(params["threadId"] == self.recipient["session_id"]
+                            for _method, params in calls))
+        add_params = next(params for method, params in calls if method == "thread/queue/add")
+        self.assertEqual(add_params["input"], [{"type": "text", "text": text}])
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
         self.assertFalse(self._ledger_file("sender").exists())
 
     def test_actual_observer_path_reclaims_dead_claim_and_preserves_live_claim_boundary(self):

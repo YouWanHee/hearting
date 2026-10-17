@@ -445,6 +445,19 @@ def _native_file(path: Path, *, directory: bool = False) -> bool:
     return (kind_ok and info.st_uid == os.geteuid() and not info.st_mode & 0o022)
 
 
+def _native_rollout_file(path: Path, *, trusted_home: Path) -> bool:
+    """Validate a regular owned rollout under the already trusted native home."""
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o002):
+            return False
+        path.resolve(strict=True).relative_to(trusted_home.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _observe_peer_message(path, thread_id, client_message_id, *, timeout,
                           expected_message=None):
     """Observe an exact userMessage in the native projection without writing it."""
@@ -492,10 +505,10 @@ def _observe_peer_message(path, thread_id, client_message_id, *, timeout,
             return unknown("native-thread-unbound")
 
         rollout = Path(native["rollout_path"])
-        if not rollout.is_absolute() or not _native_file(rollout):
+        if (not rollout.is_absolute()
+                or not _native_rollout_file(rollout, trusted_home=home)):
             return unknown("native-rollout-unbound")
         try:
-            rollout.resolve(strict=True).relative_to(home.resolve(strict=True))
             rollout_size = rollout.stat().st_size
         except (OSError, ValueError):
             return unknown("native-rollout-unbound")
@@ -543,7 +556,7 @@ def _observe_peer_message(path, thread_id, client_message_id, *, timeout,
             try:
                 item = json.loads(row["item_json"])
             except (TypeError, json.JSONDecodeError):
-                return _PeerObservation("conflict", reason="candidate-json-invalid")
+                return unknown("candidate-json-invalid")
             turn_id = row["turn_id"]
             if (not isinstance(item, dict) or not isinstance(turn_id, str) or not turn_id
                     or row["confirmed_turn_id"] != turn_id

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import stat
 from pathlib import Path
 import sqlite3
 import struct
@@ -34,7 +35,7 @@ ITEM = {"id": ITEM_ID, "clientUserMessageId": CLIENT_ID,
 
 def native_fixture(root, *, entries=(), turn_ids=(), thread_id=THREAD,
                    rollout_bytes=b"", projected_offset=None,
-                   projected_ordinal=10000):
+                   projected_ordinal=10000, rollout_mode=0o600):
     home = Path(root) / "codex"
     control = home / "app-server-control"
     sessions = home / "sessions"
@@ -45,7 +46,7 @@ def native_fixture(root, *, entries=(), turn_ids=(), thread_id=THREAD,
     sessions.chmod(0o700)
     rollout = sessions / "fixture.jsonl"
     rollout.write_bytes(rollout_bytes)
-    rollout.chmod(0o600)
+    rollout.chmod(rollout_mode)
 
     state_path = home / "state_5.sqlite"
     state = sqlite3.connect(state_path)
@@ -391,6 +392,73 @@ class NativePeerObservationTest(unittest.TestCase):
         self.assertEqual(result["status"], "consumed")
         rpc.assert_not_called()
 
+    def test_owned_group_writable_rollout_is_exactly_observable(self):
+        entry = self.entry("turn-1", "item-1", 1, CLIENT_ID)
+        _home, endpoint, _state, _history, rollout = native_fixture(
+            self.root, entries=[entry], projected_ordinal=10, rollout_mode=0o664)
+        self.assertEqual(stat.S_IMODE(rollout.stat().st_mode), 0o664)
+
+        observation = QUEUE._observe_peer_message(
+            endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
+        self.assertEqual(observation.status, "matched")
+        with mock.patch.object(QUEUE, "_rpc") as rpc:
+            result = self.send(endpoint)
+        self.assertEqual(result["status"], "consumed")
+        rpc.assert_not_called()
+
+    def test_rollout_and_native_control_safety_checks_remain_strict(self):
+        cases = []
+
+        home, endpoint, _state, _history, rollout = native_fixture(
+            self.root / "world-write-rollout")
+        rollout.chmod(0o666)
+        cases.append(("world-write-rollout", endpoint, "native-rollout-unbound"))
+
+        home, endpoint, _state, _history, rollout = native_fixture(
+            self.root / "symlink-rollout")
+        outside = self.root / "symlink-target.jsonl"
+        outside.write_bytes(b"")
+        outside.chmod(0o600)
+        rollout.unlink()
+        rollout.symlink_to(outside)
+        cases.append(("symlink-rollout", endpoint, "native-rollout-unbound"))
+
+        _home, endpoint, state_path, _history, _rollout = native_fixture(
+            self.root / "outside-rollout")
+        outside = self.root / "outside-home.jsonl"
+        outside.write_bytes(b"")
+        outside.chmod(0o600)
+        connection = sqlite3.connect(state_path)
+        try:
+            connection.execute("UPDATE threads SET rollout_path=? WHERE id=?",
+                               (str(outside), THREAD))
+            connection.commit()
+        finally:
+            connection.close()
+        cases.append(("outside-rollout", endpoint, "native-rollout-unbound"))
+
+        _home, endpoint, state_path, _history, _rollout = native_fixture(
+            self.root / "group-write-database")
+        state_path.chmod(0o664)
+        cases.append(("group-write-database", endpoint, "native-history-unavailable"))
+
+        home, endpoint, _state, _history, _rollout = native_fixture(
+            self.root / "group-write-home")
+        home.chmod(0o770)
+        cases.append(("group-write-home", endpoint, "native-home-unsafe"))
+
+        home, endpoint, _state, _history, _rollout = native_fixture(
+            self.root / "group-write-control")
+        (home / "app-server-control").chmod(0o770)
+        cases.append(("group-write-control", endpoint, "native-home-unsafe"))
+
+        for name, endpoint, reason in cases:
+            with self.subTest(source=name):
+                observation = QUEUE._observe_peer_message(
+                    endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
+                self.assertEqual(observation.status, "unknown")
+                self.assertEqual(observation.reason, reason)
+
     def test_1601_turn_never_attempted_pending_with_large_tool_items_queues_once(self):
         turn_ids = [f"turn-{index}" for index in range(1601)]
         entries = []
@@ -459,6 +527,28 @@ class NativePeerObservationTest(unittest.TestCase):
                                                 "queue-peer-history-conflict"):
                         self.send(endpoint)
                     rpc.assert_not_called()
+
+    def test_sqlite_json5_candidate_that_python_cannot_decode_is_unknown(self):
+        json5 = ("{type: 'userMessage', clientId: '" + CLIENT_ID
+                 + "', content: [{type: 'text', text: 'peer', text_elements: []}]}")
+        entry = self.entry("turn-1", "item-1", 1, CLIENT_ID)
+        entry["item_json"] = json5
+        _home, endpoint, _state, history_path, _rollout = native_fixture(
+            self.root, entries=[entry], projected_ordinal=10)
+        connection = sqlite3.connect(history_path)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT json_extract(?, '$.clientId')", (json5,)
+            ).fetchone()[0], CLIENT_ID)
+        finally:
+            connection.close()
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(json5)
+
+        observation = QUEUE._observe_peer_message(
+            endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
+        self.assertEqual(observation.status, "unknown")
+        self.assertEqual(observation.reason, "candidate-json-invalid")
 
     def test_foreign_thread_id_is_not_target_consumption(self):
         entry = self.entry("foreign-turn", "foreign-item", 1, CLIENT_ID,
