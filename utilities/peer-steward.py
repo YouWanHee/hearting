@@ -3837,7 +3837,8 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         bound, binding_state = (((), "observed") if unbound and not execution_ids else
                                 peer_obligations.bound_work_for_pane(
                                     pane or "", harness or "", sid or "",
-                                    execution_attempt_ids=execution_ids))
+                                    execution_attempt_ids=execution_ids,
+                                    include_parent=purpose != "input"))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
