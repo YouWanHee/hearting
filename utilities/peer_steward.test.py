@@ -1141,9 +1141,13 @@ mode_file = os.environ.get("FAKE_HERDR_MODE_FILE")
 if mode_file and os.path.exists(mode_file):
     mode = open(mode_file, encoding="utf-8").read().strip() or mode
 target = argv[2] if len(argv) > 2 else "-"
+agent_state = os.environ.get("FAKE_HERDR_AGENT_STATE", "idle")
+agent_state_file = os.environ.get("FAKE_HERDR_AGENT_STATE_FILE")
+if agent_state_file and os.path.exists(agent_state_file):
+    agent_state = open(agent_state_file, encoding="utf-8").read().strip() or agent_state
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
-    "agent_status": "idle", "name": target, "pane_id": "w1:p9",
+    "agent_status": agent_state, "name": target, "pane_id": "w1:p9",
     "window_id": os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move")}, "type": "agent_info"}}
 identity_path = os.environ.get("FAKE_HERDR_IDENTITY_FILE")
 if identity_path and os.path.exists(identity_path):
@@ -1152,6 +1156,10 @@ if identity_path and os.path.exists(identity_path):
     info["result"]["agent"]["agent_session"]["value"] = replacement.get("session_id", "sid-fake")
     info["result"]["agent"]["pane_id"] = replacement.get("pane", "w1:p9")
     if replacement.get("once"):
+        with open(identity_path, "w", encoding="utf-8") as fh:
+            json.dump({"session_id": replacement.get("session_id", ""),
+                       "settle_after_get": True}, fh)
+    elif replacement.get("settle_after_get"):
         os.unlink(identity_path)
 
 def fail(code):
@@ -1201,6 +1209,8 @@ if verb == "wait":
             session = replacement.get("session_id") or "sid-fake"
             info["result"]["agent"]["agent_session"]["value"] = session
             info["result"]["agent"]["pane_id"] = replacement.get("pane", "w1:p9")
+    if os.environ.get("FAKE_HERDR_WAIT_STATE"):
+        info["result"]["agent"]["agent_status"] = os.environ["FAKE_HERDR_WAIT_STATE"]
     if verb == "wait" and mode == "idle" and not info["result"]["agent"]["agent_session"]["value"]:
         info["result"]["agent"]["agent_session"]["value"] = "sid-fake"
     print(json.dumps(info)); sys.exit(0)
@@ -1561,7 +1571,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
-    def _unbound_watch(self, mode):
+    def _unbound_watch(self, mode, extra_env=None):
         identity_path = self.tmp_root / "identity.json"
         # The first get sees no session; the following native wait/get sees the
         # session created by first input. Keep that transition consistent across
@@ -1569,6 +1579,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         identity_path.write_text(json.dumps({"session_id": "", "once": True}))
         env = self._env(mode)
         env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        env.update(extra_env or {})
         proc = self._run("watch", "peer-a", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         fields = self._fields(proc.stdout.splitlines()[0])
@@ -1607,6 +1618,370 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         other = self._run("watch", "peer-a", env=env)
         self.assertEqual(self._fields(other.stdout.splitlines()[0]).get("state"), "armed", other.stdout)
         self.assertNotEqual(self._fields(other.stdout.splitlines()[0])["watch_id"], watch_id)
+
+    def test_registration_revalidates_after_observer_binds_first_native_session(self):
+        import contextlib
+        import io
+
+        state_file = self.tmp_root / "agent-state.txt"
+        state_file.write_text("working")
+        watch_id, arm_path, identity_path, env = self._unbound_watch(
+            "held", {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
+                     "FAKE_HERDR_WAIT_STATE": "idle"})
+        original_arm = json.loads(arm_path.read_text())
+        original_deadline = original_arm["deadline"]
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        self.assertEqual(observation["native_wait"]["state"], "started")
+        self._wait_for_wait_calls(1)
+
+        alias_key = peer_steward._watch_alias_lock_key(
+            "steward-1", original_arm["agent"], [], "default")
+        alias_path = self.watch_root / f"{alias_key}.lock"
+        payload_b = {"result": {"agent": {
+            "agent": "claude", "agent_status": "working",
+            "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+            "pane_id": "w1:p9"}}}
+        alias_opened = threading.Event()
+        release_registration = threading.Event()
+        alias_fds = set()
+        spawned = []
+        calls = []
+        result = {}
+        output = io.StringIO()
+        real_open_lock = peer_steward._open_lock
+        real_acquire = peer_steward._acquire_bounded
+        real_popen = peer_steward.subprocess.Popen
+
+        def cleanup_spawned():
+            for process in spawned:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_spawned)
+
+        def tracked_open(path):
+            fd = real_open_lock(path)
+            if threading.current_thread().name == "register-B" and Path(path) == alias_path:
+                alias_fds.add(fd)
+            return fd
+
+        def staged_acquire(fd, timeout_ms):
+            if threading.current_thread().name == "register-B":
+                if fd in alias_fds:
+                    alias_opened.set()
+                    if not release_registration.wait(10):
+                        return False
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                return True
+            return real_acquire(fd, timeout_ms)
+
+        def get_b(_target):
+            calls.append("sid-fake")
+            return payload_b
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def register_b():
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(peer_steward, "_run_herdr_get", side_effect=get_b), \
+                    mock.patch.object(peer_steward, "_open_lock", side_effect=tracked_open), \
+                    mock.patch.object(peer_steward, "_acquire_bounded", side_effect=staged_acquire), \
+                    mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                    contextlib.redirect_stdout(output):
+                result["rc"] = peer_steward.main(["watch", "w1:p9"])
+            result["stdout"] = output.getvalue()
+
+        registration = threading.Thread(target=register_b, name="register-B")
+        registration.start()
+        self.assertTrue(alias_opened.wait(10), "registration did not reach pane admission")
+        self.assertEqual(calls, ["sid-fake"], "pre-lock lookup should only select the pane lock")
+
+        # Complete the original single native wait while registration is held
+        # at admission. The observer must bind A under the shared pane lock.
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            bound_arm = json.loads(arm_path.read_text())
+            observation = json.loads(paths.observation.read_text())
+            if (bound_arm["agent"].get("session_id") == "sid-A"
+                    and observation.get("native_wait", {}).get("state") == "result"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(bound_arm["agent"]["session_id"], "sid-A")
+        self.assertEqual(observation["native_wait"]["agent"]["session_id"], "sid-A")
+        self.assertFalse(paths.receipt.exists(), "the original A obligation must still be active")
+        self.assertEqual(bound_arm["deadline"], original_deadline)
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+        # A conflicting later result is neither successful nor allowed to
+        # overwrite the established native identity.
+        conflicting = SimpleNamespace(
+            target="peer-a", steward_session_id="steward-1", until=[],
+            expected_harness="claude", expected_pane="w1:p9")
+        self.assertFalse(peer_steward._persist_watch_session(
+            conflicting, paths, "default", "sid-fake"))
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-A")
+
+        # The new observer must return the B pane occupant before it launches.
+        identity_path.unlink()
+        release_registration.set()
+        registration.join(30)
+        self.assertFalse(registration.is_alive(), "registration did not leave pane admission")
+        self.assertEqual(result.get("rc"), 0, result.get("stdout", ""))
+        fields = self._fields(result["stdout"].splitlines()[0])
+        self.assertEqual(fields["state"], "armed", result["stdout"])
+        self.assertNotEqual(fields["watch_id"], watch_id)
+        admitted = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+        self.assertEqual(admitted["agent"]["session_id"], "sid-fake")
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-A")
+        self.assertEqual(json.loads(arm_path.read_text())["deadline"], original_deadline)
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(sum("agent wait peer-a" in row for row in waits), 1, self.calllog.read_text())
+        self.assertEqual(sum("agent wait w1:p9" in row for row in waits), 1, self.calllog.read_text())
+
+    def test_conflicting_native_result_keeps_established_sid_and_unknown_evidence(self):
+        identity_path = self.tmp_root / "native-result-identity.json"
+        env = self._env("held")
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        armed = self._run("watch", "peer-a", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        original_arm = json.loads(arm_path.read_text())
+        self.assertEqual(original_arm["agent"]["session_id"], "sid-fake")
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self._wait_for_wait_calls(1)
+
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            observation = json.loads(paths.observation.read_text())
+            if observation.get("state") == "unknown":
+                break
+            time.sleep(0.01)
+        self.assertEqual(observation["state"], "unknown")
+        preserved = observation["native_wait"]
+        self.assertEqual((preserved["state"], preserved["reason"],
+                          preserved["pid"], preserved["pid_start"]),
+                         ("unknown", "target-identity-conflict",
+                          wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(preserved["agent"]["session_id"], "sid-A")
+        self.assertEqual(preserved["agent_state"], "idle")
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-fake")
+        self.assertFalse(paths.receipt.exists())
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+    def test_admission_reconciles_native_wait_result_before_unbound_arm_scan(self):
+        import contextlib
+        import io
+
+        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        original_arm = json.loads(arm_path.read_text())
+        original_deadline = original_arm["deadline"]
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self._wait_for_wait_calls(1)
+        alias_key = peer_steward._watch_alias_lock_key(
+            "steward-1", original_arm["agent"], [], "default")
+        alias_path = self.watch_root / f"{alias_key}.lock"
+        alias_fd = peer_steward._open_lock(alias_path)
+        fcntl.flock(alias_fd, fcntl.LOCK_EX)
+        try:
+            identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+            self._release()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                raw_log = paths.log.read_text(encoding="utf-8") if paths.log.exists() else ""
+                if '"value": "sid-A"' in raw_log and not peer_steward._pid_identity_ok(
+                        wait_record["pid"], wait_record["pid_start"]):
+                    break
+                time.sleep(0.01)
+            self.assertIn('"value": "sid-A"', raw_log)
+            self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "-")
+            self.assertEqual(len(self._wait_calls()), 1)
+
+            payload_b = {"result": {"agent": {
+                "agent": "claude", "agent_status": "working",
+                "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+                "pane_id": "w1:p9"}}}
+            alias_opened = threading.Event()
+            alias_fds = set()
+            spawned = []
+            result = {}
+            output = io.StringIO()
+            real_open_lock = peer_steward._open_lock
+            real_popen = peer_steward.subprocess.Popen
+            real_receipt = peer_steward._write_terminal_watch_receipt
+
+            def cleanup_spawned():
+                for process in spawned:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+
+            self.addCleanup(cleanup_spawned)
+
+            def tracked_open(path):
+                fd = real_open_lock(path)
+                if threading.current_thread().name == "register-B" and Path(path) == alias_path:
+                    alias_fds.add(fd)
+                return fd
+
+            def blocking_acquire(fd, _timeout_ms):
+                if threading.current_thread().name == "register-B" and fd in alias_fds:
+                    alias_opened.set()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                return True
+
+            def register_b():
+                def tracked_popen(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                def capture_receipt(target_id, *args, **kwargs):
+                    if target_id == watch_id:
+                        result["observation_before_receipt"] = peer_steward._read_json(
+                            paths.observation)
+                    return real_receipt(target_id, *args, **kwargs)
+
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(peer_steward, "_run_herdr_get", return_value=payload_b), \
+                        mock.patch.object(peer_steward, "_open_lock", side_effect=tracked_open), \
+                        mock.patch.object(peer_steward, "_acquire_bounded", side_effect=blocking_acquire), \
+                        mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                        mock.patch.object(peer_steward, "_write_terminal_watch_receipt",
+                                          side_effect=capture_receipt), \
+                        contextlib.redirect_stdout(output):
+                    result["rc"] = peer_steward.main(["watch", "w1:p9"])
+                result["stdout"] = output.getvalue()
+
+            registration = threading.Thread(target=register_b, name="register-B")
+            registration.start()
+            self.assertTrue(alias_opened.wait(10), "registration did not wait at pane admission")
+
+            # The observer cannot persist A while this lock is held. Reap only
+            # that exact fixture observer so admission must consume the durable
+            # native-wait log result itself.
+            observer = original_arm["watcher"]
+            if peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"]):
+                os.kill(observer["pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 10
+            while (peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"])
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            self.assertFalse(peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"]))
+            identity_path.unlink()
+        finally:
+            fcntl.flock(alias_fd, fcntl.LOCK_UN)
+            os.close(alias_fd)
+
+        registration.join(30)
+        self.assertFalse(registration.is_alive(), "registration did not leave pane admission")
+        self.assertEqual(result.get("rc"), 0, result.get("stdout", ""))
+        fields = self._fields(result["stdout"].splitlines()[0])
+        self.assertEqual(fields["state"], "armed", result["stdout"])
+        self.assertNotEqual(fields["watch_id"], watch_id)
+        admitted = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+        original = json.loads(arm_path.read_text())
+        self.assertEqual(original["agent"]["session_id"], "sid-A")
+        self.assertEqual(original["deadline"], original_deadline)
+        preserved_observation = result.get("observation_before_receipt")
+        self.assertIsInstance(preserved_observation, dict)
+        preserved_wait = preserved_observation["native_wait"]
+        self.assertEqual((preserved_wait["state"], preserved_wait["pid"],
+                          preserved_wait["pid_start"]),
+                         ("result", wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(preserved_wait["agent"]["session_id"], "sid-A")
+        self.assertEqual(admitted["agent"]["session_id"], "sid-fake")
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(sum("agent wait peer-a" in row for row in waits), 1, self.calllog.read_text())
+        self.assertEqual(sum("agent wait w1:p9" in row for row in waits), 1, self.calllog.read_text())
+
+    def test_watch_admission_fails_closed_when_pane_or_endpoint_changes(self):
+        import contextlib
+        import io
+
+        base_payload = {"result": {"agent": {
+            "agent": "claude", "agent_status": "working",
+            "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+            "pane_id": "w1:p9"}}}
+        variants = (
+            ("pane", {"pane_id": "w1:p10"}),
+            ("harness", {"agent": "codex"}),
+        )
+        for label, change in variants:
+            with self.subTest(change=label):
+                output = io.StringIO()
+                reads = 0
+
+                def get_changed(_target):
+                    nonlocal reads
+                    reads += 1
+                    agent = dict(base_payload["result"]["agent"])
+                    if reads > 1:
+                        agent.update(change)
+                    return {"result": {"agent": agent}}
+
+                before = len(self._arm_records())
+                with mock.patch.dict(os.environ, self._env("held")), \
+                        mock.patch.object(peer_steward, "_run_herdr_get", side_effect=get_changed), \
+                        contextlib.redirect_stdout(output):
+                    rc = peer_steward.main(["watch", "peer-a"])
+                self.assertEqual(rc, 4, output.getvalue())
+                self.assertIn("watch-target-pane-changed", output.getvalue())
+                self.assertEqual(len(self._arm_records()), before)
+
+        output = io.StringIO()
+        original_server = peer_steward._HERDR_SESSION
+        try:
+            with mock.patch.dict(os.environ, self._env("held")), \
+                    mock.patch.object(peer_steward, "_run_herdr_get", side_effect=lambda _target: (
+                        setattr(peer_steward, "_HERDR_SESSION", "changed-endpoint") or base_payload)), \
+                    contextlib.redirect_stdout(output):
+                rc = peer_steward.main(["watch", "peer-a"])
+            self.assertEqual(rc, 4, output.getvalue())
+            self.assertIn("watch-endpoint-changed", output.getvalue())
+        finally:
+            peer_steward._HERDR_SESSION = original_server
 
     def test_same_name_new_session_gets_separate_watch_and_old_rearm_cannot_overwrite_claim(self):
         env = self._env("held")

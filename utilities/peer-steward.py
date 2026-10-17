@@ -2865,19 +2865,7 @@ def _run_herdr_get(target):
     return None
 
 
-def _watch_identity_matches(expected, observed):
-    """Exact harness and pane, and the session -- except that a watch armed
-    before its target had one (a fresh Codex) takes the first session the pane
-    reports; `expected` keeps it, so every later check needs that session."""
-    if any(expected.get(key) in {None, "", "-"} or observed.get(key) != expected[key]
-           for key in ("harness", "pane")):
-        return False
-    if expected.get("session_id") == "-" and observed.get("session_id") not in {None, "", "-"}:
-        expected["session_id"] = observed["session_id"]
-    return observed.get("session_id") == expected.get("session_id")
-
-
-def _watch_arm_matches(arm, server, steward_sid, until, agent):
+def _watch_arm_scope_matches(arm, server, steward_sid, until, agent):
     if not isinstance(arm, dict) or (arm.get("server") or "default") != server:
         return False
     steward = arm.get("steward") or {}
@@ -2885,39 +2873,191 @@ def _watch_arm_matches(arm, server, steward_sid, until, agent):
         return False
     if tuple(sorted(arm.get("until") or [])) != tuple(sorted(until or [])):
         return False
-    return _watch_identity_matches(dict(arm.get("agent") or {}), agent)
+    expected = arm.get("agent") or {}
+    return all(expected.get(key) not in {None, "", "-"}
+               and expected.get(key) == agent.get(key)
+               for key in ("harness", "pane"))
 
 
-def _persist_watch_session(args, paths, server, session_id):
-    """Write the session a pane-armed watch took into its arm, under the arm
-    claim, so dedupe and a restarted observer hold that session from now on.
+def _watch_arm_matches(arm, server, steward_sid, until, agent):
+    if not _watch_arm_scope_matches(arm, server, steward_sid, until, agent):
+        return False
+    expected_sid = (arm.get("agent") or {}).get("session_id")
+    observed_sid = agent.get("session_id")
+    return expected_sid == observed_sid
 
-    New arms use their logical claim. Older arms have only the raw-target claim;
-    keep using that on-disk path until those obligations have settled.
-    """
-    current = _read_json(paths.arm)
-    claim_key = current.get("claim_key") if isinstance(current, dict) else None
+
+def _watch_claim_path_for_arm(paths, arm, server):
+    claim_key = arm.get("claim_key") if isinstance(arm, dict) else None
     if isinstance(claim_key, str) and re.fullmatch(r"logical-[0-9a-f]{16}", claim_key):
-        claim = paths.arm.parent / f"{claim_key}.arm"
-    else:
-        raw_target = current.get("target", args.target) if isinstance(current, dict) else args.target
-        claim = paths.arm.parent / (
-            f"{_dedupe_key(args.steward_session_id, raw_target, list(args.until or []), server)}.arm"
-        )
+        return paths.arm.parent / f"{claim_key}.arm"
+    raw_target = arm.get("target") if isinstance(arm, dict) else None
+    if not isinstance(raw_target, str) or not raw_target:
+        return None
+    steward_sid = (arm.get("steward") or {}).get("session_id")
+    if not isinstance(steward_sid, str) or not steward_sid:
+        return None
+    return paths.arm.parent / (
+        f"{_dedupe_key(steward_sid, raw_target, list(arm.get('until') or []), server)}.arm"
+    )
+
+
+def _persist_watch_session_under_alias_lock(paths, server, session_id):
+    """Bind an arm while its pane alias lock is held, then its claim lock.
+
+    Lock order for watch identity is steward-seat (registration only), pane
+    alias, then the arm's logical or legacy raw claim. Registration admission
+    uses the same order. The claim lock protects durable legacy/new claim
+    publication; the pane lock serializes the SID transition itself.
+    """
+    if not isinstance(session_id, str) or session_id in {"", "-"}:
+        return False, _read_json(paths.arm)
+    arm = _read_json(paths.arm)
+    agent = arm.get("agent") if isinstance(arm, dict) else None
+    if (not isinstance(agent, dict) or (arm.get("server") or "default") != server
+            or any(not isinstance(agent.get(key), str) or agent.get(key) in {"", "-"}
+                   for key in ("harness", "pane"))):
+        return False, arm
+    claim = _watch_claim_path_for_arm(paths, arm, server)
+    if claim is None:
+        return False, arm
     try:
         claim_fd = _open_lock(claim)
     except OSError:
-        return False
+        return False, arm
     try:
         if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
-            return False
-        arm = _read_json(paths.arm)
-        agent = arm.get("agent") if isinstance(arm, dict) else None
-        if isinstance(agent, dict) and agent.get("session_id") == "-":
-            _write_json_atomic(paths.arm, {**arm, "agent": {**agent, "session_id": session_id}})
-        return True
+            return False, _read_json(paths.arm)
+        current = _read_json(paths.arm)
+        current_agent = current.get("agent") if isinstance(current, dict) else None
+        if (not isinstance(current_agent, dict)
+                or (current.get("server") or "default") != server
+                or (current.get("steward") or {}).get("session_id") !=
+                    (arm.get("steward") or {}).get("session_id")
+                or tuple(sorted(current.get("until") or [])) !=
+                    tuple(sorted(arm.get("until") or []))
+                or any(current_agent.get(key) != agent.get(key) for key in ("harness", "pane"))):
+            return False, current
+        current_sid = current_agent.get("session_id")
+        if current_sid in {None, "", "-"}:
+            updated = {**current, "agent": {**current_agent, "session_id": session_id}}
+            _write_json_atomic(paths.arm, updated)
+            return True, updated
+        if current_sid == session_id:
+            return True, current
+        # A native binding is immutable. A conflicting later result stays
+        # unknown to its observer and never replaces the established SID.
+        return False, current
     finally:
         os.close(claim_fd)
+
+
+def _watch_native_binding_evidence(paths, arm):
+    """Return durable binding evidence without inventing a second identity source."""
+    observation = _read_json(paths.observation) or {}
+    wait_record = observation.get("native_wait") if isinstance(observation, dict) else None
+    payload = None
+    try:
+        raw = paths.log.read_text(encoding="utf-8")
+    except OSError:
+        raw = ""
+    candidates = [raw, *reversed(raw.splitlines())] if raw else []
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+            payload = parsed
+            break
+
+    target_agent = arm.get("agent") or {}
+    if payload is not None:
+        state, result_agent, _code, reason = _interpret_payload(
+            payload, arm.get("target", "-"))
+        if state in {"timeout", "agent-not-found", "herdr-unavailable"}:
+            return "terminal", None, None
+        if reason is not None or state == "unknown":
+            return "unknown", None, None
+        sid = result_agent.get("session_id")
+        if (result_agent.get("harness") == target_agent.get("harness")
+                and result_agent.get("pane") == target_agent.get("pane")
+                and isinstance(sid, str) and sid not in {"", "-"}):
+            return "bound", sid, {
+                "agent_state": state, "agent": result_agent,
+                "reason": reason or state,
+            }
+        return "unknown", None, None
+
+    if isinstance(wait_record, dict):
+        result_agent = wait_record.get("agent")
+        if isinstance(result_agent, dict):
+            sid = result_agent.get("session_id")
+            if (result_agent.get("harness") == target_agent.get("harness")
+                    and result_agent.get("pane") == target_agent.get("pane")
+                    and isinstance(sid, str) and sid not in {"", "-"}):
+                return "bound", sid, {
+                    "agent_state": wait_record.get("agent_state", "unknown"),
+                    "agent": result_agent,
+                    "reason": wait_record.get("reason", "native-wait-result"),
+                }
+            return "unknown", None, None
+        if wait_record.get("state") == "unknown" or observation.get("state") == "unknown":
+            return "unknown", None, None
+    if observation.get("state") == "unknown" or raw.strip():
+        return "unknown", None, None
+    return "none", None, None
+
+
+def _record_watch_native_result(paths, arm, result):
+    """Keep parsed wait-result identity in the existing observation record."""
+    if not isinstance(result, dict):
+        return
+    observation = _read_json(paths.observation) or {}
+    previous = observation.get("native_wait")
+    native_wait = dict(previous) if isinstance(previous, dict) else {}
+    native_wait.update(result)
+    native_wait["state"] = "result"
+    observation.update({
+        "schema_version": _WATCH_SCHEMA,
+        "watch_id": paths.arm.stem,
+        "server": arm.get("server") or "default",
+        "native_wait": native_wait,
+        "observed_ts": _utc_now(),
+    })
+    _write_json_atomic(paths.observation, observation)
+
+
+def _persist_watch_session(args, paths, server, session_id):
+    """Bind an unbound arm under the same pane admission lock as registration."""
+    arm = _read_json(paths.arm)
+    agent = arm.get("agent") if isinstance(arm, dict) else None
+    if (not isinstance(agent, dict) or (arm.get("server") or "default") != server
+            or (arm.get("steward") or {}).get("session_id") != args.steward_session_id
+            or tuple(sorted(arm.get("until") or [])) != tuple(sorted(args.until or []))
+            or agent.get("harness") != getattr(args, "expected_harness", None)
+            or agent.get("pane") != getattr(args, "expected_pane", None)):
+        return False
+    alias = paths.arm.parent / (
+        f"{_watch_alias_lock_key(args.steward_session_id, agent, list(arm.get('until') or []), server)}.lock"
+    )
+    try:
+        alias_fd = _open_lock(alias)
+    except OSError:
+        return False
+    try:
+        if not _acquire_bounded(alias_fd, _CLAIM_TIMEOUT_MS):
+            return False
+        current = _read_json(paths.arm)
+        current_agent = current.get("agent") if isinstance(current, dict) else None
+        if (not isinstance(current_agent, dict)
+                or (current.get("steward") or {}).get("session_id") != args.steward_session_id
+                or any(current_agent.get(key) != agent.get(key) for key in ("harness", "pane"))):
+            return False
+        ok, _updated = _persist_watch_session_under_alias_lock(paths, server, session_id)
+        return ok
+    finally:
+        os.close(alias_fd)
 
 
 def cmd_watch(args):
@@ -2968,9 +3108,11 @@ def cmd_watch(args):
             os.close(seat_fd)
             return _unavailable("watch-seat-claim-contended")
 
-    # The pane-scoped lock covers aliases and the unbound-pane -> bound-session
-    # transition. The logical claim then names this resolved target; the raw
-    # target claim remains present for older arms and observers on disk.
+    # The pane-scoped lock covers aliases, authoritative target revalidation,
+    # and the unbound-pane -> bound-session transition. Lock order is steward
+    # seat -> pane alias -> logical claim -> raw claim. Observer binding starts
+    # at the same pane alias lock and then takes its arm's logical or legacy raw
+    # claim, so old arms follow the same order.
     alias_claim = root / f"{_watch_alias_lock_key(steward_sid, agent, until, server)}.lock"
     try:
         alias_fd = _open_lock(alias_claim)
@@ -2984,8 +3126,97 @@ def cmd_watch(args):
             os.close(seat_fd)
         return _unavailable("watch-alias-claim-contended")
 
+    # The first get only selects a pane lock. It cannot authorize admission:
+    # the pane may have been reused while this call waited for that lock.
+    if (_HERDR_SESSION or "default") != server:
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-endpoint-changed")
+    state, current_agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
+    if state == "agent-not-found":
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        print(_typed_line("agent-not-found", "-", "-", target, "-"))
+        return 2
+    if reason is not None:
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable(reason)
+    if (_HERDR_SESSION or "default") != server:
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-endpoint-changed")
+    if any(current_agent.get(key) in {None, "", "-"} for key in ("harness", "pane")):
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-identity-unverified")
+    if any(current_agent.get(key) != agent.get(key) for key in ("harness", "pane")):
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-target-pane-changed")
+    agent = current_agent
+
     logical_key = _logical_watch_claim_key(steward_sid, agent, until, server)
     logical_claim = root / f"{logical_key}.arm"
+
+    # Inspect active obligations before taking this request's logical/raw
+    # claims. An unbound candidate may own a legacy raw claim; reconciling it
+    # here preserves the global alias -> arm-claim order without holding a
+    # second, unrelated claim lock.
+    claim = root / f"{_dedupe_key(steward_sid, target, until, server)}.arm"
+    candidate_ids = []
+    for candidate_claim in (logical_claim, claim):
+        try:
+            candidate_id = candidate_claim.read_text(encoding="utf-8").strip()
+        except OSError:
+            candidate_id = ""
+        if candidate_id and candidate_id not in candidate_ids:
+            candidate_ids.append(candidate_id)
+    entries = _watch_entries(root)
+    by_id = {watch_id: arm for watch_id, arm in entries}
+    ordered_ids = candidate_ids + [watch_id for watch_id, _arm in entries
+                                   if watch_id not in candidate_ids]
+    existing_match = None
+    requested_sid = agent.get("session_id")
+    for existing_id in ordered_ids:
+        existing_arm = by_id.get(existing_id)
+        existing_paths = _watch_paths(existing_id, root)
+        if (existing_paths.receipt.exists()
+                or not _watch_arm_scope_matches(
+                    existing_arm, server, steward_sid, until, agent)):
+            continue
+        existing_agent = existing_arm.get("agent") or {}
+        existing_sid = existing_agent.get("session_id")
+        evidence, evidence_sid, wait_result = _watch_native_binding_evidence(
+            existing_paths, existing_arm)
+        if evidence == "bound":
+            _record_watch_native_result(existing_paths, existing_arm, wait_result)
+            if existing_sid not in {None, "", "-"} and existing_sid != evidence_sid:
+                # A later native result that conflicts with the durable arm is
+                # not a successful match for either identity. Keep the arm's
+                # established SID and admit a separate current-session watch.
+                continue
+            if existing_sid in {None, "", "-"}:
+                _bound, updated_arm = _persist_watch_session_under_alias_lock(
+                    existing_paths, server, evidence_sid)
+                existing_arm = updated_arm or _read_json(existing_paths.arm)
+                by_id[existing_id] = existing_arm
+        elif (existing_sid in {None, "", "-"}
+              and requested_sid not in {None, "", "-"} and evidence == "none"):
+            _bound, updated_arm = _persist_watch_session_under_alias_lock(
+                existing_paths, server, requested_sid)
+            existing_arm = updated_arm or _read_json(existing_paths.arm)
+            by_id[existing_id] = existing_arm
+        if _watch_arm_matches(existing_arm, server, steward_sid, until, agent):
+            existing_match = (existing_id, existing_arm, existing_paths)
+            break
+
     try:
         logical_fd = _open_lock(logical_claim)
     except OSError as exc:
@@ -3000,7 +3231,7 @@ def cmd_watch(args):
             os.close(seat_fd)
         return _unavailable("watch-claim-contended")
 
-    claim = root / f"{_dedupe_key(steward_sid, target, until, server)}.arm"
+    claim_fd = None
     try:
         claim_fd = _open_lock(claim)
     except OSError as exc:
@@ -3013,26 +3244,8 @@ def cmd_watch(args):
         if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
             return _unavailable("watch-claim-contended")
 
-        # Resolve either modern logical claims or legacy raw claims first, then
-        # inspect durable arms so aliases from older registrations also dedupe.
-        candidate_ids = []
-        for candidate_claim in (logical_claim, claim):
-            try:
-                candidate_id = candidate_claim.read_text(encoding="utf-8").strip()
-            except OSError:
-                candidate_id = ""
-            if candidate_id and candidate_id not in candidate_ids:
-                candidate_ids.append(candidate_id)
-        entries = _watch_entries(root)
-        by_id = {watch_id: arm for watch_id, arm in entries}
-        ordered_ids = candidate_ids + [watch_id for watch_id, _arm in entries
-                                       if watch_id not in candidate_ids]
-        for existing_id in ordered_ids:
-            existing_arm = by_id.get(existing_id)
-            existing_paths = _watch_paths(existing_id, root)
-            if (existing_paths.receipt.exists()
-                    or not _watch_arm_matches(existing_arm, server, steward_sid, until, agent)):
-                continue
+        if existing_match is not None:
+            existing_id, existing_arm, existing_paths = existing_match
             if not _watcher_present(existing_arm):
                 _spawn_watch_observer(existing_id, existing_arm)
                 existing_arm = _read_json(existing_paths.arm) or existing_arm
@@ -3205,7 +3418,9 @@ def cmd_watch(args):
 
         for old_id, old_arm in superseded:
             old_paths = _watch_paths(old_id, root)
+            old_observation = _read_json(old_paths.observation) or {}
             _write_json_atomic(old_paths.observation, {
+                **old_observation,
                 "schema_version": _WATCH_SCHEMA, "watch_id": old_id,
                 "state": "terminal_pending", "reason": "steward-replaced",
                 "server": server,
@@ -3218,7 +3433,9 @@ def cmd_watch(args):
 
         for old_id, old_arm in retired_targets:
             old_paths = _watch_paths(old_id, root)
+            old_observation = _read_json(old_paths.observation) or {}
             _write_json_atomic(old_paths.observation, {
+                **old_observation,
                 "schema_version": _WATCH_SCHEMA, "watch_id": old_id,
                 "state": "terminal_pending", "reason": "session-replaced",
                 "server": server,
@@ -3246,7 +3463,8 @@ def cmd_watch(args):
         _mark_observed(agent["harness"], agent["session_id"], target,
                        from_identity=(steward_sid, steward_harness))
     finally:
-        os.close(claim_fd)
+        if claim_fd is not None:
+            os.close(claim_fd)
         os.close(logical_fd)
         os.close(alias_fd)
         if seat_fd is not None:
@@ -3520,18 +3738,42 @@ def cmd_watch_run(args):
                 exact_pane = (result_agent.get("harness") == expected.get("harness")
                               and result_agent.get("pane") == expected.get("pane"))
                 if not exact_pane:
-                    return {"unverified": "target-identity-unverified"}
+                    return {"unverified": "target-identity-unverified",
+                            "agent": result_agent, "agent_state": result_state,
+                            "reason": result_reason}
                 if expected.get("session_id") in {None, "", "-"}:
                     if (not isinstance(observed_sid, str) or observed_sid in {"", "-"}
                             or not _persist_watch_session(args, paths, server, observed_sid)):
-                        return {"unverified": "target-identity-unverified"}
+                        return {"unverified": "target-identity-unverified",
+                                "agent": result_agent, "agent_state": result_state,
+                                "reason": result_reason}
                     expected["session_id"] = observed_sid
                     expected_agent.update(result_agent)
                     arm = _read_json(paths.arm) or arm
                 elif observed_sid != expected.get("session_id"):
-                    return {"terminal_reason": "session-replaced"}
+                    return {"unverified": "target-identity-conflict",
+                            "agent": result_agent, "agent_state": result_state,
+                            "reason": result_reason}
             return {"agent_state": result_state, "agent": result_agent,
                     "reason": result_reason}
+
+        def preserve_unknown_wait(reason, wait_result=None):
+            """Mark identity unresolved while retaining durable native evidence."""
+            current = _read_json(paths.observation) or observation
+            previous_wait = current.get("native_wait")
+            unknown_wait = dict(previous_wait) if isinstance(previous_wait, dict) else {}
+            if isinstance(wait_result, dict):
+                if isinstance(wait_result.get("agent"), dict):
+                    unknown_wait["agent"] = wait_result["agent"]
+                if wait_result.get("agent_state") is not None:
+                    unknown_wait["agent_state"] = wait_result["agent_state"]
+                if wait_result.get("reason") is not None:
+                    unknown_wait["result_reason"] = wait_result["reason"]
+            unknown_wait.update({"state": "unknown", "reason": reason})
+            current.update({"state": "unknown", "reason": reason,
+                            "native_wait": unknown_wait, "observed_ts": _utc_now()})
+            _write_json_atomic(paths.observation, current)
+            return unknown_wait, current
 
         # Reattached observers may start after the single native waiter has
         # already exited. Its exact stdout log is the durable result; settle it
@@ -3540,20 +3782,14 @@ def cmd_watch_run(args):
                 and not _pid_identity_ok(wait_pid, wait_start)):
             wait_result = read_wait_result()
             if wait_result is None:
-                wait_record = {"state": "unknown", "reason": "native-wait-result-unavailable"}
-                observation = {**(_read_json(paths.observation) or observation),
-                               "state": "unknown", "reason": wait_record["reason"],
-                               "native_wait": wait_record, "observed_ts": _utc_now()}
-                _write_json_atomic(paths.observation, observation)
+                wait_record, observation = preserve_unknown_wait(
+                    "native-wait-result-unavailable")
             elif wait_result.get("terminal_reason"):
                 terminal_reason = wait_result["terminal_reason"]
                 state, agent = "pane-exited", expected_agent
             elif wait_result.get("unverified"):
-                wait_record = {"state": "unknown", "reason": wait_result["unverified"]}
-                observation = {**(_read_json(paths.observation) or observation),
-                               "state": "unknown", "reason": wait_result["unverified"],
-                               "native_wait": wait_record, "observed_ts": _utc_now()}
-                _write_json_atomic(paths.observation, observation)
+                wait_record, observation = preserve_unknown_wait(
+                    wait_result["unverified"], wait_result)
             else:
                 state, agent = wait_result["agent_state"], wait_result["agent"]
                 reason = wait_result["reason"] or state
@@ -3612,11 +3848,7 @@ def cmd_watch_run(args):
                         terminal_reason = wait_result["terminal_reason"]
                         state, agent = "pane-exited", expected_agent
                     elif wait_result.get("unverified"):
-                        _write_json_atomic(paths.observation, {
-                            **observation, "state": "unknown",
-                            "reason": wait_result["unverified"],
-                            "native_wait": wait_record, "observed_ts": _utc_now(),
-                        })
+                        preserve_unknown_wait(wait_result["unverified"], wait_result)
                         os._exit(0)
                     else:
                         state, agent = wait_result["agent_state"], wait_result["agent"]
@@ -3639,11 +3871,7 @@ def cmd_watch_run(args):
                             terminal_reason = wait_result["terminal_reason"]
                             state, agent = "pane-exited", expected_agent
                         elif wait_result.get("unverified"):
-                            _write_json_atomic(paths.observation, {
-                                **observation, "state": "unknown",
-                                "reason": wait_result["unverified"],
-                                "native_wait": wait_record, "observed_ts": _utc_now(),
-                            })
+                            preserve_unknown_wait(wait_result["unverified"], wait_result)
                             os._exit(0)
                         else:
                             state, agent = wait_result["agent_state"], wait_result["agent"]
