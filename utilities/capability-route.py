@@ -10128,7 +10128,11 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             or not verdict_pass(metadata)
         ):
             raise ValueError(f"subsession not semantic PASS:{session['attempt_id']}")
-        process=attempt_process_quiescence(metadata)
+        # An exact terminal gate like the other completion gates: the row was just
+        # proven a done PASS, so its complete post-exit receipt also settles a slice
+        # that ran in a PID namespace this observer can no longer scan (a codex
+        # owner's command sandbox), the case the receipt exists for.
+        process=attempt_process_quiescence(metadata,terminal_receipt=True)
         if process.state!="quiescent":
             raise ValueError(f"subsession process not quiescent:{session['attempt_id']}:{process.reason}")
     # AC 28 post-hoc diff-scope audit, measured against the subdivision's own

@@ -266,6 +266,40 @@ class SubdivisionContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "subsession-has-no-stage-gate-authority"):
                     CR.complete_node(route, node, "execute", evidence, jobs=jobs_path, attempt_id=slice_attempt_id)
 
+    def test_post_exit_receipt_settles_a_slice_from_a_pid_namespace_out_of_sight(self):
+        # A slice a codex owner ran inside its command sandbox is foreground-scoped
+        # and namespace-local. Once that namespace is gone this observer cannot
+        # rescan its tagged processes (observer-namespace-mismatch); the complete
+        # post-exit receipt is the proof the exact terminal gates accept.
+        with tempfile.TemporaryDirectory() as td:
+            worktree, route, node, manifest_path = self._fixture(td)
+            manifest = SSC.load_manifest(manifest_path, route=route, node=node)
+            jobs_path = Path(td) / "jobs.log"
+            self._write_jobs(jobs_path, route, manifest)
+            lines = jobs_path.read_text(encoding="utf-8").splitlines()
+            columns = lines[0].split("\t")
+            fields = dict(item.split("=", 1) for item in columns[5].split(","))
+            fields.update({
+                "registered_worker": "1", "transport": "headless",
+                "execution_surface": "registered-headless", "fallback_hop": "same-harness-headless",
+                "harness": "codex", "pid": "614", "pgid": "614", "pid_start": "4242",
+                "pid_scope": "namespace-local", "pid_ns": "pid:[1]", "pid_observer_ns": "pid:[1]",
+                "launch_lifecycle": "foreground-scoped", "launch_outcome": "governed-process-reaped",
+                "group_reap_pgid": "614", "group_reap_proof": "pgid-empty-v1",
+            })
+            columns[5] = ",".join(f"{key}={value}" for key, value in fields.items())
+            lines[0] = "\t".join(columns)
+            jobs_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            evidence = Path(td) / "evidence.md"
+            evidence.write_text("execute done\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs_path)}):
+                self._admit(route, node, manifest)
+                _marker, status = CR.complete_subsession_stage(
+                    route, node, "execute", evidence, manifest_path, jobs_path,
+                )
+            self.assertEqual(status["status"], "stage-gate-aggregated")
+            self.assertEqual(status["sessions"], 2)
+
     def test_ac28_diff_scope_violation_refuses_marker(self):
         # G7: an unplanned change outside the declared fixed_files union must
         # be caught by complete_subsession_stage itself -- typed rejection,
