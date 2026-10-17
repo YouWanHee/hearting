@@ -2136,5 +2136,341 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIn(verdict, line)
 
 
+class PendingLockLifetimeTest(_TmpRootMixin, unittest.TestCase):
+    def lock_path(self, key):
+        return peer_message._pending_dir() / (".lock-" + key)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _old_pending_lock(key):
+        """Literal copy of the pre-change pending_lock body."""
+        if not isinstance(key, str) or not peer_message.re.fullmatch(r"[a-z0-9-]{1,80}", key):
+            raise ValueError("peer-pending-lock-key-invalid")
+        path = peer_message._pending_dir() / (".lock-" + key)
+        fd = peer_message.os.open(path, peer_message.os.O_RDWR | peer_message.os.O_CREAT |
+                                  peer_message.os.O_NOFOLLOW | peer_message.os.O_NONBLOCK, 0o600)
+        try:
+            info = peer_message.os.fstat(fd)
+            if (not peer_message.stat.S_ISREG(info.st_mode) or info.st_uid != peer_message.os.geteuid()
+                    or info.st_mode & 0o077):
+                raise ValueError("peer-pending-lock-unsafe")
+            peer_message.fcntl.flock(fd, peer_message.fcntl.LOCK_EX | peer_message.fcntl.LOCK_NB)
+            yield
+        finally:
+            peer_message.os.close(fd)
+
+    def test_t1_prepare_directory_is_removed_after_normal_and_body_exception(self):
+        path = self.lock_path("prepare-t1")
+        with peer_message.pending_lock("prepare-t1"):
+            self.assertTrue(path.is_dir())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        self.assertFalse(path.exists())
+        with self.assertRaisesRegex(RuntimeError, "body"):
+            with peer_message.pending_lock("prepare-t1"):
+                raise RuntimeError("body")
+        self.assertFalse(path.exists())
+
+    def test_t2_ref_lock_remains_0600_regular_file(self):
+        path = self.lock_path("a" * 32)
+        with peer_message.pending_lock("a" * 32):
+            self.assertTrue(path.is_file())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertTrue(path.is_file())
+
+    def test_t3_existing_regular_file_is_shared_and_preserved(self):
+        path = self.lock_path("prepare-existing")
+        path.touch(mode=0o600)
+        before = path.stat()
+        old_fd = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(old_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-existing"):
+                    pass
+        finally:
+            os.close(old_fd)
+        with peer_message.pending_lock("prepare-existing"):
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino), (before.st_dev, before.st_ino))
+            with self.assertRaises(BlockingIOError):
+                with self._old_pending_lock("prepare-existing"):
+                    pass
+        self.assertTrue(path.is_file())
+
+    def test_t4_old_writer_hits_directory_before_flock(self):
+        path = self.lock_path("prepare-old")
+        seen = []
+        real_flock = fcntl.flock
+        with peer_message.pending_lock("prepare-old"):
+            with mock.patch.object(fcntl, "flock", side_effect=lambda *a: (seen.append(a), real_flock(*a))[1]):
+                with self.assertRaises(IsADirectoryError):
+                    with self._old_pending_lock("prepare-old"):
+                        pass
+        self.assertEqual(seen, [])
+
+    def test_t5_empty_and_sigkill_directory_residue_is_reclaimed(self):
+        import multiprocessing
+        path = self.lock_path("prepare-residue")
+        path.mkdir(mode=0o700)
+        with peer_message.pending_lock("prepare-residue"):
+            self.assertTrue(path.is_dir())
+        self.assertFalse(path.exists())
+
+        child_path = self.lock_path("prepare-killed")
+        ready = multiprocessing.Event()
+        def hold_until_killed():
+            with peer_message.pending_lock("prepare-killed"):
+                ready.set()
+                time.sleep(10)
+        proc = multiprocessing.Process(target=hold_until_killed)
+        proc.start()
+        self.assertTrue(ready.wait(2), "holder did not acquire lock")
+        proc.kill(); proc.join(2)
+        self.assertFalse(proc.is_alive(), "SIGKILL holder did not exit")
+        self.assertNotEqual(proc.exitcode, 0)
+        with peer_message.pending_lock("prepare-killed"):
+            pass
+        self.assertFalse(child_path.exists())
+
+    def test_t6_open_disappearance_and_identity_race_are_busy(self):
+        path = self.lock_path("prepare-race")
+        real_open = os.open
+        def disappear_on_open(name, flags, *args, **kwargs):
+            if os.fspath(name) == str(path):
+                path.rmdir()
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_open(name, flags, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=disappear_on_open):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-race"):
+                    pass
+        self.assertFalse(path.exists())
+
+        successor = self.lock_path("prepare-successor")
+        replaced = []
+        real_flock = fcntl.flock
+        def replace_after_open(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and successor.exists():
+                old = successor.stat()
+                successor.rmdir(); successor.mkdir(mode=0o700)
+                replaced.append((old.st_ino, successor.stat().st_ino))
+            return real_flock(fd, operation)
+        # Instrument only the key directory fd; the pending-dir probe remains real.
+        with mock.patch.object(fcntl, "flock", side_effect=replace_after_open):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-successor"):
+                    pass
+        self.assertTrue(successor.is_dir())
+        successor.rmdir()
+
+    def test_t7_nested_same_key_busy_other_key_independent(self):
+        with peer_message.pending_lock("prepare-a"):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-a"):
+                    pass
+            with peer_message.pending_lock("prepare-b"):
+                self.assertTrue(self.lock_path("prepare-b").is_dir())
+
+    def test_t8_unsafe_directory_and_fifo_are_unchanged(self):
+        path = self.lock_path("prepare-wide")
+        path.mkdir(mode=0o755); path.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+            with peer_message.pending_lock("prepare-wide"):
+                pass
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        path.rmdir()
+        fifo = self.lock_path("prepare-fifo")
+        os.mkfifo(fifo, 0o600)
+        before = fifo.lstat()
+        with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+            with peer_message.pending_lock("prepare-fifo"):
+                pass
+        after = fifo.lstat()
+        self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
+        owned = self.lock_path("prepare-uid")
+        owned.mkdir(mode=0o700)
+        real_fstat = os.fstat
+        def foreign_owner(fd):
+            info = real_fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (
+                    owned.stat().st_dev, owned.stat().st_ino):
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(os, "fstat", side_effect=foreign_owner):
+            with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+                with peer_message.pending_lock("prepare-uid"):
+                    pass
+        self.assertTrue(owned.is_dir())
+        owned.rmdir()
+
+    def test_t9_probe_unsupported_falls_back_and_probe_contention_selects_directory(self):
+        probe = peer_message._pending_dir()
+        real_flock = fcntl.flock
+        def unsupported(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == probe.stat().st_ino:
+                raise OSError(errno.EBADF, "probe unsupported")
+            return real_flock(fd, operation)
+        path = self.lock_path("prepare-fallback")
+        with mock.patch.object(fcntl, "flock", side_effect=unsupported):
+            with peer_message.pending_lock("prepare-fallback"):
+                self.assertTrue(path.is_file())
+        self.assertTrue(path.is_file())
+
+        def probe_busy(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == probe.stat().st_ino:
+                raise BlockingIOError(errno.EAGAIN, "probe busy")
+            return real_flock(fd, operation)
+        with mock.patch.object(fcntl, "flock", side_effect=probe_busy):
+            with peer_message.pending_lock("prepare-probe-busy"):
+                self.assertTrue(self.lock_path("prepare-probe-busy").is_dir())
+
+    def test_t10_key_flock_error_propagates_and_later_acquisition_reclaims(self):
+        probe = peer_message._pending_dir()
+        path = self.lock_path("prepare-enolck")
+        real_flock = fcntl.flock
+        def key_failure(fd, operation):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and info.st_ino != probe.stat().st_ino:
+                raise OSError(errno.ENOLCK, "key lock unavailable")
+            return real_flock(fd, operation)
+        with mock.patch.object(fcntl, "flock", side_effect=key_failure):
+            with self.assertRaises(OSError) as caught:
+                with peer_message.pending_lock("prepare-enolck"):
+                    pass
+        self.assertEqual(caught.exception.errno, errno.ENOLCK)
+        self.assertTrue(path.is_dir())
+        with peer_message.pending_lock("prepare-enolck"):
+            pass
+        self.assertFalse(path.exists())
+
+    def test_t11_deferred_prepare_deduplicates_and_leaves_no_lock(self):
+        sender = {"harness": "claude", "session_id": "sender"}
+        recipient = {"harness": "claude", "session_id": "recipient"}
+        first = peer_message.prepare_peer_message("same body", sender, recipient, defer=True)
+        second = peer_message.prepare_peer_message("same body", sender, recipient, defer=True)
+        self.assertEqual(first[1], second[1])
+        self.assertTrue(peer_message._read_pending(first[1]))
+        self.assertEqual(list(peer_message._pending_dir().glob(".lock-prepare-*")), [])
+
+    def test_t11b_deferred_prepare_is_busy_when_its_directory_is_held(self):
+        sender = {"harness": "claude", "session_id": "sender"}
+        recipient = {"harness": "claude", "session_id": "recipient"}
+        body = "busy body"
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+        key_data = json.dumps([[sender["harness"], sender["session_id"], None, None],
+                               [recipient["harness"], recipient["session_id"], None, None],
+                               body_hash], ensure_ascii=False)
+        key = "prepare-" + hashlib.sha256(key_data.encode()).hexdigest()
+        with peer_message.pending_lock(key):
+            with self.assertRaises(BlockingIOError):
+                peer_message.prepare_peer_message(body, sender, recipient, defer=True)
+
+    def test_t13_release_window_cannot_be_reopened_by_protocol_writers(self):
+        # Between the release identity check and rmdir, a new writer is busy and an
+        # old writer fails before flock, so neither can swap the held directory.
+        # Only an outside deletion could, and that would split file locks as well.
+        path = self.lock_path("prepare-release")
+        real_rmdir, real_flock = os.rmdir, fcntl.flock
+        seen, old_flocks = [], []
+        def contend_then_remove(target):
+            if os.fspath(target) == str(path):
+                with self.assertRaises(BlockingIOError):
+                    with peer_message.pending_lock("prepare-release"):
+                        pass
+                counted = lambda *a: (old_flocks.append(a), real_flock(*a))[1]
+                with mock.patch.object(fcntl, "flock", side_effect=counted):
+                    with self.assertRaises(IsADirectoryError):
+                        with self._old_pending_lock("prepare-release"):
+                            pass
+                current = path.lstat()
+                seen.append((current.st_dev, current.st_ino))
+            return real_rmdir(target)
+        with mock.patch.object(os, "rmdir", side_effect=contend_then_remove):
+            with peer_message.pending_lock("prepare-release"):
+                holder = path.lstat()
+        self.assertEqual(seen, [(holder.st_dev, holder.st_ino)])
+        self.assertEqual(old_flocks, [])
+        self.assertFalse(path.exists())
+
+    def test_t12_short_mixed_multiprocess_old_and_new_writers(self):
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        keys = ["prepare-mix-a", "prepare-mix-b", "prepare-mix-c"]
+        for key in keys[:2]:
+            self.lock_path(key).mkdir(mode=0o700)
+        self.lock_path(keys[2]).touch(mode=0o600)
+        barrier = ctx.Barrier(4)
+        queue = ctx.Queue()
+        key_dirs = {(p.stat().st_dev, p.stat().st_ino) for p in
+                    (self.lock_path(key) for key in keys[:2])}
+
+        def worker(old, worker_id):
+            real_flock = fcntl.flock
+            old_directory_calls = [0]
+            def observed_flock(fd, operation):
+                info = os.fstat(fd)
+                if old and stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) in key_dirs:
+                    old_directory_calls[0] += 1
+                return real_flock(fd, operation)
+            fcntl.flock = observed_flock
+            successes = 0
+            overlaps = 0
+            try:
+                barrier.wait(timeout=2)
+                for i in range(24):
+                    if old:
+                        key = keys[2] if i % 2 == 0 else keys[(i + worker_id) % 2]
+                    else:
+                        key = keys[2] if i % 2 == 1 else keys[(i + worker_id) % 2]
+                    try:
+                        lock = self._old_pending_lock(key) if old else peer_message.pending_lock(key)
+                        with lock:
+                            marker = peer_message._pending_dir() / (".overlap-" + key)
+                            try:
+                                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                            except FileExistsError:
+                                overlaps += 1
+                                continue
+                            try:
+                                os.write(fd, str(worker_id).encode())
+                                time.sleep(0.001)
+                                successes += 1
+                            finally:
+                                os.close(fd)
+                                marker.unlink()
+                    except BlockingIOError:
+                        pass
+                    except IsADirectoryError:
+                        pass
+            except BaseException as exc:
+                queue.put((worker_id, "error", repr(exc)))
+            else:
+                queue.put((worker_id, successes, overlaps, old_directory_calls[0]))
+            finally:
+                fcntl.flock = real_flock
+
+        procs = [ctx.Process(target=worker, args=(worker_id < 2, worker_id)) for worker_id in range(4)]
+        started = time.monotonic()
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(5)
+        timed_out = [proc.pid for proc in procs if proc.is_alive()]
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate(); proc.join(1)
+        self.assertEqual(timed_out, [], "worker join timeout")
+        self.assertTrue(all(proc.exitcode == 0 for proc in procs))
+        results = [queue.get(timeout=1) for _ in procs]
+        self.assertFalse([r for r in results if len(r) == 3 and r[1] == "error"], results)
+        self.assertEqual(sum(r[2] for r in results if len(r) == 4), 0, results)
+        self.assertEqual(sum(r[3] for r in results if len(r) == 4 and r[0] < 2), 0, results)
+        self.assertGreater(sum(r[1] for r in results if len(r) == 4 and r[0] < 2), 0, results)
+        self.assertGreater(sum(r[1] for r in results if len(r) == 4 and r[0] >= 2), 0, results)
+        self.assertLess(time.monotonic() - started, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1986,7 +1986,9 @@ full message), `body_sha256` (sha256 of the complete body, never itself stored),
 `delivery{surface,status,receipt}`, `refs[]`. No field carries the message body.
 An undelivered transfer withheld for a form, a user draft or an unreadable input
 box retains its bounded wire text in the private runtime
-`peer-messages/pending/` directory (0700, files 0600). A long message sent by
+`peer-messages/pending/` directory (0700, files 0600); preparation locks are
+0700 subdirectories removed on release, while transfer locks remain as 0600
+files for compatibility with older releases. A long message sent by
 reference also has one immutable UTF-8 payload at
 `peer-messages/payloads/<transfer-ref>.txt` (directory 0700, file 0600). The
 transfer and pending row bind its ref, byte count, raw digest, normalized source

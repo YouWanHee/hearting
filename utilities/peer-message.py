@@ -519,7 +519,12 @@ def _pending_dir():
 def pending_lock(key="prepare"):
     if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", key):
         raise ValueError("peer-pending-lock-key-invalid")
-    path = _pending_dir() / (".lock-" + key)
+    pending = _pending_dir()
+    path = pending / (".lock-" + key)
+    if key.startswith("prepare-") and _pending_directory_flock_supported(pending):
+        with _pending_directory_lock(path):
+            yield
+        return
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
@@ -530,6 +535,86 @@ def pending_lock(key="prepare"):
         yield
     finally:
         os.close(fd)
+
+
+def _pending_directory_flock_supported(pending):
+    """Probe directory flock support before creating a preparation lock."""
+    try:
+        fd = os.open(pending, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass  # Another probe holds it, so the filesystem does lock directories.
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+@contextlib.contextmanager
+def _pending_directory_lock(path):
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+
+    try:
+        try:
+            initial = path.lstat()
+        except FileNotFoundError as exc:
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+        if stat.S_ISDIR(initial.st_mode):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        elif stat.S_ISREG(initial.st_mode):
+            # Keep legacy transfer lock files on the exact shared inode.
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        else:
+            raise ValueError("peer-pending-lock-unsafe")
+        fd = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+
+    acquired = False
+    directory = False
+    primary_error = None
+    try:
+        info = os.fstat(fd)
+        directory = stat.S_ISDIR(info.st_mode)
+        if (not (directory or stat.S_ISREG(info.st_mode))
+                or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise ValueError("peer-pending-lock-unsafe")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path))
+        acquired = True
+        yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            if acquired and directory:
+                try:
+                    # Only an inode's flock holder removes its path, and old releases
+                    # remove none, so only an outside deletion can swap it before rmdir.
+                    current = path.lstat()
+                    if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                        os.rmdir(path)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                if primary_error is None:
+                    raise
 
 
 def _pending_path(ref):
