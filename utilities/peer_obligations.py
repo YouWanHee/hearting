@@ -794,7 +794,8 @@ class ObligationStore:
                observation: dict | None = None, result: str | None = None,
                delivery: str | None = None, cleanup: str | None = None,
                observer_error: str | None = None,
-               expected_phases: set[str] | None = None) -> dict:
+               expected_phases: set[str] | None = None,
+               skip_unchanged: bool = False) -> dict:
         if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
             raise ObligationError("peer-obligation-state-invalid")
         path = self._record_path(duty_id)
@@ -818,16 +819,24 @@ class ObligationStore:
                                "reason": observer_error}
             if result is not None and record.get("result") not in {None, result}:
                 raise ObligationError("peer-obligation-result-conflict")
-            if state is not None:
+            changed = False
+            if state is not None and record.get("state") != state:
                 record["state"] = state
-            if observation is not None:
+                changed = True
+            if observation is not None and record.get("observation") != observation:
                 record["observation"] = observation
-            if result is not None:
+                changed = True
+            if result is not None and record.get("result") != result:
                 record["result"] = result
-            if delivery is not None:
+                changed = True
+            if delivery is not None and record.get("delivery") != delivery:
                 record["delivery"] = delivery
-            if cleanup is not None:
+                changed = True
+            if cleanup is not None and record.get("cleanup") != cleanup:
                 record["cleanup"] = cleanup
+                changed = True
+            if skip_unchanged and not changed:
+                return record
             record["revision"] = int(record.get("revision", 0)) + 1
             record["updated_at"] = time.time()
             _write_atomic(path, record)

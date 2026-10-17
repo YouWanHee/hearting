@@ -174,12 +174,16 @@ class BatchObligationTest(unittest.TestCase):
             self.assertEqual(obligations.pending_observer_signature(self.jobs),
                              ((str(self.jobs), "unavailable"),))
             self.assertTrue(obligations.has_unowned_work(self.jobs))
+            snapshot = obligations.pending_observer_snapshot(self.jobs)
+            self.assertFalse(snapshot["cacheable"])
+            self.assertEqual(snapshot["paths_by_jobs"][str(self.jobs)], None)
 
         malformed = root / "batch-malformed.json"
         malformed.write_text("{not-json", encoding="utf-8")
         self.assertEqual(obligations.pending_observer_signature(self.jobs),
                          ((str(self.jobs), malformed.name, "unreadable"),))
         self.assertTrue(obligations.has_unowned_work(self.jobs))
+        self.assertFalse(obligations.pending_observer_snapshot(self.jobs)["cacheable"])
 
         protected_jobs = self.base / "protected" / "jobs.log"
         protected_jobs.parent.mkdir(parents=True)
@@ -191,6 +195,44 @@ class BatchObligationTest(unittest.TestCase):
         protected_root.symlink_to(target, target_is_directory=True)
         self.assertEqual(obligations.pending_observer_signature(protected_jobs),
                          ((str(protected_jobs), "unavailable"),))
+        self.assertFalse(obligations.pending_observer_snapshot(protected_jobs)["cacheable"])
+
+    def test_pending_snapshot_reuses_only_stable_readable_directory_pair(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           reason="awaiting-recipient")
+        original = obligations._read_only_records
+        key = str(self.jobs.resolve(strict=False))
+
+        with mock.patch.object(obligations, "_read_only_records", wraps=original) as scan:
+            snapshot = obligations.pending_observer_snapshot(self.jobs)
+            self.assertTrue(snapshot["cacheable"])
+            self.assertIn(duty_id, [item[1] for item in snapshot["signature"]])
+            self.assertEqual(snapshot["root_stamps"][key], obligations._directory_stamp(
+                snapshot["roots_by_jobs"][key]))
+            scan.assert_called_once_with(self.jobs)
+
+    def test_sidecar_created_between_scan_and_after_stamp_forces_refresh(self):
+        original = obligations._read_only_records
+        created = []
+
+        def scan_then_publish(jobs):
+            records = original(jobs)
+            if not created:
+                duty_id, _record = obligations.create(self.args)
+                obligations.update(jobs, duty_id, state="delivery-pending",
+                                   reason="accepted-during-snapshot")
+                created.append(duty_id)
+            return records
+
+        with mock.patch.object(obligations, "_read_only_records", side_effect=scan_then_publish):
+            stale = obligations.pending_observer_snapshot(self.jobs)
+        self.assertFalse(stale["cacheable"])
+        self.assertNotIn(created[0], [item[1] for item in stale["signature"]])
+
+        refreshed = obligations.pending_observer_snapshot(self.jobs)
+        self.assertTrue(refreshed["cacheable"])
+        self.assertIn(created[0], [item[1] for item in refreshed["signature"]])
 
     def test_unowned_work_probe_is_read_only_and_uses_exact_observer_identity(self):
         duty_id, _record = obligations.create(self.args)

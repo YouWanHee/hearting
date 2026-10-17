@@ -602,6 +602,7 @@ def pending_observer_snapshot(jobs: str | Path | None = None):
         key = str(jobs_path.resolve(strict=False))
         root_path = jobs_path.resolve(strict=False).parent / "supervisor-state" / "obligations"
         roots_by_jobs[key] = root_path
+        before_stamp = _directory_stamp(root_path)
         try:
             records = _read_only_records(jobs_path)
         except (OSError, BatchObligationError):
@@ -610,12 +611,16 @@ def pending_observer_snapshot(jobs: str | Path | None = None):
             root_stamps[key] = _directory_stamp(root_path)
             cacheable = False
             continue
-        root_stamps[key] = _directory_stamp(root_path)
+        after_stamp = _directory_stamp(root_path)
+        root_stamps[key] = after_stamp
+        if before_stamp is None or before_stamp != after_stamp:
+            cacheable = False
         pending_paths = []
         for path, record, error in records:
             if error is not None:
                 signature.append((str(jobs_path), path.name, "unreadable"))
                 pending_paths.append(path)
+                cacheable = False
                 continue
             if not record or record.get("state") not in _PENDING:
                 continue

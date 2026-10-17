@@ -90,6 +90,22 @@ class PeerReadContextTest(unittest.TestCase):
         self.assertIs(PeerReadContext().recipient_census("server-a", next_scan), agents)
         next_scan.assert_called_once_with()
 
+    def test_transfer_root_candidates_are_resolved_once_per_scan(self):
+        context = PeerReadContext()
+        roots = [Path(self.tmp.name) / "current", Path(self.tmp.name) / "legacy"]
+        loader = mock.Mock(return_value=(roots, "fixture"))
+
+        first = context.transfer_roots(loader)
+        second = context.transfer_roots(loader)
+
+        self.assertEqual(first, tuple(roots))
+        self.assertIs(first, second)
+        loader.assert_called_once_with()
+
+        next_scan = mock.Mock(return_value=(roots, "fixture"))
+        self.assertEqual(PeerReadContext().transfer_roots(next_scan), tuple(roots))
+        next_scan.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()
