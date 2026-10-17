@@ -795,14 +795,28 @@ def queue_target(jobs: Path, attempts: set[str], registered: str) -> str:
     try:
         import dispatch_seat_handover as handover
         rows = handover.latest_rows(jobs)
-        owners = {(handover.effective_parent(rows[a][1], jobs), handover.effective_parent_harness(rows[a][1], jobs))
+        owners = {(handover.effective_parent(rows[a][1], jobs),
+                   handover.effective_parent_harness(rows[a][1], jobs))
                   for a in attempts if a in rows}
         if len(owners) == 1:
             owner, harness = owners.pop()
-            # Only a Codex thread has a Codex queue. A route handed to a successor on another
-            # harness keeps its record stored here, and that successor reads it as its own.
             return (owner or registered) if harness == "codex" else registered
-    except Exception:  # noqa: BLE001 - the registered parent is always a valid target
+    except Exception:  # noqa: BLE001 - the registered parent remains a valid target
+        pass
+    return registered
+
+
+def _queue_target_from_rows(jobs: Path, rows, registered: str, *, read_context=None) -> str:
+    """Resolve the recipient from the already-read exact batch rows."""
+    try:
+        import dispatch_seat_handover as handover
+        owners = {(handover.effective_parent(row.metadata, jobs, read_context=read_context),
+                   handover.effective_parent_harness(row.metadata, jobs, read_context=read_context))
+                  for row in rows}
+        if len(owners) == 1:
+            owner, harness = owners.pop()
+            return (owner or registered) if harness == "codex" else registered
+    except Exception:  # noqa: BLE001 - the registered parent remains a safe target
         pass
     return registered
 
@@ -814,12 +828,21 @@ def _native_queue_delivery_once(
     *, allow_enqueue: bool = True,
     session: codex_queue_delivery.DeliverySession | None = None,
     delivery_target: str | None = None,
+    initial_rows=None,
 ) -> dict[str, Any]:
     """Queue one stable completion item through its durable per-child ledger."""
     path = args.queue_socket or resolve_queue_socket()
     if not path.is_absolute():
         raise CompletionError("native-queue-endpoint-path-invalid")
-    target = queue_target(args.jobs, attempts, args.thread_id)
+    rows = (initial_rows if initial_rows is not None else
+            current_session_children(args.jobs, args.thread_id, attempts,
+                                     CODEX_QUEUE_PARENT_DELIVERY))
+    if {row.attempt_id for row in rows} != attempts:
+        raise CompletionError("native-queue-ledger-attempt-set-mismatch")
+    from peer_read_context import PeerReadContext
+    target = (delivery_target if initial_rows is not None and delivery_target is not None else
+              _queue_target_from_rows(args.jobs, rows, args.thread_id,
+                                      read_context=PeerReadContext()))
     if delivery_target is not None and target != delivery_target:
         raise CompletionError("native-queue-target-changed")
     transport = {"session": session} if session is not None else {}
@@ -842,18 +865,26 @@ def _native_queue_delivery_once(
     )
     delivery_material = "\0".join((
         "codex-native-queue-v1", args.thread_id,
-        *sorted(row.metadata.get("delivery_id", "") for row in
-                current_session_children(args.jobs, args.thread_id, attempts,
-                                         CODEX_QUEUE_PARENT_DELIVERY)),
+        *sorted(row.metadata.get("delivery_id", "") for row in rows),
     ))
     client_message_id = "delivery-" + hashlib.sha256(
         delivery_material.encode("utf-8")
     ).hexdigest()[:32]
-    rows = current_session_children(
+    # The first batch read selected the queue. Re-read immediately before the
+    # claim/send boundary and reject a changed recipient or delivery identity.
+    fresh_rows = current_session_children(
         args.jobs, args.thread_id, attempts, CODEX_QUEUE_PARENT_DELIVERY
     )
-    if {row.attempt_id for row in rows} != attempts:
+    fresh_context = PeerReadContext()
+    fresh_target = _queue_target_from_rows(args.jobs, fresh_rows, args.thread_id,
+                                           read_context=fresh_context)
+    if fresh_target != target:
+        raise CompletionError("native-queue-target-changed")
+    if ({row.attempt_id for row in fresh_rows} != attempts
+            or {row.metadata.get("delivery_id", "") for row in fresh_rows}
+            != {row.metadata.get("delivery_id", "") for row in rows}):
         raise CompletionError("native-queue-ledger-attempt-set-mismatch")
+    rows = fresh_rows
     root = args.jobs.resolve(strict=False).parent
     ledger_ids: list[str] = []
     for row in rows:
@@ -951,9 +982,13 @@ def _native_queue_delivery_once(
 
 
 def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
+    from peer_read_context import PeerReadContext
     deadline = time.monotonic() + max(0.0, args.timeout)
     result = {"schema_version": 1, "status": "retryable", "reason": "native-queue-timeout"}
     submitted = False
+    base_delay = min(max(args.delivery_retry_interval, 0.05), 15.0)
+    delay = base_delay
+    last_observation = None
     while time.monotonic() < deadline:
         if stop_check is not None:
             stopped = stop_check() or ""
@@ -962,11 +997,14 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
         session = None
         try:
             path = args.queue_socket or resolve_queue_socket()
-            target = queue_target(args.jobs, attempts, args.thread_id)
+            rows = current_session_children(args.jobs, args.thread_id, attempts,
+                                            CODEX_QUEUE_PARENT_DELIVERY)
+            target = _queue_target_from_rows(args.jobs, rows, args.thread_id,
+                                             read_context=PeerReadContext())
             session = codex_queue_delivery.DeliverySession(path, timeout=5.0)
             result = _native_queue_delivery_once(
                 args, receipt, attempts, allow_enqueue=not submitted,
-                session=session, delivery_target=target,
+                session=session, delivery_target=target, initial_rows=rows,
             )
             # Positive queue acceptance is not ambiguous. Keep observing until
             # consumed, but do not repeatedly enqueue during a history outage.
@@ -987,7 +1025,15 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
+            observation = (result.get("status"), result.get("reason"),
+                           result.get("client_user_message_id"), bool(submitted))
+            if (observation != last_observation
+                    or result.get("reason") == "native-queue-target-changed"):
+                delay = base_delay
+            else:
+                delay = min(15.0, delay * 1.7)
+            last_observation = observation
+            time.sleep(min(delay, remaining))
     return result
 
 
@@ -1042,6 +1088,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--resume-obligation", help=argparse.SUPPRESS)
     value.add_argument("--obligation-lock-fd", type=int, help=argparse.SUPPRESS)
     value.add_argument("--ensure-obligations", action="store_true", help=argparse.SUPPRESS)
+    value.add_argument("--service-current", help=argparse.SUPPRESS)
     return value
 
 
@@ -1382,8 +1429,9 @@ def _validate_obligation_identity(args: argparse.Namespace, identity: dict) -> N
 
 
 def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    service_current = getattr(args, "service_current", None)
     if getattr(args, "ensure_obligations", False):
-        launched = batch_obligations.ensure_observers(args.jobs)
+        launched = batch_obligations.ensure_observers(args.jobs, service_current=service_current)
         return {"schema_version": 1, "status": "accepted", "resumed": launched}, 0
 
     inherited_fd = getattr(args, "obligation_lock_fd", None)
@@ -1431,7 +1479,9 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         return {"schema_version": 1, "status": "retryable",
                 "reason": "completion-observer-already-running"}, 75
     batch_obligations.update(args.jobs, args._obligation_id,
-                             observer={"pid": os.getpid()}, reason="observing")
+                             observer={"pid": os.getpid(),
+                                       "pid_start": batch_obligations._pid_start(os.getpid())},
+                             reason="observing")
     result = None
     code = 75
     try:
@@ -1461,7 +1511,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         batch_obligations.release(lease)
         current = batch_obligations.read(args.jobs, args._obligation_id) or {}
         if current.get("state") in batch_obligations._PENDING:
-            batch_obligations.ensure_observers(args.jobs)
+            batch_obligations.ensure_observers(args.jobs, service_current=service_current)
 
 
 def main() -> int:

@@ -16,6 +16,14 @@ class PeerReadContext:
         self._attempt_indexes = {}
         self._handover_snapshots = None
         self._handover_ledgers = {}
+        self._recipient_censuses = {}
+
+    def recipient_census(self, endpoint, loader):
+        """Reuse one endpoint's recipient listing within a single read pass."""
+        key = str(endpoint or "default")
+        if key not in self._recipient_censuses:
+            self._recipient_censuses[key] = loader()
+        return self._recipient_censuses[key]
 
     def current_attempt_row(self, jobs: Path, attempt_id: str):
         """Return the latest exact attempt row from this scan's registry view."""

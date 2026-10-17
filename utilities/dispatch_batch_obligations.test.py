@@ -66,6 +66,44 @@ class BatchObligationTest(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], str(self.jobs))
         self.assertEqual(obligations.read(self.jobs, duty_id)["identity"]["attempt_ids"], ["att-child"])
 
+    def test_verified_service_replaces_exact_live_observer_and_passes_control_binding(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           observer={"pid": 321, "pid_start": "654"})
+        root = obligations._root(self.jobs)
+        lock_fd = os.open(root / (duty_id + ".lease"), os.O_RDWR | os.O_CREAT, 0o600)
+        binding = "/fixture/managed/current"
+        target = Path("/fixture/releases/B/utilities/codex-managed-completion.py")
+        environment = {"AGENT_HOME": "/fixture/releases/B"}
+        calls = []
+
+        class Launched:
+            pid = 9002
+
+        try:
+            with mock.patch("peer_obligations.service_script",
+                            return_value=(target, environment, binding)) as service_script, \
+                 mock.patch("peer_obligations.replace_managed_observer",
+                            return_value="replaced") as replace, \
+                 mock.patch.object(obligations, "acquire", side_effect=[None, lock_fd]), \
+                 mock.patch.object(obligations.subprocess, "Popen",
+                                   side_effect=lambda *a, **kw: calls.append((a, kw)) or Launched()):
+                self.assertEqual(obligations.ensure_observers(self.jobs, service_current=binding), 1)
+            service_script.assert_called_once_with(
+                "utilities/codex-managed-completion.py", binding)
+            replace.assert_called_once()
+            self.assertEqual(replace.call_args.args[0:2], (321, "654"))
+            argv = calls[0][0][0]
+            self.assertEqual(Path(argv[1]), target)
+            self.assertEqual(argv[-2:], ["--service-current", binding])
+            self.assertEqual(calls[0][1]["env"], environment)
+            self.assertNotIn("service_current", obligations.read(self.jobs, duty_id)["arguments"])
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
     def test_complete_duty_is_not_replayed(self):
         duty_id, _record = obligations.create(self.args)
         obligations.update(self.jobs, duty_id, state="complete", outcome={"state": "ready"},
@@ -73,6 +111,65 @@ class BatchObligationTest(unittest.TestCase):
         with mock.patch.object(obligations.subprocess, "Popen") as launch:
             self.assertEqual(obligations.ensure_observers(self.jobs), 0)
         launch.assert_not_called()
+
+    def test_absent_compatibility_slots_are_known_empty(self):
+        roots = (self.base / "release" / ".dispatch",
+                 self.base / "xdg-state" / "hearting" / "dispatch")
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.base / "release"), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=roots):
+            self.assertEqual(obligations.pending_observer_signature(), ())
+            self.assertFalse(obligations.has_unowned_work())
+
+        unused_jobs = self.base / "unused" / "jobs.log"
+        unused_jobs.parent.mkdir()
+        self.assertEqual(obligations.pending_observer_signature(unused_jobs), ())
+        self.assertFalse(obligations.has_unowned_work(unused_jobs))
+
+    def test_empty_existing_registry_and_sidecar_state_are_known_empty(self):
+        empty_jobs = self.base / "empty" / "jobs.log"
+        empty_jobs.parent.mkdir(parents=True)
+        empty_jobs.touch()
+        (empty_jobs.parent / "supervisor-state" / "obligations").mkdir(parents=True)
+        self.assertEqual(obligations.pending_observer_signature(empty_jobs), ())
+        self.assertFalse(obligations.has_unowned_work(empty_jobs))
+
+    def test_missing_registry_keeps_durable_pending_records_visible(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           reason="awaiting-recipient")
+        self.jobs.unlink()
+
+        signature = obligations.pending_observer_signature(self.jobs)
+        self.assertEqual(len(signature), 1)
+        self.assertEqual(signature[0][:3], (str(self.jobs), duty_id, "delivery-pending"))
+        self.assertTrue(obligations.has_unowned_work(self.jobs))
+        with self.assertRaises(obligations.BatchObligationError):
+            obligations._root(self.jobs)
+
+    def test_unreadable_malformed_and_symlink_state_remains_unknown(self):
+        root = obligations._root(self.jobs)
+        root.mkdir(parents=True)
+        with mock.patch.object(obligations.os, "scandir", side_effect=PermissionError("protected")):
+            self.assertEqual(obligations.pending_observer_signature(self.jobs),
+                             ((str(self.jobs), "unavailable"),))
+            self.assertTrue(obligations.has_unowned_work(self.jobs))
+
+        malformed = root / "batch-malformed.json"
+        malformed.write_text("{not-json", encoding="utf-8")
+        self.assertEqual(obligations.pending_observer_signature(self.jobs),
+                         ((str(self.jobs), malformed.name, "unreadable"),))
+        self.assertTrue(obligations.has_unowned_work(self.jobs))
+
+        protected_jobs = self.base / "protected" / "jobs.log"
+        protected_jobs.parent.mkdir(parents=True)
+        protected_jobs.touch()
+        protected_root = protected_jobs.parent / "supervisor-state" / "obligations"
+        target = self.base / "protected-target"
+        target.mkdir()
+        protected_root.parent.mkdir()
+        protected_root.symlink_to(target, target_is_directory=True)
+        self.assertEqual(obligations.pending_observer_signature(protected_jobs),
+                         ((str(protected_jobs), "unavailable"),))
 
     def test_unowned_work_probe_is_read_only_and_uses_exact_observer_identity(self):
         duty_id, _record = obligations.create(self.args)
