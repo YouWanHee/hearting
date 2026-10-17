@@ -38,6 +38,7 @@ class ManagedCopyProjectionHealthTest(unittest.TestCase):
             dest.chmod(0o644)
             self.assertEqual(activation._entries_healthy([entry]), (False, True))
 
+            # destructive-ok: reason=exercise the missing projected-copy state; boundary=dest leaf under this test's TemporaryDirectory root
             dest.unlink()
             self.assertEqual(activation._entries_healthy([entry]), (True, False))
 
@@ -50,12 +51,14 @@ class ManagedCopyProjectionHealthTest(unittest.TestCase):
             foreign = root / "foreign.sh"
             foreign.write_bytes(source.read_bytes())
             foreign.chmod(0o755)
+            # destructive-ok: reason=replace this test's expected-source symlink with a foreign symlink; boundary=dest leaf under this test's TemporaryDirectory root
             dest.unlink()
             dest.symlink_to(foreign)
             self.assertEqual(activation._entries_healthy([entry]), (False, True))
             self.assertTrue(dest.is_symlink())
             self.assertEqual(dest.resolve(), foreign.resolve())
 
+            # destructive-ok: reason=replace this test's foreign symlink with a directory; boundary=dest leaf under this test's TemporaryDirectory root
             dest.unlink()
             dest.mkdir()
             self.assertEqual(activation._entries_healthy([entry]), (False, True))
