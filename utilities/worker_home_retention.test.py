@@ -967,6 +967,46 @@ class Races(Fixture):
     def two(self):
         return self.add("att-x1"), self.add("att-x2")
 
+    def test_log_activity_before_preparation_or_lock_extends_window(self):
+        for phase in ("preparation", "lock"):
+            with self.subTest(phase=phase):
+                old = self.now - 10 * DAY
+                recent = self.now - DAY
+                log = self.root / (phase + ".log")
+                log.write_text("finished")
+                attempt = "att-late-log-" + phase
+                home = self.add(attempt, log_file=str(log))
+                self.set_timestamp(attempt, datetime.fromtimestamp(
+                    old / 10**9, timezone.utc).isoformat())
+                os.utime(log, ns=(old, old))
+                os.utime(home, ns=(old, old))
+
+                def advance():
+                    os.utime(log, ns=(recent, recent))
+
+                if phase == "preparation":
+                    original = R._detach
+
+                    def detach(*args, **kwargs):
+                        advance()
+                        return original(*args, **kwargs)
+
+                    with mock.patch.object(R, "_detach", detach):
+                        result = self.sweep(0)
+                    reason = "late-activity"
+                else:
+                    with self.landing(advance, key=home.name) as fired:
+                        result = self.sweep(0)
+                    self.assertTrue(fired)
+                    reason = "late-evidence-changed"
+
+                self.assertEqual(result["removed"], 0)
+                self.assertEqual(self.kept(result, reason), 1)
+                self.assertTrue(home.is_dir())
+                self.assertEqual(self.sweep(5)["removed"], 0)
+                self.assertEqual(self.sweep(8)["removed"], 1)
+                self.assertFalse(home.exists())
+
     def test_unrelated_append_defers_without_restarting_established_clock(self):
         home = self.add("att-append")
         self.sweep(0)

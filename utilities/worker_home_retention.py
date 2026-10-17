@@ -327,6 +327,7 @@ def _ended_ns(row: _Row) -> int | None:
     log_file = row.meta.get("log_file", "")
     if log_file and os.path.isabs(log_file):
         try:
+            _track(log_file)
             st = os.stat(log_file, follow_symlinks=False)
         except (OSError, ValueError):
             pass
@@ -1193,6 +1194,9 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
             if verdict.kind == "unknown":
                 return "defer:" + verdict.reason
             return "activity:row-changed"
+        ended = _ended_ns(row)
+        if ended is not None:
+            first_ns = max(first_ns, ended)
         try:
             home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
         except OSError:
