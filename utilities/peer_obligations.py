@@ -395,7 +395,7 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
         ensure_normal_runner(Path(jobs).parent)
 
 
-def _registered_delivery_bindings(message, roots=None, *, received_only=False):
+def _registered_delivery_bindings(message, roots=None, *, received_only=False, read_context=None):
     if (received_only and (message.get("state") != "received"
             or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
         return
@@ -433,7 +433,8 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False):
             or binding.get("claim_owner") != "retained-rewake:" + binding["duty_id"]):
         return
     try:
-        row = current_attempt_row(jobs, binding["attempt_id"])
+        row = (current_attempt_row(jobs, binding["attempt_id"]) if read_context is None else
+               current_attempt_row(jobs, binding["attempt_id"], read_context=read_context))
         storage, delivery_id = binding["storage_recipient"], binding["delivery_id"]
         record = pending.read(root, storage, delivery_id)
         if (row is None or not record or record.get("delivery_id") != delivery_id
@@ -444,7 +445,9 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False):
                 or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
             return
         from dispatch_seat_handover import effective_parent
-        if effective_parent(row.metadata, jobs) != binding["recipient_sid"]:
+        parent = (effective_parent(row.metadata, jobs) if read_context is None else
+                  effective_parent(row.metadata, jobs, read_context=read_context))
+        if parent != binding["recipient_sid"]:
             return
         if (row.metadata.get("delivery_intent") == "1"
                 and row.metadata.get("delivery_id") == delivery_id and (
@@ -460,11 +463,11 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False):
     yield store, duty, row, record, root, storage, delivery_id
 
 
-def registered_delivery_settled(message, *, roots=None):
+def registered_delivery_settled(message, *, roots=None, read_context=None):
     """A consumed exact notice makes its deferred peer payload unnecessary."""
     return any(record["state"] in {"acked", "rejected", "expired"}
                for _store, _duty, _row, record, _root, _storage, _delivery_id
-               in _registered_delivery_bindings(message, roots))
+               in _registered_delivery_bindings(message, roots, read_context=read_context))
 
 
 def acknowledge_registered_delivery(message, *, roots=None):
@@ -636,13 +639,15 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
     return kind + "-" + hashlib.sha256(raw).hexdigest()[:32]
 
 
-def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
+def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
+                          reconciliation_required=False):
     """Replace only an exact observer whose old code cannot process this duty.
 
     Accepted work stays in the existing store; the same flock fences its next
     observer. A pidfd prevents a recycled PID from ever receiving the signal.
     """
-    if not any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list()):
+    has_batch = any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list())
+    if not has_batch and not reconciliation_required:
         return False
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         return False
@@ -662,11 +667,14 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
             if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
                 continue
             source = Path(argv[1]).read_text()
-            if ("def _resume_registered_obligation(" in source
+            if "def _reconcile_obligations(" in source:
+                return "current"
+            if (not reconciliation_required
+                    and "def _resume_registered_obligation(" in source
                     and "from dispatch_session_sweep import addressed_records" in source):
-                continue
+                return "current"
             signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-            return True
+            return "replaced"
         except (OSError, ValueError, IndexError, UnicodeError):
             continue
         finally:
@@ -676,11 +684,11 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
 
 
 def _ensure_runner(root, *, service_current=None, use_remembered=False,
-                   remember_binding=False):
+                   remember_binding=False, reconciliation_required=False):
     store = ObligationStore(root)
     duties = store.list()
     lock_path = store.root / RUNNER_LOCK_NAME
-    if not duties and not remember_binding:
+    if not duties and not remember_binding and not reconciliation_required:
         if not use_remembered or not lock_path.exists():
             return False
     store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -691,8 +699,12 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if not _handoff_legacy_runner(store, lock_path):
+            handoff = _handoff_legacy_runner(
+                store, lock_path, reconciliation_required=reconciliation_required)
+            if handoff == "current":
                 return True
+            if handoff != "replaced":
+                return not reconciliation_required
             deadline = time.monotonic() + 2
             while True:
                 try:
@@ -712,7 +724,7 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
                 binding = None
             else:
                 _write_runner_control(fd, payload)
-        if not duties:
+        if not duties and not reconciliation_required:
             return False
         os.set_inheritable(fd, True)
         active_root = active_service_root(binding, root=code_root) if binding else None
@@ -739,12 +751,15 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
 
 
 def ensure_runner(root: str | Path | None = None, *,
-                  service_current: str | Path | None = None) -> bool:
+                  service_current: str | Path | None = None,
+                  reconciliation_required=False) -> bool:
     """Start a fixed-root runner unless an explicit internal binding is supplied."""
-    return _ensure_runner(root, service_current=service_current)
+    return _ensure_runner(root, service_current=service_current,
+                          reconciliation_required=reconciliation_required)
 
 
-def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None) -> bool:
+def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None,
+                         reconciliation_required=False) -> bool:
     """Ensure a producer runner using only verified lifecycle provenance.
 
     Lifecycle callbacks may establish the binding while holding the existing
@@ -754,8 +769,10 @@ def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None)
     if lifecycle_root is not None:
         binding = managed_service_binding(lifecycle_root)
         return _ensure_runner(root, service_current=binding,
-                              remember_binding=binding is not None)
-    return _ensure_runner(root, use_remembered=True)
+                              remember_binding=binding is not None,
+                              reconciliation_required=reconciliation_required)
+    return _ensure_runner(root, use_remembered=True,
+                          reconciliation_required=reconciliation_required)
 
 
 @contextmanager

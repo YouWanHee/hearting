@@ -114,6 +114,12 @@ also remove the duplicate implementation and the caller procedures it made
 unnecessary. Do not hide a responsibility gap by removing every guard or by only
 adding new refusal rules.
 
+Read-only work shared during one input may reuse that input's parsed snapshot.
+The snapshot is not authority for a later input or a state-changing action:
+claims, acknowledgements, and sends recheck the current row and binding under
+their existing lock. Recovery callbacks reconnect the existing owner of work;
+they do not repeat work already owned by its live runner.
+
 Documentation explains behavior and preserves the reasons for decisions. Do not
 build the product on a protocol that only ends cleanly when a model perfectly
 remembers long operating documents.
