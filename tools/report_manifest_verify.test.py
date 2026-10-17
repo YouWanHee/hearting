@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import hashlib,importlib.util,io,json,tempfile,unittest,sys
+from unittest import mock
 from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/"utilities"))
 P=Path(__file__).with_name("report-manifest-verify.py"); S=importlib.util.spec_from_file_location("report",P); V=importlib.util.module_from_spec(S); S.loader.exec_module(V)
 class TestReport(unittest.TestCase):
  def fixture(self,root):
@@ -107,4 +110,24 @@ class TestReport(unittest.TestCase):
  def test_one_to_one(self):
   with tempfile.TemporaryDirectory() as td:
    p,d=self.fixture(Path(td)); d["media"].pop(); p.write_text(json.dumps(d)); self.assertRaises(ValueError,V.verify,p)
+
+ def test_routed_cli_uses_declared_current_manifest_when_positional_is_omitted(self):
+  import artifact_context
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); output=root/"cycle"/"artifacts"
+   node={"id":"report","outputs":["report/report_manifest.json","report/REPORT.md"],
+         "write_scope":["report/report_manifest.json","report/REPORT.md"]}
+   context=artifact_context.ArtifactContext(root,{"route_id":"rt-report"},node,"report",None,
+       root/"cycle",output,root,"route-lineage")
+   old=sys.argv; stdout=sys.stdout
+   try:
+    sys.argv=["report-manifest-verify.py","--classification"]
+    sys.stdout=io.StringIO()
+    with mock.patch("artifact_context.resolve_context",return_value=context), \
+         mock.patch.object(V,"verify",return_value={"bundle_classification":"declared"}) as verify:
+     V.main()
+    self.assertEqual(verify.call_args.args[0],str(output/"report/report_manifest.json"))
+    self.assertEqual(sys.stdout.getvalue().strip(),"declared")
+   finally:
+    sys.argv=old; sys.stdout=stdout
 if __name__=="__main__": unittest.main()

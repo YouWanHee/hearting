@@ -761,6 +761,27 @@ def _half_up(value):
     return int(math.floor(float(value) + 0.5))
 
 
+def _native_context_gauge(entity):
+    """Without an applied compaction trigger, draw the native gauge: raw window and percent.
+
+    An unknown or disabled policy still has a measured window and usage; showing nothing would
+    hide what every session showed before applied triggers existed."""
+    policy = getattr(entity, "context_policy", None)
+    if isinstance(policy, dict) and policy.get("state") == "applied":
+        return None, None
+    window = getattr(entity, "context_window_tokens", None)
+    raw = policy.get("raw_percentage") if isinstance(policy, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return min(99, round(raw)), window
+    active = getattr(entity, "active_context_tokens", None)
+    if getattr(entity, "harness", None) == "codex":
+        from .token_budget import codex_context_used_pct
+        return codex_context_used_pct(active, window), window
+    if (type(active) is int and active >= 0 and type(window) is int and window > 0):
+        return min(99, round(100 * active / window)), window
+    return None, window
+
+
 def _context_gauge_track(window):
     """F-52b context-gauge track length: `clamp(half_up(16 * window / 1M), 1, 16)`.
 
@@ -1958,8 +1979,11 @@ def _unused_badge(s, compact=False):
 
 def _interaction_badge(s):
     state = getattr(s, "interaction_state", None)
-    label = _INTERACTION_LABEL.get(state.get("kind")) if isinstance(state, dict) else None
-    return " " + label if label else ""
+    kinds = [state.get("kind")] if isinstance(state, dict) else []
+    kinds.extend(row.get("kind") for row in (getattr(s, "interaction_observations", None) or [])
+                 if isinstance(row, dict))
+    labels = list(dict.fromkeys(_INTERACTION_LABEL[kind] for kind in kinds if kind in _INTERACTION_LABEL))
+    return " " + " + ".join(labels) if labels else ""
 
 
 def _interaction_chip(s):
@@ -1981,13 +2005,28 @@ def _interaction_chip(s):
 
 
 def _session_tag_chip(s, dim=False):
-    """F-100a — the 2-hex session tag (`hearting-46` → `46`) as an outline badge, exactly
-    `_TAG_W` cells: dim `[` `]` around the tag in soft white (user 2026-09-03: the reverse
-    chip read too heavy; white, not the harness hue, so it separates from the harness text).
+    """F-100a — the 2-hex session tag (`hearting-46` → `46`) as an outline badge in
+    `_TAG_W` cells, then the steward flag when the session supervises others: dim `[` `]`
+    around the tag in soft white (user 2026-09-03: the reverse chip read too heavy; white,
+    not the harness hue, so it separates from the harness text).
     A session without a tag draws the same cells blank — the badge is a slot, not a suffix,
     so every harness label starts in the same column. This is what replaced the F-99c
     ` · hearting-46` companion: the title owns the whole name zone again and the identity
     token has its own fixed home."""
+    return _session_tag_slot(s, dim) + _steward_flag(s, dim)
+
+
+def _steward_flag(s, dim=False):
+    """`[aa] ⚑ claude` — the flag sits between the tag and the harness word (user
+    2026-10-14: on the row under the ID it hid the supervisor line whenever the first
+    watched session was only one row away). Callers size the harness cell by the chip's
+    real width, so the name column stays where it was."""
+    if not getattr(s, "steward", False):
+        return []
+    return [(_ICON_STEWARD, "tag_dim" if dim else "tag_steward"), (" ", None)]
+
+
+def _session_tag_slot(s, dim=False):
     tag = getattr(s, "session_tag", None)
     steward = bool(getattr(s, "steward", False))
     if not isinstance(tag, str) or not tag:
@@ -2030,10 +2069,11 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
                 else _NAME_KEY.get(s.harness, "nm_other"))
     # F-33 (v11): harness field carries model/effort as a parenthetical — a dead/stale row has
     # no live telemetry to show (F-13), so it renders the bare harness name only.
-    segs = [("  ", None), (gch, gkey), (" ", None)]
-    segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
+    chip = _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
+    chip_w = sum(_dw(text) for text, _key in chip)
+    segs = [("  ", None), (gch, gkey), (" ", None)] + chip
     segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
-                                None if dead_stale else s.effort, _HMW - _TAG_W,
+                                None if dead_stale else s.effort, _HMW - chip_w,
                                 hkey, dim=dim_tel,
                                 effort_default=not dead_stale and bool(getattr(s, "effort_default", False)))
 
@@ -3181,9 +3221,10 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
             else ("hb_" + s.harness if s.harness in _BADGE_TEXT else "hb_other"))
     name_key = (_NAME_KEY_DIM.get(s.harness, "nmd_other") if dim_tel
                 else _NAME_KEY.get(s.harness, "nm_other"))   # F-76b, see `_session_row`
-    l1 = ([("  ", None), (gch, gkey), (" ", None)]
-          + _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
-          + [(_badge_cell(hn, _HW - _TAG_W), hkey)])   # word-boundary clip, last cell blank
+    chip = _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
+    chip_w = sum(_dw(text) for text, _key in chip)
+    l1 = ([("  ", None), (gch, gkey), (" ", None)] + chip
+          + [(_badge_cell(hn, _HW - chip_w), hkey)])   # word-boundary clip, last cell blank
     suffix = []
     if is_parent and child_count:
         suffix.append((" ▾%d" % child_count, name_key))
@@ -4666,10 +4707,12 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         # F-65: a missing first-turn denominator is an unknown gauge, not a missing row.
         # Dispatch rows retain their dim visual weight and sit two cells AFTER their own
         # spinner, matching the main row's ``spinner + 2`` relationship without flattening
-        # the hierarchy back onto the main-session detail column.
+        # the hierarchy back onto the main-session detail column. Inside a card the box
+        # already carries the hierarchy, so every worker gauge shares the owner's column.
         shown_depth = min(depth, 1) if in_card else depth
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
-        detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
+        detail_indent = (4 + _HW - _CTX_LABEL_W
+                         if _route_rides_the_rail(job, None, in_card) or (in_card and not orphan)
                          else indicator_col + 2)
         content_width = (_dispatch_box_width(term_width) - 2 if in_card and term_width else
                          _context_content_width(term_width))
@@ -5255,14 +5298,17 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         elif getattr(entity, "_details_pending", False):
             now_text = "loading"
         elif hasattr(entity, "_details_pending"):
-            now_text = "unavailable"
+            now_text = "no summary yet"
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_window_tokens", None))
+    window = getattr(entity, "context_display_window_tokens", None)
+    if pct is None and window is None:
+        pct, window = _native_context_gauge(entity)
+    track = _context_gauge_track(window)
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))
@@ -5313,7 +5359,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             if clipped:
                 if sep:
                     tail.append((sep, None))
-                tail.append((clipped, now_key))
+                tail.append((clipped, "dim" if now_text == "no summary yet" else now_key))
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
@@ -6218,8 +6264,7 @@ def _gpu_session_label(owner, sessions=None, display_snapshot=None):
     key = _gpu_session_key(owner)
     if key is None:
         return "미귀속", "미귀속"
-    session = next((s for s in sessions or ()
-                    if (getattr(s, "harness", None), getattr(s, "session_id", None)) == key), None)
+    session = next((s for s in sessions or () if key in _gpu_session_keys(s)), None)
     name = ""
     if session is not None:
         for candidate in (getattr(session, "runtime_name", None),
@@ -8450,7 +8495,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         if live_order is not None:
             shown = live_order.reconcile_sessions(name, shown)
         shown, steward_edges = _steward_hierarchy(shown)
-        session_starts, session_identity_rows, steward_markers = {}, set(), {}
+        session_starts, session_identity_rows = {}, set()
         rendered_parent_sids = set()  # ambiguous enrichment must not duplicate a dispatch tree
         for s in shown:
             if getattr(s, "mem_worker", False):
@@ -8563,24 +8608,18 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                                     detached_root=(
                                         max(1, int(getattr(cj, "depth", 1) or 1)) >= 2
                                     ), card_rail_col=_RAIL_COL)
-            if getattr(s, "steward", False):
-                marker_row = session_starts[id(s)] + 1
-                if marker_row == len(lines):
-                    lines.append([(" " * _SESSION_DETAIL_COL, None)])
-                steward_markers[marker_row] = ("tag_dim" if s.liveness in ("stale", "dead")
-                                                else "tag_steward")
         # Draw each supervisor interval after its complete session/card block exists.
+        # The line ends above the last watched session: none of that session's rows
+        # carry it (user 2026-10-14).
         connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
                 stop = session_starts.get(id(targets[-1]))
                 if stop is not None:
                     connector_rows.update(range(session_starts[parent] + 1, stop))
-        for idx in sorted(connector_rows - session_identity_rows - steward_markers.keys()):
+        for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
                 lines[idx] = _under_id_connector(lines[idx])
-        for idx, key in steward_markers.items():
-            lines[idx] = _under_id_connector(lines[idx], _ICON_STEWARD, key)
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 
@@ -10541,6 +10580,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_pump.stop(join_timeout=1.0)
         if install_pump is not None:
             install_pump.stop(join_timeout=0.1)
+        close_observation = getattr(collect_all, "close", None)
+        if callable(close_observation):
+            try:
+                close_observation()
+            except Exception:
+                pass
 
 
 def _stderr_log_path():

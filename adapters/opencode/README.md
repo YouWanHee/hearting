@@ -344,7 +344,7 @@ provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
 `stages [--capability <name>] [--json]` prints the part catalog a graph is
 assembled from: every stage as `capability:stage` with its one-line summary,
 inputs and outputs, `unit_choices`, `shareable`, `start_approval`, optional parts,
-and the parts of other recipes this host can borrow. `compose --graph` accepts a
+and the parts of other recipes this host can borrow. `compose --shape staged --graph` accepts a
 host stage id or a shareable `capability:stage` (for example
 `inspect,autopilot-research:retrieval,autopilot-research:synthesis,report`); a
 borrowed part is written under `parts/<capability>/<stage>/` inside the host's own
@@ -352,7 +352,8 @@ artifact scope. Claude reaches both through `adapters/claude/bin/capability-rout
 Codex and OpenCode through `preflight.sh compose|stages`; every surface forwards
 the arguments unmodified and prints the same output.
 
-When assembling `staged` routes, follow the shared
+A shape-omitted `--graph` is a frame routing hint. Assemble `staged` routes only
+for a frame brief or person-named stage list; follow the shared
 [WORKFLOW §0.2.1 guidance](../../core/WORKFLOW.md#021-shape-before-preset-sd-135).
 
 The five portable profiles are deep, balanced-deep, balanced, light and mini.
@@ -377,4 +378,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-`experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary through the v1 client, then saves it as the seat card at the session's own pane/native seat and queues tidy (a shared project seat queues the tidy only). Missing summary/client data queues memory only for a known main session; a session whose identity cannot be read is recorded ledger-only, as before.
+`experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary and its parent compaction part through the v1 client. Only a verified `auto=true` part with a nonempty summary successfully saved to the main session's own verified herdr pane can book the existing snapshot/clear/`이어서해` flow. The helper requires the latest ordinary assistant to finish after the matching user and a native idle observation after compaction, then refreshes the card with bounded recent conversation and the transcript path. It waits up to three hours. Manual/unknown parts, missing/empty summaries, failed card writes, project/outside-herdr seats, and workers/sub-sessions remain queue-only; unknown session identity stays ledger-only.

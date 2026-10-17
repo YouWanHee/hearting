@@ -16,6 +16,16 @@ dispatcher already supplies the assigned contract. Login, user guard hooks and
 permission rules are retained. Actual native first-request usage and input
 records, rather than template presence, establish the observed boundary.
 
+Registered Claude dispatches keep this masked settings home while the builder
+passes the selected native authentication directory through
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` (the source config directory by default, with
+explicit secure-storage environment and settings overrides preserved), so
+Claude owns credential replacement and refresh locking in its native store.
+The legacy `build-home.py --instance`
+command only creates and prints a directory; it does not return an environment
+binding to a child process, so this registered-launch guarantee does not apply
+to a separately launched CLI pointed at that printed directory.
+
 ## Catalog
 
 | Profile | Description |

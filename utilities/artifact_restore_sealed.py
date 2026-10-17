@@ -426,7 +426,9 @@ def build(selection, snapshot):
         for row in selection['selections']:
             cid, aid, arev = row['cycle_id'], row['artifact_id'], row['artifact_revision_id']
             manifest = manifests[cid]
-            one(manifest['artifacts'], lambda x: x['artifact_id'] == aid and x['cycle_id'] == cid, 'artifact')
+            artifact = one(manifest['artifacts'], lambda x: x['artifact_id'] == aid and x['cycle_id'] == cid, 'artifact')
+            require(artifact.get('type') != 'directory-bundle',
+                    'directory-bundle-restore-unsupported', 'descriptor-does-not-restore-tree')
             rev = one(manifest['artifact_revisions'], lambda x: x['artifact_id'] == aid and
                       x['artifact_revision_id'] == arev, 'revision')
             loc = rev['locator']

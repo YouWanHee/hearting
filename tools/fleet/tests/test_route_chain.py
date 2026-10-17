@@ -87,6 +87,28 @@ class LedgerPathTest(EnvTmpTestCase):
         path = route_chain.ledger_path("claude", "sess-a.1")
         self.assertEqual(path, os.path.join(self.chains_dir, "claude", "sess-a.1.jsonl"))
 
+    def test_full_history_cache_uses_all_file_stamp_fields_and_invalidates_rewrite(self):
+        path = route_chain.ledger_path("claude", "cache-session")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        first = route_chain.build_line({"route_id": "rt-first", "route_hash": "h"},
+                                       event="compose", harness="claude",
+                                       session_id="cache-session", route_file="/tmp/a")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(first) + "\n")
+        self.assertEqual(len(route_chain.read_tail("claude", "cache-session", None)), 1)
+        with mock.patch.object(route_chain.json, "loads", wraps=json.loads) as loads:
+            self.assertEqual(len(route_chain.read_tail("claude", "cache-session", None)), 1)
+            self.assertEqual(loads.call_count, 0)
+            second = dict(first, route_id="rt-other")
+            before = json.dumps(first)
+            after = json.dumps(second)
+            self.assertEqual(len(before), len(after))
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(after + "\n")
+            self.assertEqual(route_chain.read_tail("claude", "cache-session", None)[0]["route_id"],
+                             "rt-other")
+            self.assertEqual(loads.call_count, 1)
+
 
 class WriterIdentityTest(EnvTmpTestCase):
     def test_depth_zero_single_native_session_is_the_anchor(self):

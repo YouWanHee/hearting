@@ -38,8 +38,7 @@ def project(jobs, manifest, rows):
         if (old['metadata'].get('session_chain_id') != manifest['chain_id']
                 or any(old['metadata'].get(key) != new['metadata'].get(key) for key in SCOPE_KEYS)
                 or old['fields'][2:5] != new['fields'][2:5]
-                or old['metadata'].get('replacement_claim_digest') != edge['claim_digest']
-                or new['metadata'].get('replacement_claim_digest') != edge['claim_digest']):
+                or old['metadata'].get('replacement_claim_digest') != edge['claim_digest']):
             raise R.DC.DispatchContractError('replacement-subsession-scope-mismatch')
         mapping[original] = target
         consumed.add(original)

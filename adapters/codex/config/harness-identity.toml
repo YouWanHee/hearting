@@ -9,7 +9,8 @@
 # tool shell starts and go stale. A per-command `AGENT_DISPATCH_CALLER_HARNESS=<harness> <command>`
 # is set inside the shell and still works.
 #
-# Runtime activation merges this table into `$CODEX_HOME/config.toml` as one delimited block
+# Runtime activation publishes this table and the interactive question feature into
+# `$CODEX_HOME/config.toml`; it owns only its delimited identity block and exact feature line
 # (`harness runtime activate --runtime codex`); the rest of config.toml stays runtime-owned.
 # A config that already defines a conflicting `[shell_environment_policy]` (legacy `exclude`
 # / `include_only`, or other values for these keys) is left untouched and reported as

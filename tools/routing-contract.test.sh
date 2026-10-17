@@ -46,11 +46,14 @@ need adapters/opencode/skills/autopilot-lab/SKILL.md 'capabilities/autopilot-lab
 need adapters/codex/skills/autopilot-refine/SKILL.md 'capabilities/autopilot-refine.md' 'Codex refine projection 에 owner pointer 존재'
 
 # 4. adapter bootstraps
-need adapters/claude/CLAUDE.md 'new non-direct work defaults to .framed.' 'Claude bootstrap semantic routing 실현 (+ framed 기본)'
+need adapters/claude/CLAUDE.md 'The main session decides only whether the work is' 'Claude main session decides direct or not'
+need adapters/claude/CLAUDE.md 'otherwise omit .--shape. and let the frame decide' 'Claude omits shape for other new work'
 need adapters/claude/CLAUDE.md  'headless worker dispatch'         'Claude bootstrap delegation-surface 실현'
-need adapters/codex/AGENTS.md 'new non-direct work defaults to .framed.' 'Codex bootstrap semantic routing 실현 (+ framed 기본)'
+need adapters/codex/AGENTS.md 'The main session decides only whether the work is' 'Codex main session decides direct or not'
+need adapters/codex/AGENTS.md 'otherwise omit .--shape. and let the frame decide' 'Codex omits shape for other new work'
 need adapters/codex/AGENTS.md   'never silently extends'           'Codex bootstrap delegation-surface 실현'
-need adapters/opencode/AGENTS.md 'new non-direct work defaults to .framed.' 'OpenCode bootstrap semantic routing 실현 (+ framed 기본)'
+need adapters/opencode/AGENTS.md 'The main session decides only whether the work is' 'OpenCode main session decides direct or not'
+need adapters/opencode/AGENTS.md 'otherwise omit .--shape. and let the frame decide' 'OpenCode omits shape for other new work'
 
 # 5. Claude skill realization
 need skills/autopilot-lab/SKILL.md 'core/WORKFLOW.md §0.2'         'lab SKILL semantic routing 참조'

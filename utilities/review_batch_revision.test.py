@@ -277,6 +277,14 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             first = self.launch()
             self.settle(first)
             self.revise_execute(first, 4)
+            same_source_rows = self.jobs.read_bytes()
+            exhausted = self.launch(expected=65)
+            self.assertEqual(exhausted['reason'], 'review-round-budget-exhausted', exhausted)
+            self.assertEqual(self.jobs.read_bytes(), same_source_rows)
+            # The partial-start/resume case needs an eligible generation. Move
+            # the source to B and reopen it through the ordinary execute path.
+            (self.repo / 'x').write_text('source B\n')
+            self.revise_execute(first, 6)
         self.prompt.write_text('Exact admitted pending generation ' + gates)
         # Inject a refusal at the outer child-command boundary, after full
         # group admission/reservation. Shared selection/admission/readiness are
@@ -297,7 +305,9 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         started = [leg for leg in partial['legs'] if leg['child_spawned'] == '1']
         if started:
             self.settle({'legs': started})
-            self.assertEqual(self.admission(started[0]['node']).budget.state, 'exhausted')
+            budget = self.admission(started[0]['node']).budget
+            expected = ('admit', 1) if closure else ('exhausted', 2)
+            self.assertEqual((budget.state, budget.verdict_rounds), expected, repr(budget))
         changed = self.prompt.read_text()
         self.prompt.write_text(changed + ' changed without revision')
         self.assert_atomic_refusal(reason='replacement-batch-source-drift')
@@ -486,7 +496,11 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             self.assertEqual(registered['launch_claimed'], '0')
             self.assertEqual(self.owner_operation(lambda: REPLACEMENT.admission(
                 self.jobs, self.jobs.read_text().splitlines(), registered)), record)
-            self.assertEqual(REPLACEMENT.effective_attempts(self.jobs, {self.owner})[0], {successor})
+            # The fixture takes over the already-created row as its active owner.
+            self.fixture_row(successor, status='open', launch_claimed='1', launch_started='1')
+            effective, lineage = REPLACEMENT.effective_attempts(self.jobs, {self.owner})
+            self.assertEqual(effective, {successor})
+            self.assertEqual(lineage[0]['replacement_attempt_id'], successor)
             self.assertEqual(REPLACEMENT.launch_input(self.jobs, self.owner, source), replay)
             self.assertTrue(self.jobs.read_bytes().startswith(original_rows))
             for path, data in original.items():
@@ -547,16 +561,26 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
 
     def revise_execute(self, receipt, sequence):
         self.evidence.write_text("implementation correction " + str(sequence) + "\n")
+        prior_markers = {}
+        for leg in receipt["legs"]:
+            path = self.jobs.parent / 'completion' / self.route['route_id'] / (leg['node'] + '.json')
+            if path.is_file():
+                prior_markers[leg['node']] = (path.read_bytes(), json.loads(path.read_text()))
         self.route_cmd("revise", "--node", "execute", "--evidence", str(self.evidence),
             "--basis", "review-findings", "--answers", ",".join(leg["attempt_id"] for leg in receipt["legs"]),
             "--author-attempt-id", self.owner)
         self.assertEqual(self.marker("execute")["sequence"], sequence)
         for leg in receipt["legs"]:
-            if not (self.jobs.parent / 'completion' / self.route['route_id'] / (leg['node'] + '.json')).exists():
+            path = self.jobs.parent / 'completion' / self.route['route_id'] / (leg['node'] + '.json')
+            if leg['node'] not in prior_markers:
                 continue  # A real FAIL has a verdict row, not a successful marker.
+            prior_bytes, prior = prior_markers[leg['node']]
             tombstone = self.marker(leg["node"])
-            self.assertEqual(tombstone["state"], "superseded-by-upstream-revision")
-            self.assertEqual(tombstone["superseded_by"], {"node": "execute", "sequence": sequence})
+            if prior.get("state") == "superseded-by-upstream-revision":
+                self.assertEqual(path.read_bytes(), prior_bytes)
+            else:
+                self.assertEqual(tombstone["state"], "superseded-by-upstream-revision")
+                self.assertEqual(tombstone["superseded_by"], {"node": "execute", "sequence": sequence})
         self.inline_execute("att-inline-execute-" + str(sequence + 1))
         self.assertEqual(self.marker("execute")["sequence"], sequence + 1)
 
@@ -639,14 +663,37 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.assertTrue(self.jobs.read_bytes().startswith(original_rows))
         for path, data in original.items():
             self.assertEqual(path.read_bytes(), data, str(path))
-        # One additional revision-backed verdict is allowed, then spent.
+        # An evidence-only revision keeps the same source subject and cannot
+        # buy a third verdict beyond that subject's cap.
         self.revise_execute(round_two, 4)
-        self.prompt.write_text("Final correction check.")
+        self.prompt.write_text("A third verdict for source A cannot be admitted.")
+        rows = self.jobs.read_bytes()
+        self.assert_atomic_refusal(reason="review-round-budget-exhausted")
+        self.assertEqual(self.jobs.read_bytes(), rows)
+
+        # A real source change opens the ordinary independent-review path for
+        # B. Its two verdicts then exhaust B's own budget; a same-source
+        # revision still cannot admit another one.
+        (self.repo / "x").write_text("source B\n")
+        self.revise_execute(round_two, 6)
+        self.prompt.write_text("Independent review for source B.")
         round_three = self.launch()
         self.settle(round_three)
         self.assertEqual(self.launch()["newly_started"], 0)
-        self.revise_execute(round_three, 6)
-        self.prompt.write_text("A fourth verdict cannot be admitted.")
+        self.revise_execute(round_three, 8)
+        for leg in round_three["legs"]:
+            budget = self.admission(leg["node"]).budget
+            self.assertEqual((budget.state, budget.verdict_rounds, budget.round_kind),
+                             ("admit", 1, "closure-check"), repr(budget))
+        self.prompt.write_text("Second in-cap verdict for source B.")
+        round_four = self.launch()
+        self.settle(round_four)
+        self.assertEqual(self.launch()["newly_started"], 0)
+        for leg in round_four["legs"]:
+            budget = self.admission(leg["node"]).budget
+            self.assertEqual((budget.state, budget.verdict_rounds), ("exhausted", 2), repr(budget))
+        self.revise_execute(round_four, 10)
+        self.prompt.write_text("A third verdict for source B cannot be admitted.")
         rows = self.jobs.read_bytes()
         spent = self.assert_atomic_refusal(reason="review-round-budget-exhausted")
         self.assertEqual(self.jobs.read_bytes(), rows)
@@ -738,6 +785,11 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.fixture_row(target, note='dead-invalid-envelope', failure_class='contract')
         fields, meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[target]
         meta = {**meta, 'attempt_id': 'att-fixture-verdictless-2', 'note': 'dead-missing-result'}
+        # This synthetic physical observation has no immutable source binding;
+        # it must remain legacy-unknown rather than borrowing the original
+        # attempt's exact subject digest under a different attempt id.
+        meta.pop('review_subject_digest', None)
+        meta.pop('review_subject_binding_digest', None)
         # This extra physical fixture record never had a native launch claim.
         meta.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
         for key in ('pid', 'pid_start', 'pgid', 'log_file', 'completion_marker'):

@@ -680,7 +680,7 @@ def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any]) -> 
         from codex_dispatch_terminal import inspect_terminal_attempt
         inspected = inspect_terminal_attempt(
             log_file, worktree=fields[3], artifact_root_metadata=route.get("artifact_root"),
-            worker_type="owner")
+            worker_type="owner", artifact_binding=meta)
         if (inspected.get("state") != "valid" or inspected.get("verdict") != "PASS"
                 or inspected.get("artifact_state") != "readable"):
             return None
@@ -1123,10 +1123,22 @@ def _settled_gate_rows(route_module, route, request, gates, *, historical=False)
                         and marker.get("node_id") == node_id
                         and marker.get("completion_gate") == nodes[node_id].get("terminal_gate")
                         and isinstance(marker.get("attempt_id"), str) and isinstance(evidence.get("sha256"), str)):
+                    marker_digest = hashlib.sha256(raw).hexdigest()
                     rebuilt = {"passed": True, "node_id": node_id, "attempt_id": marker["attempt_id"],
                                "completion_gate": marker["completion_gate"],
-                               "marker_digest": hashlib.sha256(raw).hexdigest(),
+                               "marker_digest": marker_digest,
                                "evidence_digest": evidence["sha256"], "evidence": evidence.get("path")}
+                    # The commit identity was taken from the live row the closed outcome
+                    # recorded; when the evidence changed after the marker was written,
+                    # that recorded digest, not the marker's, is the one bound to it.
+                    candidate = recorded.get(node_id) if outcome_matches else None
+                    if (isinstance(candidate, Mapping) and candidate.get("passed") is True
+                            and candidate.get("node_id") == node_id
+                            and candidate.get("attempt_id") == marker["attempt_id"]
+                            and candidate.get("completion_gate") == marker["completion_gate"]
+                            and candidate.get("marker_digest") == marker_digest
+                            and re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("evidence_digest") or ""))):
+                        rebuilt["evidence_digest"] = candidate["evidence_digest"]
             except (OSError, ValueError, TypeError, AttributeError):
                 rebuilt = None
         rows[node_id] = rebuilt or row

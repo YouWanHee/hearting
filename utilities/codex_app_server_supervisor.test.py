@@ -10,6 +10,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -157,6 +158,57 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                                 'command':'python3 worker.py --private value',
                                 'aggregatedOutput':'MUST_NOT_REACH_FLEET','exitCode':0,
                                 'status':'completed'}}})
+                        git_item_file = os.environ.get('FAKE_GIT_ITEM_FILE')
+                        if git_item_file:
+                            with open(git_item_file, encoding='utf-8') as handle:
+                                git_item = json.load(handle)
+                            for routine_index in range(128):
+                                routine = {
+                                    'type':'commandExecution','id':f'cmd-routine-{routine_index}',
+                                    'command':'git status --short','cwd':git_item.get('cwd'),
+                                    'aggregatedOutput':('routine success' if routine_index % 2 == 0
+                                                        else 'fatal: unrelated command failure'),
+                                    'exitCode':(0 if routine_index % 2 == 0 else 1),
+                                    'status':('completed' if routine_index % 2 == 0 else 'failed')}
+                                send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                    'threadId':'thread-1','turnId':turn_id,'item':routine}})
+                            incomplete = dict(git_item)
+                            incomplete['id'] = 'cmd-incomplete'
+                            incomplete.pop('exitCode', None)
+                            send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                'threadId':'thread-1','turnId':turn_id,'item':incomplete}})
+                            unknown_status = dict(git_item)
+                            unknown_status['id'] = 'cmd-unknown-status'
+                            unknown_status['status'] = 'unknown'
+                            send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                'threadId':'thread-1','turnId':turn_id,'item':unknown_status}})
+                            signal_exit = dict(git_item)
+                            signal_exit['id'] = 'cmd-signal-exit'
+                            signal_exit['exitCode'] = 130
+                            send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                'threadId':'thread-1','turnId':turn_id,'item':signal_exit}})
+                            for status in ('inProgress', 'declined'):
+                                nonterminal = dict(git_item)
+                                nonterminal['id'] = f'cmd-{status}'
+                                nonterminal['status'] = status
+                                send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                    'threadId':'thread-1','turnId':turn_id,'item':nonterminal}})
+                            send({'jsonrpc':'2.0','method':'item/completed','params':{
+                                'threadId':'foreign-thread','turnId':turn_id,'item':git_item}})
+                            command_event = {'jsonrpc':'2.0','method':'item/completed','params':{
+                                'threadId':'thread-1','turnId':turn_id,'item':git_item}}
+                            send(command_event)
+                            send(command_event)  # replay the same native callback id
+                            record('command-result-replay', item_id=git_item.get('id'))
+                            if os.environ.get('FAKE_EXPECT_STEER') == '1':
+                                steer = json.loads(sys.stdin.readline())
+                                record('turn-steer', request=steer)
+                                if os.environ.get('FAKE_STEER_REJECT') == '1':
+                                    send({'jsonrpc':'2.0','id':steer['id'],
+                                          'error':{'code':-32000,'message':'turn expired'}})
+                                else:
+                                    send({'jsonrpc':'2.0','id':steer['id'],
+                                          'result':{'turnId':turn_id}})
                         dry_first = os.environ.get('FAKE_DRY_RUN_FIRST') == '1'
                         launch_race = os.environ.get('FAKE_LAUNCH_STARTED_RACE') == '1'
                         if launch_race and turns == 1:
@@ -861,6 +913,211 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             sum(row.get("type") == "dispatch.supervisor.owner-boundary" for row in rows),
             0,
         )
+
+    def test_real_git_failure_result_is_steered_and_acknowledged_once(self):
+        repo = self.base / "git-failure-repo"
+        repo.mkdir()
+
+        def git(*args, check=True):
+            return subprocess.run(["git", *args], cwd=repo, capture_output=True, check=check)
+
+        git("init", "-q")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        tracked = repo / "tracked.txt"
+        tracked.write_text("base\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-qm", "base")
+        tracked.write_text("changed\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        index = git("rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
+        lock = Path(index + ".lock")
+        lock.write_bytes(b"fixture lock")
+        lock_fd = os.open(lock, os.O_RDONLY)
+        self.addCleanup(os.close, lock_fd)
+        lock.chmod(0)
+        failure = git("commit", "-m", "expected lock failure", check=False)
+        self.assertNotEqual(failure.returncode, 0)
+        after_failure = {
+            "head": git("rev-parse", "HEAD").stdout,
+            "index": Path(index).read_bytes(),
+            "work": tracked.read_bytes(),
+            "lock": (os.fstat(lock_fd).st_dev, os.fstat(lock_fd).st_ino,
+                     os.fstat(lock_fd).st_mode, os.fstat(lock_fd).st_size,
+                     os.pread(lock_fd, 128, 0)),
+        }
+        item_file = self.base / "git-command-item.json"
+        item_file.write_text(json.dumps({
+            "type": "commandExecution", "id": "cmd-real-git-lock",
+            "command": "zsh -lc 'git commit -m expected-lock-failure'",
+            "cwd": str(repo), "status": "failed", "exitCode": failure.returncode,
+            "aggregatedOutput": failure.stderr.decode("utf-8", errors="replace"),
+        }), encoding="utf-8")
+        self.assertEqual(failure.returncode, 128)
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        result = self.run_supervisor(
+            FAKE_NO_CHILD="1", FAKE_GIT_ITEM_FILE=str(item_file), FAKE_EXPECT_STEER="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        steer_rows = [row for row in trace if row.get("event") == "turn-steer"]
+        self.assertEqual(len(steer_rows), 1, trace)
+        request = steer_rows[0]["request"]
+        self.assertEqual(request["method"], "turn/steer")
+        self.assertEqual(request["params"]["threadId"], "thread-1")
+        self.assertEqual(request["params"]["expectedTurnId"], "turn-1")
+        self.assertEqual(len(request["params"]["input"]), 1)
+        advisory = request["params"]["input"][0]["text"]
+        self.assertIn(str(lock), advisory)
+        self.assertIn("Ownership: unknown", advisory)
+        self.assertIn("Codex App Server aggregatedOutput", advisory)
+        self.assertIn("Stdout/stderr separation or raw bytes may be unavailable", advisory)
+
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        feedback = [row for row in events
+                    if row.get("type") == "dispatch.supervisor.git_failure_feedback"]
+        self.assertEqual([row["status"] for row in feedback].count("submitted"), 1, feedback)
+        self.assertEqual([row["status"] for row in feedback].count("acknowledged"), 1, feedback)
+        self.assertEqual([row["status"] for row in feedback].count("duplicate-ignored"), 1, feedback)
+        self.assertFalse(any(row.get("reason") == "per-turn-command-result-limit"
+                             for row in feedback), feedback)
+        original_items = [row["item"] for row in events
+                          if row.get("type") == "item.completed"
+                          and row.get("item", {}).get("id") == "cmd-real-git-lock"]
+        expected_item = {
+            "type": "command_execution", "id": "cmd-real-git-lock",
+            "command": "zsh -lc 'git commit -m expected-lock-failure'",
+            "aggregated_output": failure.stderr.decode("utf-8", errors="replace"),
+            "exit_code": 128, "status": "failed",
+        }
+        self.assertEqual(original_items, [expected_item, expected_item, expected_item])
+
+        # A rejected advisory remains non-blocking: the same turn's original
+        # final result is returned, and the rejection is an observation limit.
+        self.trace.write_text("", encoding="utf-8")
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        rejected = self.run_supervisor(
+            FAKE_NO_CHILD="1", FAKE_GIT_ITEM_FILE=str(item_file),
+            FAKE_EXPECT_STEER="1", FAKE_STEER_REJECT="1")
+        self.assertEqual(rejected.returncode, 0, rejected.stderr + rejected.stdout)
+        rejected_events = [json.loads(line) for line in rejected.stdout.splitlines()]
+        rejected_feedback = [row for row in rejected_events
+                             if row.get("type") == "dispatch.supervisor.git_failure_feedback"]
+        self.assertTrue(any(row.get("status") == "observation-limit"
+                            and row.get("reason") == "feedback-rejected"
+                            for row in rejected_feedback), rejected_feedback)
+        self.assertEqual(sum(row.get("type") == "dispatch.supervisor.turn.started"
+                             for row in rejected_events), 1)
+        self.assertIn("verdict: PASS", rejected.stdout)
+        lock_stat = os.fstat(lock_fd)
+        current = {
+            "head": git("rev-parse", "HEAD").stdout,
+            "index": Path(index).read_bytes(),
+            "work": tracked.read_bytes(),
+            "lock": (lock_stat.st_dev, lock_stat.st_ino, lock_stat.st_mode,
+                     lock_stat.st_size, os.pread(lock_fd, 128, 0)),
+        }
+        self.assertEqual(current, after_failure)
+
+    def test_feedback_bounds_eligible_candidates_and_records_late_replies(self):
+        name = "codex_app_server_supervisor_feedback_test_subject"
+        spec = importlib.util.spec_from_file_location(name, SUPERVISOR)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+
+        class FakeServer:
+            next_id = 1
+
+            def __init__(self):
+                self.requests = []
+
+            def send(self, value):
+                self.requests.append(json.loads(json.dumps(value)))
+
+        server = FakeServer()
+        emitted = []
+        feedback = module.CodexGitFailureFeedback(server)
+        feedback.begin_turn("thread-1", "turn-1")
+        error_path = self.base / ".git" / "index.lock"
+        error_output = f"fatal: Unable to create '{error_path}': File exists.\n"
+        command = "zsh -lc " + shlex.quote(f"git -C {self.base} commit -m fixture")
+        wrapped_command = "python3 -c " + shlex.quote(
+            "import subprocess; subprocess.run(['git', 'add', 'x'], check=True)")
+        self.assertTrue(module.git_index_lock.codex_command_candidate(
+            wrapped_command, str(self.base), 1, error_output))
+        candidates = []
+        diagnosis = {"state": "present", "message": "fixture diagnosis"}
+
+        with mock.patch.object(module, "emit", side_effect=emitted.append), \
+                mock.patch.object(module.git_index_lock, "diagnose_codex_command",
+                                  return_value=diagnosis) as diagnose:
+            for index in range(128):
+                ordinary = {
+                    "type": "commandExecution", "id": f"ordinary-{index}",
+                    "command": "git status --short", "cwd": str(self.base),
+                    "status": "completed" if index % 2 == 0 else "failed",
+                    "exitCode": 0 if index % 2 == 0 else 1,
+                    "aggregatedOutput": "routine success" if index % 2 == 0
+                    else "fatal: unrelated command failure",
+                }
+                feedback.consider("thread-1", "turn-1", ordinary)
+            for status, exit_code in (("unknown", 128), ("inProgress", 128),
+                                      ("declined", 128), ("failed", 130)):
+                unsupported = {
+                    "type": "commandExecution", "id": f"unsupported-{status}-{exit_code}",
+                    "command": command, "cwd": str(self.base), "status": status,
+                    "exitCode": exit_code, "aggregatedOutput": error_output,
+                }
+                feedback.consider("thread-1", "turn-1", unsupported)
+
+            for index in range(feedback.MAX_COMMANDS_PER_TURN + 1):
+                item = {
+                    "type": "commandExecution", "id": f"eligible-{index}",
+                    "command": wrapped_command if index % 2 else command,
+                    "cwd": str(self.base), "status": "failed",
+                    "exitCode": 128, "aggregatedOutput": error_output,
+                }
+                candidates.append((item, json.dumps(item, sort_keys=True)))
+                feedback.consider("thread-1", "turn-1", item)
+            feedback.consider("thread-1", "turn-1", candidates[0][0])
+            feedback.consider("thread-1", "turn-1", candidates[-1][0])
+
+            self.assertEqual(diagnose.call_count, feedback.MAX_COMMANDS_PER_TURN)
+            self.assertEqual(server.requests[0]["method"], "turn/steer")
+            self.assertEqual(server.requests[0]["params"]["threadId"], "thread-1")
+            self.assertEqual(server.requests[0]["params"]["expectedTurnId"], "turn-1")
+            self.assertEqual(server.requests[0]["params"]["input"][0]["text"],
+                             "fixture diagnosis")
+            self.assertTrue(feedback.response({
+                "jsonrpc": "2.0", "id": 1, "result": {"turnId": "turn-1"},
+            }))
+            self.assertTrue(feedback.response({
+                "jsonrpc": "2.0", "id": 2,
+                "error": {"code": -32000, "message": "turn rejected"},
+            }))
+            feedback.finish_turn("turn-1")
+            self.assertTrue(feedback.response({
+                "jsonrpc": "2.0", "id": 3, "result": {"turnId": "turn-1"},
+            }))
+
+        key = ("thread-1", "turn-1")
+        self.assertEqual(len(feedback.seen[key]), feedback.MAX_COMMANDS_PER_TURN)
+        self.assertLessEqual(len(feedback.pending), feedback.MAX_PENDING)
+        self.assertLessEqual(len(feedback.turn_order), feedback.MAX_TURNS)
+        self.assertEqual(len(feedback.limit_reported), 1)
+        self.assertEqual(len(server.requests), feedback.MAX_PENDING)
+        self.assertTrue(all(json.dumps(item, sort_keys=True) == before
+                            for item, before in candidates))
+        statuses = [row.get("status") for row in emitted
+                    if row.get("type") == "dispatch.supervisor.git_failure_feedback"]
+        self.assertEqual(statuses.count("duplicate-ignored"), 1)
+        self.assertEqual(sum(row.get("reason") == "per-turn-command-result-limit"
+                             for row in emitted), 1)
+        self.assertIn("acknowledged", statuses)
+        self.assertIn("feedback-rejected", [row.get("reason") for row in emitted])
+        self.assertIn("late-feedback-ack", [row.get("reason") for row in emitted])
 
     def test_input_queued_before_the_first_turn_reaches_that_turn(self):
         import dispatch_owner_input as owner_input

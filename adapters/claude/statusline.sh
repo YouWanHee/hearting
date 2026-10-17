@@ -3,7 +3,8 @@
 # 표시: 디렉토리 │ git 브랜치 │ context │ 모델·effort + 5h/7d 사용량 (세로선 파티션).
 # 입력: stdin JSON (Claude Code statusLine schema). 출력: 한 줄.
 # 5h/7d 사용량 = stdin 의 rate_limits.{five_hour,seven_day}.used_percentage — /usage 와 동일한 공식 값.
-# context     = stdin 의 context_window.used_percentage (공식 값) — 부재 시 current_usage/context_window_size, 최후 fallback 만 id "1m" 추측.
+# context     = stdin 의 context_window.used_percentage (공식 값), or the same callback's
+# current_usage/context_window_size pair. Missing native window means an empty reading.
 set -euo pipefail
 AGENT_HOME="${AGENT_HOME:-${CLAUDE_HOME:-$HOME/.claude}}"
 # 상태 파일(.statusline-last*.json, .statusline/<sid>.json)은 Claude Code 설정 홈에 쓴다.
@@ -17,7 +18,7 @@ input=$(cat)
 printf '%s' "$input" > "$SL_STATE_HOME/.statusline-last.json" 2>/dev/null || true  # 디버그·필드 탐사용 (최신 입력 1건)
 
 eval "$(printf '%s' "$input" | python3 -c '
-import sys, json, shlex
+import sys, json, shlex, math
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 cwd = d.get("cwd") or (d.get("workspace") or {}).get("current_dir") or "."
@@ -58,11 +59,23 @@ for e in (rl.get("model_scoped") or []):
         ms_parts.append(f"{lbl}:{round(u * 100)}")
 cwin = d.get("context_window") or {}
 cw = cwin.get("current_usage") or {}
-ctok = cw.get("input_tokens", 0) + cw.get("cache_creation_input_tokens", 0) + cw.get("cache_read_input_tokens", 0)
-# used_percentage/context_window_size 가 stdin 공식 값 — id 의 "1m" 추측은 fallback 만 (Fable 5 1M 을 200k 로 나눠 42% 오표시한 건, 2026-06-11)
+def token_count(value):
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and math.isfinite(value) and value >= 0 else None
+parts = [token_count(cw.get(key)) for key in (
+    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+# used_percentage/context_window_size are raw values from this callback. Model ids and
+# catalogue defaults are not capacity evidence.
 up = cwin.get("used_percentage")
-win = cwin.get("context_window_size") or (1_000_000 if "1m" in mid else 200_000)
-cpct = min(99, round(up)) if isinstance(up, (int, float)) else (min(99, round(100 * ctok / win)) if ctok else -1)
+win = cwin.get("context_window_size")
+if isinstance(up, (int, float)) and not isinstance(up, bool) and math.isfinite(up):
+    cpct = min(99, round(up))
+elif (all(value is not None for value in parts)
+      and isinstance(win, (int, float)) and not isinstance(win, bool)
+      and math.isfinite(win) and win > 0):
+    cpct = min(99, round(100 * sum(parts) / win))
+else:
+    cpct = -1
 print("S_CWD=" + shlex.quote(cwd))
 print("S_MS=" + shlex.quote(" ".join(ms_parts)))
 print("S_MODEL=" + shlex.quote(model))
@@ -123,7 +136,7 @@ try:
                              registry_name=inputs.get("registry_name"),
                              title=session_name or None, slug=None, cwd=cwd)
     # 2026-09-09 사용자 결정: statusline 은 제목만 진다. `[46]` 식별 배지는 herdr pane
-    # 상단 제목(`[46] claude ⚑ <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
+    # 상단 제목(`[46] ⚑ claude <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
     # 억지로 신원을 맞추는 대신 세 하네스가 공유하는 바깥 표면 하나에 둔다.
     # 제목이 없어 이름이 디렉토리로 떨어지면 왼쪽 `📁 <dir>` 세그먼트와 같은 말이 되므로
     # 그 경우엔 아무것도 출력하지 않는다.
@@ -149,10 +162,60 @@ if [ -n "$S_SID" ]; then
   # (F-26). $tap_pid/$tap_start 는 위 F-99 세션 이름 블록에서 이미 walk-up 해 계산했다
   # (동일 pid 필요 — 중복 계산 대신 재사용).
   tap_json=$input
+  if command -v python3 >/dev/null 2>&1; then
+    tap_with_policy=$(printf '%s' "$input" | python3 -c '
+import json, os, sys
+raw = sys.stdin.read()
+try:
+    value = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw)
+    raise SystemExit(0)
+if not isinstance(value, dict):
+    sys.stdout.write(raw)
+    raise SystemExit(0)
+pid, start = sys.argv[1:3]
+if pid.isdigit() and start.isdigit():
+    value["pid"], value["proc_start"] = int(pid), start
+
+def config_disables_auto_compact():
+    # `autoCompactEnabled: false` in a settings source this process reads. Presence only;
+    # the effective window and trigger are computed by the collector from the request.
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    cwd = (value.get("workspace") or {}).get("project_dir") or value.get("cwd") or ""
+    paths = [os.path.join(cfg, "settings.json"), os.path.join(cfg, ".claude.json"),
+             os.path.join(os.path.expanduser("~"), ".claude.json")]
+    if cwd:
+        paths += [os.path.join(cwd, ".claude", "settings.json"),
+                  os.path.join(cwd, ".claude", "settings.local.json")]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if json.load(fh).get("autoCompactEnabled") is False:
+                    return True
+        except Exception:
+            continue
+    return False
+
+# Inputs the native auto-compaction consumer reads from this exact process (2.1.299):
+# the Hearting collector derives the applied trigger from them; nothing here is a guess.
+value["hearting_context_request"] = {
+    "window": os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+    "pct_override": os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
+    "disable_auto_compact_env": os.environ.get("DISABLE_AUTO_COMPACT"),
+    "disable_compact_env": os.environ.get("DISABLE_COMPACT"),
+    "max_output_env": os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+    "auto_compact_enabled": False if config_disables_auto_compact() else None,
+}
+sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    ' "$tap_pid" "$tap_start" 2>/dev/null) || tap_with_policy=""
+    [ -n "$tap_with_policy" ] && tap_json=$tap_with_policy
+  fi
+  # Older/minimal environments without Python retain the original additive PID tap.
   case "$tap_pid$tap_start" in
     ''|*[!0-9]*) ;;                       # 미확보·비정상 값 → 원문 그대로 (주입 생략)
-    *) case "$input" in
-         '{"'*) tap_json='{"pid":'"$tap_pid"',"proc_start":"'"$tap_start"'",'"${input#\{}" ;;
+    *) case "$tap_json" in
+         '{"'*) case "$tap_json" in *'"pid":'*) ;; *) tap_json='{"pid":'"$tap_pid"',"proc_start":"'"$tap_start"'",'"${tap_json#\{}" ;; esac ;;
        esac ;;
   esac
   # atomic write (temp + rename) so a concurrent reader (tools/fleet dashboard) never sees a

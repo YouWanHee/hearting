@@ -22,12 +22,117 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import wait
 
 from ..refresh import background_read
 
 _TIMEOUT_S = 2.0
+_OBSERVATION_WAIT_MAX_S = 0.75
+_OBSERVATION_LOCK = threading.RLock()
+_OBSERVATION_TRANSPORTS = {}
+_OBSERVATION_FUTURES = {}
+_PANE_INFO_CACHE = OrderedDict()
+_PANE_INFO_CACHE_LIMIT = 512
+
+
+def _observation_module():
+    from pathlib import Path
+    utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    import herdr_observation
+    return herdr_observation
+
+
+def observation_view(session=None, *, refresh=False, wait_timeout=0.0):
+    """Reuse one event subscription for this exact endpoint/socket pair."""
+    try:
+        observation = _observation_module()
+        endpoint = observation.endpoint_name(session)
+        socket_path = observation.socket_path_for_endpoint(session)
+        if not socket_path:
+            return None
+        key = (endpoint, os.path.realpath(socket_path))
+        with _OBSERVATION_LOCK:
+            transport = _OBSERVATION_TRANSPORTS.get(key)
+            if transport is None:
+                # A failed socket or snapshot must not delay Fleet's basic
+                # process/NOW/resource publication. Transport work is bounded
+                # off-thread and reused by the next collector lifetime.
+                transport = observation.ObservationTransport(
+                    endpoint, socket_path, timeout=0.15)
+                _OBSERVATION_TRANSPORTS[key] = transport
+            future = _OBSERVATION_FUTURES.get(key)
+            if future is not None:
+                if not future.done() and refresh:
+                    return None
+                if future.done():
+                    _OBSERVATION_FUTURES.pop(key, None)
+                    try:
+                        completed = future.result()
+                    except Exception:
+                        completed = None
+                    if completed is not None and not refresh:
+                        return completed
+                elif wait_timeout <= 0:
+                    return None
+                elif wait_timeout > 0:
+                    try:
+                        completed = future.result(timeout=min(
+                            _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
+                    except TimeoutError:
+                        return None
+                    except Exception:
+                        completed = None
+                    _OBSERVATION_FUTURES.pop(key, None)
+                    if completed is not None and not refresh:
+                        return completed
+            if refresh:
+                transport.close()
+            future = background_read(transport.observe)
+            _OBSERVATION_FUTURES[key] = future
+            if wait_timeout > 0:
+                try:
+                    completed = future.result(timeout=min(
+                        _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
+                except TimeoutError:
+                    return None
+                except Exception:
+                    completed = None
+                _OBSERVATION_FUTURES.pop(key, None)
+                return completed
+            if future.done():
+                _OBSERVATION_FUTURES.pop(key, None)
+                try:
+                    return future.result()
+                except Exception:
+                    return None
+            return None
+    except Exception:
+        return None
+
+
+def close_observations():
+    """Close endpoint subscriptions when their Fleet consumer exits."""
+    with _OBSERVATION_LOCK:
+        transports = list(_OBSERVATION_TRANSPORTS.values())
+        futures = list(_OBSERVATION_FUTURES.values())
+        _OBSERVATION_TRANSPORTS.clear()
+        _OBSERVATION_FUTURES.clear()
+        _PANE_INFO_CACHE.clear()
+    if futures:
+        wait(futures, timeout=0.8)
+    for transport in transports:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
 def verified_id_harnesses():
     """Harnesses whose Fleet session_id is known to equal herdr's ``agent_session.value``.
 
@@ -52,8 +157,24 @@ def list_agents(runner=subprocess.run, which=shutil.which):
     the call fails/times out, or the payload is not the documented shape."""
     if which("herdr") is None:
         return None
+    observation = None
+    if runner is subprocess.run and which is shutil.which:
+        observation = _observation_module()
+        view = observation_view()
+        if view is not None:
+            return [dict(agent) for agent in view.agents]
+        # An explicitly selected socket that did not produce a complete
+        # subscription/snapshot is unknown. Do not fall through to a second,
+        # potentially different endpoint or stall basic Fleet discovery.
+        if observation.socket_path_for_endpoint():
+            return None
     try:
-        proc = runner(["herdr", "agent", "list"], capture_output=True, text=True,
+        endpoint = observation.endpoint_name() if observation is not None else "default"
+        argv = ["herdr"]
+        if endpoint != "default":
+            argv.extend(("--session", endpoint))
+        argv.extend(("agent", "list"))
+        proc = runner(argv, capture_output=True, text=True,
                       timeout=_TIMEOUT_S)
     except Exception:
         return None
@@ -70,23 +191,21 @@ def list_agents(runner=subprocess.run, which=shutil.which):
     return [a for a in agents if isinstance(a, dict)]
 
 
-def list_panes(runner=subprocess.run, which=shutil.which):
+def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0):
     """``[pane dict, ...]`` from ``herdr pane list``; ``None`` on any failure."""
-    if which("herdr") is None:
-        return None
     try:
-        proc = runner(["herdr", "pane", "list"], capture_output=True, text=True,
-                      timeout=_TIMEOUT_S)
-        payload = json.loads(proc.stdout or "")
+        observation = _observation_module()
+        if runner is subprocess.run and which is shutil.which:
+            view = (observation_view(wait_timeout=wait_timeout)
+                    if wait_timeout > 0 else observation_view())
+            if view is not None:
+                return [dict(pane) for pane in view.panes]
+            if observation.socket_path_for_endpoint():
+                return None
+        census = observation.pane_census(runner=runner, which=which)
+        return list(census.panes) if census is not None else None
     except Exception:
         return None
-    if getattr(proc, "returncode", 1) != 0:
-        return None
-    result = payload.get("result") if isinstance(payload, dict) else None
-    panes = result.get("panes") if isinstance(result, dict) else None
-    if not isinstance(panes, list):
-        return None
-    return [p for p in panes if isinstance(p, dict)]
 
 
 class PaneEvidence(tuple):
@@ -97,7 +216,7 @@ class PaneEvidence(tuple):
         return result
 
 
-def pane_evidence(panes, runner=subprocess.run, bindings=None):
+def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None):
     """Return shell PIDs, foreground PIDs, and exact Codex PID → thread IDs.
 
     A pane's session metadata alone can outlive its foreground process. Only a live
@@ -113,13 +232,42 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
         pane_id = pane.get("pane_id")
         if not pane_id:
             raise ValueError("pane id missing")
-        proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
+        cache_key = None
+        if observation is not None and runner is subprocess.run:
+            cache_key = (observation.endpoint, observation.socket_path,
+                         observation.generation,
+                         observation.pane_revisions.get(str(pane_id), 0), str(pane_id))
+            with _OBSERVATION_LOCK:
+                cached = _PANE_INFO_CACHE.get(cache_key)
+                if cached is not None:
+                    _PANE_INFO_CACHE.move_to_end(cache_key)
+                    return dict(cached)
+        if observation is not None:
+            endpoint = observation.endpoint
+        elif runner is subprocess.run:
+            try:
+                endpoint = _observation_module().endpoint_name()
+            except Exception:
+                endpoint = "default"
+        else:
+            endpoint = "default"
+        argv = ["herdr"]
+        if endpoint != "default":
+            argv.extend(("--session", endpoint))
+        argv.extend(("pane", "process-info", "--pane", str(pane_id)))
+        proc = runner(argv,
                       capture_output=True, text=True, timeout=_TIMEOUT_S)
         if getattr(proc, "returncode", 1) != 0:
             raise RuntimeError("process-info exit %s" % proc.returncode)
         info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info")
         if not isinstance(info, dict):
             raise ValueError("process-info missing")
+        if cache_key is not None:
+            with _OBSERVATION_LOCK:
+                _PANE_INFO_CACHE[cache_key] = dict(info)
+                _PANE_INFO_CACHE.move_to_end(cache_key)
+                while len(_PANE_INFO_CACHE) > _PANE_INFO_CACHE_LIMIT:
+                    _PANE_INFO_CACHE.popitem(last=False)
         return info
 
     # One shared deadline replaces N serial pane deadlines. Daemon reads never
@@ -155,20 +303,20 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
                         complete=panes is not None and not errors, errors=errors)
 
 
-def pane_pids(panes, runner=subprocess.run, bindings=None):
+def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
     """F-100c — ``(shell_pids, foreground_pids)`` for agent panes."""
-    evidence = pane_evidence(panes, runner=runner, bindings=bindings)
+    evidence = pane_evidence(panes, runner=runner, bindings=bindings,
+                             observation=observation)
     shells, fg, _identities = evidence
     return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
                         errors=getattr(evidence, "errors", ()))
 
 
-def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
-    """Exact thread IDs for unresolved Codex TUIs, bounded by cwd and cached by PID.
+def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False):
+    """Process identities for Codex TUIs currently foreground in herdr panes.
 
-    Herdr pane metadata can be stale (a closed pane may retain a thread ID), so a
-    matching live foreground Codex PID and its original process start are required.
-    This is called only for TUIs still missing a rollout after process attribution.
+    Pane metadata is not thread proof. The live foreground PID's
+    ``process_identity`` is authoritative; pane process info confirms ownership.
     """
     from . import procscan
 
@@ -181,7 +329,8 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
     key = tuple(sorted((pid, str(s.proc_start), os.path.realpath(s.cwd or ""))
                        for pid, s in targets.items()))
     now = time.monotonic()
-    if panes is None and runner is subprocess.run and key == _CODEX_PANE_CACHE["key"] \
+    if not force_current and panes is None and runner is subprocess.run \
+            and key == _CODEX_PANE_CACHE["key"] \
             and now < _CODEX_PANE_CACHE["until"]:
         found = _CODEX_PANE_CACHE["identities"]
     else:
@@ -191,7 +340,26 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
         selected = [p for p in panes or []
                     if p.get("agent") == "codex"
                     and os.path.realpath(p.get("cwd") or "") in cwds]
-        _shells, _fg, found = pane_evidence(selected, runner=runner)
+        _shells, foreground, _metadata = pane_evidence(selected, runner=runner)
+        utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        try:
+            from pane_ownership import current_codex_thread
+            found = {}
+            for pid, session in targets.items():
+                if pid not in foreground or procscan.read_proc_start(pid) != session.proc_start:
+                    continue
+                for pane in selected:
+                    pane_id = pane.get("pane_id")
+                    if not pane_id:
+                        continue
+                    sid = current_codex_thread(str(pane_id), pid)
+                    if sid:
+                        found[pid] = sid
+                        break
+        except Exception:
+            found = {}
         if runner is subprocess.run:
             _CODEX_PANE_CACHE.update(key=key, until=now + _CODEX_PANE_TTL_S,
                                      identities=found)
@@ -342,7 +510,8 @@ def _lineage_attachment(sessions, lineage):
             s.herdr_attached = None
 
 
-def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
+def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None,
+           wait_timeout=0.0):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
     = pre-fetched pane list / ``pane_pids()`` result (``None`` → probe once here);
@@ -351,7 +520,18 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         session._gpu_session_aliases = []
         session._herdr_name = None
         session._pane_session_claim = None
-    if agents is None:
+    observation = None
+    if agents is None and panes is None:
+        observation = observation_view(wait_timeout=wait_timeout)
+        if observation is not None:
+            agents = [dict(agent) for agent in observation.agents]
+            panes = [dict(pane) for pane in observation.panes]
+        elif _observation_module().socket_path_for_endpoint():
+            agents = None
+            panes = None
+        else:
+            agents = list_agents()
+    elif agents is None:
         agents = list_agents()
     if agents is None:
         _lineage_attachment(sessions, lineage)
@@ -368,7 +548,9 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     if pids is None:
         if panes is None:
             panes = list_panes()
-        pids = pane_pids(panes, bindings=bindings) if panes is not None else None
+        if panes is not None and observation is None:
+            observation = observation_view()
+        pids = pane_pids(panes, bindings=bindings, observation=observation) if panes is not None else None
     if panes is None:
         _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())

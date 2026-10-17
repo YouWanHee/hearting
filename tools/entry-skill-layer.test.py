@@ -47,12 +47,12 @@ for bootstrap in (
     routing = " ".join(text.split("Route by `core/WORKFLOW.md §0.2`", 1)[1].split())
     compose = re.search(r"`(?:utilities/capability-route.py|preflight.sh|hearting run capability-route) compose`", routing)
     assert compose is not None, f"{bootstrap} lost the compose route surface"
-    shape_choice = routing[:compose.start()]
-    assert "§0.2.1" in shape_choice and "shape" in shape_choice, (
-        f"{bootstrap} must choose the work shape before the compose route"
+    normalized = " ".join(routing.split())
+    assert "The main session decides only whether the work is direct (§0.2.1)" in normalized, (
+        f"{bootstrap} must limit the main session to deciding direct or not"
     )
-    assert all(f"`{shape}`" in shape_choice for shape in ("direct", "solo", "staged")), (
-        f"{bootstrap} must route direct, solo, and staged work through compose"
+    assert "use `--shape direct` for one atomic, reversible inline change; otherwise omit `--shape` and let the frame decide" in normalized, (
+        f"{bootstrap} must send other new work to the frame by omitting shape"
     )
 
 

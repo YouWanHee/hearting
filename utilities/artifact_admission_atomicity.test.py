@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission as adm
+import artifact_directory_bundle as bundles
 import artifact_identity as idm
 import artifact_manifest as m
 
@@ -405,6 +406,67 @@ class TestConcurrentAdmission(AtomicityTestBase):
 
 
 class TestCrashRecovery(AtomicityTestBase):
+    def test_bundle_coverage_survives_post_publish_recovery(self):
+        doc, content = _make_valid_document(self.alloc, self.identity)
+        src = self._stage_source(content)
+        raw = src / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "covered.bin").write_bytes(b"covered")
+        tree = bundles.scan_tree(src, "artifacts/raw-results")
+        descriptor_rel = "artifacts/_internal/directory-bundles/raw-results.json"
+        descriptor = src / descriptor_rel
+        descriptor.parent.mkdir(parents=True)
+        descriptor.write_bytes(tree.descriptor)
+        artifact_id = self.alloc.allocate("artifact")
+        revision_id = self.alloc.allocate("artifact_revision")
+        event = dict(doc["events"][0])
+        event.update(event_id=self.alloc.allocate("event"), stream_id=self.alloc.allocate("stream"),
+                     target_id=artifact_id, payload={"locator": descriptor_rel})
+        provenance = dict(doc["artifact_revisions"][0]["provenance"])
+        doc["artifacts"].append({"artifact_id": artifact_id, "cycle_id": doc["cycle"]["cycle_id"],
+                                 "role": "output", "type": "directory-bundle",
+                                 "capability": "autopilot-code", "title": "raw-results"})
+        doc["artifact_revisions"].append({"artifact_revision_id": revision_id, "artifact_id": artifact_id,
+            "revision_sequence": 1, "content_digest": tree.descriptor_digest,
+            "byte_size": len(tree.descriptor), "media_type": bundles.MEDIA_TYPE,
+            "locator": {"kind": "cycle-relative", "path": descriptor_rel}, "provenance": provenance})
+        doc["events"].append(event)
+        report = m.validate(doc)
+        self.assertTrue(report.ok, report.to_payload())
+
+        utilities_dir = Path(__file__).resolve().parent
+        script = textwrap.dedent(
+            """
+            import sys, json, os
+            sys.path.insert(0, {utilities_dir!r})
+            import artifact_admission as adm
+            root = {root!r}
+            document = json.loads({document_json!r})
+            src = {src!r}
+            original = adm._write_journal
+            def kill_after_publish(root_, key, **fields):
+                original(root_, key, **fields)
+                if fields.get("state") == "published":
+                    os.kill(os.getpid(), 9)
+            adm._write_journal = kill_after_publish
+            req = adm.AdmissionRequest(idempotency_key=document["manifest_id"],
+                                       document=document, staging_source=src)
+            adm.admit(root, req)
+            """
+        ).format(utilities_dir=str(utilities_dir), root=str(self.root),
+                 document_json=json.dumps(doc), src=str(src))
+        proc = subprocess.Popen([sys.executable, "-c", script])
+        proc.wait(timeout=30)
+        self.assertEqual(proc.returncode, -9)
+        cycle_dir = (self.root / "campaigns" / doc["campaign"]["campaign_id"] / "cycles"
+                     / doc["cycle"]["cycle_id"])
+        self.assertTrue((cycle_dir / "artifacts/raw-results/covered.bin").is_file())
+        recovered = adm.recover(self.root)
+        self.assertIn(doc["manifest_id"], recovered["rolled_forward"])
+        manifest = json.loads((cycle_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(m.validate(manifest).ok)
+        self.assertEqual(adm._verify_staged_files(cycle_dir, manifest), [])
+
     def test_kill_after_stage_before_publish_rolls_back_and_commits_nothing(self):
         doc, content = _make_valid_document(self.alloc, self.identity)
         src = self._stage_source(content)

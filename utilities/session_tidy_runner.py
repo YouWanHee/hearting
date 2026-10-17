@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import dataclasses
 import datetime
 import fcntl
 import hashlib
@@ -218,21 +219,132 @@ def _log(run_dir: Path, text: str) -> None:
             handle.write(f"{st.iso_utc(_now())} {text}\n")
 
 
+def _card_seat(item: dict) -> "st.Seat":
+    """Restore the project author's card identity, including for older queue rows."""
+    seat = st.Seat(**item["seat"])
+    if seat.kind == "project":
+        return dataclasses.replace(seat, harness=item.get("harness") or seat.harness,
+                                       sid=item.get("sid") or seat.sid)
+    return seat
+
+
 # ---------------------------------------------------------------------------
 # enqueue: write the entry, start the detached runner, return
 # ---------------------------------------------------------------------------
 
-def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "") -> dict:
-    item = {"schema": SCHEMA, "id": new_id(), "created": _now(), "status": "queued", "updated": _now(),
-            "seat": seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
+def _existing_operation(operation_id: str) -> Optional[dict]:
+    matches = [item for item in list_items() if item.get("operation_id") == operation_id]
+    return min(matches, key=lambda item: (float(item.get("created", 0) or 0), item["id"])) if matches else None
+
+
+def operation_queue_id(operation_id: str) -> str:
+    """Return the stable queue identity shared with a compact reservation."""
+    digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:32]
+    return f"tidy-op-{digest}"
+
+
+def _start_queued(item: dict) -> dict:
+    """Best-effort launch; unfinished stages resume under the same queue/batch identity."""
+    if item.get("status") not in UNFINISHED:
+        return item
+    pid = item.get("runner_pid")
+    started = str(item.get("runner_pid_start") or "")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            current = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            current = current[current.rfind(")") + 2:].split()[19]
+            if not started or current == started:
+                return item
+        except (OSError, IndexError, ValueError):
+            pass
+    try:
+        pid = start_detached(item["id"])
+        item.pop("runner_start_error", None)
+        if pid:
+            item["runner_pid"] = int(pid)
+            try:
+                raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+                item["runner_pid_start"] = raw[raw.rfind(")") + 2:].split()[19]
+            except (OSError, IndexError, ValueError):
+                item["runner_pid_start"] = ""
+        write_item(item)
+    except (OSError, subprocess.SubprocessError) as exc:
+        item["runner_start_error"] = type(exc).__name__
+        write_item(item)
+    return item
+
+
+def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "", *,
+                 operation_id: Optional[str] = None, queue_id: Optional[str] = None,
+                 start: bool = True) -> dict:
+    """Durably enqueue one memory operation, optionally idempotent across hook retries.
+
+    ``operation_id`` is used by automatic compact/idle events. Re-observing that event returns
+    the same queue row and never creates a second apply. A saved queued row survives a detached
+    runner launch failure so a later normal hook can start it again.
+    """
+    if operation_id:
+        existing = _existing_operation(operation_id)
+        if existing:
+            return _start_queued(existing) if start else existing
+    queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
+    if queue_id is None and operation_id:
+        queue_id = operation_queue_id(operation_id)
+    if queue_id:
+        existing = read_item(queue_id)
+        if existing:
+            if operation_id and existing.get("operation_id") not in (None, operation_id):
+                raise RunnerFailure("queue-id-operation-mismatch")
+            if operation_id and not existing.get("operation_id"):
+                existing["operation_id"] = operation_id
+                write_item(existing)
+            return _start_queued(existing) if start else existing
+    item = {"schema": SCHEMA, "id": queue_id or new_id(), "created": _now(), "status": "queued", "updated": _now(),
+            "seat": queue_seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
             "attempts": 0}
+    if operation_id:
+        item["operation_id"] = operation_id
     with contextlib.suppress(BaseException):
-        card = st.read_latest_card(seat)
+        card = st.read_latest_card(_card_seat(item))
         if card:
             item["card_generation"] = int(card.get("generation", 0) or 0)   # the card this batch was queued under
     write_item(item)
-    start_detached(item["id"])
-    return item
+    return _start_queued(item) if start else item
+
+
+def reconcile_queued(seat: "st.Seat", harness: str, sid: str) -> int:
+    """Restart durable queued rows for this exact session after an earlier launch miss."""
+    resumed = 0
+    for item in list_items():
+        if item.get("status") not in UNFINISHED or (item.get("harness"), item.get("sid")) != (harness, sid):
+            continue
+        if (item.get("seat") or {}).get("key") != seat.key:
+            continue
+        before = item.get("runner_start_error")
+        started = _start_queued(item)
+        if before and not started.get("runner_start_error"):
+            resumed += 1
+    return resumed
+
+
+def reconcile_reservation_queue(seat: "st.Seat") -> bool:
+    """Restart the accepted queued operation carried by this seat's clear reservation."""
+    try:
+        import session_tidy_clear as clear
+        req = clear.read_reservation(seat.key)
+    except BaseException:
+        return False
+    if not req or (req.get("seat") or {}).get("key") != seat.key:
+        return False
+    qid = str(req.get("queue_id") or "")
+    item = read_item(qid) if qid else None
+    if (not item or (item.get("seat") or {}).get("key") != seat.key
+            or item.get("operation_id") != req.get("operation_id")
+            or (item.get("harness"), item.get("sid")) != (req.get("harness"), req.get("sid"))):
+        return False
+    before = str(item.get("runner_start_error") or "")
+    started = _start_queued(item)
+    return bool(before and not started.get("runner_start_error"))
 
 
 def start_detached(qid: str) -> int:
@@ -413,6 +525,7 @@ def _unread_entry(target: dict, chunk) -> dict:
 
 def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     seat = st.Seat(**item["seat"])
+    card_seat = _card_seat(item)
     project_key = st.project_key_for(item["cwd"])
     sessions, cursors, choices, skipped, unread = [], [], [], [], []
     remaining = TOTAL_CHUNK_BYTES
@@ -458,7 +571,7 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     pending = _pending_decisions(project_key)
     conversation = "\n".join(s["text"] for s in sessions)
     records, groups = existing_records(item["cwd"], conversation) if (sessions or pending or choices) else ([], [])
-    card = st.read_latest_card(seat)
+    card = st.read_latest_card(card_seat)
     doc = {"schema_version": 1, "batch_id": batch, "created": st.iso_utc(_now()), "cwd": item["cwd"],
            "project_key": project_key, "seat": {"kind": seat.kind, "key": seat.key},
            "caller": {"harness": item["harness"], "sid": item["sid"]},
@@ -924,7 +1037,7 @@ def publish_memory(item: dict, batch: str, run_dir: Path, bundle: Optional[Bundl
     """Refresh the seat card's "참고할 기억" list (never touches the card itself); best effort."""
     with contextlib.suppress(BaseException):
         refs, more = memory_refs(run_dir, bundle) if status != "failed" or journal_ids(run_dir) else ([], 0)
-        st.update_memory_refs(st.Seat(**item["seat"]), batch=batch, status=status, refs=refs, more=more,
+        st.update_memory_refs(_card_seat(item), batch=batch, status=status, refs=refs, more=more,
                               coverage=coverage_note(bundle) if bundle else "", detail=detail,
                               result_path=str(run_dir / "result.json"),
                               source_generation=item.get("card_generation"))
@@ -952,7 +1065,9 @@ def _with_coverage(line: str, note: str) -> str:
 
 def process_item(item: dict) -> None:
     attempts = int(item.get("attempts", 0))
-    batch = item["id"] if attempts == 0 else f"{item['id']}-r{attempts}"
+    # An interrupted operation keeps the same tidy-apply batch. The apply journal and
+    # source keys then make replay after an unknown completion idempotent.
+    batch = str(item.get("batch") or item["id"])
     item["attempts"] = attempts + 1
     run_dir = st.ensure_dir(_runs_dir() / batch)
     set_status(item, "assembling", batch=batch)
@@ -1064,6 +1179,74 @@ def _handoff_steward():
     return module
 
 
+def validate_handoff_receiver(row, caller, *, steward=None):
+    """Read-only check shared by receiver guidance and explicit acceptance."""
+    try:
+        seat, harness, sid = caller
+    except (TypeError, ValueError):
+        raise ValueError("handoff-successor-mismatch") from None
+    steward = steward or _handoff_steward()
+    peer = steward.peer_message
+    context = row.get("handoff") if isinstance(row, dict) else None
+    original_from = row.get("from") if isinstance(row, dict) else None
+    original_to = row.get("to") if isinstance(row, dict) else None
+    if (not isinstance(context, dict) or not isinstance(original_from, dict)
+            or not isinstance(original_to, dict)
+            or (original_to.get("harness"), original_to.get("session_id")) != (harness, sid)
+            or not peer._valid_transfer_endpoint(original_to)):
+        raise ValueError("handoff-successor-mismatch")
+
+    predecessor = context.get("predecessor")
+    successor = context.get("successor")
+    requester = context.get("requester")
+    target = context.get("target")
+    def valid_pane(value):
+        return (isinstance(value, str) and 0 < len(value) <= 512
+                and not any(ord(ch) < 32 for ch in value))
+    def valid_server(value):
+        return isinstance(value, str) and bool(value) and not any(ord(ch) < 32 for ch in value)
+
+    if (not isinstance(predecessor, dict) or not isinstance(successor, dict)
+            or not isinstance(requester, dict) or not valid_pane(target)
+            or not valid_pane(predecessor.get("pane"))
+            or not valid_server(predecessor.get("server"))
+            or predecessor.get("pane") != target
+            or (predecessor.get("harness"), predecessor.get("session_id"))
+               != (original_from.get("harness"), original_from.get("session_id"))
+            or not peer._valid_transfer_endpoint({"harness": predecessor.get("harness"),
+                                                  "session_id": predecessor.get("session_id")})
+            or not valid_pane(successor.get("pane"))
+            or not valid_server(successor.get("server"))
+            or (successor.get("harness"), successor.get("session_id")) != (harness, sid)
+            or successor.get("pane") == predecessor.get("pane")
+            or not peer._valid_transfer_endpoint({"harness": successor.get("harness"),
+                                                  "session_id": successor.get("session_id")})
+            or (requester.get("harness"), requester.get("session_id"),
+                requester.get("pane"), requester.get("server"))
+               != (successor.get("harness"), successor.get("session_id"),
+                   successor.get("pane"), successor.get("server"))):
+        raise ValueError("handoff-context-invalid")
+
+    if (getattr(seat, "kind", None) != "pane" or seat.pane != successor["pane"]
+            or (steward._HERDR_SESSION or "default") != successor["server"]):
+        raise ValueError("handoff-successor-seat-mismatch")
+    _, current, _, _ = steward._retire_target(successor["pane"])
+    try:
+        observed = steward._retire_request_identity(current,
+            steward._retire_foreground(successor["pane"], harness, strict=False))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("handoff-successor-lifetime-unverified") from None
+    for identity in (successor, observed):
+        foreground = identity.get("foreground")
+        if (not steward._handoff_lifetime_valid(foreground)
+                or not steward._pid_identity_ok(foreground["pid"], foreground["start"])):
+            raise ValueError("handoff-successor-lifetime-unverified")
+    if any(observed.get(k) != successor.get(k)
+           for k in ("server", "pane", "harness", "session_id", "foreground")):
+        raise ValueError("handoff-successor-lifetime-mismatch")
+    return context, successor
+
+
 def accept_handoff(ref, caller, *, steward=None):
     """The agent explicitly asserts it read the card/docs and accepts this transfer."""
     seat, harness, sid = caller
@@ -1071,23 +1254,7 @@ def accept_handoff(ref, caller, *, steward=None):
     peer = steward.peer_message
     with peer.pending_lock(ref):
         row = peer._read_pending(ref)
-        context = (row or {}).get("handoff")
-        if not isinstance(context, dict) or (row["to"].get("harness"), row["to"].get("session_id")) != (harness, sid):
-            raise ValueError("handoff-successor-mismatch")
-        successor = context["successor"]
-        if (seat.pane != successor["pane"] or (steward._HERDR_SESSION or "default") != successor["server"]):
-            raise ValueError("handoff-successor-seat-mismatch")
-        _, current, _, _ = steward._retire_target(successor["pane"])
-        observed = steward._retire_request_identity(current,
-            steward._retire_foreground(successor["pane"], harness, strict=False))
-        for identity in (successor, observed):
-            foreground = identity.get("foreground")
-            if (not steward._handoff_lifetime_valid(foreground)
-                    or not steward._pid_identity_ok(foreground["pid"], foreground["start"])):
-                raise ValueError("handoff-successor-lifetime-unverified")
-        if any(observed.get(k) != successor.get(k)
-               for k in ("server", "pane", "harness", "session_id", "foreground")):
-            raise ValueError("handoff-successor-lifetime-mismatch")
+        context, successor = validate_handoff_receiver(row, caller, steward=steward)
         # Receipt callbacks never set this. Keep progress in the existing row.
         # Register recovery before recording acceptance. Until that explicit
         # record exists the runner waits; it can never infer agent approval.

@@ -244,42 +244,37 @@ An entry's recipe is an assembly preset: the default when nothing else is
 chosen and an example of how its parts fit together. The route is the sealed
 stage list, assembled from the part catalog (`capabilities/topologies.json`
 recipes plus `part_catalog`, SD-165).
-Before proposing a route, choose the **shape** of the work from its size; the
-shape and explicit choices determine the route; defaults only fill omissions:
+The main session decides only whether the work is direct. For one atomic,
+reversible inline change, use `compose --shape direct`. Otherwise use
+`compose --start --prompt-file <task>` with no `--shape`; the frame chooses
+the capability, stages, and solo or staged shape.
 
-| Shape | When | Route |
+| Main decision | Command | Result |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose` — the inline node, dispatch depth 0 |
-| `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
-| `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
-| `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — one frame leg (both `top` legs with `--intensity strong` or higher, for uncertain or hard-to-reverse work) proposes the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
+| One atomic, reversible inline change | `compose --shape direct` | inline node, dispatch depth 0 |
+| Other new work | `compose --start --prompt-file <task>` | framed; frame proposes the smallest route and the existing interview confirms it |
 
-**`framed` is the default; four cases skip the frame.** Work that is not
-`direct` starts with `compose --shape framed --campaign-key <stream> --start
---prompt-file <task>`. `--capability`, `--capability-mode`, `--graph` and
-`--profile` are only hints to the frame legs — recorded only: not sealed, not
-refused; `--pin` applies as usual. Use `staged`/`solo` as before when (1) the
-person named the capability and its stages, (2) the work continues a stopped
-route, (3) the main session composes the next leg of an approved proposal from
-its `next_leg`, or (4) the same campaign already holds an approved frame
-decision (`shards/frame/route-decision.json`) and the new instruction is inside
-its scope: reuse that record, and choose `framed` again only when the scope
-changed. The main session judges the scope; nothing picks a campaign's latest
-record automatically. `direct` is unchanged. A route made from a proposal
-(`compose --route-plan <record>#<i>`, a command the runtime prints) has no frame
-nodes, and neither has a `solo` or `staged` compose: those shapes are chosen for
-decided work, so they compile without the recipe's frame pair (a route sealed
-earlier keeps the frame nodes it was sealed with). A `framed` route's one leg
-is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own
-frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered
-automatically; a frame-rule `top` that stops at a usage limit is retried once at
-`deep` through the SD-157 replacement lineage, and the lowering is recorded.
-The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
-조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or,
-with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+`solo` means one registered owner; `staged` means separate stages. Shape
+omission starts a framed route. `--capability`, `--capability-mode`, `--graph`,
+and `--profile` without a shape are routing hints recorded for the frame, not
+sealed choices. `--pin` applies as usual.
 
-**Staged assembly guidance.** New non-direct work defaults to `framed`; assemble
-`staged` directly when the whole route is already decided under the cases above.
+Skip a new frame only when a frame or the person already decided the shape:
+resume a stopped route, follow the runtime-printed `next_leg`, continue within
+an approved frame decision of the same campaign, or follow the person's
+explicit capability and stages. The main session judges whether follow-up
+stays within that approved scope. Its own judgment that work is already
+decided is not an exception. Use the decided shape explicitly; a person-named
+stage list uses `--shape staged --graph <stage,…>`. A route made from a
+proposal (`compose --route-plan <record>#<i>`, a command the runtime prints)
+has no frame nodes, and neither has a `solo` or `staged` compose: those shapes
+compile without the recipe's frame pair (a route sealed earlier keeps the
+frame nodes it was sealed with).
+
+A `framed` route's one leg is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+
+**Staged assembly guidance.** Staged assembly guidance is for frame brief
+authors and routes whose capability and stages the person explicitly named.
 These advisory points add no prerequisite or required stage:
 
 - Name `--capability` and `--capability-mode`, and select only the needed parts.
@@ -372,7 +367,8 @@ budget and start approval) and writing under
 `parts/plan/<id>/`; one that cannot be placed is named in `read_notes`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
-<task>` with the selected shape/graph. The slug comes from the task; the
+<task>` with no `--shape` for framed work or an explicit decided shape. Use
+`--shape direct` only for one atomic, reversible inline change. The slug comes from the task; the
 campaign defaults to this session's latest stream in the same artifact root,
 else to the one active stream of the routes sealed for this folder, and otherwise
 is an existing or new stream key, `--parent-cycle`, or an explicit `--unassigned`
@@ -429,10 +425,16 @@ defaults before execution. Input/output, explicit human gates, and terminal proo
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
 to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
-non-direct `--start` whose stages change source from a primary checkout, the worktree
-`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused, unless the
-checkout holds work the base lacks; a framed
-decision's first such leg does the same under the frame's slug), artifact root
+source-changing `--start` from a primary checkout, the worktree
+`<repo>-wt/<slug>` on a collision-free branch and path, based on the commit SHA
+resolved by a successful fetch of the current remote default; this applies
+regardless of shape, explicit cwd, or supplied dispatch evidence. An explicitly
+approved task linked worktree is reused with its changes, and exact saved route
+snapshots/cursors/receipts and official continuations resume before any new
+preparation. A framed first leg and each new successor use the same preparation
+contract; an existing plan cursor wins over allocation. A preparation failure
+leaves the start unpublished and retryable through the same request. Preview,
+explain, non-start `compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
@@ -458,10 +460,13 @@ the write, spec, and core gates, the dispatch-depth-3 ban, and every
 completion gate are unchanged, and a preset-free route is still a route the
 §0.4 gate and the route-participation invariant apply to.
 
-`compose` runs the same probe an owner launch re-checks, so it is called from
-the dispatch-depth-0 session in the final worktree; inside a registered owner
-(`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence` or
-`--registered-headless-evidence` from the parent, exactly like `compile`.
+For an approved source-changing `--start`, the shared preparation boundary
+resolves the selected graph first, prepares a new independent worktree when the
+caller is in a primary checkout, then collects eligibility and launch evidence
+from that final cwd before sealing or publishing. `compose` runs the same probe an owner launch re-checks,
+so it is called from the dispatch-depth-0 session in the final worktree; inside
+a registered owner (`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence`
+or `--registered-headless-evidence` from the parent, exactly like `compile`.
 The stderr `[경로]` notice (§0.4) keeps the campaign choice observed before
 compose starts, and accompanies an admitted first leg. A no-wait snapshot is
 pending; only an elapsed bounded wait is a timeout.
@@ -590,12 +595,20 @@ long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`
 asks whether this session's route-chain ledger names any route for that
 folder's canonical artifact root — composed, compiled, continued or started,
 open or closed. If not, it refuses that call and prints one paste-ready
-`capability-route.py compose --shape direct …` line; once any route exists
-there, every later call of that session×folder passes. It does not check which
+`capability-route.py compose --shape direct …` line for one atomic, reversible
+inline change; other new work omits `--shape` so the frame decides. Once any
+route exists there, every later call of that session×folder passes. It does not check which
 route, its freshness, lineage, stage or proof. Registered owners and workers,
 artifact roots, the temp directory, runtime homes, CI and dev activation pass;
 any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
 `capability-route.py verify`/`status` still only inspect a route that exists.
+
+Compute-host storage access follows the `execution_needs` declaration on the
+registered part catalog row in `capabilities/topologies.json`. Native and
+borrowed route nodes resolve the same row from their sealed stage identity;
+the need is not copied into sealed nodes or inferred from the outer
+capability, node name, or task text. Routes without a declared compute stage
+retain their ordinary execution access.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
@@ -647,8 +660,9 @@ itself, in this order, and never leaves it to a helper:
 1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
-3. Ask each interview question through the native question tool (Claude
-   `AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), one topic
+3. Ask the understanding sentence first, then the registered interview
+   questions in the same native question batch. Use Claude `AskUserQuestion`,
+   Codex `request_user_input`, or OpenCode `question`, one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not
@@ -778,6 +792,13 @@ Supply a readable, nonempty artifact from the route's exact open cycle and the
 final summary; the command records terminal proof, closes the route, finalizes
 that cycle and returns a receipt only after rechecking all three. A partial
 transaction remains `finish-pending` and is resumed with the same intent.
+The synthetic `source-scoped` authority does not make unrelated tracked edits
+a finish veto; concrete declared files, directories and path patterns remain
+guarded, with tracked status read again under the finish lock. The returned
+result may report unscoped tracked dirt as an observation, without attributing
+authorship or changing the stored receipt. Finish preserves the worktree and
+index, while its evidence, route/session identity, commit lineage and replay
+checks remain in force.
 
 ```text
 python3 utilities/capability-route.py finish [--route <route.json|rt-id>] --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
@@ -982,9 +1003,10 @@ be replaced by another run.
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
 keeps the exact question and gate available for a later real answer; independent
-authorized work can continue. Managed question surfaces disable automatic empty
-answers where the runtime supports this. Otherwise the owner leaves a plain-text
-question for a later reply instead of repeatedly opening expiring prompts.
+authorized work can continue. A question surface that submits an empty answer
+after a timeout does not answer the gate; the question stays for a later real
+answer. Otherwise the owner leaves a plain-text question for a later reply
+instead of repeatedly opening expiring prompts.
 An owner that raises a gate calls the bounded `await-release` once; when the gate
 is still blocked it ends its turn with `verdict: BLOCKED`, naming the gate as its
 blocker. That parked stop is a pause, not a failure, and no model turn runs while
@@ -1000,6 +1022,7 @@ An owner that needs a person's answer at a node no declared gate covers ends
 `owner-blocked` with that report. The answer sent with `correct` starts one
 replacement owner that receives it and continues the route. No gate, close, or
 recompose is needed.
+An owner whose turn ended normally but whose final result does not follow the three-line handoff format waits for an answer the same way: `correct` continues the route, the format failure stays recorded, and nothing retries automatically.
 
 A continuation route projects this contract onto its suffix. It drops a gate
 whose gated entry node was cut, never rebinds a retained raising continuation to
@@ -1174,8 +1197,10 @@ references a unit in `roles/units/`, and routing happens at entry only — a
 dispatch-depth-2 worker never routes and never selects another worker. Enumerated
 recipes are curated fast paths, not the default. For a request no recipe fits, the
 entry composes its own route from the same catalog (**compose-on-demand**, §0.2.1):
-`capability-route.py compose` seals a `direct`, `solo`, or `staged` shape. Staged
-uses the capability recipe unless `--graph` selects a subgraph. Both use the same
+`capability-route.py compose` defaults to `framed`; `--shape direct` selects
+inline work. Explicit `solo` and `staged` shapes remain available for decisions
+already made by a frame or the person; `--shape staged --graph <stage,…>`
+selects that decided subgraph. Both use the same
 validator and seal; a subgraph embeds its recipe as `composed: true`. Confirmation
 follows §0.4 (`[경로]` for small work, the card or SD-123 pair otherwise).
 Composition changes route *shape only* — it never bypasses the §0.1

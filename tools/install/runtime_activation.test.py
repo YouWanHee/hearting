@@ -6,12 +6,160 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_activation as activation  # noqa: E402
 import installer  # noqa: E402
 import fixture_env  # noqa: E402
+import codex_hook_trust  # noqa: E402
+
+
+class CodexHookTrustTest(unittest.TestCase):
+    def test_activation_publishes_the_receipt_and_deactivation_restores_its_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            calls = []
+
+            def record(home, hooks_file, previous, **_kwargs):
+                calls.append((home, hooks_file, previous))
+                self.assertTrue((home / "hooks.json").is_symlink())
+                config = home / "config.toml"
+                with config.open("a", encoding="utf-8") as handle:
+                    handle.write('\n[hooks.state."fixture-key"]\ntrusted_hash = "sha256:fixture"\n')
+                return {"record": {"schema": 1, "hooks": {"fixture-key": {
+                    "source": str(hooks_file), "written_hash": "sha256:fixture",
+                    "baseline_present": False, "baseline_value": None}}},
+                    "status": "recorded", "report_lines": []}
+
+            with fixture_env.patched_environment(root / "fixture", source), \
+                    mock.patch.object(codex_hook_trust, "record_managed_trust", side_effect=record):
+                activation.activate("codex", "linked", str(source))
+                state = activation._load_json(activation._state_path("codex"))
+                self.assertEqual(state["managed_config"]["codex_hook_trust"]["hooks"]["fixture-key"][
+                    "written_hash"], "sha256:fixture")
+                self.assertEqual(len(calls), 1)
+                activation.deactivate("codex")
+                config = activation.paths.runtime_home("codex") / "config.toml"
+                self.assertFalse(config.exists())
+
+    def test_state_publication_failure_rolls_back_the_native_trust_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            original_atomic_json = activation._atomic_json
+
+            def record(home, hooks_file, previous, **_kwargs):
+                with (home / "config.toml").open("a", encoding="utf-8") as handle:
+                    handle.write('\n[hooks.state."fixture-key"]\ntrusted_hash = "sha256:fixture"\n')
+                return {"record": {"schema": 1, "hooks": {"fixture-key": {
+                    "source": str(hooks_file), "written_hash": "sha256:fixture",
+                    "baseline_present": False, "baseline_value": None}}},
+                    "status": "recorded", "report_lines": []}
+
+            def fail_state(path, payload):
+                if Path(path) == activation._state_path("codex"):
+                    raise OSError("fixture-state-publication-failed")
+                return original_atomic_json(path, payload)
+
+            with fixture_env.patched_environment(root / "fixture", source), \
+                    mock.patch.object(codex_hook_trust, "record_managed_trust", side_effect=record), \
+                    mock.patch.object(activation, "_atomic_json", side_effect=fail_state):
+                with self.assertRaisesRegex(OSError, "fixture-state-publication-failed"):
+                    activation.activate("codex", "linked", str(source))
+                home = activation.paths.runtime_home("codex")
+                self.assertFalse((home / "config.toml").exists())
+                self.assertFalse((home / "hooks.json").exists())
+                self.assertFalse(activation._state_path("codex").exists())
+
+    def test_native_hash_upsert_uses_resolved_config_and_preserves_disabled_sibling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "codex-home"
+            home.mkdir()
+            active = root / "active"
+            active.mkdir()
+            hooks = active / "hooks.json"
+            hooks.write_text('{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}')
+            (home / "hooks.json").symlink_to(hooks)
+            target = root / "external-config.toml"
+            target.write_text('[hooks.state."stable-key"]\nenabled = false\n')
+            target.chmod(0o640)
+            config = home / "config.toml"
+            config.symlink_to(os.path.relpath(target, home))
+            observed = {}
+
+            class Server:
+                def __init__(self, command, cwd, *, env=None):
+                    observed.update(command=command, cwd=cwd, env=env)
+                def request(self, method, params, *, timeout=5):
+                    observed.setdefault("calls", []).append((method, params, timeout))
+                    if method == "hooks/list":
+                        return {"data": [{"cwd": str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()),
+                                          "hooks": [{"sourcePath": str(hooks), "key": "stable-key",
+                                                     "currentHash": "sha256:new", "trustStatus": "untrusted",
+                                                     "enabled": False}]}]}
+                    if method == "config/batchWrite":
+                        self.params = params
+                        target.write_text('[hooks.state."stable-key"]\nenabled = false\ntrusted_hash = "sha256:new"\n')
+                        return {}
+                    return {}
+                def notify(self, method):
+                    observed.setdefault("notifications", []).append(method)
+                def close(self):
+                    observed["closed"] = True
+
+            fake_client = type("Client", (), {
+                "AppServer": Server,
+                "same_source": staticmethod(lambda raw, expected: Path(raw).samefile(expected)),
+            })
+            with mock.patch.object(codex_hook_trust, "_status_client", return_value=fake_client):
+                result = codex_hook_trust.record_managed_trust(home, hooks, None, command=["fixture"])
+            self.assertEqual(result["status"], "recorded")
+            self.assertEqual(result["record"]["hooks"]["stable-key"]["written_hash"], "sha256:new")
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            self.assertIn("enabled = false", target.read_text())
+            write = next(params for method, params, _ in observed["calls"] if method == "config/batchWrite")
+            self.assertEqual(write["filePath"], str(target))
+            self.assertTrue(write["reloadUserConfig"])
+            self.assertNotIn("enabled", json.dumps(write))
+            self.assertEqual(write["edits"][0]["keyPath"], "hooks.state")
+            self.assertEqual(observed["env"]["CODEX_HOME"], str(home))
+
+    def test_restorer_only_changes_its_owned_trusted_hash_leaf(self):
+        original = ('[hooks.state."key"]\nenabled = false\ntrusted_hash = "sha256:owned"\n'
+                    '\n[other]\nvalue = 1\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertIn("enabled = false", restored)
+        self.assertNotIn("trusted_hash", restored)
+        self.assertIn("[other]", restored)
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["hooks"]["state"]["key"]["enabled"], False)
+
+    def test_restorer_removes_an_empty_owned_table_before_an_unrelated_table(self):
+        original = ('[hooks.state."key"]\ntrusted_hash = "sha256:owned"\n'
+                    '\n[projects."/mine"]\ntrust_level = "trusted"\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertNotIn("[hooks.state.", restored)
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["projects"]["/mine"]["trust_level"], "trusted")
+
+    def test_restorer_removes_one_separator_with_an_empty_owned_table(self):
+        original = ('[hooks.state."key"]\ntrusted_hash = "sha256:owned"\n'
+                    '\n[projects."/mine"]\ntrust_level = "trusted"\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertEqual(restored, '[projects."/mine"]\ntrust_level = "trusted"\n')
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["projects"]["/mine"]["trust_level"], "trusted")
 
 
 class RuntimeSnapshotTest(unittest.TestCase):
@@ -520,6 +668,154 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                 self.assertNotIn(sibling, destinations)
                 self.assertIn(state_dir / "transactions", destinations)
 
+    def test_codex_projection_failure_before_state_commit_restores_native_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                            'status_line_use_colors = false\n').encode()
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
+                original_prepare = activation._prepare_runtime_config
+
+                def project_then_fail(*args, **kwargs):
+                    original_prepare(*args, **kwargs)
+                    self.assertTrue(config.is_symlink())
+                    self.assertEqual(os.readlink(config), link_target)
+                    projected = target.read_text(encoding="utf-8")
+                    self.assertIn('status_line = ["project-name", "custom", "thread-id"]', projected)
+                    self.assertIn(activation.CODEX_IDENTITY_BEGIN, projected)
+                    self.assertIn('status_line_use_colors = false', projected)
+                    self.assertEqual(backup.read_bytes(), original)
+                    raise activation.ActivationError("injected after native projection")
+
+                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
+                activation._prepare_runtime_config = project_then_fail
+                try:
+                    with self.assertRaisesRegex(activation.ActivationError, "injected"):
+                        activation.activate("codex", "linked", str(source))
+                finally:
+                    activation._prepare_runtime_config = original_prepare
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
+                self.assertFalse(backup.exists())
+                self.assertFalse(activation._state_path("codex").exists())
+
+    def test_runtime_snapshot_restores_codex_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = b'[tui]\nstatus_line = ["custom"]\n'
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
+
+                snapshot = activation.capture_runtime_state("codex", str(source))
+                self.addCleanup(activation.discard_runtime_state, snapshot)
+                destinations = {Path(record["dest"]) for record in snapshot["records"]}
+                self.assertIn(target.resolve(), destinations)
+                target.write_bytes(b'[tui]\nstatus_line = ["activation-postimage"]\n')
+                activation.seal_runtime_state(snapshot)
+
+                activation.restore_runtime_state(snapshot)
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
+
+
+class NativeContextLifecycleTest(unittest.TestCase):
+    """Activate, refresh, then deactivate: what activation added leaves, what the user had stays."""
+
+    def _lifecycle(self, runtime, seed=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                home = activation.paths.runtime_home(runtime)
+                name = "settings.json" if runtime == "claude" else "config.toml"
+                config = home / name
+                if seed is not None:
+                    config.parent.mkdir(parents=True, exist_ok=True)
+                    config.write_bytes(seed)
+                activation.activate(runtime, "linked", str(source))
+                activation.activate(runtime, "linked", str(source))
+                activation.deactivate(runtime)
+                backup = home / activation.CODEX_IDENTITY_BACKUP
+                return (config.read_bytes() if config.exists() else None,
+                        backup.read_bytes() if backup.exists() else None)
+
+    def test_codex_clean_home_leaves_no_config_or_backup(self):
+        config, backup = self._lifecycle("codex")
+        self.assertIsNone(config)
+        self.assertIsNone(backup)
+
+    def test_codex_manual_window_survives_with_its_bytes(self):
+        seed = b"# mine\nmodel_context_window = 800000\nmodel = \"x\"\n"
+        config, backup = self._lifecycle("codex", seed)
+        self.assertEqual(config, seed)
+        self.assertEqual(backup, seed)
+
+    def test_claude_clean_home_drops_the_added_window(self):
+        config, _ = self._lifecycle("claude")
+        env = json.loads(config).get("env", {})
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+
+    def test_codex_refresh_and_uninstall_keep_user_edits_and_symlink(self):
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                home = activation.paths.runtime_home("codex")
+                home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared.toml"
+                target.write_text('model = "mine"\n[tui]\nstatus_line = ["custom"]\n', encoding="utf-8")
+                target.chmod(0o640)
+                config = home / "config.toml"
+                link_target = os.path.relpath(target, home)
+                config.symlink_to(link_target)
+                activation.activate("codex", "linked", str(source))
+                edited = target.read_text(encoding="utf-8").replace(
+                    '["custom", "thread-id"]', '["custom", "later", "thread-id"]')
+                edited = edited.replace('status_line_use_colors = true', 'status_line_use_colors = false')
+                target.write_text(edited + '\n[projects."/mine"]\ntrust_level = "trusted"\n', encoding="utf-8")
+                activation.activate("codex", "linked", str(source))
+                before = target.read_bytes()
+                args = installer.build_parser().parse_args(["uninstall", "codex", "--dry-run"])
+                self.assertEqual(installer.cmd_uninstall(args)["exit"], 0)
+                self.assertEqual(target.read_bytes(), before)
+                args.dry_run = False
+                self.assertEqual(installer.cmd_uninstall(args)["exit"], 0)
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(tomllib.loads(target.read_text(encoding="utf-8")), {
+                    "model": "mine", "tui": {"status_line": ["custom", "later"],
+                                               "status_line_use_colors": False},
+                    "projects": {"/mine": {"trust_level": "trusted"}},
+                })
+
+    def test_claude_manual_window_survives(self):
+        seed = json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000",
+                                   "USER_FLAG": "keep"}}).encode()
+        config, _ = self._lifecycle("claude", seed)
+        self.assertEqual(json.loads(config)["env"],
+                         {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000", "USER_FLAG": "keep"})
+
 
 class RuntimeActivationConflictPreflightTest(unittest.TestCase):
     def test_codex_conflict_refuses_before_capture(self):
@@ -752,6 +1048,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
         fragment.mkdir(parents=True)
         (fragment / "harness-identity.toml").write_bytes(
             (REPO_ROOT / "adapters/codex/config/harness-identity.toml").read_bytes())
+        (fragment / "tui-statusline.toml").write_bytes(
+            (REPO_ROOT / "adapters/codex/config/tui-statusline.toml").read_bytes())
         return release
 
     def _call(self, name, config: Path, *args):
@@ -790,6 +1088,137 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
             self._assert_clears_inherited(config)
 
+    def test_runtime_config_preparation_moves_thread_id_last_and_deactivation_restores_it(self):
+        import tomllib
+        import native_context
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "home" / "config.toml"
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n')
+            config.parent.mkdir(parents=True)
+            config.write_text(original, encoding="utf-8")
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original.encode("utf-8")}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"],
+                                        "codex_tui": changes[0]["tui_record"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = config.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
+
+    def test_runtime_config_preparation_and_deactivation_preserve_symlink(self):
+        import native_context
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            target = root / "shared" / "codex.toml"
+            target.parent.mkdir()
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n').encode()
+            target.write_bytes(original)
+            config = root / "home" / "config.toml"
+            config.parent.mkdir()
+            link_target = os.path.relpath(target, config.parent)
+            config.symlink_to(link_target)
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
+            applied = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(applied)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, applied)
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"],
+                                        "codex_tui": changes[0]["tui_record"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
+
+    def test_native_window_restores_without_identity_record_and_deletes_created_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("model_context_window = 800000\n", encoding="utf-8")
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": True, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self.assertEqual(self._unmerge(config, state), [str(config)])
+            self.assertFalse(config.exists())
+
+    def test_native_window_restores_independently_when_identity_block_was_edited(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            edited = self.BEGIN + "\n[shell_environment_policy.filters]\n# user edit\n" + self.END + "\n"
+            config.write_text("model_context_window = 800000\n\n" + edited, encoding="utf-8")
+            state = {"managed_config": {
+                "codex_identity": {"inserted": self.BEGIN + "\nold block\n" + self.END + "\n"},
+                "native_context": {"codex": {"file_created": False, "keys": {
+                    "model_context_window": {"baseline": {"present": True, "value": 640000},
+                                              "projected": 800000}}}}}}
+            self._unmerge(config, state)
+            text = config.read_text(encoding="utf-8")
+            self.assertIn("model_context_window = 640000", text)
+            self.assertIn("# user edit", text)
+
+    def test_empty_original_config_is_retained_after_window_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("model_context_window = 800000\n", encoding="utf-8")
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": False, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self._unmerge(config, state)
+            self.assertTrue(config.is_file())
+            self.assertEqual(config.read_text(encoding="utf-8"), "")
+
+    def test_legacy_record_without_identity_block_keeps_user_empty_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("", encoding="utf-8")
+            self.assertEqual(self._unmerge(config, {"managed_config": {}}), [])
+            self.assertTrue(config.is_file())
+
+    def test_dry_run_leaves_native_config_bytes_mode_and_mtime_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_bytes(b'model_context_window = 800000 # keep\r\nmodel = "x"\r\n')
+            config.chmod(0o640)
+            before = (config.read_bytes(), config.stat().st_mode, config.stat().st_mtime_ns)
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": False, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self._unmerge(config, state, dry_run=True)
+            self.assertEqual((config.read_bytes(), config.stat().st_mode,
+                              config.stat().st_mtime_ns), before)
+
     def test_the_block_is_appended_after_user_content_and_the_rest_stays_runtime_owned(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -802,6 +1231,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self._assert_clears_inherited(config)
             self.assertTrue((root / "config.toml.pre-harness-identity").is_file())
             self.assertEqual((root / "config.toml.pre-harness-identity").read_text(encoding="utf-8"), original)
+            import tomllib
+            self.assertIs(tomllib.loads(text)["features"]["default_mode_request_user_input"], True)
 
     def test_a_second_merge_is_byte_identical(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -833,7 +1264,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = root / "config.toml"
-            body = ('[shell_environment_policy]\ninherit = "core"\n'
+            body = ('[features]\ndefault_mode_request_user_input = true\n\n'
+                    '[shell_environment_policy]\ninherit = "core"\n'
                     '[shell_environment_policy.set]\nFOO = "1"\n'
                     '[shell_environment_policy.filters]\n'
                     + "".join('"%s" = "exclude"\n' % key for key in self.EXCLUDED))
@@ -925,9 +1357,15 @@ class CodexIdentityConfigTest(unittest.TestCase):
             result = self._merge(config, self._release(root))
             edited = config.read_text(encoding="utf-8").replace('"CLAUDECODE"', '"MINE"')
             config.write_text(edited, encoding="utf-8")
+            # Each insertion is unmerged on its own: the edited block stays exactly as the
+            # user left it, while the untouched question feature line still goes.
+            expected = activation._codex_feature_remove(edited, result["managed_config"]["feature"])
+            self.assertNotEqual(expected, edited)
+            self.assertIn('"MINE"', expected)
             self.assertEqual(
-                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}), [])
-            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}),
+                [str(config)])
+            self.assertEqual(config.read_text(encoding="utf-8"), expected)
 
     def test_invalid_toml_takes_the_existing_activation_error_path(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -960,6 +1398,200 @@ class CodexIdentityConfigTest(unittest.TestCase):
             config.write_text('[shell_environment_policy]\nexclude = ["A"]\n', encoding="utf-8")
             missing, conflicts = self._call("_codex_identity_health", config, release, "global")
             self.assertTrue(conflicts)
+
+    def test_explicit_feature_true_is_respected_and_false_or_non_boolean_is_preserved(self):
+        for value, expected_conflict in (("true", False), ("false", True), ('"yes"', True)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                original = f'[features]\nother = "kept"\ndefault_mode_request_user_input = {value}\n'
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertEqual(bool(result["conflicts"]), expected_conflict)
+                if expected_conflict:
+                    self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    import tomllib
+                    parsed = tomllib.loads(content.decode("utf-8"))
+                    self.assertEqual(parsed["features"]["default_mode_request_user_input"],
+                                     tomllib.loads(original)["features"]["default_mode_request_user_input"])
+                    self.assertIsNone(result["managed_config"]["feature"])
+                else:
+                    self.assertIsNone(result["managed_config"]["feature"])
+                    import tomllib
+                    self.assertIs(tomllib.loads(config.read_text(encoding="utf-8"))
+                                  ["features"]["default_mode_request_user_input"], True)
+
+    def test_deactivate_removes_only_the_inserted_feature_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = '[features]\napps = false\n\n[model]\nname = "x"\n'
+            config.write_text(original, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_inline_or_dotted_feature_forms_are_respected_when_true_and_conflicts_when_unsafe(self):
+        for original, conflict in (
+                ('features = { default_mode_request_user_input = true }\n', False),
+                ('features.default_mode_request_user_input = true\n', False),
+                ('features = { apps = false }\n', True),
+                ('features.apps = false\n', True)):
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                if conflict:
+                    self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    parsed = self._feature_parsed(config)
+                    self.assertIs(parsed["features"]["apps"], False)
+                    self.assertIsNone(result["managed_config"]["feature"])
+                else:
+                    self.assertEqual(result["conflicts"], [])
+                    self.assertTrue(config.read_text(encoding="utf-8").startswith(original))
+                    self.assertIsNone(result["managed_config"]["feature"])
+
+    def _feature_parsed(self, config):
+        import tomllib
+        return tomllib.loads(config.read_text(encoding="utf-8"))
+
+    def test_identity_satisfied_but_feature_missing_inserts_and_records_only_the_feature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            body = ('[shell_environment_policy]\ninherit = "core"\n'
+                    '[shell_environment_policy.set]\nFOO = "1"\n'
+                    '[shell_environment_policy.filters]\n'
+                    + "".join('"%s" = "exclude"\n' % key for key in self.EXCLUDED))
+            config.write_text(body, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self.assertIsNone(result["managed_config"]["inserted"])
+            self.assertTrue(result["managed_config"]["feature"])
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+            self.assertIs(self._feature_parsed(config)["features"]["default_mode_request_user_input"], True)
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), body)
+
+    def test_remerge_never_moves_or_deletes_a_user_key_added_under_the_feature_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            release = self._release(root)
+            config.write_text('model = "x"\n', encoding="utf-8")
+            first = self._merge(config, release)
+            self.assertTrue(first["managed_config"]["feature"]["header"])
+            edited = config.read_text(encoding="utf-8").replace(
+                "default_mode_request_user_input = true\n",
+                "default_mode_request_user_input = true\nmine = 1\n", 1)
+            config.write_text(edited, encoding="utf-8")
+            previous = {"managed_config": {"codex_identity": first["managed_config"]}}
+            second = self._merge(config, release, previous)
+            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+            parsed = self._feature_parsed(config)
+            self.assertEqual(parsed["features"], {"default_mode_request_user_input": True, "mine": 1})
+            self._unmerge(config, {"managed_config": {"codex_identity": second["managed_config"]}})
+            parsed = self._feature_parsed(config)
+            self.assertEqual(parsed["features"], {"mine": 1})
+            self.assertEqual(parsed["model"], "x")
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+    def test_deactivate_removes_an_activation_created_header_once_it_is_empty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = 'model = "x"'
+            config.write_text(original, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_feature_header_spellings_lookalikes_and_other_tables_stay_valid(self):
+        cases = {
+            "spaced header": '[ features ]\napps = false\n',
+            "lookalike in multiline string": 'note = """\n[features]\n"""\n',
+            "same key under another table": '[profiles.x]\ndefault_mode_request_user_input = false\n',
+            "lookalike string then real header": 'note = """\n[features]\n"""\n\n[features]\napps = false\n',
+            "quoted header": '["features"]\napps = false\n',
+            "subtable only": '[features.sub]\na = 1\n',
+        }
+        for label, original in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                import tomllib
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertEqual(result["conflicts"], [], label)
+                before = tomllib.loads(original)
+                after = self._feature_parsed(config)
+                self.assertIs(after["features"]["default_mode_request_user_input"], True)
+                for key, value in before.items():
+                    if key == "features":
+                        for sub, sub_value in value.items():
+                            self.assertEqual(after["features"][sub], sub_value)
+                    else:
+                        self.assertEqual(after[key], value, label)
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+                self.assertEqual(config.read_text(encoding="utf-8"), original, label)
+
+    def test_deactivate_leaves_a_feature_the_user_changed_to_false_or_removed(self):
+        for label, edit in (("false", lambda text: text.replace(
+                "default_mode_request_user_input = true", "default_mode_request_user_input = false")),
+                ("removed", lambda text: text.replace(
+                    "default_mode_request_user_input = true\n", ""))):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text('[features]\napps = false\n', encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                edited = edit(config.read_text(encoding="utf-8"))
+                config.write_text(edited, encoding="utf-8")
+                record = {"managed_config": {"codex_identity": {**result["managed_config"], "inserted": None}}}
+                self.assertEqual(self._unmerge(config, record), [])
+                self.assertEqual(config.read_text(encoding="utf-8"), edited)
+
+    def test_a_feature_conflict_after_activation_drops_the_feature_receipt_and_keeps_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            release = self._release(root)
+            config.write_text('[features]\napps = false\n', encoding="utf-8")
+            first = self._merge(config, release)
+            edited = config.read_text(encoding="utf-8").replace(
+                "default_mode_request_user_input = true", "default_mode_request_user_input = false")
+            config.write_text(edited, encoding="utf-8")
+            second = self._merge(config, release, {"managed_config": {"codex_identity": first["managed_config"]}})
+            self.assertEqual(second["conflicts"], ["features.default_mode_request_user_input"])
+            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+            self.assertEqual(second["managed_config"]["inserted"], first["managed_config"]["inserted"])
+            self.assertIsNone(second["managed_config"]["feature"])
+            self._unmerge(config, {"managed_config": {"codex_identity": second["managed_config"]}})
+            self.assertIn("default_mode_request_user_input = false", config.read_text(encoding="utf-8"))
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+    def test_health_names_a_feature_conflict_and_reports_a_missing_feature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "config.toml"
+            config.write_text('model = "x"\n', encoding="utf-8")
+            self._merge(config, release)
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (False, []))
+            text = config.read_text(encoding="utf-8")
+            config.write_text(text.replace("default_mode_request_user_input = true\n", ""), encoding="utf-8")
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (True, []))
+            config.write_text(text.replace("= true", "= false"), encoding="utf-8")
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"),
+                             (False, ["features.default_mode_request_user_input"]))
 
 
 class OpencodeTuiSeedTest(unittest.TestCase):
@@ -1068,6 +1700,38 @@ class OpencodeTuiSeedTest(unittest.TestCase):
             self.assertEqual(self._unseed(home, kept), [])
             self.assertEqual((home / "tui.json").read_text(encoding="utf-8"), edited)
 
+
+
+class HerdrIntegrationAdoptionTest(unittest.TestCase):
+    def _write(self, path, *lines):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_only_herdrs_own_file_for_the_same_integration_is_adopted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = self._write(root / "src/herdr-agent-state.js", "// installed by herdr",
+                                 "// HERDR_INTEGRATION_ID=opencode", "// HERDR_INTEGRATION_VERSION=13")
+            dest = self._write(root / "home/plugins/herdr-agent-state.js", "// installed by herdr",
+                               "// managed by herdr; reinstalling or updating the integration overwrites this file.",
+                               "// HERDR_INTEGRATION_ID=opencode", "// HERDR_INTEGRATION_VERSION=9")
+            activation._safe_existing_dest(dest, "copy", set(), [], source)
+            refused = {
+                "other integration": ("// installed by herdr", "// HERDR_INTEGRATION_ID=opencode-tui"),
+                "user file": ("// my own plugin", "// HERDR_INTEGRATION_ID=opencode"),
+            }
+            for name, lines in refused.items():
+                with self.subTest(name):
+                    self._write(dest, *lines)
+                    with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
+                        activation._safe_existing_dest(dest, "copy", set(), [], source)
+            self._write(dest, "// installed by herdr", "// HERDR_INTEGRATION_ID=opencode")
+            plain = self._write(root / "src/plain.js", "// HERDR_INTEGRATION_ID=opencode")
+            for name, src in (("source without herdr header", plain), ("no source", None)):
+                with self.subTest(name):
+                    with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
+                        activation._safe_existing_dest(dest, "copy", set(), [], src)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

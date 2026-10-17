@@ -31,6 +31,12 @@ describe how to reach them; judge any structure or change against these first.
    execution. There are no per-harness exception branches or duplicated
    judgments. (See §3 and §5.)
 
+For durable completion delivery, an exact recipient-side receipt remains valid
+after the transport claim expires or changes owner. The shared delivery record
+may settle only the matching delivery from that verified receipt; receiving a
+notice does not mean its work or follow-up has completed. Emission remains
+recoverable when no receipt exists.
+
 ## 1. The unit of a feature is a responsibility carried to the end
 
 `intent → execution → observation → result settlement → follow-up or recovery → closure → handoff`
@@ -107,6 +113,12 @@ into one shared judgment and transition. When a new path replaces an old one,
 also remove the duplicate implementation and the caller procedures it made
 unnecessary. Do not hide a responsibility gap by removing every guard or by only
 adding new refusal rules.
+
+Read-only work shared during one input may reuse that input's parsed snapshot.
+The snapshot is not authority for a later input or a state-changing action:
+claims, acknowledgements, and sends recheck the current row and binding under
+their existing lock. Recovery callbacks reconnect the existing owner of work;
+they do not repeat work already owned by its live runner.
 
 Documentation explains behavior and preserves the reasons for decisions. Do not
 build the product on a protocol that only ends cleanly when a model perfectly

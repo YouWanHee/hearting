@@ -16,6 +16,17 @@ import workflow_state as WS
 import worker_bootstrap as WB
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _clean_test_env():
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_",
+                                  "AGENT_ARTIFACT_", "AGENT_MODEL_GOVERNOR_"))
+           and key not in {"AGENT_HOME", "CODEX_HOME"}}
+    env["AGENT_HOME"] = str(ROOT)
+    return env
+
+
 ADAPTERS = {
     "codex": (
         ROOT / "adapters/codex/bin/dispatch-headless.py",
@@ -137,7 +148,7 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                     *model,
                 ]
                 env = {
-                    **os.environ,
+                    **_clean_test_env(),
                     "AGENT_HOME": str(ROOT),
                     "AGENT_ARTIFACT_ROOT": str(artifact_root),
                     "AGENT_ARTIFACT_CYCLE_ID": "cyc-concrete-prompt",
@@ -145,7 +156,6 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                     "AGENT_ARTIFACT_OUTPUT_DIR": "",
                     "OPENCODE_CONFIG_CONTENT": "{}",
                 }
-                env.pop("AGENT_DISPATCH_JOBS", None)
                 if harness in {"codex", "claude"}:
                     env["AGENT_DISPATCH_ATTEMPT_ID"] = "att-prompt-parent"
                 result = subprocess.run(command, text=True, capture_output=True, env=env)
@@ -383,8 +393,8 @@ class UnitBootstrapPromptTest(unittest.TestCase):
         self.exemplar.write_text("# Old report\n" + "x" * 2048, encoding="utf-8")
         store = tmp / "store"
         store.mkdir()
-        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ARTIFACT_")}
-        env.update(MEM_STORE=str(store), MEM_RECALL_EVENTS=str(tmp / "events.jsonl"),
+        env = _clean_test_env()
+        env.update(XDG_STATE_HOME=str(tmp / "state"), MEM_STORE=str(store), MEM_RECALL_EVENTS=str(tmp / "events.jsonl"),
                    MEM_RECALL_RECEIPTS=str(tmp / "receipts"))
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()

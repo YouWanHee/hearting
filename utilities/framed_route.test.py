@@ -87,7 +87,7 @@ FROZEN_GLOBAL_TABLE_DIGESTS = {
     "human_gate_positions": "fc45768a57481792e0643d4bec1faae15743411bc06096fdb1740f632f0707b0",
     "artifact_buckets": "ccbd32ef24b84897147e3d1a0862a824d9c6f893a12aed07f53c9f77724cb835",
     "producer_lifecycle": "a9f26a373d2e3af19f55be8c37b8cd0126f30165cdfa0407ef0242aa7c2f9816",
-    "part_catalog": "4a90cec3f0df00c09bb16f4c4e44f1f2f7372f88f75bde6b8c84f51cb2ba4a03",
+    "part_catalog": "1b06bb1ed2f3d4cd561dd7c67c205c4b05bc5905c2a8482b4eee3e2aab181180",
 }
 FROZEN_GATE_CONTRACT_DIGEST = "4b243bd3f897ea98d1ba93283f8297c10c88155c2c2ee80146322023902adb58"
 FROZEN_RECIPE_COUNT = 14
@@ -361,13 +361,40 @@ class FramedRouteCompileTest(FramedBase):
                                    env=env, check=False)
         self.assertEqual(explained.returncode, 0, explained.stderr)
         self.assertEqual(json.loads(explained.stdout.strip().splitlines()[-1])["shape"], "framed")
-        # the ordinary shapes keep their default capability
-        ordinary = subprocess.run(
-            [sys.executable, str(HERE / "capability-route.py"), "compose", "--cwd", str(R.ROOT),
-             "--artifact-root", str(self.root), "--spec-read", "fixture", "--slug", "plain", "--unassigned",
-             "--explain"], text=True, capture_output=True, env=env, check=False)
-        self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
-        self.assertEqual(json.loads(ordinary.stdout.strip().splitlines()[-1])["capability"], "autopilot-code")
+        # Omission seals a frame; --graph alone remains only a routing hint.
+        omitted = [sys.executable, str(HERE / "capability-route.py"), "compose", "--cwd", str(R.ROOT),
+                   "--artifact-root", str(self.root), "--spec-read", "fixture", "--prompt-file", str(task),
+                   "--dispatch-evidence", str(evidence), "--slug", "omitted-shape", "--unassigned"]
+        explained = subprocess.run(omitted + ["--explain"], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(explained.returncode, 0, explained.stderr)
+        explanation = json.loads(explained.stdout.strip().splitlines()[-1])
+        self.assertEqual((explanation["shape"], explanation["capability"]), ("framed", "route-frame"))
+        sealed = subprocess.run(omitted, text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        receipt = json.loads(sealed.stdout.strip().splitlines()[-1])
+        route = json.loads(Path(receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual((route["selection"]["shape"], route["capability"]), ("framed", "route-frame"))
+
+        direct = subprocess.run(omitted + ["--shape", "direct", "--slug", "direct-shape", "--explain"],
+                                text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        direct_result = json.loads(direct.stdout.strip().splitlines()[-1])
+        self.assertEqual((direct_result["shape"], direct_result["capability"]),
+                         ("direct", "autopilot-code"))
+        self.assertTrue(direct_result["nodes"])
+        self.assertTrue(all(node["dispatch_depth"] == 0 for node in direct_result["nodes"]))
+
+        graph_only = omitted + ["--graph", "execute,test,report", "--slug", "graph-hint"]
+        graph_explained = subprocess.run(graph_only + ["--explain"], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(graph_explained.returncode, 0, graph_explained.stderr)
+        graph_result = json.loads(graph_explained.stdout.strip().splitlines()[-1])
+        self.assertEqual((graph_result["shape"], graph_result["capability"]), ("framed", "route-frame"))
+        graph_sealed = subprocess.run(graph_only, text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(graph_sealed.returncode, 0, graph_sealed.stderr)
+        graph_receipt = json.loads(graph_sealed.stdout.strip().splitlines()[-1])
+        graph_route = json.loads(Path(graph_receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(graph_route["work_request"]["routing_hints"]["graph"], "execute,test,report")
+        self.assertEqual(graph_route["selection"]["shape"], "framed")
 
 
 class RegistryRegistrationTest(unittest.TestCase):
@@ -992,7 +1019,8 @@ class FramedStartTest(FramedBase):
                          ("needs-attention", "yaml-unavailable", "install-pyyaml"), result)
         self.assertEqual((self.calls, result["launches"]), ([], []))   # no frame leg, so nothing spent
         self.assertIn("-m pip install --user pyyaml", result["next_step"])
-        self.assertIn("non-framed shape", result["next_step"])
+        self.assertIn("atomic, reversible inline change", result["next_step"])
+        self.assertIn("--shape direct", result["next_step"])
         self.assertFalse(R.outcome_path(self.path).exists())           # open: resume_command continues it
         with mock.patch.object(RP, "yaml_available", return_value=True):
             self.assertEqual(self.start()["state"], "preparing")

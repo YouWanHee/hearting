@@ -38,9 +38,10 @@ class IsolationHelperTest(unittest.TestCase):
         self.iso = isolated_env()
         self.addCleanup(self.iso.cleanup)
 
-    def test_root_is_under_var_tmp_and_never_tmp(self):
-        self.assertTrue(str(self.iso.root).startswith("/var/tmp/"))
-        self.assertFalse(str(self.iso.root).startswith("/tmp/"))
+    def test_root_is_under_the_configured_isolation_base(self):
+        self.assertTrue(self.iso.root.is_relative_to(tidy_isolation.ISOLATION_BASE.resolve()))
+        if not tidy_isolation.RUNNER_ISOLATION_BASE:
+            self.assertFalse(self.iso.root.is_relative_to(Path("/tmp")))
 
     def test_every_state_path_points_below_the_root(self):
         env = self.iso.env()

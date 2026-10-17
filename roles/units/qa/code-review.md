@@ -51,6 +51,20 @@ this itself; it receives no caller mode signal.
 
 ## Round Protocol
 
+For implementation reviews, the runtime binds the reviewed source content at
+registration and verifies it at launch. A different content subject starts an
+ordinary independent review with its own verdict budget; read earlier findings
+for context, but do not treat the new subject as a same-source closure check.
+Returning to earlier content reuses that subject's existing budget. Reports,
+marker sequence, timestamps, staging alone, and identical-content commits do
+not create a new subject. A PASS remains attached to the content it reviewed
+and cannot be reused for changed content.
+
+If continuation reaches a legacy implementation-review PASS without a source
+binding, treat its reviewed source as unknown. The runtime resumes at that
+review for a fresh independent judgment; do not infer the old subject from
+`launch_head` or count the old PASS as current evidence.
+
 A review node may run more than once on the same route. The round number and the
 prior review path arrive in the dispatch assignment (`Round protocol` block); when
 absent, treat the pass as round 1. Every round returns one closed finding set — the

@@ -19,6 +19,7 @@ import functools
 import json
 import glob
 import hashlib
+import math
 import os
 import re
 import shlex
@@ -47,6 +48,7 @@ from dispatch_contract import (  # noqa: E402
     residue_live_pids,
     tagged_residue_receipt,
 )
+from claude_project_dir import resolve_session_transcript
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
@@ -60,7 +62,8 @@ except Exception:  # a monitor must never fail to import over a read helper
 from .. import gitinfo
 from .. import model
 from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
-from ..token_budget import parse_codex_token_count, telemetry_from_explicit
+from ..token_budget import (context_policy_snapshot, context_policy_used_pct,
+                            parse_codex_token_count, telemetry_from_explicit)
 from . import procscan
 from . import parse_cache
 
@@ -1128,6 +1131,11 @@ def _candidate_jobs_paths(override=None):
     return result
 
 
+def human_gate_registry_paths(override=None):
+    """Exact read-only registry candidates for route-bound human-gate observation."""
+    return tuple(_candidate_jobs_paths(override))
+
+
 # --- job liveness = transcript mtime (dispatch-liveness.sh reuse, PRD §7) ---
 def _proj_home():
     """Runtime telemetry home (projects/sessions/.statusline) — Claude Code config dir.
@@ -1137,9 +1145,9 @@ def _proj_home():
 
 
 _CLAUDE_STREAM_TAIL_BYTES = 512 * 1024
+_CLAUDE_STREAM_HEAD_BYTES = 64 * 1024
 _CLAUDE_SUPERVISOR_HEAD_BYTES = 64 * 1024
 _CLAUDE_SUBAGENT_SCAN_BYTES = 8 * 1024 * 1024
-_CLAUDE_DISPATCH_CONTEXT_WINDOW_DEFAULT = 1_000_000
 _CLAUDE_STREAM_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
 _CODEX_ATTEMPT_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
 _OPENCODE_ATTEMPT_CACHE = {}    # path -> ((mtime_ns, size, dev, ino), parsed)
@@ -1255,7 +1263,8 @@ def _enrich_attempt_summary(job, fast_first=False):
 
 
 def _counter(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0):
         return int(value)
     return None
 
@@ -1327,32 +1336,12 @@ def _supervised_claude_transcript(job, receipt_path):
     session_id = announcement.get("session_id")
     announced_cwd = announcement.get("cwd")
     job_cwd = getattr(job, "cwd", None)
-    if not (
-        isinstance(session_id, str)
-        and re.fullmatch(r"[A-Za-z0-9._-]+", session_id)
-        and isinstance(announced_cwd, str)
-        and os.path.isabs(announced_cwd)
-        and isinstance(job_cwd, str)
-        and os.path.isabs(job_cwd)
-    ):
-        return None, "invalid-supervisor-session-event"
-    try:
-        if os.path.realpath(announced_cwd) != os.path.realpath(job_cwd):
-            return None, "supervisor-worktree-mismatch"
-    except (OSError, TypeError, ValueError):
-        return None, "supervisor-worktree-mismatch"
-    # Claude's project encoding is deterministic (`encode_project_dir`).  Do not
-    # glob for this session id: a same-id file under another project is not evidence.
-    encoded_cwd = encode_project_dir(announced_cwd)
     runtime_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
-    project_dir = os.path.realpath(os.path.join(runtime_home or _proj_home(), "projects", encoded_cwd))
-    transcript = os.path.realpath(os.path.join(project_dir, session_id + ".jsonl"))
-    try:
-        if os.path.commonpath((project_dir, transcript)) != project_dir:
-            return None, "invalid-supervisor-session-event"
-    except (TypeError, ValueError):
-        return None, "invalid-supervisor-session-event"
-    return (transcript, None) if os.path.isfile(transcript) else (None, None)
+    transcript, reason = resolve_session_transcript(
+        session_id, announced_cwd, expected_cwd=job_cwd,
+        runtime_home=runtime_home or _proj_home(),
+    )
+    return (str(transcript), None) if transcript else (None, reason)
 
 
 def _parse_claude_stream_tail(path):
@@ -1366,28 +1355,39 @@ def _parse_claude_stream_tail(path):
     if cached and cached[0] == cache_key:
         return cached[1]
     disk_key = parse_cache.key("claude-attempt", path, cache_key,
-                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+                               (_CLAUDE_STREAM_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+                                _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-context-policy-v1"))
     parsed = parse_cache.load(disk_key)
     if isinstance(parsed, dict):
         _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
         if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
             _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
         return parsed
-    start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
+    tail_start = st.st_size
     try:
         with open(path, "rb") as stream:
-            stream.seek(start)
-            raw = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
+            head = stream.read(_CLAUDE_STREAM_HEAD_BYTES)
+            tail = b""
+            if st.st_size > len(head):
+                tail_start = max(len(head), st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
+                stream.seek(tail_start)
+                tail = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
     except OSError:
         return None
-    lines = raw.decode("utf-8", "replace").splitlines()
-    if start and lines:
-        lines = lines[1:]  # the first item is a partial JSON line
+    head_lines = head.decode("utf-8", "replace").splitlines()
+    if head and not head.endswith(b"\n") and head_lines:
+        head_lines.pop()  # the last head item may be a partial JSON line
+    tail_lines = tail.decode("utf-8", "replace").splitlines()
+    if tail_start > 0 and tail_lines:
+        tail_lines = tail_lines[1:]  # the first tail item may be a partial JSON line
+    lines = head_lines + tail_lines
     session_ids = set()
     latest_usage = None
     latest_model = None
     latest_result_usage = None
+    runtime_version = None
     model_windows = {}
+    model_max_output = {}
     open_tools = {}
     for line in lines:
         try:
@@ -1404,6 +1404,8 @@ def _parse_claude_stream_tail(path):
         if row_type == "system" and payload.get("subtype") == "init":
             if isinstance(payload.get("model"), str) and payload["model"].startswith("claude-"):
                 latest_model = payload["model"]
+            if isinstance(payload.get("claude_code_version"), str):
+                runtime_version = payload["claude_code_version"][:32]
         if row_type == "assistant" and isinstance(message, dict):
             usage = message.get("usage")
             if isinstance(usage, dict):
@@ -1437,9 +1439,15 @@ def _parse_claude_stream_tail(path):
                     window = _counter(values.get("contextWindow"))
                     if window:
                         model_windows[model_id] = window
+                    max_output = _counter(values.get("maxOutputTokens"))
+                    if max_output:
+                        model_max_output[model_id] = max_output
     window = model_windows.get(latest_model)
     if window is None and len(model_windows) == 1:
         window = next(iter(model_windows.values()))
+    max_output = model_max_output.get(latest_model)
+    if max_output is None and len(model_max_output) == 1:
+        max_output = next(iter(model_max_output.values()))
     active = None
     if latest_usage is not None:
         parts = [_counter(latest_usage.get(key)) for key in (
@@ -1452,6 +1460,8 @@ def _parse_claude_stream_tail(path):
         "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
         "ambiguity": ambiguity,
         "model": latest_model,
+        "runtime_version": runtime_version,
+        "max_output_tokens": max_output,
         "active_context_tokens": active,
         "context_window_tokens": window,
         "session_input_tokens": _counter(cumulative.get("input_tokens")),
@@ -1464,6 +1474,53 @@ def _parse_claude_stream_tail(path):
     if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
     return parsed
+
+
+def _claude_attempt_policy(metadata, *, runtime_version, model_id, raw_window, max_output,
+                           session_id, attempt_id):
+    """Applied Claude trigger for one registered attempt from its launch-recorded env inputs.
+
+    Claude assigns settings `env` over the inherited environment, so a settings value and a
+    launch env value that disagree leave the applied window unproven.
+    """
+    from ..context_policy import claude_applied_policy
+    fields = (("window", "claude_context_window_request", "claude_settings_window"),
+              ("pct_override", "claude_compaction_pct_override", "claude_settings_pct_override"),
+              ("disable_auto_compact_env", "claude_compaction_disable_auto_compact_env",
+               "claude_settings_disable_auto_compact_env"),
+              ("disable_compact_env", "claude_compaction_disable_compact_env",
+               "claude_settings_disable_compact_env"),
+              ("max_output_env", "claude_compaction_max_output_env",
+               "claude_settings_max_output_env"))
+    request = {}
+    conflict = False
+    recorded = False
+    for field, launch_key, settings_key in fields:
+        launch = metadata.get(launch_key)
+        settings = metadata.get(settings_key)
+        launch = None if launch in (None, "", "absent") else str(launch)
+        settings = None if settings in (None, "", "absent") else str(settings)
+        recorded = recorded or launch_key in metadata
+        if launch is not None and settings is not None and launch != settings:
+            conflict = True
+        request[field] = settings if settings is not None else launch
+    if not recorded:
+        return context_policy_snapshot(
+            source="claude-attempt-launch", runtime_version=runtime_version,
+            session_id=session_id, attempt_id=attempt_id,
+            reason="launch-compaction-inputs-not-recorded")
+    if conflict:
+        return context_policy_snapshot(
+            source="claude-attempt-launch", runtime_version=runtime_version,
+            session_id=session_id, attempt_id=attempt_id,
+            configured_request=request.get("window"),
+            configured_request_tokens=int(request["window"])
+            if str(request.get("window") or "").isdigit() else None,
+            reason="launch-env-and-settings-env-disagree")
+    return claude_applied_policy(
+        runtime_version=runtime_version, model_id=model_id, raw_window_tokens=raw_window,
+        request=request, session_id=session_id, attempt_id=attempt_id,
+        max_output_tokens=max_output)
 
 
 def _enrich_claude_stream_session(job, fast_first=False):
@@ -1498,6 +1555,9 @@ def _enrich_claude_stream_session(job, fast_first=False):
         if resolved.get("session_id") != announced_session_id:
             job.association_ambiguity = "supervisor-transcript-session-mismatch"
             return
+        for fact in ("runtime_version", "max_output_tokens", "context_window_tokens"):
+            if resolved.get(fact) is None and parsed.get(fact) is not None:
+                resolved[fact] = parsed[fact]
         parsed = resolved
         telemetry_path = transcript
     receipt_key = _CLAUDE_STREAM_CACHE.get(path)
@@ -1512,11 +1572,6 @@ def _enrich_claude_stream_session(job, fast_first=False):
     job._dispatch_context_owned = True
     active_context_tokens = parsed.get("active_context_tokens")
     context_window_tokens = parsed.get("context_window_tokens")
-    # Claude's live JSON stream commonly omits modelUsage/contextWindow until the
-    # terminal result. Fleet uses 1M as the live dispatch default; an explicit
-    # same-attempt runtime value always takes precedence.
-    if context_window_tokens is None and active_context_tokens is not None:
-        context_window_tokens = _CLAUDE_DISPATCH_CONTEXT_WINDOW_DEFAULT
     telemetry = telemetry_from_explicit(
         adapter="claude", session_id=parsed.get("session_id"),
         active_context_tokens=active_context_tokens,
@@ -1528,7 +1583,16 @@ def _enrich_claude_stream_session(job, fast_first=False):
             "active_context_tokens", "context_window_tokens", "session_input_tokens",
             "session_cached_input_tokens", "session_output_tokens", "session_total_tokens"):
         setattr(job, field_name, getattr(telemetry, field_name))
-    job.ctx_pct = telemetry.context_used_pct
+    metadata = getattr(job, "_registry_metadata", None) or {}
+    policy = _claude_attempt_policy(
+        metadata, runtime_version=parsed.get("runtime_version"), model_id=parsed.get("model"),
+        raw_window=context_window_tokens, max_output=parsed.get("max_output_tokens"),
+        session_id=parsed.get("session_id"), attempt_id=job.attempt_id)
+    job.context_policy = policy
+    job.context_display_window_tokens = (
+        policy["applied_trigger_tokens"] if policy["state"] == "applied" else None)
+    job.ctx_pct = context_policy_used_pct(job.active_context_tokens, policy)
+    job._context_evidence = None
     job.exec_tool = parsed.get("exec_tool")
     if job.ctx_pct is not None:
         try:
@@ -1757,6 +1821,8 @@ def _enrich_codex_attempt_session(job, fast_first=False):
         job._runtime_session_id = None
         job.context = None
         job.ctx_pct = None
+        job.context_display_window_tokens = None
+        job.context_policy = None
         job._context_evidence = None
     elif thread_id:
         job._runtime_session_id = thread_id
@@ -1779,8 +1845,10 @@ def _enrich_codex_attempt_session(job, fast_first=False):
         session_total_tokens=total.get("total_tokens"))
     evidence_path = path
     evidence_source = "codex-attempt-app-server"
+    attempt_rollout, rollout_resolved = None, False   # at most one lookup; none on the fast pass
     if telemetry.context_used_pct is None and thread_id and not fast_first:
-        rollout = _codex_attempt_rollout(job, thread_id)
+        rollout = attempt_rollout = _codex_attempt_rollout(job, thread_id)
+        rollout_resolved = True
         if rollout:
             try:
                 from . import codex as codex_collector
@@ -1798,8 +1866,51 @@ def _enrich_codex_attempt_session(job, fast_first=False):
             "session_cached_input_tokens", "session_output_tokens",
             "session_reasoning_output_tokens", "session_total_tokens"):
         setattr(job, field_name, getattr(telemetry, field_name))
-    job.ctx_pct = telemetry.context_used_pct
-    job.exec_tool = parsed.get("exec_tool")
+    policy_rollout = None
+    if thread_id and not fast_first:
+        if evidence_source == "codex-attempt-rollout":
+            policy_rollout = evidence_path
+        elif rollout_resolved:
+            policy_rollout = attempt_rollout
+        else:
+            policy_rollout = _codex_attempt_rollout(job, thread_id)
+    runtime_version = model = runtime_home = session_created_at = None
+    if policy_rollout:
+        try:
+            from . import codex as codex_collector
+            runtime_version = codex_collector._rollout_cli_version(policy_rollout)
+            model = codex_collector._rollout_model_effort(policy_rollout)[0]
+            runtime_home = codex_collector._rollout_home(policy_rollout)
+            session_created_at = codex_collector._session_created(
+                codex_collector._rollout_meta(policy_rollout))
+        except Exception:
+            pass
+    from ..context_policy import codex_applied_policy
+    metadata = getattr(job, "_registry_metadata", None) or {}
+    runtime_home = metadata.get("runtime_home") or runtime_home
+    execution_start = getattr(job, "_context_execution_started_at", None)
+    try:
+        from types import SimpleNamespace
+        from .codex import _process_started_at
+        execution_start = _process_started_at(SimpleNamespace(
+            proc_start=metadata.get("pid_start") or job.proc_start)) or execution_start
+    except (AttributeError, TypeError, ValueError):
+        pass
+    policy = codex_applied_policy(
+        runtime_version=runtime_version, model=model,
+        usable_window_tokens=telemetry.context_window_tokens,
+        session_id=thread_id, attempt_id=job.attempt_id, home=runtime_home,
+        execution_started_at=execution_start, execution_key=job.attempt_id,
+        session_created_at=session_created_at,
+        private_runtime_home=bool(metadata.get("runtime_home")))
+    if not policy_rollout and policy["state"] == "unknown":
+        policy["reason"] = "rollout-runtime-facts-not-resolved"
+    policy["source"] = evidence_source + ":" + policy["source"]
+    job.context_policy = policy
+    job.context_display_window_tokens = (
+        policy["applied_trigger_tokens"] if policy["state"] == "applied" else None)
+    job.ctx_pct = context_policy_used_pct(job.active_context_tokens, policy)
+    job._context_evidence = None
     if job.ctx_pct is not None:
         try:
             st = os.stat(evidence_path)
@@ -1810,16 +1921,16 @@ def _enrich_codex_attempt_session(job, fast_first=False):
                 observed_at=st.st_mtime, fresh_until=st.st_mtime + 900)
         except OSError:
             pass
+    job.exec_tool = parsed.get("exec_tool")
 
 
 def _parse_opencode_attempt_tail(path):
     """Read the last step's prompt size from an `opencode run --format json` attempt log.
 
     Every event is an envelope ``{"type":..., "sessionID":..., "part":{...}}``.  Only
-    ``step_finish`` carries ``part.tokens``; its ``input + cache.read + cache.write`` is
-    the prompt the model actually saw on that request — the same context-side definition
-    the session-level opencode collector uses.  ``output``/``reasoning`` are excluded, and
-    the per-step numbers are never summed: a bounded tail cannot prove a session total.
+    ``step_finish`` carries ``part.tokens``. OpenCode 1.19.0's overflow consumer uses
+    ``tokens.total || input + output + cache.read + cache.write``; the per-step number is
+    never summed across turns.
 
     No ``exec_tool`` is derived from the stream:
     opencode publishes a ``tool_use`` event only once the call has already finished.
@@ -1893,10 +2004,13 @@ def _parse_opencode_attempt_tail(path):
         if not isinstance(tokens, dict):
             continue
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
-        parts = [_counter(tokens.get("input")), _counter(cache.get("read")),
-                 _counter(cache.get("write"))]
-        if any(value is not None for value in parts):
-            active = sum(value or 0 for value in parts)     # last one wins = current context
+        total = _counter(tokens.get("total"))
+        parts = [_counter(tokens.get("input")), _counter(tokens.get("output")),
+                 _counter(cache.get("read")), _counter(cache.get("write"))]
+        if total:
+            active = total
+        elif any(value is not None for value in parts):
+            active = sum(value or 0 for value in parts)     # native fallback; last step wins
     parsed = {
         "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
         "ambiguity": "multiple-stream-session-ids" if len(session_ids) > 1 else None,
@@ -1912,16 +2026,14 @@ def _parse_opencode_attempt_tail(path):
 
 
 def _opencode_job_context_window(job):
-    """Registry ``model`` is ``<providerID>/<model-id>``; resolve its declared window."""
-    model = getattr(job, "model", None)
-    if not isinstance(model, str) or not model:
-        return None
-    provider, _, model_id = model.rpartition("/")
+    """Raw context capacity captured from this exact child launch, if present."""
+    metadata = getattr(job, "_registry_metadata", None) or {}
+    value = metadata.get("opencode_context_window_final_limit_context")
     try:
-        from . import opencode as opencode_collector
-        return opencode_collector._model_ctx_limit(model_id or model, provider or None)
-    except Exception:
+        parsed = int(value)
+    except (TypeError, ValueError):
         return None
+    return parsed if parsed >= 0 else None
 
 
 _OPENCODE_ACTIVITY_CACHE = {}
@@ -1996,13 +2108,62 @@ def _enrich_opencode_attempt_session(job, fast_first=False):
     if parsed.get("session_id"):
         job._runtime_session_id = parsed["session_id"]
         _enrich_opencode_native_activity(job, parsed["session_id"], fast_first=fast_first)
+    metadata = getattr(job, "_registry_metadata", None) or {}
+    raw_window = _opencode_job_context_window(job)
+    record = None
+    if parsed.get("session_id") and job.attempt_id:
+        try:
+            from ..context_policy import read_policy
+            record = read_policy(
+                harness="opencode", session_id=parsed["session_id"],
+                attempt_id=job.attempt_id)
+        except Exception:
+            record = None
+    policy_data = record.get("policy") if isinstance(record, dict) else None
+    try:
+        log_mtime = os.stat(path).st_mtime
+    except OSError:
+        log_mtime = None
+    pair_current = bool(
+        isinstance(policy_data, dict) and isinstance(log_mtime, (int, float))
+        and isinstance(record.get("observed_at"), (int, float))
+        and record["observed_at"] <= log_mtime + 1.0
+        and policy_data.get("session_id") in (None, parsed.get("session_id")))
+    if pair_current:
+        policy = context_policy_snapshot(
+            source=policy_data.get("source") or "opencode-native-chat-params",
+            runtime_version=policy_data.get("runtime_version"),
+            configured_request_tokens=policy_data.get("configured_request_tokens"),
+            configured_request=policy_data.get("configured_request"),
+            effective_window_tokens=policy_data.get("effective_window_tokens"),
+            applied_trigger_tokens=policy_data.get("applied_trigger_tokens"),
+            output_allowance_tokens=policy_data.get("output_allowance_tokens"),
+            compaction_reserve_tokens=policy_data.get("compaction_reserve_tokens"),
+            disabled=policy_data.get("disabled"), enabled=policy_data.get("enabled"),
+            enforced=policy_data.get("enforced"), session_id=parsed.get("session_id"),
+            attempt_id=job.attempt_id, raw_percentage=policy_data.get("raw_percentage"),
+            reason=policy_data.get("reason"))
+        raw_window = policy["effective_window_tokens"]
+        if isinstance(record.get("model"), str) and record["model"]:
+            job.resolved_model = record["model"]
+    else:
+        policy = context_policy_snapshot(
+            source="opencode-attempt-stream", session_id=parsed.get("session_id"),
+            attempt_id=job.attempt_id,
+            configured_request=metadata.get("opencode_context_window_request"),
+            effective_window_tokens=raw_window,
+            reason="native-chat-params-policy-not-found-or-stale")
     telemetry = telemetry_from_explicit(
         adapter="opencode", session_id=parsed.get("session_id"),
         active_context_tokens=parsed.get("active_context_tokens"),
-        context_window_tokens=_opencode_job_context_window(job))
+        context_window_tokens=raw_window)
     for field_name in ("active_context_tokens", "context_window_tokens"):
         setattr(job, field_name, getattr(telemetry, field_name))
-    job.ctx_pct = telemetry.context_used_pct
+    job.context_policy = policy
+    job.context_display_window_tokens = (
+        policy["applied_trigger_tokens"] if policy["state"] == "applied" else None)
+    job.ctx_pct = context_policy_used_pct(job.active_context_tokens, policy)
+    job._context_evidence = None
     if job.ctx_pct is None:
         return
     try:
@@ -3071,6 +3232,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         if dead_terminal_owner:
             job.note = meta.get("note") or "dead-runtime-exit"
         job._registry_metadata = dict(meta)
+        job._context_execution_started_at = _iso_to_epoch(ts)
         job.attention_reason = _attempt_attention(meta)
         job._registry_repo = repo
         job._registry_worktree = cwd

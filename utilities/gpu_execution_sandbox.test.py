@@ -205,9 +205,10 @@ class GpuSandboxTest(unittest.TestCase):
 
     def test_normal_compose_seals_the_same_gpu_choice_used_by_readiness(self):
         observed = []
-        def readiness(cwd, jobs, parent, children, *, gpu_route=None):
+        def readiness(cwd, jobs, parent, children, *, gpu_route=None, owner_harnesses=None):
             choice = G.select(gpu_route)
             observed.append(choice)
+            self.assertEqual(owner_harnesses, ("claude", "codex", "opencode"))
             return self.evidence(choice)
         with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}), \
              mock.patch.object(R, "_compose_readiness", side_effect=readiness):

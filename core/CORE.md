@@ -218,7 +218,7 @@ locator to be declared here.
 | `spec/artifact-path-contract/_internal/research/` | retained artifact-path-contract research evidence | `C-LEG(sealed-evidence)` | `campaigns/2026-09-05_2026-08-24-artifact-knowledge-index-w7/2026-08-24_artifact-path-contract/` |
 | `research/hermes-agent/.gitignore` | retained research repository-control evidence | `C-LEG(sealed-evidence)` | `campaigns/2026-09-05_2026-08-24-artifact-knowledge-index-w7/2026-06-29_hermes-agent/` |
 
-**Write cutover.** The legacy `C-DUR` buckets above (`analysis_project/`, `research/`, `spec/`, `plans/`, `documents/`, `experiments/`, `designs/`) are writable only while the producer cutover is inactive (`.runtime/artifact-producer/v1/cutover.json` absent). Once activated by the approval package, every new write must land under a cycle's `campaigns/<campaign-locator>/<cycle-locator>/artifacts/`, IDs are issued by `begin` before the first write, and `artifact_producer.py check-write` is the location judgment (legacy top level, `shared/`, campaign records, unknown cycles, containment) a writer may call; no hook calls it. Finalizing a cycle records its completion at that moment and does not lock it: a finalized cycle's files can still be written, edited, moved or deleted (artifact-path-contract §45 D-123). The approval-gated follow-ups run through `utilities/artifact_cutover.py`: `migrate-delta`/`migrate-seal` copy the census-classified legacy delta into one sealed cycle and new shared revisions (sources preserved, journaled), `compat-close` records the map set legacy readers resolve through (`resolve-legacy`; the spec gate falls back to the latest `shared/spec/` revision), and `retire` deletes only digest-verified, backed-up sources. Existing legacy content stays readable; nothing is moved or deleted by activation. Readers resolve a bucket through `utilities/artifact_reader.py` (cycle dirs → latest shared revision → the legacy bucket as a read-only fallback, missing legacy paths via `resolve-legacy`); a reader that still opens `<root>/<bucket>/` directly sees only the retirement exclusions. A gated lump cycle from an earlier migration is retro-split into D-23-bounded cycles through `artifact_resplit.py resplit-legacy-cycle` (gates `r1`/`r2`/`r3`), never by editing the lump tree in place. `fleet_cutover_gate.py complete --require-resplit` additionally blocks a root that still has an unresplit lump remaining. The historical `campaigns/<camp-id>/cycles/<cyc-id>/` layout is moved into readable `<date>_<slug>` locators by `utilities/artifact_relayout.py` (`plan` is a pure read; `apply` is a journaled same-filesystem rename with per-operation inverse rows, D-92 retroactive naming, and a D-82 compat-map append so old ID locators keep resolving; `resume`/`rollback` replay the journal; a nonterminal run is a typed `relayout-in-progress` hold that `artifact_reader.py hold` reports). Completion closes the D-91 transition window for that root, after which `begin` refuses a slugless route (`route-slug-missing`), and `fleet_cutover_gate.py complete --require-relayout` blocks a root that still has a legacy-shaped campaign or cycle directory. What W7C/W7G left at the legacy top level (stage internals, project materials, route containers, sealed W7 evidence, trash) is disposed of by `utilities/artifact_residue.py` (`plan` pure read; `apply --route-file` derives one route per residue cycle, moves files by rename into sealed residue cycles that cite their origin, into `documents` cycles, or into `.runtime/routes/legacy/`, appends compat rows and re-points a moved map file; `retire-trash --approval` is the only deletion path and backs up first; a live symlink whose siblings already migrated rejoins them by rename — link bytes preserved, a `kind: symlink` compat row with `relocated_from`, the sealed manifest untouched — while a link with no mapped ancestor, a relative link that would not resolve at its new home, and a dangling link stay typed deferrals; `spec/` stays a typed deferral while consumers still read it, and moves as root support residue only under `--include-spec-top`); `fleet_cutover_gate.py complete --require-residue` blocks a root whose top level holds anything but typed deferrals.
+**Write cutover.** The legacy `C-DUR` buckets above (`analysis_project/`, `research/`, `spec/`, `plans/`, `documents/`, `experiments/`, `designs/`) are writable only while the producer cutover is inactive (`.runtime/artifact-producer/v1/cutover.json` absent). Once activated by the approval package, normal outputs land under a cycle's `campaigns/<campaign-locator>/<cycle-locator>/artifacts/`; cycle-bound internal support may also use that exact cycle's `_internal/<non-empty-valid-relative-locator>`. These are actual cycle-relative paths, with no move or alias between them. IDs are issued by `begin` before the first write, and `artifact_producer.py check-write` is the location judgment (legacy top level, `shared/`, campaign records, unknown cycles, containment) a writer may call; no hook calls it. Finalizing a cycle records its completion at that moment and does not lock it: a finalized cycle's files can still be written, edited, moved or deleted (artifact-path-contract §45 D-123). The approval-gated follow-ups run through `utilities/artifact_cutover.py`: `migrate-delta`/`migrate-seal` copy the census-classified legacy delta into one sealed cycle and new shared revisions (sources preserved, journaled), `compat-close` records the map set legacy readers resolve through (`resolve-legacy`; the spec gate falls back to the latest `shared/spec/` revision), and `retire` deletes only digest-verified, backed-up sources. Existing legacy content stays readable; nothing is moved or deleted by activation. Readers resolve a bucket through `utilities/artifact_reader.py` (cycle dirs → latest shared revision → the legacy bucket as a read-only fallback, missing legacy paths via `resolve-legacy`); a reader that still opens `<root>/<bucket>/` directly sees only the retirement exclusions. A gated lump cycle from an earlier migration is retro-split into D-23-bounded cycles through `artifact_resplit.py resplit-legacy-cycle` (gates `r1`/`r2`/`r3`), never by editing the lump tree in place. `fleet_cutover_gate.py complete --require-resplit` additionally blocks a root that still has an unresplit lump remaining. The historical `campaigns/<camp-id>/cycles/<cyc-id>/` layout is moved into readable `<date>_<slug>` locators by `utilities/artifact_relayout.py` (`plan` is a pure read; `apply` is a journaled same-filesystem rename with per-operation inverse rows, D-92 retroactive naming, and a D-82 compat-map append so old ID locators keep resolving; `resume`/`rollback` replay the journal; a nonterminal run is a typed `relayout-in-progress` hold that `artifact_reader.py hold` reports). Completion closes the D-91 transition window for that root, after which `begin` refuses a slugless route (`route-slug-missing`), and `fleet_cutover_gate.py complete --require-relayout` blocks a root that still has a legacy-shaped campaign or cycle directory. What W7C/W7G left at the legacy top level (stage internals, project materials, route containers, sealed W7 evidence, trash) is disposed of by `utilities/artifact_residue.py` (`plan` pure read; `apply --route-file` derives one route per residue cycle, moves files by rename into sealed residue cycles that cite their origin, into `documents` cycles, or into `.runtime/routes/legacy/`, appends compat rows and re-points a moved map file; `retire-trash --approval` is the only deletion path and backs up first; a live symlink whose siblings already migrated rejoins them by rename — link bytes preserved, a `kind: symlink` compat row with `relocated_from`, the sealed manifest untouched — while a link with no mapped ancestor, a relative link that would not resolve at its new home, and a dangling link stay typed deferrals; `spec/` stays a typed deferral while consumers still read it, and moves as root support residue only under `--include-spec-top`); `fleet_cutover_gate.py complete --require-residue` blocks a root whose top level holds anything but typed deferrals.
 
 **Cutover 이전 상태.** 아직 cutover되지 않은 root는 두 상태로 갈린다. runtime-owned 이름
 (`.`-prefix, `_scratch/`) 밖에 내용이 하나도 없는 root의 첫 `begin`은 legacy로 떨어지지 않고
@@ -264,7 +264,7 @@ blueprint `spec/artifact-path-contract/prd.md` D-23; it is not restated here.
 
 **Cycle payload paths.** Producer collection and manifest validation share one
 locator check, and finalization and every later refresh share one inclusion rule
-(§45 D-123). The closed-cycle refresh pauses on one machine while `${XDG_CONFIG_HOME:-~/.config}/hearting/cycle-refresh.off` exists, so a reader that does not yet follow updated closed-cycle manifests can catch up; open-cycle checkpoints are unaffected. Inside cycle-relative `artifacts/`, hidden components
+(§45 D-123). The closed-cycle refresh pauses on one machine while `${XDG_CONFIG_HOME:-~/.config}/hearting/cycle-refresh.off` exists, so a reader that does not yet follow updated closed-cycle manifests can catch up; open-cycle checkpoints are unaffected. The two payload locations are the exact cycle-relative `artifacts/<non-empty-locator>` and `_internal/<non-empty-locator>`; `artifacts/` remains the normal output directory and bucket root, while root `_internal/` holds ordinary internal support. Inside either payload subtree, hidden components
 (dot-prefixed names such as `.git/` or `.pytest_cache/`), `__pycache__/`,
 `*.pyc`, editor temporaries (`*.swp`, `*~`, `.#*`), `*.tmp`/`*.part` and symbolic
 links are not output: a link is only `lstat`-ed and its target is not followed or read, and each
@@ -283,13 +283,30 @@ invalid. Absolute/escaping paths and out-of-payload files remain invalid. Cycle 
 Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
+A payload directory may opt itself and its descendants out of new candidate
+collection with any one of three independent markers: a regular, no-follow
+`CACHEDIR.TAG` whose first 43 bytes are exactly
+`Signature: 8a477f597d28d172789f06886806bc55`; a regular, no-follow
+`pyvenv.cfg` of any contents; or a regular, no-follow `.gitignore` whose entire
+contents are exactly `*`, `*\n`, or `*\r\n`. Marker checks apply only to the
+exact cycle payload roots `artifacts/` and `_internal/` and directories below
+them; a marker in a repository, artifact-root, or cycle-root ancestor has no
+effect. The marked directory is pruned before descending into it, reading its
+payload, or validating descendant locators. Marker symlinks and special files
+are not markers, and their targets are not followed. A marked tree changes only
+the current candidate set: existing manifest rows remain unchanged under
+§45 D-123, actual file removal continues to follow D-124, and completion proof
+continues to describe the recorded close under D-127. Candidate bundle search
+uses this rule; validation of already-published bundle descriptors retains its
+recorded coverage behavior.
+
 **Cycle payload buckets.** The top-level table above closes only the names
 directly under the artifact root. Inside a cycle, the first segment below
 `artifacts/` is the bucket, and this table closes the bucket names: it lists
 exactly the keys of `BUCKET_TYPES` in `utilities/artifact_producer.py`, and
 `artifact_producer.test.py` fails when the two differ. Another first segment (for example `shards/`) is not a
 bucket. A file outside a bucket stays where it was written and carries type
-`file`; nothing moves it. Compose shows the capability's default bucket as the
+`file`; nothing moves it. A `raw-results` directory and its ancestors also stay at their exact payload paths; first-seal finalize may register a non-empty tree with one directory-bundle descriptor, while `raw-results` is not a bucket. Compose shows the capability's default bucket as the
 output folder.
 Payload paths retain valid UTF-8 names, so report images and audio with Korean
 filenames remain in checkpoint and sealed manifests.
@@ -300,7 +317,10 @@ primary artifact itself, it skips any path through a top-level `C-INT` name
 that is not a cycle bucket (`_internal/`, `shards/`) while the cycle holds
 another file, then takes the first `PRIMARY_CANDIDATES` name (including nested
 `report.html`), then a Markdown or HTML document, then the first remaining file;
-an explicit `--primary` is kept as given.
+an explicit `--primary` is kept as given. Exact cycle-root `_internal/**`
+rows have support role and no authority as an automatic or explicit primary or
+terminal evidence. Without another primary candidate, the outcome has no required
+primary role.
 When the registered owner supplies a valid primary in its exact PASS handoff,
 terminal settlement uses that same artifact for the producer manifest and the
 sealed owner envelope. Without a valid owner primary, existing selection
@@ -534,12 +554,19 @@ under those same locks and uses ordinary atomic rename, as producer admission do
 ## 4. Workflow Invariants
 
 Transport deaths have no cumulative automatic replacement count limit. The
-existing controller may replace each settled, proven-dead attempt with one
-successor per exact predecessor. It preserves original results, completed
-stages, review ceilings, runtime pins and normal backoff. Live or unknown
-processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
-retain their existing handling. A route paused only by the old replacement
-count resumes through its ordinary `start` surface.
+existing controller may replace each settled, resultless, proven-dead attempt
+with one stable successor per exact predecessor. A join carries one bounded
+original-to-final projection while the registry retains every verified edge.
+Carriers use their verified jobs path when the sealed terminal receipt
+intentionally has an empty `job_registry`; a registered or merely claimed
+successor is not execution or consumption. Intermediate failure stays pending
+while a launched successor owns the result, and the final result or inability
+to continue follows the existing delivery path. Original rows and receipts,
+completed stages, review ceilings, runtime pins, live or unknown work,
+unsettled cleanup, semantic FAIL or BLOCKED, and human decisions retain their
+existing handling. Automatic replacement currently follows the existing
+controller timing; no per-generation delay is persisted. A route paused only
+by the old replacement count resumes through its ordinary `start` surface.
 
 Artifacts move forward in one direction:
 

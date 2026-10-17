@@ -110,5 +110,15 @@ if [ -e "$SMOKE/home/.claude/CLAUDE.md" ] || [ -L "$SMOKE/home/.claude/CLAUDE.md
   echo "post-publish smoke: uninstall left the claude bootstrap projection" >&2
   exit 1
 fi
+# The context window the install added must leave with it.
+python3 - "$SMOKE/home/.claude/settings.json" <<'PY'
+import json, os, sys
+if os.path.exists(sys.argv[1]):
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        settings = json.load(handle)
+    env = settings.get("env", {})
+    if isinstance(env, dict) and "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in env:
+        sys.exit(f"post-publish smoke: uninstall left the claude context window: {env}")
+PY
 
 echo "post-publish smoke: PASS ($VERSION)"

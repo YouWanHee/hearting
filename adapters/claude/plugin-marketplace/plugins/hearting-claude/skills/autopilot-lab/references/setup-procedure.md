@@ -10,7 +10,7 @@ The stage list lives in one place: `capabilities/topologies.json` (recipe plus `
 
 | Procedure step | Part | What the step adds to the part contract |
 |---|---|---|
-| S1 spec | owner step (the `research/plan-review` unit reviews the draft at standard+) | Writes `experiments/{date}_{slug}/experiment_spec.md` from recent `_RUNLOG.md` rows and research artifacts; it is the `setup-contract` input of `scaffold` |
+| S1 spec | owner step (the `research/plan-review` unit reviews the draft at standard+) | Writes the setup node's declared experiment-spec output from recent `_RUNLOG.md` rows and research artifacts; it is the `setup-contract` input of `scaffold` |
 | S2 scaffold | `autopilot-lab:scaffold` | `train.py`, `eval.py`, `config.yaml`, and the `metrics.jsonl` logger from `experiment_spec.md` plus the reference or parent config |
 | S3 run | `autopilot-lab:smoke` → `autopilot-lab:full-run` → `autopilot-lab:run-verify` → `autopilot-lab:handoff` | S3-3 hash-bound smoke, then the detached full run when its part is included in start approval; otherwise provide the command and compose this part later, followed by verification and handoff |
 
@@ -58,7 +58,7 @@ Proceed? (continue / revise / stop)
 
 Have it add `<!-- review: ... -->` comments to `experiment_spec.md` and return the file plus a one-line summary. Skip this review at quick and light.
 
-**S1-5. Save** `experiments/{date}_{slug}/experiment_spec.md` in 7–12 lines. Include `parent:` when applicable.
+**S1-5. Save** the experiment spec to the supplied output path in 7–12 lines. Include `parent:` when applicable.
 
 ### S2 — Scaffold with development/new-lib
 

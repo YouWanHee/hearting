@@ -22,6 +22,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tools" / "run-tests.py"
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith((
+    "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))}
+for _key in tuple(os.environ):
+    if _key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_")):
+        os.environ.pop(_key, None)
 
 
 def load_runner_module():
@@ -45,6 +50,7 @@ def run_runner(args: list[str], cwd: Path | None = None) -> subprocess.Completed
         capture_output=True,
         text=True,
         timeout=120,
+        env=CLEAN_ENV,
     )
 
 
@@ -2214,6 +2220,50 @@ class NoAmbientExecutionPathFixture(unittest.TestCase):
                 if not has_env_kw:
                     offending.append(node.lineno)
         self.assertEqual(offending, [], f"subprocess.run calls missing explicit env= at lines: {offending}")
+
+
+class RoutedTestOutputDefaults(unittest.TestCase):
+    def test_routed_cli_uses_test_node_report_and_preserves_explicit_paths(self):
+        import importlib.util
+        fixture_spec = importlib.util.spec_from_file_location(
+            "artifact_producer_fixture_for_run_tests", ROOT / "utilities" / "artifact_producer.test.py")
+        fixture_module = importlib.util.module_from_spec(fixture_spec)
+        fixture_spec.loader.exec_module(fixture_module)
+        fixture = fixture_module.ProducerTestBase("runTest")
+        fixture.setUp()
+        runtime_home = fixture._env.get("AGENT_HOME") or str(ROOT)
+        try:
+            os.environ["AGENT_HOME"] = runtime_home
+            fixture.activate()
+            route, route_file = fixture.route("standard", "autopilot-code", "dev")
+            begun = fixture_module.P.begin(fixture.root, route_file=route_file,
+                capability="autopilot-code", intensity="standard", require_cycle=True)
+            node = next(row for row in route["nodes"] if row.get("id") in {"test", "verification"})
+            env = {**CLEAN_ENV, "AGENT_HOME": runtime_home,
+                "AGENT_DISPATCH_JOBS": str(fixture.jobs),
+                "AGENT_DISPATCH_WORKTREE": str(ROOT),
+                "AGENT_ROUTE_FILE": str(route_file), "AGENT_ROUTE_ID": route["route_id"],
+                "AGENT_ROUTE_NODE": node["id"], "AGENT_ARTIFACT_ROOT": str(fixture.root),
+                **begun["env"]}
+            common = [sys.executable, str(RUNNER), "--select", "utilities/artifact_context.test.py",
+                      "--jobs", "1", "--timeout", "30"]
+            routed = subprocess.run(common, cwd=ROOT, env=env, text=True, capture_output=True, timeout=90)
+            self.assertEqual(routed.returncode, 0, routed.stdout + routed.stderr)
+            default_report = Path(begun["cycle_dir"]) / "artifacts/test_logs/run-tests-report.tsv"
+            self.assertTrue(default_report.is_file())
+
+            explicit_report = Path(begun["cycle_dir"]) / "artifacts/test_logs/explicit-report.tsv"
+            explicit_diagnostics = Path(begun["cycle_dir"]) / "artifacts/test_logs/explicit-diagnostics"
+            explicit = subprocess.run([*common, "--root", str(ROOT), "--report", str(explicit_report),
+                "--diagnostics-dir", str(explicit_diagnostics)], cwd=ROOT, env=env,
+                text=True, capture_output=True, timeout=90)
+            self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+            self.assertTrue(explicit_report.is_file())
+
+            standalone = run_runner(["--census"], cwd=ROOT)
+            self.assertEqual(standalone.returncode, 0, standalone.stdout + standalone.stderr)
+        finally:
+            fixture.doCleanups()
 
 
 if __name__ == "__main__":

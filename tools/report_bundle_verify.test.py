@@ -11,12 +11,15 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 import wave
 
 HERE = Path(__file__).resolve().parent
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith((
+    "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))}
 SPEC = importlib.util.spec_from_file_location("bundle", HERE / "report-bundle.py")
 B = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(B)
 
@@ -85,6 +88,78 @@ class BundleV2Tests(unittest.TestCase):
             browser.assert_not_called()
             with self.assertRaisesRegex(B.BundleError, "cannot be combined"):
                 B.main(["read", "--source", source, "--json", "--format", "html"])
+
+    def test_routed_status_uses_declared_report_subtree_when_source_is_omitted(self):
+        import artifact_context
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); cycle=root/"cycle"; output=cycle/"artifacts"
+            node={"id":"report","outputs":["report/REPORT.md","report/index.html",
+                "report/report_manifest.json","experiment-artifact"],
+                "write_scope":["report/REPORT.md","report/index.html","report/report_manifest.json"]}
+            context=artifact_context.ArtifactContext(root,{"route_id":"rt-report"},node,"report",
+                None,cycle,output,root,"route-lineage")
+            projected={"status":"current"}
+            with mock.patch("artifact_context.resolve_context",return_value=context), \
+                 mock.patch.object(B.REPORT_PROJECTION,"project_report",return_value=projected) as project, \
+                 mock.patch("sys.stdout",new_callable=io.StringIO) as stdout:
+                self.assertEqual(B.main(["status","--json"]),0)
+            self.assertEqual(project.call_args.args[0],str(output/"report"))
+            self.assertEqual(json.loads(stdout.getvalue()),projected)
+
+    def test_routed_bundle_and_manifest_verifier_default_to_current_report(self):
+        import importlib.util
+        fixture_spec=importlib.util.spec_from_file_location(
+            "artifact_producer_fixture_for_report_context",HERE.parent/"utilities"/"artifact_producer.test.py")
+        fixture_module=importlib.util.module_from_spec(fixture_spec); fixture_spec.loader.exec_module(fixture_module)
+        fixture=fixture_module.ProducerTestBase("runTest"); fixture.setUp()
+        runtime_home=fixture._env.get("AGENT_HOME") or str(HERE.parent)
+        inherited={key:value for key,value in os.environ.items() if key.startswith((
+            "AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_"))}
+        for key in inherited: os.environ.pop(key,None)
+        try:
+            os.environ["AGENT_HOME"]=runtime_home
+            source=Path(fixture._tmp.name)/"source"; source.mkdir()
+            subprocess.run(["git","init","-q",str(source)],check=True)
+            subprocess.run(["git","-C",str(source),"config","user.email","fixture@example.invalid"],check=True)
+            subprocess.run(["git","-C",str(source),"config","user.name","Fixture"],check=True)
+            (source/"README").write_text("source\n")
+            subprocess.run(["git","-C",str(source),"add","."],check=True)
+            subprocess.run(["git","-C",str(source),"commit","-qm","source"],check=True)
+            fixture.activate()
+            dispatch=fixture_module.dispatch_evidence()
+            for row in dispatch["tuples"]: row["checked_worktree"]=str(source)
+            route=fixture_module.R.compile_route("autopilot-lab","eval","standard",cwd=source,
+                artifact_root=fixture.root,predicates=[],transport="headless",tracking="tracked",
+                tracked_gate_evidence=fixture_module.gate_evidence(),dispatch_evidence=dispatch,slug="report-cli")
+            route_file=Path(fixture_module.L.admit_runtime_route(fixture.root,route).route_file)
+            begun=fixture_module.P.begin(fixture.root,route_file=route_file,capability="autopilot-lab",
+                intensity="standard",require_cycle=True)
+            node=next(row for row in route["nodes"] if row.get("id")=="report")
+            report=Path(begun["cycle_dir"])/"artifacts/report"; report.mkdir(parents=True)
+            manifest,_data=self.prose(report)
+            env={key:value for key,value in os.environ.items() if not key.startswith((
+                "AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_"))}
+            env={**env,"AGENT_HOME":runtime_home,"AGENT_DISPATCH_JOBS":str(fixture.jobs),
+                "AGENT_ARTIFACT_ROOT":str(fixture.root),"AGENT_ROUTE_FILE":str(route_file),
+                "AGENT_ROUTE_ID":route["route_id"],"AGENT_ROUTE_NODE":node["id"],
+                "AGENT_DISPATCH_WORKTREE":str(source),**begun["env"]}
+            status=subprocess.run([sys.executable,str(HERE/"report-bundle.py"),"status","--json"],
+                cwd=source,env=env,text=True,capture_output=True)
+            self.assertEqual(status.returncode,0,status.stdout+status.stderr)
+            self.assertTrue(json.loads(status.stdout))
+            verify=subprocess.run([sys.executable,str(HERE/"report-manifest-verify.py"),"--classification"],
+                cwd=source,env=env,text=True,capture_output=True)
+            self.assertEqual(verify.returncode,0,verify.stdout+verify.stderr)
+            self.assertEqual(verify.stdout.strip(),"bundle/v2")
+            standalone=subprocess.run([sys.executable,str(HERE/"report-bundle.py"),"status"],
+                cwd=source,env=CLEAN_ENV,text=True,capture_output=True)
+            self.assertEqual(standalone.returncode,2,standalone.stderr)
+        finally:
+            fixture.doCleanups()
+            for key in tuple(os.environ):
+                if key.startswith(("AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_")):
+                    os.environ.pop(key,None)
+            os.environ.update(inherited)
 
     def test_cross_repo_v2_golden_shapes_are_exact(self):
         link = json.loads((HERE.parent / "capabilities/report-bundle-link-existing.request.example.json").read_text())

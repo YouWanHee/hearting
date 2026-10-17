@@ -13,6 +13,7 @@ import concurrent.futures
 import unittest
 import unittest.mock
 import uuid
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -107,6 +108,7 @@ class PendingForCycleTest(unittest.TestCase):
 class PublicInlineFinishTest(unittest.TestCase):
     CAPABILITY = "autopilot-code"
     CAPABILITY_MODE = "dev"
+    CAMPAIGN_ARGUMENTS = ("--campaign-key", "inline-finish-test")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="inline-finish-test-")
@@ -163,7 +165,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.prompt = self.base / "task.md"
         self.prompt.write_text("Exercise the direct inline finish transaction.\n", encoding="utf-8")
         compose = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
-                   "--slug", "inline-finish-test", "--campaign-key", "inline-finish-test",
+                   "--slug", "inline-finish-test", *self.CAMPAIGN_ARGUMENTS,
                    "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
                    "--intensity", "direct", "--cwd", str(self.repo),
                    "--artifact-root", str(self.root), "--tracking", "tracked",
@@ -541,6 +543,62 @@ class PublicInlineFinishTest(unittest.TestCase):
                 finally:
                     fixture.tearDown()
 
+    def test_unassigned_and_parent_cycle_direct_routes_finish(self):
+        # f7 2026-10-16: a route composed with `--unassigned` or `--parent-cycle` names no
+        # campaign key of its own, and finish refused it as finish-campaign-key-mismatch.
+        for name, arguments in (("unassigned", ("--unassigned",)),
+                                ("parent-cycle", ("--parent-cycle", self.cycle["cycle_id"]))):
+            with self.subTest(selection=name):
+                fixture = type("Fixture", (PublicInlineFinishTest,), {"CAMPAIGN_ARGUMENTS": arguments})(
+                    self._testMethodName)
+                if name == "unassigned":
+                    fixture.setUp()
+                else:
+                    self._compose_child(fixture)
+                try:
+                    self.assertIsNone(fixture.route.get("campaign_key"))
+                    first = fixture.finish()
+                    self.assertEqual(first.returncode, 0, first.stderr)
+                    self.assertEqual(json.loads(first.stdout)["schema"], "finish_receipt_v1")
+                    record = artifact_producer.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])
+                    self.assertEqual(record["state"], "sealed")
+                    replay = fixture.finish()
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    self.assertTrue(json.loads(replay.stdout)["replay"])
+                finally:
+                    if name == "unassigned":
+                        fixture.tearDown()
+
+    def _compose_child(self, fixture):
+        """Compose and start `fixture`'s direct route in this repository, artifact root and registry."""
+        fixture.repo, fixture.root, fixture.env = self.repo, self.root, self.env.copy()
+        prompt = self.base / "child-task.md"
+        prompt.write_text("Finish a direct route that joins its parent cycle.\n", encoding="utf-8")
+        capability_route = [sys.executable, str(ROOT / "utilities/capability-route.py")]
+        composed = subprocess.run([
+            *capability_route, "compose", "--slug", "inline-finish-child", *fixture.CAMPAIGN_ARGUMENTS,
+            "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
+            "--intensity", "direct", "--cwd", str(self.repo), "--artifact-root", str(self.root),
+            "--tracking", "tracked", "--prompt-file", str(prompt),
+            "--spec-read", "fixture", "--drift-verdict", "within-spec", "--artifact-guard", "fixture",
+            "--owner", "codex", "--parent-harness", "codex"],
+            cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(composed.returncode, 0, composed.stderr)
+        fixture.route_file = Path(json.loads(composed.stdout)["route_file"])
+        fixture.route = json.loads(fixture.route_file.read_text(encoding="utf-8"))
+        started = subprocess.run([*capability_route, "start", "--route", str(fixture.route_file),
+                                  "--jobs", str(self.jobs)],
+                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        fixture.cycle = artifact_producer.route_cycle_for(self.root, fixture.route)
+        self.assertIsNotNone(fixture.cycle, started.stdout + started.stderr)
+        evidence = artifact_producer.cycle_dir(
+            self.root, fixture.cycle["campaign_id"], fixture.cycle["cycle_id"], fixture.cycle) / "artifacts/documents/evidence.md"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_bytes(b"child terminal evidence\n")
+        fixture.command = [*capability_route, "finish", "--route", str(fixture.route_file),
+                           "--evidence", str(evidence), "--summary-file", str(self.summary)]
+
     def test_public_finish_seals_and_exact_replay_returns_one_receipt(self):
         first = self.finish()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -749,18 +807,182 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("finish-registered-caller-ineligible", refused.stderr)
 
-    def test_closed_route_and_scoped_tracked_dirt_are_refused_before_intent(self):
+    def test_closed_route_still_refuses_before_finish_intent(self):
         outcome = self.route_file.with_name(self.route_file.stem + ".outcome.json")
         outcome.write_text("{}\n", encoding="utf-8")
         closed = self.finish()
         self.assertNotEqual(closed.returncode, 0)
         self.assertIn("finish-route-already-closed", closed.stderr)
-        outcome.unlink()
-        (self.repo / "README.md").write_text("dirty source\n", encoding="utf-8")
-        dirty = self.finish()
-        self.assertNotEqual(dirty.returncode, 0)
-        self.assertIn("finish-scoped-tracked-dirt", dirty.stderr)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
+
+    def test_synthetic_scope_finishes_with_unrelated_tracked_state_and_replays_without_git_changes(self):
+        def git(*args, check=True):
+            return subprocess.run(["git", "-C", str(self.repo), *args], check=check,
+                                  capture_output=True)
+
+        branch = git("branch", "--show-current").stdout.decode().strip()
+        for name in ("staged file.txt", "unstaged file.txt", "rename source.txt"):
+            (self.repo / name).write_bytes((name + " base\n").encode())
+        git("add", "staged file.txt", "unstaged file.txt", "rename source.txt")
+        git("commit", "-qm", "add tracked finish fixtures")
+
+        git("checkout", "-qb", "finish-side")
+        (self.repo / "side-only.txt").write_bytes(b"side\n")
+        git("add", "side-only.txt")
+        git("commit", "-qm", "side change")
+        git("checkout", "-q", branch)
+        (self.repo / "ours-only.txt").write_bytes(b"ours\n")
+        git("add", "ours-only.txt")
+        git("commit", "-qm", "ours change")
+        merged = git("merge", "--no-commit", "--no-ff", "finish-side", check=False)
+        self.assertEqual(merged.returncode, 0, merged.stderr.decode(errors="replace"))
+        self.assertTrue((self.repo / ".git/MERGE_HEAD").is_file())
+
+        (self.repo / "staged file.txt").write_bytes(b"staged edit\n")
+        git("add", "staged file.txt")
+        (self.repo / "unstaged file.txt").write_bytes(b"unstaged edit\n")
+        git("mv", "rename source.txt", "renamed target.txt")
+
+        def git_snapshot():
+            names = ("README.md", "staged file.txt", "unstaged file.txt",
+                     "renamed target.txt", "side-only.txt")
+            operation = {name: (self.repo / ".git" / name).read_bytes()
+                         for name in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE")
+                         if (self.repo / ".git" / name).is_file()}
+            return {
+                "files": {name: (self.repo / name).read_bytes() for name in names if (self.repo / name).is_file()},
+                "entries": git("ls-files", "--stage", "-z").stdout,
+                "tree": git("write-tree").stdout,
+                "status": git("status", "--porcelain=v1", "-z", "--untracked-files=no").stdout,
+                "operation": operation,
+            }
+
+        before = git_snapshot()
+        first = self.finish()
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        receipt = json.loads(first.stdout)
+        observed = set(receipt["unscoped_tracked_dirt"])
+        self.assertTrue({"staged file.txt", "unstaged file.txt",
+                         "rename source.txt", "renamed target.txt", "side-only.txt"} <= observed)
+        self.assertEqual(git_snapshot(), before)
+        stored_before = json.loads(
+            (self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").read_text())
+        replay = self.finish()
+        self.assertEqual(replay.returncode, 0, replay.stderr + replay.stdout)
+        replay_receipt = json.loads(replay.stdout)
+        self.assertTrue(replay_receipt["replay"])
+        self.assertEqual(replay_receipt["unscoped_tracked_dirt"], receipt["unscoped_tracked_dirt"])
+        self.assertEqual(git_snapshot(), before)
+        stored_after = json.loads(
+            (self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").read_text())
+        self.assertEqual(stored_after, stored_before)
+
+    def test_mixed_synthetic_and_concrete_file_directory_or_glob_scope_still_refuses(self):
+        (self.repo / "README.md").write_text("dirty source\n", encoding="utf-8")
+        nested = self.repo / "pkg" / "nested dir" / "tracked file.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("base\n", encoding="utf-8")
+        test_file = self.repo / "tests" / "unit" / "tracked file.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "pkg", "tests"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add nested scope fixtures"], check=True)
+        nested.write_text("dirty nested source\n", encoding="utf-8")
+        test_file.write_text("dirty test source\n", encoding="utf-8")
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        state_path = self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json"
+        for concrete in ("README.md", "README.md/**", "READ*", "pkg/**", "p*/**", "tests/**"):
+            with self.subTest(scope=concrete):
+                scope = ["source-scoped", concrete]
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                    inline_finish._unscoped_tracked_dirt(str(self.repo), scope)
+                self.assertFalse(state_path.exists())
+
+    def test_synthetic_scope_vocabulary_does_not_match_tracked_paths(self):
+        (self.repo / "source").mkdir()
+        (self.repo / "source/source.py").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "source/source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add source fixture"], check=True)
+        (self.repo / "source/source.py").write_text("dirty\n", encoding="utf-8")
+        for token in ("source-scoped", "source/**", "source-alternative/**", "target-artifact"):
+            with self.subTest(token=token):
+                self.assertEqual(inline_finish._unscoped_tracked_dirt(str(self.repo), [token]),
+                                 ["source/source.py"])
+
+    def test_porcelain_status_keeps_both_rename_paths_and_spaces_for_scope_checks(self):
+        def git(*args, check=True):
+            return subprocess.run(["git", "-C", str(self.repo), *args], check=check,
+                                  capture_output=True)
+
+        (self.repo / "old name.txt").write_bytes(b"rename bytes\n")
+        git("add", "old name.txt")
+        git("commit", "-qm", "add rename fixture")
+        git("mv", "old name.txt", "new name.txt")
+        observed = set(inline_finish._unscoped_tracked_dirt(str(self.repo), []))
+        self.assertEqual(observed, {"old name.txt", "new name.txt"})
+        for scope in ("old name.txt", "new name.txt"):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                    inline_finish._unscoped_tracked_dirt(str(self.repo), ["source-scoped", scope])
+
+    def test_fresh_scope_judgment_rejects_concrete_dirt_added_after_the_first_scan(self):
+        scope = ["source-scoped", "README.md"]
+        self.assertEqual(inline_finish._unscoped_tracked_dirt(str(self.repo), scope), [])
+        (self.repo / "README.md").write_text("raced scoped dirt\n", encoding="utf-8")
+        with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+            inline_finish._unscoped_tracked_dirt(str(self.repo), scope)
+        self.assertFalse((self.root / ".runtime/inline-finish/v1" /
+                          self.route["route_id"] / "finish.json").exists())
+
+    def test_locked_revalidation_rejects_recursive_glob_dirt_without_mutating_sealed_route(self):
+        nested = self.repo / "pkg" / "locked dir" / "tracked file.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "pkg"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add locked glob fixture"], check=True)
+        route_bytes = self.route_file.read_bytes()
+        original = inline_finish._unscoped_tracked_dirt
+        calls = 0
+
+        def introduce_scoped_dirt(cwd, scope):
+            nonlocal calls
+            calls += 1
+            # Exercise the same shared judgement with a concrete recursive glob
+            # while leaving the compiler-sealed route and its hash untouched.
+            concrete_scope = [*scope, "p*/**"]
+            if calls == 2:
+                nested.write_text("raced scoped dirt\n", encoding="utf-8")
+            return original(cwd, concrete_scope)
+
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        with unittest.mock.patch.object(inline_finish, "_unscoped_tracked_dirt",
+                                        side_effect=introduce_scoped_dirt):
+            with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                inline_finish.finish(args, self.route, self.route_file, CAP)
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.route_file.read_bytes(), route_bytes)
+        self.assertEqual(CAP.route_hash(json.loads(route_bytes)), self.route["route_hash"])
+        self.assertFalse((self.root / ".runtime/inline-finish/v1" /
+                          self.route["route_id"] / "finish.json").exists())
+
+    def test_locked_revalidation_reports_unrelated_dirt_that_arrives_after_first_scan(self):
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        original = inline_finish._unscoped_tracked_dirt
+        calls = 0
+
+        def introduce_unrelated_dirt(cwd, scope):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (self.repo / "README.md").write_text("raced unrelated dirt\n", encoding="utf-8")
+            return original(cwd, scope)
+
+        with unittest.mock.patch.object(inline_finish, "_unscoped_tracked_dirt",
+                                        side_effect=introduce_unrelated_dirt):
+            result = inline_finish.finish(args, self.route, self.route_file, CAP)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["unscoped_tracked_dirt"], ["README.md"])
+        self.assertTrue(result["inline_finish_id"])
 
     def test_changed_result_commit_conflicts_with_existing_claim(self):
         self.assertNotEqual(self.finish("after-claim").returncode, 0)
@@ -946,6 +1168,7 @@ class NextLegFinishTest(PublicInlineFinishTest):
     """A direct route that is leg 0 of an approved route plan reports `next_leg` on finish and replay."""
 
     PLAN_INDEX = 0
+    NEXT_LEG = {"shape": "staged", "graph": ["execute", "test"]}
 
     def extra_compose_arguments(self):
         import route_plan
@@ -953,7 +1176,7 @@ class NextLegFinishTest(PublicInlineFinishTest):
         self.task_file.write_text("the reusable work request\n", encoding="utf-8")
         leg = {"capability": "autopilot-code", "mode": "dev", "shape": "direct", "graph": None, "intensity": None,
                "why": "x"}
-        second = {**leg, "shape": "staged", "graph": ["execute", "test"]}
+        second = {**leg, **self.NEXT_LEG}
         frame = {"route_id": "rt-" + "1" * 16, "route_hash": "sha256:" + "2" * 64, "cycle_id": "cyc_" + "3" * 32}
         decision = route_plan.build_decision(
             frame_route=frame, selected="Go", reason="", briefs=[], intent={"path": "x", "sha256": "0" * 64},
@@ -966,6 +1189,37 @@ class NextLegFinishTest(PublicInlineFinishTest):
         self.record_path.parent.mkdir(parents=True)
         self.record_path.write_bytes(route_plan.render(route_plan.build_record(decision)))
         return ["--route-plan", f"{self.record_path}#{self.PLAN_INDEX}"]
+
+    def add_origin(self, *, ahead=False):
+        """The next leg changes source, so its start prepares a worktree from origin's default branch.
+        `ahead` moves that branch one commit past this checkout; returns origin's tip."""
+        origin = self.base / "origin.git"
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(origin)], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", str(origin)], check=True)
+        if ahead:
+            writer = self.base / "writer"
+            subprocess.run(["git", "clone", "-q", str(origin), str(writer)], check=True)
+            subprocess.run(["git", "-C", str(writer), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                            "commit", "--allow-empty", "-qm", "remote tip"], check=True)
+            subprocess.run(["git", "-C", str(writer), "push", "-q", "origin", "HEAD"], check=True)
+        return subprocess.run(["git", "--git-dir", str(origin), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def start_finished(self):
+        started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                                  "--route", str(self.route_file), "--jobs", str(self.jobs)],
+                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        return json.loads(started.stdout)
+
+    def checkout_state(self):
+        git = lambda *args: subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                                           capture_output=True, text=True).stdout
+        return git("rev-parse", "HEAD"), git("branch", "--show-current"), git("status", "--porcelain")
+
+    def preparations(self):
+        return [json.loads(path.read_text(encoding="utf-8"))
+                for path in (self.root / ".runtime/worktree-preparation").glob("*.json")]
 
     def test_the_first_finish_and_every_replay_carry_the_same_next_leg(self):
         first = json.loads(self.finish().stdout)
@@ -994,23 +1248,26 @@ class NextLegFinishTest(PublicInlineFinishTest):
 
     def test_the_start_receipt_of_the_finished_route_and_route_status_carry_the_same_next_leg(self):
         next_leg = json.loads(self.finish().stdout)["next_leg"]
-        started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
-                                  "--route", str(self.route_file), "--jobs", str(self.jobs)],
-                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
-        self.assertEqual(started.returncode, 0, started.stderr)
-        receipt = json.loads(started.stdout)
+        self.add_origin()
+        before = self.checkout_state()
+        receipt = self.start_finished()
         # The start of a finished leg starts the plan's next leg (plan cursor). In a HOME with no
         # supported harness the leg cannot be prepared: the finished leg's receipt then says why,
         # beside the same next_leg. Either way the plan's next leg was taken up, never dropped.
+        (prepared,) = self.preparations()
+        allocation = Path(prepared["path"]).resolve()
+        self.assertEqual((prepared["state"], allocation.parent), ("ready", (self.base / "repo-wt").resolve()))
         if "plan_advanced" in receipt:
             self.assertEqual(receipt["plan_advanced"]["leg"], next_leg["index"], receipt)
             started_leg = json.loads(Path(receipt["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
             self.assertEqual(started_leg["route_plan"]["index"], next_leg["index"])
+            self.assertEqual(started_leg["cwd"], str(allocation))
         else:
             self.assertEqual((receipt["state"], receipt["next_leg"]), ("completed", next_leg), receipt)
             self.assertEqual((receipt["plan_advance"]["state"], receipt["plan_advance"]["leg"]),
                              ("not-started", next_leg["index"]), receipt)
         self.assertNotIn("next_leg", receipt.get("required_action") or "")
+        self.assertEqual(self.checkout_state(), before)
         status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
                                  "--artifact-root", str(self.root)], cwd=self.repo, env=os.environ.copy(),
                                 capture_output=True, text=True)
@@ -1019,6 +1276,25 @@ class NextLegFinishTest(PublicInlineFinishTest):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["next_leg"], next_leg)
         self.assertTrue(rows[0]["closed"])
+
+    def test_a_next_leg_without_its_worktree_keeps_the_plan_and_the_same_start_retries(self):
+        next_leg = json.loads(self.finish().stdout)["next_leg"]
+        published = lambda: sorted(p.name for p in (self.root / ".runtime/routes").glob("rt-*.json"))
+        routes, before = published(), self.checkout_state()
+        failed = self.start_finished()           # this checkout has no origin to take the base from
+        self.assertEqual((failed["state"], failed["reason"]),
+                         ("needs-attention", "source-worktree-preparation-failed"), failed)
+        self.assertEqual((failed["plan_advance"]["state"], failed["plan_advance"]["leg"]),
+                         ("retryable", next_leg["index"]), failed)
+        self.assertIn("remote-default-fetch-failed", failed["plan_advance"]["reason"])
+        self.assertEqual(failed["next_leg"], next_leg)
+        self.assertNotIn("required_action", failed)
+        self.assertEqual((published(), self.preparations(), self.checkout_state()), (routes, [], before))
+        self.add_origin()
+        retried = self.start_finished()
+        self.assertTrue("plan_advanced" in retried or retried["plan_advance"]["state"] == "not-started", retried)
+        (prepared,) = self.preparations()
+        self.assertEqual(Path(prepared["path"]).resolve().parent, (self.base / "repo-wt").resolve())
 
     def test_a_route_that_has_not_finished_has_no_next_leg_anywhere(self):
         status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
@@ -1034,6 +1310,28 @@ class NextLegFinishTest(PublicInlineFinishTest):
         replay = json.loads(self.finish().stdout)
         self.assertNotIn("next_leg", replay)
         self.assertTrue(replay["replay"])
+
+
+class DirectNextLegFinishTest(NextLegFinishTest):
+    """A direct next leg needs no harness probe, so its start runs in any HOME."""
+
+    NEXT_LEG = {"shape": "direct", "graph": None}
+
+    def test_the_successor_of_a_leg_in_the_primary_is_sealed_in_its_own_worktree(self):
+        self.finish()
+        self.assertEqual(Path(self.route["cwd"]).resolve(), self.repo.resolve())   # this leg ran in the primary
+        tip = self.add_origin(ahead=True)
+        before = self.checkout_state()
+        receipt = self.start_finished()
+        self.assertEqual((receipt["state"], receipt["plan_advanced"]["leg"]), ("inline", 1), receipt)
+        started = json.loads(Path(receipt["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
+        (prepared,) = self.preparations()
+        self.assertEqual(started["cwd"], str(Path(prepared["path"]).resolve()))
+        self.assertEqual(Path(started["cwd"]).parent, (self.base / "repo-wt").resolve())
+        head = subprocess.run(["git", "-C", started["cwd"], "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual((head, self.checkout_state()), (tip, before))
+        self.assertNotEqual(tip, before[0].strip())                                  # origin's tip, not local HEAD
 
 
 class LastLegFinishTest(NextLegFinishTest):
@@ -1097,9 +1395,13 @@ for _klass in (NextLegFinishTest, LastLegFinishTest, LegacyInlineFinishTest):
     for _name in dir(PublicInlineFinishTest):
         if _name.startswith("test_") and _name not in _klass.__dict__:
             setattr(_klass, _name, None)
+for _name in dir(DirectNextLegFinishTest):
+    if _name.startswith("test_") and _name not in DirectNextLegFinishTest.__dict__:
+        setattr(DirectNextLegFinishTest, _name, None)
 LastLegFinishTest.test_the_stored_receipt_and_its_identity_are_untouched = None
 LastLegFinishTest.test_a_vanished_record_leaves_the_receipt_as_it_was_without_the_key = None
 LastLegFinishTest.test_the_start_receipt_of_the_finished_route_and_route_status_carry_the_same_next_leg = None
+LastLegFinishTest.test_a_next_leg_without_its_worktree_keeps_the_plan_and_the_same_start_retries = None
 LastLegFinishTest.test_a_route_that_has_not_finished_has_no_next_leg_anywhere = None
 
 

@@ -1201,7 +1201,8 @@ class OpenCodeContextTest(unittest.TestCase):
             "sid", 2, '{"role":"assistant","tokens":{"input":14,"cache":{"read":182016,"write":7},"output":703}}',
         ))
 
-        self.assertEqual(opencode._last_request_context(con, "sid"), 182037)
+        # OpenCode 1.19.0's overflow count is input + output + cache read + cache write.
+        self.assertEqual(opencode._last_request_context(con, "sid"), 182740)
         con.close()
 
     def test_opencode_enrich_uses_message_context_before_closing_db(self):
@@ -1226,12 +1227,37 @@ class OpenCodeContextTest(unittest.TestCase):
             con.commit()
             con.close()
 
-            sess = Session(harness="opencode", pid=1, cwd="/repo")
+            # Without observed native compaction policy the catalogue window proves nothing.
+            sess = Session(harness="opencode", pid=4242, cwd="/repo", proc_start="55")
             with mock.patch.dict(os.environ, {"OPENCODE_DB": db}, clear=True), \
+                 mock.patch.object(opencode, "_process_started_ms", return_value=None), \
                  mock.patch.object(opencode, "_model_ctx_limit", return_value=2_000_000):
                 opencode.enrich(sess)
+            self.assertEqual(sess.active_context_tokens, 182740)   # input+output+cache
+            self.assertIsNone(sess.ctx_pct)
+            self.assertEqual(sess.context_policy["state"], "unknown")
 
-        self.assertEqual(sess.ctx_pct, 9)
+            # The plugin's exact chat.params record for this PID/start/session/model applies.
+            from fleet.context_policy import SCHEMA, policy_path
+            state = os.path.join(tmp, "state")
+            env = {"OPENCODE_DB": db, "XDG_STATE_HOME": state}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(opencode, "_process_started_ms", return_value=None):
+                path = policy_path("opencode", pid=4242, proc_start="55")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "schema": SCHEMA, "harness": "opencode", "session_id": "sid",
+                    "pid": 4242, "proc_start": "55", "attempt_id": None,
+                    "model": "/glm-5.2", "observed_at": 1.0,
+                    "policy": {"state": "applied", "source": "opencode-native-chat-params",
+                               "runtime_version": "1.19.0", "effective_window_tokens": 2_000_000,
+                               "applied_trigger_tokens": 1_827_400, "enabled": True,
+                               "enforced": True}}), encoding="utf-8")
+                os.chmod(path, 0o600)
+                sess = Session(harness="opencode", pid=4242, cwd="/repo", proc_start="55")
+                opencode.enrich(sess)
+        self.assertEqual(sess.context_display_window_tokens, 1_827_400)
+        self.assertEqual(sess.ctx_pct, 10)
 
     def _make_db(self, tmp, with_title_col):
         db = os.path.join(tmp, "opencode.db")

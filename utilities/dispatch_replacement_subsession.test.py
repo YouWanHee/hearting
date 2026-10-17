@@ -42,7 +42,8 @@ def replace_row(jobs, route, original, *, status='done', note='completed-subsess
         if R.DC.parse_registry_metadata(line.split('\t')[-1]).get('attempt_id') == original:
             lines[i] = '\t'.join(fields)
     candidate = dict(source, attempt_id=target, replacement_original_attempt_id=original,
-                     automatic_retry_of=original, note=note, failure_class='pass', launch_claimed='1')
+                     automatic_retry_of=original, note=note, failure_class='pass',
+                     launch_claimed='1', launch_started='1')
     candidate.pop('replacement_attempt_id')
     fresh = list(fields); fresh[1] = status
     fresh[5] = ','.join(key+'='+value for key,value in candidate.items())

@@ -1209,6 +1209,8 @@ def cmd_runtime(args):
                     exit_code = EXIT_VERIFY_FAIL
                     report["next_action"] = "harness runtime refresh --runtime codex to retire the managed launcher"
             reports.append(report)
+            for message in report.get("report_lines", []):
+                lines.append(f"{runtime}: {message}")
             freshness = report.get("freshness")
             if freshness is None and isinstance(report.get("status"), dict):
                 freshness = report["status"].get("freshness")

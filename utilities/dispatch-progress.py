@@ -631,6 +631,7 @@ def watchdog(args, now):
                 worktree=fields[3],
                 artifact_root_metadata=metadata.get("artifact_root"),
                 worker_type=metadata.get("worker_type"),
+                artifact_binding=metadata,
             )
             terminal_note = terminal.get("failure_note") if terminal else ""
             if terminal_note and args.apply:

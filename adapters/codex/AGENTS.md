@@ -65,10 +65,9 @@ Interactive completion uses Codex's native queue, addressed to the caller's
 The exact-batch sidecar checks consumed and pending messages before sending;
 ambiguous sends may repeat. Only an exact Hearting item may restart an interrupted
 parent. The TUI owns questions and approvals; headless owners keep their separate
-supervisor. Default mode asks through `request_user_input_async`; its question box vanishes when the turn ends, so an open decision question is restated in the final message and the next reply is its answer (response-policy). Empty answers are not decisions.
+supervisor. Default mode asks via waiting `request_user_input` (`default_mode_request_user_input`); it submits empty at 120 s (countdown from 60 s; typing cancels). Empty is no decision: restate at turn end (Fleet keeps `answer needed`); `_async`: fallback.
 Arbitrary detached shell output still does not auto-resume. For non-dispatch
-long-running work, obey `preflight.sh
-loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
+long-running work, obey `preflight.sh loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
 instead of ending with a detached completion promise.
 
 The session uses one canonical `AGENT_DISPATCH_JOBS`.
@@ -96,21 +95,25 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1; new non-direct work defaults to `framed`):
-`direct`/`solo`/`staged`/`framed` use `hearting run capability-route compose` (defaults fill the rest;
-`--graph` = stage subgraph); `preflight.sh route --capability …` only for the
-entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: the
-§0.4 card on user-authored turns; received peer envelopes use one `[경로]`
-line unless destructive or external-facing (§0.4 SD-136); else the
-§0.4 card unless approved. Close with §0.5.
+Route by `core/WORKFLOW.md §0.2`. The main session decides only whether the work is
+direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
+otherwise omit `--shape` and let the frame decide.
+
+Use `hearting run capability-route compose`; presets: loops/promotions.
+Apply §0.3. Peer envelopes get one
+`[경로]` line unless destructive/external-facing; else the §0.4 card unless
+approved. Close with §0.5.
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Ordinary execution is one command, the same in every harness:
-
 ```
 hearting run capability-route compose --start --prompt-file <task> \
-  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+  [--shape direct] [--campaign-key <stream>]
 ```
+
+Use `--shape direct` only for one atomic, reversible inline change; otherwise
+omit it and let the frame decide. Other shape-free flags are hints. Follow
+decided routes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the
@@ -184,8 +187,8 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 terminal, and a graph that breaks this is refused at route compile and at launch.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Keep unfinished tracked work in this turn or its existing registered continuation; when automatic follow-up is unsupported, state the checked fallback. Report PID/start, exit/log and artifact evidence.
-On completion, read the exact result and perform approved parent review/follow-through now or through that continuation. Receipt/queue/ACK is not execution; report actual chronology. Reply before processing an actionable peer request; no-reply notices need no reply. After reading a handoff card/docs, accept with `utilities/session_tidy.py handoff accept <ref>`.
+Keep unfinished work here or in its registered continuation; state checked fallback if unsupported. Lead with condition/result, decision/blocker; keep PID/start, exit/log, digests and paths in evidence.
+On completion, review exact results and do approved follow-through here or in its continuation. Receipt/queue/ACK is not execution; report chronology. Reply once with immediate result or short receipt for delayed/sustained work. Informational notices need no reply. Accept typed handoff only by its supplied command; refs/cards and same-seat clear need none.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
 The native queue never substitutes for a continuation.

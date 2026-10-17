@@ -280,7 +280,7 @@ def merge(basic, detail):
                 # to an unchanged observation, but cannot erase current evidence.
                 if not isinstance(row, Session) and current.exec_tool is None:
                     current.exec_tool = getattr(previous, "exec_tool", None)
-            # Empty success is unavailable, not a request that is still running.
+            # Empty success means no summary is available yet, not detail failure.
             # Route-neighbourhood changes gate projections separately from NOW.
             current._details_pending = not same_activity
             current._details_error = same_activity and getattr(previous, "_details_error", False)

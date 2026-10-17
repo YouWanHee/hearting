@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 import ship_parent_deploy as S
+from review_round_cap import round_budget
 
 
 class ParentDeployTest(unittest.TestCase):
@@ -253,6 +254,232 @@ class ParentDeployTest(unittest.TestCase):
                 raw="2000-01-01T00:00:00Z\t")):
             with self.assertRaisesRegex(ValueError, "review-precedes-request"):
                 S.run(request)
+
+    def functional_route(self, inputs=True):
+        """A functional check a plan placed before the readiness reviews, as in [35] wK:p9."""
+        self.route["nodes"] = [
+            {"id": "release-setup", "kind": "capability-owner", "unit": "_kernel/owner", "dispatch_depth": 1,
+             "completion_gate": "ship-setup", "depends_on": [], "outputs": ["release-config/**", "ship-checklist"]},
+            {"id": "functional-check", "kind": "review-worker", "unit": "qa/test",
+             "completion_gate": "ship-post-deploy-verify", "depends_on": ["release-setup"],
+             "inputs": ["release-config/**"],
+             "outputs": ["reviews/parts/plan/functional-check/reviews/post-deploy-verdict.json"],
+             "plan_stage": {"id": "functional-check", "template": "post-deploy-verify"}},
+            {"id": "security-review", "kind": "review-worker", "unit": "qa/security-review",
+             "completion_gate": "ship-security", "depends_on": ["functional-check"],
+             "outputs": ["reviews/security-verdict.json"]},
+            {"id": "release-review", "kind": "review-worker", "unit": "qa/code-review",
+             "completion_gate": "ship-release", "depends_on": ["security-review"],
+             "outputs": ["reviews/release-verdict.json"]},
+            {"id": "deploy", "kind": "capability-owner", "completion_gate": "ship-deploy",
+             "depends_on": ["release-review"],
+             "inputs": ["reviews/security-verdict.json", "reviews/release-verdict.json", "release-config/**"]}]
+        self.proof["functional-check"] = {"passed": True, "attempt_id": "functional", "marker_digest": "f"}
+        S.write(self.markers / "functional-check.json", {"review_independence": "independent"})
+        self.product = self.root / "product/app.py"
+        self.product.parent.mkdir()
+        self.product.write_text("print('verified product')\n")
+        command = {"argv": [sys.executable, str(self.script)], "cwd": str(self.root), "timeout_seconds": 3}
+        if inputs:
+            command["inputs"] = [str(self.product)]
+        self.command.write_text(json.dumps(command))
+
+    def registered(self, *rows):
+        self.jobs.write_text(self.jobs.read_text() + "".join(self.review_row(a, n) for a, n in rows))
+
+    def renewed(self, *nodes):
+        for node in nodes:
+            self.proof[node]["attempt_id"] = "new-" + node
+            self.registered(("new-" + node, node))
+
+    def change_command_only(self):
+        self.script.write_text("from pathlib import Path\nPath('effects').write_text('race-fixed')\n")
+
+    def test_command_only_reprepare_keeps_capped_unchanged_functional_review(self):
+        # [35] wK:p9: only the deploy script changes and the functional check's ceiling is spent.
+        self.functional_route()
+        request = self.prepared()
+        first = S.read(request)
+        self.registered(("functional", "functional-check"), ("security", "security-review"),
+                        ("release", "release-review"))
+        functional = next(n for n in self.route["nodes"] if n["id"] == "functional-check")
+        spent = [("done", {"attempt_id": aid, "note": "completed-marker", "worker_type": "review",
+                           "route_node": "functional-check"}) for aid in ("functional-round-1", "functional")]
+        with patch.object(S.authority, "decide_continuation", self.real_decide):
+            self.assertEqual(round_budget({**self.route, "effective_intensity": "standard"}, functional,
+                                          spent).state, "exhausted")
+        self.change_command_only()
+        self.prepared()
+        changed = S.read(request)
+        self.assertNotEqual(changed["request_digest"], first["request_digest"])
+        self.assertIn("functional", changed["prior_review_attempts"])
+        self.renewed("security-review", "release-review")
+        checked = S.run(request, check=True)
+        self.assertEqual(changed["inputs_unchanged_since"], {
+            "prepared_at": first["prepared_at"], "prior_review_attempts": first["prior_review_attempts"]})
+        self.assertEqual(checked["reviews"]["functional-check"]["inputs_unchanged_since"], first["prepared_at"])
+        for node in ("security-review", "release-review"):
+            self.assertEqual(checked["reviews"][node], self.proof[node])
+        for harness, variable in [("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"),
+                                  ("opencode", "OPENCODE_SESSION_ID")]:
+            with self.subTest(harness=harness), patch.dict(os.environ, {variable: "parent"}, clear=True):
+                self.meta["parent_harness"] = harness
+                self.assertEqual(S.run(request, check=True)["reviews"], checked["reviews"])
+        self.meta["parent_harness"] = "codex"
+        # The carried PASS keeps every existing independence requirement.
+        S.write(self.markers / "functional-check.json", {"review_independence": "owner-overridden"})
+        with self.assertRaisesRegex(ValueError, "independent-review-required:functional-check"):
+            S.run(request, check=True)
+        S.write(self.markers / "functional-check.json", {"review_independence": "independent"})
+        self.assertEqual(S.run(request)["state"], "success")
+        self.assertEqual(self.counter.read_text(), "race-fixed")
+        S.validate_completion(self.route, self.jobs, self.record)
+
+    def test_carried_functional_review_never_approves_the_changed_command(self):
+        self.functional_route()
+        request = self.prepared()
+        self.registered(("functional", "functional-check"), ("security", "security-review"),
+                        ("release", "release-review"))
+        self.change_command_only()
+        self.prepared()
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:(security|release)-review"):
+            S.run(request, check=True)
+        self.renewed("release-review")
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:security-review"):
+            S.run(request, check=True)
+        self.assertFalse(self.counter.exists())
+
+    def test_changed_functional_input_requires_fresh_review(self):
+        for command_too in (True, False):
+            with self.subTest(command_too=command_too):
+                self.setUp()
+                self.functional_route()
+                request = self.prepared()
+                self.registered(("functional", "functional-check"), ("security", "security-review"),
+                                ("release", "release-review"))
+                self.product.write_text("print('changed product')\n")
+                if command_too:
+                    self.change_command_only()
+                self.prepared()
+                self.assertNotIn("inputs_unchanged_since", S.read(request))
+                self.renewed("security-review", "release-review")
+                with self.assertRaisesRegex(ValueError, "review-precedes-request:functional-check"):
+                    S.run(request, check=True)
+                self.renewed("functional-check")
+                self.assertEqual(S.run(request, check=True)["state"], "checked")
+
+    def test_functional_review_without_observed_inputs_is_not_carried(self):
+        cases = {"before-first-request": False, "older-registry-start": False, "no-listed-inputs": True}
+        for case, empty in cases.items():
+            with self.subTest(case=case):
+                self.setUp()
+                self.functional_route(inputs=not empty)
+                if case == "before-first-request":
+                    self.registered(("functional", "functional-check"))
+                request = self.prepared()
+                if case != "before-first-request":
+                    self.registered(("functional", "functional-check"))
+                self.change_command_only()
+                self.prepared()
+                self.assertEqual("inputs_unchanged_since" in S.read(request), not empty)
+                self.renewed("security-review", "release-review")
+                fresh = {p["attempt_id"] for p in self.proof.values()} - {"functional"}
+                started = "2000-01-01T00:00:00Z" if case == "older-registry-start" else datetime.now(timezone.utc).isoformat()
+                with patch.object(S, "exact_attempt_row", side_effect=lambda jobs, aid: SimpleNamespace(
+                        status="done", metadata={"worker_type": "review"} if aid in fresh | {"functional"} else self.meta,
+                        raw=(started if aid == "functional" else datetime.now(timezone.utc).isoformat()) + "\t")):
+                    with self.assertRaisesRegex(ValueError, "review-precedes-request:functional-check"):
+                        S.run(request, check=True)
+
+    def test_same_request_and_repeated_command_changes_keep_first_input_generation(self):
+        self.functional_route()
+        request = self.prepared()
+        first = S.read(request)
+        self.registered(("functional", "functional-check"))
+        self.change_command_only()
+        self.prepared()
+        second = S.read(request)
+        self.prepared()
+        self.assertEqual(S.read(request), second)
+        self.script.write_text("from pathlib import Path\nPath('effects').write_text('second-fix')\n")
+        self.prepared()
+        third = S.read(request)
+        self.assertNotEqual(third["request_digest"], second["request_digest"])
+        self.assertEqual(third["inputs_unchanged_since"]["prepared_at"], first["prepared_at"])
+        self.assertEqual(third["inputs_unchanged_since"], second["inputs_unchanged_since"])
+        self.renewed("security-review", "release-review")
+        self.assertEqual(S.run(request, check=True)["reviews"]["functional-check"]["inputs_unchanged_since"],
+                         first["prepared_at"])
+
+    def test_readiness_family_and_legs_judge_the_command(self):
+        cases = ["security-delta", "parallel-leg", "unclassified-route"]
+        for case in cases:
+            with self.subTest(case=case):
+                self.setUp()
+                self.functional_route()
+                nodes = {n["id"]: n for n in self.route["nodes"]}
+                if case == "security-delta":
+                    # A plan's security stage keeps the readiness gate, even with a relocated verdict.
+                    extra = {"id": "plan-security-delta", "kind": "review-worker", "unit": "qa/security-review",
+                             "completion_gate": "ship-security", "depends_on": ["functional-check"],
+                             "outputs": ["reviews/parts/plan/security-delta/reviews/security-verdict.json"],
+                             "plan_stage": {"id": "security-delta", "template": "security-review"}}
+                    nodes["security-review"]["depends_on"] = ["plan-security-delta"]
+                elif case == "parallel-leg":
+                    extra = {"id": "security-review-alternative", "kind": "review-worker",
+                             "unit": "qa/security-review", "completion_gate": "ship-security",
+                             "parallel_anchor": "security-review", "depends_on": ["functional-check"],
+                             "outputs": ["reviews-alternative/security-verdict.json"]}
+                    nodes["deploy"]["depends_on"].append(extra["id"])
+                    self.route["parallel_groups"] = [{"id": "security-review",
+                                                      "members": ["security-review", extra["id"]]}]
+                else:
+                    extra = None
+                    nodes["deploy"].pop("inputs")
+                if extra:
+                    self.route["nodes"].insert(2, extra)
+                    self.proof[extra["id"]] = {"passed": True, "attempt_id": extra["id"], "marker_digest": "x"}
+                    S.write(self.markers / (extra["id"] + ".json"), {"review_independence": "independent"})
+                request = self.prepared()
+                self.registered(*((p["attempt_id"], node) for node, p in self.proof.items()))
+                self.change_command_only()
+                self.prepared()
+                self.renewed("security-review", "release-review")
+                refused = extra["id"] if extra else "functional-check"
+                with self.assertRaisesRegex(ValueError, "review-precedes-request:" + refused + "$"):
+                    S.run(request, check=True)
+                self.renewed(refused)
+                self.assertEqual(S.run(request, check=True)["state"], "checked")
+
+    def test_legacy_changed_request_without_input_generation_stays_refused(self):
+        # A request prepared before this record (the live [35] request) never carries a PASS.
+        self.functional_route()
+        request = self.prepared()
+        self.registered(("functional", "functional-check"), ("security", "security-review"),
+                        ("release", "release-review"))
+        self.change_command_only()
+        self.prepared()
+        legacy = S.read(request)
+        legacy.pop("inputs_unchanged_since", None)
+        bound = {k: v for k, v in legacy.items() if k not in {"request_digest", "parent_availability"}}
+        legacy["request_digest"] = S.digest(bound)
+        S.write(request, legacy)
+        self.prepared()
+        self.assertEqual(S.read(request), legacy)
+        self.renewed("security-review", "release-review")
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:functional-check"):
+            S.run(request, check=True)
+        # A later command-only change observes inputs from that request onward, not before it.
+        self.script.write_text("from pathlib import Path\nPath('effects').write_text('later-fix')\n")
+        self.prepared()
+        self.assertEqual(S.read(request)["inputs_unchanged_since"]["prepared_at"], legacy["prepared_at"])
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:(security|release)-review"):
+            S.run(request, check=True)
+        for node in ("security-review", "release-review"):
+            self.proof[node]["attempt_id"] = "later-" + node
+            self.registered(("later-" + node, node))
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:functional-check"):
+            S.run(request, check=True)
 
     def test_command_source_drift_and_route_report_scope_refuse(self):
         request = self.prepared()

@@ -31,6 +31,7 @@ import artifact_identity
 import artifact_index
 import artifact_locator
 import artifact_manifest
+import artifact_directory_bundle
 
 
 PUBLICATION_RESULTS = frozenset(
@@ -390,7 +391,14 @@ def read_admitted_cycle(
 
 
 def _sha256_path(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(artifact_directory_bundle.CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return "sha256:" + hasher.hexdigest()
 
 
 def verify_artifact_revisions(
@@ -398,6 +406,9 @@ def verify_artifact_revisions(
 ) -> Tuple[str, ...]:
     failures = []
     root = Path(content_root).resolve()
+    artifacts_by_id = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                       if isinstance(row, Mapping)}
+    bundle_directories = []
     for row in document.get("artifact_revisions", []) or []:
         locator = row.get("locator") if isinstance(row, Mapping) else None
         rel = locator.get("path") if isinstance(locator, Mapping) else None
@@ -450,6 +461,24 @@ def verify_artifact_revisions(
         media_type = row.get("media_type")
         if not isinstance(media_type, str) or "/" not in media_type:
             failures.append(f"artifact-media-type-invalid:{rel}")
+        artifact = artifacts_by_id.get(row.get("artifact_id"), {})
+        is_bundle = artifact.get("type") == "directory-bundle"
+        if is_bundle or media_type == artifact_directory_bundle.MEDIA_TYPE:
+            if not is_bundle or media_type != artifact_directory_bundle.MEDIA_TYPE:
+                failures.append(f"bundle-type-media-mismatch:{rel}")
+            else:
+                try:
+                    covered = artifact_directory_bundle.verify_coverage(root, rel, row)
+                    body = artifact_directory_bundle.parse_descriptor((root / rel).read_bytes())
+                    directory_rel = body["directory"]["path"]
+                    if artifact.get("title") != directory_rel[len("artifacts/"):]:
+                        failures.append(f"bundle-title-directory-mismatch:{rel}")
+                    if any(directory_rel == prior or directory_rel.startswith(prior + "/")
+                           or prior.startswith(directory_rel + "/") for prior in bundle_directories):
+                        failures.append(f"bundle-directory-overlap:{directory_rel}")
+                    bundle_directories.append(directory_rel)
+                except artifact_directory_bundle.DirectoryBundleError as exc:
+                    failures.append(f"{exc.code}:{exc.path or rel}")
     return tuple(sorted(failures))
 
 

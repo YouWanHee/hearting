@@ -367,6 +367,39 @@ class AnswersTest(unittest.TestCase):
         self.assertIn('"understanding_confirmed"', FI.validate_answers(interview, [])[0])
 
 
+class NativeAnswerNormalizationTest(unittest.TestCase):
+    def test_repeated_recommendation_suffixes_are_removed_only_at_the_end(self):
+        self.assertEqual(FI._plain("모두 적용 (recommended) (Recommended)"), "모두 적용")
+        self.assertEqual(FI._plain("모두 적용（권장）（권장）"), "모두 적용")
+        self.assertEqual(FI._plain("모두 적용 (test only)"), "모두 적용 (test only)")
+
+    def test_normalized_option_collision_is_not_the_first_option(self):
+        interview = good_interview()
+        question = interview["questions"][0]
+        question["options"][0]["label"] = "Same (Recommended)"
+        question["options"][1]["label"] = "Same (recommended)"
+        asked = [
+            {"question": interview["understanding"], "options": ["yes", "no"], "answer": "yes"},
+            {"question": question["question"], "options": ["Same"], "answer": "Same"},
+            {"question": interview["questions"][1]["question"], "options": ["Yes", "No"], "answer": "Yes"},
+        ]
+        self.assertIsNone(FI.answers_from_native(interview, asked))
+
+    def test_exact_original_label_wins_even_when_normalized_labels_collide(self):
+        interview = good_interview()
+        question = interview["questions"][0]
+        question["options"][0]["label"] = "Same (Recommended)"
+        question["options"][1]["label"] = "Same (recommended)"
+        asked = [
+            {"question": interview["understanding"], "options": ["yes", "no"], "answer": "yes"},
+            {"question": question["question"], "options": ["Same (Recommended)"],
+             "answer": "Same (Recommended)"},
+            {"question": interview["questions"][1]["question"], "options": ["Yes", "No"], "answer": "Yes"},
+        ]
+        answers = FI.answers_from_native(interview, asked)
+        self.assertEqual(answers["answers"][question["id"]]["choice"], 0)
+
+
 class IntentTest(unittest.TestCase):
     def test_nonuser_intent_and_approvals_keep_the_declared_source(self):
         interview = good_interview()

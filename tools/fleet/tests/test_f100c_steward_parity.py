@@ -6,8 +6,8 @@ counts — `steward on` (source=explicit), a SENT `watch` (source=watch) or a `s
 that launched the target (source=start) — and a steer/handoff/gate-relay send is
 just a message. The Fleet steward collector joins markers by exact
 (harness, session_id) and asks the ledger tool which entries are evidence; the tag
-badge then wears bold pink text (`[46]`) and an untagged steward keeps its role mark,
-with a legend entry.
+badge then wears bold pink text followed by the flag (`[46] ⚑ claude`), an untagged
+steward keeps the flag in the same place, with a legend entry.
 """
 import json
 import os
@@ -41,10 +41,11 @@ class StewardChipTest(unittest.TestCase):
         return [row for row in render._build_lines([session], [], "fleet", False, 0,
                                    layout=render._layout_mode(width), term_width=width) if row]
 
-    def test_steward_tag_is_bold_pink_text_and_keeps_the_slot_width(self):
+    def test_steward_tag_is_bold_pink_text_followed_by_the_flag(self):
         segs = render._session_tag_chip(self._s(session_tag="46", steward=True))
-        self.assertEqual(segs, [("[", "dim"), ("46", "tag_steward"), ("]", "dim"), (" ", None)])
-        self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
+        self.assertEqual(segs, [("[", "dim"), ("46", "tag_steward"), ("]", "dim"), (" ", None),
+                                ("⚑", "tag_steward"), (" ", None)])
+        self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W + 2)
         self.assertEqual(render._HUE_OF["tag_steward"], ("p", render._A_BOLD))
 
     def test_steward_text_is_pink_without_background_in_curses_and_snapshots(self):
@@ -68,7 +69,7 @@ class StewardChipTest(unittest.TestCase):
         self.assertIn("\033[1;38;5;219m46\033[0m", render._snapshot_line(segs, colored=True))
         self.assertIn("\033[1;35m46\033[0m", render._snapshot_line(segs, colored=True, colors=8))
         self.assertNotIn("48;", render._snapshot_line(segs, colored=True))
-        self.assertEqual(render._snapshot_line(segs), "[46] ")
+        self.assertEqual(render._snapshot_line(segs), "[46] ⚑ ")
 
     def test_untagged_steward_wears_the_role_mark_not_a_pretend_id(self):
         """The badge column holds session numbers, so `*` there read as an id the user
@@ -77,10 +78,11 @@ class StewardChipTest(unittest.TestCase):
         for harness in ("codex", "opencode"):
             with self.subTest(harness=harness):
                 segs = render._session_tag_chip(self._s(harness=harness, steward=True))
-                self.assertEqual(segs, [(" " * render._TAG_W, None)])
+                self.assertEqual(segs, [(" " * render._TAG_W, None),
+                                        ("⚑", "tag_steward"), (" ", None)])
                 rows = self._rows(self._s(harness=harness, steward=True))
                 self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
-                self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
+                self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W + 2)
                 self.assertNotIn("*", "".join(t for t, _k in segs))
 
     def test_non_steward_rows_are_unchanged(self):
@@ -92,7 +94,7 @@ class StewardChipTest(unittest.TestCase):
                                         dim=True)
         self.assertEqual(segs[1], ("46", "tag_dim"))
 
-    def test_flag_starts_under_id_for_all_harnesses_and_layouts(self):
+    def test_flag_sits_between_id_and_harness_for_all_harnesses_and_layouts(self):
         for harness, model in (("claude", "claude-opus-5.5"),
                                ("codex", "gpt-6.1-sol"),
                                ("opencode", "openai/gpt-6.1-sol")):
@@ -102,9 +104,9 @@ class StewardChipTest(unittest.TestCase):
                 with self.subTest(harness=harness, width=width):
                     rows = self._rows(s, width)
                     identity = next(i for i, row in enumerate(rows) if "[46]" in _text(row))
-                    self.assertNotIn("⚑", _text(rows[identity]))
-                    self.assertEqual(_text(rows[identity + 1])[render._STEWARD_LINE_COL], "⚑")
-                    self.assertIn(("⚑", "tag_steward"), rows[identity + 1])
+                    self.assertIn("[46] ⚑ " + harness, _text(rows[identity]))
+                    self.assertIn(("⚑", "tag_steward"), rows[identity])
+                    self.assertNotIn("⚑", _text(rows[identity + 1]))
                     self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
                     self.assertFalse(any("┆" in _text(row) for row in rows))  # off-screen target
 
@@ -198,6 +200,86 @@ class StewardOrderTest(unittest.TestCase):
         first = next(i for i, l in enumerate(visible) if "[46]" in l)
         second = next(i for i, l in enumerate(visible) if "[0a]" in l)
         self.assertLess(first, second)
+
+
+class StewardConnectorRowsTest(unittest.TestCase):
+    """The line runs under the ID through every watched session but the last one."""
+
+    def _session(self, sid, tag, **over):
+        base = dict(harness="codex", pid=1, cwd="/tmp/steward-short-project",
+                    slug=sid, title=sid + " short", session_id=sid, session_tag=tag,
+                    model="gpt-6.1-sol", liveness="idle", elapsed_min=5, ctx_pct=25,
+                    summary=sid + " detail")
+        base.update(over)
+        return Session(**base)
+
+    def _build(self, sessions, width):
+        with mock.patch.object(render, "_PROCESS_VIEW", False):
+            return render._build_lines(sessions, [], "both", False, 0,
+                                       layout=render._layout_mode(width), term_width=width)
+
+    def _row_index(self, lines, marker):
+        return next(i for i, row in enumerate(lines) if row and marker in _text(row))
+
+    def test_line_runs_through_middle_targets_and_stops_above_the_last(self):
+        for width in (60, 100, 120, 150, 168):
+            with self.subTest(width=width):
+                parent = self._session("parent-id", "be", steward=True)
+                first = self._session("first-id", "7a")
+                last = self._session("last-id", "31")
+                targets = [
+                    {"harness": "codex", "session_id": "first-id"},
+                    {"harness": "codex", "session_id": "last-id"},
+                ]
+                parent.steward_targets = None
+                plain = self._build([parent, first, last], width)
+                parent.steward_targets = targets
+                marked = self._build([parent, first, last], width)
+
+                self.assertEqual(len(marked), len(plain))  # no synthetic connector row
+                parent_row = self._row_index(marked, "[be]")
+                first_row = self._row_index(marked, "[7a]")
+                last_row = self._row_index(marked, "[31]")
+                self.assertNotIn("┆", _text(marked[parent_row]))
+                self.assertNotIn("┆", _text(marked[first_row]))
+                self.assertNotIn("┆", _text(marked[last_row]))
+                self.assertIn(("⚑", "tag_steward"), marked[parent_row])
+                self.assertEqual(_text(marked[parent_row + 1])[render._STEWARD_LINE_COL], "┆")
+                before = _text(plain[self._row_index(plain, "[7a]") + 1])
+                after = _text(marked[first_row + 1])
+                self.assertEqual(after, before[:render._STEWARD_LINE_COL] + "┆"
+                                 + before[render._STEWARD_LINE_COL + 1:])
+                self.assertIn(("┆", "dim"), marked[first_row + 1])
+                # User 2026-10-14: the last watched session carries no line at all.
+                self.assertFalse(any("┆" in _text(row) for row in marked[last_row:] if row))
+                self.assertEqual(sum(_text(row).count("⚑") for row in marked if row), 1)
+
+    def test_hidden_cross_group_and_ambiguous_targets_do_not_draw_a_connector(self):
+        cases = []
+
+        hidden_parent = self._session("hidden-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "hidden-target"}])
+        hidden = self._session("hidden-target", "7a", liveness="stale")
+        cases.append(("hidden", [hidden_parent, hidden]))
+
+        other_group_parent = self._session("other-group-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "other-group-target"}])
+        other_group = self._session("other-group-target", "7a", cwd="/tmp/another-project")
+        cases.append(("other-group", [other_group_parent, other_group]))
+
+        ambiguous_parent = self._session("ambiguous-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "old-target"}])
+        alias_a = self._session("target-a", "7a")
+        alias_b = self._session("target-b", "31")
+        alias_a._gpu_session_aliases = ["old-target"]
+        alias_b._gpu_session_aliases = ["old-target"]
+        cases.append(("ambiguous-alias", [ambiguous_parent, alias_a, alias_b]))
+
+        for label, sessions in cases:
+            with self.subTest(case=label):
+                lines = self._build(sessions, 150)
+                self.assertFalse(any("┆" in _text(row) for row in lines if row))
+                self.assertEqual(sum(_text(row).count("⚑") for row in lines if row), 1)
 
 
 class StewardCollectorTest(unittest.TestCase):

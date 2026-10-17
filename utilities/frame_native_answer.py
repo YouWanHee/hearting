@@ -76,7 +76,7 @@ def _session_routes(harness: str, session_id: str) -> list:
         sys.path.insert(0, str(tools))
     from fleet import route_chain
     found = []
-    for line in reversed(route_chain.read_tail(harness, session_id)):
+    for line in reversed(route_chain.read_tail(harness, session_id, max_bytes=None)):
         if line["route_file"] not in found:
             found.append(line["route_file"])
     return found
@@ -89,15 +89,27 @@ def record(harness: str, payload: dict) -> Path | None:
     import work_start
     from dispatch_contract import stable_state_root
     jobs = Path(os.environ.get("AGENT_DISPATCH_JOBS") or stable_state_root(os.environ) / "jobs.log")
+    candidates = []
     for route_file in _session_routes(harness, session_id):
         try:
-            route = json.loads(Path(route_file).read_text(encoding="utf-8"))
-            kept = work_start.record_native_answer(route, jobs, asked)
+            from fleet import route as route_reader
+            route = route_reader.load(route_file)
+            if route is None:
+                continue
+            candidate = work_start.native_answer_candidate(route, jobs, asked)
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if kept is not None:
-            return kept
-    return None
+        if candidate is not None:
+            candidates.append((route, candidate))
+    if len(candidates) != 1:
+        return None
+    route, (_target, _answers) = candidates[0]
+    try:
+        # Recompute immediately before the existing write path so a changed raise,
+        # route, or sibling answer cannot inherit an earlier candidate decision.
+        return work_start.record_native_answer(route, jobs, asked)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def main(argv=None) -> int:

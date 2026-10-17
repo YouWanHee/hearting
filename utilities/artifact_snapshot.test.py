@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import json, subprocess, sys, tempfile, unittest
+import os
 from pathlib import Path
 from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[1]
 HELPER=ROOT/"utilities/artifact-snapshot.py"
+CLEAN_ENV={k:v for k,v in os.environ.items() if not k.startswith((
+ "AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_"))}
 
 
 class ArtifactSnapshotTest(unittest.TestCase):
@@ -14,7 +17,7 @@ class ArtifactSnapshotTest(unittest.TestCase):
   return path
 
  def run_helper(self, artifact: Path, target: Path, route: Path, route_id: str, node: str="transaction"):
-  return subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(artifact),"--target",str(target),"--route",str(route),"--route-id",route_id,"--node",node],text=True,capture_output=True)
+  return subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(artifact),"--target",str(target),"--route",str(route),"--route-id",route_id,"--node",node],text=True,capture_output=True,env=CLEAN_ENV)
 
  def draft_route(self, root: Path, *, route_id="rt-draft", intensity="standard") -> Path:
   path=root/f"{route_id}.json"
@@ -314,10 +317,10 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
         other.write_text(json.dumps(route))
         for node in ("transaction",""):
             with self.subTest(node=node):
-                env={**os.environ,"AGENT_ARTIFACT_ROOT":str(self.root),"AGENT_DISPATCH_JOBS":str(self.jobs)}
+                env={**CLEAN_ENV,"AGENT_ARTIFACT_ROOT":str(self.root),"AGENT_DISPATCH_JOBS":str(self.jobs)}
                 done=subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(self.root),"--target",str(doc),
                                      "--route",str(other),"--route-id",route["route_id"],"--node",node],
-                                    text=True,capture_output=True,env=env)
+                                    text=True,capture_output=True,env={**CLEAN_ENV,**env})
                 self.assertEqual(done.returncode,0,done.stderr)
                 self.assertIn("node-does-not-mutate-target",done.stdout)
         self.assertFalse((doc.parent/"_internal").exists())
@@ -329,6 +332,21 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
             route=ArtifactSnapshotTest().route(root)
             done=ArtifactSnapshotTest().run_helper(artifact,doc,route,"rt-one")
             self.assertEqual(done.returncode,0,done.stderr)
+
+    def test_routed_prepare_defaults_route_context_and_preserves_explicit_target(self):
+        self.build("claude",close=False)
+        doc=self.target()
+        self.raise_gate()
+        self.assertEqual(self.release("proceed").returncode,0)
+        env={**CLEAN_ENV,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.root),
+            "AGENT_ROUTE_FILE":str(self.path),"AGENT_ROUTE_ID":self.route["route_id"],
+            "AGENT_ROUTE_NODE":"transaction","AGENT_DISPATCH_WORKTREE":self.route["cwd"],
+            "AGENT_DISPATCH_JOBS":str(self.jobs),**self.cycle["env"]}
+        done=subprocess.run([sys.executable,str(HELPER),"prepare","--target",str(doc)],
+            cwd=self.route["cwd"],env=env,text=True,capture_output=True)
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        self.assertEqual(doc.read_text(),"original\n")
+        self.assertEqual(json.loads(done.stdout)["status"],"snapshot")
 
 
 if __name__=="__main__": unittest.main()

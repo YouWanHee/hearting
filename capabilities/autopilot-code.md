@@ -38,13 +38,13 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 Artifact root: `core/CONVENTIONS.md §5.1`.
 
-Code work normally writes to `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, even when a `spec/` directory exists. `spec/` is the blueprint bucket; `plans/` is the work-cycle bucket.
+The standalone default is `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, even when a `spec/` directory exists. Routed stages use their sealed node outputs and write scope; `AGENT_ARTIFACT_OUTPUT_DIR` supplies only the cycle base.
 
 Artifact intensity policy:
 
 - `direct`: no new plan root, no `plan.md`, and no durable pipeline artifact unless the adapter or current repo policy explicitly requires one;
 - `quick`: no durable `plan.md` by default; record a short summary/evidence only when a work-cycle artifact is already required;
-- `standard+`: create or resume `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`.
+- `standard+`: the selected route graph declares its plan, implementation, test, and report outputs.
 
 The default full graph produces the following public artifacts. A selected
 subgraph produces only its declared outputs; omitted planning does not require
@@ -70,14 +70,13 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    While the cutover is inactive and the root already holds legacy content,
    inline start returns `legacy-compat` (`AGENT_ARTIFACT_ROOT` only) and the
    legacy `<artifact-root>/plans/` layout stays writable.
-   Compile-only legacy routes can still use explicit producer `begin`.
 2. **write only inside the open cycle.** Every durable artifact goes under
-   `<cycle_dir>/artifacts/plans/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
+   the current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.
    `artifact_producer.py` owns cycle output paths and shared revisions.
 3. **stage workers join, never fork.** `standard+` stage workers receive
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
-   from the owner (dispatch env pass-through) and call `begin --node <id>`
-   on the same route, which resumes the owner's open cycle.
+   from the owner (dispatch env pass-through); the resolver applies the
+   sealed node's outputs and write scope.
 4. **runtime-owned closure.** New registered owners write their report and
    return the final handoff. After exact PASS and process cleanup, the shared
    completion controller completes the workflow, closes the route and seals
@@ -130,7 +129,12 @@ Pipeline intensity is the primary ceremony selector. `direct` is inline and `qui
 
 Stage-local gates must not become full independent QA loops after every sub-stage. Keep plan-check small, concentrate expensive independent review in the selected risk point or final verification, and keep raw logs in artifacts rather than parent context. A stage remains one semantic gate even when the dispatch-depth-1 owner realizes it as several bounded sessions; those sub-sessions have no gate authority and return phase-brief/ledger/handoff evidence only. `code-plan`, `code-refine`, and `code-test` inherit the selected graph: `code-plan` is standard+ durable planning, `code-refine` is optional correction, and `code-test` is final concrete verification rather than hardcoded-thorough QA.
 
-**Corrections are batched, never atomic.** A failed review gate (`plan-check`, `impl-review`, `test`) is followed by exactly one correction pass that closes every 🔴 finding of that round together, plus the follow-on gaps the review named; the owner never redispatches the full `plan` or `execute` node to fix a single finding. The plan correction runs through the `code-refine` boundary and the code correction re-enters the `execute` boundary as a bounded fix under the same node. The re-review that follows is a **closure check** under the review unit's Round Protocol — the owner's assignment names the round number and the prior review artifact and asks whether the prior 🔴 items are closed and the delta is clean; it never asks for a fresh independent re-audit of the whole artifact. Each correction consumes one unit of the `core/CONVENTIONS.md §1.1` retry budget; when the budget is spent, remaining concerns go to the plan's risk/unresolved section and the owner reports them instead of opening another round. A review round that records blocking findings ends `completed-review-blocking`, not as a dead worker; when the budget is spent on such rounds, the owner writes `round_{N}.owner-closure.md` beside the review artifacts (frontmatter `verdict: closed-by-owner`, `node`, `gate`; body naming every blocking attempt and its disposition) and completes the review node with that record as evidence — `core/OPERATIONS.md §5.10` owns the gate's evidence checks.
+**Corrections are batched, never atomic.** A failed review gate (`plan-check`, `impl-review`, `test`) is followed by exactly one correction pass that closes every 🔴 finding of that round together, plus the follow-on gaps the review named; the owner never redispatches the full `plan` or `execute` node to fix a single finding. The plan correction runs through the `code-refine` boundary and the code correction re-enters the `execute` boundary as a bounded fix under the same node. A re-review of the same implementation source is a **closure check** under the review unit's Round Protocol — the assignment names the prior blocking review and asks whether its 🔴 items are closed and the delta is clean. A changed implementation source receives its own ordinary independent review budget and full independent review; a prior subject's PASS is historical and cannot satisfy it. Each same-subject correction consumes one unit of the `core/CONVENTIONS.md §1.1` retry budget. Owner-closure remains available only for an exhausted history with an eligible blocking review; an exhausted all-PASS history cannot be converted into owner-closure. When the existing writer admits owner-closure, the owner completes that exact blocking attempt with the evidence contract in `core/OPERATIONS.md §5.10`.
+
+When continuation would reuse an implementation-review PASS for a different
+source, or reaches a legacy PASS with no source binding, it automatically
+resumes at that review node for the ordinary independent review. It does not
+infer a legacy subject or ask for a new command or approval.
 
 **Pre-owner direction gate (SD-123).** Depth-0 compiles/binds the route and
 begins its producer cycle before launching the frame pair. The direction gate
@@ -192,7 +196,7 @@ Additional code-entry gates:
 - detect whether `spec/pipeline_state.yaml` has changed since the last relevant plan and re-read newer spec/design artifacts before editing;
 - for app mode, treat design tokens and handoff artifacts as source contracts, not suggestions;
 - for destructive DB/schema/migration work, explain the command and risk, but do not auto-run destructive operations without explicit user approval;
-- for non-trivial feature, multi-file, or module work, use the runtime's isolated-worktree or equivalent dispatch policy from `core/OPERATIONS.md`; for standard+ create the final isolated worktree before collecting route eligibility evidence, and seal only tuples whose `checked_worktree` exactly matches the route `cwd`.
+- for every approved start whose selected graph changes source, use the common preparation boundary in `core/OPERATIONS.md` before collecting eligibility evidence, sealing, publishing, or launching. It applies to direct and staged work, explicit or omitted primary cwd, framed first legs, and successor/printed next-leg starts. New independent work starts from the commit SHA resolved by a successful fetch of the remote default; explicit approved task worktrees and exact saved route/cursor/receipt/continuation state retain their existing changes and identity. Probe the final cwd and seal only tuples whose `checked_worktree` exactly matches the route `cwd`. Preparation failure prevents publication and launch and remains retryable through the same start.
 - after main/orchestrator merges, verifies the integrated tree, and pushes the
   integration ref, invoke the guarded worktree cleanup check/apply path; never
   infer cleanup eligibility from a runtime session-end event.
@@ -200,7 +204,7 @@ Additional code-entry gates:
 ## Portable Procedure
 
 1. Parse arguments and infer `dev`, `debug`, or `audit` when the adapter allows natural-language entry.
-2. Resolve artifact root and create or resume a `plans/<date>_<slug>/` work cycle.
+2. Use the selected route node's declared outputs; standalone work keeps the `plans/<date>_<slug>/` default.
 3. Run git/worktree preflight and remember the starting `HEAD`.
 4. If `spec/` exists, read `spec/prd.md` plus relevant mode contracts before planning.
 5. Emit `spec-significance: within-spec` or `spec-significance: SPEC-SIGNIFICANT (...)`.
@@ -214,6 +218,10 @@ Additional code-entry gates:
    artifact-sink extension. When available, offer `final_report.md` through the
    app-neutral receipt contract; otherwise record
    `skipped/extension-unavailable` without changing code-cycle completion.
+
+If Git reports an index-lock error, preserve that failure and its partial
+state; attach only the shared read-only diagnosis in core/OPERATIONS.md §5.9.
+Do not remove the lock or rerun Git automatically.
 
 ## Mode-Specific Semantics
 

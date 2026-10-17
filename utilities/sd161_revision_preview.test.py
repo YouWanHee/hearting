@@ -102,7 +102,7 @@ class RevisionPreviewTest(FIX.CompletionMarkerTest):
         route,node,evidence,owner,attempt=self.input_case()
         outside=self.base/'outside.md';outside.write_text('outside input\n')
         opts=dict(answers=(attempt,),author_attempt_id=owner,jobs=self.jobs)
-        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+        with mock.patch.dict(os.environ,{**self.base_env(),"HEARTING_GATES":"on"},clear=True):
             for changes,path in (({'author_attempt_id':'att-wrong'},evidence),
                                  ({'answers':('att-wrong',)},evidence),({},outside)):
                 errors=[]

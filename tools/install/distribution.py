@@ -2546,11 +2546,19 @@ def _route_registry_index(text: str) -> dict:
                 owners[value] = (fields[1], metadata)
     for route_id, (status, metadata) in owners.items():
         # Standalone install.sh cannot import the runtime. Mirror
-        # Mirror route_authority.answerable_owner_end/runtime_owner_can_resume:
+        # Mirror route_authority.answerable_owner_end/owner_result_format_only_end/runtime_owner_can_resume:
         # a correction continues this route, so exit cannot release its code.
         # Unstarted or unsupervised deaths still have no settlement continuation.
         if status == "done" and (
             metadata.get("note") == "dead-worker-blocked"
+            or (metadata.get("worker_type") == "owner"
+                and metadata.get("note") == "dead-contract"
+                and metadata.get("failure_class") == "contract"
+                and metadata.get("classifier_source") == "supervisor-terminal-v1"
+                and metadata.get("process_exit") == "0"
+                and metadata.get("reconcile_reason") in {"final-handoff-invalid", "pass-blocker-not-none"}
+                and metadata.get("terminal_event") in {
+                    "claude-result", "opencode-result", "turn.completed", "step_finish.stop"})
             or (metadata.get("note") == "dead-worker-fail"
                 and metadata.get("failure_class") == "fail")
             or (metadata.get("note") in {"dead-runtime-exit", "dead-runtime-error"}
