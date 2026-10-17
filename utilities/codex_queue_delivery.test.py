@@ -522,6 +522,18 @@ class NativePeerObservationTest(unittest.TestCase):
             corrupt_endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
         self.assertEqual(corrupt.status, "unknown")
 
+        _home, schema_endpoint, _state, schema_path, _rollout = native_fixture(
+            self.root / "schema", projected_ordinal=10)
+        connection = sqlite3.connect(schema_path)
+        try:
+            connection.execute("DROP TABLE thread_turns")
+            connection.commit()
+        finally:
+            connection.close()
+        schema_mismatch = QUEUE._observe_peer_message(
+            schema_endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
+        self.assertEqual(schema_mismatch.status, "unknown")
+
     def test_native_database_lock_is_unknown_and_bounded(self):
         _home, endpoint, state_path, *_ = native_fixture(self.root)
         writer = sqlite3.connect(state_path, timeout=1)
