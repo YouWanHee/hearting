@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import codecs
 import os
 from pathlib import Path
 import threading
@@ -45,50 +46,14 @@ def _stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _utf8_status(data: bytes) -> tuple[bool, bool]:
-    """Return whether bytes contain invalid UTF-8 or end in an incomplete scalar."""
-    invalid = False
-    incomplete = False
-    index = 0
-    size = len(data)
-    while index < size:
-        lead = data[index]
-        if lead <= 0x7F:
-            index += 1
-            continue
-        if 0xC2 <= lead <= 0xDF:
-            length, second_low, second_high = 2, 0x80, 0xBF
-        elif 0xE0 <= lead <= 0xEF:
-            length, second_low, second_high = 3, 0x80, 0xBF
-            if lead == 0xE0:
-                second_low = 0xA0
-            elif lead == 0xED:
-                second_high = 0x9F
-        elif 0xF0 <= lead <= 0xF4:
-            length, second_low, second_high = 4, 0x80, 0xBF
-            if lead == 0xF0:
-                second_low = 0x90
-            elif lead == 0xF4:
-                second_high = 0x8F
-        else:
-            invalid = True
-            index += 1
-            continue
-
-        valid = True
-        for offset in range(1, length):
-            if index + offset >= size:
-                incomplete = True
-                break
-            byte = data[index + offset]
-            low, high = ((second_low, second_high) if offset == 1 else (0x80, 0xBF))
-            if not low <= byte <= high:
-                invalid = True
-                valid = False
-                break
-        if incomplete:
-            break
-        index += length if valid else 1
-    return invalid, incomplete
+    """Check UTF-8 availability without a Python loop over registry bytes."""
+    if data.isascii():
+        return False, False
+    try:
+        _text, consumed = codecs.utf_8_decode(data, "strict", False)
+    except UnicodeDecodeError:
+        return True, False
+    return False, consumed < len(data)
 
 
 def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
