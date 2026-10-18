@@ -55,6 +55,25 @@ class BatchObligationTest(unittest.TestCase):
             obligations._resume_owner_settlements(self.jobs)
         settle.assert_called_once_with(self.jobs, "att-owner")
 
+    def test_owner_settlement_keeps_partial_registry_retryable_until_complete(self):
+        self.jobs.write_text(self._runtime_owner_row(), encoding="utf-8")
+        before = self.jobs.read_bytes()
+        context = obligations.OwnerSettlementReadContext()
+        with mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
+            self.assertTrue(obligations.has_unowned_work(self.jobs))
+            self.assertIn((str(self.jobs), "unavailable"),
+                          obligations.pending_observer_signature(self.jobs))
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_not_called()
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+            with self.jobs.open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_called_once_with(self.jobs, "att-owner")
+
     def test_pending_done_owner_stays_visible_across_cached_passes(self):
         self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
         registry_cache.clear_cache()

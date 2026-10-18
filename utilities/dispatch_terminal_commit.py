@@ -989,7 +989,12 @@ def _prove_route_children(request, route, gates):
     related = []
     seen_attempts = set()
     from dispatch_registry_cache import registry_view
-    candidates = registry_view(request.jobs).completion_related(
+    view = registry_view(request.jobs)
+    try:
+        view.require_complete_text()
+    except UnicodeError:
+        return _proof_failure("route-identity-unverified")
+    candidates = view.completion_related(
         request.owner_attempt_id, route.get("route_id", ""), route.get("route_hash", ""))
     for record in candidates:
         row_index, fields = record.order, list(record.fields)

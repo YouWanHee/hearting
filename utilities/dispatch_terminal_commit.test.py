@@ -471,6 +471,34 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
         proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
         self.assertEqual((proof.status, proof.reason), ("proved", None))
 
+    def test_terminal_proof_keeps_damaged_or_uncommitted_registry_unknown(self):
+        latest = self.row("done", "att-latest", owner_route_id=self.route["route_id"],
+                          owner_route_hash=self.route["route_hash"],
+                          note="completed-marker", failure_class="pass",
+                          launch_outcome="never-launched")
+        child = self.row("open", "att-hidden", dispatch_depth="2",
+                         worker_type="stage", parent_attempt_id="att-latest")
+        for suffix in (b"\xff\n", child.encode("utf-8")):
+            with self.subTest(suffix=suffix[:20]):
+                self.jobs.write_bytes((latest + "\n").encode("utf-8") + suffix)
+                before = self.jobs.read_bytes()
+                proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+                self.assertEqual((proof.status, proof.reason),
+                                 ("rejected", "route-identity-unverified"))
+                self.assertEqual(self.jobs.read_bytes(), before)
+
+        # Committing the newline reveals the real open child; it still cannot
+        # be hidden by the cache's earlier prefix or by an exact owner gate.
+        self.jobs.write_text(latest + "\n" + child + "\n", encoding="utf-8")
+        self.assertEqual(T._prove_route_children(
+            self.request(), self.route, self.owner_gate()).status, "rejected")
+
+        # Valid malformed history and a literal replacement character keep
+        # the prior tolerant semantics once the current text is complete.
+        self.jobs.write_text(latest + "\nmalformed \ufffd\n", encoding="utf-8")
+        self.assertEqual(T._prove_route_children(
+            self.request(), self.route, self.owner_gate()).status, "proved")
+
     def test_a_registered_row_closed_without_ever_launching_does_not_block_settlement(self):
         # OpenCode r4 leg1: a `test` row was registered, never claimed, then closed by a marker;
         # it has no process identity because nothing was ever spawned.

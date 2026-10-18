@@ -303,6 +303,11 @@ class RegistryView:
     def records(self) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments for record in segment.records)
 
+    def require_complete_text(self) -> None:
+        """Authority cannot prove absence from damaged or uncommitted text."""
+        if self.has_invalid_utf8 or self.has_partial_tail:
+            raise UnicodeError("dispatch-registry-incomplete-text")
+
     @property
     def has_duplicate_attempts(self) -> bool:
         """Whether any exact attempt key occurs more than once in this generation."""
