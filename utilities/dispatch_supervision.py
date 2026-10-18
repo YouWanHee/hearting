@@ -13,11 +13,11 @@ from pathlib import Path
 import re
 import shlex
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 from dispatch_attempt_policy import decide_attempt, terminal_conflict_digest
 from dispatch_receipt_identity import receipt_digest
-from dispatch_registry_cache import registry_lines
+from dispatch_registry_cache import registry_view
 import dispatch_pending_delivery as pending_delivery
 
 KIND = "supervision"
@@ -28,6 +28,10 @@ ANSWER_AWAITING_PARENT = "answer-awaiting-parent"
 
 class SupervisionError(ValueError):
     pass
+
+
+class StopWaiting(RuntimeError):
+    """Abort a managed wait without recording a delivery notice or row change."""
 
 
 def join_process_error(returncode: int, receipt: object, parent_attempt_id: str) -> str:
@@ -43,19 +47,38 @@ def join_process_error(returncode: int, receipt: object, parent_attempt_id: str)
     return f"join-process-contract-failed:exit={returncode}:reason={reason}"
 
 
-def _rows(jobs: Path) -> dict:
-    from dispatch_contract import parse_registry_metadata
+def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
+    view = registry_view(Path(jobs))
     rows = {}
-    for line in registry_lines(jobs):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = parse_registry_metadata(fields[5])
+    if attempts is None:
+        selected = ((record, record.completion_metadata()) for record in view.records)
+    else:
+        pending = list(dict.fromkeys(attempts))
+        seen = set()
+        selected_rows = []
+        while pending:
+            aid = pending.pop()
+            if aid in seen:
+                continue
+            seen.add(aid)
+            candidates = view.completion_attempt_records(aid)
+            if len(candidates) > 1:
+                raise SupervisionError("supervision-attempt-ambiguous")
+            if not candidates:
+                continue
+            record = candidates[0]
+            meta = record.completion_metadata()
+            selected_rows.append((record, meta))
+            parent = meta.get("parent_attempt_id")
+            if parent not in (None, "", "-"):
+                pending.append(parent)
+        selected = iter(selected_rows)
+    for record, meta in selected:
         aid = meta.get("attempt_id")
         if aid:
             if aid in rows:
                 raise SupervisionError("supervision-attempt-ambiguous")
-            rows[aid] = (fields[1], meta)
+            rows[aid] = (record.status, meta)
     return rows
 
 
@@ -152,7 +175,7 @@ def materialize(jobs: Path, attempts: set[str], *, reason: str) -> list[dict]:
     if reason not in REASONS:
         raise SupervisionError("supervision-reason-invalid")
     jobs = jobs.resolve()
-    rows = _rows(jobs)
+    rows = _rows(jobs, attempts)
     groups: dict[str, list[str]] = {}
     for aid in sorted(attempts):
         groups.setdefault(_root(rows, aid), []).append(aid)
@@ -252,7 +275,7 @@ def validate_receipt(receipt: dict, *, jobs: Path, expected_thread_id: str,
             or receipt["owner_attempt_id"] not in expected_attempts
             or receipt["sealed_batch_id"] != expected_sealed_batch_id):
         raise SupervisionError("supervision-binding-mismatch")
-    rows = _rows(jobs)
+    rows = _rows(jobs, set(receipt["monitored_attempt_ids"]) | {receipt["owner_attempt_id"]})
     owner = receipt["owner_attempt_id"]
     if owner not in rows:
         raise SupervisionError("supervision-owner-missing")
@@ -292,7 +315,8 @@ def notice_is_current(record: dict) -> bool:
     receipt = validate(record.get("receipt"))
     if record.get("receipt_digest") != receipt_digest(receipt):
         raise SupervisionError("supervision-digest-mismatch")
-    rows = _rows(Path(receipt["job_registry"]))
+    rows = _rows(Path(receipt["job_registry"]),
+                 set(receipt["monitored_attempt_ids"]) | {receipt["owner_attempt_id"]})
     owner = receipt["owner_attempt_id"]
     if (owner not in rows or rows[owner][1].get("parent_sid") != receipt["recipient_thread_id"]
             or any(_root(rows, aid) != owner for aid in receipt["monitored_attempt_ids"])):
@@ -306,7 +330,8 @@ def _residue_text(receipt: dict) -> str:
     """Name survivors a finished worker left running; display only, empty when none."""
     try:
         from dispatch_contract import residue_live_pids
-        rows = _rows(Path(receipt["job_registry"]))
+        rows = _rows(Path(receipt["job_registry"]),
+                     set(receipt["monitored_attempt_ids"]) | {receipt["owner_attempt_id"]})
     except (OSError, ValueError, SupervisionError):
         return ""
     parts = []
@@ -331,7 +356,7 @@ def _resume_text(receipt: dict) -> str:
     try:
         from dispatch_replacement import _route
         from parent_next_directive import resume_command
-        rows = _rows(Path(receipt["job_registry"]))
+        rows = _rows(Path(receipt["job_registry"]), {receipt["owner_attempt_id"]})
         path, _route_doc = _route(Path(receipt["job_registry"]), receipt["owner_attempt_id"],
                                   rows[receipt["owner_attempt_id"]][1])
         return resume_command(path, receipt["job_registry"], agent_home=Path(__file__).resolve().parents[1])
@@ -361,7 +386,7 @@ def continue_for_parent(record: dict, *, session_id: str, recipient_kind: str,
         harness = recipient_kind.split("-", 1)[0]
         jobs = Path(receipt["job_registry"])
         owner = receipt["owner_attempt_id"]
-        route_file, route = _route(jobs, owner, _rows(jobs)[owner][1])
+        route_file, route = _route(jobs, owner, _rows(jobs, {owner})[owner][1])
         env = {**(os.environ if environ is None else environ),
                session_env()[harness][0]: session_id, "AGENT_DISPATCH_CALLER_HARNESS": harness}
         if arm is None:
@@ -543,6 +568,8 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
                 if attention:
                     receipt = {**receipt, "replacement_attention": attention}
                 return receipt
+        except StopWaiting:
+            raise
         except Exception as exc:
             from dispatch_completion_join import CompletionDeferred
             if isinstance(exc, CompletionDeferred):
@@ -556,6 +583,8 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
             if stop_check is not None:
                 try:
                     halt_reason = stop_check() or ""
+                except StopWaiting:
+                    raise
                 except Exception as exc:
                     observer_error = str(exc)
             if not halt_reason and deadline is not None and time.monotonic() >= deadline:
@@ -609,14 +638,14 @@ def wait_for_child_settlement(*, jobs: Path, attempts: set[str],
     The ordinary wait controller retains the obligation and parent handback.
     """
     def observe(monitored: set[str]) -> dict:
-        if not _pending(_rows(jobs), sorted(monitored), jobs):
+        if not _pending(_rows(jobs, monitored), sorted(monitored), jobs):
             return {"state": "settled"}
         reconcile(monitored)
-        if not _pending(_rows(jobs), sorted(monitored), jobs):
+        if not _pending(_rows(jobs, monitored), sorted(monitored), jobs):
             return {"state": "settled"}
         receipt = join(monitored)
         reconcile(monitored)
-        if not _pending(_rows(jobs), sorted(monitored), jobs):
+        if not _pending(_rows(jobs, monitored), sorted(monitored), jobs):
             return {"state": "settled"}
         if receipt.get("state") != "timeout":
             # A terminal-but-unclosed observation may return immediately.

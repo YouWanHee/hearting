@@ -238,6 +238,48 @@ raise SystemExit(3 if state == 'timeout' else 0)
         )
         self.addCleanup(self._stop_recovery_observers)
 
+    def test_lost_observer_record_cannot_mutate_an_unknown_duty(self):
+        import dispatch_batch_obligations as batch
+        module = load_completion_module()
+
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.touch(exist_ok=True)
+        args = SimpleNamespace(
+            jobs=self.jobs, sealed_batch_id="sealed-observer-owner",
+            parent_attempt_id=PARENT, parent_session_id=None,
+            attempt_id=["att-observer-owner"], control_socket=None,
+            queue_socket=None, thread_id=None, interval=1.0, timeout=30.0,
+        )
+        duty_id, _record = batch.create(args)
+        lease_path = batch._root(self.jobs) / (duty_id + ".lease")
+        fd = batch.acquire(self.jobs, duty_id)
+        self.assertIsNotNone(fd)
+        try:
+            claimed = batch.update_for_observer(
+                self.jobs, duty_id, fd, claim=True, reason="observing")
+            self.assertIsNotNone(claimed)
+            args.obligation_lock_fd = fd
+            batch.update(self.jobs, duty_id, state="unknown",
+                         observer={"pid": 1, "pid_start": "1"})
+            before = batch.read(self.jobs, duty_id)
+            with self.assertRaises(module.ObserverOwnershipLost):
+                module._update_duty(args, duty_id, state="complete")
+            self.assertEqual(batch.read(self.jobs, duty_id), before)
+        finally:
+            batch.release(fd, lease_path)
+
+    def test_resumed_observer_without_parent_lifetime_uses_bounded_join_checkpoints(self):
+        module = load_completion_module()
+        args = SimpleNamespace(parent_lifetime=None, _resume_execution=True,
+                               timeout=600.0, interval=1.0)
+        with mock.patch.object(module, "run_join", return_value={"state": "timeout"}) as join:
+            result = module._join_checkpoint(args, {"att-child"})
+        self.assertEqual(result["state"], "timeout")
+        bounded = join.call_args.args[0]
+        self.assertEqual(bounded.timeout, module.JOIN_CHECKPOINT_SECONDS)
+        self.assertEqual(bounded.interval, 1.0)
+        self.assertEqual(args.timeout, 600.0)
+
     def fixture_env(self):
         env = dict(os.environ)
         for key in list(env):

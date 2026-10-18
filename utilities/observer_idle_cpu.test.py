@@ -149,8 +149,8 @@ class ObserverIdleCpuTest(unittest.TestCase):
                         "client_user_message_id": "delivery-stable-fixture"}
 
             import dispatch_registry_cache
-            with mock.patch.object(dispatch_registry_cache, "_CACHE", {}), \
-                 mock.patch("dispatch_seat_handover.effective_parent", return_value=SESSION), \
+            dispatch_registry_cache.clear_cache()
+            with mock.patch("dispatch_seat_handover.effective_parent", return_value=SESSION), \
                  mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
                  mock.patch.object(completion.codex_queue_delivery, "_rpc",
                                    side_effect=history_rpc):
@@ -159,8 +159,8 @@ class ObserverIdleCpuTest(unittest.TestCase):
                 counters["history_pages"] = 0
                 counters["after_observations"] = 0
                 args.timeout = WINDOW_SECONDS
-                with mock.patch.object(dispatch_registry_cache, "_CACHE", {}), \
-                     mock.patch.object(completion.codex_queue_delivery, "DeliverySession",
+                dispatch_registry_cache.clear_cache()
+                with mock.patch.object(completion.codex_queue_delivery, "DeliverySession",
                                        side_effect=QueueSession), \
                      mock.patch.object(completion, "_native_queue_delivery_once",
                                        side_effect=current_observation):

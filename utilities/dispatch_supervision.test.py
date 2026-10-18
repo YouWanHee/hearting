@@ -612,6 +612,49 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertEqual(result["state"], "ready")
         self.assertEqual(stop_check.call_count, 0)
 
+    def test_exact_materialization_uses_indexed_attempt_ancestry_on_large_history(self):
+        from dispatch_registry_cache import RegistryRecord, clear_cache, metrics_snapshot, reset_metrics
+
+        self._notice_rows()
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(row(f"att-unrelated-{index:05d}", parent_attempt_id="att-other"))
+        clear_cache()
+        reset_metrics()
+        visited = []
+        original = RegistryRecord.completion_metadata
+
+        def observe(record):
+            metadata = original(record)
+            visited.append(metadata.get("attempt_id"))
+            return metadata
+
+        with mock.patch.object(RegistryRecord, "completion_metadata", observe):
+            first = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")
+            second = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")
+        self.assertEqual(first[0]["delivery_id"], second[0]["delivery_id"])
+        self.assertEqual(len(visited), 4, "each checkpoint should project only child and owner rows")
+        self.assertEqual(set(visited), {"att-child", "att-owner"})
+        metrics = metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        self.assertGreaterEqual(metrics["cache_hits"], 1)
+        clear_cache()
+
+    def test_stop_waiting_aborts_without_materializing_or_retrying(self):
+        self._notice_rows()
+        join = mock.Mock(return_value={"state": "timeout"})
+        with mock.patch.object(supervision, "materialize") as materialize, \
+             mock.patch.object(supervision.time, "sleep") as sleep:
+            with self.assertRaises(supervision.StopWaiting):
+                supervision.wait_for_batch(
+                    join=join, attempts={"att-child"}, jobs=self.jobs,
+                    stop_check=lambda: (_ for _ in ()).throw(
+                        supervision.StopWaiting("observer-ownership-lost")))
+        join.assert_called_once()
+        materialize.assert_not_called()
+        sleep.assert_not_called()
+
 
 
 class NamespaceExtinctObligationTest(unittest.TestCase):
