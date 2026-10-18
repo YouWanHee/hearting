@@ -495,16 +495,21 @@ names the release, and live processes whose `AGENT_HOME` names it, still keep
 it. It is never selected automatically. Re-running the command when the
 requested release is already current still performs this checked prune pass.
 
-The legacy/current collision exception is limited to
-`logs/dispatch-session-sweep.log`, an observation file rather than dispatch
-authority. When its bytes differ during carry-forward, the existing canonical
-file stays in place and the legacy bytes are copied and digest-verified under
+The legacy/current collision exception covers only these observations:
+`logs/dispatch-session-sweep.log`, `logs/<slug>.heartbeat`, and
+`plugin-load.<slug>.mark`, with a single safe slug as the name component. The
+heartbeat and plugin-load marker are OpenCode best-effort liveness side
+channels: the liveness reader uses heartbeat mtime and marker existence. They
+are not dispatch authority. Exact attempt evidence under
+`heartbeats/<attempt>.json` remains strict. When one of the recognized
+observation files differs during carry-forward, the existing canonical file
+stays in place and the legacy bytes are copied and digest-verified under
 `<state-root>/dispatch-observation-archive/`, keyed by the resolved source
 root, relative path, and content digest. The archive is outside dispatch reader
 roots. Every other conflicting file, including completion proofs, sidecars,
 registry rows, delivery records, and ACKs, keeps the release until the existing
-verification succeeds. Raw logs and their observation archives have no new
-time-based deletion policy.
+verification succeeds. No `logs/**` or extension-wide exception is made. Raw
+logs and their observation archives have no new time-based deletion policy.
 
 After a release directory has actually been removed, pruning also removes only
 the matching release subtree beneath the default

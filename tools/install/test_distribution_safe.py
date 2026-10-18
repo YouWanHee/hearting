@@ -209,6 +209,8 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
 
         with mock.patch.dict(os.environ, self.environment, clear=True):
             self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            self.assertEqual(archived.stat().st_nlink, 1)
+            self.assertEqual(list(archived.parent.iterdir()), [archived])
             self.assertEqual(
                 distribution._migration_deletion_precondition(
                     self.candidate, self.environment
@@ -216,8 +218,36 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 (True, ""),
             )
             self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            self.assertEqual(archived.stat().st_nlink, 1)
+            self.assertEqual(list(archived.parent.iterdir()), [archived])
         self.assertEqual(target.read_bytes(), b"current observation\n")
         self.assertEqual(archived.read_bytes(), b"legacy observation\n")
+
+    def test_observation_classifier_matches_only_the_verified_name_forms(self) -> None:
+        positives = (
+            Path("logs/dispatch-session-sweep.log"),
+            Path("logs/legacy-worker.heartbeat"),
+            Path("plugin-load.legacy-worker.mark"),
+        )
+        negatives = (
+            Path("logs/dispatch-session-sweep.log.1"),
+            Path("logs/nested/legacy-worker.heartbeat"),
+            Path("logs/legacy-worker.heartbeat.bak"),
+            Path("logs/.heartbeat"),
+            Path("logs/worker name.heartbeat"),
+            Path("plugin-load.legacy-worker.mark.bak"),
+            Path("plugin-load..mark"),
+            Path("plugin-load.worker name.mark"),
+            Path("heartbeats/att-test.json"),
+            Path("completion/proof.json"),
+            Path("unrecognized.log"),
+        )
+        for relative in positives:
+            with self.subTest(relative=relative):
+                self.assertTrue(distribution._dispatch_observation_file(relative))
+        for relative in negatives:
+            with self.subTest(relative=relative):
+                self.assertFalse(distribution._dispatch_observation_file(relative))
 
     def test_observation_written_after_carry_is_archived_by_final_delta_check(self) -> None:
         relative = Path("logs/dispatch-session-sweep.log")
@@ -306,6 +336,73 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
         self.assertEqual(source.read_bytes(), b"legacy observation\n")
         self.assertEqual(target.read_bytes(), b"current observation\n")
+
+    def test_archive_link_and_fsync_failures_are_retryable(self) -> None:
+        failures = ("copy", "link", "file-fsync", "directory-fsync")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            for failure in failures:
+                with self.subTest(failure=failure):
+                    relative = Path(f"logs/{failure}-worker.heartbeat")
+                    source = self.source_root / relative
+                    target = self.target_root / relative
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    legacy = f"legacy {failure}\n".encode()
+                    current = f"current {failure}\n".encode()
+                    source.write_bytes(legacy)
+                    target.write_bytes(current)
+                    root_digest = hashlib.sha256(
+                        os.fsencode(str(self.source_root.resolve()))
+                    ).hexdigest()
+                    content_digest = hashlib.sha256(legacy).hexdigest()
+                    archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                                / "dispatch-observation-archive" / root_digest
+                                / relative / content_digest)
+
+                    if failure == "copy":
+                        failure_patch = mock.patch.object(
+                            distribution.shutil, "copyfileobj",
+                            side_effect=OSError("copy fixture"),
+                        )
+                    elif failure == "link":
+                        failure_patch = mock.patch.object(
+                            distribution.os, "link", side_effect=OSError("link fixture")
+                        )
+                    elif failure == "file-fsync":
+                        failure_patch = mock.patch.object(
+                            distribution.os, "fsync", side_effect=OSError("file fsync fixture")
+                        )
+                    else:
+                        real_fsync = os.fsync
+                        calls = 0
+
+                        def fail_directory_fsync(fd):
+                            nonlocal calls
+                            calls += 1
+                            if calls == 2:
+                                raise OSError("directory fsync fixture")
+                            return real_fsync(fd)
+
+                        failure_patch = mock.patch.object(
+                            distribution.os, "fsync", side_effect=fail_directory_fsync
+                        )
+
+                    with failure_patch:
+                        self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+                    self.assertEqual(source.read_bytes(), legacy)
+                    self.assertEqual(target.read_bytes(), current)
+                    self.assertFalse(any(".migrate-" in path.name
+                                         for path in archived.parent.iterdir())
+                                     if archived.parent.exists() else False)
+
+                    self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+                    self.assertEqual(archived.read_bytes(), legacy)
+                    self.assertEqual(archived.stat().st_nlink, 1)
+                    self.assertEqual(list(archived.parent.iterdir()), [archived])
+                    self.assertEqual(target.read_bytes(), current)
+                    self.assertTrue(distribution._migration_deletion_precondition(
+                        self.candidate, self.environment
+                    )[0])
 
     def test_symlink_in_dispatch_tree_keeps_source_and_refuses_carry(self) -> None:
         relative = Path("logs/dispatch-session-sweep.log")
@@ -476,6 +573,93 @@ class ReleasePycachePruneTest(unittest.TestCase):
         self.assertTrue(middle.exists() and self._cache_for(middle).exists())
         self.assertTrue(newest.exists() and self._cache_for(newest).exists())
         self.assertTrue((sibling / "unrelated.pyc").is_file())
+
+    def test_known_observation_collisions_prune_but_completion_conflict_retains(self) -> None:
+        real_succeed_dispatch_state = distribution._succeed_dispatch_state
+        observations = {
+            Path("logs/dispatch-session-sweep.log"): (
+                b"legacy sweep bytes\n", b"current sweep bytes\n"),
+            Path("logs/legacy-worker.heartbeat"): (
+                b"legacy heartbeat bytes\n", b"current heartbeat bytes\n"),
+            Path("plugin-load.legacy-worker.mark"): (
+                b"legacy plugin marker\n", b"current plugin marker\n"),
+        }
+
+        for conflict in (False, True):
+            case_root = self.root / ("proof-conflict" if conflict else "observations-only")
+            self.share = case_root / "share" / "hearting"
+            self.releases = self.share / "releases"
+            self.releases.mkdir(parents=True)
+            self.state = case_root / "state" / "hearting"
+            self.pycache = self.state / "pycache"
+
+            old = self._create_release("v-old", 1)
+            middle = self._create_release("v-middle", 2)
+            newest = self._create_release("v-newest", 3)
+            current = self.share / "current"
+            current.symlink_to(newest)
+
+            source_dispatch = old / ".dispatch"
+            current_dispatch = newest / ".dispatch"
+            for relative, (legacy_bytes, current_bytes) in observations.items():
+                source = source_dispatch / relative
+                target = current_dispatch / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(legacy_bytes)
+                target.write_bytes(current_bytes)
+
+            source_proof = source_dispatch / "completion" / "proof.json"
+            target_proof = current_dispatch / "completion" / "proof.json"
+            source_proof.parent.mkdir(parents=True, exist_ok=True)
+            target_proof.parent.mkdir(parents=True, exist_ok=True)
+            source_proof.write_bytes(b'{"proof":"legacy"}\n')
+            target_proof.write_bytes(
+                b'{"proof":"current"}\n' if conflict else b'{"proof":"legacy"}\n'
+            )
+
+            cache = self._cache_for(old)
+            cache.mkdir(parents=True)
+            (cache / "legacy.pyc").write_bytes(b"derived cache")
+            for release, timestamp in ((old, 1), (middle, 2), (newest, 3)):
+                os.utime(release, (timestamp, timestamp))
+
+            environment = {
+                "HOME": str(case_root / "home"),
+                "XDG_STATE_HOME": str(case_root / "xdg-state"),
+                "HARNESS_DATA_ROOT": str(self.share),
+                "HARNESS_STATE_ROOT": str(self.state),
+            }
+            with mock.patch.dict(os.environ, environment, clear=True), ExitStack() as stack:
+                self._patch_cleanup(stack)
+                stack.enter_context(mock.patch.object(
+                    distribution, "_succeed_dispatch_state",
+                    side_effect=real_succeed_dispatch_state,
+                ))
+                distribution._cleanup_releases(set())
+
+            self.assertEqual(old.exists(), conflict)
+            self.assertEqual(cache.exists(), conflict)
+            self.assertTrue(middle.is_dir() and newest.is_dir())
+            if conflict:
+                self.assertEqual(source_proof.read_bytes(), b'{"proof":"legacy"}\n')
+            else:
+                self.assertFalse(source_proof.exists())
+            self.assertEqual(
+                target_proof.read_bytes(),
+                b'{"proof":"current"}\n' if conflict else b'{"proof":"legacy"}\n',
+            )
+
+            source_digest = hashlib.sha256(os.fsencode(str(source_dispatch.resolve()))).hexdigest()
+            archive_root = self.state / "dispatch-observation-archive" / source_digest
+            for relative, (legacy_bytes, current_bytes) in observations.items():
+                archive = (archive_root / relative
+                           / hashlib.sha256(legacy_bytes).hexdigest())
+                target = current_dispatch / relative
+                self.assertEqual(archive.read_bytes(), legacy_bytes)
+                self.assertEqual(target.read_bytes(), current_bytes)
+                self.assertFalse(any(".migrate-" in path.name
+                                     for path in archive.parent.iterdir()))
 
     def test_orphan_cache_waits_for_live_or_unresolved_release_evidence(self) -> None:
         cache = self._cache_for(self.releases / "gone")

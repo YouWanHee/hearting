@@ -758,10 +758,27 @@ class ComputeHostsTest(unittest.TestCase):
             "CODEX_SESSION_ID": "other-stale",
             "CLAUDE_CODE_SESSION_ID": "stale-claude",
         })
-        clean = {key: value for key, value in self.env.items()
-                 if key not in dict(load_module().SESSION_ENV_KEYS)}
-        env = {**clean, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
-               "CODEX_THREAD_ID": "launch-thread"}
+        session_keys = {key for key, _harness in load_module().SESSION_ENV_KEYS}
+        env = {key: value for key, value in self.env.items()
+               if key not in session_keys
+               and key not in ("AGENT_HOME", "CLAUDE_HOME",
+                               "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_JOBS")}
+        for key in tuple(env):
+            if (key.startswith("AGENT_DISPATCH_")
+                    or key in ("AGENT_OWNER_ROUTE_FILE", "AGENT_ROUTE_FILE",
+                               "AGENT_SESSION_ROLE", "FLEET_ROUTE_CHAIN_DIR",
+                               "FLEET_TITLE_REFRESH")):
+                env.pop(key, None)
+        empty_home = self.root / "empty-home"
+        empty_home.mkdir(exist_ok=True)
+        env.update({
+            "AGENT_DISPATCH_DEPTH": "0",
+            "HOME": str(empty_home),
+            "XDG_DATA_HOME": str(empty_home / ".local" / "share"),
+            "XDG_STATE_HOME": str(empty_home / ".local" / "state"),
+            "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
+            "CODEX_THREAD_ID": "launch-thread",
+        })
         result = subprocess.run(
             [sys.executable, str(TOOL), "run", "here", "--gpus", "", "--name", "tmux-owner",
              "--", "bash", "-c",

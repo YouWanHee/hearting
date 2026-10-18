@@ -2121,21 +2121,36 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
             "route_id=rt-b3b14,harness=claude\n",
             encoding="utf-8",
         )
-        legacy_observation = v1 / ".dispatch" / "logs" / "dispatch-session-sweep.log"
         stable_root = DISTRIBUTION.stable_state_root(os.environ)
         stable_root.parent.mkdir(parents=True, exist_ok=True)
         DISTRIBUTION._ensure_new_directory_mode(stable_root, 0o700)
-        current_observation = stable_root / "logs" / "dispatch-session-sweep.log"
-        legacy_observation.parent.mkdir(parents=True)
-        current_observation.parent.mkdir(parents=True, exist_ok=True)
-        legacy_observation.write_bytes(b"legacy sweep bytes\n")
-        current_observation.write_bytes(b"current sweep bytes\n")
-        observation_archive = (
-            stable_root.parent / "dispatch-observation-archive"
-            / hashlib.sha256(os.fsencode(str((v1 / ".dispatch").resolve()))).hexdigest()
-            / "logs" / "dispatch-session-sweep.log"
-            / hashlib.sha256(legacy_observation.read_bytes()).hexdigest()
+        observation_values = (
+            ("logs/dispatch-session-sweep.log", b"legacy sweep bytes\n", b"current sweep bytes\n"),
+            ("logs/legacy-worker.heartbeat", b"legacy heartbeat bytes\n", b"current heartbeat bytes\n"),
+            ("plugin-load.legacy-worker.mark", b"legacy plugin marker\n", b"current plugin marker\n"),
         )
+        source_dispatch = v1 / ".dispatch"
+        source_root_digest = hashlib.sha256(
+            os.fsencode(str(source_dispatch.resolve()))
+        ).hexdigest()
+        observation_paths = []
+        for relative_text, legacy_bytes, current_bytes in observation_values:
+            relative = Path(relative_text)
+            legacy_observation = source_dispatch / relative
+            current_observation = stable_root / relative
+            legacy_observation.parent.mkdir(parents=True, exist_ok=True)
+            current_observation.parent.mkdir(parents=True, exist_ok=True)
+            legacy_observation.write_bytes(legacy_bytes)
+            current_observation.write_bytes(current_bytes)
+            observation_archive = (
+                stable_root.parent / "dispatch-observation-archive"
+                / source_root_digest / relative
+                / hashlib.sha256(legacy_bytes).hexdigest()
+            )
+            observation_paths.append(
+                (legacy_observation, current_observation, observation_archive,
+                 legacy_bytes, current_bytes)
+            )
         completion_dir = v1 / ".dispatch" / "completion" / "rt-b3b14"
         completion_dir.mkdir(parents=True)
         (completion_dir / "plan.json").write_text(
@@ -2149,8 +2164,9 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
         result = DISTRIBUTION.run_dispatch_state_migration(v1 / ".dispatch", environ=os.environ)
         self.assertEqual(result["status"], "completed")
         self.assertTrue((stable_root / "completion" / "rt-b3b14" / "plan.json").is_file())
-        self.assertEqual(current_observation.read_bytes(), b"current sweep bytes\n")
-        self.assertEqual(observation_archive.read_bytes(), b"legacy sweep bytes\n")
+        for _legacy, current_observation, observation_archive, legacy_bytes, current_bytes in observation_paths:
+            self.assertEqual(current_observation.read_bytes(), current_bytes)
+            self.assertEqual(observation_archive.read_bytes(), legacy_bytes)
 
         v2 = DISTRIBUTION.data_root() / "releases" / "v-b3b14-2"
         (v2 / "core").mkdir(parents=True)
@@ -2160,12 +2176,20 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
         (v3 / "core").mkdir(parents=True)
         (v3 / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         os.utime(v3, (future + 2, future + 2))
+        releases_root = Path(os.path.abspath(DISTRIBUTION.data_root() / "releases"))
+        v1_cache = (stable_root.parent / "pycache").joinpath(
+            *releases_root.parts[1:], v1.name
+        )
+        v1_cache.mkdir(parents=True)
+        (v1_cache / "legacy.pyc").write_bytes(b"derived cache")
         DISTRIBUTION.current_path().unlink()
         DISTRIBUTION.current_path().symlink_to(v3)
         DISTRIBUTION._cleanup_releases(keep=set())
         self.assertFalse(v1.exists(), "v1 must actually be pruned for this to be a real B-3/B-14 test")
-        self.assertEqual(current_observation.read_bytes(), b"current sweep bytes\n")
-        self.assertEqual(observation_archive.read_bytes(), b"legacy sweep bytes\n")
+        self.assertFalse(v1_cache.exists(), "the pruned release's derived cache must also be removed")
+        for _legacy, current_observation, observation_archive, legacy_bytes, current_bytes in observation_paths:
+            self.assertEqual(current_observation.read_bytes(), current_bytes)
+            self.assertEqual(observation_archive.read_bytes(), legacy_bytes)
 
         # B-3: capability-route's continuation resolver reaches the stable
         # row through the alias, not the now-deleted release path.

@@ -1921,13 +1921,15 @@ def _atomic_migrate_copy(
             os.link(tmp_name, destination)
         ok = True
     except OSError:
-        return False
+        ok = False
     finally:
-        if not ok and os.path.exists(tmp_name):
+        if os.path.lexists(tmp_name):
             try:
                 os.unlink(tmp_name)
             except OSError:
-                pass
+                ok = False
+    if not ok:
+        return False
     dir_fd = os.open(str(destination.parent), os.O_RDONLY)
     try:
         os.fsync(dir_fd)
@@ -1937,10 +1939,20 @@ def _atomic_migrate_copy(
 
 
 _DISPATCH_OBSERVATION_FILES = {"logs/dispatch-session-sweep.log"}
+_DISPATCH_OBSERVATION_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def _dispatch_observation_file(relative: Path) -> bool:
-    return relative.as_posix() in _DISPATCH_OBSERVATION_FILES
+    if relative.as_posix() in _DISPATCH_OBSERVATION_FILES:
+        return True
+    parts = relative.parts
+    if len(parts) == 2 and parts[0] == "logs" and parts[1].endswith(".heartbeat"):
+        slug = parts[1][:-len(".heartbeat")]
+        return _DISPATCH_OBSERVATION_SLUG_RE.fullmatch(slug) is not None
+    if len(parts) == 1 and parts[0].startswith("plugin-load.") and parts[0].endswith(".mark"):
+        slug = parts[0][len("plugin-load."):-len(".mark")]
+        return _DISPATCH_OBSERVATION_SLUG_RE.fullmatch(slug) is not None
+    return False
 
 
 def _path_has_symlink_from(path: Path, boundary: Path) -> bool:
