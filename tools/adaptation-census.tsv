@@ -159,6 +159,7 @@ utility-deferred	dispatch_completion_join.py
 utility-deferred	dispatch_completion_join.test.py
 utility-deferred	dispatch_completion_marker.test.py
 utility-deferred	dispatch_continuation_budget.py
+utility-deferred	dispatch_attempt_reference.py
 utility-deferred	dispatch_contract.py
 utility-deferred	dispatch_contract.test.py
 utility-deferred	dispatch_degradation.py

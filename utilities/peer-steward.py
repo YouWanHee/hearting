@@ -5461,7 +5461,8 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                             now_ns=time.monotonic_ns())
         record = pending.claim(jobs.parent, storage_recipient, delivery_id,
                                claim_owner=owner, lease_seconds=30, require_generation_proof=False,
-                               jobs=jobs)
+                               jobs=jobs,
+                               retry_context=f"{harness}:{recipient_sid}:{pane}:{duty['id']}")
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent

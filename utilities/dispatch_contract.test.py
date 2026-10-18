@@ -2098,29 +2098,78 @@ class DispatchContractTest(unittest.TestCase):
         f"attempt_id={attempt}")
    self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
    observed=[]
+   writer_progress=[]
    def spawn(gate_fd):
     return subprocess.Popen(
      [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
       "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
-      sys.executable,"-c",f"from pathlib import Path;Path({str(marker)!r}).write_text('yes')"],
+      sys.executable,"-c",f"from pathlib import Path; import time; Path({str(marker)!r}).write_text('yes'); time.sleep(.2)"],
      pass_fds=(gate_fd,),start_new_session=True)
    def attach(identity):
     self.assertFalse(marker.exists())
     with Path(f"{jobs}.lock").open("a") as contender:
-     with self.assertRaises(BlockingIOError):
-      fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+     fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+     writer_progress.append(True)
+     fcntl.flock(contender.fileno(),fcntl.LOCK_UN)
     observed.append(dict(identity))
     return {"summary_owner":"dispatch-v1","summary_owner_pid":"777"}
    proc,identity=D.spawn_claimed_attempt(
     jobs,attempt,parent_binding=None,spawn=spawn,pre_release=attach)
+   self.assertIsNone(proc.poll())
+   with Path(f"{jobs}.lock").open("a") as contender:
+    fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+    self.assertIsNone(proc.poll())
+    fcntl.flock(contender.fileno(),fcntl.LOCK_UN)
    proc.wait(timeout=5)
    self.assertTrue(marker.exists())
+   self.assertEqual(writer_progress,[True])
    self.assertEqual(observed[0]["pid"],str(proc.pid))
    meta=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
    self.assertEqual(meta["summary_owner"],"dispatch-v1")
    self.assertEqual(meta["summary_owner_pid"],"777")
    self.assertEqual(meta["launch_claimed"],"1")
    self.assertEqual(identity["summary_owner"],"dispatch-v1")
+
+ def test_pre_release_wait_yields_registry_writer_for_all_harnesses(self):
+  for harness in ("claude", "codex", "opencode"):
+   with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
+    base=Path(td);jobs=base/"jobs.log";marker=base/"payload-started"
+    attempt=f"att-summary-{harness}"
+    row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+         f"harness={harness},attempt_id={attempt}")
+    self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+    writer_progress=[]
+    def spawn(gate_fd):
+     return subprocess.Popen(
+      [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+       "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+       sys.executable,"-c",f"from pathlib import Path; import time; Path({str(marker)!r}).write_text('yes'); time.sleep(10)"],
+      pass_fds=(gate_fd,),start_new_session=True)
+    def attach(_identity):
+     self.assertFalse(marker.exists())
+     with Path(f"{jobs}.lock").open("a") as contender:
+      fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+      writer_progress.append(True)
+      fcntl.flock(contender.fileno(),fcntl.LOCK_UN)
+     time.sleep(0.01)  # Stand in for the bounded summary-owner activation wait.
+     return {"summary_owner":"dispatch-v1"}
+    proc,_identity=D.spawn_claimed_attempt(
+     jobs,attempt,parent_binding=None,spawn=spawn,pre_release=attach)
+    try:
+     until=time.monotonic()+1
+     while not marker.exists() and proc.poll() is None and time.monotonic()<until:
+      time.sleep(0.01)
+     self.assertTrue(marker.exists())
+     self.assertIsNone(proc.poll())
+     with Path(f"{jobs}.lock").open("a") as contender:
+      fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+      self.assertIsNone(proc.poll())
+      fcntl.flock(contender.fileno(),fcntl.LOCK_UN)
+    finally:
+     if proc.poll() is None:
+      proc.terminate()
+     proc.wait(timeout=5)
+    self.assertEqual(writer_progress,[True])
 
  def test_post_claim_runs_unlocked_then_rejects_terminal_row_race(self):
   with tempfile.TemporaryDirectory() as td:

@@ -4864,6 +4864,25 @@ def _parent_binding_is_live_from_metadata(
     return live
 
 
+@contextmanager
+def _launch_serialization_lock(jobs: Path):
+    """Keep same-registry launch claims exclusive while the jobs lock is dropped."""
+    path = Path(f"{jobs}.launch.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1):
+            raise DispatchContractError("attempt-launch-lock-invalid")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def parent_attempt_binding_is_live(
     jobs: str | Path, binding: ParentAttemptBinding
 ) -> bool:
@@ -4929,7 +4948,7 @@ def spawn_claimed_attempt(
         raise DispatchContractError("attempt-id-required")
     ensure_global_registry_writable(jobs)
     lock_path = Path(f"{jobs}.lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
+    with _launch_serialization_lock(jobs), lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
         matches = []
@@ -5053,6 +5072,9 @@ def spawn_claimed_attempt(
             )
         observer_metadata: dict[str, str] = {}
         if pre_release is not None:
+            callback_error: BaseException | None = None
+            registry_reacquire_error: OSError | None = None
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             try:
                 observer_metadata = {
                     key: str(value)
@@ -5060,6 +5082,22 @@ def spawn_claimed_attempt(
                     if value not in (None, "")
                 }
             except BaseException as exc:
+                callback_error = exc
+            finally:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                except OSError as exc:
+                    registry_reacquire_error = exc
+            if registry_reacquire_error is not None:
+                cleanup_verified = _abort_fenced_launch(
+                    proc, gate_write, identity.get("pid_start", "")
+                )
+                raise DispatchContractError(
+                    "attempt-launch-registry-reacquire-failed"
+                    if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    str(registry_reacquire_error),
+                ) from registry_reacquire_error
+            if callback_error is not None:
                 cleanup_verified = _abort_fenced_launch(
                     proc, gate_write, identity.get("pid_start", "")
                 )
@@ -5069,8 +5107,95 @@ def spawn_claimed_attempt(
                         if cleanup_verified
                         else "attempt-launch-cleanup-unverified"
                     ),
-                    str(exc),
-                ) from exc
+                    str(callback_error),
+                ) from callback_error
+
+            # The observer activation wait runs outside the registry lock, so
+            # reload the exact claim before committing its metadata. The child
+            # remains fenced and the launch serialization lock prevents a
+            # second wrapper from claiming another row in this registry.
+            fresh_lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+            fresh_matches = []
+            for index, line in enumerate(fresh_lines):
+                fields = line.split("\t")
+                if len(fields) == 6 and row_has_attempt(fields[5], attempt_id):
+                    fresh_matches.append((index, fields, parse_registry_metadata(fields[5])))
+            changed_reason = "attempt-pre-release-row-not-unique"
+            changed_detail = attempt_id
+            claim_verified = False
+            if len(fresh_matches) == 1:
+                fresh_index, fresh_fields, fresh_meta = fresh_matches[0]
+                old_meta = {key: value for key, value in child_meta.items()
+                            if key != "resolved_model"}
+                new_meta = {key: value for key, value in fresh_meta.items()
+                            if key != "resolved_model"}
+                if (fresh_fields[1] not in {"open", "running"}
+                        or fresh_fields[2:5] != child_fields[2:5]
+                        or fresh_meta.get("attempt_id") != attempt_id
+                        or fresh_meta.get("launch_claimed") != "0"
+                        or new_meta != old_meta):
+                    changed_reason = "attempt-pre-release-identity-changed"
+                else:
+                    import route_parent_close
+                    if route_parent_close.row_requested(fresh_meta, jobs):
+                        changed_reason = "cancelled-by-parent"
+                    else:
+                        try:
+                            replacement_admission(jobs, fresh_lines, fresh_meta)
+                            validate_review_input(jobs, fresh_meta)
+                            validate_review_subject(jobs, fresh_fields, fresh_meta)
+                        except SourceSubjectError as exc:
+                            changed_reason, changed_detail = exc.reason, exc.detail
+                        except DispatchContractError as exc:
+                            changed_reason, changed_detail = exc.reason, exc.detail
+                        else:
+                            if parent_binding is not None:
+                                parent_matches = []
+                                for line in fresh_lines:
+                                    fields = line.split("\t")
+                                    if len(fields) != 6 or fields[1] not in {"open", "running"}:
+                                        continue
+                                    metadata = parse_registry_metadata(fields[5])
+                                    if metadata.get("attempt_id") == parent_binding.attempt_id:
+                                        parent_matches.append((fields, metadata))
+                                if len(parent_matches) != 1:
+                                    changed_reason = "parent-attempt-not-live"
+                                    changed_detail = parent_binding.attempt_id
+                                else:
+                                    parent_fields_now, parent_meta_now = parent_matches[0]
+                                    same_parent = (
+                                        parent_meta_now.get("dispatch_depth") == "1"
+                                        and parent_meta_now.get("worker_type") == "owner"
+                                        and canonical_repository_identity(parent_fields_now[2])
+                                        == parent_binding.repository_identity
+                                        and canonical_repository_identity(fresh_fields[2])
+                                        == parent_binding.repository_identity
+                                        and (parent_fields_now[3] == fresh_fields[3]
+                                             or is_linked_worktree_slice(fresh_meta))
+                                        and parent_fields_now[4] == fresh_meta.get("parent")
+                                        and fresh_meta.get("parent_attempt_id") == parent_binding.attempt_id
+                                        and parent_fields_now[3] == parent_binding.worktree
+                                        and parent_fields_now[4] == parent_binding.slug
+                                        and _parent_metadata_matches_binding(parent_meta_now, parent_binding)
+                                        and _parent_binding_is_live_from_metadata(
+                                            jobs, parent_meta_now, parent_binding)
+                                    )
+                                    if not same_parent:
+                                        changed_reason = "parent-attempt-not-live"
+                                        changed_detail = parent_binding.attempt_id
+                            if changed_reason == "attempt-pre-release-row-not-unique":
+                                child_index, child_fields, child_meta = (
+                                    fresh_index, fresh_fields, fresh_meta)
+                                lines = fresh_lines
+                                claim_verified = True
+            if not claim_verified:
+                cleanup_verified = _abort_fenced_launch(
+                    proc, gate_write, identity.get("pid_start", "")
+                )
+                raise DispatchContractError(
+                    changed_reason if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    changed_detail,
+                )
         callback_conflicts = sorted(
             ({*_PROCESS_IDENTITY_METADATA_KEYS, "launch_claimed"})
             .intersection(observer_metadata)
