@@ -27,7 +27,8 @@ class PermissionProfileTest(unittest.TestCase):
         self.env = {"PATH": os.environ["PATH"]}
         for key, name in (("HOME", "home"), ("CODEX_HOME", "codex-home"),
                           ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
-                          ("TMPDIR", "tmp"), ("CODEX_APP_SERVER_SOCKET_DIR", "sockets")):
+                          ("XDG_RUNTIME_DIR", "runtime"), ("TMPDIR", "tmp"),
+                          ("CODEX_APP_SERVER_SOCKET_DIR", "sockets")):
             path = self.base / name
             path.mkdir(mode=0o700)
             self.env[key] = str(path)

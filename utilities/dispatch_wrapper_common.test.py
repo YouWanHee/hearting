@@ -548,5 +548,35 @@ class SameRowTest(unittest.TestCase):
         self.assertEqual(rows["codex"]["reasoning"], "high")
         self.assertEqual(rows["claude"]["supervisor_lease_nonce"], "nonce")
 
+    def test_shared_start_path_checks_projection_before_seal_and_spawn(self):
+        from unittest import mock
+
+        args = self.args(Path(self.tmp))
+        args.action = "start"
+        args.route_file = None
+        jobs = Path(self.tmp) / "fenced.jobs.log"
+        claimed = []
+        with mock.patch.object(C.commit_policy, "assert_launch_permission_projection",
+                               side_effect=[None, C.DispatchContractError(
+                                   "runtime-permission-projection-changed",
+                                   "axis=git_operation predecessor=None candidate=merge child_spawned=0")]) as check, \
+             mock.patch.object(C.subprocess, "check_output", return_value="/repo\n"), \
+             mock.patch.object(C, "sealed_launch_home", return_value="/home"), \
+             mock.patch.object(C, "workflow_completion_receipt", return_value=""), \
+             mock.patch.object(C, "stage_session_metadata", return_value=""), \
+             mock.patch.object(C, "route_node_leg_fields", return_value=("-", "-")), \
+             mock.patch.object(C, "secrets") as secrets_, \
+             mock.patch("review_input.registration_fragment", return_value=""), \
+             mock.patch("dispatch_replacement.seal_launch_input", return_value=""):
+            secrets_.token_hex.return_value = "nonce"
+            C.append_job(jobs, args, harness="codex", runtime_sandbox="workspace-write",
+                         effort_key="reasoning", claim=lambda *a, **kw: claimed.append(kw) or True,
+                         marker_gate=None, replacement_sandbox="workspace-write")
+            self.assertEqual(check.call_count, 1)
+            with self.assertRaises(C.DispatchContractError) as refused:
+                claimed[0]["preclaim"]([])
+            self.assertIn("child_spawned=0", refused.exception.detail)
+            self.assertEqual(check.call_count, 2)
+
 if __name__ == "__main__":
     unittest.main()

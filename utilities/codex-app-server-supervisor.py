@@ -808,6 +808,16 @@ def run_turn(
     if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
         raise SupervisorError("turn-start-response-invalid")
     turn_id = turn["id"]
+    permission_event = commit_policy.permission_projection_event(
+        owner_projection, adapter="codex", attempt_id=getattr(args, "parent_attempt_id", ""),
+        thread_id=thread_id, turn_id=turn_id, sandbox=args.sandbox,
+        network_access=bool(args.network_access),
+        file_enforcement=("os-sandbox" if args.sandbox == "workspace-write" else "none"),
+        read_enforcement=("os-sandbox" if args.sandbox in {"workspace-write", "read-only"} else "none"),
+        network_enforcement=("os-sandbox" if args.sandbox == "workspace-write" else "none"),
+    )
+    if permission_event is not None:
+        emit(permission_event)
     control = getattr(args, "owner_input", None)
     if control is not None:
         control.started(turn_id)

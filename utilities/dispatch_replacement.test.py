@@ -508,10 +508,17 @@ class ReplacementTest(unittest.TestCase):
                     **D.parse_registry_metadata(first)},'open',append=True)
         host=SimpleNamespace(**vars(args));host.launch_lifecycle='detached'
         host.replacement_runtime_sandbox='workspace-write'
+        with self.assertRaises(D.DispatchContractError) as sandbox_change:
+            R.seal_launch_input(host,'codex','phase g2')
+        self.assertEqual(sandbox_change.exception.reason,'replacement-input-tuple-mismatch')
+        self.assertIn('axis=file',sandbox_change.exception.detail)
+        self.assertIn("predecessor='danger-full-access'",sandbox_change.exception.detail)
+        self.assertIn("candidate='workspace-write'",sandbox_change.exception.detail)
+        host.replacement_runtime_sandbox='danger-full-access'
         second=R.seal_launch_input(host,'codex','phase g2')
         saved=json.loads((R._directory(self.jobs)/'inputs'/'att-g2.json').read_text())
         self.assertEqual((saved['applied_permissions']['launch_lifecycle'],saved['applied_permissions']['runtime_sandbox']),
-                         ('detached','workspace-write'))
+                         ('detached','danger-full-access'))
         self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
         # A granted permission, the work or the sandbox it asks for still conflicts.
         for changes in ({'nested_headless_network':True},
@@ -522,7 +529,11 @@ class ReplacementTest(unittest.TestCase):
             with self.subTest(changed=sorted(changes)):
                 with self.assertRaises(D.DispatchContractError) as caught:
                     R.seal_launch_input(SimpleNamespace(**{**vars(host),**changes}),'codex','phase g2')
-                self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+                if 'replacement_input_argv' in changes:
+                    self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+                else:
+                    self.assertEqual(caught.exception.reason,'replacement-input-tuple-mismatch')
+                    self.assertIn('child_spawned=0', caught.exception.detail)
         with self.assertRaises(D.DispatchContractError):R.seal_launch_input(host,'codex','another phase')
         # Once claimed, even the launcher's location may not reseal it.
         self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'1'},'open',append=True)
@@ -543,12 +554,18 @@ class ReplacementTest(unittest.TestCase):
         replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
         shell={**replay,'applied_permissions':{'launch_lifecycle':'foreground-scoped','runtime_sandbox':'danger-full-access',
                                                'nested_headless_network':False}}
-        R._check_tuple({**shell,'applied_permissions':{'launch_lifecycle':'detached','runtime_sandbox':'workspace-write',
-                                                        'nested_headless_network':False}},shell)
+        with self.assertRaises(D.DispatchContractError) as sandbox_change:
+            R._check_tuple({**shell,'applied_permissions':{'launch_lifecycle':'detached','runtime_sandbox':'workspace-write',
+                                                           'nested_headless_network':False}},shell)
+        self.assertIn('axis=file', sandbox_change.exception.detail)
+        self.assertIn("predecessor='danger-full-access'", sandbox_change.exception.detail)
+        self.assertIn("candidate='workspace-write'", sandbox_change.exception.detail)
         with self.assertRaises(D.DispatchContractError) as caught:
             R._check_tuple({**shell,'applied_permissions':{**shell['applied_permissions'],'nested_headless_network':True}},shell)
-        self.assertEqual((caught.exception.reason,caught.exception.detail),
-                         ('replacement-input-tuple-mismatch','applied_permissions'))
+        self.assertEqual(caught.exception.reason,'replacement-input-tuple-mismatch')
+        self.assertIn('axis=network', caught.exception.detail)
+        self.assertIn('predecessor=False', caught.exception.detail)
+        self.assertIn('candidate=True', caught.exception.detail)
 
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
@@ -942,7 +959,9 @@ class ReplacementTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as caught:
             R.admission(self.jobs,self.jobs.read_text().splitlines(),metadata)
         self.assertEqual(caught.exception.reason,'replacement-input-tuple-mismatch')
-        self.assertEqual(caught.exception.detail,'applied_permissions')
+        self.assertIn('axis=adapter-permission', caught.exception.detail)
+        self.assertIn('predecessor=', caught.exception.detail)
+        self.assertIn('candidate=', caught.exception.detail)
 
     def test_replay_uses_raw_task_and_new_identity(self):
         record=self.claim();source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
@@ -2740,6 +2759,7 @@ class ReplacementTest(unittest.TestCase):
         self._blocked_owner()
         self._answer()
         first = self.claim()
+        self.assertEqual(first['original_attempt_id'], 'att-source')
         successor = self._successor(first, self.meta | {'worker_type': 'owner'}, status='open')
         import dispatch_owner_input as I
         I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
@@ -2749,8 +2769,14 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotEqual(result.get('reason'), 'automatic-replacement-exhausted', result)
         self.assertEqual(len(commands), 1)
         second = result['record']
+        self.assertEqual(second['original_attempt_id'], successor['attempt_id'])
         self.assertNotEqual(second['family_id'], first['family_id'])
         self.assertEqual(second['logical_node']['after_capacity'], successor['attempt_id'])
+        self.assertEqual(R.claim(self.jobs, successor['attempt_id']), second)
+        self.assertEqual(commands[0][commands[0].index('--attempt-id') + 1],
+                         second['replacement_attempt_id'])
+        self.assertEqual(commands[0][commands[0].index('--automatic-retry-of') + 1],
+                         successor['attempt_id'])
 
     def test_an_answered_replacement_its_launcher_refused_hands_the_answer_to_the_next_owner(self):
         self._blocked_owner()
@@ -2839,6 +2865,56 @@ class ReplacementTest(unittest.TestCase):
         same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
         with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
 
+    def test_permission_widening_and_narrowing_are_refused_with_axis_values(self):
+        base = {
+            'attempt_id': 'att-permission-axis', 'jobs': str(self.jobs.resolve()),
+            'worktree': str(self.root / 'wt'), 'launch_home': '/release/v1', 'resolved': {},
+            'applied_permissions': {
+                'runtime_sandbox': 'workspace-write', 'nested_headless_network': True,
+                'execution_access': {
+                    'writable_roots': ['/approved/output'], 'read_roots': ['/approved/input'],
+                    'network': 'enforced', 'file_enforcement': 'os-sandbox',
+                    'read_enforcement': 'os-sandbox', 'network_enforcement': 'os-sandbox',
+                },
+            },
+        }
+        variants = (
+            ('file', {'execution_access': {'writable_roots': ['/approved/output', '/extra/output'],
+                                           'read_roots': ['/approved/input'], 'network': 'enforced',
+                                           'file_enforcement': 'os-sandbox', 'read_enforcement': 'os-sandbox',
+                                           'network_enforcement': 'os-sandbox'}}),
+            ('file', {'execution_access': {'writable_roots': [], 'read_roots': ['/approved/input'],
+                                           'network': 'enforced', 'file_enforcement': 'none',
+                                           'read_enforcement': 'os-sandbox',
+                                           'network_enforcement': 'os-sandbox'}}),
+            ('read', {'execution_access': {'writable_roots': ['/approved/output'],
+                                           'read_roots': ['/other/input'], 'network': 'enforced',
+                                           'file_enforcement': 'os-sandbox', 'read_enforcement': 'os-sandbox',
+                                           'network_enforcement': 'os-sandbox'}}),
+            ('network', {'nested_headless_network': False}),
+            ('file', {'runtime_sandbox': 'read-only'}),
+        )
+        for axis, delta in variants:
+            permissions = dict(base['applied_permissions'])
+            permissions.update(delta)
+            candidate = {**base, 'applied_permissions': permissions}
+            with self.subTest(axis=axis, delta=delta), self.assertRaises(D.DispatchContractError) as refused:
+                R._check_tuple(candidate, base)
+            self.assertEqual(refused.exception.reason, 'replacement-input-tuple-mismatch')
+            self.assertIn(f'axis={axis}', refused.exception.detail)
+            self.assertIn('predecessor=', refused.exception.detail)
+            self.assertIn('candidate=', refused.exception.detail)
+            self.assertIn('child_spawned=0', refused.exception.detail)
+        no_network = json.loads(json.dumps(base))
+        no_network['applied_permissions']['nested_headless_network'] = False
+        no_network['applied_permissions']['execution_access']['network'] = 'not-requested'
+        with self.assertRaises(D.DispatchContractError) as widened:
+            R._check_tuple(base, no_network)
+        self.assertIn('axis=network', widened.exception.detail)
+        self.assertIn("predecessor='not-requested'", widened.exception.detail)
+        self.assertIn("candidate='enforced'", widened.exception.detail)
+        self.assertIn('child_spawned=0', widened.exception.detail)
+
     def test_a_release_root_spelled_through_its_pointer_is_the_same_permission(self):
         # TF rt-34ca7756: the owner's rules named releases/v3.13.0, the correcting session's
         # replacement named the `current` pointer to it, and the same work was refused.
@@ -2869,8 +2945,56 @@ class ReplacementTest(unittest.TestCase):
                                               f'Edit(//{self.root}/other/**)']}}}):
                 with self.assertRaises(D.DispatchContractError) as caught:
                     R._check_tuple(changed,sealed)
-                self.assertEqual((caught.exception.reason,caught.exception.detail),
-                                 ('replacement-input-tuple-mismatch','applied_permissions'))
+                self.assertEqual(caught.exception.reason, 'replacement-input-tuple-mismatch')
+                self.assertIn('axis=adapter-permission', caught.exception.detail)
+                self.assertIn('predecessor=', caught.exception.detail)
+                self.assertIn('candidate=', caught.exception.detail)
+                self.assertIn('child_spawned=0', caught.exception.detail)
+
+    def test_historical_read_axis_mismatch_is_detailed_on_normal_and_never_started_reentry(self):
+        import route_authority
+
+        jobs = self.root / 'history.jobs.log'
+        jobs.write_text('', encoding='utf-8')
+        attempt = 'att-history'
+        old = {
+            'attempt_id': attempt, 'jobs': str(jobs.resolve()), 'worktree': str(self.root / 'wt'),
+            'launch_home': '/release/v1', 'resolved': {}, 'route_id': 'rt-history',
+            'applied_permissions': {'execution_access': {
+                'writable_roots': [], 'read_roots': ['/data/records'],
+                'file_enforcement': 'none', 'read_enforcement': 'none',
+                'network': 'not-requested', 'network_enforcement': 'none',
+            }},
+        }
+        new = json.loads(json.dumps(old))
+        new['applied_permissions']['execution_access']['read_enforcement'] = 'os-sandbox'
+        sealed = R._directory(jobs) / 'inputs' / f'{attempt}.json'
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_bytes(R._bytes(old))
+        effective = jobs.parent / 'execution-access' / 'attempts' / attempt / 'effective.json'
+        effective.parent.mkdir(parents=True)
+        effective.write_text(json.dumps({
+            'attempt_id': attempt, 'route_id': 'rt-history', 'route_hash': 'sha256:' + '1' * 64,
+            'runtime': 'codex-exec', 'sandbox': 'workspace-write',
+            'writable_roots': [], 'read_roots': ['/data/records'], 'network_allowed': False,
+        }, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+        before_bytes = sealed.read_bytes()
+
+        detail = route_authority.permission_mismatch_detail(old, new)
+        self.assertIn('axis=read', detail)
+        self.assertIn("predecessor='none'", detail)
+        self.assertIn("candidate='os-sandbox'", detail)
+        self.assertIn(f'effective={effective}#sha256:', detail)
+        self.assertIn(f'sealed_input={sealed}#sha256:', detail)
+        with self.assertRaises(D.DispatchContractError) as refused:
+            R._check_tuple(new, old)
+        self.assertIn('axis=read', refused.exception.detail)
+        with self.assertRaises(D.DispatchContractError) as reentry:
+            R._reseal_allowed(jobs, attempt, sealed, new, lines=[])
+        self.assertEqual(reentry.exception.reason, 'replacement-input-tuple-mismatch')
+        self.assertIn('axis=read', reentry.exception.detail)
+        self.assertIn('child_spawned=0', reentry.exception.detail)
+        self.assertEqual(sealed.read_bytes(), before_bytes)
 
 
 class ReplacementReuseCurrencyTest(unittest.TestCase):

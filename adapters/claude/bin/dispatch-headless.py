@@ -885,7 +885,11 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
         mode, reason = requested, "launch-explicit"
     worktree = getattr(args, "worktree", None)
     settings_paths = _claude_settings_paths(worktree)
-    projection = commit_policy.runtime_permission_projection(args)
+    projection = (
+        commit_policy.launch_permission_projection(args)
+        if isinstance(getattr(args, "_launch_permission_projection", None), dict)
+        else commit_policy.capture_launch_permission_projection(args)
+    )
     args.merge_observation_only = bool(projection["observation_only"])
     if args.merge_observation_only:
         mode, reason = "plan", "active-git-operation"

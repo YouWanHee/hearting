@@ -169,8 +169,9 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         prompt = self.root / "prompt.txt"
         log = self.root / "log.jsonl"
         for delivery in ("one-shot", "app-server-supervised"):
-            current = self.codex.shell_command(self.codex_args(delivery), prompt, log)
-            base = self.codex_base.shell_command(self.codex_args(delivery), prompt, log)
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                current = self.codex.shell_command(self.codex_args(delivery), prompt, log)
+                base = self.codex_base.shell_command(self.codex_args(delivery), prompt, log)
             if delivery == "one-shot":
                 # Session persistence changed independently of access grants.
                 # Keep every permission/sandbox/path byte pinned to the base.
@@ -184,8 +185,9 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             current = current.replace(window_flag, "", 1)
             self.assertEqual(base, current)
         for delivery in ("one-shot", "session-resume-supervised"):
-            current = self.claude.shell_command(self.claude_args(delivery), prompt, log)
-            base = self.claude_base.shell_command(self.claude_args(delivery), prompt, log)
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                current = self.claude.shell_command(self.claude_args(delivery), prompt, log)
+                base = self.claude_base.shell_command(self.claude_args(delivery), prompt, log)
             if delivery == "session-resume-supervised":
                 current_args = shlex.split(current)
                 base_args = shlex.split(base)
@@ -687,6 +689,11 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
                 self.assertEqual(tuple(request.read_roots), tuple(grant.unwritable_read_roots))
                 self.assertEqual((grant.read_enforcement, grant.unmet), (grade, ()))
                 self.assertEqual(receipt_fields(grant)["execution_access_enforcement"], grade)
+        read_only = build_grant(request, runtime="codex-exec", effective_sandbox="read-only")
+        self.assertEqual((read_only.file_enforcement, read_only.network_enforcement,
+                          read_only.read_enforcement,
+                          receipt_fields(read_only)["execution_access_enforcement"]),
+                         ("none", "none", "os-sandbox", "os-sandbox"))
         open_sandbox = build_grant(request, runtime="codex-exec", effective_sandbox="danger-full-access")
         self.assertEqual((open_sandbox.read_enforcement, open_sandbox.unmet), ("none", ("read-only-unenforced",)))
         # A read-only root inside a writable area stays writable there, and the grant says so.

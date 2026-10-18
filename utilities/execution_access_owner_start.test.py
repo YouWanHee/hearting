@@ -118,13 +118,16 @@ class OwnerGrantStartTest(unittest.TestCase):
             except ChildProcessError:
                 pass
 
-    def request(self, name, root=None, network=False):
+    def request(self, name, root=None, network=False, read_roots=()):
         root = root or self.data
         path = self.root / (name + ".json")
         path.write_text(json.dumps({
-            "schema_version": 1, "writable_roots": [str(root)], "read_roots": [],
+            "schema_version": 1, "writable_roots": [str(root)],
+            "read_roots": [str(value) for value in read_roots],
             "network": {"required": network, "reason": "fixture" if network else "", "hosts": []},
-            "enforcement_required": "any", "justification": {str(root): "fixture output"},
+            "enforcement_required": "any",
+            "justification": {str(root): "fixture output",
+                              **{str(value): "fixture input" for value in read_roots}},
         }))
         return path
 
@@ -347,6 +350,26 @@ class OwnerGrantStartTest(unittest.TestCase):
             self.assertFalse((self.root / (attempt + ".started")).exists())
             self.assertNotIn("attempt_id=" + attempt + ",", self.jobs.read_text())
 
+    def test_codex_workspace_write_keeps_an_external_read_root_in_the_effective_grant(self):
+        route = self.route("codex")
+        external = self.root / "external-read-only"
+        external.mkdir()
+        request = self.request("codex-external-read", read_roots=(external,))
+        result, output = self.start("codex", OWNER, request, route=route)
+        self.assertEqual(0, result, output)
+        self.assertIn("started=1", output)
+        _, row = self.row(OWNER)
+        effective_path = Path(row["execution_access_effective_file"])
+        record = json.loads(effective_path.read_text(encoding="utf-8"))
+        self.assertEqual(row["runtime_sandbox"], "workspace-write")
+        self.assertIn(str(external.resolve()), record["read_roots"])
+        self.assertEqual(record["read_enforcement"], "os-sandbox")
+        self.assertEqual((record["file_enforcement"], record["network_enforcement"]),
+                         ("os-sandbox", "os-sandbox"))
+        self.assertEqual(row["execution_access_enforcement"], "os-sandbox")
+        self.assertEqual(hashlib.sha256(effective_path.read_bytes()).hexdigest(),
+                         row["execution_access_effective_sha256"])
+
     def test_other_adapters_publish_the_same_validated_owner_identity(self):
         for adapter in ("claude", "opencode"):
             with self.subTest(adapter=adapter):
@@ -362,6 +385,27 @@ class OwnerGrantStartTest(unittest.TestCase):
                 self.assertEqual(route[1]["route_hash"], record["route_hash"])
                 parent = load_parent_effective_grant(jobs=self.jobs, parent_attempt_id=attempt, context=self.context)
                 self.assertIn(self.data, parent.writable_roots)
+
+    def test_exact_attempt_reentry_spawns_one_real_child_on_each_adapter(self):
+        for adapter in ("codex", "claude", "opencode"):
+            with self.subTest(adapter=adapter):
+                attempt = "att-" + hashlib.sha256(("single-spawn-" + adapter).encode()).hexdigest()[:32]
+                route = self.route(adapter)
+                first, output = self.start(adapter, attempt, self.request(attempt), route=route)
+                self.assertEqual(first, 0, output)
+                marker = self.root / (attempt + ".started")
+                first_pid = marker.read_text(encoding="utf-8")
+                fields, first_row = self.row(attempt)
+                second, duplicate = self.start(adapter, attempt, self.request(attempt), route=route)
+                self.assertNotEqual(second, 0, duplicate)
+                self.assertIn("reason=attempt-identity-conflict", duplicate)
+                self.assertIn("child_spawned=0", duplicate)
+                self.assertEqual(marker.read_text(encoding="utf-8"), first_pid)
+                rows = [line for line in self.jobs.read_text().splitlines()
+                        if f"attempt_id={attempt}" in line]
+                self.assertEqual(len(rows), 1)
+                self.assertIn(f"pid={first_row['pid']}", rows[0])
+                self.assertTrue(fields[1] in {"open", "running"})
 
     def test_each_owner_tree_runs_on_the_release_its_launch_resolved(self):
         # Launched through a moving pointer (`<share>/hearting/current`), the owner gets the

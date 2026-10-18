@@ -475,6 +475,11 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     sandbox and effort, any fields only it records, and -- looked up in its
     own module at call time -- the claim and completion-gate functions.
     """
+    if args.action in {"register", "start"}:
+        # Validate the complete shared projection before sealing permissions or
+        # mutating the registry. Adapter settings and this row were rendered
+        # from the captured projection above.
+        commit_policy.assert_launch_permission_projection(args)
     jobs.parent.mkdir(parents=True, exist_ok=True)
     repo = subprocess.check_output(["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True).strip()
     pipe = (
@@ -667,16 +672,22 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     quick_exclusive = ({"route_id": args.route_id, "route_node": args.route_node}
                        if getattr(args, "quick_attempt", False) else None)
     preclaim = None
-    if args.action == "start" and args.route_file:
-        preclaim = lambda lines: marker_gate(
-            args.route_file,
-            args.route_node,
-            args.action,
-            args.agent_home,
-            jobs,
-            registry_lines=lines,
-            attempt_id=args.attempt_id,
-        )
+    if args.action == "start":
+        def preclaim(lines):
+            # This is the last existing safety fence before spawn. Reobserve
+            # Git here so a state transition after registration cannot launch
+            # with native settings that no longer match the current decision.
+            commit_policy.assert_launch_permission_projection(args)
+            if args.route_file:
+                marker_gate(
+                    args.route_file,
+                    args.route_node,
+                    args.action,
+                    args.agent_home,
+                    jobs,
+                    registry_lines=lines,
+                    attempt_id=args.attempt_id,
+                )
     args.launch_preclaim = preclaim
     mutation_precheck = lambda lines: ensure_terminal_claim_absent(
         jobs, args.route_id, args.parent_attempt_id or args.attempt_id

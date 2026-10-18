@@ -1512,13 +1512,13 @@ def main(argv: list[str]) -> int:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
     try:
         default_roots = adapter_default_roots(args)
+        projection = commit_policy.capture_launch_permission_projection(args)
+        args.merge_observation_only = bool(projection["observation_only"])
+        args.task_publish_scope = projection["task_publish_scope"]
         args.execution_access_grant = route_authority.bind_launch_access(
             args, runtime="opencode", default_roots=default_roots)
         grant = args.execution_access_grant
         args.opencode_config_base_content = os.environ.get("OPENCODE_CONFIG_CONTENT", "")
-        projection = commit_policy.runtime_permission_projection(args)
-        args.merge_observation_only = bool(projection["observation_only"])
-        args.task_publish_scope = projection["task_publish_scope"]
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,

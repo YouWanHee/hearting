@@ -131,10 +131,34 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
     events is not cut off while silence for the whole window still times out.
     The default keeps the fixed deadline a bounded caller relies on."""
     session = read_binding(args)
+    permission_projection_sent = False
+
+    def publish_permission_projection() -> None:
+        nonlocal permission_projection_sent
+        if permission_projection_sent or not session:
+            return
+        try:
+            import commit_policy
+            projection = commit_policy.permission_projection_event(
+                getattr(args, "owner_runtime_permission_state", None),
+                adapter="opencode", attempt_id=getattr(args, "parent_attempt_id", ""),
+                thread_id=session,
+                turn_id=str(getattr(args, "owner_runtime_turn_ordinal", "direct")),
+                sandbox="adapter-default", network_access=False,
+                file_enforcement="tool-permission", read_enforcement="tool-permission",
+                network_enforcement="none",
+            )
+        except ImportError:
+            projection = None
+        if projection is not None:
+            emit(projection)
+            permission_projection_sent = True
+
     if session:
         emit({"type": "dispatch.supervisor.session", "runtime": "opencode",
               "parent_attempt_id": args.parent_attempt_id,
               "session_id": session, "cwd": args.worktree})
+        publish_permission_projection()
     final_text = ""
     terminal_stop = False
     runtime_error = None
@@ -161,6 +185,7 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
             emit({"type": "dispatch.supervisor.session", "runtime": "opencode",
                   "parent_attempt_id": args.parent_attempt_id,
                   "session_id": session, "cwd": args.worktree})
+            publish_permission_projection()
         kind = value.get("type")
         part = value.get("part") or {}
         if kind == "text":
