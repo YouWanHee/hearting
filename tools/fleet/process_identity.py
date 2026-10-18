@@ -211,7 +211,7 @@ def _record():
     return SessionIdentity
 
 
-def process_identity(pid, harness, *, live_codex=None):
+def process_identity(pid, harness, *, live_codex=None, codex_observation=None):
     """The identity record `harness`'s own source proves for `pid`."""
     record = _record()
     session_id, source = None, ""
@@ -221,7 +221,8 @@ def process_identity(pid, harness, *, live_codex=None):
             session_id, source = claude.session_id_of_process(pid), "claude-session-registry"
         elif harness == "codex":
             from .collectors import codex
-            session_id, source = codex.session_id_of_process(pid, live_codex), "codex-process"
+            session_id, source = codex.session_id_of_process(
+                pid, live_codex, observation=codex_observation), "codex-process"
         elif harness == "opencode":
             from .collectors import opencode
             session_id, source = opencode.session_of_process(pid)

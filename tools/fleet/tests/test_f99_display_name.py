@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """F-99 — canonical session display name.
 
-Pure-fixture coverage for `session_handle.display_name()`/`resolve_display_inputs()`,
-plus the additive `Session.runtime_name` --json field (Amendment 1 / R2-1) and the
-Fleet render-side wiring (`_session_name`/`_session_name_companion`).
+Pure fixtures cover the display helpers and Fleet wiring; an actual subprocess
+runs Claude's statusline.sh against isolated pid, title, config and state paths.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,7 +19,11 @@ if _TOOLS_DIR not in sys.path:
 
 from fleet import render                                          # noqa: E402
 from fleet.model import Session                                   # noqa: E402
-from fleet.session_handle import display_name, resolve_display_inputs, session_handle  # noqa: E402
+from fleet.session_handle import (current_session_subject, display_name,
+                                  resolve_display_inputs, session_handle)  # noqa: E402
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+_STATUSLINE = os.path.join(_REPO_ROOT, "adapters", "claude", "statusline.sh")
 
 
 class _HermeticStateRoot(unittest.TestCase):
@@ -150,49 +155,130 @@ class ResolveDisplayInputsTest(_HermeticStateRoot):
 
 
 class DerivedSessionThreeSurfaceFixtureTest(_HermeticStateRoot):
-    """Owner adjudication R2-5 / Amendment 2's named fixture: `session_name` = AI
-    title, registry `name` = `hearting-fb`, `nameSource` = `derived` → statusline,
-    Fleet, and the Herdr formatter must all resolve to ONE identical string. This
-    is the pure-fixture half of that requirement (statusline/Herdr's own scripted
-    comparison was a one-off capture, since neither has a native test harness)."""
+    """Pure fixtures for current user-name / successful-title / blank selection.
+
+    These check selector inputs only; a separate test executes the real shell
+    consumer with isolated pid, title, config and state paths.
+    """
 
     def test_statusline_and_fleet_chain_converge_on_the_same_string(self):
         self._write_pid_record(5151, "hearting-fb", "derived")
-        session_name_stdin = "AI generated title"
+        successful_title = "Persisted successful title"
 
-        # statusline.sh's own call shape (adapters/claude/statusline.sh): resolve
-        # inputs from the pid record, then pass the stdin session_name as `title`.
+        # Pure selection fixture: derived labels and native session_name are not
+        # promoted; only persisted success is the fallback after a user name.
         statusline_inputs = resolve_display_inputs("claude", "sid-derived", pid=5151)
-        statusline_name = display_name(
-            "claude", "sid-derived", runtime_name=statusline_inputs["runtime_name"],
-            registry_name=statusline_inputs["registry_name"], title=session_name_stdin,
-            slug=None, cwd=None)
+        statusline_name = current_session_subject(
+            statusline_inputs["runtime_name"], successful_title)
 
-        # Fleet's collector shape: the same AI title lands on Session.title (the
-        # same underlying sidecar value statusline's stdin session_name carries),
-        # nameSource=derived leaves Session.runtime_name unset (C4).
+        # Fleet's collector shape receives the same last successful title.
         session = Session(harness="claude", pid=5151, session_id="sid-derived",
-                          title=session_name_stdin, registry_name="hearting-fb",
+                          title=successful_title, registry_name="hearting-fb",
                           runtime_name=None, slug="hearting-fb", cwd="/work/repo")
         fleet_name = render._session_name(session)
 
-        self.assertEqual(statusline_name, session_name_stdin)
-        self.assertEqual(fleet_name, session_name_stdin)
+        self.assertEqual(current_session_subject(statusline_inputs["runtime_name"], None), "")
+        self.assertEqual(statusline_name, successful_title)
+        self.assertEqual(fleet_name, successful_title)
         self.assertEqual(statusline_name, fleet_name)
 
     def test_user_set_name_also_converges(self):
         self._write_pid_record(5252, "my-custom-name", "user")
         statusline_inputs = resolve_display_inputs("claude", "sid-user", pid=5252)
-        statusline_name = display_name(
-            "claude", "sid-user", runtime_name=statusline_inputs["runtime_name"],
-            registry_name=statusline_inputs["registry_name"], title="unrelated AI title",
-            slug=None, cwd=None)
+        statusline_name = current_session_subject(
+            statusline_inputs["runtime_name"], "last successful title")
         session = Session(harness="claude", pid=5252, session_id="sid-user",
                           title="unrelated AI title", registry_name="my-custom-name",
                           runtime_name="my-custom-name", slug="my-custom-name", cwd="/work/repo")
         fleet_name = render._session_name(session)
         self.assertEqual(statusline_name, "my-custom-name")
         self.assertEqual(fleet_name, "my-custom-name")
+
+
+@unittest.skipUnless(os.path.isfile("/proc/self/comm"),
+                     "Claude pid-name walk-up requires Linux /proc")
+class StatuslineSubprocessTest(_HermeticStateRoot):
+    """Run the production shell script with writable state under TemporaryDirectory."""
+
+    def setUp(self):
+        super().setUp()
+        tools_link = Path(self.tmp.name) / "tools"
+        tools_link.mkdir()
+        (tools_link / "fleet").symlink_to(Path(_TOOLS_DIR) / "fleet",
+                                          target_is_directory=True)
+        self.title_state = Path(self.tmp.name) / "title-state"
+        self.title_state.mkdir()
+        self.claude_config = Path(self.tmp.name) / "claude-config"
+        self.claude_config.mkdir()
+
+    def _run_statusline(self, sid, cwd_name, *, name, name_source, title=None,
+                        native_name="automatic stdin title"):
+        cwd = Path(self.tmp.name) / "workspaces" / cwd_name
+        cwd.mkdir(parents=True, exist_ok=True)
+        if title is not None:
+            title_dir = self.title_state / "claude"
+            title_dir.mkdir(parents=True, exist_ok=True)
+            (title_dir / (sid + ".json")).write_text(json.dumps({
+                "title": title, "ts": 1, "source": "refresher",
+            }), encoding="utf-8")
+        env = dict(os.environ)
+        env.update({
+            "AGENT_HOME": self.tmp.name,
+            "CLAUDE_CONFIG_DIR": str(self.claude_config),
+            "FLEET_TITLE_STATE_DIR": str(self.title_state),
+            "FLEET_TITLE_DISABLE": "1",
+            "STATUSLINE_TEST_SCRIPT": _STATUSLINE,
+            "TEST_SESSION_NAME": name,
+            "TEST_NAME_SOURCE": name_source,
+        })
+        payload = json.dumps({
+            "session_id": sid, "session_name": native_name, "cwd": str(cwd),
+            "model": {"display_name": "Fixture"},
+        })
+        runner = """
+import ctypes, json, os, subprocess, sys
+ctypes.CDLL(None).prctl(15, b"claude", 0, 0, 0)
+sessions = os.path.join(os.environ["AGENT_HOME"], "sessions")
+os.makedirs(sessions, exist_ok=True)
+with open(os.path.join(sessions, str(os.getpid()) + ".json"), "w", encoding="utf-8") as f:
+    json.dump({"name": os.environ["TEST_SESSION_NAME"],
+               "nameSource": os.environ["TEST_NAME_SOURCE"]}, f)
+result = subprocess.run(["bash", os.environ["STATUSLINE_TEST_SCRIPT"]],
+                        input=sys.stdin.read(), text=True, capture_output=True,
+                        env=os.environ.copy())
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+raise SystemExit(result.returncode)
+"""
+        result = subprocess.run([sys.executable, "-c", runner], input=payload,
+                                text=True, capture_output=True, env=env, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_real_statusline_selects_user_name_last_success_blank_and_cwd_name(self):
+        explicit = self._run_statusline(
+            "statusline-explicit", "explicit-workspace", name="User chosen subject",
+            name_source="user", title="Older successful title")
+        self.assertIn("User chosen subject", explicit)
+        self.assertNotIn("Older successful title", explicit)
+
+        last_success = self._run_statusline(
+            "statusline-last-success", "title-workspace", name="derived-workspace-42",
+            name_source="derived", title="Last successful title")
+        self.assertIn("Last successful title", last_success)
+        self.assertNotIn("derived-workspace-42", last_success)
+
+        no_success = self._run_statusline(
+            "statusline-no-success", "blank-workspace", name="derived-generated-name",
+            name_source="derived")
+        self.assertNotIn("automatic stdin title", no_success)
+        self.assertNotIn("derived-generated-name", no_success)
+
+        cwd_name = "same-name-workspace"
+        same_as_cwd = self._run_statusline(
+            "statusline-same-cwd", cwd_name, name=cwd_name, name_source="user",
+            title="Older title")
+        self.assertGreaterEqual(same_as_cwd.count(cwd_name), 2, same_as_cwd)
 
 
 class RuntimeNameJsonAdditiveTest(unittest.TestCase):

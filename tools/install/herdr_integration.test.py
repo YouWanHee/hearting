@@ -20,6 +20,7 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import herdr_integration as herdr  # noqa: E402
 import fixture_env  # noqa: E402
+import projector  # noqa: E402
 
 
 class PinnedSourceTest(unittest.TestCase):
@@ -29,6 +30,88 @@ class PinnedSourceTest(unittest.TestCase):
                 checks = herdr.source_checks(runtime, ROOT)
                 self.assertTrue(checks)
                 self.assertFalse([item for item in checks if not item["ok"]], checks)
+
+    def test_claude_reporter_has_one_copy_managed_destination(self):
+        with tempfile.TemporaryDirectory(prefix="herdr-claude-plan-") as temporary:
+            home = Path(temporary) / "claude-home"
+            with mock.patch.object(projector.paths, "runtime_home", return_value=home):
+                entries = projector.plan(["claude"], scope="global")["claude"]
+        dest = home / "hooks/herdr-agent-state.sh"
+        matching = [entry for entry in entries if Path(entry.get("dest", "")) == dest]
+        self.assertEqual(len(matching), 1, matching)
+        self.assertEqual(matching[0]["action"], "copy_managed")
+        self.assertEqual(matching[0]["integration_id"], "claude")
+
+    def test_codex_uses_the_herdr_home_asset_for_callback_and_manifest(self):
+        self.assertEqual(
+            herdr.CODEX_SESSION_COMMAND,
+            'bash "${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh" session',
+        )
+        codex_asset = [item for item in projector._CODEX_TABLE
+                       if item.get("action") == "copy_managed"
+                       and item.get("integration_id") == "codex"]
+        self.assertEqual(len(codex_asset), 1)
+        self.assertEqual(codex_asset[0]["dest_name"], "herdr-agent-state.sh")
+        self.assertNotIn(("herdr-agent-state.sh", "adapters/codex/hooks/herdr-agent-state.sh"),
+                         projector._CODEX_FIXED_SYMLINKS)
+        with tempfile.TemporaryDirectory(prefix="herdr-codex-manifest-") as temporary:
+            root = Path(temporary)
+            source = root / "source/adapters/codex/hooks/herdr-agent-state.sh"
+            dest = root / "codex-home/herdr-agent-state.sh"
+            source.parent.mkdir(parents=True)
+            dest.parent.mkdir(parents=True)
+            source.write_text("source\n", encoding="utf-8")
+            dest.write_text("installed\n", encoding="utf-8")
+            receipt = herdr.manifest_assets("codex", root / "source", root / "codex-home")
+        self.assertEqual([item["path"] for item in receipt["assets"]],
+                         ["herdr-agent-state.sh"])
+
+    def test_configured_codex_session_command_parses_and_runs_in_fake_codex_home(self):
+        hooks = json.loads((ROOT / "adapters/codex/hooks/hooks.json").read_text(encoding="utf-8"))
+        commands = [item["command"] for group in hooks["hooks"]["SessionStart"]
+                    for item in group.get("hooks", [])]
+        self.assertIn(herdr.CODEX_SESSION_COMMAND, commands)
+        with tempfile.TemporaryDirectory(prefix="codex session command ") as temporary:
+            home = Path(temporary) / "codex home"
+            home.mkdir()
+            marker = Path(temporary) / "invoked.txt"
+            helper = home / "herdr-agent-state.sh"
+            helper.write_text('#!/bin/sh\nprintf "%s\\n" "$1" > "$CODEX_HOOK_MARKER"\n',
+                              encoding="utf-8")
+            helper.chmod(0o700)
+            env = {**os.environ, "HOME": str(Path(temporary) / "home"),
+                   "CODEX_HOME": str(home), "CODEX_HOOK_MARKER": str(marker)}
+            env.pop("HERDR_SOCKET_PATH", None)
+            env.pop("HERDR_PANE_ID", None)
+            syntax = subprocess.run(["bash", "-n", "-c", herdr.CODEX_SESSION_COMMAND],
+                                    text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+            result = subprocess.run(["bash", "-c", herdr.CODEX_SESSION_COMMAND],
+                                    text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "session\n")
+
+    def test_hearting_update_adopts_only_the_matching_herdr_owned_file(self):
+        with tempfile.TemporaryDirectory(prefix="herdr-asset-adoption-") as temporary:
+            root = Path(temporary)
+            source = root / "release/adapters/codex/hooks/herdr-agent-state.sh"
+            home = root / "codex-home"
+            dest = home / "herdr-agent-state.sh"
+            source.parent.mkdir(parents=True)
+            home.mkdir()
+            source.write_text("# installed by herdr\n# HERDR_INTEGRATION_ID=codex\n"
+                              "# HERDR_INTEGRATION_VERSION=10\nnew\n", encoding="utf-8")
+            dest.write_text("# installed by herdr\n# HERDR_INTEGRATION_ID=codex\n"
+                            "# HERDR_INTEGRATION_VERSION=7\nold\n", encoding="utf-8")
+            result = herdr.project_asset(source, dest, "codex", allowed_root=home)
+            self.assertEqual(result["status"], "updated")
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual(dest.read_bytes(), source.read_bytes())
+
+            dest.write_text("user callback\n", encoding="utf-8")
+            result = herdr.project_asset(source, dest, "codex", allowed_root=home)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(dest.read_text(encoding="utf-8"), "user callback\n")
 
     def test_user_hook_file_migrates_in_place_and_activation_receipt_unmerges_only_ours(self):
         with tempfile.TemporaryDirectory(prefix="herdr-claude-hooks-") as tmp:
@@ -170,14 +253,62 @@ class JsoncRegistrationTest(unittest.TestCase):
             cli_data = json.loads(cli.read_text(encoding="utf-8"))
             self.assertIn(herdr.OPENCODE_TUI_V2, cli_data["plugins"])
             self.assertIn(herdr.OPENCODE_IDENTITY, cli_data["plugins"])
+            refreshed = herdr.migrate_opencode_configs(
+                home, ROOT, previous=result["managed_config"])
+            self.assertFalse([item for item in refreshed["actions"] if item["changed"]],
+                             refreshed["actions"])
+            self.assertEqual(refreshed["managed_config"], result["managed_config"])
             with fixture_env.patched_environment(tmp, ROOT):
-                removed = herdr.remove_opencode_configs(home, result["managed_config"])
+                removed = herdr.remove_opencode_configs(home, refreshed["managed_config"])
             self.assertIn(str(tui), removed)
             self.assertIn(str(cli), removed)
             restored = herdr.parse_jsonc(tui.read_text(encoding="utf-8"))
             self.assertEqual(restored["plugin"], ["./user-tui.js"])
             self.assertEqual(restored["theme"], "user-theme")
             self.assertFalse(cli.exists())
+
+    def test_migration_repairs_both_json_formats_without_removing_user_or_identity_plugins(self):
+        with tempfile.TemporaryDirectory(prefix="herdr config spaces ") as tmp:
+            root = Path(tmp)
+            home = root / ".config" / "opencode"
+            home.mkdir(parents=True)
+            configs = {
+                "tui.jsonc": ("plugin", ["./user-tui.js", "./tui/herdr-tui-session.js",
+                                           "../../old release/adapters/opencode/tui/herdr-tui-session.js",
+                                           "./tui/hearting-tui-identity.ts"]),
+                "tui.json": ("plugin", [str(root / "old release/adapters/opencode/tui/herdr-tui-session.js"),
+                                          "./user-json.js", "./tui/hearting-tui-identity.ts"]),
+                "cli.jsonc": ("plugins", ["./user-cli.js", "./tui/herdr-opencode",
+                                             "../../old release/adapters/opencode/tui/herdr-opencode/tui.js",
+                                             "./tui/hearting-tui-identity.ts"]),
+                "cli.json": ("plugins", [str(home / "tui/herdr-opencode/tui.js"),
+                                           "./user-cli-json.js", "./tui/hearting-tui-identity.ts"]),
+            }
+            for name, (key, values) in configs.items():
+                encoded = json.dumps(values)
+                (home / name).write_text(
+                    f'{{\n  // preserve {name} user options\n  "{key}": {encoded},\n  "theme": "keep",\n}}\n',
+                    encoding="utf-8")
+
+            result = herdr.migrate_opencode_configs(home, ROOT)
+            self.assertTrue(all(item["status"] in {"updated", "unchanged"}
+                                for item in result["actions"]), result["actions"])
+            for name, (key, original) in configs.items():
+                text = (home / name).read_text(encoding="utf-8")
+                data = herdr.parse_jsonc(text)
+                expected = herdr.OPENCODE_TUI_V1 if key == "plugin" else herdr.OPENCODE_TUI_V2
+                self.assertEqual(data[key].count(expected), 1, (name, data[key]))
+                self.assertIn(herdr.OPENCODE_IDENTITY, data[key], name)
+                self.assertIn(next(value for value in original if value.startswith("./user")),
+                              data[key], name)
+                self.assertEqual(data["theme"], "keep", name)
+                self.assertIn(f"preserve {name} user options", text)
+                self.assertFalse(any(herdr._legacy_opencode_tui_ref(
+                    value, "tui" if key == "plugin" else "cli", home, ROOT)
+                    for value in data[key]), (name, data[key]))
+
+            rerun = herdr.migrate_opencode_configs(home, ROOT)
+            self.assertFalse([item for item in rerun["actions"] if item["changed"]], rerun["actions"])
 
     def test_symlinked_runtime_config_is_never_rewritten(self):
         with tempfile.TemporaryDirectory(prefix="herdr-symlink-") as tmp:
@@ -194,8 +325,8 @@ class JsoncRegistrationTest(unittest.TestCase):
 
 class NativeSessionReporterFixtureTest(unittest.TestCase):
     def _run_hook(self, harness, payload, *, allowed, launch_argv, extra_env=None,
-                  expect_report=True):
-        with tempfile.TemporaryDirectory(prefix="herdr-session-hook-") as tmp:
+                  expect_report=True, source_asset=False):
+        with tempfile.TemporaryDirectory(prefix="herdr session hook ") as tmp:
             root = Path(tmp)
             tools = root / "tools" / "fleet"
             tools.mkdir(parents=True)
@@ -233,12 +364,13 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
             )
             if harness == "claude":
                 source = ROOT / "hooks" / "herdr-agent-state.sh"
-                script = root / "hooks" / "herdr-agent-state.sh"
+                script = source if source_asset else root / ".claude" / "hooks" / "herdr-agent-state.sh"
             else:
                 source = ROOT / "adapters" / "codex" / "hooks" / "herdr-agent-state.sh"
-                script = root / "adapters" / "codex" / "hooks" / "herdr-agent-state.sh"
-            script.parent.mkdir(parents=True)
-            shutil.copyfile(source, script)
+                script = source if source_asset else root / "codex home" / "herdr-agent-state.sh"
+            if not source_asset:
+                script.parent.mkdir(parents=True)
+                shutil.copyfile(source, script)
 
             socket_path = str(root / "herdr.sock")
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -265,6 +397,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
             env = {
                 **fixture_env.build_environment(root, ROOT),
                 "AGENT_HOME": str(root),
+                "CODEX_HOME": str(root / "codex home"),
                 "HERDR_ENV": "1",
                 "HERDR_SOCKET_PATH": socket_path,
                 "HERDR_PANE_ID": "pane-fixture",
@@ -312,6 +445,19 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                     else:
                         self.assertNotIn("resume_argv", params)
                     self.assertGreater(params["seq"], 10**18)
+
+    def test_codex_source_and_runtime_copy_report_through_the_pinned_root_with_spaces(self):
+        payload = {
+            "hook_event_name": "SessionStart", "session_id": "ses-A",
+            "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
+        }
+        launch = ["codex", "--resume", "ses-A"]
+        for source_asset in (True, False):
+            with self.subTest(source_asset=source_asset):
+                request = self._run_hook("codex", payload, allowed=True, launch_argv=launch,
+                                         source_asset=source_asset)
+                self.assertEqual(request["method"], "pane.report_agent_session")
+                self.assertEqual(request["params"]["agent_session_id"], "ses-A")
 
     def test_native_hooks_translate_proven_absolute_launcher_argv_for_wire(self):
         for harness in ("claude", "codex"):
@@ -383,15 +529,17 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 }, allowed=False, launch_argv=launch)
                 self.assertIsNone(request)
 
-    def test_codex_display_projection_does_not_compute_inactive_session_lifecycle(self):
+    def test_codex_display_projection_carries_native_lifecycle_to_reporter(self):
         path = ROOT / "adapters" / "codex" / "hooks" / "herdr_session_projection.py"
         module_spec = importlib.util.spec_from_file_location("herdr_session_projection_fixture", path)
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         with mock.patch.object(module, "_project", return_value=True) as project, \
-                mock.patch.object(module.subprocess, "Popen"):
+                mock.patch.object(module.subprocess, "Popen"), \
+                mock.patch.object(module.time, "time_ns", return_value=123456):
             module.project({"hook_event_name": "SessionStart", "source": "resume"}, "ses-A")
-        project.assert_called_once_with("codex", "ses-A", worker=False, report_session=False)
+        project.assert_called_once_with("codex", "ses-A", worker=False, report_session=True,
+                                        session_seq=123456, session_start_source="resume")
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for the asset registration fixture")
@@ -411,12 +559,12 @@ const commands = (hooks) => Object.values(hooks).flat().flatMap((group) => group
   .map((hook) => hook.command || "");
 if (commands(claude.hooks).filter((value) => value.includes("herdr-agent-state.sh")).length !== 1) throw Error("Claude reporter registration");
 if (commands(codex.hooks).filter((value) => value.includes("herdr-agent-state.sh")).length !== 1) throw Error("Codex reporter registration");
-if (!v1.plugin.includes("./tui/herdr-tui-session.js")) throw Error("V1 TUI registration");
-if (!v2.plugins.includes("./tui/herdr-opencode")) throw Error("V2 CLI registration");
+if (!v1.plugin.includes("./herdr-tui-session.js")) throw Error("V1 TUI registration");
+if (!v2.plugins.includes("./herdr-opencode")) throw Error("V2 CLI registration");
 if (!heartingPublisher.includes("--no-report-session") || heartingPublisher.includes("paneReportSequence")) throw Error("duplicate OpenCode session reporter");
 const backend = await import(pathToFileURL(`${assets}/plugins/herdr-agent-state.js`));
-const tuiV1 = await import(pathToFileURL(`${assets}/tui/herdr-tui-session.js`));
-const tuiV2 = await import(pathToFileURL(`${assets}/tui/herdr-opencode/tui.js`));
+const tuiV1 = await import(pathToFileURL(`${assets}/herdr-tui-session.js`));
+const tuiV2 = await import(pathToFileURL(`${assets}/herdr-opencode/tui.js`));
 if (backend.default.id !== "herdr.opencode") throw Error("OpenCode backend export");
 if (tuiV1.default.id !== "herdr.opencode.session-selection") throw Error("V1 TUI export");
 if (tuiV2.default.id !== tuiV1.default.id) throw Error("V2 TUI export");
@@ -430,7 +578,13 @@ console.log("Claude/Codex session hooks and OpenCode v1/v2 assets registered");
                 "adapters/opencode/tui/herdr-tui-session.js",
                 "adapters/opencode/tui/herdr-opencode/tui.js",
             ):
-                target = asset_root / relative.removeprefix("adapters/opencode/")
+                source_relative = relative.removeprefix("adapters/opencode/")
+                target_relative = {
+                    "plugins/herdr-agent-state.js": "plugins/herdr-agent-state.js",
+                    "tui/herdr-tui-session.js": "herdr-tui-session.js",
+                    "tui/herdr-opencode/tui.js": "herdr-opencode/tui.js",
+                }[source_relative]
+                target = asset_root / target_relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / relative, target)
             result = subprocess.run(
@@ -554,7 +708,8 @@ import net from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 const base = process.env.HEARTING_TEST_ASSET_ROOT;
-const tui = await import(pathToFileURL(`${base}/tui/herdr-tui-session.js`));
+const tuiV1 = await import(pathToFileURL(`${base}/herdr-tui-session.js`));
+const tuiV2 = await import(pathToFileURL(`${base}/herdr-opencode/tui.js`));
 const sid = "ses-A";
 const stat = fs.readFileSync("/proc/self/stat", "utf8");
 const close = stat.lastIndexOf(") ");
@@ -569,7 +724,7 @@ const api = {
     listen: () => () => {},
   },
 };
-async function capture(index, identitySid, argv, identityStart = start) {
+async function capture(index, identitySid, argv, identityStart = start, entry = tuiV1) {
   const state = `${base}/state-${index}`;
   const identityDir = `${state}/hearting/tui-identity`;
   fs.mkdirSync(identityDir, {recursive: true});
@@ -585,6 +740,7 @@ async function capture(index, identitySid, argv, identityStart = start) {
   process.argv = argv;
   let settle;
   const received = new Promise((resolve) => { settle = resolve; });
+  let reportCount = 0;
   const server = net.createServer((client) => {
     let buffer = "";
     client.on("data", (chunk) => {
@@ -592,22 +748,29 @@ async function capture(index, identitySid, argv, identityStart = start) {
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
       const request = JSON.parse(buffer.slice(0, newline));
+      if (request.method === "pane.report_agent_session") reportCount += 1;
       client.write("{\"result\":{}}\n");
       if (request.method === "pane.report_agent_session") settle(request);
     });
   });
   await new Promise((resolve) => server.listen(socketPath, resolve));
-  const dispose = tui.default.setup(api);
+  const dispose = entry.default.setup(api);
   let timeout;
   const request = await Promise.race([received, new Promise((_, reject) =>
     { timeout = setTimeout(() => reject(new Error("session report timeout")), 2500); })]);
   clearTimeout(timeout);
+  await new Promise((resolve) => setTimeout(resolve, 25));
   dispose();
   await new Promise((resolve) => server.close(resolve));
-  return {params: request.params, processArgv: process.argv.slice()};
+  return {params: request.params, processArgv: process.argv.slice(), reportCount};
 }
 const rawArgv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"];
 const valid = await capture(1, sid, rawArgv);
+const validV2 = await capture(22, sid, rawArgv, start, tuiV2);
+if (valid.reportCount !== 1 || validV2.reportCount !== 1) throw Error("copied V1/V2 callback count");
+if (validV2.params.agent_session_id !== sid || validV2.params.session_start_source !== "resume") {
+  throw Error("copied V2 TUI callback missing");
+}
 const mismatched = await capture(2, "ses-other", rawArgv);
 const changedBirth = await capture(3, sid, rawArgv, "0");
 const invalidArgvs = [
@@ -638,12 +801,14 @@ for (const [index, item] of invalidResults.entries()) {
 console.log(JSON.stringify({valid: valid.params, mismatched: mismatched.params,
   changedBirth: changedBirth.params, invalid: invalidResults.map(item => item.params)}));
 '''
-        with tempfile.TemporaryDirectory(prefix="herdr-opencode-session-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="Herdr OpenCode session ") as temporary:
             asset_root = Path(temporary)
             (asset_root / "package.json").write_text('{"type":"module"}\n', encoding="utf-8")
-            (asset_root / "tui").mkdir()
             shutil.copyfile(ROOT / "adapters/opencode/tui/herdr-tui-session.js",
-                            asset_root / "tui/herdr-tui-session.js")
+                            asset_root / "herdr-tui-session.js")
+            v2_entry = asset_root / "herdr-opencode/tui.js"
+            v2_entry.parent.mkdir(parents=True)
+            shutil.copyfile(ROOT / "adapters/opencode/tui/herdr-opencode/tui.js", v2_entry)
             result = subprocess.run(
                 ["node", "--input-type=module", "-e", script], cwd=ROOT,
                 env={**fixture_env.build_environment(asset_root, ROOT),

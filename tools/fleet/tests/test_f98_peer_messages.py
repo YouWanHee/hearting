@@ -341,6 +341,20 @@ class ResumedSessionJoinTest(unittest.TestCase):
             collectors.apply_session_aliases([child, parent])
         self.assertIsNone(child.session_aliases)
 
+    def test_session_aliases_merge_confirmed_display_aliases_and_exclude_live_ids(self):
+        from fleet import collectors
+        confirmed = "confirmed-prior"
+        argv_resume = "argv-resume"
+        live_id = "still-live-parent"
+        child = self._session(session_id="current-child", session_aliases=[confirmed, argv_resume])
+        child.pid = 3
+        parent = self._session(session_id=live_id)
+        parent.pid = 4
+        with mock.patch("fleet.session_registry.session_aliases",
+                        return_value=[argv_resume, live_id, "new-prior"]):
+            collectors.apply_session_aliases([child, parent])
+        self.assertEqual(child.session_aliases, [confirmed, argv_resume, "new-prior"])
+
 
 class StableRootResolverTest(unittest.TestCase):
     """F-98d — `_state_roots()` must read through the SAME resolver chain the

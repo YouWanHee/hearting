@@ -473,6 +473,11 @@ def main(argv=None) -> int:
         sweep_best_effort(args.jobs)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from dispatch_log_retention import sweep_best_effort
+        sweep_best_effort(args.jobs)
+    except Exception:  # noqa: BLE001 -- independent best-effort retention
+        pass
     return result
 
 

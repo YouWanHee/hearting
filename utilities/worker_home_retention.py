@@ -53,7 +53,6 @@ MAX_DELIVERY_BYTES = 256 * 1024
 MAX_DELIVERY_RECORDS = 4096
 MAX_DEPENDENCY_STAMPS = MAX_DELIVERY_RECORDS * 8
 MAX_TREE_DEPTH = 128
-MAX_INTENT_CHILDREN = 256
 
 KEY_RE = re.compile(r"[0-9a-f]{32}")
 ATTEMPT_RE = re.compile(r"att-[A-Za-z0-9._-]{1,240}")
@@ -62,8 +61,9 @@ ATTEMPT_ID_RE = re.compile(r"(?:^|,)attempt_id=([^,]+)")
 LEAF_RE = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})")
 DELIVERY_ID_RE = re.compile(r"delivery-(?:[0-9a-f]{32}|[0-9a-f]{64})")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
-TERMINAL = frozenset({"done", "killed", "cancelled"})
-OPEN = frozenset({"open", "running"})
+from dispatch_retention import (MAX_INTENT_CHILDREN, OPEN_STATUSES as OPEN,
+                                TERMINAL_STATUSES as TERMINAL,
+                                Protection as _Verdict)
 ROUTE_KEYS = ("route_file", "route_id", "route_hash", "owner_route_file",
               "owner_route_id", "owner_route_hash", "batch_route_id")
 HARNESSES = frozenset({"claude", "codex", "opencode"})
@@ -152,14 +152,6 @@ class _Unreadable(Exception):
     """Evidence exists but cannot be read as the typed record it must be."""
 
 
-class _Verdict:
-    """One home's outcome: ``keep``/``unknown`` carry a reason, ``eligible`` a clock."""
-
-    __slots__ = ("kind", "reason", "activity_ns", "attempt", "raw")
-
-    def __init__(self, kind, reason="", activity_ns=0, attempt="", raw=""):
-        self.kind, self.reason, self.activity_ns = kind, reason, activity_ns
-        self.attempt, self.raw = attempt, raw
 
 
 # --- containment ---------------------------------------------------------
@@ -345,6 +337,9 @@ class _Snapshot:
         _track(jobs)
         self.rows: dict[str, _Row] = {}
         self.open_refs: dict[str, set[str]] = {}
+        self.log_refs: dict[str, dict[str, _Row]] = {}
+        self.unknown_log_refs: set[str] = set()
+        invalid_log_refs: set[str] = set()
         # parent attempt -> children whose completion delivery was intended
         self.intents: dict[str, set[str]] = {}
         try:
@@ -369,6 +364,22 @@ class _Snapshot:
                 found = ATTEMPT_ID_RE.search(fields[5])
                 if found:
                     self.rows[found.group(1)] = _Row(line, fields)
+                else:
+                    candidate_log = re.search(r"(?:^|,)log_file=([^,]+)", fields[5])
+                    if candidate_log:
+                        invalid_log_refs.add(candidate_log.group(1))
+        self.unknown_log_refs.update(invalid_log_refs)
+        for attempt, row in self.rows.items():
+            log_match = re.search(r"(?:^|,)log_file=([^,]+)", row.fields[5])
+            if not log_match:
+                continue
+            log_file = log_match.group(1)
+            harness_match = re.search(r"(?:^|,)harness=([^,]+)", row.fields[5])
+            harness = harness_match.group(1) if harness_match else ""
+            if not ATTEMPT_RE.fullmatch(attempt) or harness not in HARNESSES:
+                self.unknown_log_refs.add(log_file)
+                continue
+            self.log_refs.setdefault(log_file, {})[attempt] = row
         for attempt, row in self.rows.items():
             if row.status in OPEN:
                 for token in set(ATTEMPT_RE.findall(row.fields[5])):
@@ -873,75 +884,24 @@ def _declared_index(ctx_snapshot: _Snapshot, root: Path, workers_real: str) -> d
 
 
 def _protections(ctx: _Context, key: str, attempt: str, *, probe_processes: bool):
-    """Read every protection fresh. `eligible` carries the newest activity time."""
-    row = ctx.snapshot.rows[attempt]
-    meta = row.meta
-    if row.status not in TERMINAL:
-        return _Verdict("keep", "not-terminal")
-    if attempt in ctx.snapshot.open_refs:
-        return _Verdict("keep", "open-reference")
-    activity = 0
-    state, mtime = _delivery_state(ctx.root, meta)
-    if state == "open":
-        return _Verdict("keep", "delivery-open")
-    if state == "pending":
-        return _Verdict("keep", "delivery-pending")
-    if state == "unknown":
-        return _Verdict("unknown", "delivery-unknown")
-    activity = max(activity, mtime)
-    # A child's undelivered completion is addressed through this attempt.
-    children = ctx.snapshot.intents.get(attempt, ())
-    if len(children) > MAX_INTENT_CHILDREN:
-        return _Verdict("unknown", "delivery-unknown")
-    for child in children:
-        state, mtime = _delivery_state(ctx.root, ctx.snapshot.rows[child].meta)
-        if state in ("open", "pending"):
-            return _Verdict("keep", "delivery-" + state)
-        if state == "unknown":
-            return _Verdict("unknown", "delivery-unknown")
-        activity = max(activity, mtime)
-    state, mtime = _replacement_state(ctx.root, ctx.snapshot, attempt)
-    if state == "unresolved":
-        return _Verdict("keep", "replacement-unresolved")
-    if state == "unknown":
-        return _Verdict("unknown", "replacement-unknown")
-    activity = max(activity, mtime)
-    state, mtime = _route_state(ctx.jobs, meta)
-    if state == "open":
-        return _Verdict("keep", "route-open")
-    if state == "unknown":
-        return _Verdict("unknown", "route-unknown")
-    activity = max(activity, mtime)
+    """Use the shared read-only terminal/consumer decision for this home."""
+    from dispatch_retention import terminal_protection
+    from dispatch_contract import attempt_process_quiescence
     from dispatch_summary import owner_process_state
-    owner = owner_process_state(meta)
-    if owner == "live":
-        return _Verdict("keep", "summary-live")
-    if owner == "unknown":
-        return _Verdict("unknown", "summary-owner-unknown")
-    lease = _lease_state(ctx.jobs, meta)
-    if lease == "held":
-        return _Verdict("keep", "lease-held")
-    if lease == "unknown":
-        return _Verdict("unknown", "lease-unknown")
-    refs, index_unknown = ctx.delivery_index()
-    if index_unknown:
-        return _Verdict("unknown", "delivery-index-unknown")
-    if attempt in refs:
-        return _Verdict("keep", "delivery-open")
-    activity = max(activity, ctx.delivery_activity.get(attempt, 0))
-    activity = max(activity, _stat_mtime("supervisor-state/%s.json" % attempt,
-                                         dir_fd=ctx.layout.root_fd, follow_symlinks=False))
-    if probe_processes:
-        from dispatch_contract import attempt_process_quiescence
-        try:
-            quiescence = attempt_process_quiescence(meta, terminal_receipt=True)
-        except Exception:  # noqa: BLE001 -- an unobservable process is not quiet
-            return _Verdict("unknown", "quiescence-unverifiable")
-        if quiescence.state == "live":
-            return _Verdict("keep", "not-quiescent")
-        if quiescence.state != "quiescent":
-            return _Verdict("unknown", "quiescence-unverifiable")
-    return _Verdict("eligible", activity_ns=activity, attempt=attempt, raw=row.raw)
+
+    return terminal_protection(
+        ctx, attempt, probe_processes=probe_processes,
+        delivery_state=lambda meta: _delivery_state(ctx.root, meta),
+        replacement_state=lambda identity: _replacement_state(ctx.root, ctx.snapshot, identity),
+        route_state=lambda meta: _route_state(ctx.jobs, meta),
+        owner_state=owner_process_state,
+        lease_state=lambda meta: _lease_state(ctx.jobs, meta),
+        delivery_index=ctx.delivery_index,
+        supervisor_activity=lambda identity: _stat_mtime(
+            "supervisor-state/%s.json" % identity,
+            dir_fd=ctx.layout.root_fd, follow_symlinks=False),
+        process_quiescence=lambda meta: attempt_process_quiescence(meta, terminal_receipt=True),
+    )
 
 
 # --- state ---------------------------------------------------------------

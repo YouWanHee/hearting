@@ -35,6 +35,23 @@ fail() {
   exit 1
 }
 
+# Packaged activation requires an immutable clean source. Build a private tree
+# from HEAD and overlay the assigned changes so each runtime sees one source
+# snapshot without relaxing that source guard.
+PACKAGED_SOURCE="$TMP/packaged-source"
+mkdir -p "$PACKAGED_SOURCE"
+git -C "$ROOT" archive --format=tar HEAD > "$TMP/packaged-source.tar"
+tar -xf "$TMP/packaged-source.tar" -C "$PACKAGED_SOURCE"
+for changed_file in \
+  tools/install/runtime_activation.py \
+  tools/install/runtime_activation.test.py \
+  tools/install/projection-completeness.test.sh \
+  tools/install/release-lifecycle.test.sh \
+  tools/fleet/tests/test_f87_runtime_projection.py; do
+  mkdir -p "$PACKAGED_SOURCE/$(dirname -- "$changed_file")"
+  cp "$ROOT/$changed_file" "$PACKAGED_SOURCE/$changed_file"
+done
+
 count_dirs() {
   find "$1" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' '
 }
@@ -85,13 +102,55 @@ EXPECTED_MODES=$(echo "$EXPECT" | cut -d' ' -f3)
 # every runtime must expose the identical manifest-derived counts in either.
 assert_projection() {
   mode=$1
-  harness runtime activate --runtime all --mode "$mode" --source "$ROOT" --json > "$TMP/$mode-activate.json" || { cat "$TMP/$mode-activate.json" >&2; fail "$mode activation failed"; }
+  mode_source=$ROOT
+  if [ "$mode" = packaged ]; then
+    mode_source=$PACKAGED_SOURCE
+  fi
+  harness runtime activate --runtime all --mode "$mode" --source "$mode_source" --json > "$TMP/$mode-activate.json" || { cat "$TMP/$mode-activate.json" >&2; fail "$mode activation failed"; }
   python3 - "$TMP/$mode-activate.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
 for row in data["runtimes"]:
     assert "profile" not in row, row
     assert row["freshness"] == "fresh", row
+PY
+
+  # The canonical Herdr scripts/plugins are managed regular-file copies.
+  # Check the actual source selected by linked and packaged activation for all
+  # runtimes, including bytes, mode, and destination kind.
+  python3 - "$TMP/$mode-activate.json" "$HOME" "$CODEX_HOME" <<'PY'
+import json, stat, sys
+from pathlib import Path
+
+data = json.load(open(sys.argv[1]))
+home, codex_home = Path(sys.argv[2]), Path(sys.argv[3])
+for row in data["runtimes"]:
+    active = Path(row["active_root"])
+    assets = {
+        "claude": [
+            (active / "hooks/herdr-agent-state.sh",
+             home / ".claude/hooks/herdr-agent-state.sh"),
+        ],
+        "codex": [
+            (active / "adapters/codex/hooks/herdr-agent-state.sh",
+             codex_home / "herdr-agent-state.sh"),
+        ],
+        "opencode": [
+            (active / "adapters/opencode/plugins/herdr-agent-state.js",
+             home / ".config/opencode/plugins/herdr-agent-state.js"),
+            (active / "adapters/opencode/tui/herdr-tui-session.js",
+             home / ".config/opencode/herdr-tui-session.js"),
+            (active / "adapters/opencode/tui/herdr-opencode/tui.js",
+             home / ".config/opencode/herdr-opencode/tui.js"),
+        ],
+    }[row["runtime"]]
+    for source, dest in assets:
+        assert source.is_file(), (row["runtime"], source)
+        assert dest.is_file() and not dest.is_symlink(), (row["runtime"], dest)
+        assert dest.read_bytes() == source.read_bytes(), (row["runtime"], dest)
+        assert stat.S_IMODE(dest.stat().st_mode) == (source.stat().st_mode & 0o777), (
+            row["runtime"], dest,
+        )
 PY
 
   # Activation leaves the native vendor CLI on PATH without a launcher.
@@ -208,7 +267,7 @@ assert {item["id"] for item in row["checks"]} == {
 PY
 
 # Duplicate remediation next_action names the source, not a retired flag.
-python3 - "$ROOT" <<'PY'
+python3 - "$mode_source" <<'PY'
 import os, sys
 sys.path.insert(0, os.path.join(sys.argv[1], "tools", "install"))
 import runtime_activation as activation
@@ -274,7 +333,8 @@ assert row["freshness"] != "missing", row
 assert "profile" not in row, row
 PY
 
-harness runtime doctor --runtime codex --strict --json > "$TMP/legacy-doctor.json"
+harness runtime doctor --runtime codex --strict --json > "$TMP/legacy-doctor.json" \
+  || { cat "$TMP/legacy-doctor.json" >&2; exit 1; }
 python3 - "$TMP/legacy-doctor.json" <<'PY'
 import json, sys
 row = json.load(open(sys.argv[1]))

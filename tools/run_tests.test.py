@@ -1633,10 +1633,16 @@ class LiveStateLeakFixture(RunTestsFixtureBase):
         fake_home = Path(tempfile.mkdtemp(prefix="w1-fake-home-foreign-"))
         live_dir = fake_home / ".local" / "state" / "hearting"
         live_dir.mkdir(parents=True)
-        # Sleeps briefly so the runner's own before/after live-state snapshot
-        # window is wide enough for the concurrently-started foreign writer
-        # below to land inside it.
-        write_suite(self.root, "harmless.test.py", "import time\ntime.sleep(1.0)\n")
+        # Signal from the suite process after the nested runner has taken its
+        # before-snapshot and started the whole-run fd sampler. A startup sleep
+        # in the parent made this test depend on how quickly Python imported
+        # the runner under host load.
+        ready = self.root / "suite-ready"
+        write_suite(
+            self.root, "harmless.test.py",
+            f"from pathlib import Path\nimport time\n"
+            f"Path({str(ready)!r}).write_text('ready')\ntime.sleep(1.5)\n",
+        )
         baseline = write_baseline(self.root, [])
         isolation = write_isolation_tsv(self.root)
         report_path = self.root / "leak-report.tsv"
@@ -1644,11 +1650,15 @@ class LiveStateLeakFixture(RunTestsFixtureBase):
         env["HOME"] = str(fake_home)
 
         def write_foreign_entry_mid_run():
-            time.sleep(0.3)
+            deadline = time.time() + 30
+            while not ready.exists() and time.time() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                return
             with open(live_dir / "foreign-marker.json", "w") as f:
                 f.write("{}")
                 f.flush()
-                time.sleep(0.5)
+                time.sleep(1.0)
 
         import threading as _threading
         writer = _threading.Thread(target=write_foreign_entry_mid_run, daemon=True)
@@ -1671,6 +1681,7 @@ class LiveStateLeakFixture(RunTestsFixtureBase):
             )
         finally:
             writer.join(timeout=5)
+        self.assertTrue(ready.exists(), "fixture suite never entered the runner's live-state sampling window")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("LIVE-STATE-OBSERVED-FOREIGN", result.stderr)
         self.assertNotIn("LIVE-STATE-LEAK:", result.stderr)

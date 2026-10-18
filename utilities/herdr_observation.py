@@ -293,6 +293,11 @@ class ObservationTransport:
             self._close_socket()
             self._state.reconnect()
 
+    def fileno(self):
+        """Return the live subscription descriptor for an external event selector."""
+        with self._lock:
+            return self._socket.fileno() if self._socket is not None else None
+
     def _close_socket(self):
         client, self._socket = self._socket, None
         self._buffer.clear()

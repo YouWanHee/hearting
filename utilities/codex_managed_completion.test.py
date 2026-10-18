@@ -120,6 +120,51 @@ class ControlServer:
         self.thread.join(timeout=2)
 
 
+class ParentLifetimeStopTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_completion_module()
+        self.binding = {"pid": 123, "pid_start": "456", "session_id": SESSION,
+                        "pane": "w1:p9", "socket_path": "", "pid_namespace": "ns"}
+        self.args = SimpleNamespace(parent_session_id=SESSION, thread_id=SESSION,
+                                    parent_lifetime=dict(self.binding), jobs=Path("/jobs"))
+
+    def test_capture_binds_one_native_tui_process_start(self):
+        binding = {key: value for key, value in self.binding.items() if key != "pid_namespace"}
+        with mock.patch("pane_ownership.codex_tui_process_bindings", return_value=[binding]), \
+             mock.patch.object(self.module, "process_namespace_identity", side_effect=["ns", "ns"]):
+            self.assertEqual(self.module.capture_parent_lifetime(self.args), self.binding)
+
+    def test_missing_legacy_lifetime_stays_unknown_without_procfs_observation(self):
+        args = SimpleNamespace(parent_session_id=SESSION, thread_id=SESSION,
+                               jobs=Path("/jobs"))
+        with mock.patch.object(self.module, "process_namespace_identity",
+                               side_effect=AssertionError("missing lifetime is unknown")), \
+             mock.patch.object(self.module, "_parent_proc_state",
+                               side_effect=AssertionError("missing lifetime is unknown")):
+            self.assertEqual(self.module.parent_session_stop_reason(args, {"att-child"}), "")
+
+    def test_live_exact_parent_does_not_trigger_observer_exit(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("live", "456")), \
+             mock.patch("pane_ownership._native_session", return_value=SESSION):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}), "")
+
+    def test_proven_parent_exit_stops_only_without_a_bound_successor(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("gone", None)), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor", return_value=""):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}),
+                             self.module.PARENT_SESSION_ENDED)
+
+    def test_confirmed_attempt_successor_keeps_the_obligation(self):
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch.object(self.module, "_parent_proc_state", return_value=("gone", None)), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor", return_value="successor"):
+            self.assertEqual(self.module.parent_session_stop_reason(self.args, {"att-child"}), "")
+
+
 class ReplacementAuthorityTest(unittest.TestCase):
     def test_requires_current_epoch_generation_and_exact_parent(self):
         from argparse import Namespace
@@ -888,7 +933,10 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
                                jobs=Path("/tmp/jobs.log"), timeout=2.0,
                                delivery_retry_interval=0.01)
-        with mock.patch.object(module, "queue_target", side_effect=[SESSION, "successor-thread"]), \
+        row = SimpleNamespace(attempt_id="att-one", metadata={})
+        with mock.patch.object(module, "_queue_target_from_rows",
+                               side_effect=[SESSION, "successor-thread"]), \
+             mock.patch.object(module, "current_session_children", return_value=[row]), \
              mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=new_session), \
              mock.patch.object(module, "_native_queue_delivery_once", side_effect=[
                  {"status": "sent-ambiguous", "submitted": True},
@@ -905,6 +953,42 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                          [SESSION, "successor-thread"])
         self.assertEqual([call.kwargs["allow_enqueue"] for call in deliver.call_args_list],
                          [True, False])
+
+    def test_unchanged_delivery_uses_bounded_exponential_idle_observations(self):
+        module = load_completion_module()
+        args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
+                               jobs=Path("/tmp/jobs.log"), timeout=60.0,
+                               delivery_retry_interval=0.01)
+        row = SimpleNamespace(attempt_id="att-one", metadata={})
+        checks = {"count": 0}
+
+        def stop():
+            checks["count"] += 1
+            return "fixture-stop" if checks["count"] >= 8 else ""
+
+        class Session:
+            def __init__(self, path, *, timeout):
+                self.path = path
+
+            def close(self):
+                pass
+
+        with mock.patch.object(module, "current_session_children", return_value=[row]), \
+             mock.patch.object(module, "_queue_target_from_rows", return_value=SESSION), \
+             mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=Session), \
+             mock.patch.object(module, "_native_queue_delivery_once", return_value={
+                 "status": "sent-ambiguous", "reason": "native-queue-consumption-pending",
+                 "submitted": True, "client_user_message_id": "delivery-stable"}) as observe, \
+             mock.patch.object(module.time, "sleep") as sleep:
+            result = module.deliver_to_native_queue(args, {"receipt": True}, {"att-one"},
+                                                    stop_check=stop)
+
+        self.assertEqual(result["reason"], "fixture-stop")
+        self.assertEqual(observe.call_count, 4)
+        waits = [call.args[0] for call in sleep.call_args_list]
+        self.assertEqual(len(waits), 3)
+        for actual, expected in zip(waits, [0.05, 0.085, 0.1445]):
+            self.assertAlmostEqual(actual, expected)
 
     def test_standalone_stage_close_creates_the_real_ledger_then_queue_delivery_acks_it(self):
         # Exercise the real close, materializer, session-row lookup and ledger;
@@ -1025,7 +1109,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
                                sealed_batch_id="batch-exact", jobs=Path("/tmp/jobs.log"), timeout=3.0,
                                interval=0.01, delivery_retry_interval=0.01)
-        with mock.patch.object(module, "queue_target", return_value="successor-thread"), \
+        with mock.patch.object(module, "_queue_target_from_rows", return_value="successor-thread"), \
              mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
                  "thread": {"id": "successor-thread", "cwd": "/tmp/repo"}}) as rpc, \
              mock.patch.object(module, "current_session_children", return_value=[row]), \

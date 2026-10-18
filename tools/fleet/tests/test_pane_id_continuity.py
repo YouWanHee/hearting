@@ -37,6 +37,13 @@ class PaneContinuityTest(unittest.TestCase):
             session_tidy.record_event(seat, harness, sid, "start", source=source,
                                       cwd=str(cwd or self.repo), now=now)
 
+    def handover(self, harness, older, newer, pane="w:p", source="clear", now=500):
+        seat = session_tidy._pane_seat_of(pane)
+        row = {"ts": now, "harness": harness, "sid": newer, "event": "handover",
+               "from": older, "source": source}
+        with session_tidy.seat_lock(seat):
+            session_tidy._append_ledger_entry(seat, row)
+
     def test_aliases_use_exact_pane_harness_repository_and_both_id_directions(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
@@ -48,6 +55,161 @@ class PaneContinuityTest(unittest.TestCase):
                 self.assertEqual(session_tidy.pane_session_aliases(harness, "current", "w:p", str(self.repo)), ["old"])
                 self.assertEqual(session_tidy.pane_session_aliases(harness, "unknown", "w:p", str(self.repo)), [])
                 self.assertEqual(session_tidy.session_start_source(harness, "current", "w:p"), "resume")
+
+    def test_confirmed_handover_chain_survives_compact_resume_and_recent_alias_limit(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                ids = [f"{harness}-{index}" for index in range(10)]
+                self.record(harness, ids[0], source="startup", now=100)
+                for index, sid in enumerate(ids[1:], start=1):
+                    if harness == "opencode":
+                        seat = session_tidy._pane_seat_of("w:p")
+                        with session_tidy.seat_lock(seat):
+                            session_tidy.record_event(seat, harness, sid, "prompt",
+                                                      cwd=str(self.repo), now=100 + index)
+                        source = "first-message"
+                    else:
+                        self.record(harness, sid, source="clear", now=100 + index)
+                        source = "clear"
+                    self.handover(harness, ids[index - 1], sid, source=source, now=200 + index)
+                    seat = session_tidy._pane_seat_of("w:p")
+                    with session_tidy.seat_lock(seat):
+                        session_tidy.record_event(seat, harness, sid, "compact", now=300 + index)
+                        session_tidy.record_event(seat, harness, sid, "start", source="resume",
+                                                  cwd=str(self.repo), now=400 + index)
+
+                expected = list(reversed(ids[:-1]))
+                self.assertEqual(session_tidy.confirmed_pane_predecessors(
+                    harness, ids[-1], "w:p", str(self.repo)), expected)
+                self.assertEqual(herdr._clear_gpu_session_aliases(
+                    harness, ids[-1], "w:p", str(self.repo)), expected)
+                aliases = session_tidy.pane_session_aliases(harness, ids[-1], "w:p", str(self.repo))
+                self.assertEqual(set(aliases), set(ids[:-1]))
+                self.assertEqual(len(aliases), 9)
+
+    def test_legacy_endpoint_ledger_requires_exact_sid_and_repository_bridge(self):
+        with mock.patch.dict(os.environ, {"AGENT_HERDR_SESSION": "fixture-current",
+                                         "HERDR_SOCKET_PATH": ""}):
+            current = session_tidy._pane_seat_of("w:p")
+            legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p"),
+                                       "w:p", "codex")
+            with session_tidy.seat_lock(current):
+                session_tidy.record_event(current, "codex", "shared", "start",
+                                          source="startup", cwd=str(self.repo), now=300)
+            with session_tidy.seat_lock(legacy):
+                session_tidy.record_event(legacy, "codex", "older", "start",
+                                          source="startup", cwd=str(self.repo), now=100)
+                session_tidy.record_event(legacy, "codex", "shared", "start",
+                                          source="clear", cwd=str(self.repo), now=200)
+                session_tidy._append_ledger_entry(legacy, {
+                    "ts": 250, "harness": "codex", "sid": "shared", "event": "handover",
+                    "from": "older", "source": "clear"})
+            paths = (session_tidy._ledger_path(current), session_tidy._ledger_path(legacy))
+            before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+            self.assertEqual(session_tidy.confirmed_pane_predecessors(
+                "codex", "shared", "w:p", str(self.repo)), ["older"])
+            self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_other_endpoint_and_unbridged_legacy_rows_are_not_read_as_lineage(self):
+        with mock.patch.dict(os.environ, {"AGENT_HERDR_SESSION": "fixture-current",
+                                         "HERDR_SOCKET_PATH": ""}):
+            current = session_tidy._pane_seat_of("w:p")
+            other_endpoint_id = session_tidy._digest("herdr-endpoint", "session", "fixture-other")
+            other_endpoint = session_tidy.Seat(
+                "pane", session_tidy._digest("pane", other_endpoint_id, "w:p"),
+                "w:p", "codex", endpoint=other_endpoint_id)
+            legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p"),
+                                       "w:p", "codex")
+            with session_tidy.seat_lock(current):
+                session_tidy.record_event(current, "codex", "current", "start",
+                                          source="startup", cwd=str(self.repo), now=300)
+            for seat, successor in ((other_endpoint, "current"), (legacy, "legacy-current")):
+                with session_tidy.seat_lock(seat):
+                    session_tidy.record_event(seat, "codex", "foreign-old", "start",
+                                              source="startup", cwd=str(self.repo), now=100)
+                    session_tidy.record_event(seat, "codex", successor, "start",
+                                              source="clear", cwd=str(self.repo), now=200)
+                    session_tidy._append_ledger_entry(seat, {
+                        "ts": 250, "harness": "codex", "sid": successor, "event": "handover",
+                        "from": "foreign-old", "source": "clear"})
+            self.assertEqual(session_tidy.confirmed_pane_predecessors(
+                "codex", "current", "w:p", str(self.repo)), [])
+
+    def test_conflicting_foreign_pane_metadata_invalidates_same_sid_evidence(self):
+        seat = session_tidy._pane_seat_of("w:p")
+        self.record("codex", "old", source="startup", now=100)
+        self.record("codex", "current", source="clear", now=200)
+        with session_tidy.seat_lock(seat):
+            session_tidy._append_ledger_entry(seat, {
+                "ts": 250, "harness": "codex", "sid": "current", "event": "handover",
+                "from": "old", "source": "clear", "pane": "w:foreign"})
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), [])
+
+    def test_clear_start_uses_the_exact_booking_and_immediate_same_harness_predecessor(self):
+        import session_tidy_clear
+        seat = session_tidy._pane_seat_of("w:p")
+        self.record("codex", "first", source="startup", now=100)
+        self.record("codex", "middle", source="resume", now=200)
+        self.record("codex", "current", source="clear", now=300)
+        booking = {"schema": 1, "nonce": "fixture", "status": "cleared", "seat": seat.as_dict(),
+                   "harness": "codex", "sid": "middle", "new_session": "current",
+                   "observed": {"harness": "codex", "sid": "current"}, "cwd": str(self.repo)}
+        session_tidy_clear._write_reservation(booking)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), ["middle"])
+
+        booking["observed"] = {"harness": "codex", "sid": "other"}
+        session_tidy_clear._write_reservation(booking)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), [])
+
+        booking.update(observed={"harness": "codex", "sid": "current"}, sid="first")
+        session_tidy_clear._write_reservation(booking)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), [])
+
+    def test_folded_start_provenance_confirms_clear_when_raw_predecessor_start_is_gone(self):
+        import session_tidy_clear
+        seat = session_tidy._pane_seat_of("w:p")
+        with session_tidy.seat_lock(seat):
+            session_tidy._append_ledger_entry(seat, {
+                "ts": 150, "harness": "codex", "sid": "folded-old", "event": "summary",
+                "cwd": str(self.repo), "latest_start_source": "startup", "latest_start_at": 100})
+            session_tidy.record_event(seat, "codex", "current", "start", source="clear",
+                                      cwd=str(self.repo), now=300)
+        session_tidy_clear._write_reservation({
+            "schema": 1, "nonce": "folded-fixture", "status": "cleared", "seat": seat.as_dict(),
+            "harness": "codex", "sid": "folded-old", "new_session": "current",
+            "observed": {"harness": "codex", "sid": "current"}, "cwd": str(self.repo)})
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), ["folded-old"])
+
+    def test_foreign_repository_and_harness_handover_evidence_is_ignored(self):
+        self.record("codex", "foreign-repo-old", cwd=self.foreign, source="startup", now=100)
+        self.record("codex", "repo-current", source="resume", now=200)
+        self.handover("codex", "foreign-repo-old", "repo-current", now=300)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "repo-current", "w:p", str(self.repo)), [])
+
+        self.record("codex", "harness-old", source="startup", now=400)
+        self.record("codex", "harness-current", source="resume", now=500)
+        self.handover("claude", "harness-old", "harness-current", now=600)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "harness-current", "w:p", str(self.repo)), [])
+
+    def test_ambiguous_predecessors_and_cycles_do_not_repeat_ids(self):
+        for sid, now in (("a", 100), ("b", 200), ("c", 300), ("current", 400)):
+            self.record("codex", sid, source="startup", now=now)
+        self.handover("codex", "a", "current", now=500)
+        self.handover("codex", "b", "current", now=501)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "current", "w:p", str(self.repo)), [])
+
+        self.handover("codex", "a", "b", now=600)
+        self.handover("codex", "b", "a", now=601)
+        self.assertEqual(session_tidy.confirmed_pane_predecessors(
+            "codex", "b", "w:p", str(self.repo)), ["a"])
 
     def test_stale_native_id_joins_new_marker_peer_badge_and_herdr_role_on_every_harness(self):
         for harness in ("claude", "codex", "opencode"):
@@ -125,7 +287,7 @@ class PaneContinuityTest(unittest.TestCase):
                 herdr_projection.project(harness, "current", pane_id="w:p")
                 report.assert_not_called()
 
-    def test_codex_display_projection_keeps_resume_and_fork_lifecycle_out_of_metadata(self):
+    def test_codex_projection_reports_start_lifecycle_for_start_resume_and_fork(self):
         lifecycle_path = ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py"
         lifecycle_spec = importlib.util.spec_from_file_location("codex_sessionstart_lifecycle_test",
                                                                  lifecycle_path)
@@ -148,10 +310,32 @@ class PaneContinuityTest(unittest.TestCase):
                     self.assertTrue(projection.project(payload, current_thread))
                 args, kwargs = publish.call_args
                 self.assertEqual(args, ("codex", current_thread))
-                self.assertIs(kwargs["report_session"], False)
-                self.assertNotIn("session_seq", kwargs)
-                self.assertNotIn("session_start_source", kwargs)
+                self.assertIs(kwargs.get("report_session", True), True)
+                self.assertGreater(kwargs["session_seq"], 0)
+                self.assertEqual(kwargs["session_start_source"], source)
                 self.assertNotIn("resume_argv", kwargs)
+
+    def test_proven_embedded_sessionstart_keeps_reporting_with_the_v10_state_hook(self):
+        path = ROOT / "adapters/codex/hooks/herdr_session_projection.py"
+        spec = importlib.util.spec_from_file_location("codex_embedded_projection_test", path)
+        projection = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(projection)
+        payload = {"hook_event_name": "SessionStart", "session_id": "thread-A",
+                   "transcript_path": "/fixture/rollout.jsonl", "source": "resume"}
+        with tempfile.TemporaryDirectory(prefix="codex-home-") as temporary:
+            (Path(temporary) / "herdr-agent-state.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            env = {"HERDR_SOCKET_PATH": "/fixture/herdr.sock", "HERDR_PANE_ID": "w:p",
+               "CODEX_HOME": temporary,
+               "CODEX_THREAD_ID": "thread-A"}
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(projection, "_may_report", return_value=True), \
+                 mock.patch.object(projection, "_project", return_value=True) as publish, \
+                 mock.patch.object(projection.subprocess, "Popen"):
+                projection.project(payload, "thread-A")
+        kwargs = publish.call_args.kwargs
+        self.assertIs(kwargs["report_session"], False)
+        self.assertEqual(kwargs["session_start_source"], "resume")
+        self.assertGreater(kwargs["session_seq"], 0)
 
     def test_claude_pane_badge_survives_native_id_change(self):
         self.record("claude", "old", now=100)

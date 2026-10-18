@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_attempt_policy import (
     decide_attempt, required_action, deferred_completion, success_note,
-    DEFERRED_COMPLETION_NOTE, DEFERRED_COMPLETION_SOURCE,
+    DEFERRED_COMPLETION_NOTE, DEFERRED_COMPLETION_SOURCE, terminal_conflict_pending,
 )
 from dispatch_receipt_identity import (
     CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, canonical_receipt, receipt_digest, unseal_receipt,
@@ -81,7 +81,7 @@ from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_supervisor_terminal import (  # noqa: E402
     classify_supervisor_log, missing_result_terminal,
 )
-from dispatch_registry_cache import registry_lines  # noqa: E402
+from dispatch_registry_cache import registry_lines, registry_view  # noqa: E402
 
 INVALID_ENVELOPE_CLASSIFIER_SOURCE = "completion-join-invalid-envelope-v1"
 OPEN_STATES = frozenset({"open", "running"})
@@ -299,21 +299,14 @@ def _log_pending_delivery_refusal(jobs: Path, attempt_id: str, reason: str) -> N
     (2026-08-29: three owner terminals refused, zero trace). Never raises."""
 
     try:
-        root = jobs.resolve(strict=False).parent
-        log_dir = root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "ts": time.time(),
-                "event": "delivery-persistence-refused",
-                "attempt_id": attempt_id,
-                "reason": reason,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with open(log_dir / PENDING_DELIVERY_LOG, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        from dispatch_contract import dispatch_state_root
+        from dispatch_observation_log import append_record
+        append_record(dispatch_state_root(jobs), PENDING_DELIVERY_LOG, {
+            "ts": time.time(),
+            "event": "delivery-persistence-refused",
+            "attempt_id": attempt_id,
+            "reason": reason,
+        })
     except OSError:
         pass
 
@@ -2809,18 +2802,17 @@ def current_children(
     if bool(route_id) != bool(route_hash):
         raise JoinContractError("route-selection-identity-incomplete")
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except FileNotFoundError:
-        lines = []
+        view = None
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
 
     latest: dict[str, ChildRow] = {}
-    for order, line in enumerate(lines):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = _metadata(fields[5])
+    records = view.completion_children(parent_attempt_id) if view is not None else ()
+    for record in records:
+        fields = record.fields
+        meta = record.completion_metadata()
         if meta.get("parent_attempt_id") != parent_attempt_id:
             continue
         if meta.get("attempt_schema_version") != "2":
@@ -2829,11 +2821,11 @@ def current_children(
         if not attempt_id:
             raise JoinContractError("owned-row-attempt-id-missing")
         latest[attempt_id] = ChildRow(
-            order=order,
+            order=record.order,
             status=fields[1],
             slug=fields[4],
             attempt_id=attempt_id,
-            raw=line,
+            raw=record.raw,
             metadata=meta,
         )
 
@@ -2868,26 +2860,22 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     if not attempt_id:
         raise JoinContractError("attempt-id-missing")
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     matches: list[ChildRow] = []
-    for order, line in enumerate(lines):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        metadata = _metadata(fields[5])
-        if metadata.get("attempt_id") != attempt_id:
-            continue
+    for record in view.completion_attempt_records(attempt_id):
+        fields = record.fields
+        metadata = record.completion_metadata()
         if metadata.get("attempt_schema_version") != "2":
             raise JoinContractError("attempt-row-schema-invalid")
         matches.append(
             ChildRow(
-                order=order,
+                order=record.order,
                 status=fields[1],
                 slug=fields[4],
                 attempt_id=attempt_id,
-                raw=line,
+                raw=record.raw,
                 metadata=metadata,
             )
         )
@@ -2904,28 +2892,18 @@ def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> Ch
     if read_context is not None:
         return read_context.current_attempt_row(jobs, attempt_id)
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
-    found: ChildRow | None = None
-    # A row of this attempt always carries this text; skipping the others before
-    # parsing keeps a lookup cheap on a registry of thousands of rows.
-    needle = "attempt_id=" + attempt_id
-    for order, line in enumerate(lines):
-        if needle not in line:
-            continue
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        metadata = _metadata(fields[5])
-        if metadata.get("attempt_id") != attempt_id:
-            continue
-        if metadata.get("attempt_schema_version") != "2":
-            raise JoinContractError("attempt-row-schema-invalid")
-        found = ChildRow(order, fields[1], fields[4], attempt_id, line, metadata)
-    return found
+    record, error = view.completion_attempt(attempt_id)
+    if error:
+        raise JoinContractError(error)
+    if record is None:
+        return None
+    return ChildRow(record.order, record.status, record.slug, attempt_id,
+                    record.raw, record.completion_metadata())
 
 
 def current_delivery_state(
@@ -3823,6 +3801,9 @@ def route_completion_evidence(
     reader debugging a stuck row needs (round_1 review advisory 4).
     """
 
+    if terminal_conflict_pending(metadata):
+        return None, "terminal-evidence-conflict"
+
     if terminal is None:
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,
             artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
@@ -4189,6 +4170,52 @@ def settle_exited_owner_terminal(row: ChildRow, *, jobs: str | Path) -> str | No
     return "" if closed else "owner-terminal-revalidation-pending"
 
 
+def _reconcile_late_terminal_conflict(row: ChildRow, *, jobs: str | Path) -> str | None:
+    """Record an exact late negative envelope without rewriting a committed PASS."""
+    try:
+        current = exact_attempt_row(Path(jobs), row.attempt_id)
+        from dispatch_attempt_policy import committed_outcome
+        from dispatch_contract import terminal_conflict_pending
+        if current.status not in {"done", "killed", "cancelled"}:
+            return None
+        if launched_attempt_identity(current.raw.split("\t")) != launched_attempt_identity(row.raw.split("\t")):
+            return None
+        if terminal_conflict_pending(current.metadata):
+            return "terminal-evidence-conflict"
+        if current.metadata.get("terminal_conflict") == "1":
+            return None
+        if committed_outcome(current.status, current.metadata) != "succeeded":
+            return None
+        if not current.metadata.get("log_file"):
+            return None
+        terminal = inspect_terminal_attempt(
+            current.metadata.get("log_file"),
+            worktree=_row_worktree(current),
+            artifact_root_metadata=current.metadata.get("artifact_root"),
+            worker_type=current.metadata.get("worker_type"),
+            artifact_binding=current.metadata,
+        )
+        if terminal.get("state") != "valid" or terminal.get("verdict") not in {"FAIL", "BLOCKED"}:
+            return None
+        note = str(terminal.get("failure_note") or "")
+        failure_class = str(terminal.get("failure_class") or "")
+        if not note or failure_class not in {"fail", "blocked", "sandbox-init"}:
+            return None
+        evidence = {
+            "failure_class": failure_class,
+            "classifier_source": "completion-join-late-terminal-v1",
+            "reconcile_reason": f"late-terminal-envelope:{terminal.get('verdict')}",
+        }
+        if note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
+            evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
+        reconcile_attempt_terminal(Path(jobs), current.attempt_id, note, evidence=evidence)
+        updated = exact_attempt_row(Path(jobs), current.attempt_id)
+        return ("terminal-evidence-conflict"
+                if terminal_conflict_pending(updated.metadata) else None)
+    except (DispatchContractError, JoinContractError, OSError, ValueError, RuntimeError):
+        return None
+
+
 def close_finished_child(
     row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None,
     correct_recorded_move: bool = False,
@@ -4200,6 +4227,10 @@ def close_finished_child(
     """
 
     metadata = getattr(row, "metadata", {}) or {}
+    late_conflict = _reconcile_late_terminal_conflict(row, jobs=jobs)
+    if late_conflict:
+        cleanup = resolve_attempt_cleanup(Path(jobs), row.attempt_id, apply=True)
+        return late_conflict if cleanup["settled"] else str(cleanup["reason"])
     from route_authority import decide_continuation
     obligation = decide_continuation(action="attempt-action", status=row.status, metadata=metadata)
     if (obligation.next_action not in {"complete-open", "complete-deferred"}

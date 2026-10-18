@@ -58,6 +58,13 @@ Each clause is one contract line plus the signal that it was violated.
   In user-facing replies, identify other sessions by Fleet tag and pane (SID
   when needed), with their role in parentheses; use herdr name and pane when
   no tag exists, rather than internal abbreviations.
+  For the first core subject in a message that must stand on its own, carry the
+  source description and the comparison condition that distinguishes it, then
+  add its original identifier as a reference: “the fixed two-speaker,
+  multi-reference model without dropout (E2 best48).” Keep the source
+  document or revision when it changes the meaning; leave an unexplained key
+  such as F11 unresolved instead of guessing. Completion conditions are
+  reported from their existing text, with internal IDs kept for traceability.
 - **Terminal-safe enumeration** — never use circled or otherwise enclosed
   numeral Unicode characters in user-facing replies. Use ordinary Arabic
   numerals (`1.`, `2.`), ASCII hyphens (`-`), letters, or short bold labels.

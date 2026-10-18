@@ -50,6 +50,68 @@ class ObligationStoreTest(unittest.TestCase):
         os.environ.update(self._saved_env)
         self.temp.cleanup()
 
+    def test_list_reuses_json_generation_and_observes_external_changes(self):
+        first = self.store.create("cached-one", "message", {}, {"ref": "a" * 32})
+        second = self.store.create("cached-two", "retire", {}, {"target": "pane"})
+        self.store.reset_discovery_metrics()
+
+        listed = self.store.list(states={"pending"})
+        self.assertEqual({row["id"] for row in listed}, {first["id"], second["id"]})
+        listed[0]["intent"]["mutated"] = True
+        self.assertEqual(len(self.store.list(states={"pending"})), 2)
+        metrics = self.store.discovery_metrics()
+        self.assertEqual(metrics["json_reads"], 2)
+        self.assertEqual(metrics["json_parses"], 2)
+        self.assertGreater(metrics["stat_calls"], 2)
+
+        path = self.store._record_path(first["id"])
+        old_mtime = path.stat().st_mtime_ns
+        raw = path.read_text(encoding="utf-8")
+        self.assertIn('"state":"pending"', raw)
+        changed = raw.replace('"state":"pending"', '"state":"unknown"')
+        self.assertEqual(len(raw), len(changed))
+        path.write_text(changed, encoding="utf-8")
+        os.utime(path, ns=(old_mtime, old_mtime))
+        self.assertNotIn(first["id"], {row["id"] for row in self.store.list(states={"pending"})})
+        self.assertIn(first["id"], {row["id"] for row in self.store.list(states={"unknown"})})
+        self.assertNotIn("mutated", self.store.get(first["id"])["intent"])
+
+        peer = obligations.ObligationStore(self.root)
+        peer.create("cached-three", "message", {}, {"ref": "c" * 32})
+        self.assertIn("cached-three", {row["id"] for row in self.store.list(states={"pending"})})
+        self.store._record_path(second["id"]).unlink()
+        self.assertNotIn(second["id"], {row["id"] for row in self.store.list(states={"pending"})})
+
+        refreshed = self.store.get(first["id"])
+        self.store.update(first["id"], state="complete")
+        self.assertEqual(self.store.list(states={"complete"})[0]["state"], "complete")
+        self.assertEqual(refreshed["state"], "unknown")
+
+    def test_runner_pass_shares_discovery_but_next_pass_observes_external_rewrite(self):
+        duty = self.store.create("pass-snapshot", "retire", {}, {"target": "pane"})
+        self.store.begin_read_pass()
+        self.assertEqual(self.store.list(states={"pending"}, kinds={"retire"})[0]["id"], duty["id"])
+        path = self.store._record_path(duty["id"])
+        raw = path.read_text(encoding="utf-8")
+        path.write_text(raw.replace('"state":"pending"', '"state":"unknown"'), encoding="utf-8")
+        self.assertEqual(self.store.list(states={"pending"}, kinds={"retire"})[0]["id"], duty["id"])
+        self.store.end_read_pass()
+        self.assertEqual(self.store.list(states={"pending"}, kinds={"retire"}), [])
+        self.assertEqual(self.store.list(states={"unknown"}, kinds={"retire"})[0]["state"], "unknown")
+
+    def test_skip_unchanged_preserves_default_revision_updates(self):
+        duty = self.store.create("message-noop", "message", {}, {})
+        observation = {"ref": "r" * 32, "reason": "target-identity-changed"}
+        updated = self.store.update(duty["id"], state="unknown", observation=observation)
+
+        same = self.store.update(duty["id"], state="unknown", observation=observation,
+                                 skip_unchanged=True)
+        self.assertEqual(same, updated)
+
+        default_update = self.store.update(duty["id"], state="unknown", observation=observation)
+        self.assertEqual(default_update["revision"], updated["revision"] + 1)
+        self.assertGreaterEqual(default_update["updated_at"], updated["updated_at"])
+
     def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
         self.store.create("message-reconnect", "message", {"session_id": "parent"},
                           {"ref": "a" * 32})
@@ -298,9 +360,10 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     spawned.assert_not_called()
                 else:
-                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
-                    spawned.assert_called_once()
-                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+                    # A caller without a verified managed lifecycle binding
+                    # cannot replace a live process, even if it looks legacy.
+                    self.assertIsNone(process.poll())
+                    spawned.assert_not_called()
             self.assertEqual(self.store.get(duty["id"]), duty)
             self.assertEqual(self.store.get(prior["id"]), prior)
         finally:
@@ -532,7 +595,23 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self._wait_for_death(pid)
 
         self._apply_fixture_env(mode="held")
-        peer_steward._ensure_watch_observers()
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def tracked_spawn(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def reap_spawned():
+            for process in spawned:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=5)
+
+        self.addCleanup(reap_spawned)
+        with mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_spawn):
+            peer_steward._ensure_watch_observers()
 
         resumed = json.loads(arm_path.read_text(encoding="utf-8"))
         self.assertEqual(resumed["watch_id"], watch_id,
@@ -540,7 +619,6 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(resumed.get("observer_generation", 1), 2)
         new_pid = int((resumed.get("watcher") or {})["pid"])
         self.assertNotEqual(new_pid, pid)
-        self._children.append(new_pid)
         try:
             os.kill(new_pid, 0)
         except OSError:

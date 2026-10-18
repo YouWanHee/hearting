@@ -37,6 +37,7 @@ def _load(name: str, path: Path):
 
 PD = _load("dispatch_pending_delivery", HERE / "dispatch_pending_delivery.py")
 SWEEP = _load("dispatch_session_sweep", HERE / "dispatch_session_sweep.py")
+import dispatch_batch_obligations as OBLIGATIONS  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -890,6 +891,87 @@ process.exit(0);
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
             self.assertTrue(liveness.plugin_loaded_for_slug(release, "oc-worker"))
             self.assertIsNotNone(liveness.heartbeat_age_min(release, "oc-worker", time.time()))
+
+
+class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
+    def test_only_canonical_session_activation_runs_existing_reconcile_owners(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        secondary = self.root.parent / "secondary-dispatch"
+        secondary.mkdir()
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
+             mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
+             mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
+            SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
+            SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
+        reconcile.assert_called_once_with(jobs)
+        ensure.assert_called_once_with()
+
+    def test_canonical_activation_continues_past_unreadable_registry(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        args = SimpleNamespace(
+            jobs=jobs, sealed_batch_id="batch-activation", parent_attempt_id="att-parent",
+            parent_session_id=None, attempt_id=["att-sidecar"],
+            delivery_parent_id="att-parent", control_socket=self.root / "control.sock",
+            queue_socket=None, thread_id=None, interval=0.1, timeout=1.0,
+        )
+        duty_id, _record = OBLIGATIONS.create(args)
+        unreadable = b"\xffactivation-registry\n"
+        jobs.write_bytes(unreadable)
+
+        secondary = self.root.parent / "secondary-dispatch"
+        secondary.mkdir()
+        other_jobs = secondary / "jobs.log"
+        metadata = ",".join((
+            "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
+            "launch_started=1", "supervisor_lease=flock-v1",
+            "supervisor_lease_file=/fixture/owner.lease", "log_file=/fixture/owner.log",
+            "attempt_id=att-activation-owner", "workflow_completion=runtime-v1",
+            "note=completed-supervisor",
+        ))
+        other_jobs.write_text(
+            f"2026-10-18T00:00:00Z\tdone\t/repo\t/wt\towner\t{metadata}\n",
+            encoding="utf-8")
+        other_before = other_jobs.read_bytes()
+        other_args = SimpleNamespace(**vars(args))
+        other_args.jobs = other_jobs
+        other_args.sealed_batch_id = "batch-secondary-activation"
+        other_args.attempt_id = ["att-secondary-sidecar"]
+        other_args.control_socket = secondary / "control.sock"
+        other_duty_id, _other_record = OBLIGATIONS.create(other_args)
+
+        class Launched:
+            pid = 902343
+
+        service_script = self.root.parent / "release" / "utilities" / "codex-managed-completion.py"
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
+             mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
+             mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch.object(OBLIGATIONS.subprocess, "Popen", return_value=Launched()) as launch:
+            self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
+
+        reconcile.assert_called_once_with(jobs)
+        settle.assert_not_called()
+        self.assertEqual(launch.call_count, 2)
+        launches = [call.args[0] for call in launch.call_args_list]
+        self.assertEqual(
+            {argv[argv.index("--jobs") + 1] for argv in launches},
+            {str(jobs), str(other_jobs)},
+        )
+        self.assertTrue(any(duty_id in argv for argv in launches))
+        self.assertTrue(any(other_duty_id in argv for argv in launches))
+        self.assertEqual(jobs.read_bytes(), unreadable)
+        self.assertEqual(other_jobs.read_bytes(), other_before)
 
 
 if __name__ == "__main__":

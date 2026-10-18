@@ -176,7 +176,9 @@ harness install claude
 
 | Surface | Wiring | Contract |
 |---|---|---|
-| `CLAUDE.md`/`core`/`skills`/`agents`/`hooks`/`tools`/`statusline.sh`/… | symlink | Repository changes appear immediately; harness-owned and read-only from the runtime |
+| `CLAUDE.md`/`core`/`skills`/`agents`/`tools`/`statusline.sh`/… | symlink | Repository changes appear immediately; harness-owned and read-only from the runtime |
+| Claude native hook files | per-file symlink fan-out | A real `hooks/` directory leaves the Herdr-owned `hooks/herdr-agent-state.sh` destination safe to replace and refresh |
+| `hooks/herdr-agent-state.sh` | managed regular copy | Installed at Herdr's consumer path; Hearting update restores its pinned bytes after an upstream reinstall |
 | `settings.json`/`keybindings.json` | copy once + hash manifest | Copy once and never link again (see configuration files below) |
 | packaged activation | repo-local immutable bundle → same native surfaces | Does not use plugin registries or caches |
 
@@ -219,7 +221,7 @@ harness install claude
   runtime activation are two legitimate owners of `$HOME/.claude` symlinks, and
   each owns a distinct owner-name-set — the installer's `projector.py`
   `_CLAUDE_SYMLINK_NAMES` table (`CLAUDE.md`, `README.md`, `core`, `commands`,
-  `skills`, `agents`, `agent-modes`, `hooks`, `utilities`, `tools`,
+  `skills`, `agents`, `agent-modes`, `utilities`, `tools`,
   `scaffolds`, `loops`, `manifest.json`, `statusline.sh`) and activation's
   native discovery names. When no activation record exists, the installer owns
   its full name set alone. Once a
@@ -383,6 +385,7 @@ harness install codex
 | Codex-native skills/agents/modes | symlink fan-out (`skills/*`, `agents/*.toml`) | Generated from `capabilities/` and `roles/` into `codex_setting/codex-{skills,agents,modes}`; do not reimplement |
 | packaged activation | repo-local immutable bundle → same native surfaces | Does not use plugin marketplace, config, or cache state |
 | hooks | `codex_setting/codex-hooks` → `hooks.json` | Adapter-owned hook bridge; executes only `type:"command"` entries |
+| Herdr SessionStart reporter | managed regular copy at `$CODEX_HOME/herdr-agent-state.sh` (fallback `~/.codex/herdr-agent-state.sh`) | Matches Herdr's native consumer path; `hooks.json` registers one SessionStart call and the manifest tracks this same asset |
 | `config.toml` | not copied; narrow managed leaves | Runtime-owned config remains intact; activation owns recorded Codex hook `trusted_hash` leaves and statusline/identity fragments, with conditional restoration. |
 
 - **Runtime activation:** both linked and packaged modes use Codex-native
@@ -437,6 +440,7 @@ harness install opencode
 | `AGENTS.md`/core/capabilities/roles/bin/tools/utilities | symlink using `agent-*` pointer names | Routes through generated projections under `opencode_setting/` |
 | OpenCode-native skills/agents/commands | symlink fan-out (`skills/*`, `agents/*.md`, `commands/*.md`) | Uses the current official plural discovery paths |
 | guard plugin | `opencode_setting/opencode-plugins/hearting-guards.js` | JS/TS plugin hook surface; OpenCode has no marketplace or bundle format, so installer symlinks are the only channel |
+| Herdr backend/TUI assets | regular copies at `plugins/herdr-agent-state.js`, `herdr-tui-session.js`, and `herdr-opencode/tui.js` | Herdr reinstall can replace its own files in the runtime home; Hearting update restores current pinned bytes |
 | `opencode.json`/`opencode.jsonc` `skills.paths` | non-destructive merge | Preserves user config; reports conflicts and stops instead of guessing an automatic merge |
 | `opencode.json`/`opencode.jsonc` `instructions[]` | conditional merge | Bootstrap carrier of last resort: added only when the config-home `AGENTS.md` auto-load is missing, and a previously installed entry is dropped once that link exists. User entries are never touched |
 

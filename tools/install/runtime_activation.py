@@ -573,11 +573,14 @@ def _children(
     surface: str,
     pattern: str = "*",
     allowed: Optional[set[str]] = None,
+    exclude: Optional[set[str]] = None,
 ) -> List[dict]:
     if not source.is_dir():
         return []
     entries = []
     for item in sorted(source.glob(pattern)):
+        if exclude is not None and item.name in exclude:
+            continue
         identifier = item.stem if item.is_file() else item.name
         if allowed is not None and identifier not in allowed:
             continue
@@ -654,9 +657,17 @@ def _linked_entries(
             (source_root / "roles", home / "agent-roles", "instructions"),
             (source_root / "adapters/codex/bin", home / "agent-bin", "hook_config"),
             (source_root / "adapters/codex/hooks", home / "agent-hooks", "hook_config"),
-            (source_root / "adapters/codex/hooks/hooks.json", home / "hooks.json", "hook_config"),
         ]
         entries.extend(_entry(src, dst, surface) for src, dst, surface in fixed)
+        entries.append(_entry(source_root / "adapters/codex/hooks/herdr-agent-state.sh",
+                              home / "herdr-agent-state.sh", "hook_config", kind="copy"))
+        # A real hooks.json is user-owned. The Codex driver and Herdr migration
+        # merge their exact owned entries in place; projecting a whole-file
+        # symlink would discard unrelated callbacks and comments.
+        hooks_json = home / "hooks.json"
+        if not (hooks_json.exists() and not hooks_json.is_symlink()):
+            entries.append(_entry(source_root / "adapters/codex/hooks/hooks.json",
+                                  hooks_json, "hook_config"))
         entries.extend(
             _mode_entries(
                 source_root / "adapters/codex/modes",
@@ -726,8 +737,11 @@ def _linked_entries(
             _children(source_root / "adapters/claude/commands", home / "commands", "skill", "*.md")
         )
         entries.extend(
-            _children(source_root / "adapters/claude/hooks", home / "hooks", "hook_config")
+            _children(source_root / "adapters/claude/hooks", home / "hooks", "hook_config",
+                      exclude={"herdr-agent-state.sh"})
         )
+        entries.append(_entry(source_root / "hooks/herdr-agent-state.sh",
+                              home / "hooks/herdr-agent-state.sh", "hook_config", kind="copy"))
 
     elif runtime == "opencode":
         fixed = [
@@ -762,13 +776,13 @@ def _linked_entries(
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
         herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
-        entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config"))
+        entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
         entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
         herdr_tui = source_root / "adapters/opencode/tui/herdr-tui-session.js"
-        entries.append(_entry(herdr_tui, home / "tui/herdr-tui-session.js", "hook_config"))
+        entries.append(_entry(herdr_tui, home / "herdr-tui-session.js", "hook_config", kind="copy"))
         herdr_tui_v2 = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
-        entries.append(_entry(herdr_tui_v2, home / "tui/herdr-opencode/tui.js", "hook_config"))
+        entries.append(_entry(herdr_tui_v2, home / "herdr-opencode/tui.js", "hook_config", kind="copy"))
         # Owned scoped TUI config: dormant until an owned launch points
         # OPENCODE_TUI_CONFIG at it. Never auto-read (the loader only reads
         # tui.json/tui.jsonc by name), never merged into user files.
@@ -2036,6 +2050,12 @@ def _merge_codex_identity_config(
                 result["conflicts"] = ["shell_environment_policy"]
                 return result
             identity_inserted = separator + block
+    elif existing == block:
+        recorded = previous_record.get("inserted")
+        if isinstance(recorded, str) and recorded and original.count(recorded) == 1 and block in recorded:
+            # Retain uninstall ownership when the user's policy now independently
+            # satisfies the fragment but the exact activation block is unchanged.
+            identity_inserted = recorded
     final_text, feature_record, feature_conflict = _codex_feature_insert(
         identity_text, previous_record.get("feature")
     )
@@ -2093,7 +2113,9 @@ def _unmerge_codex_identity_config(
         text = original_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    remaining = _codex_feature_remove(text, feature)
+    remaining = codex_tui_config.restore_startup_update_default_text(
+        text, record.get("startup_default") if isinstance(record, dict) else None)
+    remaining = _codex_feature_remove(remaining, feature)
     try:
         remaining = codex_tui_config.restore_status_line_text(remaining, managed.get("codex_tui"))
     except codex_tui_config.CodexTuiConfigError:
@@ -2376,15 +2398,45 @@ def _prepare_runtime_config(
         fragment = active_root / "adapters" / "codex" / "config" / "tui-statusline.toml"
         try:
             original = config.read_text(encoding="utf-8") if config.exists() else ""
-            updated = codex_tui_config.merge_status_line_from_fragment(original, fragment)
-            prior_tui = (previous.get("managed_config") or {}).get("codex_tui") if previous else None
-            result["tui_record"] = codex_tui_config.status_line_record(original, updated, prior_tui)
+        except (OSError, UnicodeError) as exc:
+            result.setdefault("conflicts", []).extend(("tui.status_line", "check_for_update_on_startup"))
+            result["tui_status_line_detail"] = str(exc)
+            result["startup_default_detail"] = str(exc)
+        else:
+            updated = original
+            prior_managed = (previous or {}).get("managed_config", {})
+            prior_managed = prior_managed if isinstance(prior_managed, dict) else {}
+            prior_identity = prior_managed.get("codex_identity")
+            prior_identity = prior_identity if isinstance(prior_identity, dict) else {}
+            try:
+                statusline_updated = codex_tui_config.merge_status_line_from_fragment(updated, fragment)
+                result["tui_record"] = codex_tui_config.status_line_record(
+                    updated, statusline_updated, prior_managed.get("codex_tui"))
+                updated = statusline_updated
+                result["tui_status_line_changed"] = updated != original
+            except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+                result.setdefault("conflicts", []).append("tui.status_line")
+                result["tui_status_line_detail"] = str(exc)
+
+            before_startup = updated
+            startup_record = None
+            try:
+                startup_updated = codex_tui_config.merge_startup_update_default_text(before_startup)
+                startup_record = codex_tui_config.startup_update_default_record(
+                    before_startup, startup_updated, prior_identity.get("startup_default"))
+                updated = startup_updated
+                result["startup_default_changed"] = updated != before_startup
+            except (UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+                result.setdefault("conflicts", []).append("check_for_update_on_startup")
+                result["startup_default_detail"] = str(exc)
+
+            if startup_record:
+                managed_config = result.get("managed_config")
+                managed_config = dict(managed_config) if isinstance(managed_config, dict) else {}
+                managed_config["startup_default"] = startup_record
+                result["managed_config"] = managed_config
             if updated != original:
                 _atomic_codex_config_text(config, updated)
-            result["tui_status_line_changed"] = updated != original
-        except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
-            result.setdefault("conflicts", []).append("tui.status_line")
-            result["tui_status_line_detail"] = str(exc)
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
         result["native_context"] = native
@@ -2878,6 +2930,21 @@ def _apply_transaction(
             if item["kind"] == "copytree":
                 _remove_path(dest)
                 shutil.copytree(source, dest, symlinks=False)
+            elif item["kind"] == "copy":
+                current = safe_fs.capture_state(dest)
+                try:
+                    auth = safe_fs.authority(
+                        dest,
+                        owner=f"runtime-activation:{runtime}:{item['surface']}:copy",
+                        allowed_paths=(dest,), allow_leaf_symlink=True,
+                        expected=current,
+                    )
+                    safe_fs.atomic_write_bytes(
+                        auth, source.read_bytes(), source.stat().st_mode & 0o777,
+                        expected=current, create_parents=True,
+                    )
+                except (OSError, safe_fs.SafetyError) as exc:
+                    raise ActivationError(str(exc)) from exc
             else:
                 current = safe_fs.capture_state(dest)
                 try:
@@ -3268,6 +3335,17 @@ def _entries_healthy(entries: List[dict]) -> tuple[bool, bool]:
             continue
         if item.get("kind") == "copytree":
             if _tree_digest(dest) != _tree_digest(source):
+                stale = True
+        elif item.get("kind") == "copy":
+            try:
+                if (
+                    dest.is_symlink()
+                    or not dest.is_file()
+                    or dest.read_bytes() != source.read_bytes()
+                    or (dest.stat().st_mode & 0o777) != (source.stat().st_mode & 0o777)
+                ):
+                    stale = True
+            except OSError:
                 stale = True
         elif not dest.is_symlink() or dest.resolve(strict=False) != source.resolve(strict=False):
             stale = True

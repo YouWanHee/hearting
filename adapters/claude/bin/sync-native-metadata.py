@@ -34,7 +34,6 @@ def generated_frontmatter(identifier: str, spec: dict) -> str:
     modes = json.dumps(spec["modes"], ensure_ascii=False)
     return f"""---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: {identifier}
 description: {quoted(description)}
 argument-hint: {quoted(spec["argument_shape"])}
 metadata:

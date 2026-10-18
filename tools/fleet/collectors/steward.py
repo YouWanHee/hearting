@@ -102,10 +102,23 @@ def _projection_sessions():
             rows.append(SimpleNamespace(harness=harness, session_id=sid, cwd=cwd,
                                         _herdr_name=agent.get("name"),
                                         session_aliases=herdr.pane_session_aliases(harness, sid, pane, cwd),
-                                        _gpu_session_aliases=herdr._clear_gpu_session_aliases(harness, sid, pane)))
-    current_keys = {key for row in rows for key in _session_keys(row)}
-    return rows + [row for row in _registry_sessions()
-                   if not current_keys.intersection(_session_keys(row))]
+                                        _gpu_session_aliases=herdr._clear_gpu_session_aliases(
+                                            harness, sid, pane, cwd)))
+    registry_rows = _registry_sessions()
+    live_keys = {(str(getattr(row, "harness", "") or "").lower(),
+                  getattr(row, "session_id", None))
+                 for row in [*rows, *registry_rows] if getattr(row, "session_id", None)}
+    for row in rows:
+        harness = str(getattr(row, "harness", "") or "").lower()
+        for field in ("session_aliases", "_gpu_session_aliases"):
+            aliases = getattr(row, field, None) or ()
+            setattr(row, field, [sid for sid in aliases if (harness, sid) not in live_keys])
+    projected_keys = {(str(getattr(row, "harness", "") or "").lower(),
+                       getattr(row, "session_id", None))
+                      for row in rows if getattr(row, "session_id", None)}
+    return rows + [row for row in registry_rows
+                   if (str(getattr(row, "harness", "") or "").lower(),
+                       getattr(row, "session_id", None)) not in projected_keys]
 
 
 def _native_role_sessions(markers, rows):
@@ -224,7 +237,7 @@ def _owner_targets(winners, harness, session_id):
 
 
 def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
-                 _winners=None):
+                 _winners=None, include_native=False):
     """One same-repository role lookup for Fleet and herdr, with proven prior ids.
 
     Current snapshot rows override registry history for their exact join keys.
@@ -258,7 +271,7 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
                           _herdr_name=next(iter(own_names)) if len(own_names) == 1 else None,
                           runtime_name=next(iter(runtime_names)) if len(runtime_names) == 1 else None)
     rows = [own] + [row for row in rows if not own_keys.intersection(_session_keys(row))]
-    if sessions is None:
+    if sessions is None or include_native:
         rows += _native_role_sessions(markers, rows)
     winners = _role_winners(markers, rows, evidence)
     return _owner_targets(winners, harness, session_id)

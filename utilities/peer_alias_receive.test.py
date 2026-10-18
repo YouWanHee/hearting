@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,22 +38,47 @@ class AliasReceive(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name)
+        for path in (self.state / "home", self.state / "xdg", self.state / "xdg-config",
+                     self.state / "xdg-data", self.state / "artifacts", self.state / "runtime",
+                     self.state / "peer-ledger"):
+            path.mkdir(parents=True, exist_ok=True)
+        self.agent_home = self.state / "agent-home"
+        self.agent_home.mkdir()
+        (self.agent_home / "core").mkdir()
+        shutil.copy2(ROOT / "core/CORE.md", self.agent_home / "core/CORE.md")
+        if (ROOT / "harness-manifest.json").is_file():
+            shutil.copy2(ROOT / "harness-manifest.json", self.agent_home / "harness-manifest.json")
+        if (ROOT / "RELEASE_VERSION").is_file():
+            shutil.copy2(ROOT / "RELEASE_VERSION", self.agent_home / "RELEASE_VERSION")
+        for name in ("adapters", "utilities", "tools"):
+            (self.agent_home / name).symlink_to(ROOT / name, target_is_directory=True)
         inherited = dict(os.environ)
         for key in tuple(os.environ):
-            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_",
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_ARTIFACT_", "AGENT_SESSION_", "AGENT_RUNTIME_",
                                "AGENT_THREAD_", "HERDR_")):
                 os.environ.pop(key, None)
         for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
                     "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG",
-                    "FLEET_TITLE_REFRESH"):
+                    "FLEET_TITLE_REFRESH", "HARNESS_STATE_ROOT", "HARNESS_DATA_ROOT",
+                    "AGENT_SERVICE_CURRENT", "HEARTING_SERVICE_CURRENT", "SERVICE_CURRENT",
+                    "AGENT_INSTALL_CURRENT", "AGENT_INSTALL_ROOT"):
             os.environ.pop(key, None)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(inherited)))
         self.env = mock.patch.dict(os.environ, {
             "AGENT_DISPATCH_JOBS": str(self.state / "jobs.log"),
             "AGENT_PEER_LEDGER_ROOT": str(self.state),
             "HOME": str(self.state / "home"), "CODEX_HOME": str(self.state / "home/.codex"),
-            "AGENT_HOME": str(ROOT), "CLAUDE_CONFIG_DIR": str(self.state / "home/.claude"),
-            "XDG_STATE_HOME": str(self.state / "xdg"), "PYTHONDONTWRITEBYTECODE": "1"})
+            "AGENT_HOME": str(self.state / "agent-home"),
+            "CLAUDE_HOME": str(self.state / "claude-home"),
+            "AGENT_RUNTIME_ROOT": str(self.state / "runtime"),
+            "CLAUDE_CONFIG_DIR": str(self.state / "home/.claude"),
+            "OPENCODE_CONFIG_DIR": str(self.state / "home/.config/opencode"),
+            "XDG_STATE_HOME": str(self.state / "xdg"),
+            "XDG_CONFIG_HOME": str(self.state / "xdg-config"),
+            "XDG_DATA_HOME": str(self.state / "xdg-data"),
+            "AGENT_ARTIFACT_ROOT": str(self.state / "artifacts"),
+            "HARNESS_DATA_ROOT": str(self.state / "data"),
+            "PYTHONDONTWRITEBYTECODE": "1"})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.sender = {"harness": "codex", "session_id": "01a07b2b-9108-7110-bd41-93b7ade4d9c4", "name": "동명"}
@@ -163,9 +189,10 @@ class AliasReceive(unittest.TestCase):
         self.assertEqual(context["hookEventName"], "PostToolUse")
         self.assertEqual(context["additionalContext"], text)
         row = pm._read_pending(ref)
-        self.assertEqual((row["state"], row["receipt"], row["text"]), ("queued", "hook-context-emitted", text))
-        self.assertFalse(self.rows(), "emitted context is not confirmed receipt")
-        self.assertEqual(hook().stdout, "", "an accepted context must not be emitted twice")
+        self.assertEqual((row["state"], row["receipt"], row["text"]),
+                         ("received", "exact-peer-ref", None))
+        self.assertEqual(len(self.rows()), 1, "native context delivery settles one exact receive")
+        self.assertEqual(hook().stdout, "", "a received context must not be emitted twice")
         self.assertEqual(pm.receive_peer_message(text, recipient), 0)
         self.assertEqual(pm._read_pending(ref)["state"], "received")
         self.assertIsNone(pm._read_pending(ref)["text"])
@@ -910,7 +937,7 @@ if (process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1") {
                 if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "HERDR_")):
                     env.pop(key, None)
             env.pop("OPENCODE_DISPATCH_SLUG", None)
-            env.update({"AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_CHECKPOINT": "off",
+            env.update({"AGENT_HOME": str(self.agent_home), "AGENT_ARTIFACT_CHECKPOINT": "off",
                         "FIXTURE_GUARDS": str(module_path),
                         "XDG_STATE_HOME": str(fixture_state),
                         "FIXTURE_BARE_NATIVE_ORIGIN": "1" if bare_origin else "0",
