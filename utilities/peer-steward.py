@@ -108,11 +108,6 @@ _PERMISSION_FLAGS = {
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
     "opencode": ["--auto"],
 }
-# A started session has no one at its keyboard: Codex's startup update dialog would hold
-# it at agent_not_ready. The user's own `codex` keeps its update check.
-_STARTUP_FLAGS = {
-    "codex": ["-c", "check_for_update_on_startup=false"],
-}
 
 def _current_session_identity():
     """`(session_id, harness)` — delegates to `dispatch_parent_completion
@@ -1441,10 +1436,9 @@ def _start_in_pane(args):
     agent_args = list(getattr(args, "agent_args", None) or [])
     prefix = list(_PERMISSION_FLAGS.get(args.kind, [])) if mode == "bypass" else []
     project_arg = [pane_cwd] if args.kind == "opencode" and pane_cwd else []
-    # Codex's shared-daemon defaults and caller-supplied connection flags pass through
-    # unchanged. Identity is resolved once from the started foreground process below.
-    full_agent_args = (list(_STARTUP_FLAGS.get(args.kind, [])) + prefix + cwd_flag
-                       + project_arg + agent_args)
+    # Shared-daemon defaults and caller-supplied connection flags pass through unchanged.
+    # Identity is resolved once from the started foreground process below.
+    full_agent_args = prefix + cwd_flag + project_arg + agent_args
 
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when

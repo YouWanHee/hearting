@@ -62,12 +62,32 @@ class CodexDriverLauncherRetirementTest(unittest.TestCase):
 
         applied = codex_driver.install(dry_run=False)
         import tomllib
-        merged = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+        merged_root = tomllib.loads(config.read_text(encoding="utf-8"))
+        merged = merged_root["tui"]
+        self.assertIs(merged_root["check_for_update_on_startup"], False)
         self.assertEqual(merged["status_line"], ["custom", "thread-id"])
         self.assertIs(merged["status_line_use_colors"], False)
         self.assertEqual((self.runtime_home / "config.toml.pre-harness-tui").read_text(), original)
         action = next(item for item in applied["actions"] if item["action"] == "codex-tui-statusline")
         self.assertEqual(action["status"], "updated")
+
+    def test_install_preserves_explicit_startup_update_values(self):
+        import tomllib
+        for value in (True, False):
+            with self.subTest(value=value):
+                config = self.runtime_home / "config.toml"
+                original = (f'check_for_update_on_startup = {str(value).lower()}\n'
+                            '[tui]\nstatus_line = ["thread-title", "git-branch", "context-used", '
+                            '"model-with-reasoning", "five-hour-limit", "weekly-limit", "thread-id"]\n'
+                            'status_line_use_colors = true\n')
+                config.write_text(original, encoding="utf-8")
+                result = codex_driver.install(dry_run=False)
+                parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+                self.assertIs(parsed["check_for_update_on_startup"], value)
+                self.assertEqual(config.read_text(encoding="utf-8"), original)
+                action = next(item for item in result["actions"]
+                              if item["action"] == "codex-tui-statusline")
+                self.assertEqual(action["status"], "unchanged")
 
     def test_install_updates_symlink_target_and_keeps_link_target_text(self):
         import os
@@ -86,7 +106,9 @@ class CodexDriverLauncherRetirementTest(unittest.TestCase):
         self.assertTrue(config.is_symlink())
         self.assertEqual(os.readlink(config), link_target)
         self.assertEqual((self.runtime_home / "config.toml.pre-harness-tui").read_bytes(), original)
-        parsed = tomllib.loads(target.read_text(encoding="utf-8"))["tui"]
+        parsed_root = tomllib.loads(target.read_text(encoding="utf-8"))
+        parsed = parsed_root["tui"]
+        self.assertIs(parsed_root["check_for_update_on_startup"], False)
         self.assertEqual(parsed["status_line"], ["custom", "thread-id"])
         self.assertIs(parsed["status_line_use_colors"], False)
 

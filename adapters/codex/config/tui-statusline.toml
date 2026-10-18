@@ -1,7 +1,9 @@
 # Codex-owned TUI preference fragment.
 #
 # `/statusline` persists these values in $CODEX_HOME/config.toml under [tui].
-# Keep config.toml runtime-owned because it also stores local project trust,
+# The shared installer merge also inserts the root startup-update default when
+# that key is absent; explicit true/false values stay user-owned. Keep the rest
+# of config.toml runtime-owned because it also stores local project trust,
 # hook trust hashes, plugin state, model defaults, credentials pointers, and
 # other user/session state.
 #

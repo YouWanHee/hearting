@@ -683,32 +683,262 @@ def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
     return max(rows, key=lambda r: r["last_seen"]) if rows else None
 
 
-def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
-    """Display IDs observed at this exact pane, bounded to one harness/repository.
+def _lineage_row_matches_seat(row: dict, seat: Seat) -> bool:
+    if "pane" in row and row.get("pane") != seat.pane:
+        return False
+    endpoint = row.get("endpoint")
+    if "endpoint" in row and endpoint not in (None, seat.endpoint):
+        return False
+    metadata = row.get("seat")
+    if not isinstance(metadata, dict):
+        return True
+    if "kind" in metadata and metadata.get("kind") != "pane":
+        return False
+    if "pane" in metadata and metadata.get("pane") != seat.pane:
+        return False
+    if "key" in metadata and metadata.get("key") != seat.key:
+        return False
+    endpoint = metadata.get("endpoint")
+    return "endpoint" not in metadata or endpoint in (None, seat.endpoint)
 
-    Reuse the seat history; a same-cwd session elsewhere is not an alias. Readers
-    can hold the previous ID while native publication is catching up, so the
-    display join is bidirectional. Execution and notification identities stay exact.
-    """
+
+def _pane_repository_map(rows: list[dict], seat: Seat, resolve_gitdir) -> dict[tuple[str, str], str]:
+    repositories: dict[tuple[str, str], set[str]] = {}
+    conflicts: set[tuple[str, str]] = set()
+    resolved_cwds = {}
+    for row in rows:
+        harness, sid = row.get("harness"), row.get("sid")
+        if not isinstance(harness, str) or not isinstance(sid, str) or not harness or not sid:
+            continue
+        identity = (harness, sid)
+        if not _lineage_row_matches_seat(row, seat):
+            conflicts.add(identity)
+            continue
+        cwd = row.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        if cwd not in resolved_cwds:
+            try:
+                result = resolve_gitdir(cwd)
+                resolved_cwds[cwd] = (result[1] if isinstance(result, (list, tuple))
+                                      and len(result) > 1 else "")
+            except Exception:
+                resolved_cwds[cwd] = ""
+        repository = resolved_cwds[cwd]
+        if repository:
+            repositories.setdefault(identity, set()).add(str(repository))
+    return {identity: next(iter(values)) for identity, values in repositories.items()
+            if len(values) == 1 and identity not in conflicts}
+
+
+def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str):
     if harness not in HARNESSES or not sid or not pane or not cwd:
-        return []
+        return None
     try:
         tools = str(Path(__file__).resolve().parents[1] / "tools")
         if tools not in sys.path:
             sys.path.insert(0, tools)
         from fleet.gitinfo import resolve_gitdir
-        repository = resolve_gitdir(cwd)[1]
+        resolved = resolve_gitdir(cwd)
+        repository = resolved[1] if isinstance(resolved, (list, tuple)) and len(resolved) > 1 else ""
         if not repository:
-            return []
-        rows = [row for row in session_summary(_pane_seat_of(pane)).values()
-                if row["harness"] == harness and row.get("cwd")
-                and resolve_gitdir(row["cwd"])[1] == repository]
-        if not any(row["sid"] == sid for row in rows):
-            return []
-        return [row["sid"] for row in sorted(rows, key=lambda r: r["last_seen"], reverse=True)
-                if row["sid"] != sid][:8]
-    except (OSError, ValueError, TypeError, ImportError):
+            return None
+        current = _pane_seat_of(pane)
+        current_rows = _read_ledger_lines(current)
+        current_repositories = _pane_repository_map(current_rows, current, resolve_gitdir)
+        if current_repositories.get((harness, sid)) != repository:
+            return None
+        inputs = [(current, current_rows, current_repositories)]
+        if current.endpoint:
+            # Endpoint-free keys are legacy only. Never enumerate or scan another endpoint.
+            legacy = Seat("pane", _digest("pane", pane), pane, harness)
+            legacy_rows = _read_ledger_lines(legacy)
+            legacy_repositories = _pane_repository_map(legacy_rows, legacy, resolve_gitdir)
+            if legacy_repositories.get((harness, sid)) == repository:
+                inputs.append((legacy, legacy_rows, legacy_repositories))
+        return repository, inputs, resolve_gitdir
+    except Exception:
+        return None
+
+
+def _previous_distinct_start(rows: list[dict], index: int, seat: Seat, harness: str,
+                             successor: str, repositories: dict, repository: str) -> str:
+    raw_seen = False
+    previous = ""
+    for row in rows[:index]:
+        if (row.get("harness") != harness or row.get("event") != "start"
+                or not _lineage_row_matches_seat(row, seat)):
+            continue
+        old = row.get("sid")
+        if not isinstance(old, str) or not old:
+            continue
+        raw_seen = True
+        if old != successor:
+            previous = old
+    if raw_seen:
+        return previous
+
+    # Folding retains each session's last native-start provenance. Use it only
+    # when no raw start remains in this ledger; never compare timestamps across keys.
+    current_row = rows[index]
+    current_at = current_row.get("ts")
+    if not isinstance(current_at, (int, float)) or isinstance(current_at, bool):
+        return ""
+    candidates: dict[str, float] = {}
+    for row in rows:
+        if (row.get("harness") != harness or row.get("event") != "summary"
+                or not _lineage_row_matches_seat(row, seat)):
+            continue
+        old = row.get("sid")
+        source = row.get("latest_start_source", row.get("start_source"))
+        started = row.get("latest_start_at", row.get("start_at"))
+        if (not isinstance(old, str) or not old or old == successor
+                or source not in {"startup", "resume", "select", "clear", "compact", "fork"}
+                or not isinstance(started, (int, float)) or isinstance(started, bool)
+                or started <= 0 or started >= current_at
+                or repositories.get((harness, old)) != repository):
+            continue
+        candidates[old] = float(started)
+    if not candidates:
+        return ""
+    latest = max(candidates.values())
+    winners = [old for old, started in candidates.items() if started == latest]
+    return winners[0] if len(winners) == 1 else ""
+
+
+def _confirmed_clear_start_edges(seat: Seat, rows: list[dict], repositories: dict,
+                                 harness: str, repository: str, resolve_gitdir) -> set[tuple[str, str]]:
+    starts = [(index, row) for index, row in enumerate(rows)
+              if row.get("event") == "start" and row.get("source") == "clear"
+              and row.get("harness") == harness and row.get("sid")
+              and _lineage_row_matches_seat(row, seat)]
+    if not starts:
+        return set()
+    try:
+        import session_tidy_clear
+        booking = session_tidy_clear.read_reservation(seat.key)
+    except Exception:
+        return set()
+    if not isinstance(booking, dict):
+        return set()
+    booked_seat = booking.get("seat")
+    observed = booking.get("observed")
+    old = booking.get("sid")
+    successor = booking.get("new_session")
+    if (booking.get("schema") != 1 or booking.get("status") != "cleared"
+            or booking.get("harness") != harness or not isinstance(old, str) or not old
+            or not isinstance(successor, str) or not successor or old == successor
+            or not isinstance(booked_seat, dict) or booked_seat.get("kind") != "pane"
+            or booked_seat.get("key") != seat.key or booked_seat.get("pane") != seat.pane
+            or ("endpoint" in booked_seat
+                and booked_seat.get("endpoint") not in (None, seat.endpoint))
+            or not isinstance(observed, dict) or observed.get("harness") != harness
+            or observed.get("sid") != successor):
+        return set()
+    booking_cwd = booking.get("cwd")
+    if not isinstance(booking_cwd, str) or not booking_cwd:
+        return set()
+    try:
+        resolved = resolve_gitdir(booking_cwd)
+        booking_repository = resolved[1] if isinstance(resolved, (list, tuple)) and len(resolved) > 1 else ""
+    except Exception:
+        return set()
+    if booking_repository != repository:
+        return set()
+
+    edges: set[tuple[str, str]] = set()
+    for index, row in starts:
+        if row.get("sid") != successor:
+            continue
+        previous = _previous_distinct_start(rows, index, seat, harness, successor,
+                                            repositories, repository)
+        if (previous == old and repositories.get((harness, previous)) == repository
+                and repositories.get((harness, successor)) == repository):
+            edges.add((previous, successor))
+    return edges
+
+
+def _confirmed_predecessors_from(inputs, harness: str, sid: str, repository: str,
+                                 resolve_gitdir) -> list[str]:
+    edges: set[tuple[str, str]] = set()
+    for seat, rows, repositories in inputs:
+        for row in rows:
+            if (row.get("event") != "handover" or row.get("harness") != harness
+                    or row.get("source") not in {"clear", "reservation", "first-message"}
+                    or not _lineage_row_matches_seat(row, seat)):
+                continue
+            successor = row.get("sid")
+            predecessor = row.get("from")
+            if isinstance(predecessor, dict):
+                if predecessor.get("harness") != harness:
+                    continue
+                predecessor = predecessor.get("sid")
+            if (not isinstance(predecessor, str) or not predecessor
+                    or not isinstance(successor, str) or not successor or predecessor == successor):
+                continue
+            if (repositories.get((harness, predecessor)) == repository
+                    and repositories.get((harness, successor)) == repository):
+                edges.add((predecessor, successor))
+        edges.update(_confirmed_clear_start_edges(
+            seat, rows, repositories, harness, repository, resolve_gitdir))
+
+    chain = []
+    visited = {sid}
+    current = sid
+    while True:
+        predecessors = {old for old, new in edges if new == current}
+        if len(predecessors) != 1:
+            break
+        predecessor = next(iter(predecessors))
+        if predecessor in visited:
+            break
+        visited.add(predecessor)
+        chain.append(predecessor)
+        current = predecessor
+    return chain
+
+
+def confirmed_pane_predecessors(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+    """Return only confirmed same-harness clear/handover predecessors for display."""
+    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    if state is None:
         return []
+    repository, inputs, resolver = state
+    return _confirmed_predecessors_from(inputs, harness, sid, repository, resolver)
+
+
+def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+    """Compatibility aliases plus confirmed predecessors, for display only.
+
+    The compatibility join keeps its eight-recent-ID bound. Confirmed lineage is
+    separate and may extend beyond that bound; neither result changes execution or
+    notification identity.
+    """
+    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    if state is None:
+        return []
+    repository, inputs, resolver = state
+    compatibility = []
+    for seat, _rows, repositories in inputs:
+        summaries = session_summary(seat)
+        compatibility.append(sorted(
+            ((row["sid"], float(row.get("last_seen", 0) or 0))
+             for key, row in summaries.items()
+             if key[0] == harness and key[1] != sid and repositories.get(key) == repository),
+            key=lambda item: item[1], reverse=True))
+    ordered = []
+    seen = {sid}
+    for local in compatibility:
+        for old, _last_seen in local:
+            if old not in seen:
+                seen.add(old)
+                ordered.append(old)
+                if len(ordered) == 8:
+                    break
+        if len(ordered) == 8:
+            break
+    predecessors = _confirmed_predecessors_from(inputs, harness, sid, repository, resolver)
+    return list(dict.fromkeys([*ordered, *predecessors]))
 
 
 def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:

@@ -419,9 +419,9 @@ def _eligible(session):
     return True
 
 
-def _clear_gpu_session_aliases(harness, sid, pane):
-    """Display-only ids linked by this pane's confirmed native /clear."""
-    if harness not in {"claude", "codex", "opencode"} or not sid or not pane:
+def _clear_gpu_session_aliases(harness, sid, pane, cwd=None):
+    """Confirmed display predecessors from the shared same-repository reader."""
+    if harness not in {"claude", "codex", "opencode"} or not sid or not pane or not cwd:
         return []
     try:
         import sys
@@ -430,28 +430,7 @@ def _clear_gpu_session_aliases(harness, sid, pane):
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
         import session_tidy
-        seat = session_tidy.Seat("pane", session_tidy._digest("pane", pane), pane, harness)
-        record = session_tidy.read_json(session_tidy.state_root() / "clear" / (seat.key + ".json"))
-        if (not isinstance(record, dict) or record.get("schema") != 1
-                or record.get("status") != "cleared" or record.get("harness") != harness
-                or record.get("new_session") != sid
-                or (record.get("seat") or {}).get("kind") != "pane"
-                or (record.get("seat") or {}).get("pane") != pane
-                or (record.get("observed") or {}).get("harness") != harness
-                or (record.get("observed") or {}).get("sid") != sid):
-            return []
-        older = record.get("sid")
-        if not isinstance(older, str) or not older or older == sid:
-            return []
-        aliases = [older]
-        starts = [row for row in session_tidy._read_ledger_lines(seat)
-                  if row.get("harness") == harness and row.get("event") == "start"]
-        if len(starts) >= 2 and starts[-1].get("sid") == sid and starts[-2].get("sid") == older:
-            for index in range(len(starts) - 2, 0, -1):
-                if starts[index].get("source") != "clear":
-                    break
-                aliases.append(starts[index - 1]["sid"])
-        return list(dict.fromkeys(aliases))[:8]
+        return session_tidy.confirmed_pane_predecessors(harness, sid, pane, cwd)
     except (OSError, ValueError, TypeError, AttributeError, ImportError):
         return []
 
@@ -619,8 +598,9 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                      and agent.get("name")}
             if len(names) == 1:
                 s._herdr_name = names.pop()
-            aliases = _clear_gpu_session_aliases(harness, sid, next(iter(matching_panes)))
-            pane_aliases = pane_session_aliases(harness, sid, pane, getattr(s, "cwd", None))
+            session_cwd = getattr(s, "cwd", None)
+            aliases = _clear_gpu_session_aliases(harness, sid, pane, session_cwd)
+            pane_aliases = pane_session_aliases(harness, sid, pane, session_cwd)
             if aliases or pane_aliases:
                 from . import procscan
                 if getattr(s, "proc_start", None) and procscan.read_proc_start(s.pid) == s.proc_start:

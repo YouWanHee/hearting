@@ -1000,15 +1000,24 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         cmd = _agent_start_cmd(run_mock)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
-    def test_codex_start_skips_its_startup_update_dialog(self):
+    def test_codex_start_keeps_shared_daemon_and_caller_args_without_update_override(self):
+        user_args = ["--remote", "unix:///tmp/caller-codex.sock"]
         for mode in ("bypass", "inherit"):
             with self.subTest(mode=mode), \
                     mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                     mock.patch.object(peer_steward.subprocess, "run",
                                       return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
-                self._start(kind="codex", permission_mode=mode)
+                self._start(kind="codex", permission_mode=mode, agent_args=user_args)
                 cmd = _agent_start_cmd(run_mock)
-                self.assertEqual(cmd[cmd.index("--") + 1:][:2], ["-c", "check_for_update_on_startup=false"])
+                passed = cmd[cmd.index("--") + 1:]
+                self.assertNotIn("check_for_update_on_startup=false", passed)
+                self.assertIn(user_args, [passed[i:i + len(user_args)]
+                                          for i in range(len(passed) - len(user_args) + 1)])
+                self.assertEqual(passed.count("--no-daemon"), 0)
+                if mode == "bypass":
+                    self.assertIn("--dangerously-bypass-approvals-and-sandbox", passed)
+                else:
+                    self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", passed)
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                 mock.patch.object(peer_steward.subprocess, "run",
                                   return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:

@@ -645,5 +645,53 @@ class StewardReverseIndexTest(unittest.TestCase):
         self.assertIsNone(target.steward_parents)
 
 
+class LineageConsumerWiringTest(unittest.TestCase):
+    def test_steward_projection_passes_its_known_repository_to_lineage_reader(self):
+        from fleet.collectors import herdr
+        cwd = "/fixture/repository"
+        agent = {"agent": "codex", "pane_id": "w:p", "cwd": cwd,
+                 "agent_session": {"value": "current"}}
+        with mock.patch.object(herdr, "list_agents", return_value=[agent]), \
+             mock.patch.object(herdr, "pane_session_aliases", return_value=[]), \
+             mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=["older"]) as aliases, \
+             mock.patch.object(steward, "_registry_sessions", return_value=[]):
+            rows = steward._projection_sessions()
+        aliases.assert_called_once_with("codex", "current", "w:p", cwd)
+        self.assertEqual(rows[0]._gpu_session_aliases, ["older"])
+
+    def test_role_snapshot_does_not_fold_a_still_live_sid_into_its_parent(self):
+        from fleet.collectors import herdr
+        cwd = "/fixture/repository"
+        agent = {"agent": "codex", "pane_id": "w:p", "cwd": cwd,
+                 "agent_session": {"value": "current"}}
+        old_live = Session(harness="codex", pid=2, session_id="older", cwd=cwd)
+        with mock.patch.object(herdr, "list_agents", return_value=[agent]), \
+             mock.patch.object(herdr, "pane_session_aliases", return_value=["older", "ended"]), \
+             mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=["older", "ended"]), \
+             mock.patch.object(steward, "_registry_sessions", return_value=[old_live]):
+            rows = steward._projection_sessions()
+        self.assertEqual([row.session_id for row in rows], ["current", "older"])
+        self.assertEqual(rows[0].session_aliases, ["ended"])
+        self.assertEqual(rows[0]._gpu_session_aliases, ["ended"])
+
+    def test_herdr_role_lookup_drops_predecessors_that_are_still_live(self):
+        from fleet.collectors import herdr
+        cwd = "/fixture/repository"
+        sessions = [
+            Session(harness="codex", pid=1, cwd=cwd, session_id="live-old"),
+            Session(harness="codex", pid=2, cwd=cwd, session_id="current"),
+        ]
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w:p"}), \
+             mock.patch.object(herdr, "_clear_gpu_session_aliases",
+                               return_value=["live-old", "ended-old"]) as lineage, \
+             mock.patch.object(steward, "_projection_sessions", return_value=sessions), \
+             mock.patch.object(steward, "role_flag", return_value=True) as role_flag, \
+             mock.patch.object(herdr_projection.os, "getcwd", return_value=cwd):
+            self.assertTrue(herdr_projection.is_steward("codex", "current"))
+        lineage.assert_called_once_with("codex", "current", "w:p", cwd)
+        self.assertEqual(role_flag.call_args.kwargs["aliases"], ["ended-old"])
+        self.assertIs(role_flag.call_args.kwargs["sessions"], sessions)
+
+
 if __name__ == "__main__":
     unittest.main()
