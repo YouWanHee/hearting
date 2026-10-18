@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: design-init
 description: "Use only when autopilot-design dispatches design environment and state initialization. Not for top-level user requests or primary capability routing."
 argument-hint: "<design task description> [--scope ui|slide|icon|diagram|mixed]"
 metadata:

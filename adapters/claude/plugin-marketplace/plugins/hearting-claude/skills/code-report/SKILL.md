@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: code-report
 description: "Use only when autopilot-code dispatches the final code-cycle reporting stage. Not for top-level user requests or primary capability routing."
 argument-hint: "<plan name or path>"
 metadata:

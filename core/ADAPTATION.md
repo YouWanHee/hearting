@@ -264,10 +264,17 @@ A runtime skill/slash command/native instruction describes:
 - how hook events are attached;
 - runtime-specific file formats and frontmatter.
 
-Current `skills/*/SKILL.md` files are compatibility references. Claude Code
-consumes adapter-owned concrete files under
-`adapters/claude/skills/*/SKILL.md`. Portable capability meaning belongs in
-`capabilities/`.
+Current `skills/*/SKILL.md` files are Claude-format compatibility references.
+Claude Code consumes adapter-owned concrete files under
+`adapters/claude/skills/*/SKILL.md`. Portable capability meaning and canonical
+identifiers belong in `capabilities/` and the manifest; a native skill's
+frontmatter is only the runtime representation of that identifier. Claude
+resolves a skill's invocation name from its directory, so Claude projections
+omit an explicit `name` field. Codex and OpenCode require an explicit native
+`name`, which their projections retain. The compatibility tree follows Claude's
+directory-name convention and may remain byte-identical to Claude's native
+tree. Duplicate discovery across runtime homes is prevented by projecting only
+the selected adapter's native tree, not by changing the shared identifier.
 
 ## 5. Hook Model
 

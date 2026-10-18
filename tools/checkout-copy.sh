@@ -27,16 +27,20 @@ _checkout_copy_existing() {
     'for f; do if [ -e "$f" ] || [ -L "$f" ]; then printf "%s\0" "$f"; fi; done' sh
 }
 
-checkout_copy() {
+_checkout_copy_impl() {
   _cc_root=$1
   _cc_dest=$2
-  git -C "$_cc_root" rev-parse --is-inside-work-tree >/dev/null || return 1
+  _cc_root=$(CDPATH= cd -- "$_cc_root" 2>/dev/null && pwd -P) || return 1
+  _checkout_copy_source_git() {
+    git -c "safe.directory=$_cc_root" -C "$_cc_root" "$@"
+  }
+  _checkout_copy_source_git rev-parse --is-inside-work-tree >/dev/null || return 1
   mkdir -p "$_cc_dest" || return 1
   # Each step is checked on its own: a pipeline would hide a failed listing
   # or archive behind a successful extract and leave a partial copy.
-  git -C "$_cc_root" ls-files -z --cached --others --exclude-standard \
+  _checkout_copy_source_git ls-files -z --cached --others --exclude-standard \
     > "$_cc_dest.all" || return 1
-  git -C "$_cc_root" ls-files -z --cached > "$_cc_dest.tracked" || return 1
+  _checkout_copy_source_git ls-files -z --cached > "$_cc_dest.tracked" || return 1
   (cd "$_cc_root" && _checkout_copy_existing < "$_cc_dest.all" > "$_cc_dest.files" \
     && _checkout_copy_existing < "$_cc_dest.tracked" > "$_cc_dest.tracked-existing") || return 1
   (cd "$_cc_root" && tar --null --no-recursion -T "$_cc_dest.files" -cf "$_cc_dest.tar") || return 1
@@ -50,4 +54,19 @@ checkout_copy() {
   rm -f "$_cc_dest.tracked-existing"
   git -C "$_cc_dest" -c user.name=checkout-copy -c user.email=checkout-copy@localhost \
     -c commit.gpgsign=false commit -q --no-verify -m "checkout copy" || return 1
+}
+
+# A checkout copy is an independent Git repository. In particular, direct
+# fixture invocations may be launched by hooks that export GIT_DIR,
+# GIT_COMMON_DIR, GIT_WORK_TREE, index/object redirection, namespace, or config
+# injection. Clear every Git-owned variable before the first source query as
+# well as before fixture init/add/commit. Run in a subshell so callers keep
+# their own Git context after the copy is complete.
+checkout_copy() {
+  (
+    for _cc_name in $(env | sed -n 's/=.*//p' | sed -n '/^GIT_/p'); do
+      unset "$_cc_name"
+    done
+    _checkout_copy_impl "$@"
+  )
 }

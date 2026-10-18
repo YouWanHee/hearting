@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: code-test
 description: "Use only when autopilot-code dispatches implementation verification and evidence recording. Not for top-level user requests or primary capability routing."
 argument-hint: "<plan name, path, or test scope> [--intensity direct|quick|standard|strong|thorough|adversarial]"
 metadata:

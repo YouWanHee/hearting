@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: design-tokens
 description: "Use only when autopilot-design dispatches design-token definition or revision. Not for top-level user requests or primary capability routing."
 argument-hint: "<design path or app path>"
 metadata:

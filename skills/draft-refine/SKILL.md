@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: draft-refine
 description: "Use only when autopilot-draft or autopilot-refine dispatches an internal strategy or draft refinement stage. Not for top-level user requests or primary capability routing."
 argument-hint: "<strategy or draft name or path> [--intensity direct|quick|standard|strong|thorough|adversarial]"
 metadata:

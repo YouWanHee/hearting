@@ -48,20 +48,13 @@ def _append_self_instrumentation(
             # `<release>/.dispatch/logs/` on every prompt made every
             # superseded release un-prunable (delta-digest-mismatch).
             return
-        log_dir = root_path / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "ts_ns": time.time_ns(),
-                "elapsed_ns": elapsed_ns,
-                "entries": entry_count,
-                "claimed": 1 if claimed_count else 0,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with open(log_dir / LOG_FILENAME, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        from dispatch_observation_log import append_record
+        append_record(root_path, LOG_FILENAME, {
+            "ts_ns": time.time_ns(),
+            "elapsed_ns": elapsed_ns,
+            "entries": entry_count,
+            "claimed": 1 if claimed_count else 0,
+        })
     except OSError:
         pass
 

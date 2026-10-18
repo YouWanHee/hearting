@@ -10463,6 +10463,86 @@ def _existing_local_branch(top, branch):
     return result.returncode == 0
 
 
+def _ref_namespace_conflict(top, branch, *, allow_local_branch=False):
+    """Fail closed on every ref spelling that can make Git's short name ambiguous."""
+    valid = _worktree_git(top, "check-ref-format", "--branch", branch)
+    if valid.returncode != 0:
+        return True
+    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return True
+    # Git's revision DWIM checks these namespaces, while pseudo-ref files live
+    # directly in the common directory and are not returned by for-each-ref.
+    if os.path.lexists(Path(common) / branch):
+        return True
+    refs = _worktree_git(top, "for-each-ref", "--format=%(refname)")
+    if refs.returncode != 0:
+        return True
+    names = {line.strip() for line in refs.stdout.splitlines() if line.strip()}
+    aliases = {
+        f"refs/{branch}", f"refs/tags/{branch}", f"refs/heads/{branch}",
+        f"refs/remotes/{branch}", f"refs/remotes/{branch}/HEAD",
+    }
+    target = f"refs/heads/{branch}"
+    for ref in names:
+        if ref in aliases and not (allow_local_branch and ref == target):
+            return True
+        # A ref cannot be both a file and a directory. Check D/F collisions in
+        # each DWIM namespace and in the actual branch namespace.
+        if any(ref.startswith(alias + "/") or alias.startswith(ref + "/")
+               for alias in aliases):
+            if allow_local_branch and ref == target:
+                continue
+            return True
+        if ref.startswith(target + "/") or target.startswith(ref + "/"):
+            return True
+    worktrees = _worktree_git(top, "worktree", "list", "--porcelain")
+    if worktrees.returncode != 0:
+        return True
+    if any(line == f"branch {target}" for line in worktrees.stdout.splitlines()):
+        # A reserved branch is allowed only when it is not already checked out.
+        return True
+    return False
+
+
+def _allocate_branch_ref(top, branch, base_sha):
+    """Create a branch ref we own with a CAS against the all-zero absent value."""
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(base_sha or "")):
+        return False, "invalid-base-object-id"
+    created = _worktree_git(top, "update-ref", f"refs/heads/{branch}", base_sha,
+                            "0" * len(base_sha))
+    if created.returncode == 0:
+        return True, ""
+    return False, (created.stderr or created.stdout or "branch-ref-allocation-failed").strip()
+
+
+def _release_owned_branch(top, branch, expected_sha):
+    """CAS-delete only this call's unlinked branch; uncertainty always keeps it."""
+    worktrees = _worktree_git(top, "worktree", "list", "--porcelain")
+    if worktrees.returncode != 0 or any(
+            line == f"branch refs/heads/{branch}" for line in worktrees.stdout.splitlines()):
+        return False
+    current = _worktree_git(top, "rev-parse", "--verify", f"refs/heads/{branch}")
+    if current.returncode != 0 or current.stdout.strip() != expected_sha:
+        return False
+    removed = _worktree_git(top, "update-ref", "-d", f"refs/heads/{branch}", expected_sha)
+    if removed.returncode != 0:
+        return False
+    # Recheck after the CAS delete: a user or another tool may have attached
+    # the branch between the first worktree scan and ref removal. Restore only
+    # the exact old SHA with an absent-ref CAS; never overwrite a concurrent
+    # move or a newly allocated branch.
+    attached = _worktree_git(top, "worktree", "list", "--porcelain")
+    if attached.returncode == 0 and not any(
+            line == f"branch refs/heads/{branch}" for line in attached.stdout.splitlines()):
+        return True
+    current = _worktree_git(top, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if current.returncode == 1:
+        _worktree_git(top, "update-ref", f"refs/heads/{branch}", expected_sha,
+                      "0" * len(expected_sha))
+    return False
+
+
 def _worktree_collision(result):
     detail = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
     return any(token in detail for token in ("already exists", "already checked out", "already in use",
@@ -10557,25 +10637,53 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                     return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
                 return {"state": "reused", **reused, "preparation_key": key}
 
-        # A branch created before interruption is a retry anchor only when it still points at
-        # the recorded fetched SHA. This avoids both another fetch and accidental branch adoption.
-        reserved = None
-        if record and record.get("primary_top") == primary and record.get("state") == "reserved":
-            branch, path, base_sha = record.get("branch"), Path(record.get("path") or ""), record.get("base_sha")
-            if (branch and not os.path.lexists(path) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(base_sha or ""))
-                    and _git(primary, "rev-parse", "--verify", f"refs/heads/{branch}") == base_sha):
-                reserved = (branch, path, base_sha)
-        base = {"branch": None, "sha": None}
-        if reserved is None:
-            base, reason, detail = _remote_default_base(primary)
-            if reason:
-                return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
-
         worktree_root = Path(primary).parent / f"{Path(primary).name}-wt"
         try:
             worktree_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return {"state": "failed", "reason": "worktree-parent-create-failed", "detail": str(exc)}
+        # A reserved record pins the fetched SHA even after a failed add safely
+        # removes the branch it created. Recreate that exact absent ref on
+        # retry without another network fetch. A moved or otherwise occupied
+        # reserved ref is never adopted or overwritten.
+        reserved = None
+        retry_base = None
+        if record and record.get("primary_top") == primary and record.get("state") == "reserved":
+            branch = record.get("branch")
+            path = Path(record.get("path") or "")
+            base_sha = record.get("base_sha")
+            valid_anchor = (
+                isinstance(branch, str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
+                and path.parent.resolve() == worktree_root.resolve()
+                and path.name == branch
+                and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(base_sha or ""))
+                and not os.path.lexists(path)
+            )
+            if valid_anchor:
+                ref = f"refs/heads/{branch}"
+                existing = _worktree_git(primary, "show-ref", "--verify", "--quiet", ref)
+                if existing.returncode == 0:
+                    current = _worktree_git(primary, "rev-parse", "--verify", ref)
+                    if current.returncode == 0 and current.stdout.strip() == base_sha:
+                        reserved = (branch, path, base_sha)
+                    else:
+                        return {"state": "failed", "reason": "preparation-identity-conflict",
+                                "path": str(path), "branch": branch, "base": base_sha}
+                elif existing.returncode == 1:
+                    retry_base = {"branch": record.get("remote_default"), "sha": base_sha}
+                else:
+                    return {"state": "failed", "reason": "preparation-identity-conflict",
+                            "path": str(path), "branch": branch, "base": base_sha}
+            elif branch or os.path.lexists(path):
+                return {"state": "failed", "reason": "preparation-identity-conflict",
+                        "path": str(path), "branch": str(branch or "")}
+        base = retry_base or ({"branch": record.get("remote_default"), "sha": reserved[2]}
+                              if reserved is not None else {"branch": None, "sha": None})
+        if reserved is None and retry_base is None:
+            base, reason, detail = _remote_default_base(primary)
+            if reason:
+                return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
         candidates = []
         if reserved:
             candidates.append((reserved[0], reserved[1], reserved[2], True))
@@ -10604,6 +10712,8 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                                     "detail": str(exc)}
                         return {"state": "reused", **reused, "preparation_key": key}
                 continue
+            if _ref_namespace_conflict(primary, branch, allow_local_branch=resume_branch):
+                continue
             if not resume_branch and _existing_local_branch(primary, branch):
                 continue
             record = {"schema_version": 1, "state": "reserved", "key": key,
@@ -10615,11 +10725,27 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                 atomic_write(record_path, record)
             except OSError as exc:
                 return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
-            command = (("worktree", "add", str(path), branch) if resume_branch else
-                       ("worktree", "add", "-b", branch, str(path), base_sha))
+            branch_created = False
+            if not resume_branch:
+                branch_created, ref_error = _allocate_branch_ref(primary, branch, base_sha)
+                if not branch_created:
+                    if _ref_namespace_conflict(primary, branch):
+                        continue
+                    return {"state": "failed", "reason": "branch-ref-allocation-failed",
+                            "branch": branch, "base": base_sha, "detail": ref_error}
+            command = ("worktree", "add", str(path), branch)
             added = _worktree_git(primary, *command)
             if added.returncode != 0:
+                released = _release_owned_branch(primary, branch, base_sha) if branch_created else False
                 if _worktree_collision(added):
+                    if branch_created and not released:
+                        return {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
+                                "branch": branch, "base": base_sha,
+                                "detail": (added.stderr or added.stdout).strip()}
+                    if resume_branch:
+                        return {"state": "failed", "reason": "reserved-worktree-resume-failed",
+                                "path": str(path), "branch": branch, "base": base_sha,
+                                "detail": (added.stderr or added.stdout).strip()}
                     continue
                 failed = {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
                           "branch": branch, "base": base_sha,

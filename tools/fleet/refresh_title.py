@@ -1104,7 +1104,8 @@ def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=Fal
             return None
         return _ProviderCommand(
             ["opencode", "run", "--pure", "--dir", str(workdir),
-             "--agent", agent_name, "--format", "default", "-m", model,
+             "--agent", agent_name, "--title", agent_name, "--log-level", "WARN",
+             "--format", "default", "-m", model,
              "--variant", budget], prompt, None, env=env, cwd=workdir)
     return None
 
