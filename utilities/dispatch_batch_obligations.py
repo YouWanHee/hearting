@@ -363,7 +363,12 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
         "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
     settlement_signatures = []
-    for jobs_path in jobs_paths:
+    # Discovery returns the canonical writer first, followed by compatibility
+    # roots that are read-only under dispatch_state_roots(). Owner settlement
+    # mutates the registry, so only the explicitly selected path (or the
+    # canonical discovered path at index 0) may reach that writer. Sidecar
+    # discovery below still visits every root independently.
+    for jobs_path in jobs_paths[:1]:
         try:
             settlement_signatures.extend(
                 _resume_owner_settlements(jobs_path, context=settlement_context))

@@ -95,27 +95,47 @@ class BatchObligationTest(unittest.TestCase):
         self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                             for item in third["signature"]))
 
-    def test_reconnection_checks_every_registry_root(self):
+    def test_reconnection_writes_only_the_selected_registry_root(self):
         other_jobs = self.base / "other-jobs.log"
         other_jobs.write_text(self._runtime_owner_row("att-second") + "\n", encoding="utf-8")
+        other_before = other_jobs.read_bytes()
         self.jobs.write_text(self._runtime_owner_row("att-first") + "\n", encoding="utf-8")
         service_script = self.base / "release" / "utilities" / "codex-managed-completion.py"
-        with mock.patch.object(obligations, "_jobs_paths", return_value=[self.jobs, other_jobs]), \
+        def selected_or_discovered(selected, *, strict=True):
+            if selected:
+                path = Path(selected).expanduser()
+                return [path.resolve(strict=strict) if strict else path.resolve(strict=False)]
+            return [self.jobs, other_jobs]
+
+        with mock.patch.object(obligations, "_jobs_paths", side_effect=selected_or_discovered), \
              mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
              mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
              mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
             self.assertEqual(obligations.ensure_observers(), 0)
-        self.assertEqual([call.args for call in settle.call_args_list],
-                         [(self.jobs, "att-first"), (other_jobs, "att-second")])
+            settle.assert_called_once_with(self.jobs, "att-first")
+            self.assertEqual(other_jobs.read_bytes(), other_before)
 
-    def test_invalid_registry_does_not_starve_later_settlement_or_sidecars(self):
+            # An explicitly supplied registry is authoritative for this call;
+            # discovery of that same compatibility path above is read-only.
+            settle.reset_mock()
+            self.assertEqual(obligations.ensure_observers(other_jobs), 0)
+            settle.assert_called_once_with(other_jobs, "att-second")
+
+    def test_invalid_registry_does_not_starve_later_sidecars_or_mutate_legacy(self):
         other_root = self.base / "other-registry"
         other_root.mkdir()
         other_jobs = other_root / "jobs.log"
         other_jobs.write_text(
             self._runtime_owner_row("att-second") + "\n"
             + self._runtime_owner_row("att-live") + "\n", encoding="utf-8")
+        other_before = other_jobs.read_bytes()
+        other_args = Namespace(**vars(self.args))
+        other_args.jobs = other_jobs
+        other_args.sealed_batch_id = "batch-other-root"
+        other_args.attempt_id = ["att-other-child"]
+        other_args.control_socket = other_root / "control.sock"
+        other_duty_id, _other_record = obligations.create(other_args)
         duty_id, _record = obligations.create(self.args)
         unknown_args = Namespace(**vars(self.args))
         unknown_args.sealed_batch_id = "batch-unknown"
@@ -142,16 +162,21 @@ class BatchObligationTest(unittest.TestCase):
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
              mock.patch.object(obligations, "_parent_duty_has_recipient", return_value=False), \
              mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()) as launch:
-            self.assertEqual(obligations.ensure_observers(), 1)
+            self.assertEqual(obligations.ensure_observers(), 2)
             signature = obligations.pending_observer_signature()
             self.assertTrue(obligations.has_unowned_work())
 
-        settle.assert_called_once_with(other_jobs, "att-second")
-        self.assertEqual(launch.call_count, 1)
-        argv = launch.call_args.args[0]
-        self.assertEqual(argv[argv.index("--jobs") + 1], str(self.jobs))
-        self.assertIn(duty_id, argv)
+        settle.assert_not_called()
+        self.assertEqual(launch.call_count, 2)
+        launches = [call.args[0] for call in launch.call_args_list]
+        self.assertEqual(
+            {argv[argv.index("--jobs") + 1] for argv in launches},
+            {str(self.jobs), str(other_jobs)},
+        )
+        self.assertTrue(any(duty_id in argv for argv in launches))
+        self.assertTrue(any(other_duty_id in argv for argv in launches))
         self.assertEqual(self.jobs.read_bytes(), unreadable)
+        self.assertEqual(other_jobs.read_bytes(), other_before)
         self.assertEqual(unknown_path.read_bytes(), unknown_before)
         self.assertIn((str(self.jobs), "unavailable"), signature)
         self.assertTrue(any(item[:3] == (str(self.jobs), duty_id, "observing")
@@ -159,15 +184,24 @@ class BatchObligationTest(unittest.TestCase):
         self.assertTrue(any(item[:3] == (str(self.jobs), unknown_id, "unknown")
                             for item in signature))
         self.assertTrue(any(item[:3] == (str(other_jobs), "owner-settlement", "att-second")
-                            for item in signature))
+                            for item in signature), "read-only census still reports discovered work")
         self.assertFalse(any(item[:3] == (str(other_jobs), "owner-settlement", "att-live")
                              for item in signature))
+        self.assertTrue(any(item[:3] == (str(other_jobs), other_duty_id, "observing")
+                            for item in signature))
 
     def test_registry_read_oserror_keeps_liveness_signature_and_later_work(self):
         other_root = self.base / "other-registry"
         other_root.mkdir()
         other_jobs = other_root / "jobs.log"
         other_jobs.write_text(self._runtime_owner_row("att-readable") + "\n", encoding="utf-8")
+        other_before = other_jobs.read_bytes()
+        other_args = Namespace(**vars(self.args))
+        other_args.jobs = other_jobs
+        other_args.sealed_batch_id = "batch-readable-root"
+        other_args.attempt_id = ["att-readable-child"]
+        other_args.control_socket = other_root / "control.sock"
+        other_duty_id, _other_record = obligations.create(other_args)
         duty_id, _record = obligations.create(self.args)
         first_registry_before = self.jobs.read_bytes()
         read_owner_rows = obligations._pending_owner_settlements
@@ -188,18 +222,21 @@ class BatchObligationTest(unittest.TestCase):
              mock.patch.object(obligations, "_pending_owner_settlements",
                                side_effect=fail_first_registry), \
              mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()) as launch:
-            self.assertEqual(obligations.ensure_observers(), 1)
+            self.assertEqual(obligations.ensure_observers(), 2)
             signature = obligations.pending_observer_signature()
             self.assertTrue(obligations.has_unowned_work())
 
-        settle.assert_called_once_with(other_jobs, "att-readable")
-        self.assertEqual(launch.call_count, 1)
+        settle.assert_not_called()
+        self.assertEqual(launch.call_count, 2)
         self.assertIn((str(self.jobs), "unavailable"), signature)
         self.assertTrue(any(item[:3] == (str(self.jobs), duty_id, "observing")
                             for item in signature))
         self.assertTrue(any(item[:3] == (str(other_jobs), "owner-settlement", "att-readable")
                             for item in signature))
+        self.assertTrue(any(item[:3] == (str(other_jobs), other_duty_id, "observing")
+                            for item in signature))
         self.assertEqual(self.jobs.read_bytes(), first_registry_before)
+        self.assertEqual(other_jobs.read_bytes(), other_before)
 
     def test_exact_identity_and_settled_result_are_immutable(self):
         duty_id, record = obligations.create(self.args)

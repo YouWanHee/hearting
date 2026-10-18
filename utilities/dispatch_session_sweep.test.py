@@ -937,6 +937,13 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
         other_jobs.write_text(
             f"2026-10-18T00:00:00Z\tdone\t/repo\t/wt\towner\t{metadata}\n",
             encoding="utf-8")
+        other_before = other_jobs.read_bytes()
+        other_args = SimpleNamespace(**vars(args))
+        other_args.jobs = other_jobs
+        other_args.sealed_batch_id = "batch-secondary-activation"
+        other_args.attempt_id = ["att-secondary-sidecar"]
+        other_args.control_socket = secondary / "control.sock"
+        other_duty_id, _other_record = OBLIGATIONS.create(other_args)
 
         class Launched:
             pid = 902343
@@ -954,12 +961,17 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
         reconcile.assert_called_once_with(jobs)
-        settle.assert_called_once_with(other_jobs, "att-activation-owner")
-        self.assertEqual(launch.call_count, 1)
-        argv = launch.call_args.args[0]
-        self.assertEqual(argv[argv.index("--jobs") + 1], str(jobs))
-        self.assertIn(duty_id, argv)
+        settle.assert_not_called()
+        self.assertEqual(launch.call_count, 2)
+        launches = [call.args[0] for call in launch.call_args_list]
+        self.assertEqual(
+            {argv[argv.index("--jobs") + 1] for argv in launches},
+            {str(jobs), str(other_jobs)},
+        )
+        self.assertTrue(any(duty_id in argv for argv in launches))
+        self.assertTrue(any(other_duty_id in argv for argv in launches))
         self.assertEqual(jobs.read_bytes(), unreadable)
+        self.assertEqual(other_jobs.read_bytes(), other_before)
 
 
 if __name__ == "__main__":
