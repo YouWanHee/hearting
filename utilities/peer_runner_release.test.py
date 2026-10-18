@@ -859,6 +859,100 @@ print(json.dumps(result))
                                          "body_sha256": digest})
         obligations._RUNNERS.clear()
 
+    def test_mixed_release_hands_legacy_reader_off_before_pending_quarantine(self):
+        """A current pane-bound schema-1 row and a future row survive A→B takeover."""
+        pane_target = {"harness": "claude", "session_id": None,
+                       "name": "fresh", "pane_id": "w1:p-mixed"}
+        proof = {"schema": "peer-first-input-process-v1", "harness": "claude",
+                 "pane_id": pane_target["pane_id"], "pid": os.getpid(),
+                 "start": "123", "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            pane_text, pane_ref = peer_message.prepare_peer_message(
+                "[steer] current pane-bound payload", self.sender, pane_target,
+                defer=True, first_input_process=proof)
+            claim = peer_message.claim_pending_first_input(pane_ref, pane_target, proof)
+            self.assertIsNotNone(claim)
+            self.assertTrue(peer_message.mark_pending_prompt_queued(
+                pane_ref, claim["rpc_claim"], receipt="native-first-input-submitted"))
+            _future_text, future_ref = peer_message.prepare_peer_message(
+                "[steer] future schema payload", self.sender, self.recipient, defer=True)
+            future_path = peer_message._pending_path(future_ref)
+            future_row = json.loads(future_path.read_text(encoding="utf-8"))
+            future_path.write_text(json.dumps(dict(future_row, schema_version=2)),
+                                   encoding="utf-8")
+            initial_bytes = {
+                pane_ref: peer_message._pending_path(pane_ref).read_bytes(),
+                future_ref: future_path.read_bytes(),
+            }
+
+        # Model the prior managed reader's two failure branches in its isolated
+        # release copy: it has no first-input exception and classifies unknown
+        # schema as generic malformed data, which the scan quarantines.
+        legacy_path = self.a / "utilities" / "peer-message.py"
+        legacy_source = legacy_path.read_text(encoding="utf-8")
+        schema_guard = 'raise UnsupportedPendingSchema("peer-pending-schema-unsupported")'
+        pane_guard = 'and row.get("receipt") == "native-first-input-submitted"'
+        self.assertIn(schema_guard, legacy_source)
+        self.assertIn(pane_guard, legacy_source)
+        legacy_source = legacy_source.replace(schema_guard, "pass  # pre-takeover legacy reader")
+        legacy_source = legacy_source.replace(pane_guard, "and False  # pre-takeover legacy reader")
+        legacy_path.write_text(legacy_source, encoding="utf-8")
+
+        probe_root = self.base / "legacy-reader-probe"
+        shutil.copytree(self.state / "peer-messages", probe_root / "peer-messages")
+        legacy_spec = importlib.util.spec_from_file_location(
+            "mixed_release_legacy_peer_message", legacy_path)
+        legacy_reader = importlib.util.module_from_spec(legacy_spec)
+        legacy_spec.loader.exec_module(legacy_reader)
+        probe_env = dict(self.env, AGENT_PEER_LEDGER_ROOT=str(probe_root))
+        with mock.patch.dict(os.environ, probe_env, clear=True):
+            self.assertEqual(list(legacy_reader._pending_rows()), [])
+        for ref in (pane_ref, future_ref):
+            self.assertEqual(len(list((probe_root / "peer-messages" / "quarantine").glob(
+                f"*/{ref}.json"))), 1)
+
+        old_runner = self._start_managed_runner(self.a, self.env)
+        try:
+            self._wait_for(self.ready)
+            self.assertEqual([json.loads(line)["release"]
+                              for line in self.markers.read_text().splitlines()], ["A"])
+            self._point_current(self.b)
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                    mock.patch.dict(os.environ, self.env, clear=True), \
+                    mock.patch.object(obligations.subprocess, "Popen") as concurrent:
+                binding = obligations.managed_service_binding(self.a)
+                self.assertEqual(binding, str(self.current))
+                self.assertTrue(obligations.ensure_runner(self.state, service_current=binding))
+                concurrent.assert_not_called()
+            self.release_boundary.touch()
+            self.assertEqual(old_runner.wait(timeout=15), 0)
+            records = [json.loads(line) for line in self.markers.read_text().splitlines()]
+            self._assert_same_lock_handoff(records)
+            self.assertEqual(json.loads(self.ack_marker.read_text())["release"], "B")
+
+            current_spec = importlib.util.spec_from_file_location(
+                "mixed_release_current_peer_message", self.b / "utilities" / "peer-message.py")
+            current_reader = importlib.util.module_from_spec(current_spec)
+            current_spec.loader.exec_module(current_reader)
+            with mock.patch.dict(os.environ, self._environment(self.b), clear=True):
+                rows = list(current_reader._pending_rows())
+                by_ref = {row["ref"]: row for row in rows}
+                self.assertEqual(by_ref[pane_ref]["text"], pane_text)
+                with self.assertRaises(current_reader.UnsupportedPendingSchema):
+                    current_reader._read_pending(future_ref)
+                self.assertEqual(current_reader._pending_path(pane_ref).read_bytes(),
+                                 initial_bytes[pane_ref])
+                self.assertEqual(current_reader._pending_path(future_ref).read_bytes(),
+                                 initial_bytes[future_ref])
+                self.assertTrue(current_reader._pending_path(future_ref).exists())
+        finally:
+            self.release_boundary.touch()
+            if old_runner.poll() is None:
+                old_runner.terminate()
+                old_runner.wait(timeout=5)
+            obligations._RUNNERS.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

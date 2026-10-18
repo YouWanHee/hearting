@@ -33,6 +33,12 @@ class _TmpRootMixin:
         self.jobs_path = self.tmp_root / "jobs.log"
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
+        for key in tuple(os.environ):
+            if (key.startswith(("AGENT_DISPATCH_", "AGENT_ARTIFACT_", "AGENT_RUNTIME_",
+                                "AGENT_SESSION_", "AGENT_THREAD_", "HERDR_"))
+                    or key in {"AGENT_HOME", "CLAUDE_HOME", "AGENT_SERVICE_CURRENT",
+                               "HEARTING_SERVICE_CURRENT", "SERVICE_CURRENT"}):
+                os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root / "peer-state")
         # C-9 makes `_iter_records` include dispatch and installed-runtime roots.
@@ -41,9 +47,15 @@ class _TmpRootMixin:
         os.environ["HOME"] = str(self.tmp_root / "home")
         os.environ["XDG_STATE_HOME"] = str(self.tmp_root / "xdg-state")
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "xdg-config")
+        os.environ["XDG_DATA_HOME"] = str(self.tmp_root / "xdg-data")
+        os.environ["HARNESS_DATA_ROOT"] = str(self.tmp_root / "harness-data")
         os.environ["HARNESS_STATE_ROOT"] = str(self.tmp_root / "harness-state")
+        os.environ["AGENT_RUNTIME_ROOT"] = str(self.tmp_root / "runtime")
+        os.environ["AGENT_ARTIFACT_ROOT"] = str(self.tmp_root / "artifacts")
+        os.environ["AGENT_ARTIFACT_OUTPUT_DIR"] = str(self.tmp_root / "artifacts" / "output")
         os.environ["CODEX_HOME"] = str(self.tmp_root / "home" / ".codex")
         os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".claude")
+        os.environ["OPENCODE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".config" / "opencode")
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore_environ)
 
@@ -771,6 +783,28 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         quarantine = malformed.parent.parent / "quarantine"
         self.assertEqual(len(list(quarantine.rglob(malformed.name))), 1)
 
+    def test_future_pending_schema_is_preserved_without_quarantine(self):
+        text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_bytes())
+        row["schema_version"] = 2
+        row["future_field"] = {"opaque": [1, 2, 3]}
+        raw = json.dumps(row, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(peer_message.pending_messages(self.recipient), [])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(errors.getvalue(), "")
+        quarantine = path.parent.parent / "quarantine"
+        self.assertFalse(quarantine.exists())
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message._read_pending(ref)
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message.receive_peer_message(text, self.recipient)
+        self.assertEqual(path.read_bytes(), raw)
+
     def test_production_read_scope_source_is_codex_adapter_contract_only(self):
         self.assertTrue(peer_message._codex_model_read_access(self.recipient))
         self.assertFalse(peer_message._codex_model_read_access(
@@ -1331,16 +1365,98 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
                     self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
                     self.assertEqual(peer_message.parse_peer_trailer(text, recipient, include_ref=True)["transfer_ref"], ref)
 
-    def test_legacy_shell_sender_uses_existing_claude_context_and_codex_queue(self):
+    def test_claude_native_context_delivery_receives_exact_ref(self):
         recipient = dict(self.recipient, harness="claude")
         text, ref = self.legacy_shell_pending(recipient)
         stream = io.StringIO()
-        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream)
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                       native_delivery=True)
         context = json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(context, text)
-        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
-        peer_message.receive_peer_message(context, recipient)
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "exact-peer-ref")
+        self.assertIsNone(peer_message._read_pending(ref)["text"])
+        # A subsequent duplicate hook sees no pending row and cannot rewrite it.
+        duplicate = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=duplicate,
+                                       native_delivery=True)
+        self.assertEqual(duplicate.getvalue(), "")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
+    def test_claude_cli_context_output_and_same_sid_callback_stay_unreceived(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        stream = io.StringIO()
+        peer_message.emit_peer_context(recipient, stream=stream)
+        context = json.loads(stream.getvalue())["context"]
+        self.assertEqual(context, text)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "context-emitted")
+        peer_message.receive_peer_message("ordinary next user prompt", recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+
+    def test_retained_hook_context_row_recovers_only_through_native_boundary(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        with peer_message.pending_lock(ref):
+            row = peer_message._read_pending(ref)
+            peer_message._save_pending(dict(row, state="queued", receipt="hook-context-emitted"))
+        ordinary = io.StringIO()
+        peer_message.emit_peer_context(recipient, stream=ordinary)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "hook-context-emitted")
+        native = io.StringIO()
+        peer_message.emit_peer_context(recipient, "PostToolUse", stream=native,
+                                       native_delivery=True)
+        self.assertEqual(json.loads(native.getvalue())["hookSpecificOutput"]["additionalContext"], text)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "exact-peer-ref")
+
+    def test_failed_claude_native_flush_keeps_ambiguous_claim_unreceived(self):
+        class PartialFlush:
+            def __init__(self):
+                self.data = ""
+            def write(self, value):
+                self.data += value
+            def flush(self):
+                raise OSError("simulated partial native output")
+
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        stream = PartialFlush()
+        with self.assertRaisesRegex(OSError, "partial native output"):
+            peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                           native_delivery=True)
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["receipt"], "hook-context-inflight")
+        self.assertTrue(row["rpc_claim"])
+        self.assertEqual(row["text"], text)
+
+    def test_claude_native_context_rejects_wrong_target_and_corrupt_body(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        wrong_target = io.StringIO()
+        peer_message.emit_peer_context(
+            dict(recipient, session_id="sid-other"), "UserPromptSubmit",
+            stream=wrong_target, native_delivery=True)
+        self.assertEqual(wrong_target.getvalue(), "")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["text"] = row["text"].replace("external notification", "forged notification")
+        path.write_text(json.dumps(row), encoding="utf-8")
+        stream = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                       native_delivery=True)
+        self.assertEqual(stream.getvalue(), "")
+        self.assertFalse(peer_message._peer_notice_exists(ref, recipient))
+        quarantined = list((peer_message._pending_dir().parent / "quarantine").glob(f"*/{ref}.json"))
+        self.assertEqual(len(quarantined), 1)
+
+    def test_codex_queue_uses_native_consumption_evidence(self):
         import codex_queue_delivery as queue
         text, ref = self.legacy_shell_pending(self.recipient)
         with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
