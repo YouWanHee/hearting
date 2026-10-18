@@ -439,7 +439,9 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
             text = supervision.render_text(receipt)
         self.assertNotIn("retains cleanup observation only", text)
         self.assertIn("inspect these exact attempts", text)
-        self.assertIn("ask the user whether to keep waiting or cancel", text)
+        self.assertIn("An inspection notice alone does not require a user decision", text)
+        self.assertIn("actual unfinished work", text)
+        self.assertNotIn("ask the user whether to keep waiting or cancel", text)
 
     def test_claim_binds_live_generation_without_changing_the_obligation(self):
         self._notice_rows()

@@ -364,6 +364,12 @@ def _run_replay(output_dir: Path) -> dict:
         raise ReplayBlocked("codex-version-probe-failed")
     _write_json(output_dir / "replay.json", report)
 
+    shared_directory = Path("/tmp").resolve() / f"codex-daemon-{os.geteuid()}"
+    if shared_directory.exists() and stat.S_IMODE(shared_directory.stat().st_mode) == 0:
+        # The outer native sandbox deliberately masks privileged daemon IPC.
+        # Private CODEX_HOME modes cannot repair it; never unmask that boundary.
+        raise ReplayBlocked("nested-codex-shared-daemon-directory-masked")
+
     source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
     # The private runtime fixture is removed after the replay; only evidence
     # remains under output_dir. /tmp is the writable temp root in this runner.
@@ -386,6 +392,16 @@ def _run_replay(output_dir: Path) -> dict:
             "[analytics]\nenabled = false\n\n[features]\napps = false\nmulti_agent = false\n",
             encoding="utf-8")
         agent_home = _fake_agent_home(temp_root)
+        workflow = (ROOT / "core/WORKFLOW.md").read_text(encoding="utf-8")
+        report_policy = workflow.split("### 0.5. Post-Execution Completion Report", 1)[1].split(
+            "### 0.6.", 1)[0]
+        response_policy = (ROOT / "roles/response-policy.md").read_text(encoding="utf-8")
+        # Exercise candidate policy in native project context, not an ideal
+        # reporting rubric supplied in the user's task message.
+        policy = "# Candidate completion policy\n" + report_policy + "\n" + response_policy
+        (worktree / "AGENTS.md").write_text(policy, encoding="utf-8")
+        report["candidate_policy_sha256"] = hashlib.sha256(policy.encode()).hexdigest()
+        _write_json(output_dir / "replay.json", report)
         jobs = runtime / "jobs.log"
         jobs.touch(mode=0o600)
         artifact_root = worktree / ".agent_reports"
@@ -437,7 +453,7 @@ def _run_replay(output_dir: Path) -> dict:
                 # server. Remove the private copy before model tools can run.
                 (codex_home / "auth.json").unlink(missing_ok=True)
                 thread_result = client.request("thread/start", {
-                    "cwd": str(worktree), "ephemeral": True, "sandbox": "workspace-write",
+                    "cwd": str(worktree), "ephemeral": False, "sandbox": "workspace-write",
                     "approvalPolicy": "never",
                 })
                 thread = thread_result.get("thread")
@@ -451,9 +467,7 @@ def _run_replay(output_dir: Path) -> dict:
                     f"{artifact}. Verify its sentinel, then write exactly that sentinel once to "
                     f"{followthrough}, unless it already contains the exact sentinel once. Do not repeat a completed action. "
                     "The earlier chronology is fixture history, not a production deployment or real independent review. "
-                    "In your first closing report state "
-                    "what changed and why, observed before/after, actual checks, commit/PR/deployment/serving "
-                    "status, and limitations. This is only an isolated fixture: no real deployment, PR, "
+                    "This is only an isolated fixture: no real deployment, PR, "
                     "commit, or operating change occurred."
                 )
                 (output_dir / "input.txt").write_text(prompt + "\n", encoding="utf-8")
@@ -614,6 +628,11 @@ def _run_replay(output_dir: Path) -> dict:
                 route_id=route_id, route_node="_owner", receipt=receipt,
                 receipt_digest=completion_record["receipt_digest"],
                 row_revisions={attempt: metadata["delivery_row_revision"]})
+            # Admit these records to the candidate consumer before observing
+            # silence; an unsubmitted empty native queue is not evidence.
+            deliveries, _ = dispatch_session_sweep.sweep_deliver(runtime, "codex-native-queue", thread_id)
+            if deliveries:
+                raise ReplayFailed("late-cleanup-or-duplicate-still-eligible-for-native-delivery")
             history_after_cleanup = _all_turns(endpoint, thread_id)
             queue_after_cleanup = codex_queue_delivery.list_queue(endpoint, thread_id, timeout=10)
             no_extra_turn = len(history_after_cleanup) == 2
@@ -702,7 +721,7 @@ def _run_replay(output_dir: Path) -> dict:
                 "followthrough_unchanged_after_direct_question": followthrough_unchanged,
                 "crash_reconnect_replayed": True,
                 "limitations": ["Fixture result, deployment, serving, and operating performance were not real "
-                    "production events. The app-server replay used an isolated ephemeral thread and copied "
+                    "production events. The app-server replay used an isolated persisted thread and copied "
                     "private auth material that was removed before model tools ran."],
             })
             if not all(report_check.values()):
@@ -715,9 +734,10 @@ def _run_replay(output_dir: Path) -> dict:
                 report["d1"] = "observed-with-native-continuation"
                 report["d2"] = "late-cleanup-and-direct-question-observed"
             else:
-                report["verdict"] = "PASS"
-                report["d1"] = "observed-in-isolated-native-crash-replay"
-                report["d2"] = "late-cleanup-and-duplicate-result-produced-no-extra-turn; direct question answered"
+                report["verdict"] = "BLOCKED"
+                report["blocker"] = "full-parent-chronology-and-idle-handover-native-replay-not-yet-covered"
+                report["d1"] = "isolated-native-crash-slice-observed; full-parent-acceptance-unfinished"
+                report["d2"] = "shared-consumer-suppression-observed; full-native-notice-and-idle-handover-unfinished"
                 report["d3"] = "exact-ack-and-cleanup-unknown-preserved; adapter matrix is deterministic-only"
             return report
         finally:

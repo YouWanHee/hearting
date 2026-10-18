@@ -342,6 +342,14 @@ class NoticeWatcher:
                     client_message_id=claimed["delivery_id"], message=values[0],
                     timeout=5.0,
                 )
+                if queue_result.get("status") == "queued" and not queue_result.get("already_pending"):
+                    try:
+                        pending_delivery.record_send(
+                            self.root, self.recipient, claimed["delivery_id"],
+                            source="codex-native-queue-notice-accepted",
+                            event_id=str(queue_result.get("queued_submission_id") or claimed["delivery_id"]))
+                    except (pending_delivery.PendingDeliveryError, OSError):
+                        pass  # Timing is evidence, never delivery or execution authority.
                 if queue_result.get("status") == "consumed":
                     pending_delivery.ack(self.root, self.recipient, claimed["delivery_id"],
                                          acked_by=self.owner)

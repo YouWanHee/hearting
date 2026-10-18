@@ -8484,9 +8484,44 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(sent[0]["client_message_id"].startswith("delivery-"))
         self.assertIn("turn-exact", sent[0]["message"])
         current = store.get(duty["id"])
-        self.assertEqual(current["state"], "complete")
+        self.assertEqual(current["state"], "pending")
         self.assertEqual(current["delivery"], "native-continuation-accepted")
         self.assertEqual(current["observation"]["continuation_source_turn"], "turn-exact")
+
+        with mock.patch.object(join, "materialize_after_terminal_close", return_value=None), \
+             mock.patch.object(join, "pending_record_identity", return_value=("rt-native", "execute", "att-owner")), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
+             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={"id": "turn-exact", "status": "interrupted"}), \
+             mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id", side_effect=[
+                 {"id": "continuation-turn", "status": "inProgress"},
+                 {"id": "continuation-turn", "status": "completed"}]), \
+             mock.patch.object(codex_queue_delivery, "send_at_least_once") as again:
+            peer_steward._reconcile_obligations(store, [current])
+            self.assertEqual(store.get(duty["id"])["state"], "pending")
+            peer_steward._reconcile_obligations(store, [store.get(duty["id"])])
+            self.assertEqual(store.get(duty["id"])["state"], "complete")
+        again.assert_not_called()
+
+    def test_queued_continuation_keeps_same_duty_and_does_not_resend(self):
+        import codex_queue_delivery
+        import codex_queue_dispatch
+        import dispatch_completion_join as join
+        store, duty, aid, sid = self._duty()
+        duty = store.update(duty["id"], observation={**duty["observation"],
+            "continuation_id": "delivery-stable", "continuation_source_turn": "turn-exact"})
+        with mock.patch.object(join, "materialize_after_terminal_close", return_value=None), \
+             mock.patch.object(join, "pending_record_identity", return_value=("rt-native", "execute", "att-owner")), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
+             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={"id": "turn-exact", "status": "interrupted"}), \
+             mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id", return_value=None), \
+             mock.patch.object(codex_queue_delivery, "list_queue", return_value=[{"clientUserMessageId": "delivery-stable"}]), \
+             mock.patch.object(codex_queue_delivery, "send_at_least_once") as send:
+            peer_steward._reconcile_obligations(store, [duty])
+        send.assert_not_called()
+        self.assertEqual(store.get(duty["id"])["state"], "pending")
+        self.assertEqual(store.get(duty["id"])["observation"]["continuation_id"], "delivery-stable")
 
     def test_live_or_unknown_turn_never_starts_a_competing_continuation(self):
         import codex_queue_delivery

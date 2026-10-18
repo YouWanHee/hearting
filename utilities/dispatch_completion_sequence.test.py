@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +108,23 @@ class ExactCompletionSequenceTest(unittest.TestCase):
         self.assertIn("notice record materialized", delivered_text)
         self.assertNotIn("run the route's start command", delivered_text)
         self.assertEqual(self.jobs.read_bytes(), original_jobs)
+
+        # The native queue courier must retire the same notice before enqueue,
+        # with no gateway/queue RPC at all for an already received exact result.
+        spec = importlib.util.spec_from_file_location("native_cleanup_courier",
+                                                     ROOT / "utilities/codex-managed-completion.py")
+        courier = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = courier
+        spec.loader.exec_module(courier)
+        native_notice = supervision.materialize(self.jobs, {self.attempts[0]}, reason="process-unverifiable")[0]
+        watcher = courier.NoticeWatcher(SimpleNamespace(jobs=self.jobs, parent_session_id=self.recipient,
+            queue_socket=Path("/isolated-never-contact.sock"), sealed_batch_id="", interval=0.1),
+            {self.attempts[0]}, None)
+        with mock.patch.object(courier.codex_queue_delivery, "send_at_least_once") as send:
+            watcher._one(pending.record_path(self.root, self.recipient, native_notice["delivery_id"]))
+        send.assert_not_called()
+        self.assertEqual(pending.read(self.root, self.recipient, native_notice["delivery_id"])["state"], "rejected")
+        self.assertEqual(self.jobs.read_bytes(), original_jobs)
         self.assertEqual(json.loads(history.read_text(encoding="utf-8")), chronology)
         self.assertEqual(history.read_bytes(), original_history)
 
@@ -120,6 +139,15 @@ class ExactCompletionSequenceTest(unittest.TestCase):
             receipt_digest=original_record["receipt_digest"],
             row_revisions={self.attempts[0]: "revision-1"})
         self.assertEqual(duplicate["timestamp_provenance"], original_record["timestamp_provenance"])
+
+        # Run the actual shared consumer: rendering/empty queue inspection alone
+        # cannot prove that a pending cleanup notice would not wake the parent.
+        self.assertFalse(supervision.notice_is_current(notice))
+        records, _ = sweep.sweep_deliver(self.root, "codex-native-queue", self.recipient)
+        self.assertEqual(records, [])
+        retired = pending.read(self.root, self.recipient, notice["delivery_id"])
+        self.assertEqual(retired["state"], "rejected")
+        self.assertEqual(self.jobs.read_bytes(), original_jobs)
 
     def test_unacked_child_or_new_terminal_conflict_keeps_recovery_visible(self):
         record = pending.read(self.root, self.recipient, self.delivery_ids[self.attempts[-1]])
@@ -136,11 +164,25 @@ class ExactCompletionSequenceTest(unittest.TestCase):
                 self.jobs, set(self.attempts), recipient_sid=self.recipient,
                 parent_attempt_id=self.receipt["parent_attempt_id"],
                 parent_completion_delivery="codex-native-queue"))
+            notice = supervision.materialize(self.jobs, {self.attempts[0]}, reason="join-deadline")[0]
+            self.assertIsNone(supervision._cleanup_only_result(notice["receipt"]))
         with mock.patch("dispatch_contract.terminal_conflict_pending", return_value=True):
             self.assertIsNone(join.recover_acknowledged_batch_outcome(
                 self.jobs, set(self.attempts), recipient_sid=self.recipient,
                 parent_attempt_id=self.receipt["parent_attempt_id"],
                 parent_completion_delivery="codex-native-queue"))
+
+    def test_one_acknowledged_batch_does_not_cover_a_different_unreceived_attempt(self):
+        metadata = {"attempt_schema_version": "2", "attempt_id": "att-unreceived",
+            "dispatch_depth": "1", "worker_type": "stage", "harness": "codex",
+            "parent_attempt_id": "-", "parent_sid": self.recipient,
+            "parent_completion_delivery": "codex-native-queue", "delivery_id": "delivery-unreceived"}
+        with self.jobs.open("a") as stream:
+            stream.write("2026-10-19T00:00:00Z\tdone\t/r\t/w\tother\t" +
+                         ",".join(f"{k}={v}" for k,v in metadata.items()) + "\n")
+        receipt = {"job_registry": str(self.jobs), "recipient_thread_id": self.recipient,
+                   "monitored_attempt_ids": [self.attempts[0], "att-unreceived"], "reason": "join-deadline"}
+        self.assertIsNone(supervision._cleanup_only_result(receipt))
 
 
 if __name__ == "__main__":

@@ -448,7 +448,7 @@ def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by:
             try:
                 event_id = hashlib.sha256((delivery_id + "\0" + acked_by).encode("utf-8")).hexdigest()
                 pending_delivery.record_send(root, storage, delivery_id,
-                    source="codex-prompt-context-rendered", event_id=event_id)
+                    source="prompt-context-rendered", event_id=event_id)
             except (pending_delivery.PendingDeliveryError, OSError):
                 pass  # Timestamp observation is advisory; it never withholds an exact ACK.
             pending_delivery.ack(root, storage, delivery_id, acked_by=acked_by)

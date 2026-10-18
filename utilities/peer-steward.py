@@ -5380,9 +5380,21 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         from codex_queue_dispatch import resolve_queue_socket
         import codex_queue_delivery
         endpoint = resolve_queue_socket()
-        turn_id = binding.get("turn_id")
+        turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
         current_turn = codex_queue_delivery.read_exact_turn(
             endpoint, recipient_sid, turn_id, timeout=5.0)
+        continuation_id = observation.get("continuation_id")
+        if continuation_id:
+            continuation = codex_queue_delivery.find_turn_by_client_message_id(
+                endpoint, recipient_sid, continuation_id, timeout=5.0)
+            if continuation is not None:
+                current_turn = continuation
+                turn_id = continuation.get("id")
+            elif any(item.get("clientUserMessageId") == continuation_id for item in
+                     codex_queue_delivery.list_queue(endpoint, recipient_sid, timeout=5.0)):
+                store.update(duty["id"], state="pending", delivery="native-continuation-accepted",
+                             observation={**observation, "reason": "native-continuation-still-queued"})
+                return True
         if current_turn is None:
             store.update(duty["id"], state="unknown", delivery="pending",
                          observation={**observation, "reason": "native-receiving-turn-unavailable"})
@@ -5432,6 +5444,8 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
 
         def before_add():
             fresh = current_attempt_row(jobs_path, row.attempt_id)
+            from dispatch_seat_handover import effective_parent
+            from dispatch_contract import terminal_conflict_pending
             fresh_turn = codex_queue_delivery.read_exact_turn(
                 endpoint, recipient_sid, turn_id, timeout=5.0)
             newest = codex_queue_delivery._latest_turn(endpoint, recipient_sid, timeout=5.0)
@@ -5440,6 +5454,11 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                     or fresh.metadata.get("delivery_id") != delivery_id
                     or fresh.metadata.get("delivery_receipt_digest")
                         != row.metadata.get("delivery_receipt_digest")
+                    or fresh.metadata.get("delivery_row_revision") != row.metadata.get("delivery_row_revision")
+                    or effective_parent(fresh.metadata, jobs_path) != recipient_sid
+                    or terminal_conflict_pending(fresh.metadata)
+                    or pending_record_identity(fresh.metadata, jobs_path)
+                        != (route_id, route_node, parent_attempt_id)
                     or not fresh_turn or fresh_turn.get("status") != "interrupted"
                     or not isinstance(newest, dict) or newest.get("id") != turn_id
                     or not latest_record or latest_record.get("state") != "acked"
@@ -5451,8 +5470,10 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             endpoint, thread_id=recipient_sid, client_message_id=stable, message=message,
             timeout=5.0, require_message_match=True, before_add=before_add)
         if sent.get("status") in {"queued", "consumed"}:
-            store.update(duty["id"], state="complete", delivery="native-continuation-accepted",
-                         observation={**observation, "reason": "native-continuation-accepted",
+            # Queue acceptance transfers transport, not the still-unfinished
+            # receiving turn. Keep observing its exact native turn on this duty.
+            store.update(duty["id"], state="pending", delivery="native-continuation-accepted",
+                         observation={**observation, "reason": "native-continuation-awaiting-turn",
                                       "continuation_status": sent["status"]})
         else:
             store.update(duty["id"], state="unknown", delivery="pending",
@@ -5533,7 +5554,36 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
 
     if row.status not in {"open", "running", "done"}:
         return
-    if row.status == "done":
+    notice_id = intent.get("notice_delivery_id")
+    if notice_id:
+        # A fresh handover is independent of the original completion ACK. Its
+        # exact pending record already carries revision, lineage and authority.
+        record = pending.read(jobs.parent, storage_recipient, notice_id)
+        if not record or record.get("receipt_digest") != intent.get("notice_digest"):
+            return
+        from dispatch_supervision import validate as validate_notice
+        notice = validate_notice(record.get("receipt"), expected_thread=storage_recipient)
+        pending.received_ack_identity(record, storage_recipient, notice_id)
+        if (notice["owner_attempt_id"] != row.attempt_id
+                or notice["job_registry"] != str(jobs)
+                or notice["sealed_batch_id"] != row.metadata.get("managed_sealed_batch_id", "")
+                or record.get("recipient_kind") != intent["carrier"]):
+            return
+        delivery_id = notice_id
+        if record.get("state") in {"acked", "rejected", "expired"}:
+            store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+            return
+        from dispatch_supervision import notice_is_current
+        if not notice_is_current(record):
+            owner = "retained-rewake:" + duty["id"]
+            claimed = pending.claim(jobs.parent, storage_recipient, notice_id,
+                claim_owner=owner, lease_seconds=30, require_generation_proof=False, jobs=jobs)
+            keep_claim(jobs.parent, storage_recipient, notice_id, claimed, owner, jobs=jobs)
+            latest = pending.read(jobs.parent, storage_recipient, notice_id)
+            if latest and latest.get("state") == "rejected":
+                store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete")
+            return
+    elif row.status == "done":
         if row.metadata.get("delivery_intent") != "1":
             store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete")
             return
@@ -5548,7 +5598,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             return
     if transferred and transferred.get("state") in {"queued", "unverified"}:
         return  # The existing message courier owns this accepted/ambiguous send.
-    if holder and rewake._holder_alive(holder) and rewake._holder_alive(parent):
+    if not notice_id and holder and rewake._holder_alive(holder) and rewake._holder_alive(parent):
         return
     old_server = _HERDR_SESSION
     globals()["_HERDR_SESSION"] = None if identity["server"] == "default" else identity["server"]
@@ -5575,7 +5625,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 return
             _schedule_message_obligation(transferred, pane, pane)
             return
-        if row.status in {"open", "running"}:
+        if not notice_id and row.status in {"open", "running"}:
             records, _ = addressed_records(jobs.parent, intent["carrier"], recipient_sid)
             record = next((r for r in records if row.attempt_id in (r.get("attempt_ids") or [])
                            and (is_human_gate_record(r) or

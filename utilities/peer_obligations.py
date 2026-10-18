@@ -713,6 +713,40 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     return True
 
 
+def retain_registered_notice(jobs, record):
+    """Give a new parent handover to the existing runner, apart from old completion."""
+    from dispatch_completion_join import current_attempt_row
+    from dispatch_seat_handover import effective_parent
+    from harness_capabilities import HARNESSES, parent_completion
+    import dispatch_supervision as supervision
+    jobs = Path(jobs).resolve(strict=True)
+    receipt = record.get("receipt") or {}
+    if (receipt.get("kind") != supervision.KIND
+            or receipt.get("reason") not in {supervision.ANSWER_AWAITING_PARENT, "no-progress"}):
+        return False
+    row = current_attempt_row(jobs, receipt.get("owner_attempt_id", ""))
+    if row is None:
+        return False
+    carrier = row.metadata.get("parent_completion_delivery")
+    harness = next((h for h in HARNESSES if parent_completion(h)["carrier"] == carrier), None)
+    storage = row.metadata.get("parent_sid", "")
+    if not harness or not storage or record.get("recipient_kind") != carrier:
+        return False
+    supervision.validate_pending_record(record, jobs=jobs, expected_thread_id=storage,
+        expected_epoch=1, expected_attempts={row.attempt_id},
+        expected_sealed_batch_id=row.metadata.get("managed_sealed_batch_id", ""))
+    identity = {"jobs": str(jobs), "attempt_id": row.attempt_id,
+                "session_id": effective_parent(row.metadata, jobs), "harness": harness,
+                "server": os.environ.get("AGENT_HERDR_SESSION") or "default"}
+    store = ObligationStore(jobs.parent)
+    duty = store.create(stable_duty_id("registered-batch", identity, record["delivery_id"]),
+        "registered-batch", identity, {"carrier": carrier,
+            "notice_delivery_id": record["delivery_id"], "notice_digest": record["receipt_digest"]})
+    if duty.get("state") not in {"complete", "cancelled"}:
+        ensure_normal_runner(jobs.parent)
+    return True
+
+
 def _registered_delivery_bindings(message, roots=None, *, received_only=False, read_context=None):
     if (received_only and (message.get("state") != "received"
             or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
@@ -748,6 +782,8 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False, r
             or identity.get("harness") != recipient.get("harness")
             or binding.get("recipient_sid") != recipient.get("session_id")
             or intent.get("carrier") != binding.get("carrier")
+            or (intent.get("notice_delivery_id")
+                and intent["notice_delivery_id"] != binding.get("delivery_id"))
             or binding.get("claim_owner") != "retained-rewake:" + binding["duty_id"]):
         return
     try:
@@ -761,6 +797,8 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False, r
                 or record.get("recipient_digest") != pending.recipient_digest(storage)
                 or row.metadata.get("parent_sid") != storage
                 or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
+            return
+        if intent.get("notice_delivery_id") and record.get("receipt_digest") != intent.get("notice_digest"):
             return
         from dispatch_seat_handover import effective_parent
         parent = (effective_parent(row.metadata, jobs) if read_context is None else
@@ -812,7 +850,8 @@ def acknowledge_registered_delivery(message, *, roots=None):
                 continue
         if settled["state"] != "acked":
             continue
-        terminal = row.status == "done" and row.metadata.get("delivery_id") == delivery_id
+        terminal = (duty.get("intent", {}).get("notice_delivery_id") == delivery_id
+                    or (row.status == "done" and row.metadata.get("delivery_id") == delivery_id))
         if duty.get("state") not in {"complete", "cancelled"}:
             try:
                 store.update(duty["id"], state="complete" if terminal else "pending",

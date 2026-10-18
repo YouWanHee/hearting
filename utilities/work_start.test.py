@@ -3174,6 +3174,20 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(len(self.launches), launches)
         self.assertNotIn("dispatch-harvest.py", result.get("next_step", ""))
 
+    def test_normal_start_native_answer_does_not_require_or_forge_transport_ack(self):
+        import dispatch_pending_delivery as pending
+        owner = self._native_blocked_owner()
+        before = self.replacement._rows(self.jobs.read_text().splitlines())[owner][1]
+        original = pending.read(self.jobs.parent, before["parent_sid"], before["delivery_id"])
+        self.assertNotEqual((original or {}).get("state"), "acked")
+        self._store(owner, "continue the approved fixture", "input-native-unacked")
+        result = self._cli_start()
+        self.assertTrue(result["owner_started"], result)
+        self.assertNotEqual(result["owner_attempt_id"], owner)
+        after = pending.read(self.jobs.parent, before["parent_sid"], before["delivery_id"])
+        self.assertNotEqual((after or {}).get("state"), "acked")
+        self.assertIn("continue the approved fixture", self.delivered_prompts[result["owner_attempt_id"]])
+
     def test_full_blocked_chain_normal_start_carries_late_correction_and_replays_once(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
         late = self._store(owner_b, "late correction after C reservation", "input-late")

@@ -556,8 +556,11 @@ def _harvest_unread_blocked_owner(route, jobs, run):
             receipt = acknowledged_attempt_receipt(Path(jobs), aid, recipient_sid=recipient,
                 parent_completion_delivery=carrier)
             if receipt is None:
-                return {"ok": False, "attempt_id": aid,
-                        "reason": "blocked-result-receipt-identity-unavailable"}
+                # ACK recovery is optional for modern carriers. Normal start
+                # already inspects the exact terminal owner and applies its
+                # stored-answer/parent-authority path. A missing transport ACK
+                # must not become a new prerequisite for that continuation.
+                return None
             return {"ok": True, "attempt_id": aid, "status": "exact-result-consumed"}
         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             return {"ok": False, "attempt_id": aid,

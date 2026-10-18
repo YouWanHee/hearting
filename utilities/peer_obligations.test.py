@@ -529,6 +529,113 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertFalse(obligations.retain_registered_completion(
             self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=invalid_turn))
 
+    def _parent_handover(self, harness="codex"):
+        import dispatch_supervision as supervision
+        import dispatch_pending_delivery as pending
+        from harness_capabilities import parent_completion
+        carrier = parent_completion(harness)["carrier"]
+        metadata = {"attempt_schema_version": "2", "attempt_id": "att-stopped-owner",
+            "dispatch_depth": "1", "worker_type": "owner", "parent_sid": "idle-parent",
+            "parent_harness": harness, "parent_completion_delivery": carrier,
+            "note": "dead-worker-blocked", "delivery_intent": "1", "delivery_id": "delivery-original"}
+        self.jobs.write_text("2026-10-18T01:00:00Z\tdone\t/r\t/w\towner\t" +
+                             ",".join(f"{k}={v}" for k,v in metadata.items()) + "\n")
+        identity = {"jobs": str(self.jobs), "attempt_id": "att-stopped-owner",
+                    "session_id": "idle-parent", "harness": harness, "server": "default"}
+        old = self.store.create(obligations.stable_duty_id("registered-batch", identity),
+                                 "registered-batch", identity, {"carrier": carrier})
+        self.store.update(old["id"], state="complete", delivery="acked", cleanup="complete")
+        answers = [{"id": "input-retained", "digest": "kept", "text": "continue approved scope"}]
+        with mock.patch("dispatch_owner_input.retained", return_value=answers), \
+             mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=answers), \
+             mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+             mock.patch.object(obligations, "ensure_normal_runner") as ensure:
+            result = supervision.handover_identity_refusal(self.jobs, "att-stopped-owner",
+                {"reason": "replacement-parent-identity-unproven"})
+            self.assertTrue(result["parent_notified"])
+            records = list(pending.record_directory(self.root, "idle-parent").glob("*.json"))
+            record = json.loads(records[0].read_text())
+            self.assertTrue(obligations.retain_registered_notice(self.jobs, record))
+        self.assertEqual(ensure.call_count, 2)  # repeat producer requests the same runner/duty
+        duties = self.store.list(states={"pending"}, kinds={"registered-batch"})
+        self.assertEqual(len(duties), 1)
+        self.assertEqual(self.store.get(old["id"])["state"], "complete")
+        return duties[0], record, answers
+
+    def test_idle_parent_handover_uses_existing_runner_without_a_hook_turn(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_supervision as supervision
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                duty, record, answers = self._parent_handover(harness)
+                sent = []
+                armed = []
+                def courier(args, expected_recipient, on_prepared):
+                    sent.append((expected_recipient, Path(args.body_file).read_text()))
+                    on_prepared("a" * 32)
+                    return 0
+                census = {"result": {"agents": [{"agent": harness, "pane_id": "w1:p5",
+                             "agent_session": {"value": "idle-parent"}}]}}
+                with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=answers), \
+                     mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+                     mock.patch.object(peer_steward.subprocess, "run",
+                         return_value=type("Result", (), {"stdout": json.dumps(census)})()), \
+                     mock.patch.object(peer_steward, "_resolve_target", return_value=(harness, "idle-parent")), \
+                     mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier), \
+                     mock.patch.object(peer_steward.peer_message, "bind_dispatch_notice"), \
+                     mock.patch.object(peer_steward.peer_message, "_read_pending", return_value={"state": "queued"}), \
+                     mock.patch.object(supervision, "continue_for_parent", side_effect=lambda *a, **k:
+                         armed.append(k) or {"state": "armed"}):
+                    peer_steward._reconcile_obligations(self.store, [duty])
+                    latest = self.store.get(duty["id"])
+                    self.assertEqual(latest["observation"]["transfer_ref"], "a" * 32)
+                    peer_steward._reconcile_obligations(self.store, [latest])
+                    self.assertEqual(len(sent), 1)
+                    self.assertEqual(sent[0][0], (harness, "idle-parent"))
+                    self.assertIn("scheduled the route's start under the parent's identity", sent[0][1])
+                    self.assertEqual(armed[0]["session_id"], "idle-parent")
+                    exact = pending.read(self.root, "idle-parent", record["delivery_id"])
+                    self.assertEqual(exact["state"], "sent-ambiguous")
+                    # Sending is not ACK. Only the exact recipient receipt settles this notice.
+                    pending.ack_received(self.root, "idle-parent", record["delivery_id"],
+                        expected_identity=pending.received_ack_identity(exact, "idle-parent", record["delivery_id"]),
+                        acked_by="fixture-exact-recipient")
+                    peer_steward._reconcile_obligations(self.store, [self.store.get(duty["id"])])
+                    self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+                    self.assertEqual(len(sent), 1)
+                # Each adapter's fixture is distinct; no completed duty is reopened.
+                for path in pending.record_directory(self.root, "idle-parent").glob("*.json"):
+                    path.unlink()
+
+    def test_obsolete_handover_retires_without_waking_a_parent(self):
+        duty, record, answers = self._parent_handover()
+        with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=[]), \
+             mock.patch.object(peer_steward, "cmd_prompt") as send:
+            peer_steward._reconcile_obligations(self.store, [duty])
+        send.assert_not_called()
+        self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+
+    def test_new_handover_preserves_a_live_claim_and_recipient_identity(self):
+        import dispatch_pending_delivery as pending
+        duty, record, answers = self._parent_handover()
+        with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=answers), \
+             mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=type("Result", (), {
+                 "stdout": json.dumps({"result": {"agents": [{"agent": "codex", "pane_id": "w1:p5",
+                     "agent_session": {"value": "idle-parent"}}]}})})()), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("codex", "wrong-parent")), \
+             mock.patch.object(peer_steward, "cmd_prompt") as send:
+            peer_steward._reconcile_obligations(self.store, [duty])
+            self.assertEqual(pending.read(self.root, "idle-parent", record["delivery_id"])["attempts"], 0)
+            pending.claim(self.root, "idle-parent", record["delivery_id"], claim_owner="other-live-carrier",
+                          lease_seconds=300, require_generation_proof=False, jobs=self.jobs)
+            with mock.patch.object(peer_steward, "_resolve_target", return_value=("codex", "idle-parent")):
+                peer_steward._reconcile_obligations(self.store, [duty])
+        send.assert_not_called()
+        self.assertIn(self.store.get(duty["id"])["state"], {"pending", "unknown"})
+        self.assertEqual(pending.read(self.root, "idle-parent", record["delivery_id"])["claim_owner"],
+                         "other-live-carrier")
+
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
     def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
         self._check_observer_handoff(supported=False)
