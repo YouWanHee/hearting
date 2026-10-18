@@ -2635,6 +2635,28 @@ class FallbackTest(unittest.TestCase):
     self.assertIn("worker_failure=interrupted",out.splitlines())
     self.assertNotIn("selected_hop",out)
     self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
+ def test_incomplete_forwarded_output_preserves_receipt_without_settling_or_retrying(self):
+  import json
+  receipt=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
+           "terminal_verdict=PASS\nterminal_note=completed\n")
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   calls=[]
+   no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+   code,out,err=self.start(
+    path,lifecycle=F.FOREGROUND_SCOPED,
+    patches=(self.compiled_order(),self.forwarded(
+     calls,stdout=receipt,stderr="fixture-stderr\n",cleanup_incomplete=True),no_watch))
+  fields=self.cli_verdict(out)
+  self.assertEqual(code,76,out+err)
+  self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
+  self.assertEqual(fields.get("child_spawned"),"unknown",out)
+  self.assertEqual(fields.get("cleanup"),"incomplete",out)
+  self.assertEqual(json.loads(fields["wrapper_stdout_json"]),receipt)
+  self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+  self.assertNotIn("selected_hop=",out)
+  self.assertEqual(len(calls),1)
+  self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
  def test_a_foreground_start_prints_the_notice_first_and_the_parent_notice_second(self):
   ok=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
       "worker_exit=0\nworker_failure=-\n")

@@ -1828,9 +1828,15 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
         if getattr(completed, 'received_signal', None) or getattr(completed, 'cleanup_incomplete', False):
-            return {'state':'needs-attention','reason':'replacement-launch-timeout' if getattr(completed, 'timed_out', False)
-                    else 'replacement-launch-interrupted', 'attempt_id':replacement,'record':record,
+            reason = ('replacement-launch-timeout' if getattr(completed, 'timed_out', False)
+                      else 'replacement-launch-interrupted' if getattr(completed, 'received_signal', None)
+                      else 'replacement-launch-output-incomplete')
+            return {'state':'needs-attention','reason':reason,
+                    'attempt_id':replacement,'record':record,
                     'cleanup_incomplete':bool(getattr(completed, 'cleanup_incomplete', False)),
+                    'launcher_returncode':getattr(completed, 'returncode', None),
+                    'launcher_stdout':getattr(completed, 'stdout', None),
+                    'launcher_stderr':getattr(completed, 'stderr', None),
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}

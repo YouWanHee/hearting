@@ -735,6 +735,28 @@ class ReplacementTest(unittest.TestCase):
             self.assertEqual((replay['state'],replay['attempt_id']),('running',aid))
             self.assertEqual(forward.call_count,1)
 
+    def test_post_exit_output_cleanup_is_explicit_and_preserves_exact_streams(self):
+        import dispatch_lifecycle as L
+        record=self.claim()
+        command=['wrapper','--launch-lifecycle','foreground-scoped','--foreground-timeout','3600']
+        stdout='check=ok\nterminal_verdict=PASS\n'
+        stderr='fixture-stderr\n'
+        def incomplete(*_args,**_kwargs):
+            self._successor(record,self.meta,'open')
+            return L.ForwardedRun(0,stdout,stderr,cleanup_incomplete=True)
+        with mock.patch.object(R,'_command',return_value=command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch.object(L,'run_forwarding_termination',side_effect=incomplete) as forward:
+            result=R.advance(self.jobs,'att-source')
+            self.assertEqual(result['state'],'needs-attention')
+            self.assertEqual(result['reason'],'replacement-launch-output-incomplete',result)
+            self.assertTrue(result['cleanup_incomplete'])
+            self.assertEqual(result['launcher_stdout'],stdout)
+            self.assertEqual(result['launcher_stderr'],stderr)
+            replay=R.advance(self.jobs,'att-source')
+            self.assertEqual(replay['state'],'running')
+            self.assertEqual(forward.call_count,1)
+
     def test_soft_gate_uses_sealed_profile_policy_and_preserves_unknown_all_gated(self):
         capacity=R._capacity_reader()
         self.route['dispatch_allocation']={'strategy':'balanced','window':30,'usage_gate_used_percent':85,

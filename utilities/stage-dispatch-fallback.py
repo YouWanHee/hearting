@@ -189,6 +189,20 @@ def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]
     return code
 
 
+def report_forwarding_cleanup_incomplete(result, attempt_id: str, attempts: list[str]) -> int:
+    """Preserve captured wrapper evidence without settling an unresolved launch."""
+    return fail(
+        "foreground-output-incomplete", 76,
+        attempt_id=attempt_id,
+        child_spawned="unknown",
+        cleanup="incomplete",
+        wrapper_returncode=str(result.returncode),
+        wrapper_stdout_json=json.dumps(result.stdout or "", ensure_ascii=False),
+        wrapper_stderr_json=json.dumps(result.stderr or "", ensure_ascii=False),
+        attempt_trace="|".join(attempts),
+    )
+
+
 def fail(reason: str, code: int, **fields: str) -> int:
     print("check=failed")
     print(f"reason={reason}")
@@ -2120,6 +2134,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     attempts.append(f"{ordinal}:{key}:direct:exit-{result.returncode}:attempt-{attempt_id}")
                     if wrapper_interrupted(result, fields):
                         return report_interrupted(result, output, attempt_id, attempts)
+                    if getattr(result, "cleanup_incomplete", False):
+                        return report_forwarding_cleanup_incomplete(result, attempt_id, attempts)
                     verdict_row = (finished_verdict_row(args.jobs, route["route_id"], node["id"], attempt_id)
                                    if worker_failure != "-" else None)
                     if verdict_row is not None:

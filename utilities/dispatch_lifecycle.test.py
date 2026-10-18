@@ -533,6 +533,67 @@ class ForwardingTerminationTest(unittest.TestCase):
     def command(self, cleanup):
         return [sys.executable, str(self.script), str(cleanup), str(self.marker)]
 
+    def run_with_fixture_pipe_holder(self, *, returncode, hold_seconds, timeout):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("explicit adopted-child reaping fixture requires Linux")
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
+            self.skipTest("PR_GET_CHILD_SUBREAPER is unavailable")
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            self.skipTest("PR_SET_CHILD_SUBREAPER is unavailable")
+        pid_file = self.root / "pipe-holder.pid"
+        self.script.write_text(
+            "import os, pathlib, sys, time\n"
+            "delay, pid_file, code = float(sys.argv[1]), sys.argv[2], int(sys.argv[3])\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    time.sleep(delay)\n"
+            "    os._exit(0)\n"
+            "pathlib.Path(pid_file).write_text(str(pid))\n"
+            "print('fixture-receipt=wrapper-exited', flush=True)\n"
+            "print('fixture-stderr=wrapper-exited', file=sys.stderr, flush=True)\n"
+            "sys.exit(code)\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        try:
+            run = L.run_forwarding_termination(
+                [sys.executable, str(self.script), str(hold_seconds), str(pid_file), str(returncode)],
+                capture=True, timeout=timeout,
+            )
+            elapsed = time.monotonic() - started
+            holder_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                try:
+                    waited, _status = os.waitpid(holder_pid, os.WNOHANG)
+                except ChildProcessError:
+                    self.fail("fixture pipe holder was not adopted for explicit reaping")
+                if waited == holder_pid:
+                    return run, elapsed
+                time.sleep(0.01)
+            os.kill(holder_pid, signal.SIGKILL)
+            os.waitpid(holder_pid, 0)
+            self.fail("finite fixture pipe holder did not exit")
+        finally:
+            if pid_file.is_file():
+                try:
+                    holder_pid = int(pid_file.read_text())
+                    waited, _status = os.waitpid(holder_pid, os.WNOHANG)
+                    if waited == 0:
+                        os.kill(holder_pid, signal.SIGKILL)
+                        os.waitpid(holder_pid, 0)
+                except (ChildProcessError, ProcessLookupError, ValueError):
+                    pass
+            libc.prctl(36, previous.value, 0, 0, 0)
+
+    def fd_count(self):
+        path = Path("/proc/self/fd")
+        return len(list(path.iterdir())) if path.is_dir() else None
+
     def send_after_ready(self, signals, *, gap=0.0):
         """Send stop requests to THIS process once the wrapper can take them."""
         sent = []
@@ -559,6 +620,40 @@ class ForwardingTerminationTest(unittest.TestCase):
         self.assertEqual((run.returncode, run.stdout, run.stderr), (3, "out\n", "err\n"))
         self.assertIsNone(run.received_signal)
         self.assertFalse(run.cleanup_incomplete)
+
+    def test_post_exit_drain_preserves_receipt_streams_and_zero_or_nonzero_status(self):
+        for returncode in (0, 7):
+            with self.subTest(returncode=returncode):
+                run, elapsed = self.run_with_fixture_pipe_holder(
+                    returncode=returncode, hold_seconds=1.2, timeout=2,
+                )
+                self.assertEqual(run.returncode, returncode)
+                self.assertEqual(run.stdout, "fixture-receipt=wrapper-exited\n")
+                self.assertEqual(run.stderr, "fixture-stderr=wrapper-exited\n")
+                self.assertTrue(run.cleanup_incomplete)
+                self.assertLess(elapsed, 0.8)
+
+    def test_timeout_none_is_bounded_after_wrapper_exit_with_delayed_eof(self):
+        run, elapsed = self.run_with_fixture_pipe_holder(
+            returncode=0, hold_seconds=1.2, timeout=None,
+        )
+        self.assertEqual(run.returncode, 0)
+        self.assertIn("fixture-receipt=wrapper-exited", run.stdout)
+        self.assertTrue(run.cleanup_incomplete)
+        self.assertLess(elapsed, 0.8)
+
+    def test_post_exit_pipe_cancellation_leaves_no_reader_thread_or_fd(self):
+        before_threads = {thread.ident for thread in threading.enumerate()}
+        before_fds = self.fd_count()
+        for _ in range(3):
+            run, _elapsed = self.run_with_fixture_pipe_holder(
+                returncode=0, hold_seconds=0.7, timeout=None,
+            )
+            self.assertTrue(run.cleanup_incomplete)
+        self.assertEqual({thread.ident for thread in threading.enumerate()}, before_threads)
+        after_fds = self.fd_count()
+        if before_fds is not None:
+            self.assertEqual(after_fds, before_fds)
 
     def test_uncaptured_run_returns_no_text(self):
         run = L.run_forwarding_termination([sys.executable, "-c", "pass"], capture=False, timeout=None)

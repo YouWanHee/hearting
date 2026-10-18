@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import selectors
 import signal
 import subprocess
 import threading
@@ -62,6 +63,7 @@ EXISTING_ATTEMPT_NOTES = {
 # the first stop request: the wrapper's TERM (5s) and KILL (5s) windows plus
 # room for the registry close.
 FORWARDED_TERMINATION_GRACE = 30.0
+FORWARDED_POST_EXIT_DRAIN_GRACE = 0.25
 
 
 @dataclass(frozen=True)
@@ -986,7 +988,8 @@ class ForwardedRun:
 
     ``received_signal`` is the first stop request this launcher received while
     the wrapper ran; ``cleanup_incomplete`` means the wrapper had not finished
-    within the grace window and was killed (or its output stayed open).
+    within the grace window and was killed, or captured output did not reach EOF
+    within the bounded post-exit drain window.
     """
 
     returncode: int
@@ -1004,23 +1007,42 @@ def _forwarded_signals() -> list[int]:
     return signals
 
 
-def _drain_pipe(stream: Any, sink: list[bytes]) -> None:
-    """Read one wrapper pipe to EOF; the reader alone closes it."""
+def _close_forwarded_pipe(selector: selectors.BaseSelector, stream: Any) -> None:
+    """Unregister and close a nonblocking pipe owned by this launcher."""
 
     try:
-        fd = stream.fileno()
+        selector.unregister(stream)
+    except (KeyError, ValueError):
+        pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _drain_forwarded_pipes(
+    selector: selectors.BaseSelector,
+) -> bool:
+    """Collect available bytes without blocking; report read anomalies."""
+
+    incomplete = False
+    for key, _events in selector.select(timeout=0):
+        stream = key.fileobj
+        sink = key.data
         while True:
-            chunk = os.read(fd, 65536)
+            try:
+                chunk = os.read(stream.fileno(), 65536)
+            except BlockingIOError:
+                break
+            except (OSError, ValueError):
+                incomplete = True
+                _close_forwarded_pipe(selector, stream)
+                break
             if not chunk:
+                _close_forwarded_pipe(selector, stream)
                 break
             sink.append(chunk)
-    except (OSError, ValueError):
-        pass
-    finally:
-        try:
-            stream.close()
-        except OSError:
-            pass
+    return incomplete
 
 
 def run_forwarding_termination(
@@ -1044,7 +1066,10 @@ def run_forwarding_termination(
     wrapper: its worker group belongs to the wrapper's own cleanup) and the
     result says ``cleanup_incomplete``. With ``terminate_on_timeout`` the same
     bounded TERM cleanup applies at the outer deadline and reports ``timed_out``.
-    Otherwise timeout retains its existing ``subprocess.TimeoutExpired`` meaning.
+    Once the wrapper exits, captured pipes get one bounded short drain; a pipe
+    still open afterward sets ``cleanup_incomplete`` and does not extend the
+    execution wait. Otherwise timeout retains its existing
+    ``subprocess.TimeoutExpired`` meaning.
     Handlers are installed only on the main thread and are always restored.
     """
 
@@ -1075,6 +1100,8 @@ def run_forwarding_termination(
             signal.signal(signum, forward)
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    selector: selectors.BaseSelector | None = None
+    proc: subprocess.Popen | None = None
 
     def text(chunks: list[bytes]) -> str | None:
         if not capture:
@@ -1093,26 +1120,24 @@ def run_forwarding_termination(
         child.append(proc)
         for signum in pending:
             deliver(proc, signum)
-        readers = []
+        selector = selectors.DefaultSelector() if capture else None
         if capture:
             for stream, sink in ((proc.stdout, stdout_chunks), (proc.stderr, stderr_chunks)):
-                reader = threading.Thread(target=_drain_pipe, args=(stream, sink), daemon=True)
-                reader.start()
-                readers.append(reader)
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, sink)
         outer_deadline = None if timeout is None else time.monotonic() + timeout
         cleanup_incomplete = False
         timed_out = False
+        timeout_expired = False
         try:
-            while True:
-                try:
-                    proc.wait(timeout=poll_interval)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
+            while proc.poll() is None:
                 now = time.monotonic()
                 if cleanup_deadline:
                     if now >= cleanup_deadline[0]:
-                        proc.kill()
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
                         proc.wait()
                         cleanup_incomplete = True
                         break
@@ -1121,37 +1146,57 @@ def run_forwarding_termination(
                         timed_out = True
                         forward(signal.SIGTERM, None)
                         continue
-                    proc.kill()
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
                     proc.wait()
-                    for reader in readers:
-                        reader.join(timeout=1.0)
-                    raise subprocess.TimeoutExpired(
-                        list(command), timeout,
-                        output=text(stdout_chunks), stderr=text(stderr_chunks),
-                    )
-            for reader in readers:
-                while reader.is_alive():
-                    # The wrapper has exited; something it started may still
-                    # hold its output open. Bound that wait by the same clock.
-                    limit = cleanup_deadline[0] if cleanup_deadline else outer_deadline
-                    if limit is None:
-                        reader.join(poll_interval)
-                        continue
-                    remaining = limit - time.monotonic()
+                    timeout_expired = True
+                    break
+
+                wait_for = max(0.0, poll_interval)
+                deadline = cleanup_deadline[0] if cleanup_deadline else outer_deadline
+                if deadline is not None:
+                    wait_for = min(wait_for, max(0.0, deadline - now))
+                if selector is not None and selector.get_map():
+                    selector.select(wait_for)
+                    cleanup_incomplete |= _drain_forwarded_pipes(selector)
+                elif wait_for:
+                    time.sleep(wait_for)
+
+            if timeout_expired:
+                # Preserve bytes already in the wrapper pipes, but never let a
+                # descendant holding those pipes extend the caller's timeout.
+                drain_deadline = time.monotonic() + FORWARDED_POST_EXIT_DRAIN_GRACE
+                while selector is not None and selector.get_map():
+                    remaining = drain_deadline - time.monotonic()
                     if remaining <= 0:
-                        if cleanup_deadline:
-                            cleanup_incomplete = True
-                            break
-                        raise subprocess.TimeoutExpired(
-                            list(command), timeout,
-                            output=text(stdout_chunks), stderr=text(stderr_chunks),
-                        )
-                    reader.join(min(poll_interval, remaining))
-        except subprocess.TimeoutExpired:
-            raise
+                        break
+                    selector.select(remaining)
+                    cleanup_incomplete |= _drain_forwarded_pipes(selector)
+                raise subprocess.TimeoutExpired(
+                    list(command), timeout,
+                    output=text(stdout_chunks), stderr=text(stderr_chunks),
+                )
+
+            proc.wait()
+            # Process exit is the execution boundary. EOF may be delayed by a
+            # descendant that inherited stdout/stderr, so allow only this short
+            # fixed drain window after exit.
+            drain_deadline = time.monotonic() + FORWARDED_POST_EXIT_DRAIN_GRACE
+            while selector is not None and selector.get_map():
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    cleanup_incomplete = True
+                    break
+                selector.select(min(max(0.0, poll_interval), remaining))
+                cleanup_incomplete |= _drain_forwarded_pipes(selector)
         except BaseException:
             if proc.poll() is None:
-                proc.kill()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
                 proc.wait()
             raise
         return ForwardedRun(
@@ -1163,5 +1208,25 @@ def run_forwarding_termination(
             timed_out,
         )
     finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait()
+            except OSError:
+                pass
+        if selector is not None:
+            for key in list(selector.get_map().values()):
+                _close_forwarded_pipe(selector, key.fileobj)
+            selector.close()
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
         for signum, handler in previous.items():
             signal.signal(signum, handler)
