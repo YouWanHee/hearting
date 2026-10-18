@@ -30,6 +30,7 @@ PD = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = PD
 SPEC.loader.exec_module(PD)
+import dispatch_attempt_reference as AR  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -854,6 +855,248 @@ class PruneTest(IsolatedRootMixin, unittest.TestCase):
             PD.main(["prune", "--root", str(self.root), "--apply", "--json"])
         self.assertEqual(json.loads(buf.getvalue())["pruned_records"], 1)
         self.assertFalse(old_acked.exists())
+
+
+class ReferenceAdmissionTests(IsolatedRootMixin, unittest.TestCase):
+    def _create(self, suffix, attempt):
+        receipt = _receipt()
+        delivery_id = "delivery-" + suffix * 32
+        recipient = "sess-reference-admission"
+        PD.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key=recipient,
+            delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+            attempt_ids=[attempt], parent_attempt_id="att-reference-parent",
+            route_id="rt-reference", route_node="execute", receipt=receipt,
+            receipt_digest=_digest(receipt), row_revisions={attempt: "fixture"},
+        )
+        return recipient, delivery_id, PD.record_path(self.root, recipient, delivery_id)
+
+    def test_ack_and_terminal_state_writes_wait_for_the_reference_admission(self):
+        import fcntl, threading
+
+        recipient, delivery_id, path = self._create("a", "att-reference-ack")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        attempted, errors = threading.Event(), []
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "reference-state-writer"
+                    and operation & fcntl.LOCK_EX):
+                attempted.set()
+            return real_flock(fd, operation)
+
+        with AR.admission(self.root, ["att-reference-ack"]):
+            def ack():
+                try:
+                    PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=ack, name="reference-state-writer")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "ACK writer did not reach its reference lock")
+                self.assertEqual(json.loads(path.read_text())["state"], "claimed")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+
+        recipient, delivery_id, path = self._create("b", "att-reference-expire")
+        attempted.clear()
+        with AR.admission(self.root, ["att-reference-expire"]):
+            def expire():
+                try:
+                    PD.expire_if_due(
+                        self.root, recipient, delivery_id, actor=PD.EXPIRY_ACTOR,
+                        reason="pending-delivery-ttl-exceeded")
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=expire, name="reference-state-writer")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "terminal writer did not reach its reference lock")
+                self.assertEqual(json.loads(path.read_text())["state"], "pending")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(json.loads(path.read_text())["state"], "expired")
+
+    def test_prune_transition_waits_for_reference_admission_and_keeps_tombstone(self):
+        import fcntl, threading
+
+        recipient, delivery_id, path = self._create("c", "att-reference-prune")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+        old = time.time() - 8 * 86400
+        os.utime(path, (old, old))
+        attempted, result, errors = threading.Event(), [], []
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "reference-pruner"
+                    and operation & fcntl.LOCK_EX):
+                attempted.set()
+            return real_flock(fd, operation)
+
+        with AR.admission(self.root, ["att-reference-prune"]):
+            def prune():
+                try:
+                    result.append(PD.prune(
+                        self.root, apply=True, retention_seconds=1,
+                        lock_retention_seconds=86400))
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=prune, name="reference-pruner")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "pruner did not reach its reference lock")
+                self.assertTrue(path.is_file())
+                self.assertFalse(PD.tombstone_path(path).exists())
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["pruned_records"], 1)
+        self.assertFalse(path.exists())
+        self.assertEqual(json.loads(PD.tombstone_path(path).read_text())["terminal_state"], "acked")
+
+    def test_stale_reference_mutexes_are_removed_by_normal_prune(self):
+        recipient, delivery_id, _path = self._create("d", "att-reference-stale")
+        lock = AR.lock_path(self.root, "att-reference-stale")
+        old = time.time() - 2 * 86400
+        os.utime(lock, (old, old))
+
+        plan = PD.prune_plan(self.root, lock_retention_seconds=3600)
+        self.assertEqual([item["path"] for item in plan["reference_locks"]], [str(lock)])
+        result = PD.prune(self.root, apply=True, lock_retention_seconds=3600)
+        self.assertEqual(result["pruned_reference_locks"], 1)
+        self.assertFalse(lock.exists())
+        with AR.admission(self.root, ["att-reference-stale"]):
+            self.assertTrue(lock.exists(), "the ordinary writer recreates a pruned key safely")
+
+    def test_normal_create_does_not_resurrect_a_pruned_delivery_tombstone(self):
+        recipient, delivery_id, path = self._create("e", "att-reference-pruned")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+        old = time.time() - 8 * 86400
+        os.utime(path, (old, old))
+        result = PD.prune(self.root, apply=True, retention_seconds=1)
+        self.assertEqual(result["pruned_records"], 1)
+        tombstone = PD.tombstone_path(path)
+        self.assertTrue(tombstone.is_file())
+
+        with self.assertRaises(PD.PendingDeliveryError) as caught:
+            self._create("e", "att-reference-pruned")
+        self.assertEqual(caught.exception.detail, "record-pruned")
+        self.assertFalse(path.exists())
+        self.assertTrue(tombstone.is_file())
+
+    def test_reference_waiter_reopens_after_an_old_inode_is_unlinked(self):
+        import fcntl, threading
+
+        attempt = "att-reference-inode-race"
+        path = AR.lock_path(self.root, attempt)
+        with AR.admission(self.root, [attempt]):
+            pass
+        old_fd = os.open(path, os.O_RDWR)
+        fcntl.flock(old_fd, fcntl.LOCK_EX)
+        waiter_attempted, waiter_reopened = threading.Event(), threading.Event()
+        new_holder_entered, release_new_holder, waiter_entered = (
+            threading.Event(), threading.Event(), threading.Event())
+        errors, calls = [], {"waiter": 0}
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "old-inode-waiter"
+                    and operation & fcntl.LOCK_EX):
+                calls["waiter"] += 1
+                if calls["waiter"] == 1:
+                    waiter_attempted.set()
+                elif calls["waiter"] == 2:
+                    waiter_reopened.set()
+            return real_flock(fd, operation)
+
+        def waiter():
+            try:
+                with AR.admission(self.root, [attempt]):
+                    waiter_entered.set()
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        def new_holder():
+            try:
+                with AR.admission(self.root, [attempt]):
+                    new_holder_entered.set()
+                    if not release_new_holder.wait(3):
+                        errors.append("new lock holder timed out")
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        first = threading.Thread(target=waiter, name="old-inode-waiter")
+        second = threading.Thread(target=new_holder, name="new-inode-holder")
+        try:
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                first.start()
+                self.assertTrue(waiter_attempted.wait(3))
+                old_identity = os.fstat(old_fd).st_ino
+                path.unlink()
+                second.start()
+                self.assertTrue(new_holder_entered.wait(3))
+                self.assertNotEqual(old_identity, path.stat().st_ino)
+                fcntl.flock(old_fd, fcntl.LOCK_UN)
+                os.close(old_fd)
+                old_fd = -1
+                self.assertTrue(waiter_reopened.wait(3), "waiter must reopen the current lock inode")
+                self.assertFalse(waiter_entered.is_set(), "waiter must respect the new inode holder")
+                release_new_holder.set()
+                self.assertTrue(waiter_entered.wait(3))
+        finally:
+            release_new_holder.set()
+            if old_fd >= 0:
+                fcntl.flock(old_fd, fcntl.LOCK_UN)
+                os.close(old_fd)
+            first.join(3)
+            second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_reference_admission_releases_after_exception(self):
+        import subprocess
+
+        attempt = "att-reference-exception"
+        with self.assertRaisesRegex(RuntimeError, "fixture interruption"):
+            with AR.admission(self.root, [attempt]):
+                raise RuntimeError("fixture interruption")
+        self.assertEqual(AR.held_attempts(), frozenset())
+        with AR.admission(self.root, [attempt]) as admitted:
+            self.assertTrue(admitted)
+
+        child = (
+            "import os,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+            "import dispatch_attempt_reference as a; "
+            "ctx=a.admission(Path(sys.argv[2]),[sys.argv[3]]); "
+            "ctx.__enter__(); print('held',flush=True); os._exit(0)"
+        )
+        crashed = subprocess.run(
+            [sys.executable, "-c", child, str(HERE), str(self.root), attempt],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        self.assertEqual(crashed.stdout.strip(), "held")
+        with AR.admission(self.root, [attempt]) as admitted:
+            self.assertTrue(admitted, "process interruption releases the advisory flock")
+
+    def test_writer_reference_extraction_matches_retention_attempt_relation(self):
+        record = {
+            "attempt_ids": ["att-reference-child", "notice-" + "a" * 32, "malformed"],
+            "parent_attempt_id": "att-reference-parent",
+        }
+        expected = frozenset({"att-reference-child", "att-reference-parent"})
+        self.assertEqual(AR.record_attempts(record), expected)
+        self.assertEqual(AR.lock_paths(self.root, record["attempt_ids"] + [record["parent_attempt_id"]]),
+                         tuple(sorted(AR.lock_path(self.root, item) for item in expected)))
 
 
 class ExpiryTest(IsolatedRootMixin, unittest.TestCase):

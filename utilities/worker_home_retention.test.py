@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
 import dispatch_contract as DC  # noqa: E402
+import dispatch_attempt_reference as AR  # noqa: E402
 import worker_home_retention as R  # noqa: E402
 import dispatch_pending_delivery as P  # noqa: E402
 import dispatch_completion_join as JOIN  # noqa: E402
@@ -131,6 +132,16 @@ class Fixture(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
         return value
+
+    def publish_delivery(self, delivery_id, recipient_key, attempt_ids, parent_attempt_id):
+        receipt = {"schema_version": 2, "fixture": "reference-admission"}
+        return P.create(
+            self.root, recipient_kind="codex-native-queue", recipient_key=recipient_key,
+            delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+            attempt_ids=list(attempt_ids), parent_attempt_id=parent_attempt_id,
+            route_id="rt-reference-admission", route_node="execute", receipt=receipt,
+            receipt_digest=P._canonical_receipt_digest(receipt), row_revisions={},
+        )
 
     def kept(self, result, reason):
         return result["kept"].get(reason, 0)
@@ -977,6 +988,244 @@ class Liveness(Fixture):
 
 
 class Races(Fixture):
+    def test_normal_publisher_wins_before_final_admission_for_new_and_existing_groups(self):
+        original_broad = R._late_delivery_change
+        real_open = AR._open_locked
+        active = {"attempt": None, "relation": None, "started": False}
+        with mock.patch.object(R, "_late_delivery_change") as broad_mock, \
+                mock.patch.object(AR, "_open_locked") as open_mock:
+            broad_mock.side_effect = original_broad
+            open_mock.side_effect = real_open
+
+            def broad_then_publish(ctx, attempt, deadline):
+                result = original_broad(ctx, attempt, deadline)
+                if attempt == active["attempt"] and not active["started"]:
+                    active["started"] = True
+                    admission_entered, done, errors = threading.Event(), threading.Event(), []
+                    index = int(attempt.rsplit("-", 1)[1])
+                    recipient = f"normal-publisher-{index}"
+                    delivery_id = f"delivery-{index + 10:032x}"
+                    if index % 2:
+                        self.publish_delivery(
+                            f"delivery-{index + 100:032x}", recipient,
+                            [f"att-existing-unrelated-{index}"], "att-existing-parent")
+
+                    def tracked_open(path, *, blocking):
+                        if threading.current_thread().name == "normal-publisher":
+                            admission_entered.set()
+                        return real_open(path, blocking=blocking)
+
+                    open_mock.side_effect = tracked_open
+
+                    def publish():
+                        try:
+                            if active["relation"] == "attempt":
+                                ids, parent = [attempt], "att-normal-parent"
+                            else:
+                                ids, parent = [f"att-normal-unrelated-{index}"], attempt
+                            self.publish_delivery(delivery_id, recipient, ids, parent)
+                        except Exception as exc:  # surfaced on the sweep thread
+                            errors.append(repr(exc))
+                        finally:
+                            done.set()
+
+                    thread = threading.Thread(target=publish, name="normal-publisher")
+                    thread.start()
+                    if not admission_entered.wait(3) or not done.wait(3):
+                        errors.append("normal writer did not reach and finish publication")
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+                    record = P.record_path(self.root, recipient, delivery_id)
+                    self.assertTrue(record.is_file(), "normal API record must be durable before final admission")
+                    self.assertEqual(json.loads(record.read_text())["state"], "pending")
+                    self.assertEqual(errors, [])
+                    open_mock.side_effect = real_open
+                return result
+
+            broad_mock.side_effect = broad_then_publish
+            for index, (existing_group, relation) in enumerate((
+                    (False, "attempt"), (True, "parent"),
+                    (False, "parent"), (True, "attempt"))):
+                attempt = f"att-normal-publisher-{index}"
+                home = self.add(attempt)
+                recipient = f"normal-publisher-{index}"
+                if existing_group:
+                    self.publish_delivery(
+                        f"delivery-{index + 100:032x}", recipient,
+                        [f"att-existing-unrelated-{index}"], "att-existing-parent")
+                active.update(attempt=attempt, relation=relation, started=False)
+                self.sweep(0)
+                result = self.sweep(8)
+                self.assertTrue(active["started"], f"publisher did not run for {attempt}")
+                self.assertTrue(home.is_dir())
+                self.assertEqual(result["removed"], 0)
+                self.assertGreaterEqual(
+                    result["kept"].get("late-evidence-changed", 0), 1,
+                    f"{relation} reference from {'existing' if existing_group else 'new'} group was missed",
+                )
+
+    def test_detach_admission_orders_normal_publishers_after_rename(self):
+        original_final = R._late_candidate_delivery_change
+        real_flock = AR.fcntl.flock
+        real_rename = R.os.rename
+        real_write = P._atomic_write_json
+        active = {"attempt": None, "calls": 0}
+        for index, (existing_group, relation) in enumerate((
+                (False, "attempt"), (True, "parent"),
+                (False, "parent"), (True, "attempt"))):
+            attempt = f"att-detach-wins-{index}"
+            home = self.add(attempt)
+            recipient = f"detach-wins-{index}"
+            if existing_group:
+                self.publish_delivery(
+                    f"delivery-{index + 200:032x}", recipient,
+                    [f"att-detach-unrelated-{index}"], "att-detach-parent")
+            delivery_id = f"delivery-{index + 300:032x}"
+            record = P.record_path(self.root, recipient, delivery_id)
+            self.sweep(0)
+            start_writer, writer_attempted, writer_done = (
+                threading.Event(), threading.Event(), threading.Event())
+            order, errors = [], []
+            active.update(attempt=attempt, calls=0)
+
+            def observed_flock(fd, operation):
+                if (threading.current_thread().name == "normal-publisher"
+                        and operation & fcntl.LOCK_EX):
+                    writer_attempted.set()
+                return real_flock(fd, operation)
+
+            def final_check(ctx, selected, deadline):
+                if selected == active["attempt"]:
+                    active["calls"] += 1
+                    if active["calls"] == 2:
+                        start_writer.set()
+                        if not writer_attempted.wait(3):
+                            raise AssertionError("normal publisher never attempted reference admission")
+                        value = original_final(ctx, selected, deadline)
+                        self.assertFalse(record.exists(), "blocked writer became durable before the final proof/rename")
+                        return value
+                return original_final(ctx, selected, deadline)
+
+            def observed_rename(*args, **kwargs):
+                if threading.current_thread().name == "MainThread":
+                    self.assertFalse(record.exists(), "related publisher landed before HOME rename")
+                    order.append("rename")
+                return real_rename(*args, **kwargs)
+
+            def observed_write(path, value):
+                result = real_write(path, value)
+                if Path(path) == record:
+                    order.append("publish")
+                return result
+
+            def publish():
+                if not start_writer.wait(3):
+                    errors.append("final admission was not reached")
+                    writer_done.set()
+                    return
+                try:
+                    if relation == "attempt":
+                        ids, parent = [attempt], "att-detach-parent"
+                    else:
+                        ids, parent = [f"att-detach-unrelated-{index}"], attempt
+                    self.publish_delivery(delivery_id, recipient, ids, parent)
+                except Exception as exc:
+                    errors.append(repr(exc))
+                finally:
+                    writer_done.set()
+
+            thread = threading.Thread(target=publish, name="normal-publisher")
+            thread.start()
+            try:
+                with mock.patch.object(AR.fcntl, "flock", observed_flock), \
+                        mock.patch.object(R, "_late_candidate_delivery_change", final_check), \
+                        self.replaced("rename", observed_rename), \
+                        mock.patch.object(P, "_atomic_write_json", observed_write):
+                    result = self.sweep(8)
+            finally:
+                start_writer.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(writer_done.is_set())
+            self.assertIn("removed", result, result)
+            self.assertEqual(result["removed"], 1, result)
+            self.assertFalse(home.exists())
+            self.assertTrue(record.is_file())
+            self.assertEqual(json.loads(record.read_text())["state"], "pending")
+            self.assertEqual(order, ["rename", "publish"])
+
+    def test_unrelated_normal_publishers_run_during_candidate_admission_and_home_is_removed(self):
+        home = self.add("att-unrelated-normal-publisher")
+        self.sweep(0)
+        original_final = R._late_candidate_delivery_change
+        real_open = AR._open_locked
+        start_writer, admission_attempted, writer_done = (
+            threading.Event(), threading.Event(), threading.Event())
+        errors = []
+        check_calls = []
+        completed_inside = []
+
+        def tracked_open(path, *, blocking):
+            if threading.current_thread().name == "unrelated-normal-publisher":
+                admission_attempted.set()
+            return real_open(path, blocking=blocking)
+
+        def publish_many():
+            if not start_writer.wait(3):
+                errors.append("final admission was not reached")
+                writer_done.set()
+                return
+            try:
+                for index in range(3):
+                    self.publish_delivery(
+                        f"delivery-{index + 500:032x}", "unrelated-normal-publisher",
+                        [f"att-unrelated-normal-{index}"], "att-unrelated-normal-parent")
+            except Exception as exc:
+                errors.append(repr(exc))
+            finally:
+                writer_done.set()
+
+        thread = threading.Thread(target=publish_many, name="unrelated-normal-publisher")
+        thread.start()
+
+        def final_check(ctx, attempt, deadline):
+            if attempt == "att-unrelated-normal-publisher":
+                check_calls.append(True)
+                if len(check_calls) == 2:
+                    start_writer.set()
+                    self.assertTrue(admission_attempted.wait(3), "normal publisher never reached its write admission")
+                    completed_inside.append(writer_done.wait(0.10))
+            return original_final(ctx, attempt, deadline)
+
+        try:
+            with mock.patch.object(AR, "_open_locked", tracked_open), \
+                    mock.patch.object(R, "_late_candidate_delivery_change", final_check):
+                result = self.sweep(8)
+        finally:
+            start_writer.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(completed_inside, [True], "unrelated publication must complete under candidate admission")
+        self.assertEqual(result["removed"], 1, result)
+        self.assertFalse(home.exists())
+        self.assertEqual(len(list(P.record_directory(self.root, "unrelated-normal-publisher").glob("*.json"))), 3)
+
+    def test_related_reference_contention_defers_and_next_sweep_retries_automatically(self):
+        home = self.add("att-reference-busy")
+        self.sweep(0)
+        first = self.state()["eligible_since"][home.name]
+        with AR.admission(self.root, ["att-reference-busy"]):
+            result = self.sweep(8)
+            self.assertEqual(result["removed"], 0)
+            self.assertEqual(self.kept(result, "delivery-reference-busy"), 1)
+            self.assertTrue(home.is_dir())
+            self.assertEqual(self.state()["eligible_since"][home.name], first)
+        result = self.sweep(8.1)
+        self.assertEqual(result["removed"], 1, result)
+        self.assertFalse(home.exists())
+
     def _assert_final_admission_write_keeps_home(self, home, write_record):
         admitted, written = threading.Event(), threading.Event()
         errors = []

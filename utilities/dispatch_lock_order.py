@@ -44,17 +44,24 @@ from typing import Iterator, Optional
 # Rank ascending == acquisition order. The established order, preserved from
 # the implementation that landed with `2e0fc2b0`, is:
 #
-#     node completion  ->  jobs  ->  producer admission
+#     node completion  ->  jobs  ->  delivery reference -> delivery record
+#                       -> producer admission
 #
-# `terminal-commit-state` sits below producer admission because the terminal
-# transaction's state CAS is deliberately taken *after* the producer lock has
-# been released (see `dispatch_terminal_commit._advance_state`): it is a small
-# publication, not part of the producer critical section.
+# Pending-delivery writers take all attempt-reference locks in sorted-key
+# order, then the one record CAS lock. A final HOME detach takes jobs, the
+# candidate's attempt-reference set, then the retention view lock; it never
+# takes a delivery-record lock. This keeps the terminal path's jobs -> record
+# publication order compatible with candidate detach and prevents an inverse
+# record/reference edge. `terminal-commit-state` remains after producer
+# admission because its CAS is deliberately taken after the producer lock has
+# been released (see `dispatch_terminal_commit._advance_state`).
 LOCK_ORDER: tuple[tuple[int, str, str], ...] = (
     (1, "node-completion", "node/attempt completion admission -- a CROSS-PROCESS precheck stage"),
     (2, "jobs", "the registry `jobs.log.lock` -- the one terminal-claim fence"),
-    (3, "producer-admission", "artifact_admission admission mutex for one artifact root"),
-    (4, "terminal-commit-state", "terminal transaction `state.lock` CAS, taken after producer release"),
+    (3, "delivery-reference", "sorted per-attempt pending-delivery publication/detach admission"),
+    (4, "delivery-record", "one pending-delivery record CAS, after its reference admissions"),
+    (5, "producer-admission", "artifact_admission admission mutex for one artifact root"),
+    (6, "terminal-commit-state", "terminal transaction `state.lock` CAS, taken after producer release"),
 )
 
 RANK: dict[str, int] = {name: rank for rank, name, _ in LOCK_ORDER}
@@ -86,12 +93,16 @@ DECLARED_IN_PROCESS: tuple[str, ...] = tuple(
 # serialization point for dozens of dispatch writers, and only the terminal
 # claim fence needs to be ordered against the producer mutex. `terminal-commit-
 # state` is private to the terminal transaction, so its single writer declares.
-ENFORCED_COMPLETE: frozenset[str] = frozenset({"producer-admission", "terminal-commit-state"})
+ENFORCED_COMPLETE: frozenset[str] = frozenset({
+    "delivery-reference", "delivery-record", "producer-admission", "terminal-commit-state",
+})
 
 # Physical lock files a rank in `ENFORCED_COMPLETE` corresponds to, for the
 # acceptance census. Counting from the *acquisition* side is the only way to
 # notice a module that re-implements the same lock without declaring.
 ENFORCED_LOCK_FILES: dict[str, str] = {
+    "delivery-reference": ".attempt-reference.lock",
+    "delivery-record": ".json.lock",
     "producer-admission": "lock.flock",
     "terminal-commit-state": "state.lock",
 }

@@ -311,7 +311,7 @@ def _advance_state(path: Path, commit_id: str, expected_from: str, to_state: str
     with (path.parent / "state.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            # Rank 4 of the canonical table: declaring it is what makes "this
+            # Rank 6 of the canonical table: declaring it is what makes "this
             # CAS is taken only after the producer lock was released" checkable
             # rather than a comment two modules away.
             with dispatch_lock_order.acquired("terminal-commit-state"):

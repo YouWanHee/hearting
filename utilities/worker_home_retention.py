@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import dispatch_attempt_reference as attempt_reference
 
 IDLE_SECONDS = 7 * 86400
 DUE_SECONDS = 300
@@ -57,7 +58,7 @@ MAX_TREE_DEPTH = 128
 REGISTRY_LOCK_WAIT_SECONDS = 0.100
 
 KEY_RE = re.compile(r"[0-9a-f]{32}")
-ATTEMPT_RE = re.compile(r"att-[A-Za-z0-9._-]{1,240}")
+ATTEMPT_RE = attempt_reference.ATTEMPT_RE
 NOTICE_RE = re.compile(r"notice-[0-9a-f]{32}")
 ATTEMPT_ID_RE = re.compile(r"(?:^|,)attempt_id=([^,]+)")
 LEAF_RE = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})")
@@ -1706,96 +1707,107 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
         return ("late-evidence-unreadable" if late_delivery == "unknown"
                 else "late-evidence-changed")
 
-    # Reacquire after both outside-lock delivery checks and revalidate registry
-    # appends before touching the pinned home. Start the short critical window
-    # at admission so outside preparation cannot consume it.
-    with _registry_lock_until(ctx.jobs, deadline) as admitted:
-        if admitted is False:
-            return "registry-lock-busy"
-        final_deadline = min(deadline, time.monotonic() + 0.15)
-        if not _fresh(watched):
-            return "late-evidence-changed"
-        delta = _registry_delta_is_candidate_change(
-            fresh, ctx.jobs, key, attempt, current.workers_real,
-            current.by_key, final_deadline)
-        if delta is not False:
-            return "late-evidence-changed"
-        with _flock(layout.ret_fd, "view.lock", fcntl.LOCK_EX | fcntl.LOCK_NB) as acquired:
-            if not acquired:
-                return "view-lock-busy"
-            # The summary owner was proven dead or absent during preparation. A
-            # dead pid/start cannot return and the unchanged row declares no
-            # other, so its /proc walk stays out of this lock.
-            lease = _lease_state(ctx.jobs, row.meta)
-            if lease in ("held", "unknown"):
-                return ("protected:" if lease == "held" else "defer:") + "lease-" + lease
-            try:
-                home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
-            except OSError:
-                return "home-gone"
-            try:
-                rebound = _bind(current, key, home)
-            finally:
-                os.close(home)
-            if isinstance(rebound, _Verdict) or rebound[0] != attempt:
-                return "late-binding"
-            mark = _stat_mtime(key, dir_fd=layout.views_fd, follow_symlinks=False)
-            if mark and ctx.now_ns - mark < IDLE_SECONDS * 10**9:
-                return "recent-view"
-            try:
-                leaf = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
-            except OSError:
-                return "home-gone"
-            try:
-                st = os.fstat(leaf)
-                if _identity(st) != ident:
-                    return "identity-changed"
-                idle_from = max(first_ns, verdict.activity_ns, mark, st.st_mtime_ns)
-                if ctx.now_ns - idle_from < IDLE_SECONDS * 10**9:
-                    return "late-activity"
-                source_mount = _mount_id(layout.workers_fd)
-                target_mount = _mount_id(layout.retiring_fd)
-                leaf_mount = _mount_id(leaf)
-                if (source_mount is None or source_mount != target_mount
-                        or leaf_mount != source_mount):
-                    return "mount-unproven"
-            finally:
-                os.close(leaf)
-            if not _fresh(watched):
-                return "late-evidence-changed"
-            late_delivery = _late_candidate_delivery_change(current, attempt, final_deadline)
-            if late_delivery is not None:
-                return ("late-evidence-unreadable" if late_delivery == "unknown"
-                        else "late-evidence-changed")
-            name = f"{key}.{ctx.now_ns}"
-            journal = json.dumps({"schema": SCHEMA, "key": key, "name": name, "identity": ident},
-                                 sort_keys=True).encode()
-            try:
-                fd = os.open(name + ".journal",
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                             0o600, dir_fd=layout.retiring_fd)
-            except OSError:
-                return "journal-failed"
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(journal)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.rename(key, name, src_dir_fd=layout.workers_fd, dst_dir_fd=layout.retiring_fd)
-            except OSError:
-                with contextlib.suppress(OSError):
-                    os.unlink(name + ".journal", dir_fd=layout.retiring_fd)
-                return "detach-failed"
-            try:
-                moved = os.stat(name, dir_fd=layout.retiring_fd, follow_symlinks=False)
-            except OSError:
-                moved = None
-            if moved is None or _identity(moved) != ident:
-                # Something else sat at the name when it moved: never delete it.
-                with contextlib.suppress(OSError):
-                    os.unlink(name + ".journal", dir_fd=layout.retiring_fd)
-                return "detach-substituted"
-    return "detached:" + name
+    baseline = current.candidate_delivery_baseline
+    if baseline is None or baseline.attempt != attempt:
+        return "late-evidence-unreadable"
+    # Registry -> sorted candidate references -> retention view is the final
+    # lock order. The reference admission is nonblocking for GC, and remains
+    # held from the final proof through the journal and rename linearization.
+    try:
+        with _registry_lock_until(ctx.jobs, deadline) as admitted:
+            if admitted is False:
+                return "registry-lock-busy"
+            with attempt_reference.admission(
+                    ctx.root, baseline.related, blocking=False) as reference_admitted:
+                if not reference_admitted:
+                    return "delivery-reference-busy"
+                final_deadline = min(deadline, time.monotonic() + 0.15)
+                if not _fresh(watched):
+                    return "late-evidence-changed"
+                delta = _registry_delta_is_candidate_change(
+                    fresh, ctx.jobs, key, attempt, current.workers_real,
+                    current.by_key, final_deadline)
+                if delta is not False:
+                    return "late-evidence-changed"
+                with _flock(layout.ret_fd, "view.lock", fcntl.LOCK_EX | fcntl.LOCK_NB) as acquired:
+                    if not acquired:
+                        return "view-lock-busy"
+                    # The summary owner was proven dead or absent during preparation. A
+                    # dead pid/start cannot return and the unchanged row declares no
+                    # other, so its /proc walk stays out of this lock.
+                    lease = _lease_state(ctx.jobs, row.meta)
+                    if lease in ("held", "unknown"):
+                        return ("protected:" if lease == "held" else "defer:") + "lease-" + lease
+                    try:
+                        home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
+                    except OSError:
+                        return "home-gone"
+                    try:
+                        rebound = _bind(current, key, home)
+                    finally:
+                        os.close(home)
+                    if isinstance(rebound, _Verdict) or rebound[0] != attempt:
+                        return "late-binding"
+                    mark = _stat_mtime(key, dir_fd=layout.views_fd, follow_symlinks=False)
+                    if mark and ctx.now_ns - mark < IDLE_SECONDS * 10**9:
+                        return "recent-view"
+                    try:
+                        leaf = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
+                    except OSError:
+                        return "home-gone"
+                    try:
+                        st = os.fstat(leaf)
+                        if _identity(st) != ident:
+                            return "identity-changed"
+                        idle_from = max(first_ns, verdict.activity_ns, mark, st.st_mtime_ns)
+                        if ctx.now_ns - idle_from < IDLE_SECONDS * 10**9:
+                            return "late-activity"
+                        source_mount = _mount_id(layout.workers_fd)
+                        target_mount = _mount_id(layout.retiring_fd)
+                        leaf_mount = _mount_id(leaf)
+                        if (source_mount is None or source_mount != target_mount
+                                or leaf_mount != source_mount):
+                            return "mount-unproven"
+                    finally:
+                        os.close(leaf)
+                    if not _fresh(watched):
+                        return "late-evidence-changed"
+                    late_delivery = _late_candidate_delivery_change(current, attempt, final_deadline)
+                    if late_delivery is not None:
+                        return ("late-evidence-unreadable" if late_delivery == "unknown"
+                                else "late-evidence-changed")
+                    name = f"{key}.{ctx.now_ns}"
+                    journal = json.dumps({"schema": SCHEMA, "key": key, "name": name,
+                                          "identity": ident}, sort_keys=True).encode()
+                    try:
+                        fd = os.open(name + ".journal",
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     0o600, dir_fd=layout.retiring_fd)
+                    except OSError:
+                        return "journal-failed"
+                    try:
+                        with os.fdopen(fd, "wb") as handle:
+                            handle.write(journal)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.rename(key, name, src_dir_fd=layout.workers_fd,
+                                  dst_dir_fd=layout.retiring_fd)
+                    except OSError:
+                        with contextlib.suppress(OSError):
+                            os.unlink(name + ".journal", dir_fd=layout.retiring_fd)
+                        return "detach-failed"
+                    try:
+                        moved = os.stat(name, dir_fd=layout.retiring_fd, follow_symlinks=False)
+                    except OSError:
+                        moved = None
+                    if moved is None or _identity(moved) != ident:
+                        # Something else sat at the name when it moved: never delete it.
+                        with contextlib.suppress(OSError):
+                            os.unlink(name + ".journal", dir_fd=layout.retiring_fd)
+                        return "detach-substituted"
+                    return "detached:" + name
+    except attempt_reference.AttemptReferenceError:
+        return "late-evidence-unreadable"
 
 
 # --- carriers ------------------------------------------------------------
