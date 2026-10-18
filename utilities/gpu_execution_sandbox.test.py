@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -46,6 +47,14 @@ class GpuSandboxTest(unittest.TestCase):
         self.data = self.root / "approved-data"
         for path in (self.worktree, self.artifact, self.home, self.state, self.install, self.data):
             path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
+        subprocess.run(["git", "-C", str(self.worktree), "config", "user.email",
+                        "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.worktree), "config", "user.name",
+                        "Fixture"], check=True)
+        (self.worktree / "fixture.txt").write_text("known idle worktree\n")
+        subprocess.run(["git", "-C", str(self.worktree), "add", "fixture.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.worktree), "commit", "-qm", "fixture"], check=True)
         self.env = {"HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
                     "XDG_CONFIG_HOME": str(self.home / ".config"),
                     "XDG_STATE_HOME": str(self.root / "state")}

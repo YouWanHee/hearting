@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from worker_runtime_home import claude_worker_arguments
 import hashlib
 import json
@@ -73,6 +74,7 @@ from dispatch_supervisor_terminal import (
     classify_escaped_terminal_commit_error,
     reconcile_supervisor_terminal,
 )
+import commit_policy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -905,6 +907,101 @@ def classify_runtime_result(args, result, process_exit):
     return classify_session_result(result, process_exit, runtime=runtime)
 
 
+_PERMISSION_ADAPTERS = {}
+
+
+def _permission_adapter(name: str):
+    module = _PERMISSION_ADAPTERS.get(name)
+    if module is not None:
+        return module
+    path = ROOT / "adapters" / name / "bin" / "dispatch-headless.py"
+    spec = importlib.util.spec_from_file_location(f"{name}_runtime_permission_projection", path)
+    if spec is None or spec.loader is None:
+        raise SupervisorError("owner-runtime-permission-adapter-unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _PERMISSION_ADAPTERS[name] = module
+    return module
+
+
+def refresh_owner_runtime_permissions(args) -> None:
+    """Reproject this owner session's native permissions at every turn boundary."""
+    try:
+        context = commit_policy.read_runtime_permission_context()
+    except ValueError as exc:
+        raise SupervisorError(str(exc)) from exc
+    if context is None:
+        return
+    runtime = getattr(args, "runtime_harness", "claude")
+    if context.get("adapter") != runtime:
+        raise SupervisorError("owner-runtime-permission-context-adapter-mismatch")
+    if (context.get("attempt_id") != args.parent_attempt_id
+            or Path(str(context.get("worktree"))).resolve() != Path(args.worktree).resolve()):
+        raise SupervisorError("owner-runtime-permission-context-binding-mismatch")
+    if not commit_policy.runtime_permission_context_is_current(context):
+        raise SupervisorError("owner-runtime-permission-route-changed")
+    projection_args = argparse.Namespace(
+        worker_type=context["worker_type"],
+        dispatch_depth=context["dispatch_depth"],
+        capability=context["capability"],
+        worktree=context["worktree"],
+        route_file=context["route_file"],
+        route_id=context["route_id"],
+        route_hash=context["route_hash"],
+        artifact_root=context.get("artifact_root"),
+        artifact_output_dir=context.get("artifact_output_dir"),
+        owner_route_binding=None,
+    )
+    state = commit_policy.runtime_permission_projection(projection_args)
+    if runtime == "claude":
+        adapter = _permission_adapter("claude")
+        permission_args = argparse.Namespace(
+            **vars(projection_args),
+            permission_mode=context.get("permission_mode_requested") or "config",
+            agent_home=context.get("agent_home") or str(ROOT),
+        )
+        posture = adapter.resolve_permission_posture(permission_args)
+        args.permission_mode = posture["mode_flag"]
+        args.allowed_tool = list(posture["allowed_tools"])
+        return
+    if runtime == "opencode":
+        adapter = _permission_adapter("opencode")
+        required = ("opencode_config_base", "agent_home", "artifact_root", "selected_agent")
+        if any(key not in context for key in required):
+            raise SupervisorError("owner-runtime-permission-context-incomplete")
+        base_content = str(context["opencode_config_base"] or "")
+        previous = os.environ.get("OPENCODE_CONFIG_CONTENT")
+        os.environ["OPENCODE_CONFIG_CONTENT"] = base_content
+        try:
+            config = adapter.scoped_external_directory_config(
+                str(context["artifact_root"]), context.get("report_bundle_root"),
+                tuple(Path(value) for value in context.get("execution_access_roots", [])),
+                tuple(Path(value) for value in context.get("execution_access_read_roots", [])),
+                agent_home=Path(str(context["agent_home"])),
+                contract_read_roots=tuple(Path(value) for value in context.get("contract_read_roots", [])),
+                worktree=str(context["worktree"]),
+                selected_agent=str(context["selected_agent"]),
+                task_publish_scope=state["task_publish_scope"],
+                merge_observation_only=bool(state["observation_only"]),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise SupervisorError("owner-runtime-permission-projection-failed") from exc
+        finally:
+            if previous is None:
+                os.environ.pop("OPENCODE_CONFIG_CONTENT", None)
+            else:
+                os.environ["OPENCODE_CONFIG_CONTENT"] = previous
+        if not state["may_commit"]:
+            config = adapter.deny_commands(config, commit_policy.COMMIT_COMMANDS,
+                                           str(context["selected_agent"]))
+        if state["observation_only"]:
+            config = adapter.deny_commands(config, commit_policy.MERGE_MUTATION_COMMANDS,
+                                           str(context["selected_agent"]))
+        os.environ["OPENCODE_CONFIG_CONTENT"] = config
+        return
+    raise SupervisorError("owner-runtime-permission-runtime-unsupported")
+
+
 def run_turn(
     args: argparse.Namespace,
     session_id: str,
@@ -915,6 +1012,7 @@ def run_turn(
     handoff_intent: dict | None = None,
     owner_input: OwnerInput | None = None,
 ) -> tuple[dict[str, Any], int]:
+    refresh_owner_runtime_permissions(args)
     if getattr(args, "runtime_harness", "claude") == "opencode":
         from opencode_session_runtime import run_turn as native_turn, OpenCodeTransportError
         def native_event(value):

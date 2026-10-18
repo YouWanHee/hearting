@@ -65,6 +65,19 @@ def _id(value):
     return value
 
 
+def never_started(status, metadata):
+    """A terminal row whose launch fence proves no payload ever began.
+
+    Some standard owners retain the launcher/carrier PID after the payload was
+    refused. Keep that identity usable only when its existing exact teardown
+    receipt proves the process group and attempt descendants were cleaned up.
+    The launch and process guards still reobserve liveness before replacement.
+    """
+    return (status == 'done' and metadata.get('launch_outcome') == 'never-launched'
+            and metadata.get('launch_started') != '1'
+            and (not metadata.get('pid') or DC._settled_cleanup_receipt(metadata)))
+
+
 def _once(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _bytes(value)
@@ -325,6 +338,24 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
             result['source_result'] = 'EXITED'
         elif route_authority.owner_result_format_only_end(fields[1], meta):
             result['source_result'] = 'CONTRACT'
+    elif kind == 'unlaunched' and jobs is not None:
+        carried = _unstarted_replacement_claim(jobs, meta.get('attempt_id'))
+        carried_proof = (carried or {}).get('proof') or {}
+        if carried and (carried_proof.get('death_kind') == CORRECTED or carried_proof.get('parked_gate')):
+            source_lines = Path(jobs).read_text().splitlines() if lines is None else lines
+            validate_claim_source(jobs, source_lines, carried)
+        if carried and carried_proof.get('death_kind') == CORRECTED:
+            source_attempt = carried['original_attempt_id']
+            _correction_context(jobs, source_attempt, carried_proof)
+            result['carried_continuation'] = {
+                'attempt_id': source_attempt,
+                'family_id': carried['family_id'],
+                'claim_digest': _digest(carried),
+                'corrections': [
+                    {'id': item['id'], 'digest': item['digest']}
+                    for item in _retained_corrections(jobs, source_attempt)
+                ],
+            }
     return result
 
 
@@ -1140,31 +1171,77 @@ def _bind_source(jobs, lines, aid, record):
 
 
 def _reuse_snapshot(jobs, route, lines):
-    """Pin every current completion, including non-prefix successful siblings."""
+    """Pin settled current completions and identify only provenance-proved stale results."""
     module = DC._route_module()
     directory = module.completion_dir(route['route_id'], jobs=Path(jobs))
     completed = []
+    invalidated = {}
+    observations = {}
     for node in route.get('nodes', []):
         path = directory/(str(node['id'])+'.json')
         if not path.exists():
             continue
         marker = _read(path)
-        if not DC.completion_marker_is_current(route, node, path, marker, jobs=jobs):
+        currency = DC.gate_currency(route, node, path, marker, observe=True, jobs=jobs)
+        merge_unobservable = (currency.state == 'completion-evidence-unreadable'
+                              and currency.reason == 'review-source-index-unmerged')
+        if merge_unobservable:
+            import commit_policy
+            merge_unobservable = commit_policy.git_operation(route.get('cwd', '')) == 'merge'
+        if currency.state not in {'current', 'superseded'} and not merge_unobservable:
             raise DC.DispatchContractError('replacement-completion-unproven', str(node['id']))
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
             raise DC.DispatchContractError('replacement-completion-unsettled', str(node['id']))
-        # The replacement owner reuses this completion: a gates-off evidence edit is kept as history.
+        observations[str(node['id'])] = (node, path, marker, currency)
+        if currency.state == 'superseded' or merge_unobservable:
+            invalidated[str(node['id'])] = {
+                'node': node['id'], 'marker_digest': _digest(marker),
+                'attempt_id': marker.get('attempt_id', ''),
+                'currency': currency.state, 'currency_reason': currency.reason,
+                'depends_on_invalid': [],
+            }
+    # A settled marker downstream of a stale result remains historical too.
+    # Compute the dependency closure from the sealed route, preserving unrelated
+    # non-prefix siblings and their exact marker bytes.
+    changed = True
+    while changed:
+        changed = False
+        for node_id, (node, _path, marker, currency) in observations.items():
+            if node_id in invalidated:
+                continue
+            invalid_parents = sorted(set(str(parent) for parent in node.get('depends_on') or ())
+                                     .intersection(invalidated))
+            if invalid_parents:
+                invalidated[node_id] = {
+                    'node': node['id'], 'marker_digest': _digest(marker),
+                    'attempt_id': marker.get('attempt_id', ''),
+                    'currency': currency.state, 'currency_reason': currency.reason,
+                    'depends_on_invalid': invalid_parents,
+                }
+                changed = True
+    for node in route.get('nodes', []):
+        node_id = str(node.get('id', ''))
+        observation = observations.get(node_id)
+        if observation is None or node_id in invalidated:
+            continue
+        _node, path, marker, _currency = observation
+        # A gates-off evidence edit is recorded only when this completion is
+        # actually part of the successor's reusable evidence.
         DC.note_evidence_change(route, node, path, marker)
         completed.append({'node': node['id'], 'marker_digest': _digest(marker),
                           'attempt_id': marker.get('attempt_id', '')})
+    pending = [str(node.get('id')) for node in route.get('nodes', [])
+               if str(node.get('id')) not in {row['node'] for row in completed}]
     root = Path(route['artifact_root'])
     from artifact_producer import route_cycle_for, cycle_route_admission
     cycle = route_cycle_for(root, route)
     if not cycle or not cycle_route_admission(root, cycle, route).allow:
         raise DC.DispatchContractError('replacement-producer-not-open')
     return {'completed': completed, 'cycle_id': cycle['cycle_id'],
-            'producer_id': cycle.get('producer_id', ''), 'gates': _gate_snapshot(jobs, route)}
+            'producer_id': cycle.get('producer_id', ''), 'gates': _gate_snapshot(jobs, route),
+            'invalidated': [invalidated[key] for key in sorted(invalidated)],
+            'pending': pending}
 
 
 def _gate_snapshot(jobs, route):
@@ -1195,8 +1272,71 @@ def _gate_snapshot(jobs, route):
 def _reuse_preserved(previous, current):
     if any(previous.get(key) != current.get(key) for key in ('cycle_id','producer_id')):
         return False
-    now = {r['node']:r for r in current.get('completed',[])}
-    if any(now.get(r['node']) != r for r in previous.get('completed',[])):
+    previous_completed = {r['node']: r for r in previous.get('completed', [])}
+    now = {r['node']: r for r in current.get('completed', [])}
+    previous_invalidated = {row.get('node'): row for row in previous.get('invalidated', [])}
+    if len(previous_completed) != len(previous.get('completed', [])):
+        return False
+    if len(previous_invalidated) != len(previous.get('invalidated', [])):
+        return False
+
+    def reobserved_invalidation(row):
+        return ((row.get('currency') == 'completion-evidence-unreadable'
+                 and row.get('currency_reason') == 'review-source-index-unmerged')
+                or (bool(row.get('depends_on_invalid'))
+                    and all(parent in now for parent in row.get('depends_on_invalid') or ())))
+
+    for node, row in now.items():
+        if previous_completed.get(node) == row:
+            continue
+        old_invalid = previous_invalidated.get(node)
+        if old_invalid is None:
+            # A settled current node can finish after claim while the same
+            # successor is preparing to launch. _reuse_snapshot has already
+            # revalidated its exact marker, currency, and attempt readiness.
+            if node in previous_completed:
+                return False
+            continue
+        if (not old_invalid or old_invalid.get('marker_digest') != row.get('marker_digest')
+                or old_invalid.get('attempt_id', '') != row.get('attempt_id', '')
+                or not reobserved_invalidation(old_invalid)):
+            return False
+    invalidated = {row.get('node'): row for row in current.get('invalidated', [])}
+    if len(invalidated) != len(current.get('invalidated', [])):
+        return False
+    for node, old in previous_completed.items():
+        if now.get(node) == old:
+            continue
+        current_invalid = invalidated.get(node)
+        if (not current_invalid
+                or current_invalid.get('marker_digest') != old.get('marker_digest')
+                or current_invalid.get('attempt_id', '') != old.get('attempt_id', '')
+                or current_invalid.get('currency') not in {'current', 'superseded',
+                                                            'completion-evidence-unreadable'}
+                or (current_invalid.get('currency') == 'completion-evidence-unreadable'
+                    and current_invalid.get('currency_reason') != 'review-source-index-unmerged')):
+            return False
+    for node, old in previous_invalidated.items():
+        new = invalidated.get(node)
+        if new:
+            if (new.get('marker_digest') != old.get('marker_digest')
+                    or new.get('attempt_id', '') != old.get('attempt_id', '')
+                    or new.get('currency') not in {'current', 'superseded',
+                                                   'completion-evidence-unreadable'}
+                    or (new.get('currency') == 'completion-evidence-unreadable'
+                        and new.get('currency_reason') != 'review-source-index-unmerged')
+                    or not set(old.get('depends_on_invalid') or ()).issubset(
+                        set(new.get('depends_on_invalid') or ()))):
+                return False
+            continue
+        now_current = now.get(node)
+        if (not now_current
+                or now_current.get('marker_digest') != old.get('marker_digest')
+                or now_current.get('attempt_id', '') != old.get('attempt_id', '')
+                or not reobserved_invalidation(old)):
+            return False
+    if any(node not in previous_completed and node not in previous_invalidated
+           for node in invalidated):
         return False
     gates = {r['gate']:r for r in current.get('gates',[])}
     for old in previous.get('gates',[]):
@@ -1719,9 +1859,15 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
         if getattr(completed, 'received_signal', None) or getattr(completed, 'cleanup_incomplete', False):
-            return {'state':'needs-attention','reason':'replacement-launch-timeout' if getattr(completed, 'timed_out', False)
-                    else 'replacement-launch-interrupted', 'attempt_id':replacement,'record':record,
+            reason = ('replacement-launch-timeout' if getattr(completed, 'timed_out', False)
+                      else 'replacement-launch-interrupted' if getattr(completed, 'received_signal', None)
+                      else 'replacement-launch-output-incomplete')
+            return {'state':'needs-attention','reason':reason,
+                    'attempt_id':replacement,'record':record,
                     'cleanup_incomplete':bool(getattr(completed, 'cleanup_incomplete', False)),
+                    'launcher_returncode':getattr(completed, 'returncode', None),
+                    'launcher_stdout':getattr(completed, 'stdout', None),
+                    'launcher_stderr':getattr(completed, 'stderr', None),
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
@@ -1819,9 +1965,11 @@ def effective_attempts(jobs, attempts):
         if aid not in rows:
             continue
         current = aid
+        last_launched = aid
         seen = {aid}
         chain = [aid]
         first = None
+        root_edge = None
         while current in rows:
             _, source = rows[current]
             binding = source_binding(jobs, source)
@@ -1845,20 +1993,26 @@ def effective_attempts(jobs, attempts):
                     or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
                     or any(target.get(k) != source.get(k) for k in ('worker_type', 'dispatch_depth'))):
                 raise DC.DispatchContractError('replacement-lineage-unproven', replacement)
-            if target.get('launch_started') != '1':
-                break  # Registration and launch claim do not prove execution.
             if replacement in seen:
                 raise DC.DispatchContractError('replacement-lineage-cycle', replacement)
+            if root_edge is None:
+                root_edge = {'original_attempt_id': aid, 'replacement_attempt_id': replacement,
+                             'family_id': family, 'claim_digest': _digest(record)}
             seen.add(replacement)
             chain.append(replacement)
-            if first is None:
-                first = {'original_attempt_id': aid, 'replacement_attempt_id': replacement,
-                         'family_id': family, 'claim_digest': _digest(record)}
             current = replacement
+            if target.get('launch_started') == '1':
+                last_launched = replacement
+                if first is None:
+                    first = dict(root_edge)
+            elif not never_started(rows[replacement][0][1], target):
+                # Open, legacy, and unobservable reservations remain the current
+                # owner. Only an exact terminal never-launched row can be skipped.
+                break
         if first is not None:
             effective.discard(aid)
-            effective.add(current)
-            projected.append((chain, {**first, 'replacement_attempt_id': current}))
+            effective.add(last_launched)
+            projected.append((chain, {**first, 'replacement_attempt_id': last_launched}))
     covered = {attempt for chain, _edge in projected for attempt in chain[1:]}
     mapping = [edge for chain, edge in projected if chain[0] not in covered]
     return effective, mapping
@@ -1969,7 +2123,15 @@ def recovery_instructions(args):
     retry_context = ('\n\n## Partial-group retry brief\n' + brief + '\n') if brief else ''
     if not record or getattr(args, 'worker_type', '') != 'owner':
         return retry_context
-    completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
+    lines = jobs.read_text(encoding='utf-8', errors='replace').splitlines()
+    source = _rows(lines)[prior][1]
+    _route_path, route = _route(jobs, prior, source)
+    current_reuse = _reuse_snapshot(jobs, route, lines)
+    if not _reuse_preserved(record['reuse'], current_reuse):
+        raise DC.DispatchContractError('replacement-reuse-evidence-drift')
+    completed = ', '.join(str(row['node']) for row in current_reuse['completed']) or '(none)'
+    invalidated = ', '.join(str(row['node']) for row in current_reuse.get('invalidated', []))
+    pending = ', '.join(str(node) for node in current_reuse.get('pending', [])) or '(none)'
     kind = (record.get('proof') or {}).get('death_kind')
     fix = kind == CORRECTED and (record.get('proof') or {}).get('source_result') == 'FAIL'
     if fix:
@@ -1997,9 +2159,30 @@ def recovery_instructions(args):
     text = ('\n\n## Verified recovery context\n'
             + opening +
             f'Reuse the existing cycle {record["reuse"]["cycle_id"]} and completion evidence for: {completed}.\n'
+            + (f'Reopen these stages because their former result is historical: {invalidated}.\n'
+               if invalidated else '')
+            + f'Unfinished route stages: {pending}.\n'
             + rerun +
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
+    git_dir = ''
+    if route.get('cwd'):
+        try:
+            probe = subprocess.run(['git', '-C', str(route['cwd']), 'rev-parse', '--git-dir'],
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   check=False, timeout=5)
+            if probe.returncode == 0:
+                git_dir = probe.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            git_dir = ''
+    if git_dir:
+        git_path = Path(git_dir)
+        if not git_path.is_absolute():
+            git_path = Path(route['cwd']) / git_path
+        if (git_path / 'MERGE_HEAD').is_file():
+            text += ('A merge is in progress in the bound worktree. Observe it and retain responsibility '
+                     'for the existing route. Leave the merge, source files, and index untouched; do not '
+                     'start stages, commit, or publish until the merge is settled.\n')
     preserved = (record.get('proof') or {}).get('preserved_resources', [])
     if preserved:
         text += ('Registered payloads from the previous owner are preserved under their existing '
@@ -2020,11 +2203,21 @@ def recovery_instructions(args):
     carried_proof = (carried or {}).get('proof') or {}
     if not (carried_proof.get('parked_gate') or carried_proof.get('death_kind') == CORRECTED):
         carried = None
+    pinned_continuation = (record.get('proof') or {}).get('carried_continuation')
+    if pinned_continuation:
+        if (carried is None
+                or pinned_continuation.get('attempt_id') != carried.get('original_attempt_id')
+                or pinned_continuation.get('family_id') != carried.get('family_id')
+                or pinned_continuation.get('claim_digest') != _digest(carried)
+                or carried_proof.get('death_kind') != CORRECTED):
+            raise DC.DispatchContractError('replacement-lineage-unproven', prior)
+        _correction_context(jobs, carried['original_attempt_id'], carried_proof)
+        carried_proof = {**carried_proof, 'corrections': pinned_continuation.get('corrections') or []}
     if carried is not None:
         text += (f'{prior} was itself the continuation of {carried["original_attempt_id"]}; '
                  'what that continuation was given follows.\n')
     for claim, answered in ((record, prior), (carried, carried and carried['original_attempt_id'])):
-        proof = (claim or {}).get('proof') or {}
+        proof = carried_proof if claim is carried and pinned_continuation else (claim or {}).get('proof') or {}
         if proof.get('parked_gate'):
             text += _gate_context(jobs, claim)
         if proof.get('death_kind') == CORRECTED:
@@ -2057,15 +2250,26 @@ def _unstarted_replacement_claim(jobs, aid):
         rows = _rows(Path(jobs).read_text().splitlines())
     except (OSError, DC.DispatchContractError):
         return None
-    for _ in range(8):
-        meta = (rows.get(aid) or ((), {}))[1]
+    seen = set()
+    while aid not in seen:
+        seen.add(aid)
+        row = rows.get(aid)
+        if row is None:
+            return None
+        fields, meta = row
         family = meta.get('replacement_family_id', '')
-        if (not meta.get('replacement_original_attempt_id') or meta.get('pid')
-                or meta.get('launch_outcome') != 'never-launched' or meta.get('launch_claimed') != '0'
+        if (not meta.get('replacement_original_attempt_id')
+                or not never_started(fields[1], meta)
                 or not re.fullmatch(r'[0-9a-f]{64}', family)):
             return None
         claim = _check_record(_read(_record_path(jobs, family)), family)
-        if claim['replacement_attempt_id'] != aid:
+        original = rows.get(claim.get('original_attempt_id'))
+        if (claim['replacement_attempt_id'] != aid
+                or meta.get('automatic_retry_of') != claim.get('original_attempt_id')
+                or meta.get('replacement_claim_digest') != _digest(claim)
+                or original is None
+                or not route_authority.replacement_parent_matches(original[1], meta, jobs, lineage=True)
+                or any(meta.get(key) != original[1].get(key) for key in ('worker_type', 'dispatch_depth'))):
             return None
         if (claim.get('proof') or {}).get('death_kind') != 'unlaunched':
             return claim

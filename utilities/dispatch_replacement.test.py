@@ -559,7 +559,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(caught.exception.reason,'replacement-reuse-evidence-drift')
 
     def test_quick_owner_uses_explicit_route_without_owner_environment(self):
-        self.write({**self.meta,'worker_type':'owner','route_file':str(self.path)})
+        self.write({**self.meta,'worker_type':'owner','launch_started':'1','route_file':str(self.path)})
         record=self.claim();source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
         cmd=R._command(self.jobs,record,source,R.launch_input(self.jobs,'att-source',source))
         self.assertEqual(cmd[cmd.index('--route-file')+1],str(self.path))
@@ -584,7 +584,8 @@ class ReplacementTest(unittest.TestCase):
         self.assertFalse((R._directory(self.jobs)/'claims').exists())
 
     def _launch_env(self,worker_type,prepare):
-        self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
+        self.write({**self.meta,'worker_type':worker_type,'launch_started':'1','route_file':str(self.path)}
+                   if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
         seen={}
         def run(command,**kw):
             seen.update(kw['env']);return SimpleNamespace(returncode=0)
@@ -733,6 +734,28 @@ class ReplacementTest(unittest.TestCase):
             self.assertTrue(result['cleanup_incomplete'])
             replay=R.advance(self.jobs,'att-source')
             self.assertEqual((replay['state'],replay['attempt_id']),('running',aid))
+            self.assertEqual(forward.call_count,1)
+
+    def test_post_exit_output_cleanup_is_explicit_and_preserves_exact_streams(self):
+        import dispatch_lifecycle as L
+        record=self.claim()
+        command=['wrapper','--launch-lifecycle','foreground-scoped','--foreground-timeout','3600']
+        stdout='check=ok\nterminal_verdict=PASS\n'
+        stderr='fixture-stderr\n'
+        def incomplete(*_args,**_kwargs):
+            self._successor(record,self.meta,'open')
+            return L.ForwardedRun(0,stdout,stderr,cleanup_incomplete=True)
+        with mock.patch.object(R,'_command',return_value=command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch.object(L,'run_forwarding_termination',side_effect=incomplete) as forward:
+            result=R.advance(self.jobs,'att-source')
+            self.assertEqual(result['state'],'needs-attention')
+            self.assertEqual(result['reason'],'replacement-launch-output-incomplete',result)
+            self.assertTrue(result['cleanup_incomplete'])
+            self.assertEqual(result['launcher_stdout'],stdout)
+            self.assertEqual(result['launcher_stderr'],stderr)
+            replay=R.advance(self.jobs,'att-source')
+            self.assertEqual(replay['state'],'running')
             self.assertEqual(forward.call_count,1)
 
     def test_soft_gate_uses_sealed_profile_policy_and_preserves_unknown_all_gated(self):
@@ -1196,7 +1219,8 @@ class ReplacementTest(unittest.TestCase):
 
     def _parked_owner(self,*journal,raiser_type=None,**changes):
         self._parked_route(raiser_type)
-        self.owner={**self.meta,'worker_type':'owner','note':'dead-worker-blocked','failure_class':'blocked',**changes}
+        self.owner={**self.meta,'worker_type':'owner','launch_started':'1',
+                    'note':'dead-worker-blocked','failure_class':'blocked',**changes}
         self.write(self.owner,stamp=self.OWNER_STAMP)
         self._journal(*journal)
 
@@ -1293,7 +1317,8 @@ class ReplacementTest(unittest.TestCase):
         self._parked_route()
         if owner_executed:
             self.route['nodes'][1].update(kind='capability-owner',unit='_kernel/owner',dispatch_depth=1,terminal=True)
-        self.owner={**self.meta,'worker_type':'owner','note':'completed-supervisor','failure_class':'pass',
+        self.owner={**self.meta,'worker_type':'owner','launch_started':'1',
+                    'note':'completed-supervisor','failure_class':'pass',
                     'workflow_completion':'runtime-v1',**changes}
         self.write(self.owner,stamp=self.OWNER_STAMP)
         self._journal(*journal)
@@ -1355,7 +1380,7 @@ class ReplacementTest(unittest.TestCase):
 
     # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
     def _owner(self,**changes):
-        self.write({**self.meta,'worker_type':'owner',**changes})
+        self.write({**self.meta,'worker_type':'owner','launch_started':'1',**changes})
 
     def _capacity_owner(self):
         self._owner(note='dead-capacity',failure_class='capacity')
@@ -1390,7 +1415,8 @@ class ReplacementTest(unittest.TestCase):
         meta={**meta,**changes};self.write(meta,append=True);return meta
 
     def test_death_kind_names_why_a_row_may_be_replaced(self):
-        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner','note':note,**m})
+        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner',
+            'launch_started':'1','note':note,**m})
         self.assertEqual(R.death_kind(*row('dead-exact-pid')),'silent')
         self.assertEqual(R.death_kind(*row('dead-capacity',failure_class='capacity')),'capacity')
         self.assertEqual(R.death_kind(*row('dead-worker-fail',failure_class='capacity')),'capacity')
@@ -1406,7 +1432,8 @@ class ReplacementTest(unittest.TestCase):
         self.assertIsNone(R.death_kind(['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-runtime-error'}))
 
     def test_runtime_death_is_settled_by_its_own_error_envelope(self):
-        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime'}
+        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime',
+              'launch_started':'1'}
         fields=['now','done','',str(self.root)]
         def seen(state,failure_class):
             return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
@@ -1790,7 +1817,7 @@ class ReplacementTest(unittest.TestCase):
     # -- an owner its launcher closed before spawning: a pause the next `start` resumes ----------
     def _unlaunched_owner(self,**changes):
         self._owner(note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0',
-                    log_file=str(self.root/'never-written.log'),**changes)
+                    launch_started='0',log_file=str(self.root/'never-written.log'),**changes)
 
     def test_owner_closed_before_spawn_is_an_unlaunched_pause(self):
         self._unlaunched_owner()
@@ -1835,7 +1862,10 @@ class ReplacementTest(unittest.TestCase):
         base={**self.meta,'worker_type':'owner','note':'dead-producer-binding-failed',
               'launch_outcome':'never-launched','launch_claimed':'0'}
         self.assertEqual(R.death_kind(['now','done'],base),'unlaunched')
-        for changes in ({'launch_started':'1'},{'pid':'4242'},{'launch_claimed':'1'},
+        claimed_but_never_started={**base,'note':'dead-governor-reservation-transfer',
+                                   'launch_claimed':'1'}
+        self.assertEqual(R.death_kind(['now','done'],claimed_but_never_started),'unlaunched')
+        for changes in ({'launch_started':'1'},{'pid':'4242'},
                         {'worker_type':'stage','dispatch_depth':'2'},{'launch_outcome':''}):
             with self.subTest(changes=changes):
                 self.assertNotEqual(R.death_kind(['now','done'],{**base,**changes}),'unlaunched')
@@ -1849,10 +1879,51 @@ class ReplacementTest(unittest.TestCase):
         self.assertIn('never started',text)
         self.assertNotIn('You replace exact-dead attempt',text)
 
+    def test_owner_takeover_observes_merge_without_mutation_commit_or_publication(self):
+        import commit_policy
+        self.route.update(entry_scope_contract_version=1, entry_execution_scope="complete",
+                          work_request={"text": "Publish the PR and verify final CI."})
+        self.path.write_text(json.dumps(self.route), encoding="utf-8")
+        self._blocked_owner()
+        git = ["git", "-C", str(self.root)]
+        subprocess.run(["git", "-C", str(self.root), "init", "-q", "-b", "task"], check=True)
+        subprocess.run([*git, "config", "user.email", "fixture@example.test"], check=True)
+        subprocess.run([*git, "config", "user.name", "Fixture"], check=True)
+        source = self.root / "source.txt"
+        source.write_text("base\n", encoding="utf-8")
+        subprocess.run([*git, "add", "source.txt"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run([*git, "switch", "-c", "merge-source"], check=True, capture_output=True)
+        (self.root / "merge-source.txt").write_text("incoming\n", encoding="utf-8")
+        subprocess.run([*git, "add", "merge-source.txt"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "incoming"], check=True)
+        subprocess.run([*git, "switch", "task"], check=True, capture_output=True)
+        subprocess.run([*git, "merge", "--no-commit", "--no-ff", "merge-source"],
+                       check=True, capture_output=True)
+        git_dir = self.root / ".git"
+        before = {name: (git_dir / name).read_bytes() for name in ("MERGE_HEAD", "index")}
+        source_before = source.read_bytes()
+        self._answer()
+        result, _commands = self._launch()
+        record = result["record"]
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of="att-source",
+            worker_type="owner", jobs_path=self.jobs, attempt_id=record["replacement_attempt_id"]))
+        owner_args = SimpleNamespace(worker_type="owner", dispatch_depth=1, route_file=str(self.path),
+            route_id=self.route["route_id"], route_hash=self.route["route_hash"], worktree=str(self.root),
+            owner_route_binding=None)
+        self.assertIn("A merge is in progress", text)
+        self.assertIn("Leave the merge, source files, and index untouched", text)
+        self.assertEqual(commit_policy.git_operation(self.root), "merge")
+        self.assertFalse(commit_policy.may_commit(owner_args))
+        self.assertIsNone(commit_policy.task_publish_scope(owner_args))
+        self.assertEqual({name: (git_dir / name).read_bytes() for name in before}, before)
+        self.assertEqual(source.read_bytes(), source_before)
+
     def _blocked_owner(self):
         """An owner that ended BLOCKED with its input channel opened at launch, as its supervisor leaves it."""
         import dispatch_owner_input as I
-        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1',
+                'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
         self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
@@ -1995,7 +2066,8 @@ class ReplacementTest(unittest.TestCase):
         import dispatch_owner_input as I
         self.route.update(effective_intensity='standard',
                           nodes=[{'id': 'test', 'kind': 'pipeline-stage', 'worker_type': 'test'}])
-        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-fail', 'failure_class': 'fail'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1',
+                'note': 'dead-worker-fail', 'failure_class': 'fail'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
         self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
@@ -2597,7 +2669,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
         import dispatch_owner_input as I
-        meta = {**self.meta, 'worker_type': 'owner'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, 'att-source', 'claude-next-turn')
         self.assertFalse(I.submit(self.jobs, 'att-source', 'approved: go', 'early').get('retained'))
@@ -2772,6 +2844,132 @@ class ReplacementTest(unittest.TestCase):
                     R._check_tuple(changed,sealed)
                 self.assertEqual((caught.exception.reason,caught.exception.detail),
                                  ('replacement-input-tuple-mismatch','applied_permissions'))
+
+
+class ReplacementReuseCurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
+        self.completion = self.root / "completion" / "rt-reuse"
+        self.completion.mkdir(parents=True)
+        self.route = {
+            "route_id": "rt-reuse", "route_hash": "sha256:reuse",
+            "artifact_root": str(self.root), "cwd": str(self.root),
+            "human_gate_bindings": [],
+            "nodes": [
+                {"id": "plan", "depends_on": []},
+                {"id": "impl-review", "depends_on": ["plan"]},
+                {"id": "test", "completion_gate": "code-test", "depends_on": ["impl-review"]},
+                {"id": "report", "depends_on": ["test"]},
+                {"id": "independent-verify", "depends_on": ["plan"]},
+            ],
+        }
+        self.markers = {}
+        for node in self.route["nodes"]:
+            marker = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                      "node_id": node["id"], "attempt_id": f"att-{node['id']}",
+                      "sequence": 1, "verdict": "PASS"}
+            self.markers[node["id"]] = marker
+            (self.completion / f"{node['id']}.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    def snapshot(self, states, *, readiness="ready"):
+        module = SimpleNamespace(completion_dir=lambda route_id, jobs=None: self.completion)
+        currency = lambda _route, node, _path, _marker, **_kwargs: D.GateCurrency(
+            states[node["id"]][0], states[node["id"]][1])
+        import artifact_producer
+        with mock.patch.object(D, "_route_module", return_value=module), \
+                mock.patch.object(D, "gate_currency", side_effect=currency), \
+                mock.patch.object(D, "completion_attempt_readiness",
+                                  return_value=SimpleNamespace(state=readiness)), \
+                mock.patch.object(D, "note_evidence_change"), \
+                mock.patch.object(R, "_gate_snapshot", return_value=[]), \
+                mock.patch.object(artifact_producer, "route_cycle_for",
+                                  return_value={"cycle_id": "cyc-reuse", "producer_id": "prod-reuse"}), \
+                mock.patch.object(artifact_producer, "cycle_route_admission",
+                                  return_value=SimpleNamespace(allow=True)):
+            return R._reuse_snapshot(self.jobs, self.route, [])
+
+    def previous_snapshot(self):
+        return {
+            "cycle_id": "cyc-reuse", "producer_id": "prod-reuse", "gates": [],
+            "completed": [{"node": node, "marker_digest": R._digest(marker),
+                           "attempt_id": marker["attempt_id"]}
+                          for node, marker in self.markers.items()],
+        }
+
+    def test_only_typed_stale_results_and_their_descendants_reopen(self):
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("superseded", "completion-review-source-stale")
+        current = self.snapshot(states)
+        self.assertEqual({row["node"] for row in current["completed"]}, {"plan", "independent-verify"})
+        invalid = {row["node"]: row for row in current["invalidated"]}
+        self.assertEqual(set(invalid), {"impl-review", "test", "report"})
+        self.assertEqual(invalid["impl-review"]["currency"], "superseded")
+        self.assertEqual(invalid["test"]["depends_on_invalid"], ["impl-review"])
+        self.assertEqual(current["pending"], ["impl-review", "test", "report"])
+        self.assertTrue(R._reuse_preserved(self.previous_snapshot(), current))
+
+    def test_claim_to_launch_drift_shrinks_the_same_successors_reuse_projection(self):
+        settled = {node["id"]: ("current", "completion-marker-verified")
+                   for node in self.route["nodes"]}
+        claim_reuse = self.snapshot(settled)
+        later = dict(settled)
+        later["impl-review"] = ("superseded", "completion-review-source-stale")
+        launch_reuse = self.snapshot(later)
+        self.assertTrue(R._reuse_preserved(claim_reuse, launch_reuse))
+        self.assertEqual({row["node"] for row in launch_reuse["completed"]},
+                         {"plan", "independent-verify"})
+
+    def test_provenance_and_settlement_refusals_are_not_reclassified_as_stale(self):
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("integrity-broken:history-conflict", "completion-marker-history-conflict")
+        with self.assertRaises(D.DispatchContractError) as integrity:
+            self.snapshot(states)
+        self.assertEqual(integrity.exception.reason, "replacement-completion-unproven")
+        states["impl-review"] = ("superseded", "completion-review-source-stale")
+        with self.assertRaises(D.DispatchContractError) as unsettled:
+            self.snapshot(states, readiness="unsettled")
+        self.assertEqual(unsettled.exception.reason, "replacement-completion-unsettled")
+
+    def test_merge_index_snapshot_is_pending_only_while_merge_is_observed(self):
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "config", "user.email", "fixture@example.test"], check=True)
+        subprocess.run([*git, "config", "user.name", "Fixture"], check=True)
+        source = self.root / "engine.py"
+        source.write_text("value = 'base'\n", encoding="utf-8")
+        subprocess.run([*git, "add", "engine.py"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run([*git, "switch", "-c", "merge-source"], check=True, capture_output=True)
+        source.write_text("value = 'incoming'\n", encoding="utf-8")
+        subprocess.run([*git, "commit", "-qam", "incoming"], check=True)
+        subprocess.run([*git, "switch", "main"], check=True, capture_output=True)
+        source.write_text("value = 'current'\n", encoding="utf-8")
+        subprocess.run([*git, "commit", "-qam", "current"], check=True)
+        subprocess.run([*git, "merge", "--no-commit", "--no-ff", "merge-source"],
+                       check=False, capture_output=True)
+        self.assertTrue((self.root / ".git" / "MERGE_HEAD").is_file())
+        index_before = (self.root / ".git" / "index").read_bytes()
+        source_before = source.read_bytes()
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("completion-evidence-unreadable", "review-source-index-unmerged")
+        pending = self.snapshot(states)
+        self.assertEqual({row["node"] for row in pending["completed"]},
+                         {"plan", "independent-verify"})
+        self.assertIn("impl-review", {row["node"] for row in pending["invalidated"]})
+        self.assertEqual((self.root / ".git" / "index").read_bytes(), index_before)
+        self.assertEqual(source.read_bytes(), source_before)
+
+        (self.root / ".git" / "MERGE_HEAD").unlink()
+        with self.assertRaises(D.DispatchContractError) as refused:
+            self.snapshot(states)
+        self.assertEqual(refused.exception.reason, "replacement-completion-unproven")
 
 
 class FrameTopCapacityTest(unittest.TestCase):
