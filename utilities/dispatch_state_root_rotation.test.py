@@ -1815,6 +1815,61 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         self.assertTrue(n1.is_dir())
         self.assertTrue(n2.is_dir())
 
+    def test_changed_stable_reference_after_global_discovery_keeps_release(self):
+        n = self._make_release("v-late-reference", 1000.0)
+        self._make_release("v-late-reference-next", 2000.0)
+        n2 = self._make_release("v-late-reference-current", 3000.0)
+        self._seal_current(n2)
+        real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
+
+        def publish_reference(environ, extra_jobs_paths=(), legacy_registry_paths=None):
+            self._write_registry_row("open", "att-late-reference", f"launch_home={n}")
+            return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            DISTRIBUTION, "_dispatch_cleanup_boundary_paths",
+            side_effect=publish_reference,
+        ), contextlib.redirect_stderr(stderr):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(n.is_dir())
+        self.assertIn("open-attempt:att-late-reference", stderr.getvalue())
+
+    def test_new_route_after_global_discovery_is_refreshed_before_prune(self):
+        n = self._make_release("v-late-route", 1000.0)
+        self._make_release("v-late-route-next", 2000.0)
+        n2 = self._make_release("v-late-route-current", 3000.0)
+        self._seal_current(n2)
+        real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        discoveries = 0
+
+        def publish_route(environ, extra_jobs_paths=(), legacy_registry_paths=None):
+            self._write_registry_row(
+                "open", "att-late-route", f"artifact_root={self.artifact_root}"
+            )
+            self._write_route_record("rt-95e2db8fa2b8e5f5", n)
+            return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            DISTRIBUTION, "_dispatch_cleanup_boundary_paths",
+            side_effect=publish_route,
+        ), mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), contextlib.redirect_stderr(stderr):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(discoveries, 2, "new route input should trigger one bounded refresh")
+        self.assertTrue(n.is_dir())
+        self.assertIn("open-route:rt-95e2db8fa2b8e5f5", stderr.getvalue())
+
     def test_forced_prune_never_overrides_an_open_sealed_release(self):
         n = self._make_release("vN", 1000.0)
         self._make_release("vN+1", 2000.0)
@@ -2394,9 +2449,9 @@ with open(str(jobs) + '.lock', 'a+b') as lock:
         real_routes = DISTRIBUTION._open_route_launch_homes
         route_discoveries = 0
 
-        def discover_then_write(environ):
+        def discover_then_write(environ, **kwargs):
             nonlocal route_discoveries
-            result = real_routes(environ)
+            result = real_routes(environ, **kwargs)
             route_discoveries += 1
             if route_discoveries == 1:
                 subprocess.run(

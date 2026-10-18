@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +58,71 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         worker.join(timeout=2)
         self.assertFalse(worker.is_alive(), "competing admission did not resume after unlock")
         self.assertTrue(acquired.is_set())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork lock ownership is Linux/POSIX-specific")
+    def test_registry_lock_after_fork_waits_for_parent_and_releases_in_child(self) -> None:
+        jobs = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "fork-boundary" / "jobs.log"
+        read_fd, write_fd = os.pipe()
+        child = None
+        try:
+            with distribution._registry_lock(jobs):
+                child = os.fork()
+                if child == 0:
+                    os.close(read_fd)
+                    try:
+                        with distribution._registry_lock(jobs):
+                            os.write(write_fd, b"entered")
+                    finally:
+                        os._exit(0)
+                os.close(write_fd)
+                ready, _, _ = select.select([read_fd], [], [], 0.5)
+                self.assertFalse(ready, "fork child reused its parent's reentrant ownership")
+
+            ready, _, _ = select.select([read_fd], [], [], 3.0)
+            self.assertTrue(ready, "fork child did not enter after parent released the lock")
+            self.assertEqual(os.read(read_fd, 32), b"entered")
+            waited, status = os.waitpid(child, 0)
+            self.assertEqual(waited, child)
+            self.assertEqual(status, 0)
+            child = None
+        finally:
+            os.close(read_fd)
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child, 0)
+
+    def test_process_guard_excludes_only_the_exact_owned_lock_descriptor(self) -> None:
+        candidate = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "descriptor-release"
+        jobs = candidate / ".dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True)
+        with distribution._registry_lock(jobs):
+            self.assertEqual(distribution._release_held_by_live_process(candidate), (False, ""))
+            descriptor_open = threading.Event()
+            release_descriptor = threading.Event()
+
+            def open_independent_descriptor() -> None:
+                with open(f"{jobs}.lock", "a+b"):
+                    descriptor_open.set()
+                    release_descriptor.wait(timeout=2)
+
+            worker = threading.Thread(target=open_independent_descriptor)
+            worker.start()
+            try:
+                self.assertTrue(descriptor_open.wait(timeout=2))
+                held, reason = distribution._release_held_by_live_process(candidate)
+                self.assertTrue(held, "an unowned descriptor of the owned lock path was ignored")
+                self.assertTrue(reason.startswith("live-process:"), reason)
+            finally:
+                release_descriptor.set()
+                worker.join(timeout=3)
+            self.assertFalse(worker.is_alive(), "independent descriptor fixture did not close")
 
     # destructive-ok: reason=install a same-byte foreign successor for CAS verification; boundary=two exact symlink/file fixture leaves below HEARTING_FIXTURE_ROOT
     def test_rollback_preserves_exact_successors(self) -> None:
@@ -597,6 +664,65 @@ class ReleasePycachePruneTest(unittest.TestCase):
         self.assertTrue(newest.exists() and self._cache_for(newest).exists())
         self.assertTrue((sibling / "unrelated.pyc").is_file())
 
+    def test_cleanup_discovers_unchanged_global_routes_once_for_many_releases(self) -> None:
+        releases = [self._create_release(f"v-{index}", index) for index in range(5)]
+        calls = 0
+
+        def discover(_environ, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return [], ""
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution, "_open_route_launch_homes", side_effect=discover
+            ))
+            distribution._cleanup_releases(set())
+
+        self.assertEqual(calls, 1, "unchanged global route records were rediscovered per release")
+        self.assertEqual(sum(release.exists() for release in releases), 2)
+
+    def test_unrelated_admission_proceeds_during_delayed_global_discovery(self) -> None:
+        releases = [self._create_release(f"v-{index}", index) for index in range(3)]
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        unrelated_jobs.parent.mkdir()
+        discovery_started = threading.Event()
+        allow_discovery = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+
+        def delayed_discovery(_environ, **_kwargs):
+            discovery_started.set()
+            if not allow_discovery.wait(timeout=3):
+                raise TimeoutError("fixture did not release the bounded discovery")
+            return [], ""
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_open_route_launch_homes",
+                        side_effect=delayed_discovery,
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(discovery_started.wait(timeout=2))
+            with distribution._registry_lock(unrelated_jobs):
+                admitted.set()
+            self.assertTrue(admitted.is_set(), "global discovery blocked unrelated admission")
+        finally:
+            allow_discovery.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertEqual(worker_errors, [])
+
     def test_known_observation_collisions_prune_but_completion_conflict_retains(self) -> None:
         real_succeed_dispatch_state = distribution._succeed_dispatch_state
         observations = {
@@ -689,7 +815,7 @@ class ReleasePycachePruneTest(unittest.TestCase):
         cache.mkdir(parents=True)
         (cache / "old.pyc").write_bytes(b"orphan")
 
-        def prove_use(_release, _stable, route_snapshot):
+        def prove_use(_release, _stable, route_snapshot, _registry_snapshot=None):
             if route_snapshot[1]:
                 return True, route_snapshot[1]
             return True, "open-attempt:att-live"

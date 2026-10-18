@@ -484,22 +484,32 @@ heartbeat, and supervisor state continue to derive only from the accepted
 registry's parent.
 
 The final source-deletion boundary combines admission locks with fresh use
-evidence. While the installer transaction lock is held, pruning takes the
-stable `jobs.log.lock` and every extant managed release-local `jobs.log.lock`
-in deterministic, deduplicated order. It refreshes candidate-local and
-release-wide registry references, stable references, open route records,
-runtime activations, and the live-process scan inside that boundary; it then
-carries the final dispatch state, verifies the final source inventory/delta
-and registry containment, and removes the release before releasing those
-locks. The jobs locks stop new normal admissions on those stable and legacy
-paths. A writer admitted before the boundary is caught by its fresh registry
-or route record while admission is serialized, or by the process scan of its
-pinned environment, argv, cwd, executable, or open files. This includes a
-legacy `AGENT_DISPATCH_JOBS` path whose writer's `AGENT_HOME`/`launch_home`
-names a different release. Installer locking alone does not freeze arbitrary
-state files; the process and reference checks are part of the same deletion
-decision. Unreadable evidence, an unavailable lock, or any final mismatch
-keeps the release for a normal retry.
+evidence. While the installer transaction lock is held, one bounded global
+route/artifact discovery runs before admission locks are taken. Its in-memory
+index records the registry, route, outcome, binding, and directory inputs; at
+the boundary, unchanged records are reused and changed inputs trigger a
+bounded refresh. The updater then takes the stable `jobs.log.lock` and every
+extant managed release-local `jobs.log.lock` in deterministic, deduplicated
+order once for the cleanup pass. It reads the stable and release-wide
+registries once under those locks, checks route pins and runtime activations,
+and refreshes the live-process evidence for each candidate. It carries each
+candidate's final dispatch state, verifies its final source inventory/delta
+and registry containment, and removes it before releasing the admission
+locks. The global discovery does not hold these locks, so unrelated admission
+can proceed during route and artifact discovery.
+
+The jobs locks stop new normal admissions on those stable and legacy paths. A
+writer admitted before the boundary is caught by the changed registry or route
+index, or by the process scan of its pinned environment, argv, cwd, executable,
+or open files. This includes a legacy `AGENT_DISPATCH_JOBS` path whose
+writer's `AGENT_HOME`/`launch_home` names a different release. The process
+scan excludes only the exact descriptor owned by its current process and
+thread; forked children discard inherited ownership before acquiring a lock,
+and another descriptor for the same path remains evidence of use. Installer
+locking alone does not freeze arbitrary state files; the process and reference
+checks are part of the same deletion decision. Unreadable evidence, an
+unavailable lock, or any final mismatch keeps the affected release for a
+normal retry.
 
 Release pruning is evidence-bound. `harness update` retains every superseded
 release whose migration quiescence/final-delta proof is incomplete. The
