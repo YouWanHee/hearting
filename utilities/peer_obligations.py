@@ -1261,13 +1261,14 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         state_root = jobs_path.parent
     try:
         view = registry_view(jobs_path, append_only=registry_append_only)
+        view.require_complete_text()
     except FileNotFoundError:
         view = None
-    except OSError:
+    except (OSError, UnicodeError):
         return (), "unknown"
     if view is None:
         return (), "observed"
-    if view.malformed_rows or view.has_partial_tail:
+    if view.malformed_rows:
         return (), "unknown"
 
     if read_context is None:

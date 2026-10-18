@@ -585,6 +585,26 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual((ready.state, ready.reason),
                          ("unknown", "registered-bindings-unavailable"))
 
+    def test_invalid_utf8_binding_cannot_turn_missing_work_into_ready(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                raw = ("now\topen\trepo\t-\tchild\tattempt_id=att-child,"
+                       f"harness={harness},parent_harness={harness},parent_sid=sid").encode()
+                raw += b"\xff\n"
+                self.assertEqual(len(raw.rstrip(b"\n").split(b"\t")), 6)
+                self.jobs.write_bytes(raw)
+                work, state = obligations.bound_work_for_pane(
+                    "w1:p4", harness, "sid", jobs=self.jobs)
+                self.assertEqual((work, state), ((), "unknown"))
+                ready = obligations.pane_readiness(
+                    server="fixture-server", pane="w1:p4", harness=harness,
+                    session_id="sid", pid_birth="pid:9@start:4",
+                    identity_verified=True, native_turn="idle",
+                    bound_work=work, bindings_state=state)
+                self.assertEqual((ready.state, ready.reason),
+                                 ("unknown", "registered-bindings-unavailable"))
+                self.assertEqual(self.jobs.read_bytes(), raw)
+
     def test_foreground_tag_binds_executor_even_when_it_also_owns_children(self):
         from dispatch_contract import ObservedAttemptLiveness
         jobs = self.root / "jobs.log"
