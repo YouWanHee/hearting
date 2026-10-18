@@ -143,7 +143,7 @@ Follow the severity triage skeleton (`_shared/triage-output.md`). Unit-specific
 definitions:
 
 - Header: `## 📋 Code Review Results` — **Reviewed files** (changed files),
-  **Change summary** (1–2 sentences)
+  **Change summary** (1–2 sentences): describe the changed subject from its source description and distinguishing condition, then include the original identifier as a reference. Preserve document/revision context when it affects the meaning; leave unexplained keys unresolved.
 - Sections: 🔴 Must-fix issues / 🟡 Suggested improvements / 🟢 What is already solid
 - Item id: **file:line**
 - Item fields: Why it matters / Suggested fix

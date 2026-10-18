@@ -1484,7 +1484,19 @@ class ValidatorHardeningTest(unittest.TestCase):
         self.assertIn("replace the prior title without waiting for an explicit declaration", prompt)
         self.assertNotIn("repeat it verbatim", prompt)
         self.assertIn("NOW: one sentence", prompt)
+        flat_prompt = " ".join(prompt.split())
+        self.assertIn("preserve them before the original experiment or run identifier", flat_prompt)
+        self.assertIn("do not guess an unexplained identifier", flat_prompt)
+        self.assertIn("report failure, interruption, or unfinished status as observed", flat_prompt)
         self.assertEqual(rt.DEBOUNCE_SEC, 600)
+
+    def test_prompt_keeps_distinct_source_conditions_in_existing_data_blocks(self):
+        source = ("2-speaker fixed, multi-reference, no speaker dropout (E2 best48); "
+                  "0-3-speaker variable, reference-dropout fine-tuning (var03 FT LAST3)")
+        prompt = rt._prompt("The evaluation stopped before the second run", anchor=source)
+        self.assertIn("=== TASK CONTEXT (DATA; RECENT USER INTENT) ===\n" + source, prompt)
+        self.assertIn("=== CONVERSATION (DATA) ===\nThe evaluation stopped before the second run",
+                      prompt)
 
     def test_codex_origin_reads_recent_user_turn_from_bounded_tail(self):
         def row(role, text):
