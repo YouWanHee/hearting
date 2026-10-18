@@ -18,6 +18,11 @@ paused the same way: only the route's parent launches its continuation, so the
 parent's own carrier arms a record when it hands that notice over, and the
 record runs `start` at once.
 
+An identity refusal can also leave an exact resultless replacement for its
+parent. The carrier checks that existing lineage read-only and arms the same
+start path at once. Its record is keyed by the exact source edge, so consuming
+the same notice later does not create another run.
+
 A Claude usage-limit pause does not always last until its reset: another account
 may be signed in, or the quota may come back earlier. Every `RECHECK_SECONDS` of
 the wait asks the usage gate as a launch decision would (`usage_states(...,
@@ -51,6 +56,7 @@ LATER_SECONDS = 60
 RECHECK_SECONDS = 600
 LATER_REASONS = ("owner-launch-not-admitted", "owner-launch-not-started")
 ANSWER_REASON = "answer-awaiting-parent"
+NO_PROGRESS_REASON = "no-progress"
 CHAIN_ENV = "AGENT_CAPACITY_RESUME_CHAIN"
 
 
@@ -64,6 +70,14 @@ def _epoch(retry_at: str) -> float | None:
 def record_path(jobs: Path, route_id: str, retry_at: str) -> Path:
     key = hashlib.sha256(f"{route_id}\0{retry_at}".encode()).hexdigest()[:16]
     return Path(jobs).resolve().parent / "capacity-resume" / f"{route_id}-{key}.json"
+
+
+def replacement_record_path(jobs: Path, route_id: str, route_hash: str, source_attempt_id: str) -> Path:
+    """One stable resume record for an exact replacement edge, independent of arm time."""
+    payload = json.dumps([route_id, route_hash, source_attempt_id],
+                         ensure_ascii=False, separators=(",", ":")).encode()
+    obligation_key = hashlib.sha256(payload).hexdigest()
+    return record_path(jobs, route_id, "replacement:" + obligation_key)
 
 
 def _pause(result: dict, now) -> tuple[str | None, str] | None:
@@ -81,7 +95,26 @@ def _pause(result: dict, now) -> tuple[str | None, str] | None:
 def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen, now=time.time) -> dict | None:
     """Arm one automatic resume for a pause `_pause` names; `None` when it does not apply."""
     env = dict(os.environ if environ is None else environ)
-    pause = _pause(result, now)
+    reason = result.get("reason")
+    eligibility = None
+    if reason in {NO_PROGRESS_REASON, ANSWER_REASON} and result.get("source_attempt_id"):
+        try:
+            from dispatch_replacement import parent_resume_eligibility
+            eligibility = parent_resume_eligibility(
+                jobs, result["source_attempt_id"], route_id=result.get("route_id"), environ=env,
+                require_parent=True)
+        except (OSError, ValueError):
+            eligibility = None
+    if reason == NO_PROGRESS_REASON:
+        if eligibility is None:
+            return None
+        pause = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now())), "replacement")
+    elif reason == ANSWER_REASON and result.get("source_attempt_id"):
+        if eligibility is None:
+            return None
+        pause = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now())), "replacement")
+    else:
+        pause = _pause(result, now)
     if pause is None:
         return None
     retry_at, cause = pause
@@ -92,7 +125,12 @@ def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen,
         chain = MAX_CHAIN
     if epoch is None or chain >= MAX_CHAIN or epoch - now() > MAX_SLEEP_SECONDS:
         return None
-    path = record_path(Path(jobs), result.get("route_id") or "", retry_at)
+    if cause == "replacement":
+        path = replacement_record_path(Path(jobs), eligibility["route_id"],
+                                       eligibility["route_hash"], eligibility["source_attempt_id"])
+        route_file = eligibility["route_file"]
+    else:
+        path = record_path(Path(jobs), result.get("route_id") or "", retry_at)
     record = {"schema": "capacity-resume-v1", "route_id": result.get("route_id"),
               "route_file": str(Path(route_file).resolve()), "jobs": str(Path(jobs).resolve()),
               "retry_at": retry_at, "chain": chain + 1, "state": "armed", "cause": cause,
@@ -147,7 +185,7 @@ def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run, cle
     epoch = _epoch(record.get("retry_at"))
     if record.get("state") != "armed" or epoch is None:
         return 0
-    slack = 0 if record.get("cause") == "answer" else SLACK_SECONDS
+    slack = 0 if record.get("cause") in {"answer", "replacement"} else SLACK_SECONDS
     deadline = now() + min(MAX_SLEEP_SECONDS, max(0.0, epoch + slack - now()))
     recheck_at = now() + RECHECK_SECONDS
     early = False
@@ -205,11 +243,19 @@ def _notify(record: dict, receipt: dict) -> None:
         again = state == "waiting-capacity"
         failed = not again and (record.get("exit_code") not in (None, 0) or not receipt.get("state"))
         why = {"launch-not-started": "started again after a launch that did not start",
-               "answer": "continued with the answer another session sent"}.get(
-                   record.get("cause"), "resumed before its recorded reset because the usage gate cleared it"
+               "answer": "continued with the answer another session sent"}.get(record.get("cause"))
+        if record.get("cause") == "replacement":
+            why = ("the parent took over the remaining replacement work" if state in {"running", "completed"}
+                   else "the parent's replacement start paused again" if again
+                   else "the parent's replacement start needs attention" if state == "needs-attention"
+                   else "the parent could not start the remaining replacement work" if failed
+                   else "the parent's replacement start returned no settled result")
+        elif why is None:
+            why = ("resumed before its recorded reset because the usage gate cleared it"
                    if record.get("early") else "resumed after the usage limit reset")
         text = (f"route {record['route_id']} {why}: state {state}"
                 + (f", owner {receipt['owner_attempt_id']}" if receipt.get("owner_attempt_id") else "")
+                + (f", reason {receipt['reason']}" if state == "needs-attention" and receipt.get("reason") else "")
                 + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else "")
                 + (f"; start exited {record.get('exit_code')}, run it again: "
                    f"{resume_command(record['route_file'], record['jobs'], agent_home=ROOT)}" if failed else ""))
