@@ -223,7 +223,10 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
 
     def test_real_runner_20_second_operational_shape(self):
         registered_ids, _carrier, _attempt = self._seed_workload()
-        self.assertEqual(self.jobs.stat().st_size, 23_217_502)
+        # The active row carries this host's pid, start tick and namespace, so
+        # only the ~23 MB padding is fixed; the exact byte count varies by host.
+        self.assertGreaterEqual(self.jobs.stat().st_size, 23_017_000)
+        self.assertLess(self.jobs.stat().st_size, 23_300_000)
         self.assertEqual(len(list(peer_message._pending_dir().glob("*.json"))), 188)
         self.assertEqual(len(list(peer_message._transfer_path("0" * 32).parent.glob("*.json"))), 188)
         self.assertEqual(len(list(self.store.root.glob("*.json"))), 902)
