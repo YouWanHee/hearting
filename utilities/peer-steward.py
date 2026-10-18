@@ -863,9 +863,9 @@ def _seat_successor_path(pane):
     return peer_message.peer_state_root() / "seat-successors" / f"{digest}.json"
 
 
-def _seat_successor_lock(pane):
+def _seat_successor_lock(pane, *, wait=None):
     import session_tidy
-    return session_tidy.seat_lock("peer-successor-" + _seat_successor_path(pane).stem)
+    return session_tidy.seat_lock("peer-successor-" + _seat_successor_path(pane).stem, wait=wait)
 
 
 def _mark_seat_successor(pane, beside, kind, session_id):
@@ -887,7 +887,7 @@ def _mark_seat_successor(pane, beside, kind, session_id):
         pass
 
 
-def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None):
+def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None, wait=None):
     """After `retire` proved the predecessor exited: when this session runs in the pane started
     beside the predecessor, its routes become this session's, across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
@@ -896,7 +896,7 @@ def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=N
     if not pane:
         return None
     try:
-        with _seat_successor_lock(pane):
+        with _seat_successor_lock(pane, wait=wait):
             return _seat_handover_locked(ident, own_sid, own_harness, pane,
                                          requester=requester, accepted_at=accepted_at, recheck=recheck)
     except OSError:
@@ -1053,7 +1053,7 @@ def _retire_predecessor(duty):
     return {**identity, "session_id": sid}, (record, row.raw, binding)
 
 
-def _retire_handover(duty):
+def _retire_handover(duty, *, wait=None):
     """Consume only the accepted retirement's original succession, on any observer."""
     intent = duty.get("intent") or {}
     requester = intent.get("requester") or {}
@@ -1067,7 +1067,8 @@ def _retire_handover(duty):
     return _seat_handover(identity, requester.get("session_id"),
                           requester.get("harness"), requester=requester,
                           accepted_at=duty.get("accepted_at"),
-                          recheck=(lambda: _retire_predecessor(duty) == resolved) if evidence else None)
+                          recheck=(lambda: _retire_predecessor(duty) == resolved) if evidence else None,
+                          wait=wait)
 
 
 def _observed_start_agent(args, deadline=None, wait=False):
@@ -1897,7 +1898,10 @@ def _resume_retire_obligation(duty, store):
     phase = observation.get("phase", "waiting")
     if duty.get("state") == "complete":
         if duty.get("result") in {"normal-exit", "target-already-gone"}:
-            _retire_handover(duty)
+            # A busy successor belongs to its existing owner. Retain the
+            # completed retirement for the next pass without blocking other
+            # batch/watch duties behind that seat's lock.
+            _retire_handover(duty, wait=0)
             _request_watch_terminal(ident, "completed-retire")
         return
     if duty.get("state") == "cancelled":
@@ -5516,7 +5520,10 @@ def _external_obligation_snapshot():
         batches = dispatch_batch_obligations.pending_observer_snapshot()
     except Exception:
         batches = {"signature": (("batch-state-unavailable",),), "paths_by_jobs": {}}
+    jobs_stamps = {key: dispatch_batch_obligations._registry_stamp(Path(key))
+                   for key in batches.get("roots_by_jobs", {})}
     return {"watch_root": root, "watches": watches, "watch_stamp": watch_stamp,
+            "jobs_stamps": jobs_stamps,
             "watch_cacheable": watch_cacheable, "batches": batches}
 
 
@@ -5588,7 +5595,7 @@ def _reconcile_external_obligations(store, *, service_current=None, snapshot=Non
             except Exception:
                 pass
     try:
-        needs_batch = bool(service_current) or dispatch_batch_obligations.has_unowned_work()
+        needs_batch = snapshot is not None or bool(service_current) or dispatch_batch_obligations.has_unowned_work()
     except Exception:
         needs_batch = True
     if needs_batch:
@@ -5651,20 +5658,13 @@ def cmd_obligation_runner(args):
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
-            external_snapshot = _external_obligation_snapshot()
-            # This already-owned runner is the retry path for managed external
-            # duties too. It closes the activation/old-caller respawn window
-            # without creating a second monitor or changing any duty identity.
-            _reconcile_external_obligations(
-                store, service_current=service_current, snapshot=external_snapshot,
-                settlement_context=settlement_context)
-        else:
-            external_snapshot = None
+        external_snapshot = _external_obligation_snapshot()
+        _reconcile_external_obligations(
+            store, service_current=service_current, snapshot=external_snapshot,
+            settlement_context=settlement_context)
         current_duties = store.list()
-        external_signature = (_external_obligation_signature()
-                              if not service_current else
-                              _external_obligation_signature(external_snapshot))
-        if not _runner_duties(store, current_duties):
+        external_signature = _external_obligation_signature(external_snapshot)
+        if not _runner_duties(store, current_duties) and not any(external_signature):
             # A producer that saw our held lock may already have accepted work.
             # Release before the final read: later producers can start a runner,
             # and work accepted before release is either reclaimed here or owned
@@ -5673,17 +5673,21 @@ def cmd_obligation_runner(args):
             store.end_read_pass()
             latest_duties = store.list()
             latest_snapshot = external_snapshot
-            if (service_current and external_snapshot is not None
-                    and not _external_obligation_snapshot_unchanged(external_snapshot)):
+            if not _external_obligation_snapshot_unchanged(external_snapshot):
                 latest_snapshot = _external_obligation_snapshot()
-            latest_external = (_external_obligation_signature(latest_snapshot)
-                               if service_current else ((), ()))
-            if not _runner_duties(store, latest_duties) and not any(latest_external):
+            latest_external = _external_obligation_signature(latest_snapshot)
+            jobs_changed = any(dispatch_batch_obligations._registry_stamp(Path(key)) != stamp
+                               for key, stamp in external_snapshot.get("jobs_stamps", {}).items())
+            if (not _runner_duties(store, latest_duties) and not any(latest_external)
+                    and not jobs_changed):
                 return 0
             try:
                 fcntl.flock(args.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return 0
+            # A newly accepted owner row can owe work without a sidecar. Keep
+            # this runner for its next bounded pass. A settlement writer may
+            # also have changed jobs itself; that must not create a busy loop.
             if _runner_duties(store, latest_duties):
                 # The lock-free final read found newly accepted local work.
                 # Process that work immediately; no-progress and external-only
@@ -5701,35 +5705,11 @@ def cmd_obligation_runner(args):
 
 
 def cmd_ensure_obligations(_args):
-    """Reconnect existing recovery owners from one shared runner entry."""
-    store = peer_obligations.ObligationStore()
+    """Request the shared runner and return without repeating its global work."""
     try:
         lifecycle_root = getattr(_args, "lifecycle_root", None)
-        service_current = (peer_obligations.managed_service_binding(lifecycle_root)
-                           if lifecycle_root is not None else None)
-        # An already-running peer runner does not own watch/batch recovery.
-        # Check those families on this callback even while a peer duty is pending.
-        _reconcile_external_obligations(store, service_current=service_current)
-        if not _runner_duties(store):
-            if lifecycle_root is not None:
-                # Preserve the existing managed-current binding for later
-                # producers even while no recovery work needs a runner.
-                external_pending = (any(_external_obligation_signature())
-                                    if service_current else False)
-                peer_obligations.ensure_normal_runner(
-                    lifecycle_root=lifecycle_root,
-                    reconciliation_required=external_pending,
-                )
-            return 0
-        if lifecycle_root is None:
-            started = peer_obligations.ensure_runner(reconciliation_required=True)
-        else:
-            started = peer_obligations.ensure_normal_runner(
-                lifecycle_root=lifecycle_root, reconciliation_required=True)
-        # A legacy runner without the current reconciliation code, or a runtime
-        # without pidfd takeover support, leaves the established fallback here.
-        if not started:
-            _reconcile_obligations(store)
+        peer_obligations.ensure_normal_runner(
+            lifecycle_root=lifecycle_root, reconciliation_required=True)
     except Exception:
         pass
     return 0

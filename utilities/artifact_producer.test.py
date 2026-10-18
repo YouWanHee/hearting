@@ -4698,7 +4698,8 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                 finally:
                     fixture.doCleanups()
 
-    def _prepare_fixture(self, harness="claude", capability="autopilot-code"):
+    def _prepare_fixture(self, harness="claude", capability="autopilot-code", *,
+                         owner="att-transaction-owner", child="att-transaction-report"):
         import dispatch_terminal_commit as terminal
         self.activate()
         route=R.compile_route(capability,"update" if capability=="autopilot-spec" else "dev","standard",cwd=R.ROOT,artifact_root=self.root,
@@ -4710,7 +4711,7 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                 artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]},
                 unassigned=True)
         route_file=Path(L.admit_runtime_route(self.root,route).route_file)
-        jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
+        jobs=Path(self._tmp.name)/"jobs.log"
         owner_meta=dict(attempt_id=owner,worker_type="owner",unit="_kernel/owner",dispatch_depth="1",
             registered_worker="1",harness=harness,owner_route_file=str(route_file),
             owner_route_id=route["route_id"],owner_route_hash=route["route_hash"])
@@ -5958,6 +5959,26 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
 
 
 class HistoricalObservationCacheTest(ProducerTestBase):
+    def test_rejected_index_reuses_pure_manifest_projection_without_accepting_it(self):
+        self.activate()
+        route, route_file = self.route()
+        cycle = P.begin(self.root, route_file=route_file, capability=route["capability"],
+                        intensity=route["effective_intensity"])
+        self.write_output(cycle)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        index = adm.load_index(self.root)
+        index.cycles[cycle["cycle_id"]]["cycle_path"] += "-wrong"
+        adm._write_index(self.root, index)
+        P._HISTORICAL_OBSERVATIONS.clear()
+        P._HISTORICAL_PROJECTIONS.clear()
+        with mock.patch.object(P.artifact_index, "apply", wraps=P.artifact_index.apply) as apply:
+            for _ in range(2):
+                with self.assertRaisesRegex(P.ProducerError, "index-projection"):
+                    P.observe_finalized_cycle(self.root, cycle_id=cycle["cycle_id"],
+                        expected_binding={"route_id": route["route_id"], "route_hash": route["route_hash"]})
+            self.assertEqual(apply.call_count, 1)
+
     def test_historical_index_projection_is_cached_and_separate_from_writer_document(self):
         digest = "sha256:" + "a" * 64
 
@@ -5983,6 +6004,14 @@ class HistoricalObservationCacheTest(ProducerTestBase):
         first = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
         cached = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
         self.assertIs(first, cached)
+        # Another cycle query and route discovery share the same validated
+        # generation, even when their requested rows differ.
+        with mock.patch.object(P.artifact_index, "_parse_owned",
+                               side_effect=AssertionError("same index generation reparsed")):
+            other = P._artifact_index_observation(self.root, cycle_id="cyc_other")
+            routes = P._artifact_index_observation(self.root, route_ids=["rt-other"])
+        self.assertIs(other, first)
+        self.assertEqual(routes.matching_cycle_ids, ())
         self.assertEqual(first.manifest_row("cyc_fixture")["manifest_digest"], digest)
 
         writer = adm.load_index(self.root)

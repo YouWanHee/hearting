@@ -91,6 +91,7 @@ class _RegistrySegment:
     __slots__ = ("lines", "records", "malformed_rows", "completion_latest",
                  "completion_errors", "completion_all", "completion_children",
                  "completion_by_parent_sid",
+                 "completion_by_route_alias", "settlement_owners",
                  "handover_latest", "handover_by_parent", "handover_by_binding",
                  "headless_owner_rows")
 
@@ -102,6 +103,8 @@ class _RegistrySegment:
         completion_all = {}
         completion_children = {}
         completion_by_parent_sid = {}
+        completion_by_route_alias = {}
+        settlement_owners = []
         handover_latest = {}
         self.malformed_rows = 0
         for relative_order, line in enumerate(lines):
@@ -128,6 +131,13 @@ class _RegistrySegment:
             parent_sid = completion_meta.get("parent_sid")
             if parent_sid:
                 completion_by_parent_sid.setdefault(parent_sid, []).append(record)
+            for alias in {completion_meta.get(key) for key in
+                          ("route_id", "route_hash", "owner_route_id", "owner_route_hash")} - {None, ""}:
+                completion_by_route_alias.setdefault(alias, []).append(record)
+            if (completion_meta.get("worker_type") == "owner"
+                    and completion_meta.get("launch_started") == "1"
+                    and completion_meta.get("supervisor_lease") == "flock-v1"):
+                settlement_owners.append(record)
             handover_meta = dict(handover_items)
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
@@ -140,6 +150,10 @@ class _RegistrySegment:
         self.completion_by_parent_sid = {
             key: tuple(value) for key, value in completion_by_parent_sid.items()
         }
+        self.completion_by_route_alias = {
+            key: tuple(value) for key, value in completion_by_route_alias.items()
+        }
+        self.settlement_owners = tuple(settlement_owners)
         self.handover_latest = handover_latest
         self._index_handover()
 
@@ -177,6 +191,7 @@ class _RegistrySegment:
         completion_all = {}
         completion_children = {}
         completion_by_parent_sid = {}
+        completion_by_route_alias = {}
         result.handover_latest = {}
         for segment in segments:
             result.completion_latest.update(segment.completion_latest)
@@ -184,6 +199,7 @@ class _RegistrySegment:
                 result.completion_errors.setdefault(attempt, error)
             for target, source in ((completion_all, segment.completion_all),
                                    (completion_children, segment.completion_children),
+                                   (completion_by_route_alias, segment.completion_by_route_alias),
                                    (completion_by_parent_sid, segment.completion_by_parent_sid)):
                 for key, rows in source.items():
                     target.setdefault(key, []).extend(rows)
@@ -193,6 +209,11 @@ class _RegistrySegment:
         result.completion_by_parent_sid = {
             key: tuple(value) for key, value in completion_by_parent_sid.items()
         }
+        result.completion_by_route_alias = {
+            key: tuple(value) for key, value in completion_by_route_alias.items()
+        }
+        result.settlement_owners = tuple(record for segment in segments
+                                        for record in segment.settlement_owners)
         result._index_handover()
         return result
 
@@ -295,6 +316,21 @@ class RegistryView:
     def completion_children(self, parent_attempt_id: str) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments
                      for record in segment.completion_children.get(parent_attempt_id, ()))
+
+    def completion_related(self, parent_attempt_id: str, route_id: str, route_hash: str):
+        """Candidates only: preserve malformed/conflicting aliases for validation."""
+        selected = {}
+        for segment in self._segments:
+            for record in segment.completion_children.get(parent_attempt_id, ()):
+                selected[record.order] = record
+            for alias in (route_id, route_hash):
+                if alias:
+                    for record in segment.completion_by_route_alias.get(alias, ()):
+                        selected[record.order] = record
+        return tuple(selected[key] for key in sorted(selected))
+
+    def settlement_owner_candidates(self):
+        return tuple(record for segment in self._segments for record in segment.settlement_owners)
 
     def completion_parent_records(self, parent_sid: str) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments

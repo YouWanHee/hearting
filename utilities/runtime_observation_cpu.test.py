@@ -11,15 +11,20 @@ import json
 import os
 from pathlib import Path
 import pstats
+import resource
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import tarfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest import mock
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +39,19 @@ RUNNER_COUNT = 1
 IDLE_SECONDS = 3 if DIAGNOSTIC_PROFILE else 20
 BURST_SECONDS = 3 if DIAGNOSTIC_PROFILE else 20
 COLD_SECONDS = 5 if DIAGNOSTIC_PROFILE else 10
+
+_RUNNER_DIAGNOSTICS = r'''
+import faulthandler, os, pathlib, signal, sys, traceback
+if "peer-steward.py" in sys.argv[0] and "__obligation-runner" in sys.argv:
+    directory = pathlib.Path(os.environ["FIXTURE_RUNNER_DIAGNOSTICS"])
+    diagnostic_stream = (directory / (str(os.getpid()) + ".log")).open("a", buffering=1)
+    faulthandler.enable(file=diagnostic_stream)
+    faulthandler.register(signal.SIGUSR1, file=diagnostic_stream, all_threads=True)
+    def diagnostic_exception(kind, error, tb):
+        traceback.print_exception(kind, error, tb, file=diagnostic_stream)
+    sys.excepthook = diagnostic_exception
+    (directory / (str(os.getpid()) + ".ready")).write_text("ready")
+'''
 
 
 _FAKE_HERDR = r'''#!/usr/bin/env python3
@@ -162,6 +180,49 @@ class FakeObservationEndpoint:
         self.thread.join(timeout=1)
 
 
+class FakeControlEndpoint:
+    """A live busy recipient: real observer normalization, no delivered turn."""
+    def __init__(self, path: Path):
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(path))
+        self.listener.listen(32)
+        self.listener.settimeout(.1)
+        self.stop = threading.Event()
+        self.deliveries = set()
+        self.requests = 0
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with connection:
+                try:
+                    connection.settimeout(2)
+                    request = FakeObservationEndpoint._read_line(connection)
+                    self.requests += 1
+                    if request.get("op") == "status":
+                        response = {"schema_version": 1, "status": "ready", "capabilities": {
+                            "human_gate_delivery": {"version": 1, "thread_id": "fixture-parent", "epoch": 1}}}
+                    else:
+                        self.deliveries.update(child["attempt_id"]
+                            for child in (request.get("receipt") or {}).get("children", []))
+                        response = {"schema_version": 1, "status": "retryable", "reason": "fixture-recipient-busy"}
+                    FakeObservationEndpoint._send(connection, response)
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
+
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+        self.thread.join(timeout=2)
+
+
 def _import_from(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -181,6 +242,7 @@ def _proc_stat(pid: int):
         return {
             "pid": pid, "ppid": int(tail[1]), "pgrp": int(tail[2]),
             "utime": int(tail[11]), "stime": int(tail[12]),
+            "cutime": int(tail[13]), "cstime": int(tail[14]),
             "start": tail[19], "rss_pages": int(tail[21]),
         }
     except (OSError, ValueError, IndexError):
@@ -229,6 +291,13 @@ def _sample_window(seconds: float, seed_pids: set[int], seed_provider=None):
     sampler_start = _proc_stat(os.getpid())
     refresh_roots_at = start
     previous = _process_tree_snapshot(seed_pids)
+    hz = os.sysconf("SC_CLK_TCK")
+    def inclusive_cpu(snapshot):
+        reaped = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return (reaped.ru_utime + reaped.ru_stime) * hz + sum(
+            item["utime"] + item["stime"] + item["cutime"] + item["cstime"]
+            for item in snapshot.values())
+    inclusive_before = inclusive_cpu(previous)
     ticks = 0
     read_chars = 0
     max_rss = 0
@@ -256,7 +325,7 @@ def _sample_window(seconds: float, seed_pids: set[int], seed_provider=None):
         previous = current
     elapsed = time.monotonic() - start
     end_epoch = time.time()
-    hz = os.sysconf("SC_CLK_TCK")
+    inclusive_ticks = max(0, inclusive_cpu(previous) - inclusive_before)
     sampler_end = _proc_stat(os.getpid())
     sampler_ticks = 0
     if sampler_start is not None and sampler_end is not None:
@@ -264,8 +333,10 @@ def _sample_window(seconds: float, seed_pids: set[int], seed_provider=None):
                             - sampler_start["utime"] - sampler_start["stime"])
     return {
         "elapsed_seconds": elapsed, "start_epoch": start_epoch,
-        "end_epoch": end_epoch, "cpu_ticks": ticks,
-        "cpu_percent_one_core": 100.0 * ticks / (hz * elapsed),
+        "end_epoch": end_epoch, "cpu_ticks": inclusive_ticks,
+        "sampled_own_cpu_ticks": ticks,
+        "cpu_accounting": "live own+waited-child ticks plus driver RUSAGE_CHILDREN; no retained dead-PID double count",
+        "cpu_percent_one_core": 100.0 * inclusive_ticks / (hz * elapsed),
         "sampler_cpu_ticks": sampler_ticks,
         "sampler_cpu_percent_one_core": 100.0 * sampler_ticks / (hz * elapsed),
         "rchar_bytes": read_chars, "max_sampled_rss_bytes": max_rss,
@@ -494,6 +565,247 @@ def _valid_sealed_project(project_root: Path, temp_root: Path, modules: dict):
     }
 
 
+def _settled_owner_projects(base: Path, jobs: Path, modules: dict, *, count=16,
+                            large_first=True):
+    """Actual sealed owner transactions, not done labels on unrelated stage rows."""
+    producer_fixture = modules["producer_fixture"]
+    producer = modules["producer"]
+    admission = modules["admission"]
+    index_module = modules["artifact_index"]
+    contract = __import__("dispatch_contract")
+    terminal = __import__("dispatch_terminal_commit")
+    join = __import__("dispatch_completion_join")
+    projects, registry_rows = [], []
+    for number in range(count):
+        directory = base / f"settled-owner-{number:02d}"
+        directory.mkdir(parents=True)
+        fixture = producer_fixture.TerminalTransactionIntegrationTest()
+        fixture.root = directory / ".agent_reports"
+        fixture.root.mkdir()
+        fixture._tmp = SimpleNamespace(name=str(directory))
+        harness = ("claude", "codex", "opencode")[number % 3]
+        owner = f"att-settled-history-owner-{number:02d}"
+        child = f"att-settled-history-child-{number:02d}"
+        route, route_file, local_jobs, _, cycle, report, request = fixture._prepare_fixture(
+            harness, "autopilot-code", owner=owner, child=child)
+        if number == 0 and large_first:
+            payload_dir = Path(cycle["cycle_dir"]) / "artifacts" / "history-payloads"
+            payload_dir.mkdir(parents=True)
+            for index in range(3200):
+                (payload_dir / f"payload-{index:05d}.txt").write_bytes(b"sealed historical payload\n")
+        text = f"artifact: {report}\nverdict: PASS\nblocker: none"
+        native = {
+            "claude": [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
+            "codex": [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+                      {"type": "turn.completed"}],
+            "opencode": [{"type": "text", "sessionID": "ses_fixture", "part": {"type": "text", "text": text}},
+                         {"type": "step_finish", "sessionID": "ses_fixture",
+                          "part": {"type": "step-finish", "reason": "stop"}}],
+        }[harness]
+        log = directory / "owner.jsonl"
+        log.write_text("\n".join(json.dumps(item) for item in native) + "\n")
+        local_jobs.write_text(local_jobs.read_text().replace("worker_type=owner",
+            f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+        fixture._closed_owner(local_jobs, owner)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(local_jobs),
+                                          "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            meta = join.exact_attempt_row(local_jobs, owner).metadata
+            settled = terminal.settle_owner_completion(local_jobs, "done", meta)
+            if settled.result != "completed":
+                raise AssertionError(f"history owner did not settle: {settled}")
+            record = producer.read_cycle_record(fixture.root, cycle["cycle_id"])
+            manifest_path = producer._record_cycle_manifest_path(fixture.root, record)
+            if number == 0 and large_first:
+                index_doc = index_module.to_payload(admission.load_index(fixture.root))
+                stable_row = {"kind": "artifact", "cycle_id": cycle["cycle_id"],
+                              "manifest_id": index_doc["manifests"][cycle["cycle_id"]]["manifest_id"]}
+                for index in range(560_000):
+                    index_doc["stable_ids"].setdefault(f"artifact_{index:032x}", stable_row)
+                admission._index_path(fixture.root).write_text(
+                    json.dumps(index_doc, sort_keys=True, separators=(",", ":")) + "\n")
+                del index_doc
+        old_completion = producer_fixture.R.completion_dir(route["route_id"], jobs=local_jobs)
+        new_completion = producer_fixture.R.completion_dir(route["route_id"], jobs=jobs)
+        shutil.copytree(old_completion, new_completion, dirs_exist_ok=True)
+        producer_fixture.R._rewrite_migrated_attempt_links(new_completion, old_completion, new_completion)
+        claim = contract.terminal_claim_path(local_jobs, route["route_id"], owner)
+        destination = contract.terminal_claim_path(jobs, route["route_id"], owner)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(claim, destination)
+        for line in local_jobs.read_text().splitlines():
+            line = line.replace(str(old_completion), str(new_completion))
+            fields = line.split("\t")
+            meta = contract.parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") == owner:
+                fields[5] += (",launch_claimed=1,launch_started=1,supervisor_lease=flock-v1,supervisor_lease_file="
+                              + str(contract.supervisor_lease_path(jobs, owner)))
+            registry_rows.append("\t".join(fields) + "\n")
+        projects.append({"root": str(fixture.root), "owner_attempt_id": owner,
+                         "harness": harness, "cycle_id": cycle["cycle_id"],
+                         "manifest_path": str(manifest_path), "manifest_bytes": manifest_path.stat().st_size,
+                         "index_bytes": admission._index_path(fixture.root).stat().st_size})
+    with jobs.open("a") as out:
+        out.writelines(registry_rows)
+    # Verify the transplanted canonical registry/claim/marker graph through
+    # the actual public historical judgment before using it as workload.
+    for project in projects:
+        meta = join.exact_attempt_row(jobs, project["owner_attempt_id"]).metadata
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
+            state = terminal.owner_completion_state(jobs, "done", meta)
+        if state.state != "complete":
+            raise AssertionError(f"history fixture is not authoritative: {project['owner_attempt_id']} {state}")
+    return projects
+
+
+_FOREGROUND_WAITER = r'''
+import dataclasses, json, os, pathlib, subprocess, sys
+import dispatch_contract as D
+from dispatch_lifecycle import wait_foreground
+jobs, attempt, ready, result, child_script = sys.argv[1:]
+binding = D.resolve_live_parent_attempt(pathlib.Path(jobs), parent_slug=attempt,
+    repo=os.environ["AGENT_HOME"], worktree=os.environ["AGENT_HOME"], expected_attempt_id=attempt)
+child = subprocess.Popen([sys.executable, child_script], start_new_session=True)
+pathlib.Path(ready).write_text(json.dumps({"child_pid": child.pid, "parent_attempt": attempt}))
+outcome = wait_foreground(child, 300, parent_is_live=lambda: D.parent_attempt_binding_is_live(jobs, binding))
+pathlib.Path(result).write_text(json.dumps(dataclasses.asdict(outcome)))
+'''
+
+
+_REGISTRATION_PROBE = r'''
+import json, os, pathlib, signal, sys, time
+import dispatch_contract as D
+jobs, parent, historical_owner = sys.argv[1:]
+jobs = pathlib.Path(jobs)
+binding = D.resolve_live_parent_attempt(jobs, parent_slug=parent,
+    repo=os.environ["AGENT_HOME"], worktree=os.environ["AGENT_HOME"], expected_attempt_id=parent)
+real_flock = D.fcntl.flock
+calls = []
+def flock(fd, operation):
+    path = os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))
+    if path == str(jobs) + ".lock" and operation & D.fcntl.LOCK_EX:
+        held_other_fds = []
+        if not D._terminal_claim_lock_owned(fd, jobs):
+            for name in os.listdir("/proc/self/fd"):
+                if name.isdigit() and int(name) != fd and D._terminal_claim_lock_owned(int(name), jobs):
+                    held_other_fds.append(int(name))
+        call = {"fd": fd, "requested": time.monotonic(), "acquired": None,
+                "held_other_fds": held_other_fds}
+        calls.append(call)
+        value = real_flock(fd, operation)
+        call["acquired"] = time.monotonic()
+        return value
+    return real_flock(fd, operation)
+D.fcntl.flock = flock
+def expired(*_):
+    raise TimeoutError("registration-lock-deadline")
+signal.signal(signal.SIGALRM, expired)
+def preclaim(lines):
+    if not D.parent_attempt_binding_is_live(jobs, binding):
+        raise AssertionError("exact parent lost while registering")
+    # Both public observations must be safe inside a normal registration's
+    # existing critical section, including a closed historical owner.
+    D.probe_owner_supervision(jobs, historical_owner)
+aid = "att-fixture-registration-probe"
+row = ("now\topen\t" + os.environ["AGENT_HOME"] + "\t" + os.environ["AGENT_HOME"]
+       + "\tregistration-probe\tattempt_schema_version=2,dispatch_depth=2,transport=headless,"
+       "execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,"
+       "attempt_id=" + aid)
+start = time.monotonic()
+signal.alarm(4)
+try:
+    registered = D.claim_attempt_row(jobs, aid, row, preclaim=preclaim)
+    result = {"registered": registered, "state": "returned"}
+except TimeoutError:
+    result = {"registered": False, "state": "lock-timeout"}
+finally:
+    signal.alarm(0)
+end = time.monotonic()
+for call in calls:
+    call["acquire_wait_seconds"] = None if call["acquired"] is None else call["acquired"] - call["requested"]
+    call["hold_seconds_upper_bound"] = None if call["acquired"] is None else end - call["acquired"]
+result.update(elapsed_seconds=end-start, jobs_lock_requests=calls,
+              nested_lock_request=any(call["held_other_fds"] for call in calls))
+print(json.dumps(result), flush=True)
+'''
+
+
+def _start_foreground_waiters(root: Path, jobs: Path, source: Path, contract):
+    waiter = root / "foreground-waiter.py"
+    child = root / "foreground-child.py"
+    waiter.write_text(_FOREGROUND_WAITER)
+    child.write_text("import time; time.sleep(600)\n")
+    running = []
+    for index in range(4):
+        parent = subprocess.Popen([sys.executable, str(child)], start_new_session=True,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        attempt = f"att-foreground-parent-{index}"
+        identity = contract.process_launch_identity(parent.pid)
+        row = (f"now\topen\t{source}\t{source}\t{attempt}\t"
+               "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+               "execution_surface=registered-headless,registered_worker=1,"
+               "fallback_hop=same-harness-headless,worker_type=owner,"
+               f"attempt_id={attempt},harness=codex,"
+               + ",".join(f"{key}={value}" for key, value in identity.items()) + "\n")
+        with jobs.open("a") as out:
+            out.write(row)
+        ready, result = root / f"foreground-{index}.ready.json", root / f"foreground-{index}.result.json"
+        log = (root / f"foreground-{index}.log").open("w")
+        try:
+            process = subprocess.Popen([sys.executable, str(waiter), str(jobs), attempt,
+                str(ready), str(result), str(child)], stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        finally:
+            log.close()
+        running.append((process, parent, ready, result, attempt))
+    return running
+
+
+def _hook_delivery_roundtrip(source: Path, jobs: Path):
+    pending = __import__("dispatch_pending_delivery")
+    session = "fixture-hook-recipient"
+    aid = "att-fixture-hook-notice"
+    delivery_id = "delivery-" + "d" * 32
+    receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": "att-fixture-hook-parent",
+               "job_registry": str(jobs), "delivery_classification": "attention",
+               "children": [{"attempt_id": aid, "status": "done", "readiness": "ready",
+                             "reason": "terminal-failure-or-unclosed", "required_action": "inspect-done-failure",
+                             "delivery_classification": "attention"}]}
+    pending.create(root=jobs.parent, recipient_kind="claude-parent-runtime", recipient_key=session,
+        delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+        attempt_ids=[aid], parent_attempt_id="att-fixture-hook-parent", route_id="rt-fixture-notice",
+        route_node="execute", receipt=receipt, receipt_digest=pending._canonical_receipt_digest(receipt),
+        row_revisions={aid: "fixture-record-revision"})
+    environment = {**os.environ, "AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_DEPTH": "2"}
+    rounds = []
+    for _ in range(2):
+        started = time.monotonic()
+        try:
+            run = subprocess.run([sys.executable, str(source / "hooks/dispatch-session-sweep.py")],
+                input=json.dumps({"session_id": session, "hook_event_name": "UserPromptSubmit"}),
+                capture_output=True, text=True, env=environment, timeout=10)
+            rounds.append({"elapsed_seconds": time.monotonic()-started, "returncode": run.returncode,
+                           "notice_emitted": delivery_id in run.stdout, "timed_out": False,
+                           "stderr_tail": run.stderr[-500:]})
+        except subprocess.TimeoutExpired:
+            rounds.append({"elapsed_seconds": time.monotonic()-started, "returncode": None,
+                           "notice_emitted": False, "timed_out": True})
+    record = pending.read(jobs.parent, session, delivery_id)
+    return {"rounds": rounds, "state": record["state"], "claim_attempts": record["attempts"],
+            "worker_carrier_without_projection": True, "delivery_id": delivery_id}
+
+
+def _ensure_callback(source: Path):
+    start = time.monotonic()
+    try:
+        run = subprocess.run([sys.executable, str(source / "utilities/peer-steward.py"),
+            "__ensure-obligations", "--lifecycle-root", str(source)], timeout=10,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"elapsed_seconds": time.monotonic()-start, "returncode": run.returncode, "timed_out": False}
+    except subprocess.TimeoutExpired:
+        return {"elapsed_seconds": time.monotonic()-start, "returncode": None, "timed_out": True}
+
+
 def _row_text(index: int, jobs_path: Path, project_root: Path,
               worker_identities: list[dict[str, str]]):
     if index < OBSERVER_COUNT:
@@ -572,8 +884,49 @@ def _active_observer_processes(jobs_path: Path):
     return active
 
 
+def _active_runner_processes(state_root: Path, source: Path):
+    active = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            argv = Path(f"/proc/{name}/cmdline").read_bytes().decode(errors="replace").split("\0")
+            if (len(argv) < 3 or "__obligation-runner" not in argv or "--state-root" not in argv
+                    or Path(argv[1]).resolve() != source / "utilities/peer-steward.py"
+                    or Path(argv[argv.index("--state-root")+1]).resolve() != state_root.resolve()):
+                continue
+            record = _proc_stat(int(name))
+            if record:
+                active.append({"pid": int(name), "pid_start": record["start"]})
+        except (OSError, ValueError, IndexError):
+            continue
+    return active
+
+
 class RuntimeObservationCpuFixture(unittest.TestCase):
+    def test_cpu_accounting_includes_helpers_reaped_between_proc_samples(self):
+        def helper():
+            time.sleep(.1)
+            subprocess.run([sys.executable, "-c",
+                "import time; stop=time.process_time()+.08\nwhile time.process_time()<stop: pass"], check=True)
+        thread = threading.Thread(target=helper)
+        thread.start()
+        try:
+            # No /proc sample sees this helper; its real waited CPU still
+            # belongs in the process-tree total, exactly once.
+            with mock.patch.dict(_sample_window.__globals__, {"_process_tree_snapshot": lambda _seeds: {}}):
+                measured = _sample_window(.6, set())
+            self.assertEqual(measured["sampled_own_cpu_ticks"], 0)
+            self.assertGreaterEqual(measured["cpu_ticks"], .06 * os.sysconf("SC_CLK_TCK"))
+        finally:
+            thread.join(timeout=3)
+
     def test_isolated_production_observer_workload(self):
+        previous_term = signal.getsignal(signal.SIGTERM)
+        def interrupted(_signal, _frame):
+            raise KeyboardInterrupt("bounded runtime fixture interrupted")
+        signal.signal(signal.SIGTERM, interrupted)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous_term)
         with tempfile.TemporaryDirectory(prefix="hearting-runtime-observation-cpu-") as temporary:
             temp_root = Path(temporary)
             data_root = temp_root / "harness-data"
@@ -640,15 +993,21 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                               + str(source / "tools"),
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
+            diagnostic_dir = temp_root / "runner-diagnostics"
+            diagnostic_dir.mkdir()
+            profile_hook.mkdir()
+            (profile_hook / "sitecustomize.py").write_text(_RUNNER_DIAGNOSTICS)
+            isolated["FIXTURE_RUNNER_DIAGNOSTICS"] = str(diagnostic_dir)
+            isolated["PYTHONPATH"] = str(profile_hook) + os.pathsep + isolated["PYTHONPATH"]
             if DIAGNOSTIC_PROFILE:
                 profile_dir.mkdir()
-                profile_hook.mkdir()
                 (profile_hook / "sitecustomize.py").write_text(
-                    "import atexit, cProfile, os, signal, sys\n"
+                    _RUNNER_DIAGNOSTICS + "import atexit, cProfile, os, signal, sys\n"
                     "profile_target = ('codex-managed-completion.py' in sys.argv[0] or "
                     "'dispatch-registry.py' in sys.argv[0] or "
+                    "'foreground-waiter.py' in sys.argv[0] or "
                     "('peer-steward.py' in sys.argv[0] and "
-                    "('__watch-run' in sys.argv or '__obligation-runner' in sys.argv)))\n"
+                    "('__watch-run' in sys.argv or '__obligation-runner' in sys.argv or '__ensure-obligations' in sys.argv)))\n"
                     "if profile_target:\n"
                     "    profiler = cProfile.Profile()\n"
                     "    profiler.enable()\n"
@@ -673,7 +1032,6 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "        raise SystemExit(128 + signum)\n"
                     "    signal.signal(signal.SIGTERM, profiled_signal)\n")
                 isolated["FIXTURE_PROFILE_DIR"] = str(profile_dir)
-                isolated["PYTHONPATH"] = str(profile_hook) + os.pathsep + isolated["PYTHONPATH"]
             for key in list(os.environ):
                 if (key.startswith(("AGENT_DISPATCH_", "AGENT_PEER_", "HERDR_", "AGENT_HERDR_",
                                     "AGENT_SESSION_", "CLAUDE_", "CODEX_", "OPENCODE_"))
@@ -686,7 +1044,10 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
             runner_process = None
             watch_processes = []
             worker_processes = []
+            foreground_processes = []
+            foreground_children = set()
             observation_server = None
+            control_server = None
             open_successor_locks = contextlib.ExitStack()
             try:
                 sys.path.insert(0, str(source / "utilities"))
@@ -756,10 +1117,25 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     raise AssertionError(
                         f"sealed verifier did not reuse immutable generations: {historical_metrics}")
 
+                history_projects = _settled_owner_projects(
+                    temp_root / "history-projects", jobs_path,
+                    {"producer_fixture": producer_fixture, "producer": artifact_producer,
+                     "admission": admission, "artifact_index": artifact_index})
+                if (history_projects[0]["manifest_bytes"] < MANIFEST_BYTES
+                        or history_projects[0]["index_bytes"] < INDEX_BYTES):
+                    raise AssertionError("large historical owner did not reach the actual producer path")
+                foreground_processes = _start_foreground_waiters(
+                    temp_root, jobs_path, source, dispatch_contract)
+                for _process, _parent, ready, _result, _attempt in foreground_processes:
+                    _wait_for(ready.is_file, 20, "foreground parent-bound waiter startup")
+                    foreground_children.add(json.loads(ready.read_text())["child_pid"])
+                jobs_size = jobs_path.stat().st_size
+
                 panes = [{"pane_id": "w1:p9", "agent": "claude",
                           "agent_session": {"value": "sid-fixture"}}]
                 observation_server = FakeObservationEndpoint(
                     Path(isolated["HERDR_SOCKET_PATH"]), panes)
+                control_server = FakeControlEndpoint(temp_root / "control.sock")
                 binding = peer_obligations.managed_service_binding(source)
                 if binding != str(current):
                     raise AssertionError(f"isolated managed binding unavailable: {binding!r}")
@@ -811,17 +1187,27 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 # Create eight real exact-attempt completion duties. The managed
                 # runner below launches their actual --resume-obligation entrypoints.
                 duty_ids = []
+                terminal_observers = max(1, OBSERVER_COUNT // 2)
+                observer_workloads = []
                 for index in range(OBSERVER_COUNT):
+                    terminal_owner = index >= OBSERVER_COUNT - terminal_observers
+                    history_index = index - (OBSERVER_COUNT - terminal_observers)
+                    selected_attempt = (history_projects[history_index]["owner_attempt_id"] if terminal_owner
+                                        else f"att-observer-{index:02d}")
+                    parent_args = (["--parent-session-id", "fixture-parent", "--thread-id", "fixture-parent"]
+                                   if terminal_owner else ["--parent-attempt-id", f"att-parent-{index:02d}"])
                     args = managed.parser().parse_args([
                         "--jobs", str(jobs_path), "--control-socket",
-                        str(temp_root / "control.sock"), "--parent-attempt-id",
-                        f"att-parent-{index:02d}", "--sealed-batch-id",
+                        str(temp_root / "control.sock"), *parent_args, "--sealed-batch-id",
                         f"sealed-fixture-{index:02d}", "--attempt-id",
-                        f"att-observer-{index:02d}", "--interval", "1",
+                        selected_attempt, "--interval", "1",
                         "--timeout", "600",
                     ])
                     duty_id, _record = batch.create(args)
                     duty_ids.append(duty_id)
+                    observer_workloads.append({"duty_id": duty_id, "attempt_id": selected_attempt,
+                        "phase": "terminal-owner-recipient-busy" if terminal_owner else "live-child-join",
+                        "parent_lifetime": "legacy-unbound" if terminal_owner else "attempt-bound"})
 
                 if not peer_obligations.ensure_normal_runner(
                         state_root, lifecycle_root=source, reconciliation_required=True):
@@ -829,6 +1215,8 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 runner_process = peer_obligations._RUNNERS[-1]
                 if runner_process.poll() is not None:
                     raise AssertionError("managed obligation runner exited during startup")
+                initial_runner = {"pid": runner_process.pid,
+                                  "pid_start": _proc_stat(runner_process.pid)["start"]}
 
                 def observer_snapshot():
                     records = [batch.read(jobs_path, duty_id) for duty_id in duty_ids]
@@ -856,6 +1244,10 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     return owners
 
                 owners = _wait_for(observer_snapshot, 20, "eight exact managed observers")
+                terminal_attempts = {item["attempt_id"] for item in observer_workloads
+                                     if item["phase"] == "terminal-owner-recipient-busy"}
+                _wait_for(lambda: terminal_attempts <= control_server.deliveries,
+                          30, "terminal observers to normalize real history and reach the busy recipient")
                 try:
                     _wait_for(lambda: len(observation_server.subscriptions) >= WATCHER_COUNT,
                               20, "eleven actual watch subscriptions")
@@ -878,10 +1270,17 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 runner_pids = {runner_process.pid}
                 owner_pids = {int(owner["pid"]) for owner in owners}
                 worker_pids = {process.pid for process in worker_processes}
-                seed_pids = watcher_pids | runner_pids | owner_pids | worker_pids
+                foreground_pids = {process.pid for process, _p, _r, _o, _a in foreground_processes}
+                foreground_pids.update(parent.pid for _p, parent, _r, _o, _a in foreground_processes)
+                foreground_pids.update(foreground_children)
+                seed_pids = watcher_pids | runner_pids | owner_pids | worker_pids | foreground_pids
 
+                runner_counts = []
                 def current_seed_pids():
-                    current = set(watcher_pids | runner_pids | worker_pids)
+                    current = set(watcher_pids | runner_pids | worker_pids | foreground_pids)
+                    active_runners = _active_runner_processes(state_root, source)
+                    runner_counts.append(len(active_runners))
+                    current.update(record["pid"] for record in active_runners)
                     current.update(int(owner["pid"])
                                    for group in _active_observer_processes(jobs_path).values()
                                    for owner in group)
@@ -910,6 +1309,83 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 if not BASELINE_MODE and after_burst != stable_owners:
                     raise AssertionError("unrelated event changed managed observer ownership")
                 burst_active = _active_observer_processes(jobs_path)
+
+                # Hook storms use the same installed entry as native session
+                # projections. CPU includes short/reaped helpers as well as
+                # the persistent runner and its descendants.
+                with ThreadPoolExecutor(max_workers=9) as callbacks:
+                    ensure_futures = [callbacks.submit(_ensure_callback, source) for _ in range(8)]
+                    hook_future = callbacks.submit(_hook_delivery_roundtrip, source, jobs_path)
+                    callback_window = _sample_window(20, seed_pids, seed_provider=current_seed_pids)
+                    ensure_results = [future.result(timeout=15) for future in ensure_futures]
+                    hook_result = hook_future.result(timeout=15)
+                if not BASELINE_MODE:
+                    if runner_process.poll() is not None:
+                        raise AssertionError("activation callbacks replaced an owner with accepted external duties")
+                    if any(item["timed_out"] or item["returncode"] != 0 for item in ensure_results):
+                        raise AssertionError(f"activation helper did not return promptly: {ensure_results}")
+                    if ([item["notice_emitted"] for item in hook_result["rounds"]] != [True, False]
+                            or any(item["timed_out"] or item["returncode"] != 0
+                                   for item in hook_result["rounds"])
+                            or hook_result["state"] != "acked" or hook_result["claim_attempts"] != 1):
+                        raise AssertionError(f"worker hook failed output/ack exactly-once fixture: {hook_result}")
+
+                # Exercise real completed-retire successor locks, attached to
+                # the records that this runner actually repairs.
+                retired = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(.05)"],
+                    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                retired_start = dispatch_contract.process_start_ticks(retired.pid)
+                retired.wait(timeout=3)
+                successor_locks = contextlib.ExitStack()
+                retire_duties = []
+                store = peer_obligations.ObligationStore()
+                try:
+                    for index in range(2):
+                        pane = f"w1:pSuccessor{index}"
+                        predecessor = f"w1:pRetired{index}"
+                        steward._mark_seat_successor(pane, predecessor, "codex", "fixture-successor")
+                        duty = store.create(f"retire-lock-fixture-{index}", "retire",
+                            {"harness": "claude", "session_id": f"fixture-retired-{index}",
+                             "pane": predecessor, "server": "default", "name": "fixture-retired",
+                             "foreground": {"pid": retired.pid, "start": retired_start,
+                                "shell_pid": os.getpid(), "shell_start": _proc_stat(os.getpid())["start"]}},
+                            {"target": predecessor, "requester": {"harness": "codex",
+                             "session_id": "fixture-successor", "pane": pane, "server": "default"}})
+                        duty = store.update(duty["id"], state="complete", result="normal-exit",
+                                            observation={"phase": "complete"})
+                        retire_duties.append(duty)
+                        successor_locks.enter_context(steward._seat_successor_lock(pane))
+                    retry_start = time.monotonic()
+                    if not BASELINE_MODE:
+                        for duty in retire_duties:
+                            steward._resume_retire_obligation(duty, store)
+                    retire_retry_seconds = time.monotonic() - retry_start
+                    successor_wait_window = _sample_window(
+                        20, seed_pids, seed_provider=current_seed_pids)
+                    probe = temp_root / "registration-probe.py"
+                    probe.write_text(_REGISTRATION_PROBE)
+                    started = time.monotonic()
+                    registration_run = subprocess.run([sys.executable, str(probe), str(jobs_path),
+                        foreground_processes[0][4], history_projects[0]["owner_attempt_id"]],
+                        capture_output=True, text=True, timeout=12)
+                    registration = json.loads(registration_run.stdout)
+                    registration["process_seconds"] = time.monotonic() - started
+                    registration["returncode"] = registration_run.returncode
+                    if not BASELINE_MODE and (not registration["registered"]
+                            or registration["nested_lock_request"] or registration["elapsed_seconds"] >= 4):
+                        raise AssertionError(f"mixed workload blocked registration: {registration}")
+                finally:
+                    successor_locks.close()
+
+                # Check the exact parent-loss stop using the same live wait
+                # callback after the CPU windows, without changing sleep.
+                process, parent, ready, result_path, _attempt = foreground_processes[0]
+                parent.terminate()
+                parent.wait(timeout=3)
+                process.wait(timeout=6)
+                parent_loss = json.loads(result_path.read_text())
+                if (parent_loss["failure"] != "parent-terminated" or not parent_loss["group_empty"]):
+                    raise AssertionError(f"foreground parent death did not stop its child: {parent_loss}")
 
                 if DIAGNOSTIC_PROFILE:
                     for _watch_id, process in watch_processes:
@@ -979,6 +1455,19 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "baseline_mode": BASELINE_MODE,
                     "jobs_bytes": jobs_size,
                     "projects": projects,
+                    "settled_owner_projects": history_projects,
+                    "observer_workloads": observer_workloads,
+                    "busy_recipient_attempts": sorted(control_server.deliveries),
+                    "busy_recipient_requests": control_server.requests,
+                    "foreground_waiters": 4,
+                    "foreground_parent_loss": parent_loss,
+                    "callback_storm": callback_window,
+                    "ensure_callbacks": ensure_results,
+                    "worker_hook_delivery": hook_result,
+                    "mixed_registration": registration,
+                    "completed_retire_successor_locks": 2,
+                    "completed_retire_retry_seconds": retire_retry_seconds,
+                    "successor_lock_wait": successor_wait_window,
                     "observers": OBSERVER_COUNT, "watchers": WATCHER_COUNT,
                     "managed_runner": RUNNER_COUNT,
                     "observer_pid_start": [
@@ -994,7 +1483,10 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                              ).get("watcher", {}).get("pid_start", "")}
                         for watch_id, proc in watch_processes],
                     "runner_pid_start": {"pid": runner_process.pid,
-                                         "pid_start": _proc_stat(runner_process.pid)["start"]},
+                                         "pid_start": initial_runner["pid_start"],
+                                         "alive_at_end": runner_process.poll() is None},
+                    "current_runner_pid_start": _active_runner_processes(state_root, source),
+                    "max_active_runners": max(runner_counts, default=0),
                     "worker_pid_start": [
                         {"pid": process.pid, "pid_start": _proc_stat(process.pid)["start"]}
                         for process in worker_processes],
@@ -1003,6 +1495,7 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "unrelated_event_seconds": BURST_SECONDS,
                     "cold_start_seconds": COLD_SECONDS,
                     "cold_start": cold_start,
+                    "cold_start_boundary": "post-ready settling window; historical normalization was required before this window",
                     "warm_idle": warm,
                     "unrelated_event": burst,
                     "profile_summaries": profile_summaries,
@@ -1012,7 +1505,7 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "observer_replacement_retry": replacement_result,
                     "limitations": [
                         "target-file syscall bytes and per-function hot-branch profiles require a separate strace/profile run",
-                        "proc sampling reports every observed PID/start identity; sub-50ms exited children may fall between samples",
+                        "rchar attribution for sub-50ms exited helpers uses the separate syscall run; CPU includes reaped children",
                     ],
                 }
                 print(json.dumps(output, indent=2, sort_keys=True))
@@ -1022,12 +1515,43 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n",
                                     encoding="utf-8")
+            except BaseException as exc:
+                evidence_path = os.environ.get("HEARTING_RUNTIME_OBSERVATION_EVIDENCE")
+                if evidence_path:
+                    partial = {"fixture_state": "failed", "error": str(exc),
+                               "source_commit": source_commit, "source_diff_sha256": source_diff_digest}
+                    if runner_process is not None:
+                        partial["runner_process"] = {"pid": runner_process.pid,
+                                                     "exit_code": runner_process.poll()}
+                        for name in ("wchan", "status"):
+                            with contextlib.suppress(OSError):
+                                partial["runner_process"][name] = Path(f"/proc/{runner_process.pid}/{name}").read_text()
+                        ready = diagnostic_dir / f"{runner_process.pid}.ready"
+                        log = diagnostic_dir / f"{runner_process.pid}.log"
+                        if runner_process.poll() is None and ready.is_file():
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(runner_process.pid, signal.SIGUSR1)
+                            time.sleep(.1)  # diagnostic flush after failure, outside CPU windows
+                        if log.is_file():
+                            partial["runner_process"]["stack_or_exception"] = log.read_text(errors="replace")[-12000:]
+                    partial["batch_records"] = [batch.read(jobs_path, duty_id) for duty_id in locals().get("duty_ids", [])]
+                    values = locals()
+                    for name in ("cold_start", "warm", "burst", "callback_window", "ensure_results",
+                                 "hook_result", "registration", "successor_wait_window", "parent_loss",
+                                 "history_projects", "jobs_size"):
+                        if name in values:
+                            partial[name] = values[name]
+                    Path(evidence_path).write_text(json.dumps(partial, indent=2, sort_keys=True) + "\n")
+                raise
             finally:
                 # Every process belongs to this temporary fixture. Stop exact
                 # process groups while all state roots and sockets still exist.
                 groups = set()
+                groups.update(foreground_children)
                 for process in [runner_process, *(p for _wid, p in watch_processes),
-                                *worker_processes]:
+                                *worker_processes,
+                                *(p for p, _parent, _r, _o, _a in foreground_processes),
+                                *(p for _wait, p, _r, _o, _a in foreground_processes)]:
                     if process is not None:
                         groups.add(process.pid)
                 for duty_id in locals().get("duty_ids", []):
@@ -1050,7 +1574,8 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                         command = " ".join(argv)
                         if (temp_prefix in command and any(
                                 marker in command for marker in (
-                                    "codex-managed-completion.py", "peer-steward.py", "/bin/herdr"))):
+                                    "codex-managed-completion.py", "peer-steward.py", "/bin/herdr",
+                                    "foreground-waiter.py", "foreground-child.py", "registration-probe.py"))):
                             identity = _proc_stat(pid)
                             if identity is not None:
                                 found.add(identity["pgrp"])
@@ -1085,12 +1610,16 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     with contextlib.suppress(ProcessLookupError, PermissionError):
                         os.killpg(pgid, signal.SIGKILL)
                 for process in [runner_process, *(p for _wid, p in watch_processes),
-                                *worker_processes]:
+                                *worker_processes,
+                                *(p for p, _parent, _r, _o, _a in foreground_processes),
+                                *(p for _wait, p, _r, _o, _a in foreground_processes)]:
                     if process is not None:
                         with contextlib.suppress(Exception):
                             process.wait(timeout=2)
                 if observation_server is not None:
                     observation_server.close()
+                if control_server is not None:
+                    control_server.close()
                 open_successor_locks.close()
                 with contextlib.suppress(OSError):
                     os.close(fifo_keeper)
@@ -1099,6 +1628,24 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 for entry in (str(source / "utilities"), str(source / "tools" / "install")):
                     with contextlib.suppress(ValueError):
                         sys.path.remove(entry)
+
+            if DIAGNOSTIC_PROFILE and "output" in locals():
+                # Collect after teardown so the real runner/foreground/observer
+                # interpreters have flushed their profiles as well.
+                summaries = []
+                for profile_path in sorted(profile_dir.glob("*.prof")):
+                    stats = pstats.Stats(str(profile_path))
+                    top = sorted(stats.stats.items(), key=lambda item: item[1][3], reverse=True)[:30]
+                    summaries.append({"pid": int(profile_path.stem), "functions_by_cumulative_time": [
+                        {"file": key[0], "line": key[1], "function": key[2], "calls": value[1],
+                         "self_seconds": value[2], "cumulative_seconds": value[3]} for key, value in top]})
+                output["profile_summaries"] = summaries
+                if evidence_path:
+                    Path(evidence_path).write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+                    with tarfile.open(Path(evidence_path).with_suffix(".profiles.tar.gz"), "w:gz") as archive:
+                        for profile_path in sorted(profile_dir.glob("*.prof")):
+                            archive.add(profile_path, arcname=profile_path.name)
+                print(json.dumps({"profiles_collected_after_cleanup": len(summaries)}))
 
 
 if __name__ == "__main__":

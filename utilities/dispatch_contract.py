@@ -2160,33 +2160,21 @@ def supervisor_lease_is_held(
 def _declared_supervisor_lease_metadata(
     jobs: Path, attempt_id: str
 ) -> dict[str, str]:
-    lock_path = Path(f"{jobs}.lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            raise DispatchContractError(
-                "supervisor-lease-registry-unreadable", str(exc)
-            ) from exc
-        matches: list[tuple[str, dict[str, str]]] = []
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            metadata = parse_registry_metadata(fields[5])
-            if metadata.get("attempt_id") == attempt_id:
-                matches.append((fields[1], metadata))
-        if len(matches) != 1 or matches[0][0] not in {"open", "running"}:
-            raise DispatchContractError(
-                "supervisor-lease-attempt-not-open", attempt_id
-            )
-        metadata = matches[0][1]
-        if not _supervisor_lease_metadata_valid(jobs, metadata):
-            raise DispatchContractError(
-                "supervisor-lease-declaration-invalid", attempt_id
-            )
-        return metadata
+    # Observation can run inside a terminal writer's jobs lock. Reopening
+    # that same lock would block this process on its own open description.
+    # Lease acquisition still holds its separate exact flock and confirms
+    # the declaration again after acquisition.
+    from dispatch_registry_cache import registry_view
+    try:
+        records = registry_view(jobs).completion_attempt_records(attempt_id)
+    except OSError as exc:
+        raise DispatchContractError("supervisor-lease-registry-unreadable", str(exc)) from exc
+    if len(records) != 1 or records[0].status not in {"open", "running"}:
+        raise DispatchContractError("supervisor-lease-attempt-not-open", attempt_id)
+    metadata = records[0].completion_metadata()
+    if not _supervisor_lease_metadata_valid(jobs, metadata):
+        raise DispatchContractError("supervisor-lease-declaration-invalid", attempt_id)
+    return metadata
 
 
 @contextmanager
@@ -4879,40 +4867,35 @@ def _parent_binding_is_live_from_metadata(
 def parent_attempt_binding_is_live(
     jobs: str | Path, binding: ParentAttemptBinding
 ) -> bool:
-    """Revalidate one exact parent row plus its current liveness evidence."""
+    """Observe one exact parent without contending with registry writers.
+
+    Registry writers replace complete files atomically. This read can also be
+    called while a writer owns jobs.log.lock; opening that lock again would
+    deadlock on a different open file description. Mutation admission keeps
+    its separate fresh, lock-held parent check in spawn_claimed_attempt.
+    """
 
     registry = Path(jobs).expanduser().resolve(strict=False)
     try:
-        with Path(f"{registry}.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            lines = registry.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-            matches: list[tuple[list[str], dict[str, str]]] = []
-            for line in lines:
-                fields = line.split("\t")
-                if len(fields) != 6 or fields[1] not in {"open", "running"}:
-                    continue
-                metadata = parse_registry_metadata(fields[5])
-                if metadata.get("attempt_id") == binding.attempt_id:
-                    matches.append((fields, metadata))
-            if len(matches) != 1:
-                return False
-            fields, metadata = matches[0]
-            try:
-                validate_attempt_metadata(metadata)
-            except DispatchContractError:
-                return False
-            if (
-                fields[4] != binding.slug
-                or fields[3] != binding.worktree
-                or (fields[2] != binding.repository_path if binding.repository_path
-                    else canonical_repository_identity(fields[2]) != binding.repository_identity)
-            ):
-                return False
-            return _parent_binding_is_live_from_metadata(
-                registry, metadata, binding
-            )
+        from dispatch_registry_cache import registry_view
+        records = registry_view(registry).completion_attempt_records(binding.attempt_id)
+        matches = [record for record in records if record.status in {"open", "running"}]
+        if len(matches) != 1:
+            return False
+        record = matches[0]
+        fields, metadata = record.fields, record.completion_metadata()
+        try:
+            validate_attempt_metadata(metadata)
+        except DispatchContractError:
+            return False
+        if (
+            fields[4] != binding.slug
+            or fields[3] != binding.worktree
+            or (fields[2] != binding.repository_path if binding.repository_path
+                else canonical_repository_identity(fields[2]) != binding.repository_identity)
+        ):
+            return False
+        return _parent_binding_is_live_from_metadata(registry, metadata, binding)
     except OSError:
         return False
 

@@ -886,7 +886,10 @@ def wait_foreground(
             deadline = watchdog_budget.deadline_monotonic_ns / 1_000_000_000
         while True:
             exit_code = proc.poll()
-            group_empty = _group_empty(proc.pid)
+            # A live, unreaped leader already proves the group is nonempty.
+            # Scanning /proc on every wait tick only repeats that fact. Keep
+            # the complete fresh scan at exit and every stop/cleanup boundary.
+            group_empty = _group_empty(proc.pid) if exit_code is not None else False
             if exit_code is not None and group_empty is True:
                 break
             if received:

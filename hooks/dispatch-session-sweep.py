@@ -88,23 +88,11 @@ def main() -> int:
     # `asyncRewake` hook process survives an interrupt or a compaction is unmeasured
     # (SD-OPEN-29/32), so the next prompt is the required fallback.
     #
-    # The same activation also reconnects retained registered-batch observers:
-    # lock-guarded, completed duties are never replayed and the original
-    # assignment is never relaunched. Fail-open like every other path here.
-    try:
-        from dispatch_batch_obligations import ensure_observers
-    except Exception:
-        ensure_observers = None
-    if ensure_observers is not None and _event_name(payload) != "SessionStart":
-        for root in seen:
-            try:
-                jobs_log = Path(root) / "jobs.log"
-                if jobs_log.is_file():
-                    ensure_observers(jobs_log)
-            except Exception:  # noqa: BLE001
-                continue
     context = delivery_context(batches)
     if not context:
+        if _event_name(payload) != "SessionStart":
+            for root in seen:
+                _request_recovery(root)
         return 0
     print(
         json.dumps(
@@ -116,7 +104,8 @@ def main() -> int:
             },
             ensure_ascii=False,
             separators=(",", ":"),
-        )
+        ),
+        flush=True,
     )
     if _event_name(payload) == "UserPromptSubmit":
         for root, records in batches:
@@ -124,7 +113,20 @@ def main() -> int:
                 ack_delivered(root, session_id, records, acked_by=f"session-sweep:{session_id}")
             except Exception:  # noqa: BLE001
                 pass
+    if _event_name(payload) != "SessionStart":
+        for root in seen:
+            _request_recovery(root)
     return 0
+
+
+def _request_recovery(root):
+    # Also runs for worker/subsession prompts without a projection hook.
+    # The existing runner's nonblocking lease coalesces concurrent requests.
+    try:
+        from peer_obligations import request_dispatch_reconciliation
+        request_dispatch_reconciliation(root)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

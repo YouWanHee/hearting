@@ -105,6 +105,34 @@ def _receipt(**overrides):
 
 
 class SweepTest(IsolatedRootMixin, unittest.TestCase):
+    def test_worker_hook_flushes_and_acks_before_requesting_global_recovery(self):
+        self._seed()
+        hook = _load("worker_sweep_latency_fixture", ROOT / "hooks/dispatch-session-sweep.py")
+        class Output(io.StringIO):
+            flushed = False
+            def flush(self):
+                self.flushed = True
+        output = Output()
+        delivery_id = "delivery-" + "a" * 32
+        observed = []
+        def recovery(root):
+            observed.append((output.flushed, delivery_id in output.getvalue(),
+                             PD.read(root, "sess-owner", delivery_id)["state"]))
+        with mock.patch.object(hook, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(hook, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch("peer_obligations.request_dispatch_reconciliation", side_effect=recovery) as request, \
+             mock.patch("dispatch_batch_obligations.ensure_observers") as expensive, \
+             mock.patch.dict(os.environ, {"AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_DEPTH": "2"}), \
+             mock.patch.object(sys, "stdin", io.StringIO('{"session_id":"sess-owner","hook_event_name":"UserPromptSubmit"}')), \
+             mock.patch.object(sys, "stdout", output):
+            self.assertEqual(hook.main(), 0)
+        expensive.assert_not_called()
+        request.assert_called_once_with(self.root)
+        self.assertEqual(observed, [(True, True, "acked")])
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["attempts"], 1)
+        again, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        self.assertEqual(again, [])
+
     def _seed(self, session_id="sess-owner", **overrides):
         receipt = overrides.pop("receipt", _receipt())
         self.root.mkdir(parents=True, exist_ok=True)
@@ -904,11 +932,13 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
-             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
+             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure, \
+             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner:
             SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
-        reconcile.assert_called_once_with(jobs)
-        ensure.assert_called_once_with()
+        reconcile.assert_not_called()
+        ensure.assert_not_called()
+        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
 
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -957,19 +987,16 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
              mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner, \
              mock.patch.object(OBLIGATIONS.subprocess, "Popen", return_value=Launched()) as launch:
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
-        reconcile.assert_called_once_with(jobs)
+        reconcile.assert_not_called()
+        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
         settle.assert_not_called()
-        self.assertEqual(launch.call_count, 2)
-        launches = [call.args[0] for call in launch.call_args_list]
-        self.assertEqual(
-            {argv[argv.index("--jobs") + 1] for argv in launches},
-            {str(jobs), str(other_jobs)},
-        )
-        self.assertTrue(any(duty_id in argv for argv in launches))
-        self.assertTrue(any(other_duty_id in argv for argv in launches))
+        launch.assert_not_called()
+        self.assertEqual(OBLIGATIONS.read(jobs, duty_id)["state"], "observing")
+        self.assertEqual(OBLIGATIONS.read(other_jobs, other_duty_id)["state"], "observing")
         self.assertEqual(jobs.read_bytes(), unreadable)
         self.assertEqual(other_jobs.read_bytes(), other_before)
 

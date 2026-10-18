@@ -679,15 +679,16 @@ def _pending_owner_settlements(jobs: Path):
     from dispatch_terminal_commit import owner_completion_pending
 
     try:
-        lines = jobs.read_text(encoding="utf-8").splitlines()
+        from dispatch_registry_cache import registry_view
+        candidates = registry_view(jobs).settlement_owner_candidates()
     except FileNotFoundError:
         return ()
     pending = []
-    for order, raw in enumerate(lines):
-        fields = raw.split("\t")
-        if len(fields) != 6 or fields[1] not in {"open", "running", "done"}:
+    for candidate in candidates:
+        order, raw, fields = candidate.order, candidate.raw, candidate.fields
+        if fields[1] not in {"open", "running", "done"}:
             continue
-        meta = parse_registry_metadata(fields[5])
+        meta = candidate.completion_metadata()
         if (meta.get("worker_type") != "owner" or meta.get("launch_started") != "1"
                 or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
                 or not meta.get("supervisor_lease_file") or not meta.get("log_file")

@@ -128,6 +128,19 @@ action: claims, acknowledgements, handovers, and sends recheck the current row
 and binding under their existing lock. Recovery callbacks reconnect the
 existing owner of work; they do not repeat work already owned by its live
 runner.
+The runner keeps its lease while any accepted local or external duty remains;
+an unrelated callback must not replace that waiting owner and discard its
+observation state. Code modules use their normal process lifetime, while
+the state and authority those functions observe remain fresh inputs.
+
+Session hooks request that existing recovery runner and return; they do not
+replay global settlement history before delivering and acknowledging the
+session's own notices. The runner retains observation state across requests.
+An idle foreground waiter observes its exact parent's current row without a
+writer lock, and checks process-group cleanup only after its leader exits.
+Registry mutation keeps its fresh authority check inside the existing short
+writer section; observation must remain safe when its caller already holds
+that same registry lock.
 
 Long-lived observers may retain a bounded projection of an immutable result
 while every file generation it depended on remains current. The projection

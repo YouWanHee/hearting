@@ -1115,6 +1115,25 @@ def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None,
                           reconciliation_required=reconciliation_required)
 
 
+def request_dispatch_reconciliation(state_root: str | Path) -> bool:
+    """Reconnect the existing runner without doing global work in a carrier.
+
+    Compatibility roots remain read-only. Worker and subsession carriers use
+    this same entry even when they have no session-projection hook.
+    """
+    from dispatch_contract import dispatch_state_roots, resolve_agent_home
+    home = resolve_agent_home()
+    roots = dispatch_state_roots(home)
+    root = Path(state_root).resolve(strict=False)
+    if not roots or root != Path(roots[0]).resolve(strict=False):
+        return False
+    if not (root / "jobs.log").is_file():
+        return False
+    # Dispatch storage and peer storage may be separate roots. Preserve the
+    # same normal peer runner rather than creating another store under jobs.
+    return ensure_normal_runner(lifecycle_root=home, reconciliation_required=True)
+
+
 @contextmanager
 def legacy_runner_lock(store: ObligationStore):
     """Serialize retire side effects with a runner from before input separation."""

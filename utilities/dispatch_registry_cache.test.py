@@ -15,6 +15,27 @@ import dispatch_registry_cache as CACHE  # noqa: E402
 
 
 class RegistryLinesCacheTest(unittest.TestCase):
+    def test_route_and_owner_candidates_keep_conflicts_duplicates_and_append_rows(self):
+        def row(aid, extra):
+            return ("now\tdone\t/repo\t/wt\tfixture\tattempt_schema_version=2,"
+                    f"attempt_id={aid},{extra}\n")
+        self.jobs.write_text(
+            row("att-owner", "worker_type=owner,launch_started=1,supervisor_lease=flock-v1,route_id=rt-A")
+            + row("att-child", "parent_attempt_id=att-owner,route_id=rt-B")
+            + row("att-conflict", "worker_type=owner,launch_started=1,supervisor_lease=flock-v1,"
+                                 "owner_route_id=rt-B,owner_route_hash=sha256:A"))
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual([record.order for record in first.completion_related("att-owner", "rt-A", "sha256:A")],
+                         [0, 1, 2])
+        self.assertEqual([record.order for record in first.settlement_owner_candidates()], [0, 2])
+        with self.jobs.open("a") as out:
+            out.write(row("att-child", "parent_attempt_id=att-owner,route_id=rt-A"))
+        after = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual([record.order for record in after.completion_related("att-owner", "rt-A", "sha256:A")],
+                         [0, 1, 2, 3])
+        self.assertTrue(after.has_duplicate_attempts)
+        self.assertEqual(len(first.records), 3)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
