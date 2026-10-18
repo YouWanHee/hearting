@@ -174,9 +174,7 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         return env
 
     def merge_snapshot(self):
-        git_dir = Path(self._git("rev-parse", "--git-dir").stdout.strip())
-        if not git_dir.is_absolute():
-            git_dir = self.repo / git_dir
+        git_dir = Path(self._git("rev-parse", "--absolute-git-dir").stdout.strip())
         names = ("index", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "ORIG_HEAD", "AUTO_MERGE")
         metadata = {name: (git_dir / name).read_bytes() for name in names
                     if (git_dir / name).exists()}
@@ -277,7 +275,7 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         )
         return module, args, capture
 
-    def _codex_session(self, env, attempt):
+    def _codex_session(self, env, attempt, *, named_profile=None, approval="inherit"):
         module = load_module("fixture_codex_app_server_supervisor",
                              ROOT / "utilities/codex-app-server-supervisor.py")
         fake = self.root / "codex_app_server_fixture.py"
@@ -314,16 +312,27 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         env = {**env, "CODEX_TRACE": str(trace)}
         args = argparse.Namespace(
             parent_attempt_id=attempt, worktree=str(self.repo), writable_root=[],
-            base_writable_root=[], sandbox="read-only", network_access=False,
-            approval="inherit", model=None, reasoning=None, owner_input=None,
+            base_writable_root=[],
+            sandbox="workspace-write" if named_profile is not None else "read-only",
+            network_access=named_profile is not None,
+            approval=approval, model=None, reasoning=None, owner_input=None,
+            native_permission_profile=named_profile,
         )
+        command = [sys.executable, str(fake)]
+        if named_profile is not None:
+            command.extend(module.config_arguments(named_profile))
+        thread_params = {"cwd": str(self.repo), "ephemeral": True}
+        if named_profile is None:
+            thread_params["sandbox"] = "read-only"
+        if approval != "inherit":
+            thread_params["approvalPolicy"] = approval
         with mock.patch.dict(os.environ, env, clear=True):
-            server = module.AppServer([sys.executable, str(fake)], str(self.repo), dict(os.environ))
+            server = module.AppServer(command, str(self.repo), dict(os.environ))
             server.request("initialize", {"clientInfo":{"name":"fixture"},"capabilities":None})
             server.notification("initialized")
-            thread = server.request("thread/start", {"cwd":str(self.repo),"ephemeral":True})["thread"]["id"]
+            thread = server.request("thread/start", thread_params)["thread"]["id"]
         self.addCleanup(server.close)
-        return module, args, server, thread, trace
+        return module, args, server, thread, trace, command, thread_params
 
     def _claude_turn(self, session, env, *, resume, prompt):
         module, args, _capture = session
@@ -339,7 +348,7 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
             module.run_turn(args, "ses_fixture", prompt, resume=resume)
 
     def _codex_turn(self, session, env, *, prompt):
-        module, args, server, thread, _trace = session
+        module, args, server, thread, _trace = session[:5]
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(module, "emit"):
             module.run_turn(server, thread_id=thread, prompt=prompt, args=args)
 
@@ -447,6 +456,107 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         for harness, attempt in attempts.items():
             rows = self.jobs[harness].read_text(encoding="utf-8").splitlines()
             self.assertEqual(sum(f"attempt_id={attempt}" in row for row in rows), 1, rows)
+
+    def test_codex_named_profile_reprojects_owner_scope_on_the_same_thread(self):
+        # The session starts with a verified complete owner route while Git is
+        # idle, so its native profile is genuinely active before the conflict.
+        self._git("merge", "--abort")
+        primary_repo = self.repo
+        self.repo = self.root / "codex-owner-worktree"
+        subprocess.run(["git", "-C", str(primary_repo), "worktree", "add", "-q", "-b",
+                        "pr-ci-projection", str(self.repo), "pr-ci-task"], check=True,
+                       capture_output=True, text=True)
+        self.route = self._compile_complete_owner_route()
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+        attempt = self._register_owner("codex")
+        runtime_env = self._runtime_context("codex", attempt)
+        module = load_module("fixture_codex_named_profile_supervisor",
+                             ROOT / "utilities/codex-app-server-supervisor.py")
+        owner_args = argparse.Namespace(
+            parent_attempt_id=attempt, worktree=str(self.repo), writable_root=[],
+            base_writable_root=[], sandbox="workspace-write", network_access=False,
+        )
+        with mock.patch.dict(os.environ, runtime_env, clear=True):
+            module.apply_owner_runtime_permissions(owner_args)
+        initial = owner_args.owner_runtime_permission_state
+        self.assertFalse(initial["observation_only"])
+        self.assertTrue(initial["may_commit"])
+        self.assertEqual(initial["task_publish_scope"]["branch"], "pr-ci-projection")
+
+        # Exercise the real profile builder while stubbing only its optional
+        # installed-Codex feature probe; no native Codex process is launched.
+        import codex_permission_profile
+        with mock.patch.object(codex_permission_profile, "named_profiles_available",
+                               return_value=True):
+            profile = module.commit_profile_config(
+                str(self.repo), owner_args.writable_root, owner_args.sandbox,
+                owner_args.network_access,
+            )
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["default_permissions"], codex_permission_profile.PROFILE_NAME)
+        self.assertTrue(profile["permissions"][codex_permission_profile.PROFILE_NAME]
+                        ["network"]["enabled"])
+        profile_filesystem = profile["permissions"][codex_permission_profile.PROFILE_NAME]["filesystem"]
+        self.assertEqual(profile_filesystem[str((primary_repo / ".git").resolve())], "read")
+        self.assertTrue(all(profile_filesystem[path] == "write"
+                            for path in owner_args.writable_root))
+
+        session = self._codex_session(
+            runtime_env, attempt, named_profile=profile, approval="on-request")
+        self.assertEqual(session[1].native_permission_profile, profile)
+        self.assertEqual(session[5][2:], module.config_arguments(profile))
+
+        conflict = subprocess.run(
+            ["git", "-C", str(self.repo), "merge", "--no-commit", "--no-ff",
+             "merge-incoming"], capture_output=True, text=True)
+        self.assertNotEqual(conflict.returncode, 0, conflict.stdout + conflict.stderr)
+        self.assertIn("MERGE_HEAD", self.merge_snapshot()[1])
+        active_merge = self.merge_snapshot()
+        self._codex_turn(session, runtime_env, prompt="read-only during active merge")
+        self.assertTrue(session[1].owner_runtime_permission_state["observation_only"])
+        self.assertEqual(self.merge_snapshot(), active_merge)
+
+        # Only this fixture process settles the conflict; the same app-server
+        # thread then receives the current approved task/Git scope.
+        (self.repo / "engine.py").write_text("value = 'fixture resolution'\n", encoding="utf-8")
+        self._git("add", "engine.py")
+        self._git("commit", "-q", "-m", "settle named-profile fixture merge")
+        self.assertNotIn("MERGE_HEAD", self.merge_snapshot()[1])
+        settled = commit_policy.runtime_permission_projection(argparse.Namespace(
+            worker_type="owner", dispatch_depth=1, capability="autopilot-code",
+            worktree=str(self.repo), route_file=str(self.route_file),
+            route_id=self.route["route_id"], route_hash=self.route["route_hash"],
+            artifact_root=str(self.artifact_root), artifact_output_dir=str(self.output_dir),
+        ))
+        self.assertFalse(settled["observation_only"])
+        self.assertEqual(settled["task_publish_scope"]["branch"], "pr-ci-projection")
+        self._codex_turn(session, runtime_env, prompt="continue with approved task scope")
+
+        codex = [json.loads(line) for line in session[4].read_text(encoding="utf-8").splitlines()]
+        thread_starts = [row["params"] for row in codex if row["method"] == "thread/start"]
+        turns = [row["params"] for row in codex if row["method"] == "turn/start"]
+        self.assertEqual(len(thread_starts), 1)
+        self.assertEqual(thread_starts[0]["approvalPolicy"], "on-request")
+        self.assertNotIn("sandbox", thread_starts[0])
+        self.assertEqual(len(turns), 2)
+        self.assertEqual([turn["threadId"] for turn in turns], [session[3], session[3]])
+        for turn in turns:
+            self.assertNotIn("approvalPolicy", turn)
+        self.assertEqual(turns[0]["sandboxPolicy"], {
+            "type": "readOnly", "networkAccess": False,
+        })
+        git_roots = [str(path) for path in commit_policy.commit_git_metadata_dirs(
+            argparse.Namespace(worker_type="owner", dispatch_depth=1,
+                               worktree=str(self.repo)))
+        ]
+        self.assertEqual(turns[1]["sandboxPolicy"], {
+            "type": "workspaceWrite",
+            "writableRoots": [str(self.repo), *git_roots],
+            "networkAccess": True,
+            "excludeTmpdirEnvVar": False,
+            "excludeSlashTmp": False,
+        })
+        self.assertFalse(session[1].owner_runtime_permission_state["observation_only"])
 
 
 if __name__ == "__main__":
