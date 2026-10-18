@@ -81,6 +81,8 @@ CARD_FIRST_REPLY_GUIDANCE = (
     "[첫 답] 이 카드로 이어받은 첫 답 맨 앞에, 도구 호출 전에, 사용자의 언어로 "
     "'하던 일 · 남은 일 · 다음 할 일' 세 머리말을 써서 5줄 안팎 요약을 한 번 보여 준 뒤 "
     "이어서 하세요. 사용자가 이어서하기 대신 다른 지시를 먼저 주면 요약을 생략하고 그 지시만 따르세요."
+    " 요약에는 대상의 원천 설명과 구별 조건을 먼저 쓰고 원래 번호를 덧붙이세요. "
+    "미완료·중단 상태와 다음 행동을 유지하고, 뜻이 확인되지 않은 식별자는 추측하지 마세요."
 )
 # Keep the previous body allowance when memory references ride along.
 CARD_MIN_WHEN_BUNDLED = 900 + len(CARD_FIRST_REPLY_GUIDANCE.encode("utf-8")) + 1
@@ -105,6 +107,10 @@ COMPACT_CARD_INSTRUCTIONS = (
     "file pointers); user instructions (brief quotes, each marked finished, remaining or "
     "deferred). Keep the details needed to continue the work inside those fields, within "
     "about 90 lines."
+    " Carry the source description and distinguishing comparison condition before the "
+    "original identifier; preserve document/revision and checkpoint references when they "
+    "affect meaning. Keep failed, interrupted and unfinished states with their next action, "
+    "and leave unexplained identifiers unresolved."
 )
 
 

@@ -81,6 +81,12 @@ PR, installed version or result file. Quote each user instruction briefly and
 mark it finished, remaining or deferred. The start preview remains the bounded
 beginning of the card; read the full file for the rest. The memory worker's
 "partly read" line describes its separate conversation input, not this card.
+When naming work in any of those existing fields, keep the source description
+and the comparison condition that distinguishes it, then add the original
+identifier as a reference. Preserve document/revision and checkpoint links
+when they affect meaning. Record failed, interrupted and unfinished work in
+the same fields with its actual status and next action; do not guess what an
+unexplained identifier means.
 
 Example fields (use the user's language):
 

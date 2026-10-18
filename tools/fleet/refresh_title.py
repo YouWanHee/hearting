@@ -125,6 +125,10 @@ pending, running, idle, blocked, preparing, starting, resuming, monitoring, or "
 progress" must not appear in the title — that is the NOW line's job.
 Keep the previous wording only while recent CONVERSATION still has the same dominant topic.
 When that topic changes, replace the prior title without waiting for an explicit declaration.
+When the source provides a recognizable description and a distinguishing comparison
+condition, preserve them before the original experiment or run identifier. Keep
+different subjects distinct, and do not guess an unexplained identifier or merge
+conditions from different documents or revisions.
 Do not lock the title to the session's first user turn, and do not rename it for a mere follow-up step. No
 quotes, no trailing period. If the excerpt is unreadable or empty, output the single
 word: untitled.
@@ -132,6 +136,9 @@ NOW: one sentence, in {now_lang}, describing only the latest execution delta in 
 CONVERSATION block,
 is doing RIGHT NOW — never more than 80 characters. If you cannot tell, output the
 single word: unknown.
+When subjects are compared, retain the condition needed to tell them apart and report
+failure, interruption, or unfinished status as observed; the title carries the subject
+while NOW carries the latest change.
 
 No explanations, no other lines, nothing before TITLE: or after the NOW: line."""
 
