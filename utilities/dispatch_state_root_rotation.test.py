@@ -2442,6 +2442,52 @@ class RetentionContainmentGateTest(unittest.TestCase):
         DISTRIBUTION.current_path().symlink_to(v3)
         return v1, v2, v3
 
+    def _missing_attempt_proof(self, candidate):
+        real_attempt_ids = DISTRIBUTION._release_attempt_ids
+
+        def missing(dispatch_root):
+            ids = real_attempt_ids(dispatch_root)
+            if dispatch_root == candidate / ".dispatch":
+                return ids | {"att-missing-from-surviving-root"}
+            return ids
+
+        return mock.patch.object(
+            DISTRIBUTION, "_release_attempt_ids", side_effect=missing
+        )
+
+    def _descriptor_path(self, fd):
+        try:
+            return Path(os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")))
+        except OSError:
+            return None
+
+    def _cleanup_with_gap_before_delete(self, candidate, stable_root, minimum_rows):
+        import dispatch_registry_inventory as INV
+
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        real_rmtree = DISTRIBUTION.shutil.rmtree
+        deletion_evidence = []
+
+        def inspect_before_removal(path, *args, **kwargs):
+            if Path(path) == candidate:
+                data = gap_path.read_bytes()
+                self.assertTrue(data.endswith(b"\n"), "gap journal must end on a complete row")
+                line_count = len(data.splitlines())
+                self.assertGreaterEqual(line_count, minimum_rows)
+                rows = INV.read_gaps(stable_root)
+                self.assertEqual(len(rows), line_count)
+                self.assertTrue(all(row["discovered_by"] == "forced-prune" for row in rows))
+                self.assertTrue(all(row["recoverable"] is False for row in rows))
+                deletion_evidence.append(data)
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(
+            DISTRIBUTION.shutil, "rmtree", side_effect=inspect_before_removal
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+        self.assertEqual(len(deletion_evidence), 1, "source removal must follow a readable gap")
+        return deletion_evidence[0]
+
     def test_containment_holds_after_carry_forward_and_prune_proceeds(self):
         v1, v2, v3 = self._three_release_chain()
         DISTRIBUTION._cleanup_releases(keep=set())
@@ -2586,6 +2632,152 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["discovered_by"], "forced-prune")
         self.assertFalse(gaps[0]["recoverable"])
+
+    def test_forced_prune_gap_retries_positive_short_writes_before_removal(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        real_write = os.write
+        target_writes = 0
+
+        def short_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) == gap_path:
+                target_writes += 1
+                return real_write(fd, data[: min(13, len(data))])
+            return real_write(fd, data)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=short_write
+        ):
+            self._cleanup_with_gap_before_delete(v1, stable_root, minimum_rows=1)
+
+        self.assertGreater(target_writes, 1, "positive short writes must be completed in a loop")
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists(), "derived cache follows source removal")
+
+    def test_forced_prune_gap_partial_append_rolls_back_and_retry_preserves_prior_bytes(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        real_write = os.write
+        target_writes = 0
+
+        def interrupted_partial_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) != gap_path:
+                return real_write(fd, data)
+            target_writes += 1
+            if target_writes == 1:
+                return real_write(fd, data[:17])
+            if target_writes == 2:
+                raise InterruptedError()
+            return 0
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=interrupted_partial_write
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertEqual(target_writes, 3)
+        self.assertTrue(v1.exists(), "a partial append must not authorize source deletion")
+        self.assertTrue(cache.exists(), "failed gap append must retain derived cache")
+        self.assertEqual(gap_path.read_bytes(), original_bytes, "rollback must preserve prior journal bytes")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2
+            )
+        self.assertTrue(retry_bytes.startswith(original_bytes))
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
+
+    def test_forced_prune_gap_file_sync_failure_retains_release_and_retries(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_gap_file_sync(fd):
+            nonlocal failed
+            if self._descriptor_path(fd) == gap_path and not failed:
+                failed = True
+                raise OSError("injected forced-prune gap file sync failure")
+            return real_fsync(fd)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "fsync", side_effect=fail_gap_file_sync
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(failed, "the gap file must be synchronized before deletion")
+        self.assertTrue(v1.exists())
+        self.assertTrue(cache.exists())
+        self.assertEqual(gap_path.read_bytes(), original_bytes)
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2
+            )
+        self.assertTrue(retry_bytes.startswith(original_bytes))
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
+
+    def test_forced_prune_gap_directory_sync_failure_retains_release_and_retries(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        inventory_root = stable_root / "inventory"
+        gap_path = inventory_root / "gaps.jsonl"
+        self.assertFalse(inventory_root.exists(), "fixture must exercise first namespace creation")
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_inventory_directory_sync(fd):
+            nonlocal failed
+            if self._descriptor_path(fd) == inventory_root and not failed:
+                failed = True
+                raise OSError("injected forced-prune gap directory sync failure")
+            return real_fsync(fd)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "fsync", side_effect=fail_inventory_directory_sync
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(failed, "the new inventory namespace must be synchronized")
+        self.assertTrue(v1.exists())
+        self.assertTrue(cache.exists())
+        self.assertEqual(gap_path.read_bytes(), b"", "failed directory sync must roll back the row")
+
+        with self._missing_attempt_proof(v1):
+            self._cleanup_with_gap_before_delete(v1, stable_root, minimum_rows=1)
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
 
     def _promote_candidate(self, candidate):
         result = DISTRIBUTION.run_dispatch_state_migration(

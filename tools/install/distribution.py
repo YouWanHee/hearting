@@ -3744,44 +3744,90 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
     ).hexdigest()
     inventory_root = state_root / "inventory"
     lock_path = inventory_root / "gaps.lock"
-    inventory_root.mkdir(parents=True, exist_ok=True)
-    with open(str(lock_path), "a+b") as handle:
-        try:
-            import fcntl
+    created_directories = []
+    ancestor = inventory_root
+    while not ancestor.exists():
+        created_directories.append(ancestor)
+        ancestor = ancestor.parent
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except ImportError:
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    def _sync_directory(path: Path) -> None:
+        directory_fd = os.open(str(path), os.O_RDONLY)
         try:
-            row = {
-                "schema_version": 1,
-                "gap_id": _gap_id(from_ts, to_ts, evidence_digest),
-                "from_ts": from_ts,
-                "to_ts": to_ts,
-                "evidence_digest": evidence_digest,
-                "cited_ledger_snapshot_digest": evidence_digest,
-                "recoverable": False,
-                "discovered_by": "forced-prune",
-                "recorded_at": _utc_now(),
-            }
-            row["event_id"] = _gap_event_id(row)
-            try:
-                fd = os.open(str(inventory_root / "gaps.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-                try:
-                    os.write(fd, (_canonical_json(row) + "\n").encode("utf-8"))
-                finally:
-                    os.close(fd)
-            except OSError:
-                return False
-            return True
+            os.fsync(directory_fd)
         finally:
+            os.close(directory_fd)
+
+    try:
+        inventory_root.mkdir(parents=True, exist_ok=True)
+        with open(str(lock_path), "a+b") as handle:
             try:
-                if "fcntl" in sys.modules:
-                    sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
-            except OSError:
-                pass
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                row = {
+                    "schema_version": 1,
+                    "gap_id": _gap_id(from_ts, to_ts, evidence_digest),
+                    "from_ts": from_ts,
+                    "to_ts": to_ts,
+                    "evidence_digest": evidence_digest,
+                    "cited_ledger_snapshot_digest": evidence_digest,
+                    "recoverable": False,
+                    "discovered_by": "forced-prune",
+                    "recorded_at": _utc_now(),
+                }
+                row["event_id"] = _gap_event_id(row)
+                gap_path = inventory_root / "gaps.jsonl"
+                payload = (_canonical_json(row) + "\n").encode("utf-8")
+                sync_directories = [inventory_root]
+                for path in (*created_directories, ancestor, state_root):
+                    if path not in sync_directories:
+                        sync_directories.append(path)
+
+                fd = os.open(
+                    str(gap_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600
+                )
+                original_size = os.fstat(fd).st_size
+                try:
+                    offset = 0
+                    while offset < len(payload):
+                        try:
+                            written = os.write(fd, payload[offset:])
+                        except InterruptedError:
+                            continue
+                        if written <= 0:
+                            raise OSError("forced-prune gap append made no progress")
+                        offset += written
+                    os.fsync(fd)
+                    for directory in sync_directories:
+                        _sync_directory(directory)
+                except OSError:
+                    # The gap lock serializes this append with the runtime writer.
+                    # Restore only this attempt's suffix so a normal retry can
+                    # append a fresh complete JSONL row without losing prior rows.
+                    try:
+                        os.ftruncate(fd, original_size)
+                        os.fsync(fd)
+                        for directory in sync_directories:
+                            _sync_directory(directory)
+                    except OSError:
+                        pass
+                    os.close(fd)
+                    return False
+                os.close(fd)
+                return True
+            finally:
+                try:
+                    if "fcntl" in sys.modules:
+                        sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        return False
 
 
 def _release_keep_message(candidate: Path, why: str) -> str:
