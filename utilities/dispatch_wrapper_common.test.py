@@ -147,6 +147,60 @@ class WrapperCommonTest(unittest.TestCase):
                 self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "invalid", []))
                 execv.assert_not_called()
 
+    def test_real_execv_reaches_the_sealed_sibling_release_for_each_harness(self):
+        import subprocess
+
+        wrapper_template = """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+from dispatch_wrapper_common import reexec_for_sealed_release
+root = Path(__file__).resolve().parents[3]
+sealed = Path(os.environ["SEALED_LAUNCH_HOME"])
+reexec_for_sealed_release(root, sealed, "{harness}", sys.argv[1:])
+Path(os.environ["REEXEC_RECEIPT"]).write_text(json.dumps({{
+    "root": str(root), "agent_home": os.environ.get("AGENT_HOME"),
+    "argv": sys.argv[1:], "pid": os.getpid(),
+}}), encoding="utf-8")
+"""
+        argv = ["--slug", "argument with spaces", "--start"]
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            releases = temp_root / "managed" / "releases"
+            releases.mkdir(parents=True)
+            release_a, release_b = releases / "vA", releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            for harness in ("claude", "codex", "opencode"):
+                for release in (release_a, release_b):
+                    wrapper = release / "adapters" / harness / "bin" / "dispatch-headless.py"
+                    wrapper.write_text(wrapper_template.format(harness=harness), encoding="utf-8")
+                for source, sealed in ((release_a, release_b), (release_b, release_a)):
+                    with self.subTest(harness=harness, source=source.name, sealed=sealed.name):
+                        receipt = temp_root / f"receipt-{harness}-{source.name}-{sealed.name}.json"
+                        env = {
+                            "PATH": os.environ.get("PATH", ""),
+                            "HOME": str(temp_root / "home"),
+                            "PYTHONPATH": str(ROOT / "utilities"),
+                            "AGENT_HOME": str(source),
+                            "SEALED_LAUNCH_HOME": str(sealed),
+                            "REEXEC_RECEIPT": str(receipt),
+                        }
+                        process = subprocess.Popen(
+                            [sys.executable, str(source / "adapters" / harness / "bin" /
+                                               "dispatch-headless.py"), *argv],
+                            cwd=str(ROOT), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                        )
+                        stdout, stderr = process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 0, stdout + stderr)
+                        payload = json.loads(receipt.read_text(encoding="utf-8"))
+                        self.assertEqual(payload["root"], str(sealed.resolve()))
+                        self.assertEqual(payload["agent_home"], str(sealed.resolve()))
+                        self.assertEqual(payload["argv"], argv)
+                        self.assertEqual(payload["pid"], process.pid)
+
     def test_owner_input_opens_only_for_a_supervised_owner(self):
         from unittest import mock
         args = argparse.Namespace(attempt_id="att-1")
