@@ -3118,8 +3118,7 @@ class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
     def test_restart_adopts_the_same_wait_child_without_a_second_call(self):
         armed = self._fields(self._run("watch", "peer-a", env=self._env("held")).stdout)
         watch_id = armed["watch_id"]
-        observation = self._wait_for_observation(watch_id)
-        native_wait = observation["native_wait"]
+        native_wait = self._wait_for_native_wait_started(watch_id)
         self.assertEqual(native_wait["state"], "started")
         self.assertTrue(peer_steward._pid_identity_ok(
             native_wait["pid"], native_wait["pid_start"]))
@@ -3136,7 +3135,7 @@ class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
         arm_path = self.watch_root / f"{watch_id}.json"
         updated = json.loads(arm_path.read_text())
         self.assertNotEqual(updated["watcher"]["pid"], old_watcher)
-        resumed_wait = self._wait_for_observation(watch_id)["native_wait"]
+        resumed_wait = self._wait_for_native_wait_started(watch_id)
         self.assertEqual((resumed_wait["pid"], resumed_wait["pid_start"]),
                          (native_wait["pid"], native_wait["pid_start"]))
         waits = [line for line in self.calllog.read_text().splitlines()
