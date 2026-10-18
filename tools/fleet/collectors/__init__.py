@@ -293,8 +293,12 @@ def apply_session_aliases(sessions):
         # id here would make two rows answer to one key and hand the parent's messages to
         # the child, so an id that is still someone's current identity is never an alias.
         aliases = [a for a in aliases if (harness, a) not in live_ids]
-        if aliases:
-            s.session_aliases = aliases
+        existing = getattr(s, "session_aliases", None) or []
+        merged = list(dict.fromkeys(
+            alias for alias in (*existing, *aliases) if (harness, alias) not in live_ids
+        ))
+        if merged:
+            s.session_aliases = merged
 
 
 def apply_peer_rows(sessions, by_key):

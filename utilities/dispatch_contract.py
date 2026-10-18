@@ -2160,33 +2160,21 @@ def supervisor_lease_is_held(
 def _declared_supervisor_lease_metadata(
     jobs: Path, attempt_id: str
 ) -> dict[str, str]:
-    lock_path = Path(f"{jobs}.lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            raise DispatchContractError(
-                "supervisor-lease-registry-unreadable", str(exc)
-            ) from exc
-        matches: list[tuple[str, dict[str, str]]] = []
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            metadata = parse_registry_metadata(fields[5])
-            if metadata.get("attempt_id") == attempt_id:
-                matches.append((fields[1], metadata))
-        if len(matches) != 1 or matches[0][0] not in {"open", "running"}:
-            raise DispatchContractError(
-                "supervisor-lease-attempt-not-open", attempt_id
-            )
-        metadata = matches[0][1]
-        if not _supervisor_lease_metadata_valid(jobs, metadata):
-            raise DispatchContractError(
-                "supervisor-lease-declaration-invalid", attempt_id
-            )
-        return metadata
+    # Observation can run inside a terminal writer's jobs lock. Reopening
+    # that same lock would block this process on its own open description.
+    # Lease acquisition still holds its separate exact flock and confirms
+    # the declaration again after acquisition.
+    from dispatch_registry_cache import registry_view
+    try:
+        records = registry_view(jobs).completion_attempt_records(attempt_id)
+    except OSError as exc:
+        raise DispatchContractError("supervisor-lease-registry-unreadable", str(exc)) from exc
+    if len(records) != 1 or records[0].status not in {"open", "running"}:
+        raise DispatchContractError("supervisor-lease-attempt-not-open", attempt_id)
+    metadata = records[0].completion_metadata()
+    if not _supervisor_lease_metadata_valid(jobs, metadata):
+        raise DispatchContractError("supervisor-lease-declaration-invalid", attempt_id)
+    return metadata
 
 
 @contextmanager
@@ -3110,13 +3098,14 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     try:
         raw = (entry / "stat").read_text(encoding="utf-8")
         tail = raw[raw.rfind(")") + 2:].split()
-        if tail[0] == "Z":
-            # exit_mm can revoke environ between the walk's stat read and
-            # this adjacent observation. A zombie cannot run or fork.
+        flags = int(tail[6], 10)
+        if tail[0] == "Z" or flags & 0x4:  # PF_EXITING
+            # exit_mm can revoke environ before the process becomes a zombie.
+            # A PF_EXITING task cannot run or fork either.
             return "", ""
         current = tail[19]
         stable = start if start.isdigit() and current == start else ""
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return "", ""
     except (OSError, IndexError, ValueError):
         stable, tail = "", None
@@ -4878,40 +4867,35 @@ def _parent_binding_is_live_from_metadata(
 def parent_attempt_binding_is_live(
     jobs: str | Path, binding: ParentAttemptBinding
 ) -> bool:
-    """Revalidate one exact parent row plus its current liveness evidence."""
+    """Observe one exact parent without contending with registry writers.
+
+    Registry writers replace complete files atomically. This read can also be
+    called while a writer owns jobs.log.lock; opening that lock again would
+    deadlock on a different open file description. Mutation admission keeps
+    its separate fresh, lock-held parent check in spawn_claimed_attempt.
+    """
 
     registry = Path(jobs).expanduser().resolve(strict=False)
     try:
-        with Path(f"{registry}.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            lines = registry.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-            matches: list[tuple[list[str], dict[str, str]]] = []
-            for line in lines:
-                fields = line.split("\t")
-                if len(fields) != 6 or fields[1] not in {"open", "running"}:
-                    continue
-                metadata = parse_registry_metadata(fields[5])
-                if metadata.get("attempt_id") == binding.attempt_id:
-                    matches.append((fields, metadata))
-            if len(matches) != 1:
-                return False
-            fields, metadata = matches[0]
-            try:
-                validate_attempt_metadata(metadata)
-            except DispatchContractError:
-                return False
-            if (
-                fields[4] != binding.slug
-                or fields[3] != binding.worktree
-                or (fields[2] != binding.repository_path if binding.repository_path
-                    else canonical_repository_identity(fields[2]) != binding.repository_identity)
-            ):
-                return False
-            return _parent_binding_is_live_from_metadata(
-                registry, metadata, binding
-            )
+        from dispatch_registry_cache import registry_view
+        records = registry_view(registry).completion_attempt_records(binding.attempt_id)
+        matches = [record for record in records if record.status in {"open", "running"}]
+        if len(matches) != 1:
+            return False
+        record = matches[0]
+        fields, metadata = record.fields, record.completion_metadata()
+        try:
+            validate_attempt_metadata(metadata)
+        except DispatchContractError:
+            return False
+        if (
+            fields[4] != binding.slug
+            or fields[3] != binding.worktree
+            or (fields[2] != binding.repository_path if binding.repository_path
+                else canonical_repository_identity(fields[2]) != binding.repository_identity)
+        ):
+            return False
+        return _parent_binding_is_live_from_metadata(registry, metadata, binding)
     except OSError:
         return False
 
@@ -10174,7 +10158,7 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
-def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> None:
+def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jobs: Path | None = None) -> None:
     """The jobs lock arbitrates retries against the committed predecessor.
 
     Observers propose a predecessor, never permission. Distinct consumers of
@@ -10203,8 +10187,29 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
         raise DispatchContractError("retry-predecessor-missing", prior)
     status, source = predecessor
     if source.get("replacement_family_id"):
-        if (source.get("replacement_attempt_id") != metadata.get("attempt_id")
-                or metadata.get("replacement_family_id") != source["replacement_family_id"]):
+        if jobs is None:
+            family = source.get("replacement_family_id")
+            replacement = source.get("replacement_attempt_id")
+        else:
+            from dispatch_replacement import _check_record, _read, _record_path, source_binding
+            binding = source_binding(jobs, source)
+            family, replacement = (binding[0], binding[1]) if binding else (None, None)
+            if family and replacement:
+                record = _check_record(_read(_record_path(jobs, family)), family,
+                                       {"replacement_claim_digest": binding[2] or None})
+                if (record.get("original_attempt_id") != prior
+                        or record.get("replacement_attempt_id") != replacement):
+                    raise DispatchContractError("replacement-lineage-unproven", prior)
+            elif source.get("replacement_original_attempt_id"):
+                # The inbound family on a replacement row is not its outgoing
+                # claim. Without the exact by-source reservation there is no
+                # authorized successor to register.
+                raise DispatchContractError("automatic-replacement-exhausted", prior)
+            else:
+                family = source.get("replacement_family_id")
+                replacement = source.get("replacement_attempt_id")
+        if (not family or replacement != metadata.get("attempt_id")
+                or metadata.get("replacement_family_id") != family):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
     if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
@@ -10378,7 +10383,7 @@ def claim_attempt_row(
                         return False
                 if not launch or metadata.get("launch_claimed") == "1" or fields[1] != "open":
                     return False
-                _automatic_retry_admission(lines, row_metadata)
+                _automatic_retry_admission(lines, row_metadata, jobs=jobs)
                 if preclaim is not None:
                     preclaim(lines)
                 pipe = ",".join(part for part in fields[5].split(",") if not part.startswith("launch_claimed="))
@@ -10436,7 +10441,7 @@ def claim_attempt_row(
                     f"replacement_attempts={len(replacement_attempts)} limit={replacement_attempt_limit}",
                 )
         if launch:
-            _automatic_retry_admission(lines, row_metadata)
+            _automatic_retry_admission(lines, row_metadata, jobs=jobs)
         if launch and preclaim is not None:
             preclaim(lines)
         row_fields[5] += f",launch_claimed={1 if launch else 0}"

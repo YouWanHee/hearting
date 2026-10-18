@@ -76,6 +76,21 @@ _SYNTHETIC_NATIVE_TITLE_RE = re.compile(
 )
 
 
+class DaemonIdentityObservation:
+    """Short-lived socket-owner snapshots shared by one multi-PID observation."""
+
+    __slots__ = ("initial_scan", "recheck_scan")
+
+    def __init__(self):
+        self.initial_scan = {}
+        self.recheck_scan = {}
+
+    def invalidate(self):
+        """Discard both snapshots after any identity evidence changes."""
+        self.initial_scan.clear()
+        self.recheck_scan.clear()
+
+
 @dataclass
 class _CodexTick:
     """Collection-local Codex evidence frozen independently for each runtime home."""
@@ -1451,7 +1466,7 @@ def _live_tui_start(pid):
     return start if procscan.read_proc_start(pid) == start else None
 
 
-def _daemon_session_for_process(pid, environ=None):
+def _daemon_session_for_process(pid, environ=None, observation=None):
     """The sole root thread whose codex_tui listener belongs to this live TUI PID."""
     from . import procscan
     start = _live_tui_start(pid)
@@ -1463,7 +1478,7 @@ def _daemon_session_for_process(pid, environ=None):
         return None
     listeners = {}
     candidates = set()
-    scan = {}
+    scan = observation.initial_scan if isinstance(observation, DaemonIdentityObservation) else {}
     for thread_id, (port, source) in origins.items():
         if not port or not source or source == "subagent":
             continue
@@ -1472,6 +1487,8 @@ def _daemon_session_for_process(pid, environ=None):
             observed = _tcp_listener_snapshot(port, scan)
             if observed is None:
                 _invalidate_origins(origins)
+                if isinstance(observation, DaemonIdentityObservation):
+                    observation.invalidate()
                 return None
             listeners[port] = observed
         inodes, owners = observed
@@ -1479,12 +1496,14 @@ def _daemon_session_for_process(pid, environ=None):
             candidates.add(thread_id)
     if len(candidates) != 1:
         return None
-    recheck = {}
+    recheck = observation.recheck_scan if isinstance(observation, DaemonIdentityObservation) else {}
     if (not _daemon_endpoint_current(origins)
             or any(not _listener_unchanged(port, observed, recheck)
                    for port, observed in listeners.items())
             or procscan.read_proc_start(pid) != start):
         _invalidate_origins(origins)
+        if isinstance(observation, DaemonIdentityObservation):
+            observation.invalidate()
         return None
     return next(iter(candidates))
 
@@ -1521,7 +1540,7 @@ def process_for_thread(thread_id, environ=None):
     return pid, start
 
 
-def session_id_of_process(pid, live_codex=None):
+def session_id_of_process(pid, live_codex=None, *, observation=None):
     """Return an fd-proven thread or the daemon's unique TUI-loader thread.
 
     A Codex TUI without its own rollout fd is identified only by its
@@ -1550,7 +1569,7 @@ def session_id_of_process(pid, live_codex=None):
         return None                     # procscan lists only `codex` itself as a runtime
     if procscan.invocation_mode("codex", procscan._read_argv(pid)) != "session":
         return None
-    return _daemon_session_for_process(pid, initial_env)
+    return _daemon_session_for_process(pid, initial_env, observation=observation)
 
 
 

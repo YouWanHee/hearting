@@ -1700,10 +1700,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         from dispatch_session_sweep import activate, sweep_deliver
         self.enterContext(mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.root)}))
         self.enterContext(mock.patch.object(steward.peer_obligations, "ensure_normal_runner"))
+        # The recipient is a restorable native session: activation happens
+        # while its agent is unavailable, then the same session becomes
+        # available below. Keep the recorded parent process live for this
+        # scenario; the class-level synthetic ancestry is positively dead and
+        # would correctly trigger the separate recipient-death expiry path.
+        restorable_parent = rewake._process_identity(os.getpid())
+        self.assertIsNotNone(restorable_parent)
         for harness, carrier in (("claude", "claude-parent-runtime"),
                                  ("codex", "codex-native-queue"), ("opencode", "opencode-turn")):
             with self.subTest(harness=harness):
-                self._open_row()
+                self._open_row(ancestry=restorable_parent)
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
                 path = self._close_and_materialize(close_note)
                 with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):

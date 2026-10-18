@@ -260,6 +260,26 @@ class FrameLaunchGateTest(unittest.TestCase):
 
 
 class DispatchContractTest(unittest.TestCase):
+ def test_access_observation_exempts_exiting_and_vanished_processes_only(self):
+  entry=Path("/proc/4242")
+  stat_tail=lambda state,flags: "4242 (fixture) %s 1 2 3 4 5 %d 7 8 9 10 11 12 13 14 15 16 17 18 99" % (state,flags)
+  with mock.patch.object(Path,"stat",return_value=types.SimpleNamespace(st_uid=os.getuid())), \
+       mock.patch.object(Path,"read_text",side_effect=lambda *a,**k: stat_tail("S",4)), \
+       mock.patch.object(D,"_forked_across_uid_boundary",return_value=False):
+   self.assertEqual(D._tag_access_observation(entry,"99"),("", ""))
+
+  for error in (FileNotFoundError(), ProcessLookupError()):
+   with self.subTest(error=type(error).__name__), \
+        mock.patch.object(Path,"stat",return_value=types.SimpleNamespace(st_uid=os.getuid())), \
+        mock.patch.object(Path,"read_text",side_effect=error):
+    self.assertEqual(D._tag_access_observation(entry,"99"),("", ""))
+
+  with mock.patch.object(Path,"stat",return_value=types.SimpleNamespace(st_uid=os.getuid())), \
+       mock.patch.object(Path,"read_text",return_value=stat_tail("S",0)), \
+       mock.patch.object(D,"_forked_across_uid_boundary",return_value=False):
+   self.assertEqual(D._tag_access_observation(entry,"99"),
+                    ("99", "procfs-environ:4242:same-uid-unobservable"))
+
  def test_cancel_closes_witness_only_on_cancelled_receipt(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td)
@@ -1167,6 +1187,36 @@ class DispatchContractTest(unittest.TestCase):
      if proc.poll() is None:proc.kill()
      proc.wait()
 
+ def test_parent_wait_reuses_generation_without_taking_the_writer_lock(self):
+  import dispatch_registry_cache as cache
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   parent=subprocess.Popen(["sleep","30"])
+   try:
+    start=D.process_start_ticks(parent.pid)
+    row=self.owner_row("att-parent-wait",parent.pid,start)+"\n"
+    jobs.write_text(row)
+    binding=D.resolve_live_parent_attempt(jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+                                         expected_attempt_id="att-parent-wait")
+    cache.clear_cache();cache.reset_metrics()
+    with Path(str(jobs)+".lock").open("a") as lock:
+     fcntl.flock(lock,fcntl.LOCK_EX)
+     with mock.patch.object(D.fcntl,"flock",side_effect=AssertionError("wait reacquired jobs lock")):
+      self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
+      self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
+    self.assertEqual(cache.metrics_snapshot()["content_reads"],1)
+    stamp=jobs.stat()
+    jobs.write_text(row.replace("\topen\t","\tdone\t"))
+    os.utime(jobs,ns=(stamp.st_atime_ns,stamp.st_mtime_ns))
+    self.assertFalse(D.parent_attempt_binding_is_live(jobs,binding))
+    jobs.unlink();jobs.write_text(row)
+    self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
+    parent.kill();parent.wait()
+    self.assertFalse(D.parent_attempt_binding_is_live(jobs,binding))
+   finally:
+    if parent.poll() is None:parent.kill()
+    parent.wait()
+
  def test_dead_or_identity_missing_parent_prevents_claim(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
@@ -1214,6 +1264,16 @@ class DispatchContractTest(unittest.TestCase):
     self.assertEqual(binding.liveness_source,"supervisor-lease")
     self.assertIsNone(binding.observed_pid)
     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
+    # A normal writer may observe supervision while owning jobs.lock.
+    real_flock=D.fcntl.flock
+    def no_nested_jobs_lock(fd,operation):
+     if (operation & fcntl.LOCK_EX and os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))==str(jobs)+".lock"):
+      raise AssertionError("supervision observation reacquired jobs lock")
+     return real_flock(fd,operation)
+    with Path(str(jobs)+".lock").open("a") as registry_lock:
+     real_flock(registry_lock,fcntl.LOCK_EX)
+     with mock.patch.object(D.fcntl,"flock",side_effect=no_nested_jobs_lock):
+      self.assertEqual(D.probe_owner_supervision(jobs,attempt).state,"held")
     sealed_row=jobs.read_text()
     jobs.write_text(sealed_row.replace(
      f"supervisor_lease_nonce={nonce}",f"supervisor_lease_nonce={'e'*64}"))

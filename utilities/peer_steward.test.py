@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for utilities/peer-steward.py (SD-122 (9) steward wait/start)."""
+import concurrent.futures
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -213,23 +215,55 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                     target="peer", until=[native], timeout=500, rearm_count=0,
                     steward_harness="codex", steward_session_id="sender", steward_project="fixture",
                     armed_ts="now", rearmed_from=None, ref=[])
-                payload = {"result": {"agent": {"agent": "codex", "agent_status": native,
-                           "agent_session": {"value": "sid-peer"}, "pane_id": "w1:p9", "name": "peer"}}}
+                # Durable arms and wait observations use normalized identity,
+                # while Herdr's wire payload is normalized before persistence.
+                agent = {**identity, "name": "peer"}
+                peer_steward._write_json_atomic(paths.arm, {
+                    "schema_version": peer_steward._WATCH_SCHEMA, "watch_id": watch_id,
+                    "target": "peer", "until": [native], "timeout": 500,
+                    "deadline": peer_steward._watch_deadline(500),
+                    "server": "secondary", "agent": agent,
+                    "steward": {"harness": "codex", "session_id": "sender"},
+                    "observer_protocol": 2,
+                })
+                # The child wait has already settled. This isolates this test to
+                # readiness consumption and event wakeup; launch/result recovery
+                # has its own collector and watcher coverage.
+                peer_steward._write_json_atomic(paths.observation, {
+                    "schema_version": peer_steward._WATCH_SCHEMA, "watch_id": watch_id,
+                    "state": "waiting", "reason": "native-wait-result-consumed",
+                    "native_wait": {"state": "result", "agent_state": native,
+                                    "agent": agent, "reason": native},
+                })
                 checkpoints = []
                 def release(_delay):
                     checkpoint = peer_steward._read_json(paths.observation)
                     checkpoints.append(checkpoint["reason"])
                     self.assertFalse(paths.receipt.exists())
                     self.jobs_path.write_text("")
+                transport = mock.Mock()
+                transport.fileno.return_value = 987654
+                transport.observe.return_value = {}
+
+                def deliver_event(readers, _writers, _errors, _timeout=None):
+                    if transport.fileno.return_value in readers:
+                        if native != "working" and not checkpoints:
+                            release(None)
+                        return [transport.fileno.return_value], [], []
+                    return [], [], []
+
                 try:
-                    with mock.patch.object(peer_steward, "_run_herdr_get", return_value=payload), \
-                         mock.patch.object(peer_steward, "_run_herdr_wait", return_value=payload), \
+                    with mock.patch.object(peer_steward.herdr_observation,
+                                           "socket_path_for_endpoint", return_value="/fixture.sock"), \
+                         mock.patch.object(peer_steward.herdr_observation,
+                                           "ObservationTransport", return_value=transport), \
+                         mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                         mock.patch.object(peer_steward.select, "select", side_effect=deliver_event), \
                          mock.patch.object(peer_steward, "_retire_target", return_value=(native, identity, 0, None)), \
                          mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 123}), \
                          mock.patch.object(peer_steward, "_proc_start_ticks", return_value="birth"), \
                          mock.patch("dispatch_contract.observed_attempt_liveness", return_value=ObservedAttemptLiveness(
                              "alive" if process_state == "live" else "unverifiable", "fixture", process_state, "fixture")), \
-                         mock.patch.object(peer_steward.time, "sleep", side_effect=release), \
                          mock.patch.object(peer_steward.os, "_exit", side_effect=WatchExited), \
                          mock.patch.object(peer_steward, "_record"), \
                          mock.patch.object(peer_steward.peer_obligations, "pane_readiness",
@@ -349,6 +383,30 @@ class WaitTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print"), mock.patch.object(peer_steward.shutil, "which", return_value=None):
             self.assertEqual(self._wait(), 4)
         self.assertNotIn(("claude", "sid-steward-3"), peer_steward.peer_message.read_steward_markers())
+
+    def test_wait_marker_uses_resolved_name_and_pane_then_completes_with_sid(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        sidless = _agent_json("codex", "bad/id", "hearting-1d")
+        identified = _agent_json("codex", "sid-new", "hearting-1d")
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("codex", None, "raw-pane-alias")), \
+             mock.patch.object(peer_steward, "_run_herdr_wait",
+                               side_effect=[sidless, identified]):
+            self.assertEqual(self._wait(target="raw-pane-alias"), 0)
+            markers = peer_steward.peer_message.read_steward_markers()
+            entries = markers[("claude", "sid-steward")]["targets"]
+            self.assertEqual(set(entries), {"hearting-1d"})
+            self.assertEqual(entries["hearting-1d"], {
+                "harness": "codex", "session_id": None, "name": "hearting-1d",
+                "kind": "watch", "ts": entries["hearting-1d"]["ts"],
+                "source": "watch", "pane": "w1:pX"})
+            self.assertEqual(self._wait(target="raw-pane-alias"), 0)
+        entries = peer_steward.peer_message.read_steward_markers()[("claude", "sid-steward")]["targets"]
+        self.assertEqual(set(entries), {"sid-new"})
+        self.assertEqual((entries["sid-new"]["session_id"], entries["sid-new"]["name"],
+                          entries["sid-new"]["pane"]), ("sid-new", "hearting-1d", "w1:pX"))
 
     def test_herdr_binary_missing_is_herdr_unavailable_exit_4(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value=None):
@@ -943,15 +1001,24 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         cmd = _agent_start_cmd(run_mock)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
-    def test_codex_start_skips_its_startup_update_dialog(self):
+    def test_codex_start_keeps_shared_daemon_and_caller_args_without_update_override(self):
+        user_args = ["--remote", "unix:///tmp/caller-codex.sock"]
         for mode in ("bypass", "inherit"):
             with self.subTest(mode=mode), \
                     mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                     mock.patch.object(peer_steward.subprocess, "run",
                                       return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
-                self._start(kind="codex", permission_mode=mode)
+                self._start(kind="codex", permission_mode=mode, agent_args=user_args)
                 cmd = _agent_start_cmd(run_mock)
-                self.assertEqual(cmd[cmd.index("--") + 1:][:2], ["-c", "check_for_update_on_startup=false"])
+                passed = cmd[cmd.index("--") + 1:]
+                self.assertNotIn("check_for_update_on_startup=false", passed)
+                self.assertIn(user_args, [passed[i:i + len(user_args)]
+                                          for i in range(len(passed) - len(user_args) + 1)])
+                self.assertEqual(passed.count("--no-daemon"), 0)
+                if mode == "bypass":
+                    self.assertIn("--dangerously-bypass-approvals-and-sandbox", passed)
+                else:
+                    self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", passed)
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                 mock.patch.object(peer_steward.subprocess, "run",
                                   return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
@@ -1098,14 +1165,23 @@ if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(" ".join(argv) + " window=" + os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move") + "\n")
 
+# The real CLI accepts a selected endpoint before the command. Keep it in the
+# call log while parsing the same command shapes for endpoint-isolation tests.
+if argv[:1] == ["--session"]:
+    argv = argv[2:]
+
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
 mode_file = os.environ.get("FAKE_HERDR_MODE_FILE")
 if mode_file and os.path.exists(mode_file):
     mode = open(mode_file, encoding="utf-8").read().strip() or mode
 target = argv[2] if len(argv) > 2 else "-"
+agent_state = os.environ.get("FAKE_HERDR_AGENT_STATE", "idle")
+agent_state_file = os.environ.get("FAKE_HERDR_AGENT_STATE_FILE")
+if agent_state_file and os.path.exists(agent_state_file):
+    agent_state = open(agent_state_file, encoding="utf-8").read().strip() or agent_state
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
-    "agent_status": "idle", "name": target, "pane_id": "w1:p9",
+    "agent_status": agent_state, "name": os.environ.get("FAKE_HERDR_NAME", target), "pane_id": "w1:p9",
     "window_id": os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move")}, "type": "agent_info"}}
 identity_path = os.environ.get("FAKE_HERDR_IDENTITY_FILE")
 if identity_path and os.path.exists(identity_path):
@@ -1114,6 +1190,10 @@ if identity_path and os.path.exists(identity_path):
     info["result"]["agent"]["agent_session"]["value"] = replacement.get("session_id", "sid-fake")
     info["result"]["agent"]["pane_id"] = replacement.get("pane", "w1:p9")
     if replacement.get("once"):
+        with open(identity_path, "w", encoding="utf-8") as fh:
+            json.dump({"session_id": replacement.get("session_id", ""),
+                       "settle_after_get": True}, fh)
+    elif replacement.get("settle_after_get"):
         os.unlink(identity_path)
 
 def fail(code):
@@ -1157,6 +1237,16 @@ if verb == "wait":
             mode = open(mode_file, encoding="utf-8").read().strip() or mode
         if mode == "not-found":
             fail("agent_not_found")
+        if identity_path and os.path.exists(identity_path):
+            with open(identity_path, encoding="utf-8") as fh:
+                replacement = json.load(fh)
+            session = replacement.get("session_id") or "sid-fake"
+            info["result"]["agent"]["agent_session"]["value"] = session
+            info["result"]["agent"]["pane_id"] = replacement.get("pane", "w1:p9")
+    if os.environ.get("FAKE_HERDR_WAIT_STATE"):
+        info["result"]["agent"]["agent_status"] = os.environ["FAKE_HERDR_WAIT_STATE"]
+    if verb == "wait" and mode == "idle" and not info["result"]["agent"]["agent_session"]["value"]:
+        info["result"]["agent"]["agent_session"]["value"] = "sid-fake"
     print(json.dumps(info)); sys.exit(0)
 print(json.dumps(info)); sys.exit(0)
 '''
@@ -1284,6 +1374,24 @@ class _WatchMixin(_TmpRootMixin):
                 out[key] = value
         return out
 
+    def _arm_records(self):
+        return sorted(path for path in self.watch_root.glob("*.json")
+                      if re.fullmatch(r"[0-9a-f]{16}\.json", path.name))
+
+    def _wait_calls(self):
+        if not self.calllog.exists():
+            return []
+        return [line for line in self.calllog.read_text().splitlines()
+                if " agent wait " in f" {line} "]
+
+    def _wait_for_wait_calls(self, count, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if len(self._wait_calls()) >= count:
+                return self._wait_calls()
+            time.sleep(0.02)
+        self.fail(f"only {len(self._wait_calls())} native waits appeared; expected {count}")
+
     def _directive(self, stdout):
         """The `parent_next*` fields, read from the directive line only.
 
@@ -1298,15 +1406,25 @@ class _WatchMixin(_TmpRootMixin):
         return {}
 
     def _release(self):
-        # A held reader can close between our open() and write() (a watcher that just
-        # got EOF from the previous release): EPIPE means "no reader took it", retry.
-        for _ in range(100):
+        # A held reader can close between retries. Nonblocking open turns "no
+        # reader" into ENXIO so this bounded recovery loop cannot hang at open().
+        # The arm receipt precedes the native child's interpreter startup.
+        # Wait for the FIFO reader handshake within the existing startup
+        # budget; a fixed count of 100 retries gave it only one second.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            fd = None
             try:
-                with open(self.fifo, "w") as fh:
-                    fh.write("go")
+                fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(fd, b"go")
                 return
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {errno.ENXIO, errno.EPIPE}:
+                    raise
                 time.sleep(0.01)
+            finally:
+                if fd is not None:
+                    os.close(fd)
         self.fail("no reader took the FIFO release")
 
     def _wait_for_lock(self, watch_id, seconds=30):
@@ -1344,9 +1462,132 @@ class _WatchMixin(_TmpRootMixin):
             time.sleep(0.02)
         self.fail(f"observation checkpoint never appeared for {watch_id}")
 
+    def _wait_for_native_wait_started(self, watch_id, seconds=10):
+        path = self.watch_root / f"{watch_id}.observation.json"
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            observation = peer_steward._read_json(path) or {}
+            native_wait = observation.get("native_wait") or {}
+            if (native_wait.get("state") == "started"
+                    and native_wait.get("pid") and native_wait.get("pid_start")):
+                return native_wait
+            time.sleep(0.02)
+        self.fail(f"native wait never published its process identity for {watch_id}")
+
+
+class WatchDeadlineTest(unittest.TestCase):
+    def test_same_boot_deadline_uses_monotonic_time_after_wall_clock_reversal(self):
+        deadline = peer_steward._watch_deadline(
+            60_000, wall=1_000, monotonic=100, boot_id="boot-a")
+        remaining, state = peer_steward._watch_timeout_remaining_ms(
+            {"timeout": 60_000, "deadline": deadline},
+            wall=100, monotonic=101, boot_id="boot-a")
+        self.assertEqual((remaining, state), (59_000, "active"))
+
+    def test_reboot_rebuilds_a_clamped_budget_from_the_wall_deadline(self):
+        deadline = peer_steward._watch_deadline(
+            60_000, wall=1_000, monotonic=100, boot_id="boot-a")
+        arm = {"timeout": 60_000, "deadline": deadline}
+        self.assertEqual(peer_steward._watch_timeout_remaining_ms(
+            arm, wall=1_010, monotonic=1, boot_id="boot-b"), (50_000, "active"))
+        self.assertEqual(peer_steward._watch_timeout_remaining_ms(
+            arm, wall=100, monotonic=1, boot_id="boot-b"), (60_000, "active"))
+
+    def test_incomplete_legacy_timeout_is_unknown_without_a_fresh_budget(self):
+        remaining, state = peer_steward._watch_timeout_remaining_ms(
+            {"timeout": 30_000, "armed_ts": "not-a-timestamp"},
+            wall=1_000, monotonic=100, boot_id="boot-a")
+        self.assertIsNone(remaining)
+        self.assertEqual(state, "unknown")
+
+
+class WatchPendingRegisteredWorkTest(_TmpRootMixin, unittest.TestCase):
+    def _view(self, sid="sid-current"):
+        return SimpleNamespace(complete=True, endpoint="default", panes=[{
+            "pane_id": "w1:p9", "agent": "claude", "agent_session": {"value": sid}}])
+
+    def _expected(self):
+        return {"pane": "w1:p9", "harness": "claude", "session_id": "sid-current"}
+
+    def _row(self, status="running", sid="sid-current"):
+        import dispatch_contract
+        metadata = {
+            "attempt_schema_version": "2", "dispatch_depth": "2", "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "fallback_hop": "same-harness-headless", "attempt_id": "att-watch-live",
+            "harness": "codex", "parent_sid": sid, "parent_harness": "claude",
+            **dispatch_contract.process_launch_identity(os.getpid()),
+        }
+        pipe = ",".join(f"{key}={value}" for key, value in metadata.items())
+        self.jobs_path.write_text(f"now\t{status}\trepo\tworktree\twatch-live\t{pipe}\n")
+
+    def test_unchanged_registry_does_not_cache_liveness_or_terminal_status(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        self._row()
+        check = peer_steward._watch_registered_work_pending
+        self.assertTrue(check(self._view(), self._expected(), "default"))
+        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                        ObservedAttemptLiveness("unverifiable", "fixture", "unverifiable", "fixture")):
+            self.assertFalse(check(self._view(), self._expected(), "default"))
+        self._row(status="done")
+        self.assertFalse(check(self._view(), self._expected(), "default"))
+        self._row(sid="sid-foreign")
+        self.assertFalse(check(self._view(), self._expected(), "default"))
+
+    def test_replacement_incomplete_census_and_observation_errors_use_full_readiness(self):
+        self._row()
+        check = peer_steward._watch_registered_work_pending
+        self.assertFalse(check(self._view("sid-foreign"), self._expected(), "default"))
+        self.assertFalse(check(None, self._expected(), "default"))
+        view = self._view()
+        view.complete = False
+        self.assertFalse(check(view, self._expected(), "default"))
+        with mock.patch.object(peer_steward.peer_obligations, "bound_work_for_pane",
+                               side_effect=OSError("unreadable")):
+            self.assertFalse(check(self._view(), self._expected(), "default"))
+
+
+class WatchWakeTest(unittest.TestCase):
+    def test_malformed_observer_protocol_does_not_interrupt_watch_sweep(self):
+        with mock.patch.object(peer_steward.os, "kill") as kill:
+            self.assertFalse(peer_steward._wake_watch_observer({"observer_protocol": "bad"}))
+        kill.assert_not_called()
+
 
 class WatchArmTest(_WatchMixin, unittest.TestCase):
     """A56-1."""
+
+    def test_explicit_watch_timeout_is_terminal_and_sweep_does_not_restart_it(self):
+        env = self._env("held")
+        armed = self._run("watch", "peer-a", "--timeout", "500", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        original_deadline = peer_steward._read_json(arm_path)["deadline"]
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["state"], "timeout")
+        self.assertEqual(receipt["reason"], "watch-deadline")
+        waits = [line for line in self.calllog.read_text().splitlines()
+                 if line.startswith("agent wait ")]
+        # The total budget can expire before the observer launches its waiter.
+        # Either path must remain terminal without another wait or a new budget.
+        self.assertLessEqual(len(waits), 1, self.calllog.read_text())
+        final_arm = peer_steward._read_json(arm_path)
+        self.assertEqual(final_arm["deadline"], original_deadline)
+        self.assertEqual(peer_steward._watch_timeout_remaining_ms(final_arm)[1], "expired")
+        before = self.calllog.read_text()
+        self.assertEqual(self._run("__ensure-obligations", env=env).returncode, 0)
+        self.assertEqual(self.calllog.read_text(), before)
+
+    def test_zero_timeout_writes_receipt_without_launching_a_native_wait(self):
+        env = self._env("held")
+        armed = self._run("watch", "peer-a", "--timeout", "0", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual((receipt["state"], receipt["reason"]), ("timeout", "watch-deadline"))
+        self.assertFalse(any(line.startswith("agent wait ")
+                             for line in self.calllog.read_text().splitlines()))
 
     def test_a_hook_armed_watch_tells_the_caller_to_end_the_turn(self):
         """Review round 2/3, M-B: the contract function was locked, its wiring
@@ -1439,11 +1680,15 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
-    def _unbound_watch(self, mode):
+    def _unbound_watch(self, mode, extra_env=None):
         identity_path = self.tmp_root / "identity.json"
-        identity_path.write_text(json.dumps({"session_id": ""}))
+        # The first get sees no session; the following native wait/get sees the
+        # session created by first input. Keep that transition consistent across
+        # the fake Herdr calls so the observer can prove the same pane identity.
+        identity_path.write_text(json.dumps({"session_id": "", "once": True}))
         env = self._env(mode)
         env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        env.update(extra_env or {})
         proc = self._run("watch", "peer-a", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         fields = self._fields(proc.stdout.splitlines()[0])
@@ -1458,14 +1703,28 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         input, and `watch` refused it (`watch-identity-unverified`)."""
         watch_id, _arm, _identity, _env = self._unbound_watch("idle")
         receipt = self._wait_for_receipt(watch_id)
-        self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("-", "w1:p9"))
+        self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-fake", "w1:p9"))
+
+    def test_sidless_watch_marker_uses_resolved_name_and_pane(self):
+        _watch_id, _arm, _identity, env = self._unbound_watch(
+            "idle", {"FAKE_HERDR_NAME": "hearting-1d"})
+        markers = peer_steward.peer_message.read_steward_markers()
+        entry = markers[("claude", "steward-1")]["targets"]["hearting-1d"]
+        self.assertEqual((entry["harness"], entry["session_id"], entry["name"], entry["pane"]),
+                         ("claude", None, "hearting-1d", "w1:p9"))
 
     def test_pane_armed_watch_keeps_the_session_it_took(self):
-        watch_id, arm_path, identity_path, env = self._unbound_watch("checkpoint")
-        self.assertEqual(self._wait_for_observation(watch_id)["reason"], "timeout")
+        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
         identity_path.write_text(json.dumps({"session_id": "sid-first"}))
-        again = self._run("watch", "peer-a", env=env)
+        again = self._run("watch", "w1:p9", env=env)
         self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
+        self.assertIn("state=already-armed", again.stdout)
+        self.assertEqual(json.loads(arm_path.read_text())["target"], "peer-a")
+        self.assertEqual(len(self._arm_records()), 1)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1)
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["agent"]["session_id"], "sid-first")
         deadline = time.monotonic() + 10
         while (json.loads(arm_path.read_text())["agent"]["session_id"] != "sid-first"
                and time.monotonic() < deadline):
@@ -1477,8 +1736,539 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(self._fields(other.stdout.splitlines()[0]).get("state"), "armed", other.stdout)
         self.assertNotEqual(self._fields(other.stdout.splitlines()[0])["watch_id"], watch_id)
 
+    def test_registration_revalidates_after_observer_binds_first_native_session(self):
+        import contextlib
+        import io
+
+        state_file = self.tmp_root / "agent-state.txt"
+        state_file.write_text("working")
+        watch_id, arm_path, identity_path, env = self._unbound_watch(
+            "held", {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
+                     "FAKE_HERDR_WAIT_STATE": "idle"})
+        original_arm = json.loads(arm_path.read_text())
+        original_deadline = original_arm["deadline"]
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        self.assertEqual(observation["native_wait"]["state"], "started")
+        self._wait_for_wait_calls(1)
+
+        alias_key = peer_steward._watch_alias_lock_key(
+            "steward-1", original_arm["agent"], [], "default")
+        alias_path = self.watch_root / f"{alias_key}.lock"
+        payload_b = {"result": {"agent": {
+            "agent": "claude", "agent_status": "working",
+            "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+            "pane_id": "w1:p9"}}}
+        alias_opened = threading.Event()
+        release_registration = threading.Event()
+        alias_fds = set()
+        spawned = []
+        calls = []
+        result = {}
+        output = io.StringIO()
+        real_open_lock = peer_steward._open_lock
+        real_acquire = peer_steward._acquire_bounded
+        real_popen = peer_steward.subprocess.Popen
+
+        def cleanup_spawned():
+            for process in spawned:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_spawned)
+
+        def tracked_open(path):
+            fd = real_open_lock(path)
+            if threading.current_thread().name == "register-B" and Path(path) == alias_path:
+                alias_fds.add(fd)
+            return fd
+
+        def staged_acquire(fd, timeout_ms):
+            if threading.current_thread().name == "register-B":
+                if fd in alias_fds:
+                    alias_opened.set()
+                    if not release_registration.wait(10):
+                        return False
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                return True
+            return real_acquire(fd, timeout_ms)
+
+        def get_b(_target):
+            calls.append("sid-fake")
+            return payload_b
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def register_b():
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(peer_steward, "_run_herdr_get", side_effect=get_b), \
+                    mock.patch.object(peer_steward, "_open_lock", side_effect=tracked_open), \
+                    mock.patch.object(peer_steward, "_acquire_bounded", side_effect=staged_acquire), \
+                    mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                    contextlib.redirect_stdout(output):
+                result["rc"] = peer_steward.main(["watch", "w1:p9"])
+            result["stdout"] = output.getvalue()
+
+        registration = threading.Thread(target=register_b, name="register-B")
+        registration.start()
+        self.assertTrue(alias_opened.wait(10), "registration did not reach pane admission")
+        self.assertEqual(calls, ["sid-fake"], "pre-lock lookup should only select the pane lock")
+
+        # Complete the original single native wait while registration is held
+        # at admission. The observer must bind A under the shared pane lock.
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            bound_arm = json.loads(arm_path.read_text())
+            observation = json.loads(paths.observation.read_text())
+            if (bound_arm["agent"].get("session_id") == "sid-A"
+                    and observation.get("native_wait", {}).get("state") == "result"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(bound_arm["agent"]["session_id"], "sid-A")
+        self.assertEqual(observation["native_wait"]["agent"]["session_id"], "sid-A")
+        self.assertFalse(paths.receipt.exists(), "the original A obligation must still be active")
+        self.assertEqual(bound_arm["deadline"], original_deadline)
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+        # A conflicting later result is neither successful nor allowed to
+        # overwrite the established native identity.
+        conflicting = SimpleNamespace(
+            target="peer-a", steward_session_id="steward-1", until=[],
+            expected_harness="claude", expected_pane="w1:p9")
+        self.assertFalse(peer_steward._persist_watch_session(
+            conflicting, paths, "default", "sid-fake"))
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-A")
+
+        # The new observer must return the B pane occupant before it launches.
+        identity_path.unlink()
+        release_registration.set()
+        registration.join(30)
+        self.assertFalse(registration.is_alive(), "registration did not leave pane admission")
+        self.assertEqual(result.get("rc"), 0, result.get("stdout", ""))
+        fields = self._fields(result["stdout"].splitlines()[0])
+        self.assertEqual(fields["state"], "armed", result["stdout"])
+        self.assertNotEqual(fields["watch_id"], watch_id)
+        admitted = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+        self.assertEqual(admitted["agent"]["session_id"], "sid-fake")
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-A")
+        self.assertEqual(json.loads(arm_path.read_text())["deadline"], original_deadline)
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(sum("agent wait peer-a" in row for row in waits), 1, self.calllog.read_text())
+        self.assertEqual(sum("agent wait w1:p9" in row for row in waits), 1, self.calllog.read_text())
+
+    def test_conflicting_native_result_keeps_established_sid_and_unknown_evidence(self):
+        identity_path = self.tmp_root / "native-result-identity.json"
+        env = self._env("held")
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        armed = self._run("watch", "peer-a", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        original_arm = json.loads(arm_path.read_text())
+        self.assertEqual(original_arm["agent"]["session_id"], "sid-fake")
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self._wait_for_wait_calls(1)
+
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            observation = json.loads(paths.observation.read_text())
+            if observation.get("state") == "unknown":
+                break
+            time.sleep(0.01)
+        self.assertEqual(observation["state"], "unknown")
+        preserved = observation["native_wait"]
+        self.assertEqual((preserved["state"], preserved["reason"],
+                          preserved["pid"], preserved["pid_start"]),
+                         ("unknown", "target-identity-conflict",
+                          wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(preserved["agent"]["session_id"], "sid-A")
+        self.assertEqual(preserved["agent_state"], "idle")
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-fake")
+        self.assertFalse(paths.receipt.exists())
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+    def test_admission_reconciles_native_wait_result_before_unbound_arm_scan(self):
+        import contextlib
+        import io
+
+        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        original_arm = json.loads(arm_path.read_text())
+        original_deadline = original_arm["deadline"]
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and (observation.get("native_wait", {}).get("state") != "started"
+                    or "pid" not in observation.get("native_wait", {}))):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self._wait_for_wait_calls(1)
+        alias_key = peer_steward._watch_alias_lock_key(
+            "steward-1", original_arm["agent"], [], "default")
+        alias_path = self.watch_root / f"{alias_key}.lock"
+        alias_fd = peer_steward._open_lock(alias_path)
+        fcntl.flock(alias_fd, fcntl.LOCK_EX)
+        try:
+            identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+            self._release()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                raw_log = paths.log.read_text(encoding="utf-8") if paths.log.exists() else ""
+                if '"value": "sid-A"' in raw_log and not peer_steward._pid_identity_ok(
+                        wait_record["pid"], wait_record["pid_start"]):
+                    break
+                time.sleep(0.01)
+            self.assertIn('"value": "sid-A"', raw_log)
+            self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "-")
+            self.assertEqual(len(self._wait_calls()), 1)
+
+            payload_b = {"result": {"agent": {
+                "agent": "claude", "agent_status": "working",
+                "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+                "pane_id": "w1:p9"}}}
+            alias_opened = threading.Event()
+            alias_fds = set()
+            spawned = []
+            result = {}
+            output = io.StringIO()
+            real_open_lock = peer_steward._open_lock
+            real_popen = peer_steward.subprocess.Popen
+            real_receipt = peer_steward._write_terminal_watch_receipt
+
+            def cleanup_spawned():
+                for process in spawned:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+
+            self.addCleanup(cleanup_spawned)
+
+            def tracked_open(path):
+                fd = real_open_lock(path)
+                if threading.current_thread().name == "register-B" and Path(path) == alias_path:
+                    alias_fds.add(fd)
+                return fd
+
+            def blocking_acquire(fd, _timeout_ms):
+                if threading.current_thread().name == "register-B" and fd in alias_fds:
+                    alias_opened.set()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                return True
+
+            def register_b():
+                def tracked_popen(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                def capture_receipt(target_id, *args, **kwargs):
+                    if target_id == watch_id:
+                        result["observation_before_receipt"] = peer_steward._read_json(
+                            paths.observation)
+                    return real_receipt(target_id, *args, **kwargs)
+
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(peer_steward, "_run_herdr_get", return_value=payload_b), \
+                        mock.patch.object(peer_steward, "_open_lock", side_effect=tracked_open), \
+                        mock.patch.object(peer_steward, "_acquire_bounded", side_effect=blocking_acquire), \
+                        mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                        mock.patch.object(peer_steward, "_write_terminal_watch_receipt",
+                                          side_effect=capture_receipt), \
+                        contextlib.redirect_stdout(output):
+                    result["rc"] = peer_steward.main(["watch", "w1:p9"])
+                result["stdout"] = output.getvalue()
+
+            registration = threading.Thread(target=register_b, name="register-B")
+            registration.start()
+            self.assertTrue(alias_opened.wait(10), "registration did not wait at pane admission")
+
+            # The observer cannot persist A while this lock is held. Reap only
+            # that exact fixture observer so admission must consume the durable
+            # native-wait log result itself.
+            observer = original_arm["watcher"]
+            if peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"]):
+                os.kill(observer["pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 10
+            while (peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"])
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            self.assertFalse(peer_steward._pid_identity_ok(observer["pid"], observer["pid_start"]))
+            identity_path.unlink()
+        finally:
+            fcntl.flock(alias_fd, fcntl.LOCK_UN)
+            os.close(alias_fd)
+
+        registration.join(30)
+        self.assertFalse(registration.is_alive(), "registration did not leave pane admission")
+        self.assertEqual(result.get("rc"), 0, result.get("stdout", ""))
+        fields = self._fields(result["stdout"].splitlines()[0])
+        self.assertEqual(fields["state"], "armed", result["stdout"])
+        self.assertNotEqual(fields["watch_id"], watch_id)
+        admitted = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+        original = json.loads(arm_path.read_text())
+        self.assertEqual(original["agent"]["session_id"], "sid-A")
+        self.assertEqual(original["deadline"], original_deadline)
+        preserved_observation = result.get("observation_before_receipt")
+        self.assertIsInstance(preserved_observation, dict)
+        preserved_wait = preserved_observation["native_wait"]
+        self.assertEqual((preserved_wait["state"], preserved_wait["pid"],
+                          preserved_wait["pid_start"]),
+                         ("result", wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(preserved_wait["agent"]["session_id"], "sid-A")
+        self.assertEqual(admitted["agent"]["session_id"], "sid-fake")
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(sum("agent wait peer-a" in row for row in waits), 1, self.calllog.read_text())
+        self.assertEqual(sum("agent wait w1:p9" in row for row in waits), 1, self.calllog.read_text())
+
+    def test_conflicting_admission_result_stays_unknown_across_reattach_and_admits_new_sid(self):
+        identity_path = self.tmp_root / "admission-result-identity.json"
+        env = self._env("held")
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        env["FAKE_HERDR_WAIT_STATE"] = "idle"
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+
+        armed = self._run("watch", "peer-a", "--timeout", "60000", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stdout + armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        original_arm = json.loads(arm_path.read_text())
+        self.assertEqual(original_arm["agent"]["session_id"], "sid-A")
+        original_deadline = original_arm["deadline"]
+
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self.assertTrue(wait_record.get("pid_start"))
+        self._wait_for_wait_calls(1)
+
+        # Interrupt only this fixture observer, then let its exact native wait
+        # finish with B so the next observer starts from the old poisoned
+        # admission record shape.
+        original_watcher = original_arm["watcher"]
+        if peer_steward._pid_identity_ok(
+                original_watcher["pid"], original_watcher["pid_start"]):
+            os.kill(original_watcher["pid"], signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                original_watcher["pid"], original_watcher["pid_start"])
+                and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            original_watcher["pid"], original_watcher["pid_start"]))
+
+        identity_path.write_text(json.dumps({"session_id": "sid-B"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(wait_record["pid"], wait_record["pid_start"])
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            wait_record["pid"], wait_record["pid_start"]))
+        payload = json.loads(paths.log.read_text(encoding="utf-8"))
+        state, result_agent, _code, reason = peer_steward._interpret_payload(payload, "peer-a")
+        self.assertEqual((state, result_agent["session_id"]), ("idle", "sid-B"))
+
+        # Recover a disk record produced by the old vulnerable publisher.
+        poisoned = dict(wait_record)
+        poisoned.update({"state": "result", "agent_state": state,
+                         "agent": result_agent, "reason": reason or state})
+        observation["state"] = "waiting"
+        observation["reason"] = "native-wait-running"
+        observation["native_wait"] = poisoned
+        paths.observation.write_text(json.dumps(observation))
+        reattached_processes = []
+        real_popen = peer_steward.subprocess.Popen
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            reattached_processes.append(process)
+            return process
+
+        def cleanup_reattached_processes():
+            for process in reattached_processes:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_reattached_processes)
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen):
+                self.assertTrue(peer_steward._spawn_watch_observer(watch_id, original_arm))
+        reattached_arm = json.loads(arm_path.read_text())
+        reattached_watcher = reattached_arm["watcher"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            recovered = json.loads(paths.observation.read_text())
+            if recovered.get("state") == "unknown":
+                break
+            time.sleep(0.01)
+        self.assertEqual(recovered.get("reason"), "target-identity-conflict")
+        self.assertEqual(recovered["native_wait"]["state"], "unknown")
+        self.assertEqual((recovered["native_wait"]["pid"],
+                          recovered["native_wait"]["pid_start"]),
+                         (wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(recovered["native_wait"]["unresolved_result"]["agent"]["session_id"],
+                         "sid-B")
+        self.assertFalse(paths.receipt.exists())
+        self.assertEqual((reattached_arm["agent"]["session_id"],
+                          reattached_arm["deadline"]), ("sid-A", original_deadline))
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                reattached_watcher["pid"], reattached_watcher["pid_start"])
+                and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            reattached_watcher["pid"], reattached_watcher["pid_start"]))
+        self.assertEqual(len(reattached_processes), 1)
+        self.assertEqual(reattached_processes[0].wait(timeout=2), 0)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+
+        # Admission now sees the same completed B result. It must not publish
+        # B as A's result; the existing target-replacement lifecycle may then
+        # settle A as pane-exited under its normal terminal-pending contract.
+        retained_arm = json.loads(arm_path.read_text())
+        admitted = self._run("watch", "peer-a", "--timeout", "120000", env=env)
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        admitted_fields = self._fields(admitted.stdout.splitlines()[0])
+        self.assertEqual(admitted_fields["state"], "armed", admitted.stdout)
+        self.assertNotEqual(admitted_fields["watch_id"], watch_id)
+        admitted_arm = json.loads(
+            (self.watch_root / f"{admitted_fields['watch_id']}.json").read_text())
+        self.assertEqual(admitted_arm["agent"]["session_id"], "sid-B")
+        retained_arm = json.loads(arm_path.read_text())
+        self.assertEqual((retained_arm["agent"]["session_id"], retained_arm["deadline"]),
+                         ("sid-A", original_deadline))
+        self.assertEqual((recovered["state"], recovered["reason"],
+                          recovered["native_wait"]["state"],
+                          recovered["native_wait"]["pid"],
+                          recovered["native_wait"]["pid_start"]),
+                         ("unknown", "target-identity-conflict", "unknown",
+                          wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(recovered["native_wait"]["unresolved_result"]["agent"]["session_id"],
+                         "sid-B")
+        receipt = json.loads(paths.receipt.read_text())
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "session-replaced"))
+        self.assertNotIn(receipt["state"], {"idle", "done"})
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(len(waits), 2, self.calllog.read_text())
+        admitted_paths = peer_steward._watch_paths(admitted_fields["watch_id"], self.watch_root)
+        admitted_observation = self._wait_for_observation(admitted_fields["watch_id"])
+        deadline = time.monotonic() + 10
+        while (admitted_observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+            admitted_observation = json.loads(admitted_paths.observation.read_text())
+        admitted_wait = admitted_observation["native_wait"]
+        self.assertEqual(admitted_wait["state"], "started")
+        self._release()
+        admitted_receipt = self._wait_for_receipt(admitted_fields["watch_id"])
+        self.assertEqual((admitted_receipt["state"],
+                          admitted_receipt["agent"]["session_id"]), ("idle", "sid-B"))
+        admitted_watcher = admitted_arm["watcher"]
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                admitted_watcher["pid"], admitted_watcher["pid_start"])
+                or peer_steward._pid_identity_ok(admitted_wait["pid"], admitted_wait["pid_start"])) \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            admitted_watcher["pid"], admitted_watcher["pid_start"]))
+        self.assertFalse(peer_steward._pid_identity_ok(
+            admitted_wait["pid"], admitted_wait["pid_start"]))
+
+    def test_watch_admission_fails_closed_when_pane_or_endpoint_changes(self):
+        import contextlib
+        import io
+
+        base_payload = {"result": {"agent": {
+            "agent": "claude", "agent_status": "working",
+            "agent_session": {"value": "sid-fake"}, "name": "peer-a",
+            "pane_id": "w1:p9"}}}
+        variants = (
+            ("pane", {"pane_id": "w1:p10"}),
+            ("harness", {"agent": "codex"}),
+        )
+        for label, change in variants:
+            with self.subTest(change=label):
+                output = io.StringIO()
+                reads = 0
+
+                def get_changed(_target):
+                    nonlocal reads
+                    reads += 1
+                    agent = dict(base_payload["result"]["agent"])
+                    if reads > 1:
+                        agent.update(change)
+                    return {"result": {"agent": agent}}
+
+                before = len(self._arm_records())
+                with mock.patch.dict(os.environ, self._env("held")), \
+                        mock.patch.object(peer_steward, "_run_herdr_get", side_effect=get_changed), \
+                        contextlib.redirect_stdout(output):
+                    rc = peer_steward.main(["watch", "peer-a"])
+                self.assertEqual(rc, 4, output.getvalue())
+                self.assertIn("watch-target-pane-changed", output.getvalue())
+                self.assertEqual(len(self._arm_records()), before)
+
+        output = io.StringIO()
+        original_server = peer_steward._HERDR_SESSION
+        try:
+            with mock.patch.dict(os.environ, self._env("held")), \
+                    mock.patch.object(peer_steward, "_run_herdr_get", side_effect=lambda _target: (
+                        setattr(peer_steward, "_HERDR_SESSION", "changed-endpoint") or base_payload)), \
+                    contextlib.redirect_stdout(output):
+                rc = peer_steward.main(["watch", "peer-a"])
+            self.assertEqual(rc, 4, output.getvalue())
+            self.assertIn("watch-endpoint-changed", output.getvalue())
+        finally:
+            peer_steward._HERDR_SESSION = original_server
+
     def test_same_name_new_session_gets_separate_watch_and_old_rearm_cannot_overwrite_claim(self):
-        env = self._env("timeout")
+        env = self._env("held")
         first = self._run("watch", "peer-a", env=env)
         old_id = self._fields(first.stdout)["watch_id"]
         self._wait_for_observation(old_id)
@@ -1494,31 +2284,29 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         claim = self.watch_root / (peer_steward._dedupe_key("steward-1", "peer-a", []) + ".arm")
         self.assertEqual(claim.read_text().strip(), new_id)
         self.assertEqual(json.loads(old_path.read_text())["agent"]["session_id"], "sid-fake")
+        old_receipt = self._wait_for_receipt(old_id)
+        self.assertEqual((old_receipt["state"], old_receipt["reason"]),
+                         ("pane-exited", "session-replaced"))
         duplicate = self._run("watch", "peer-a", env=env)
+        self.assertIn("state=already-armed", duplicate.stdout)
         self.assertEqual(self._fields(duplicate.stdout)["watch_id"], new_id)
-        # A reconnect of the old duty writes only its own arm/observation.
-        os.kill(old_arm["watcher"]["pid"], signal.SIGKILL)
-        deadline = time.monotonic() + 10
-        while peer_steward._watcher_present(old_arm) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        with mock.patch.dict(os.environ, env, clear=True):
-            self.assertTrue(peer_steward._spawn_watch_observer(old_id, old_arm))
         self.assertEqual(claim.read_text().strip(), new_id)
         self.assertEqual(json.loads((self.watch_root / f"{new_id}.json").read_text())["agent"]["session_id"],
                          "new-session")
-        self.assertFalse((self.watch_root / f"{old_id}.receipt.json").exists())
+        self._release()
+        self.assertEqual(self._wait_for_receipt(new_id)["agent"]["session_id"], "new-session")
 
     def test_duplicate_arm_spawns_nothing(self):
         first = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(first.stdout)["watch_id"]
         self._wait_for_lock(watch_id)
-        before = sorted(self.watch_root.glob("*.json"))
+        before = self._arm_records()
         second = self._run("watch", "peer-a", env=self._env("held"))
         self.assertEqual(second.returncode, 0)
         fields = self._fields(second.stdout)
         self.assertEqual(fields["state"], "already-armed")
         self.assertEqual(fields["watch_id"], watch_id)
-        self.assertEqual(sorted(self.watch_root.glob("*.json")), before)
+        self.assertEqual(self._arm_records(), before)
         self._release()
         self._wait_for_receipt(watch_id)
 
@@ -1537,9 +2325,253 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertTrue(peer_steward._lock_held(self.watch_root / f"{watch_id}.lock"))
         second = self._run("watch", "peer-a", env=self._env("held"))
         self.assertEqual(self._fields(second.stdout)["state"], "already-armed")
-        self.assertEqual(len(list(self.watch_root.glob("*.json"))), 1)
+        self.assertEqual(len(self._arm_records()), 1)
         self._release()
         self._wait_for_receipt(watch_id)
+
+    def test_name_pane_and_agent_id_aliases_share_one_watch_and_native_wait(self):
+        env = self._env("held")
+        first = self._run("watch", "peer-a", env=env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_fields = self._fields(first.stdout)
+        watch_id = first_fields["watch_id"]
+        self._wait_for_lock(watch_id)
+        original_arm = json.loads((self.watch_root / f"{watch_id}.json").read_text())
+
+        for alias in ("w1:p9", "sid-fake"):
+            with self.subTest(alias=alias):
+                duplicate = self._run("watch", alias, env=env)
+                self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+                fields = self._fields(duplicate.stdout.splitlines()[0])
+                self.assertEqual((fields["state"], fields["watch_id"]),
+                                 ("already-armed", watch_id), duplicate.stdout)
+                self.assertEqual(fields["target"], "peer-a")
+                self.assertEqual(len(self._arm_records()), 1)
+                self.assertEqual(json.loads((self.watch_root / f"{watch_id}.json").read_text())[
+                    "deadline"], original_arm["deadline"])
+
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+        rows = [row for row in self._all_records() if row["kind"] == "watch"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["to"]["name"], "peer-a")
+        self.assertEqual(json.loads((self.watch_root / f"{watch_id}.json").read_text())["target"],
+                         "peer-a")
+        self._release()
+        self.assertEqual(self._wait_for_receipt(watch_id)["target"], "peer-a")
+
+    def test_concurrent_alias_registration_is_serialized_to_one_arm(self):
+        env = self._env("held")
+        start = threading.Barrier(2)
+
+        def register(target):
+            start.wait(timeout=10)
+            return self._run("watch", target, env=env)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(register, target) for target in ("peer-a", "w1:p9")]
+            results = [future.result(timeout=30) for future in futures]
+
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        heads = [self._fields(result.stdout.splitlines()[0]) for result in results]
+        ids = {head["watch_id"] for head in heads}
+        states = sorted(head["state"] for head in heads)
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(states, ["already-armed", "armed"])
+        watch_id = ids.pop()
+        self._wait_for_lock(watch_id)
+        self.assertEqual(len(self._arm_records()), 1)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+        self._release()
+        self._wait_for_receipt(watch_id)
+
+    def test_alias_reattachment_keeps_legacy_raw_claim_deadline_and_native_wait(self):
+        env = self._env("held")
+        initial = self._fields(self._run(
+            "watch", "peer-a", "--timeout", "60000", env=env).stdout)
+        watch_id = initial["watch_id"]
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+            observation = json.loads((self.watch_root / f"{watch_id}.observation.json").read_text())
+        native_wait = observation["native_wait"]
+        self.assertEqual(native_wait["state"], "started")
+        self.assertTrue(peer_steward._pid_identity_ok(
+            native_wait["pid"], native_wait["pid_start"]))
+
+        arm_path = self.watch_root / f"{watch_id}.json"
+        arm = json.loads(arm_path.read_text())
+        original_deadline = arm["deadline"]
+        original_target_claim = self.watch_root / (
+            peer_steward._dedupe_key("steward-1", "peer-a", []) + ".arm")
+        self.assertEqual(original_target_claim.read_text().strip(), watch_id)
+        # A pre-fix arm has no logical claim key and is located through its raw claim.
+        arm.pop("claim_key", None)
+        arm_path.write_text(json.dumps(arm))
+
+        old_watcher = int(initial["pid"])
+        os.kill(old_watcher, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and peer_steward._pid_identity_ok(old_watcher, initial["pid_start"])):
+            time.sleep(0.02)
+
+        duplicate = self._run("watch", "sid-fake", "--timeout", "120000", env=env)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+        fields = self._fields(duplicate.stdout.splitlines()[0])
+        self.assertEqual((fields["state"], fields["watch_id"]),
+                         ("already-armed", watch_id), duplicate.stdout)
+        reattached = json.loads(arm_path.read_text())
+        self.assertNotEqual(reattached["watcher"]["pid"], old_watcher)
+        self.assertEqual(reattached["target"], "peer-a")
+        self.assertEqual(reattached["timeout"], 60000)
+        self.assertEqual(reattached["deadline"], original_deadline)
+        self.assertNotIn("claim_key", reattached)
+        resumed = json.loads((self.watch_root / f"{watch_id}.observation.json").read_text())
+        self.assertEqual((resumed["native_wait"]["pid"], resumed["native_wait"]["pid_start"]),
+                         (native_wait["pid"], native_wait["pid_start"]))
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["target"], "peer-a")
+
+    def test_alias_scope_keeps_steward_endpoint_and_until_obligations_distinct(self):
+        first_env = self._env("held", session_id="steward-1")
+        first = self._fields(self._run("watch", "peer-a", env=first_env).stdout)
+
+        other_steward_env = self._env("held", session_id="steward-2")
+        other_steward = self._fields(self._run(
+            "watch", "w1:p9", env=other_steward_env).stdout)
+
+        other_endpoint_env = self._env("held", session_id="steward-1")
+        other_endpoint_env["AGENT_HERDR_SESSION"] = "other-endpoint"
+        other_endpoint = self._fields(self._run(
+            "watch", "sid-fake", env=other_endpoint_env).stdout)
+
+        other_until = self._fields(self._run(
+            "watch", "w1:p9", "--until", "idle", env=first_env).stdout)
+        explicit_default = self._fields(self._run(
+            "watch", "sid-fake", "--until", "idle", "--until", "done", "--until", "blocked",
+            env=first_env).stdout)
+        reordered_default = self._fields(self._run(
+            "watch", "peer-a", "--until", "blocked", "--until", "idle", "--until", "done",
+            env=first_env).stdout)
+
+        ids = {first["watch_id"], other_steward["watch_id"],
+               other_endpoint["watch_id"], other_until["watch_id"],
+               explicit_default["watch_id"]}
+        self.assertEqual(len(ids), 5)
+        self.assertEqual([first["state"], other_steward["state"],
+                          other_endpoint["state"], other_until["state"],
+                          explicit_default["state"]],
+                         ["armed", "armed", "armed", "armed", "armed"])
+        self.assertEqual((reordered_default["state"], reordered_default["watch_id"]),
+                         ("already-armed", explicit_default["watch_id"]))
+        arms = [json.loads(path.read_text()) for path in self._arm_records()]
+        self.assertEqual(len(arms), 5)
+        by_id = {arm["watch_id"]: arm for arm in arms}
+        self.assertEqual(by_id[first["watch_id"]]["server"], "default")
+        self.assertEqual(by_id[other_steward["watch_id"]]["steward"]["session_id"], "steward-2")
+        self.assertEqual(by_id[other_endpoint["watch_id"]]["server"], "other-endpoint")
+        self.assertEqual(by_id[other_until["watch_id"]]["until"], ["idle"])
+        self.assertEqual(set(by_id[explicit_default["watch_id"]]["until"]),
+                         {"idle", "done", "blocked"})
+        self._wait_for_wait_calls(len(arms))
+        for _ in arms:
+            self._release()
+        for watch_id in ids:
+            self._wait_for_receipt(watch_id)
+
+    def test_different_steward_seats_stay_independent_and_successor_retirement_is_separate(self):
+        import contextlib
+        import io
+
+        seat_by_steward = {
+            "steward-1": "seat-A",
+            "steward-2": "seat-B",
+            "steward-3": "seat-A",
+        }
+        real_popen = subprocess.Popen
+        spawned = []
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def register(session_id, target):
+            output = io.StringIO()
+            env = self._env("held", session_id=session_id)
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                    mock.patch.object(
+                        peer_steward, "_steward_seat",
+                        side_effect=lambda _harness, sid: {
+                            "kind": "pane", "key": seat_by_steward[sid],
+                        }), \
+                    contextlib.redirect_stdout(output):
+                rc = peer_steward.main(["watch", target])
+            self.assertEqual(rc, 0, output.getvalue())
+            fields = self._fields(output.getvalue().splitlines()[0])
+            arm = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+            watcher = next(process for process in spawned
+                           if process.pid == arm["watcher"]["pid"])
+            return fields, watcher
+
+        first, first_watcher = register("steward-1", "peer-a")
+        first_observation = self._wait_for_observation(first["watch_id"])
+        first_deadline = time.monotonic() + 10
+        while (first_observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < first_deadline):
+            time.sleep(0.02)
+            first_observation = json.loads((self.watch_root /
+                f"{first['watch_id']}.observation.json").read_text())
+        first_wait = first_observation["native_wait"]
+        self.assertTrue(peer_steward._pid_identity_ok(
+            first_wait["pid"], first_wait["pid_start"]))
+
+        second, second_watcher = register("steward-2", "w1:p9")
+        self.assertEqual((first["state"], second["state"]), ("armed", "armed"))
+        self.assertNotEqual(first["watch_id"], second["watch_id"])
+        self._wait_for_wait_calls(2)
+
+        # This old observer and its waiter are exact private fixture processes;
+        # freeing its lock lets the successor path settle it synchronously.
+        self.assertTrue(peer_steward._pid_identity_ok(
+            first_watcher.pid, first["pid_start"]))
+        os.kill(first_watcher.pid, signal.SIGKILL)
+        first_watcher.wait(timeout=10)
+        self.assertTrue(peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"]))
+        os.kill(first_wait["pid"], signal.SIGKILL)
+        wait_deadline = time.monotonic() + 10
+        while (time.monotonic() < wait_deadline
+               and peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"])):
+            time.sleep(0.02)
+
+        successor, successor_watcher = register("steward-3", "sid-fake")
+        self.assertEqual(successor["state"], "armed")
+        self.assertNotEqual(successor["watch_id"], first["watch_id"])
+        self.assertNotEqual(successor["watch_id"], second["watch_id"])
+        retired = self._wait_for_receipt(first["watch_id"])
+        self.assertEqual((retired["state"], retired["reason"]),
+                         ("superseded", "steward-replaced"))
+        self.assertFalse((self.watch_root / f"{second['watch_id']}.receipt.json").exists())
+        self.assertFalse((self.watch_root / f"{successor['watch_id']}.receipt.json").exists())
+        self.assertEqual(len(self._arm_records()), 3)
+
+        self._wait_for_wait_calls(3)
+        self._release()
+        self._release()
+        self._wait_for_receipt(second["watch_id"])
+        self._wait_for_receipt(successor["watch_id"])
+        for process in (second_watcher, successor_watcher):
+            process.wait(timeout=10)
+        for process in spawned:
+            if process.poll() is None:
+                process.wait(timeout=10)
 
     def test_herdr_missing_is_exit_4_with_zero_watch_files(self):
         proc = self._run("watch", "peer-a", env=self._env(with_herdr=False))
@@ -1566,7 +2598,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             tree = ast.parse(source)
             parents = {child: parent for parent in ast.walk(tree)
                        for child in ast.iter_child_nodes(parent)}
-            background_backoff = {"cmd_watch_run": "backoff", "cmd_obligation_runner": "delay"}
+            background_backoff = {"cmd_obligation_runner": "delay"}
 
             def enclosing_function(node):
                 parent = parents.get(node)
@@ -1580,7 +2612,18 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             for node in ast.walk(tree):
                 if (isinstance(node, ast.While) and isinstance(node.test, ast.Constant)
                         and node.test.value is True):
-                    if enclosing_function(node) not in background_backoff:
+                    if enclosing_function(node) == "cmd_watch_run":
+                        event_wait = any(
+                            isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr == "select"
+                            and isinstance(call.func.value, ast.Name)
+                            and call.func.value.id == "select"
+                            for statement in node.body for call in ast.walk(statement)
+                        )
+                        if not event_wait:
+                            found.append((node.lineno, "watch loop lacks blocking event wait"))
+                    elif enclosing_function(node) not in background_backoff:
                         found.append((node.lineno, "unbounded while"))
                 if not isinstance(node, ast.Call):
                     continue
@@ -1655,18 +2698,40 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             self.assertTrue(path.exists(), f"{name} missing")
             source = path.read_text()
             self.assertEqual(violations(source, bounded_ui=name == "peer-steward.py"),
-                             [], f"{path.name}: foreground waits are fixed-deadline and task observers back off")
+                             [], f"{path.name}: foreground waits are fixed-deadline and task observers are event-driven")
             if name == "peer-steward.py":
-                self.assertIn("backoff = min(_WATCH_BACKOFF_MAX_SECONDS, backoff * 1.7)", source)
                 self.assertIn("delay = min(15.0, delay * 1.7)", source)
 
 
 class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
     """A56-2."""
 
+    def test_idle_watch_keeps_one_native_wait_and_resumes_on_its_event(self):
+        env = self._env("held")
+        armed = self._fields(self._run("watch", "peer-a", env=env).stdout)
+        watch_id = armed["watch_id"]
+        wait_record = self._wait_for_native_wait_started(watch_id)
+        self._wait_for_wait_calls(1)
+        before = self.calllog.read_bytes()
+
+        # The production watcher has already entered its select-based event wait.
+        # A short bounded fixture window measures repeated transport calls without
+        # turning the product wait into a timer loop.
+        time.sleep(0.2)
+        self.assertEqual(self.calllog.read_bytes(), before)
+        self.assertEqual(len(self._wait_calls()), 1)
+        self.assertTrue(peer_steward._pid_identity_ok(
+            wait_record["pid"], wait_record["pid_start"]))
+
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["state"], "idle")
+        self.assertEqual(len(self._wait_calls()), 1)
+
     def test_receipt_is_atomic_complete_and_text_free(self):
         proc = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(proc.stdout)["watch_id"]
+        self._wait_for_wait_calls(1)
         self._release()
         receipt = self._wait_for_receipt(watch_id)
 
@@ -1709,15 +2774,14 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(notices[0]["delivery"]["receipt"], watch_id)
         self.assertEqual(notices[0]["from"]["session_id"], "steward-1")
 
-    def test_timeout_is_a_pending_checkpoint_then_same_duty_finishes(self):
+    def test_native_timeout_is_terminal_after_one_wait(self):
         proc = self._run("watch", "peer-a", env=self._env("checkpoint"))
         watch_id = self._fields(proc.stdout)["watch_id"]
-        checkpoint = self._wait_for_observation(watch_id)
-        self.assertEqual(checkpoint["state"], "pending")
-        self.assertEqual(checkpoint["reason"], "timeout")
-        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
-        self._release()
-        self.assertEqual(self._wait_for_receipt(watch_id)["state"], "idle")
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual((receipt["state"], receipt["reason"]), ("timeout", "wait-timeout"))
+        waits = [line for line in self.calllog.read_text().splitlines()
+                 if line.startswith("agent wait ")]
+        self.assertEqual(len(waits), 1, self.calllog.read_text())
 
     def test_agent_not_found_and_complete_pane_absence_settle_terminal_receipt(self):
         env = self._env("held")
@@ -1860,6 +2924,41 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                 peer_steward._ensure_watch_observers()
                 spawn.assert_not_called()
 
+    def test_update_replaces_only_the_exact_live_watch_and_rearms_same_duty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            watch_id = "legacy-watch"
+            arm = {"schema_version": 1, "watch_id": watch_id, "target": "fixture-target",
+                   "server": "named", "armed_ts": "then", "until": ["idle"],
+                   "agent": {"harness": "codex", "session_id": "sid-watch", "pane": "w1:p9"},
+                   "steward": {"harness": "claude", "session_id": "sid-steward"},
+                   "watcher": {"pid": 321, "pid_start": "654"}, "refs": ["attempt-one"],
+                   "rearm_count": 0, "observer_generation": 1}
+            paths = peer_steward._watch_paths(watch_id, root)
+            paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+            binding = "/fixture/managed/current"
+            required = peer_steward._watch_observer_duty_argv(
+                watch_id, arm, rearm_generation=0, timeout_before_refs=True)
+            with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+                 mock.patch.object(peer_steward, "_watch_entries", return_value=[(watch_id, arm)]), \
+                 mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_watcher_present", side_effect=[True, False]), \
+                 mock.patch.object(peer_steward.peer_obligations, "validate_service_binding",
+                                   return_value=binding), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "replace_managed_observer", return_value="replaced") as replace, \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(peer_steward, "_spawn_watch_observer") as spawn:
+                peer_steward._ensure_watch_observers(service_current=binding)
+            replace.assert_called_once_with(
+                321, "654", paths.lock, "utilities/peer-steward.py", required,
+                binding, lock_fd_option="--lock-fd", exact_arguments=True,
+                argument_variants=[])
+            spawn.assert_called_once_with(watch_id, arm, service_current=binding)
+
 
 class JoinTest(_WatchMixin, unittest.TestCase):
     """A56-3."""
@@ -1878,6 +2977,7 @@ class JoinTest(_WatchMixin, unittest.TestCase):
     def test_join_returns_on_the_watcher_exit_event(self):
         armed = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(armed.stdout)["watch_id"]
+        self._wait_for_wait_calls(1)
         joiner = subprocess.Popen(
             [sys.executable, str(_HERE / "peer-steward.py"), "join", watch_id],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self._env("held"),
@@ -1924,6 +3024,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
     def test_alive_needs_pid_starttime_and_lock_together(self):
         fields = self._arm()
         self._wait_for_lock(fields["watch_id"])
+        self._wait_for_wait_calls(1)
         arm = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
         self.assertTrue(peer_steward._alive(arm, self.watch_root), "live watcher holding the lock")
 
@@ -2067,82 +3168,63 @@ class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
         self.assertIn("herdr-unavailable", proc.stdout)
         self.assertEqual(list(self.watch_root.glob("*.json")), [])
 
-    def test_checkpoint_survives_observer_restart_without_changing_watch_id(self):
-        armed = self._fields(self._run("watch", "peer-a", env=self._env("checkpoint")).stdout)
+    def test_restart_adopts_the_same_wait_child_without_a_second_call(self):
+        armed = self._fields(self._run("watch", "peer-a", env=self._env("held")).stdout)
         watch_id = armed["watch_id"]
-        observation = self._wait_for_observation(watch_id)
-        self.assertEqual(observation["reason"], "timeout")
-        old_pid = int(armed["pid"])
-        os.kill(old_pid, signal.SIGKILL)
+        native_wait = self._wait_for_native_wait_started(watch_id)
+        self.assertEqual(native_wait["state"], "started")
+        self.assertTrue(peer_steward._pid_identity_ok(
+            native_wait["pid"], native_wait["pid_start"]))
+
+        old_watcher = int(armed["pid"])
+        os.kill(old_watcher, signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
-                old_pid, armed["pid_start"]):
+        while (time.monotonic() < deadline
+               and peer_steward._pid_identity_ok(old_watcher, armed["pid_start"])):
             time.sleep(0.02)
-        env = self._env("checkpoint")
+        env = self._env("held")
         env.pop("CLAUDE_CODE_SESSION_ID", None)
-        resumed = self._run("__ensure-obligations", env=env)
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        deadline = time.monotonic() + 10
+        self.assertEqual(self._run("__ensure-obligations", env=env).returncode, 0)
         arm_path = self.watch_root / f"{watch_id}.json"
-        updated = json.loads(arm_path.read_text())
-        while time.monotonic() < deadline and updated["watcher"]["pid"] == old_pid:
-            time.sleep(0.02)
+        deadline = time.monotonic() + 10
+        while True:
             updated = json.loads(arm_path.read_text())
-        self.assertNotEqual(updated["watcher"]["pid"], old_pid)
-        self._release()
-        receipt = self._wait_for_receipt(watch_id)
-        self.assertEqual(receipt["watch_id"], watch_id)
-        self.assertEqual(receipt["agent"]["session_id"], "sid-fake")
-        self.assertEqual(receipt["agent"]["pane"], "w1:p9")
-
-    def test_reconnect_preserves_pane_duty_across_tab_move_and_rejects_reused_identity(self):
-        armed = self._fields(self._run("watch", "peer-a", env=self._env("checkpoint")).stdout)
-        watch_id = armed["watch_id"]
-        self.assertEqual(self._wait_for_observation(watch_id)["reason"], "timeout")
-        old_pid = int(armed["pid"])
-        os.kill(old_pid, signal.SIGKILL)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
-                old_pid, armed["pid_start"]):
-            time.sleep(0.02)
-
-        identity_file = self.tmp_root / "reused-pane-once.json"
-        identity_file.write_text(json.dumps({
-            "session_id": "sid-reused", "pane": "w1:p-reused", "once": True,
-        }), encoding="utf-8")
-        env = self._env("checkpoint")
-        env.pop("CLAUDE_CODE_SESSION_ID", None)
-        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_file)
-        env["FAKE_HERDR_WINDOW_ID"] = "window-after-tab-move"
-        resumed = self._run("__ensure-obligations", env=env)
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-
-        deadline = time.monotonic() + 10
-        arm_path = self.watch_root / f"{watch_id}.json"
-        updated = json.loads(arm_path.read_text())
-        while time.monotonic() < deadline and updated["watcher"]["pid"] == old_pid:
-            time.sleep(0.02)
-            updated = json.loads(arm_path.read_text())
-        self.assertNotEqual(updated["watcher"]["pid"], old_pid)
-        observation_path = self.watch_root / f"{watch_id}.observation.json"
-        deadline = time.monotonic() + 10
-        observation = {}
-        while time.monotonic() < deadline:
-            if observation_path.exists():
-                observation = json.loads(observation_path.read_text())
-                if observation.get("reason") == "target-identity-changed":
-                    break
-            time.sleep(0.02)
-        self.assertEqual(observation.get("reason"), "target-identity-changed")
-        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
-        self.assertEqual(updated["watch_id"], watch_id)
+            watcher = updated.get("watcher") or {}
+            if (watcher.get("pid") != old_watcher and watcher.get("pid")
+                    and peer_steward._pid_identity_ok(watcher["pid"], watcher.get("pid_start", ""))):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(.02)
+        self.assertNotEqual(updated["watcher"]["pid"], old_watcher)
+        resumed_wait = self._wait_for_native_wait_started(watch_id)
+        self.assertEqual((resumed_wait["pid"], resumed_wait["pid_start"]),
+                         (native_wait["pid"], native_wait["pid_start"]))
+        waits = [line for line in self.calllog.read_text().splitlines()
+                 if line.startswith("agent wait ")]
+        self.assertEqual(len(waits), 1, self.calllog.read_text())
 
         self._release()
         receipt = self._wait_for_receipt(watch_id)
-        self.assertEqual(receipt["watch_id"], watch_id)
-        self.assertEqual(receipt["agent"]["session_id"], "sid-fake")
-        self.assertEqual(receipt["agent"]["pane"], "w1:p9")
-        self.assertIn("window-after-tab-move", self.calllog.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["agent"]["session_id"]),
+                         ("idle", "sid-fake"))
+
+    def test_exact_terminal_request_stops_only_its_watch_wait_and_sweep_keeps_receipt(self):
+        armed = self._fields(self._run("watch", "peer-a", env=self._env("held")).stdout)
+        watch_id = armed["watch_id"]
+        wait_record = self._wait_for_native_wait_started(watch_id)
+        request = {"server": "default", "pane": "w1:p9", "harness": "claude",
+                   "session_id": "sid-fake"}
+        self.assertEqual(peer_steward._request_watch_terminal(
+            request, "completed-retire"), 1)
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "completed-retire"))
+        self.assertFalse(peer_steward._pid_identity_ok(
+            wait_record["pid"], wait_record["pid_start"]))
+        before = self.calllog.read_text()
+        self.assertEqual(self._run("__ensure-obligations", env=self._env("held")).returncode, 0)
+        self.assertEqual(self.calllog.read_text(), before)
 
 
 class KillFixtureTest(_WatchMixin, unittest.TestCase):
@@ -2392,6 +3474,119 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         row = peer_steward.peer_message._read_pending(record["transfer_ref"])
         return rc, printed.call_args[0][0], row, sent, schedule
 
+    def _run_sidless_prompt(self, guard_results, *, send_result=(0, {}), text="[steer] first Codex turn"):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        sent = []
+        guard = mock.Mock(side_effect=guard_results)
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("sid-steward", "claude")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="steward"), \
+             mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("codex", None, "fresh")), \
+             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:pX")), \
+             mock.patch.object(peer_steward, "_first_input_foreground_proof", return_value=proof), \
+             mock.patch.object(peer_steward, "_sidless_idle_prompt_guard", guard), \
+             mock.patch.object(peer_steward, "_herdr_prompt",
+                               side_effect=lambda target, body, **kw:
+                               (sent.append((target, body, kw)) or send_result)), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+             mock.patch("builtins.print") as printed:
+            args = peer_steward.build_parser().parse_args(["prompt", "fresh", text])
+            rc = peer_steward.cmd_prompt(args)
+        record = self._all_records()[-1]
+        row = peer_steward.peer_message._read_pending(record["transfer_ref"])
+        return rc, printed.call_args[0][0], row, sent, schedule, guard.call_count
+
+    def test_sidless_codex_first_input_submits_one_private_trailer_and_stays_queued(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, guard_calls = self._run_sidless_prompt(
+            [(None, proof), (None, proof)])
+        self.assertEqual(rc, 3, line)
+        self.assertEqual((row["state"], row["receipt"]),
+                         ("queued", "native-first-input-submitted"))
+        self.assertEqual(row["first_input_process"]["pid"], os.getpid())
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "w1:pX")
+        self.assertIn("peer-from:", sent[0][1])
+        self.assertEqual(guard_calls, 2)  # before claim, then after claim at submit boundary
+        schedule.assert_not_called()
+
+    def test_sidless_target_process_race_defers_without_submitting(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, _calls = self._run_sidless_prompt(
+            [(None, proof), ("target-process-changed", None)])
+        self.assertEqual(rc, 3, line)
+        self.assertIn("reason=target-process-changed", line)
+        self.assertEqual((row["state"], row.get("rpc_claim")), ("pending", None))
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
+
+    def test_sidless_busy_draft_form_and_unknown_proof_all_defer_safely(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        for reason in ("native-state-working", "draft", "form-open", "foreground-unverified"):
+            with self.subTest(reason=reason):
+                rc, line, row, sent, schedule, calls = self._run_sidless_prompt([(reason, None)])
+                self.assertEqual(rc, 3, line)
+                self.assertIn("first-input-deferred", line)
+                self.assertEqual(row["state"], "pending")
+                self.assertEqual(sent, [])
+                self.assertEqual(calls, 1)
+                schedule.assert_called_once()
+
+    def test_sidless_ambiguous_prompt_submission_is_never_retried(self):
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        rc, line, row, sent, schedule, _calls = self._run_sidless_prompt(
+            [(None, proof), (None, proof)], send_result=(None, None))
+        self.assertEqual(rc, 5, line)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["receipt"], "native-first-input-inflight")
+        self.assertIsNotNone(row.get("rpc_claim"))
+        self.assertEqual(len(sent), 1)
+        schedule.assert_called_once()
+
+    def test_sidless_guard_requires_idle_empty_composer_exact_pane_and_same_process(self):
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
+
+        def guard(harness, status, screen, observed=process, expected=process):
+            identity = {"harness": harness, "session_id": "-", "pane": "w1:pX"}
+            with mock.patch.object(peer_steward, "_retire_target",
+                                   return_value=(status, identity, 0, None)), \
+                 mock.patch.object(peer_steward, "_agent_state", return_value=(status, "w1:pX")), \
+                 mock.patch.object(peer_steward, "_pane_readiness",
+                                   return_value=SimpleNamespace(state="ready", reason="")), \
+                 mock.patch.object(peer_steward, "_first_input_foreground_proof",
+                                   return_value=observed), \
+                 mock.patch.object(peer_steward, "_read_screen",
+                                   return_value=peer_steward._screen_lines(screen)):
+                return peer_steward._sidless_idle_prompt_guard(
+                    "fresh", harness, "w1:pX", expected_foreground=expected)[0]
+
+        self.assertIsNone(guard("codex", "idle", CODEX_EMPTY))
+        self.assertEqual(guard("codex", "working", CODEX_EMPTY), "native-state-working")
+        self.assertEqual(guard("codex", "idle", CODEX_DRAFT), "draft")
+        self.assertEqual(guard("codex", "idle", CODEX_POPUP), "draft-unknown")
+        self.assertEqual(guard("claude", "idle", CLAUDE_FORM,
+                               observed={**process, "harness": "claude"},
+                               expected={**process, "harness": "claude"}), "form-open")
+        self.assertEqual(guard("codex", "idle", CODEX_EMPTY,
+                               observed={**process, "start": "replaced-start"}),
+                         "target-process-changed")
+
     def test_idle_claude_empty_composer_uses_exact_prompt_and_receiver_ref(self):
         rc, line, row, sent, schedule = self._run_claude_prompt(consume=True)
         self.assertEqual(rc, 0, line)
@@ -2554,7 +3749,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch("builtins.print") as printed:
             rc = peer_steward.main(["prompt", "fresh", "wait for the exact thread"])
         self.assertEqual(rc, 3)
-        self.assertIn("reason=target-session-unresolved", printed.call_args[0][0])
+        self.assertIn("reason=target-process-proof-unknown", printed.call_args[0][0])
         row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
         self.assertEqual((row["state"], row["to"]["session_id"], row["to"]["pane_id"]),
                          ("pending", None, "w1:pX"))
@@ -2625,36 +3820,187 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
 
 class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
+    def test_external_duties_keep_the_runner_lease_until_they_settle(self):
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        passes = []
+        real_flock = fcntl.flock
+        with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock:
+            real_flock(lock, fcntl.LOCK_EX)
+            def reconcile(*args, **kwargs):
+                passes.append(len(passes) + 1)
+            def signature(_snapshot=None):
+                return ((("watch-still-owned",),), ()) if len(passes) < 3 else ((), ())
+            def flock(fd, operation):
+                if fd == lock.fileno() and operation == fcntl.LOCK_UN:
+                    self.assertGreaterEqual(len(passes), 3,
+                        "a callback could otherwise take this lease and discard the live owner's caches")
+                return real_flock(fd, operation)
+            with mock.patch.object(peer_steward, "_external_obligation_snapshot", return_value={}), \
+                 mock.patch.object(peer_steward, "_external_obligation_signature", side_effect=signature), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot_unchanged", return_value=True), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations", side_effect=reconcile), \
+                 mock.patch.object(peer_steward.fcntl, "flock", side_effect=flock), \
+                 mock.patch.object(peer_steward.time, "sleep") as sleep:
+                self.assertEqual(peer_steward.cmd_obligation_runner(
+                    SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+            self.assertEqual(passes, [1, 2, 3])
+            self.assertEqual(sleep.call_count, 2)
+
     def pending_message(self):
         store = peer_steward.peer_obligations.ObligationStore()
         duty = store.create("message-fixture", "message",
                             {"harness": "codex", "session_id": "sid-fixture"}, {})
         return store, duty
 
+    def test_shared_recovery_lock_is_short_noninheritable_and_per_root(self):
+        shared_peer_root = self.tmp_root / "peer-shared"
+        alternate_peer_root = self.tmp_root / "peer-independent"
+        shared_peer_root.mkdir()
+        alternate_peer_root.mkdir()
+        lifecycle_root = self.tmp_root / "lifecycle"
+        lifecycle_root.mkdir()
+        jobs = self.tmp_root / "jobs.log"
+        jobs.touch()
+        with mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(shared_peer_root)}):
+            store = peer_steward.peer_obligations.ObligationStore()
+            pending = store.create("message-pending", "message",
+                                   {"harness": "codex", "session_id": "recipient-pending"},
+                                   {"attempt_ids": ["att-pending"]})
+            unknown = store.create("batch-unknown", "registered-batch",
+                                   {"delivery_parent_id": "recipient-unknown"},
+                                   {"attempt_ids": ["att-unknown"]})
+            unknown = store.update(unknown["id"], state="unknown", observer_error="fixture-unknown")
+            pending_before = store.get(pending["id"])
+            unknown_before = store.get(unknown["id"])
+            lock_path = store.root / "ensure-obligations.lock"
+            original_inode = None
+
+            for mode in ("normal", "error"):
+                with self.subTest(callback_exit=mode):
+                    def ensure_runner(**_kwargs):
+                        nonlocal original_inode
+                        inode = lock_path.stat().st_ino
+                        if original_inode is None:
+                            original_inode = inode
+                        self.assertEqual(inode, original_inode)
+                        self.assertNotEqual(lock_path.name,
+                                            peer_steward.peer_obligations.RUNNER_LOCK_NAME)
+                        matching_fds = []
+                        for raw_fd in os.listdir("/proc/self/fd"):
+                            try:
+                                if os.readlink(f"/proc/self/fd/{raw_fd}") == str(lock_path):
+                                    matching_fds.append(int(raw_fd))
+                            except OSError:
+                                continue
+                        self.assertEqual(len(matching_fds), 1)
+                        self.assertFalse(os.get_inheritable(matching_fds[0]))
+                        self.assertIsNone(peer_steward._acquire_ensure_obligations_lock(store))
+
+                        alternate = peer_steward.peer_obligations.ObligationStore(alternate_peer_root)
+                        alternate_fd = peer_steward._acquire_ensure_obligations_lock(alternate)
+                        self.assertIsNotNone(alternate_fd)
+                        fcntl.flock(alternate_fd, fcntl.LOCK_UN)
+                        os.close(alternate_fd)
+
+                        child = subprocess.run(
+                            [sys.executable, "-c",
+                             "import os,sys; p=sys.argv[1]; print(any(os.readlink(f'/proc/self/fd/{fd}') == p "
+                             "for fd in os.listdir('/proc/self/fd') if fd.isdecimal()))",
+                             str(lock_path)],
+                            close_fds=False, capture_output=True, text=True, check=False,
+                        )
+                        self.assertEqual(child.returncode, 0, child.stderr)
+                        self.assertEqual(child.stdout.strip(), "False")
+                        if mode == "error":
+                            raise RuntimeError("fixture-runner-launch-error")
+                        return True
+
+                    with mock.patch.object(peer_steward.peer_obligations,
+                                           "ensure_normal_runner", side_effect=ensure_runner) as runner, \
+                         mock.patch.object(peer_steward, "_reconcile_external_obligations") as external, \
+                         mock.patch.object(peer_steward, "_reconcile_obligations") as inline:
+                        self.assertEqual(peer_steward.cmd_ensure_obligations(
+                            SimpleNamespace(lifecycle_root=lifecycle_root)), 0)
+                    runner.assert_called_once_with(lifecycle_root=lifecycle_root,
+                                                   reconciliation_required=True)
+                    external.assert_not_called()
+                    inline.assert_not_called()
+
+                    fd = peer_steward._acquire_ensure_obligations_lock(store)
+                    self.assertIsNotNone(fd, "short lock stayed held after callback exit")
+                    self.assertEqual(lock_path.stat().st_ino, original_inode)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                    self.assertEqual(store.get(pending["id"]), pending_before)
+                    self.assertEqual(store.get(unknown["id"]), unknown_before)
+
+    def test_ensure_lock_is_released_when_its_process_is_killed(self):
+        peer_root = self.tmp_root / "peer-killed-holder"
+        peer_root.mkdir()
+        marker = self.tmp_root / "ensure-entered"
+        script = (
+            "import importlib.util,os,sys,time\n"
+            "from pathlib import Path\n"
+            "spec=importlib.util.spec_from_file_location('peer_steward_test',%r)\n"
+            "m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)\n"
+            "def hold(**_kwargs):\n"
+            "    Path(os.environ['ENSURE_MARKER']).write_text('entered')\n"
+            "    time.sleep(30)\n"
+            "m.peer_obligations.ensure_normal_runner=hold\n"
+            "raise SystemExit(m.cmd_ensure_obligations(type('Args',(),{'lifecycle_root':None})()))\n"
+        ) % str(_HERE / "peer-steward.py")
+        env = dict(os.environ)
+        env.update({"AGENT_PEER_LEDGER_ROOT": str(peer_root), "ENSURE_MARKER": str(marker)})
+        holder = subprocess.Popen([sys.executable, "-c", script], env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "ensure callback did not acquire its short lock")
+            store = peer_steward.peer_obligations.ObligationStore(peer_root)
+            lock_path = store.root / "ensure-obligations.lock"
+            inode = lock_path.stat().st_ino
+            self.assertIsNone(peer_steward._acquire_ensure_obligations_lock(store))
+            holder.kill()
+            self.assertEqual(holder.wait(timeout=3), -signal.SIGKILL)
+            fd = peer_steward._acquire_ensure_obligations_lock(store)
+            self.assertIsNotNone(fd, "SIGKILL left the process lock held")
+            self.assertEqual(lock_path.stat().st_ino, inode)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=3)
+
     def test_existing_lifecycle_callback_reconnects_through_one_runner(self):
         self.pending_message()
         with mock.patch.object(peer_steward, "_watch_reconciliation_needed", return_value=False), \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "has_unowned_work", return_value=False), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=True) as runner, \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=True) as runner, \
              mock.patch.object(peer_steward, "_reconcile_obligations") as inline, \
              mock.patch.object(peer_steward, "_ensure_watch_observers") as watches, \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "ensure_observers") as batches:
             self.assertEqual(peer_steward.main(["__ensure-obligations"]), 0)
-        runner.assert_called_once_with(reconciliation_required=True)
+        runner.assert_called_once_with(lifecycle_root=None, reconciliation_required=True)
         inline.assert_not_called()
         watches.assert_not_called()
         batches.assert_not_called()
 
-    def test_legacy_or_unavailable_runner_uses_one_reconciliation_fallback(self):
-        self.pending_message()
+    def test_unavailable_runner_retains_work_without_blocking_the_callback(self):
+        store, duty = self.pending_message()
         with mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False) as runner, \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False) as runner, \
              mock.patch.object(peer_steward, "_reconcile_obligations") as inline:
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
-        runner.assert_called_once_with(reconciliation_required=True)
-        inline.assert_called_once()
+        runner.assert_called_once_with(lifecycle_root=None, reconciliation_required=True)
+        inline.assert_not_called()
+        self.assertEqual(store.get(duty["id"])["state"], "pending")
 
     def test_live_peer_runner_does_not_hide_new_external_work_on_next_callback(self):
         self.pending_message()
@@ -2662,7 +4008,7 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                                side_effect=[False, True]), \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "has_unowned_work", side_effect=[False, True]), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=True), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=True) as runner, \
              mock.patch.object(peer_steward, "_ensure_watch_observers") as watches, \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "ensure_observers") as batches, \
@@ -2671,8 +4017,9 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
             watches.assert_not_called()
             batches.assert_not_called()
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
-        watches.assert_called_once()
-        batches.assert_called_once()
+        watches.assert_not_called()
+        batches.assert_not_called()
+        self.assertEqual(runner.call_count, 2)
         peer_work.assert_not_called()
 
     def test_external_only_callback_recovers_without_an_idle_peer_runner(self):
@@ -2682,17 +4029,96 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_ensure_watch_observers") as watches, \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "ensure_observers") as batches, \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner") as runner:
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner") as runner:
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
-        watches.assert_called_once()
-        batches.assert_called_once()
-        runner.assert_not_called()
+        watches.assert_not_called()
+        batches.assert_not_called()
+        runner.assert_called_once_with(lifecycle_root=None, reconciliation_required=True)
 
-    def test_pending_peer_ticks_do_not_scan_external_families(self):
+    def test_managed_lifecycle_keeps_the_existing_runner_for_external_duties(self):
+        lifecycle_root = self.tmp_root / "managed-release"
+        signature = (("watch-fixture",),), ()
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "managed_service_binding", return_value="/fixture/current"), \
+             mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+             mock.patch.object(peer_steward, "_external_obligation_signature",
+                               return_value=signature), \
+             mock.patch.object(peer_steward, "_runner_duties", return_value=[]), \
+             mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner", return_value=True) as ensure:
+            self.assertEqual(peer_steward.cmd_ensure_obligations(
+                SimpleNamespace(lifecycle_root=lifecycle_root)), 0)
+        ensure.assert_called_once_with(lifecycle_root=lifecycle_root,
+                                       reconciliation_required=True)
+
+    def test_managed_runner_bounds_external_idle_scans_and_resets_for_new_batch(self):
+        import dispatch_batch_obligations as batch
+
+        def create_batch(suffix):
+            args = SimpleNamespace(
+                jobs=self.jobs_path, sealed_batch_id="sealed-" + suffix,
+                parent_attempt_id="att-parent", parent_session_id=None,
+                attempt_id=["att-child-" + suffix], control_socket=None,
+                queue_socket=None, thread_id=None, interval=1.0, timeout=2.0,
+            )
+            duty_id, _ = batch.create(args)
+            batch.update(self.jobs_path, duty_id, state="delivery-pending",
+                         reason="awaiting-recipient", outcome={"state": "done"})
+            return duty_id
+
+        first = create_batch("first")
+        watch_root = peer_steward._watch_root()
+        watch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        watch_id = "watch-idle-fixture"
+        watch_paths = peer_steward._watch_paths(watch_id, watch_root)
+        peer_steward._write_json_atomic(watch_paths.arm, {
+            "schema_version": peer_steward._WATCH_SCHEMA, "watch_id": watch_id,
+            "target": "fixture-target", "agent": {"harness": "codex",
+                "session_id": "sid-fixture", "pane": "w1:p1"},
+            "watcher": {"pid": 123, "pid_start": "456"},
+        })
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        delays = []
+        second = []
+
+        def observed_delay(delay):
+            delays.append(delay)
+            if len(delays) == 2:
+                second.append(create_batch("resumed"))
+            elif len(delays) == 3:
+                batch.update(self.jobs_path, first, state="complete", reason="fixture-settled")
+                batch.update(self.jobs_path, second[0], state="complete", reason="fixture-settled")
+                peer_steward._write_json_atomic(watch_paths.receipt, {"watch_id": watch_id})
+
+        try:
+            with mock.patch.object(peer_steward, "_reconcile_obligations"), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations") as reconcile, \
+                 mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]), \
+                 mock.patch.object(peer_steward.peer_obligations, "exec_service_runner"), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=observed_delay):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock_fd,
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        self.assertEqual(delays, [1.0, 1.7, 1.0])
+        self.assertEqual(reconcile.call_count, 4)
+        self.assertEqual(len(second), 1, "a batch arriving during idle resumes the bounded scan")
+
+    def test_fixed_root_runner_reconnects_external_families_once_per_pass(self):
         store, duty = self.pending_message()
         ticks = []
 
-        def resume(row, current):
+        def resume(row, current, *, read_context=None):
             ticks.append(row["id"])
             if len(ticks) == 3:
                 current.update(row["id"], state="complete")
@@ -2711,8 +4137,31 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                 SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
         self.assertEqual(ticks, [duty["id"]] * 3)
         self.assertEqual(sleep.call_count, 2)
-        for operation in (watches, watch_probe, batches, batch_probe):
-            operation.assert_not_called()
+        for operation in (watches, watch_probe, batches):
+            self.assertEqual(operation.call_count, 3)
+        batch_probe.assert_not_called()
+
+    def test_runner_idle_backoff_ignores_repeated_observation_writes_and_resets_on_change(self):
+        store, duty = self.pending_message()
+        ticks = []
+
+        def resume(row, current, *, read_context=None):
+            ticks.append(row["id"])
+            if len(ticks) <= 2:
+                current.update(row["id"], observer_error="same-unavailable")
+            elif len(ticks) == 3:
+                current.update(row["id"], observation={"reason": "recipient-returned"})
+            else:
+                current.update(row["id"], state="complete")
+
+        with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock, \
+             mock.patch.object(peer_steward, "_resume_message_obligation", side_effect=resume), \
+             mock.patch.object(peer_steward.time, "sleep") as sleep:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(peer_steward.cmd_obligation_runner(
+                SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+        self.assertEqual(ticks, [duty["id"]] * 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 1.7, 1.0])
 
     def test_work_accepted_at_unlock_is_reclaimed_before_runner_exit(self):
         store = peer_steward.peer_obligations.ObligationStore()
@@ -2727,7 +4176,7 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                     {"harness": "codex", "session_id": "sid-exit"}, {}))
             return result
 
-        def resume(row, current):
+        def resume(row, current, *, read_context=None):
             current.update(row["id"], state="complete")
 
         with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock, \
@@ -2740,6 +4189,407 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len(accepted), 1)
         self.assertEqual(resumed.call_count, 1)
         self.assertEqual(store.get(accepted[0]["id"])["state"], "complete")
+
+    def test_external_batch_created_at_unlock_invalidates_the_runner_snapshot(self):
+        import dispatch_batch_obligations as batch
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock = lock_path.open("w")
+        watch_root = self.tmp_root / "stable-watch-root"
+        watch_root.mkdir()
+        real_flock = fcntl.flock
+        created = []
+        inside_create = False
+        delays = []
+
+        def unlock_and_accept(fd, operation):
+            nonlocal inside_create
+            result = real_flock(fd, operation)
+            if operation == fcntl.LOCK_UN and not inside_create and not created:
+                inside_create = True
+                args = SimpleNamespace(
+                    jobs=self.jobs_path, sealed_batch_id="accepted-at-unlock",
+                    parent_attempt_id="att-parent", parent_session_id=None,
+                    attempt_id=["att-child-unlock"], control_socket=None,
+                    queue_socket=None, thread_id=None, interval=1.0, timeout=2.0,
+                )
+                created.append(batch.create(args)[0])
+                inside_create = False
+            return result
+
+        def settle_before_next_pass(delay):
+            delays.append(delay)
+            batch.update(self.jobs_path, created[0], state="complete",
+                         reason="fixture-settled")
+
+        original_snapshot = peer_steward._external_obligation_snapshot
+        snapshots = []
+
+        def count_snapshot():
+            value = original_snapshot()
+            snapshots.append(value)
+            return value
+
+        try:
+            real_flock(lock.fileno(), fcntl.LOCK_EX)
+            with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+                 mock.patch.object(batch, "_jobs_paths", side_effect=lambda jobs=None, strict=True: [
+                    Path(jobs).resolve(strict=False) if jobs else self.jobs_path.resolve()
+                 ]), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   side_effect=count_snapshot), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "exec_service_runner", return_value=False), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=settle_before_next_pass), \
+                 mock.patch.object(peer_steward.fcntl, "flock", side_effect=unlock_and_accept):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno(),
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                real_flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock.close()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(delays, [1.0])
+        self.assertEqual(len(snapshots), 3,
+                         "the new batch is reread after unlock and the completed row on the next pass")
+        self.assertEqual(batch.read(self.jobs_path, created[0])["state"], "complete")
+
+    def test_watch_snapshot_brackets_scan_and_reuses_stable_pair(self):
+        import dispatch_batch_obligations as batch
+
+        root = self.tmp_root / "watch-snapshot-race"
+        root.mkdir()
+        batch_root = batch._root(self.jobs_path)
+        batch_root.mkdir(parents=True)
+        with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+             mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]):
+            stable = peer_steward._external_obligation_snapshot()
+            self.assertTrue(stable["watch_cacheable"])
+            self.assertTrue(stable["batches"]["cacheable"])
+            self.assertTrue(peer_steward._external_obligation_snapshot_unchanged(stable))
+
+            original = peer_steward._watch_entries
+            created = []
+
+            def scan_then_create(scan_root):
+                entries = original(scan_root)
+                if not created:
+                    watch_id = "watch-created-inside-scan"
+                    peer_steward._write_json_atomic(
+                        peer_steward._watch_paths(watch_id, root).arm,
+                        {"schema_version": peer_steward._WATCH_SCHEMA,
+                         "watch_id": watch_id, "target": "synthetic-target",
+                         "agent": {"harness": "codex", "session_id": "synthetic-session",
+                                   "pane": "w1:p1"},
+                         "watcher": {"pid": 1, "pid_start": "1"}},
+                    )
+                    created.append(watch_id)
+                return entries
+
+            with mock.patch.object(peer_steward, "_watch_entries", side_effect=scan_then_create):
+                stale = peer_steward._external_obligation_snapshot()
+                self.assertFalse(stale["watch_cacheable"])
+                self.assertEqual(stale["watches"], ())
+                self.assertFalse(peer_steward._external_obligation_snapshot_unchanged(stale))
+                refreshed = peer_steward._external_obligation_snapshot()
+
+        self.assertIn(created[0], [watch_id for watch_id, _arm in refreshed["watches"]])
+
+    def test_batch_created_between_scan_and_stamp_is_reclaimed_by_runner(self):
+        import dispatch_batch_obligations as batch
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock = (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        watch_root = self.tmp_root / "empty-watch-root"
+        watch_root.mkdir()
+        batch_root = batch._root(self.jobs_path)
+        batch_root.mkdir(parents=True)
+        args = SimpleNamespace(
+            jobs=self.jobs_path, sealed_batch_id="accepted-during-read",
+            parent_attempt_id="att-parent", parent_session_id=None,
+            attempt_id=["att-child-scan-race"], delivery_parent_id="att-parent",
+            control_socket=None, queue_socket=None, thread_id=None,
+            interval=1.0, timeout=2.0,
+        )
+        created = []
+        watch_created = []
+        producer_results = []
+        snapshots = []
+        launches = []
+        original_watch_entries = peer_steward._watch_entries
+        original_records = batch._read_only_records
+        original_snapshot = peer_steward._external_obligation_snapshot
+
+        def scan_watch_then_accept(root):
+            entries = original_watch_entries(root)
+            if not watch_created:
+                watch_id = "watch-accepted-during-read"
+                peer_steward._write_json_atomic(
+                    peer_steward._watch_paths(watch_id, watch_root).arm,
+                    {"schema_version": peer_steward._WATCH_SCHEMA,
+                     "watch_id": watch_id, "target": "synthetic-watch-target",
+                     "agent": {"harness": "codex", "session_id": "synthetic-watch-session",
+                               "pane": "w1:p1"},
+                     "watcher": {}},
+                )
+                watch_created.append(watch_id)
+            return entries
+
+        def scan_then_accept(jobs):
+            records = original_records(jobs)
+            if not created:
+                duty_id, _record = batch.create(args)
+                batch.update(jobs, duty_id, state="delivery-pending",
+                             outcome={"state": "settled", "attempts": args.attempt_id})
+                created.append(duty_id)
+                producer_results.append(peer_steward.peer_obligations._ensure_runner(
+                    store.root.parent.parent, use_remembered=True,
+                    reconciliation_required=True))
+            return records
+
+        def count_snapshot():
+            snapshot = original_snapshot()
+            snapshots.append(snapshot)
+            return snapshot
+
+        class Launched:
+            pid = 901234
+
+        def launch(command, **kwargs):
+            if "--resume-obligation" in command:
+                launches.append(("batch", command, batch.read(self.jobs_path, created[0]), kwargs))
+            else:
+                launches.append(("watch", command, None, kwargs))
+            return Launched()
+
+        sleeps = []
+
+        def settle_after_reclaim(_delay):
+            sleeps.append(_delay)
+            if len(sleeps) == 2:
+                batch.update(self.jobs_path, created[0], state="complete",
+                             reason="synthetic-owner-progress")
+                peer_steward._write_json_atomic(
+                    peer_steward._watch_paths(watch_created[0], watch_root).receipt,
+                    {"watch_id": watch_created[0], "state": "synthetic-complete"})
+
+        try:
+            with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+                 mock.patch.object(peer_steward, "_watch_entries",
+                                   side_effect=scan_watch_then_accept), \
+                 mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]), \
+                 mock.patch.object(batch, "_read_only_records", side_effect=scan_then_accept), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   side_effect=count_snapshot), \
+                 mock.patch.object(peer_steward.peer_obligations, "exec_service_runner",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(batch.subprocess, "Popen", side_effect=launch), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=settle_after_reclaim):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno(),
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock.close()
+
+        self.assertEqual(producer_results, [False],
+                         "the producer saw the held runner lock and left responsibility with it")
+        self.assertEqual(len(launches), 2,
+                         "the real runner must reclaim both accepted external obligations")
+        self.assertFalse(snapshots[0]["watch_cacheable"])
+        self.assertEqual(snapshots[0]["watches"], ())
+        self.assertFalse(snapshots[0]["batches"]["cacheable"])
+        self.assertEqual(snapshots[0]["batches"]["signature"], ())
+        self.assertTrue(any(created[0] in [item[1] for item in snapshot["batches"]["signature"]]
+                            for snapshot in snapshots[1:]))
+        self.assertTrue(any(watch_created[0] in [watch_id for watch_id, _arm in snapshot["watches"]]
+                            for snapshot in snapshots[1:]))
+        self.assertEqual([kind for kind, _command, _record, _kwargs in launches], ["watch", "batch"])
+        _kind, command, accepted, _kwargs = launches[1]
+        self.assertIn("--resume-obligation", command)
+        self.assertIn(created[0], command)
+        self.assertEqual(accepted["state"], "delivery-pending")
+        recovered = batch.read(self.jobs_path, created[0])
+        self.assertEqual(recovered["state"], "complete")
+        self.assertEqual(recovered["reason"], "synthetic-owner-progress")
+        self.assertEqual(recovered["observer"]["pid"], Launched.pid)
+        self.assertTrue(peer_steward._watch_paths(watch_created[0], watch_root).receipt.is_file())
+
+    def test_scan_then_stamp_legacy_order_is_caught_at_real_runner_boundary(self):
+        import dispatch_batch_obligations as batch
+
+        def legacy_batch_snapshot(jobs=None):
+            signature, paths_by_jobs, roots_by_jobs, root_stamps = [], {}, {}, {}
+            cacheable = True
+            for jobs_path in batch._jobs_paths(jobs, strict=False):
+                key = str(jobs_path.resolve(strict=False))
+                root = jobs_path.resolve(strict=False).parent / "supervisor-state" / "obligations"
+                roots_by_jobs[key] = root
+                try:
+                    records = batch._read_only_records(jobs_path)
+                except (OSError, batch.BatchObligationError):
+                    signature.append((str(jobs_path), "unavailable"))
+                    paths_by_jobs[key] = None
+                    root_stamps[key] = batch._directory_stamp(root)
+                    cacheable = False
+                    continue
+                root_stamps[key] = batch._directory_stamp(root)
+                pending_paths = []
+                for path, record, error in records:
+                    if error is not None:
+                        signature.append((str(jobs_path), path.name, "unreadable"))
+                        pending_paths.append(path)
+                    elif record and record.get("state") in batch._PENDING:
+                        pending_paths.append(path)
+                        observer = record.get("observer") or {}
+                        signature.append((
+                            str(jobs_path), record.get("id", path.stem), record.get("state"),
+                            record.get("delivery"), observer.get("pid"), observer.get("pid_start"),
+                        ))
+                paths_by_jobs[key] = tuple(pending_paths)
+            return {"signature": tuple(sorted(signature)), "paths_by_jobs": paths_by_jobs,
+                    "roots_by_jobs": roots_by_jobs, "root_stamps": root_stamps,
+                    "cacheable": cacheable}
+
+        def legacy_external_snapshot():
+            try:
+                root = peer_steward._watch_root()
+                watches = tuple(peer_steward._watch_entries(root))
+                stamp = batch._directory_stamp(root)
+                cacheable = True
+            except Exception:
+                root, watches, stamp, cacheable = None, None, None, False
+            try:
+                batches = batch.pending_observer_snapshot()
+            except Exception:
+                batches = {"signature": (("batch-state-unavailable",),),
+                           "paths_by_jobs": {}}
+            return {"watch_root": root, "watches": watches, "watch_stamp": stamp,
+                    "watch_cacheable": cacheable, "batches": batches}
+
+        result = unittest.TestResult()
+        regression = ObligationStartupTest(
+            "test_batch_created_between_scan_and_stamp_is_reclaimed_by_runner")
+        with mock.patch.object(batch, "pending_observer_snapshot",
+                               side_effect=legacy_batch_snapshot), \
+             mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                               side_effect=legacy_external_snapshot):
+            regression.run(result)
+
+        # The focused boundary regression must fail with the old scan→stamp
+        # order; the current-source test in this class passes and proves both
+        # obligations were reclaimed by the coordinator.
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(result.failures), 1)
+        self.assertRegex(result.failures[0][1], "0 != 2|True is not false")
+
+
+class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
+    def _row_and_duty(self, *, process_proof=True, submitted=False):
+        sender = {"harness": "claude", "session_id": "sid-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": 4242, "start": "123",
+                 "pid_namespace": "pid:[77]"}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] bounded first input", sender, recipient, defer=True,
+            **({"first_input_process": proof} if process_proof else {}))
+        if submitted:
+            claim = peer_steward.peer_message.claim_pending_first_input(
+                ref, {"harness": "codex", "pane_id": "w1:pX"}, proof)
+            self.assertIsNotNone(claim)
+            self.assertTrue(peer_steward.peer_message.mark_pending_prompt_queued(
+                ref, claim["rpc_claim"], receipt="native-first-input-submitted"))
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "w1:pX", "harness": "codex", "session_id": ""},
+            {"ref": ref, "target": "fresh", "to": recipient, "from": sender})
+        return proof, ref, store, duty
+
+    def test_replaced_foreground_cannot_bind_or_queue_and_records_typed_reason(self):
+        proof, ref, store, duty = self._row_and_duty()
+        changed = {**proof, "pid": 4243, "start": "456"}
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof", return_value=changed), \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue, \
+             mock.patch.object(peer_steward, "_ensure_sender_delay_notice") as notice:
+            peer_steward._resume_message_obligation(duty, store)
+        result = store.get(duty["id"])
+        self.assertEqual((result["state"], result["observation"]["reason"]),
+                         ("unknown", "target-process-changed"))
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+        bind.assert_not_called()
+        queue.assert_not_called()
+        notice.assert_not_called()
+
+    def test_replaced_foreground_uses_only_the_existing_bounded_sender_notice(self):
+        proof, _ref, store, duty = self._row_and_duty()
+        pending_ref = duty["intent"]["ref"]
+        row = peer_steward.peer_message._read_pending(pending_ref)
+        peer_steward.peer_message._save_pending(
+            dict(row, created=time.time() - peer_steward._FLUSH_STUCK_HOURS * 3600 - 1))
+        changed = {**proof, "pid": 4243, "start": "456"}
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof", return_value=changed), \
+             mock.patch.object(peer_steward, "_ensure_sender_delay_notice") as notice, \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue:
+            peer_steward._resume_message_obligation(duty, store)
+        notice.assert_called_once()
+        bind.assert_not_called()
+        queue.assert_not_called()
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"],
+                         "target-process-changed")
+
+    def test_old_sidless_row_without_process_proof_stays_unknown(self):
+        _proof, ref, store, duty = self._row_and_duty(process_proof=False)
+        ident = {"harness": "codex", "session_id": "sid-new", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_foreground_process_proof") as current:
+            peer_steward._resume_message_obligation(duty, store)
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"],
+                         "target-process-proof-unknown")
+        current.assert_not_called()
+        self.assertIsNone(peer_steward.peer_message._read_pending(ref).get("bound_to"))
+
+    def test_submitted_first_input_is_never_queued_again_after_sid_appears(self):
+        _proof, ref, store, duty = self._row_and_duty(submitted=True)
+        with mock.patch.object(peer_steward, "_retire_target") as target, \
+             mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue:
+            peer_steward._resume_message_obligation(duty, store)
+        result = store.get(duty["id"])
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["observation"]["reason"], "native-first-input-submitted")
+        target.assert_not_called()
+        bind.assert_not_called()
+        queue.assert_not_called()
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "queued")
 
 
 class NormalProducerRunnerBindingTest(unittest.TestCase):
@@ -5757,6 +7607,9 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
              mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False):
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
+            # The callback only requests recovery; the existing runner owns
+            # this same retained duty and performs its repair in its pass.
+            peer_steward._reconcile_external_obligations(store)
         self.assert_authority()
 
     def test_later_requester_cannot_replay_another_sessions_retire(self):
@@ -6159,15 +8012,16 @@ class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
 
     def test_detached_lifecycle_needs_no_observer_native_identity(self):
         before = self.protected()
-        runner_start = len(peer_steward.peer_obligations._RUNNERS)
         with mock.patch.object(peer_steward, "_current_session_identity", return_value=("observer", "claude")), \
              mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
              mock.patch.object(peer_steward, "_ensure_watch_observers"), \
              mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
             self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
-        for process in peer_steward.peer_obligations._RUNNERS[runner_start:]:
-            self.assertEqual(process.wait(timeout=15), 0)
+            # The callback is bounded; exercise the runner's retained duty
+            # pass with this fixture's native transport boundary in place.
+            peer_steward._reconcile_external_obligations(
+                peer_steward.peer_obligations.ObligationStore())
         self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
         self.assertEqual(self.protected(), before)
 

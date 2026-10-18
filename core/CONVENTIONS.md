@@ -275,6 +275,19 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
 16. A steward session never holds launch, gate, write, or approval authority over
     another root; peer messages are advisory and the ledger is the only record
     (`OPERATIONS §5.14`).
+17. Registered `code-test` results bind to the effective source subject through
+    admission, registration, launch, completion, and downstream gate currency.
+    Each content digest keeps its own finite verdict budget across route
+    lineage; A→B→A does not replenish A, and the source epoch keeps A's old
+    marker historical. Unknown legacy PASS rows cannot satisfy a changed-source
+    gate. Live/unsettled protections remain lineage-wide, and test owner-closure
+    is unavailable.
+18. Task-branch publication, matching PR creation/update, and final-head CI
+    observation belong to a depth-1 `autopilot-code` owner whose sealed entry
+    scope is complete. This route authority supplies tool capacity; the owner
+    performs publication only when it is part of the actual requested task.
+    Request wording is not a second authorization test. Stage/review worker scope excludes publication. Main integration, merges,
+    release, installation, and worktree cleanup stay with the supervisor.
 
 Token-budget accounting is observation, not attribution. Hook invocations,
 zero/emission outcomes, exact inserted-directive UTF-8 bytes, and monotonic

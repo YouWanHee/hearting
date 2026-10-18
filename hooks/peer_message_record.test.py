@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -16,6 +17,13 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _HOOK = _HERE / "peer-message-record.py"
+_UTILITIES = _HERE.parent / "utilities"
+sys.path.insert(0, str(_UTILITIES))
+import dispatch_pending_delivery as pending_delivery
+import peer_obligations
+_PEER_SPEC = importlib.util.spec_from_file_location("hook_test_peer_message", _UTILITIES / "peer-message.py")
+peer_message = importlib.util.module_from_spec(_PEER_SPEC)
+_PEER_SPEC.loader.exec_module(peer_message)
 
 
 class _BaseTest(unittest.TestCase):
@@ -26,15 +34,42 @@ class _BaseTest(unittest.TestCase):
         self.jobs_path = self.tmp_root / "jobs.log"
         self.jobs_path.touch()
         self.env = dict(os.environ)
+        for key in tuple(self.env):
+            if (key.startswith(("AGENT_DISPATCH_", "AGENT_ARTIFACT_", "AGENT_RUNTIME_",
+                                "AGENT_SESSION_", "AGENT_THREAD_", "HERDR_"))
+                    or key in {"AGENT_HOME", "CLAUDE_HOME", "CODEX_THREAD_ID",
+                               "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID",
+                               "OPENCODE_SESSION_ID", "SERVICE_CURRENT",
+                               "HEARTING_SERVICE_CURRENT", "AGENT_SERVICE_CURRENT"}):
+                self.env.pop(key, None)
         self.env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         # C-1 moved the peer ledger's writer root off AGENT_DISPATCH_JOBS onto
         # peer_state_root(); isolating only AGENT_DISPATCH_JOBS no longer keeps this
         # fixture's records out of the real per-user ledger root. Point it at the
         # same tmp_root the `_ledger_root()` helper below already expects.
         self.env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
+        self.env.update({
+            "HOME": str(self.tmp_root / "home"),
+            "XDG_STATE_HOME": str(self.tmp_root / "xdg-state"),
+            "XDG_CONFIG_HOME": str(self.tmp_root / "xdg-config"),
+            "XDG_DATA_HOME": str(self.tmp_root / "xdg-data"),
+            "HARNESS_STATE_ROOT": str(self.tmp_root / "harness-state"),
+            "AGENT_ARTIFACT_ROOT": str(self.tmp_root / "artifacts"),
+            "AGENT_ARTIFACT_OUTPUT_DIR": str(self.tmp_root / "artifacts" / "output"),
+            "AGENT_RUNTIME_ROOT": str(self.tmp_root / "runtime"),
+            "CODEX_HOME": str(self.tmp_root / "home" / ".codex"),
+            "CLAUDE_HOME": str(self.tmp_root / "runtime" / "claude"),
+            "CLAUDE_CONFIG_DIR": str(self.tmp_root / "home" / ".claude"),
+            "OPENCODE_CONFIG_DIR": str(self.tmp_root / "home" / ".config" / "opencode"),
+            "FAKE_HERDR_SHELL_PID": str(os.getpid()),
+        })
         self.env.pop("AGENT_HOME", None)
+        for key in ("AGENT_SERVICE_CURRENT", "HEARTING_SERVICE_CURRENT", "SERVICE_CURRENT",
+                    "AGENT_INSTALL_CURRENT", "AGENT_INSTALL_ROOT", "HERDR_SOCKET_PATH",
+                    "AGENT_HERDR_SESSION", "HERDR_SESSION"):
+            self.env.pop(key, None)
         for key in ("FLEET_TITLE_REFRESH", "MEM_DISTILL", "AGENT_SESSION_ROLE",
-                    "AGENT_DISPATCH_DEPTH", "CLAUDE_CODE_CHILD_SESSION",
+                    "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH", "CLAUDE_CODE_CHILD_SESSION",
                     "CODEX_THREAD_ID", "CODEX_SESSION_ID", "AGENT_SESSION_ID",
                     "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID",
                     "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS"):
@@ -63,6 +98,169 @@ class _BaseTest(unittest.TestCase):
                     if line.strip():
                         recs.append(json.loads(line))
         return recs
+
+
+class NativeContextReceiptTest(_BaseTest):
+    def _seed_message(self, *, recipient_sid="sid-native-context", refs=()):
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            text, ref = peer_message.prepare_peer_message(
+                "[steer] isolated native hook payload",
+                {"harness": "codex", "session_id": "thread-native-sender", "name": "sender"},
+                {"harness": "claude", "session_id": recipient_sid, "name": "receiver"},
+                defer=True, refs=refs,
+            )
+        return text, ref
+
+    def _seed_registered_message(self):
+        sid = "sid-native-obligation"
+        attempt_id = "att-native-context-owner"
+        delivery_id = "delivery-native-context"
+        duty_id = "registered-batch-native-context"
+        carrier = "claude-parent-runtime"
+        root = self.jobs_path.parent
+        owner = "retained-rewake:" + duty_id
+        self.jobs_path.write_text(
+            "2026-10-18T00:00:00Z\tdone\t/repo\t/wt\tfixture\t"
+            "attempt_schema_version=2,dispatch_depth=1,attempt_id=" + attempt_id
+            + ",parent_sid=" + sid + ",parent_harness=claude,harness=claude"
+            + ",parent_completion_delivery=" + carrier + ",delivery_id=" + delivery_id
+            + ",note=completed-marker,failure_class=pass\n",
+            encoding="utf-8",
+        )
+        identity = {"jobs": str(self.jobs_path.resolve()), "attempt_id": attempt_id,
+                    "session_id": sid, "harness": "claude", "server": "default"}
+        store = peer_obligations.ObligationStore(root)
+        store.create(duty_id, "registered-batch", identity, {"carrier": carrier})
+        receipt = {
+            "schema_version": 2, "state": "delivered", "kind": "notice",
+            "parent_attempt_id": "att-native-context-parent",
+            "job_registry": str(self.jobs_path), "delivery_classification": "attention",
+            "children": [{"attempt_id": attempt_id, "status": "done", "readiness": "ready",
+                          "reason": "fixture", "required_action": "inspect-done-failure",
+                          "harness": "claude", "delivery_classification": "attention"}],
+        }
+        pending_delivery.create(
+            root, recipient_kind=carrier, recipient_key=sid, delivery_id=delivery_id,
+            session_generation="", session_generation_supported="0",
+            attempt_ids=[attempt_id], parent_attempt_id="att-native-context-parent",
+            route_id="rt-native-context", route_node="execute", receipt=receipt,
+            receipt_digest=pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={attempt_id: "fixture"},
+        )
+        pending_delivery.claim(root, sid, delivery_id, claim_owner=owner, lease_seconds=60)
+        binding = {"duty_id": duty_id, "jobs": str(self.jobs_path.resolve()),
+                   "attempt_id": attempt_id, "carrier": carrier, "recipient_sid": sid,
+                   "storage_recipient": sid, "delivery_id": delivery_id, "claim_owner": owner}
+        text, ref = self._seed_message(recipient_sid=sid, refs=[duty_id])
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            peer_message.bind_dispatch_notice(ref, binding)
+        return text, ref, sid, duty_id, delivery_id, root
+
+    def _prompt(self, sid):
+        return self._run("prompt", {"session_id": sid, "cwd": str(self.tmp_root), "prompt": ""})
+
+    def test_native_hook_receipt_completes_exact_registered_obligation_once(self):
+        text, ref, sid, duty_id, delivery_id, root = self._seed_registered_message()
+        first = self._prompt(sid)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, text)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            received = peer_message._read_pending(ref)
+            self.assertEqual((received["state"], received["receipt"], received["ref"]),
+                             ("received", "exact-peer-ref", ref))
+            self.assertEqual(received["body_sha256"], hashlib.sha256(text.encode()).hexdigest())
+            self.assertEqual(received["from"]["session_id"], "thread-native-sender")
+            self.assertEqual(received["to"], {"harness": "claude", "session_id": sid,
+                                               "name": "receiver"})
+            self.assertIsNone(received["text"])
+            transfer = peer_message._read_transfer_record(ref)
+            self.assertEqual(transfer["body_sha256"], received["body_sha256"])
+            self.assertEqual(pending_delivery.read(root, sid, delivery_id)["state"], "acked")
+            self.assertEqual(peer_obligations.ObligationStore(root).get(duty_id)["state"], "complete")
+        records = [row for row in self._all_records() if row.get("transfer_ref") == ref]
+        self.assertEqual(len(records), 1)
+        duplicate = self._prompt(sid)
+        self.assertEqual(duplicate.stdout, b"")
+        self.assertEqual([row for row in self._all_records() if row.get("transfer_ref") == ref], records)
+
+    def test_retained_hook_context_requires_a_fresh_native_delivery(self):
+        text, ref = self._seed_message()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            with peer_message.pending_lock(ref):
+                row = peer_message._read_pending(ref)
+                peer_message._save_pending(dict(row, state="queued", receipt="hook-context-emitted"))
+            peer_message.receive_peer_message("ordinary next prompt", {
+                "harness": "claude", "session_id": "sid-native-context"})
+            self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        delivered = self._prompt("sid-native-context")
+        self.assertEqual(delivered.returncode, 0, delivered.stderr)
+        context = json.loads(delivered.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, text)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            row = peer_message._read_pending(ref)
+            self.assertEqual((row["state"], row["receipt"]), ("received", "exact-peer-ref"))
+
+    def test_native_hook_wrong_session_leaves_the_exact_transfer_pending(self):
+        text, ref = self._seed_message()
+        output = self._prompt("sid-other-native-context")
+        self.assertEqual(output.returncode, 0, output.stderr)
+        self.assertEqual(output.stdout, b"")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            row = peer_message._read_pending(ref)
+            self.assertEqual((row["state"], row["text"]), ("pending", text))
+        self.assertFalse([entry for entry in self._all_records()
+                          if entry.get("transfer_ref") == ref])
+
+    def test_native_hook_partial_flush_keeps_claim_and_original_body(self):
+        text, ref = self._seed_message()
+        spec = importlib.util.spec_from_file_location(
+            "native_hook_partial_flush", _HOOK)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+
+        class PartialOutput:
+            def __init__(self):
+                self.data = ""
+            def write(self, value):
+                self.data += value
+            def flush(self):
+                raise OSError("fixture output flush failed")
+
+        stream = PartialOutput()
+        payload = {"session_id": "sid-native-context", "cwd": str(self.tmp_root), "prompt": ""}
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                mock.patch.object(sys, "stdout", stream), \
+                mock.patch.object(sys, "argv", [str(_HOOK), "prompt"]):
+            with self.assertRaisesRegex(OSError, "output flush failed"):
+                hook.main()
+            row = peer_message._read_pending(ref)
+        self.assertEqual(
+            json.loads(stream.data)["hookSpecificOutput"]["additionalContext"], text)
+        self.assertEqual((row["state"], row["receipt"], row["text"]),
+                         ("unverified", "hook-context-inflight", text))
+        self.assertTrue(row["rpc_claim"])
+        self.assertFalse([entry for entry in self._all_records()
+                          if entry.get("transfer_ref") == ref])
+
+    def test_native_hook_rejects_corrupt_body_without_receipt(self):
+        _text, ref = self._seed_message()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            path = peer_message._pending_path(ref)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row["text"] = row["text"].replace("isolated native hook payload", "wrong body")
+            path.write_text(json.dumps(row), encoding="utf-8")
+        output = self._prompt("sid-native-context")
+        self.assertEqual(output.returncode, 0, output.stderr)
+        self.assertEqual(output.stdout, b"")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            path = peer_message._pending_path(ref)
+            self.assertFalse(path.exists())
+            quarantined = list((path.parent.parent / "quarantine").glob(f"*/{ref}.json"))
+            self.assertEqual(len(quarantined), 1)
+        self.assertFalse([entry for entry in self._all_records()
+                          if entry.get("transfer_ref") == ref])
 
 
 class PostToolTest(_BaseTest):
@@ -289,10 +487,15 @@ import json, os, sys
 argv = sys.argv[1:]
 target = argv[2] if len(argv) > 2 else "-"
 if argv[:2] == ["pane", "process-info"]:
+    shell_pid = int(os.environ.get("FAKE_HERDR_SHELL_PID", os.getppid()))
     print(json.dumps({"result": {"process_info": {
-        "pane_id": argv[-1], "shell_pid": os.getppid(),
-        "foreground_process_group_id": os.getppid(),
-        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+        "pane_id": argv[-1], "shell_pid": shell_pid,
+        "foreground_process_group_id": shell_pid,
+        "foreground_processes": [{"pid": shell_pid, "argv": ["zsh"]}]}}}))
+    sys.exit(0)
+if argv[:2] == ["pane", "list"]:
+    print(json.dumps({"result": {"panes": [{"pane_id": "w1:p9", "agent": "claude",
+        "agent_session": {"value": "sid-fake"}, "agent_status": "idle"}]}}))
     sys.exit(0)
 print(json.dumps({"result": {"agent": {"agent": "claude",
     "agent_session": {"value": "sid-fake"}, "agent_status": "idle",
@@ -311,6 +514,18 @@ class SweepTest(_BaseTest):
         fake.chmod(0o755)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
         self.session = "sweep-session-1"
+        # A pane census must report a live, fixture-owned foreground shell;
+        # the hook/observer children must not borrow a caller's Herdr socket.
+        self.shell = subprocess.Popen(
+            ["/bin/sleep", "60"], env=self.env, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self._stop_fixture_shell)
+        self.env["FAKE_HERDR_SHELL_PID"] = str(self.shell.pid)
+
+    def _stop_fixture_shell(self):
+        if self.shell.poll() is None:
+            self.shell.kill()
+            self.shell.wait(timeout=5)
 
     def _steward(self, *argv, session_id=None):
         env = dict(self.env)

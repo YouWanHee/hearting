@@ -51,7 +51,7 @@ if _TOOLS not in sys.path:
     sys.path.insert(0, _TOOLS)
 
 from fleet.session_handle import (_cell_width, clip_cells,  # noqa: E402
-                                  resolve_display_inputs, resolve_tag,
+                                  current_session_subject, resolve_display_inputs, resolve_tag,
                                   sanitize_title)
 
 HARNESSES = ("claude", "codex", "opencode")
@@ -210,17 +210,18 @@ def _runtime_name(harness: str, session_id: str) -> str:
 
 def session_title(harness: str, session_id: str) -> str:
     """Share Fleet's explicit-user-name / last-successful-title / blank ladder."""
+    runtime_name = None
     try:
-        name = resolve_display_inputs(harness, session_id).get("runtime_name")
-        if name:
-            return sanitize_title(name)
+        runtime_name = resolve_display_inputs(harness, session_id).get("runtime_name")
     except Exception:
         pass
+    title = None
     try:
         from fleet.titles import last_title
-        return sanitize_title(last_title(session_id, harness=harness))
+        title = last_title(session_id, harness=harness)
     except Exception:
-        return ""
+        pass
+    return current_session_subject(runtime_name, title)
 
 
 def is_steward(harness: str, session_id: str) -> bool:
@@ -233,11 +234,25 @@ def is_steward(harness: str, session_id: str) -> bool:
         return False
     try:
         from fleet.collectors.herdr import _clear_gpu_session_aliases
-        from fleet.collectors.steward import role_flag
+        from fleet.collectors import steward as steward_collector
+        markers = steward_collector.read_markers()
+        if not markers:
+            return False
+        cwd = os.getcwd()
+        harness_key = str(harness or "").lower()
         aliases = _clear_gpu_session_aliases(harness, session_id,
-                                             os.environ.get("HERDR_PANE_ID"))
+                                             os.environ.get("HERDR_PANE_ID"), cwd)
+        sessions = steward_collector._projection_sessions()
+        live = {(str(getattr(row, "harness", "") or "").lower(),
+                 getattr(row, "session_id", None)) for row in sessions}
+        aliases = [sid for sid in aliases if (harness_key, sid) not in live]
+        targets = steward_collector.role_targets(
+            harness, session_id, aliases=aliases, markers=markers, cwd=cwd,
+            sessions=sessions, include_native=True)
         # The normal hook owns its cwd even before herdr has published a SID.
-        return role_flag(harness, session_id, aliases=aliases, cwd=os.getcwd())
+        return steward_collector.role_flag(harness, session_id, aliases=aliases,
+                                           markers=markers, cwd=cwd, sessions=sessions,
+                                           _targets=targets)
     except Exception:
         pass
     return False

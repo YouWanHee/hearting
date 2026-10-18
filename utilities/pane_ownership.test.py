@@ -23,6 +23,19 @@ import session_tidy as st
 
 
 class PaneOwnershipTest(unittest.TestCase):
+    def test_import_adds_tools_path_for_isolated_utilities_entrypoint(self):
+        utilities = str(ROOT / "utilities")
+        script = (
+            "import sys; "
+            f"sys.path.insert(0, {utilities!r}); "
+            "import pane_ownership; "
+            "from fleet.collectors import procscan; "
+            "assert procscan.__name__ == 'fleet.collectors.procscan'"
+        )
+        result = subprocess.run([sys.executable, "-I", "-c", script],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pane-ownership-")
         self.addCleanup(self.temp.cleanup)
@@ -197,6 +210,20 @@ class PaneOwnershipTest(unittest.TestCase):
                 mock.patch.object(po, "_registered_worker", return_value=False):
             self.assertEqual(po.codex_tui_pane_endpoint(current, executable=str(self.herdr)),
                              ("wB:p3N", "/owner.sock"))
+            binding = po.codex_tui_process_bindings(current, executable=str(self.herdr))
+            self.assertEqual(binding, [{
+                "pid": foreground.pid,
+                "pid_start": str(po._process(foreground.pid)[5]),
+                "session_id": current,
+                "pane": "wB:p3N",
+                "socket_path": "/owner.sock",
+            }])
+            native_process = po.codex_tui_processes_for_session(current)
+            self.assertEqual(native_process, [{
+                "pid": foreground.pid,
+                "pid_start": str(po._process(foreground.pid)[5]),
+                "session_id": current,
+            }])
             with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/owner.sock"}, clear=True):
                 self.assertEqual(self.verify(foreground.pid, "codex", current), "wB:p3N")
             with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/caller.sock"}, clear=True):
@@ -228,6 +255,40 @@ class PaneOwnershipTest(unittest.TestCase):
                 ("wB:p3N", "/owner.sock"))
             # The loader's own before/after reads are the whole proof.
             self.assertEqual(proof.call_count, 2)
+            observation = proof.call_args_list[0].kwargs["codex_observation"]
+            self.assertIsNotNone(observation)
+            self.assertTrue(all(call.kwargs["codex_observation"] is observation
+                                for call in proof.call_args_list))
+
+    def test_multi_candidate_endpoint_uses_one_collector_observation(self):
+        from fleet.collectors import procscan
+
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        pids = [43101, 43102, 43103, 43104, 43105]
+        records = {pid: (pid, 1, 77, 4, 77, str(1000 + pid)) for pid in pids}
+        envs = {pid: {"HERDR_PANE_ID": f"pane-{pid}", "HERDR_SOCKET_PATH": "/owner.sock"}
+                for pid in pids}
+
+        def pane_info(pane, **_kwargs):
+            pid = int(pane.removeprefix("pane-"))
+            return {"foreground_process_group_id": 77,
+                    "foreground_processes": [{"pid": pid}]}
+
+        with mock.patch.object(po.os, "listdir", return_value=[str(pid) for pid in pids]), \
+                mock.patch.object(po, "_runtime", return_value=("codex", False)), \
+                mock.patch.object(po, "_process", side_effect=lambda pid: records.get(int(pid))), \
+                mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(procscan, "read_environ", side_effect=lambda pid: envs[int(pid)]), \
+                mock.patch.object(po, "_pane_process_info", side_effect=pane_info), \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value=set()), \
+                mock.patch.object(po, "_native_session", return_value=current) as proof:
+            bindings = po.codex_tui_process_bindings(current, executable=str(self.herdr))
+
+        self.assertEqual(len(bindings), len(pids), bindings)
+        self.assertEqual(proof.call_count, 2 * len(pids))
+        observation = proof.call_args_list[0].kwargs["codex_observation"]
+        self.assertTrue(all(call.kwargs["codex_observation"] is observation
+                            for call in proof.call_args_list))
 
     def test_codex_hook_can_report_new_thread_only_after_current_footer_proof(self):
         from fleet import herdr_projection as hp

@@ -10,6 +10,7 @@ S=importlib.util.spec_from_file_location("route",ROOT/"utilities/capability-rout
 F_SPEC=importlib.util.spec_from_file_location("fallback",ROOT/"utilities/stage-dispatch-fallback.py"); F=importlib.util.module_from_spec(F_SPEC); F_SPEC.loader.exec_module(F)
 
 import contextlib
+import review_source_subject as SUBJECT
 
 
 @contextlib.contextmanager
@@ -155,7 +156,9 @@ class FallbackTest(unittest.TestCase):
    plan["depends_on"]=[]
    route["route_hash"]=R.route_hash(route)
    route["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
-  path=Path(self.tmp.name)/"route.json"; path.write_text(json.dumps(route),encoding="utf-8"); return path
+  path=Path(self.tmp.name)/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+  self.current_route_file=path
+  return path
  def seed_plan_marker(self,route):
   """Review placement fixtures have a genuine current producer input (SD-161)."""
   plan=next(n for n in route["nodes"] if n["id"]=="plan")
@@ -332,20 +335,32 @@ class FallbackTest(unittest.TestCase):
    except SystemExit as exc:
     code=exc.code
   return code,printed
- def seed_review_rounds(self,route_id,node_id,count):
+ def seed_review_rounds(self,route,node_id,count):
   """Prior closed rounds in the production registry shape (`route_id=`).
 
   SD-153: a review verdict must be a real blocking finding, not a crash --
   `completed-review-blocking` spends the round budget the way `dead-worker-
   fail` (a crash, never a review verdict) no longer does on its own.
   """
+  node=next(item for item in route["nodes"] if item["id"]==node_id)
+  note="dead-worker-fail" if node.get("completion_gate")=="code-test" else "completed-review-blocking"
+  worker_type=node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")
   with self.jobs.open("a",encoding="utf-8") as fh:
    for i in range(1,count+1):
+    attempt_id=f"att-{node_id}-round-{i}"
+    metadata={
+     "attempt_schema_version":"2","dispatch_depth":"2","registered_worker":"1",
+     "route_id":route["route_id"],"route_hash":route["route_hash"],
+     "route_node":node_id,"route_file":str(self.current_route_file),
+     "completion_gate":node.get("completion_gate", ""),"worker_type":worker_type,
+     "note":note,"failure_class":"fail","attempt_id":attempt_id,
+    }
+    if SUBJECT.has_review_subject(route,node,self.jobs):
+     metadata.update(SUBJECT.seal_attempt(
+      self.jobs,route,node,attempt_id,worktree=self.repo))
     fh.write(
      f"2026-08-29T00:00:0{i}Z\tdone\t{self.repo}\t{self.repo}\tround-{node_id}-{i}\t"
-     "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
-     f"route_id={route_id},route_node={node_id},note=completed-review-blocking,"
-      f"attempt_id=att-{node_id}-round-{i}\n")
+     + ",".join(f"{key}={value}" for key,value in metadata.items()) + "\n")
 
  def continuation_review_route(self,resume_from_node="plan-check"):
   """Publish a real continuation that retains a runnable plan-check node."""
@@ -511,7 +526,7 @@ class FallbackTest(unittest.TestCase):
    route=json.loads(path.read_text())
    cap=F.DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
    self.seed_parent()
-   self.seed_review_rounds(route["route_id"],"plan-check",cap)
+   self.seed_review_rounds(route,"plan-check",cap)
    code,printed=self.run_review_inline(path)
   self.assertEqual(code,65,printed)
   self.assertIn("reason=review-round-budget-exhausted",printed)
@@ -527,7 +542,7 @@ class FallbackTest(unittest.TestCase):
    route=json.loads(path.read_text())
    cap=F.DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
    self.seed_parent()
-   self.seed_review_rounds(route["route_id"],"plan-check",cap-1)
+   self.seed_review_rounds(route,"plan-check",cap-1)
    code,printed=self.run_review_inline(path)
   self.assertNotIn("reason=review-round-budget-exhausted",printed)
 
@@ -538,7 +553,7 @@ class FallbackTest(unittest.TestCase):
    path=self.route(same_status="supported",intensity="standard")
    route=json.loads(path.read_text())
    self.seed_parent()
-   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   self.seed_review_rounds(route,"plan-check",1)
    self.seed_predecessor_markers(path,"plan-check")
    self.seed_plan_marker(route)
    def act(action):
@@ -587,13 +602,24 @@ class FallbackTest(unittest.TestCase):
    ("att-contract","codex","dead-route-completion-rejected","contract","","done"),
    ("att-verdict","claude",tail_note,tail_class,"automatic_retry_of=att-contract,",tail_status),
   ):
+   node=next(item for item in route["nodes"] if item["id"]=="test")
+   metadata={
+    "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+    "execution_surface":"registered-headless","registered_worker":"1",
+    "fallback_hop":"same-harness-headless","worker_type":"test","harness":harness,
+    "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+    "route_file":str(self.current_route_file),"completion_gate":node.get("completion_gate", ""),
+    "parent_attempt_id":"att-fallback-parent","parent_sid":"fixture-native-parent",
+    "launch_head":"old-source-head","launch_claimed":"1","launch_started":"1",
+    "terminal_event":"result","process_exit":"0","attempt_id":aid,
+    "note":note,"failure_class":failure,
+   }
+   if extra:
+    key,value=extra.rstrip(",").split("=",1);metadata[key]=value
+   metadata.update(SUBJECT.seal_attempt(
+    self.jobs,route,node,aid,worktree=self.repo))
    history.append(f"2026-10-06T00:00:00Z\t{status}\t{self.repo}\t{self.repo}\tfallback-test\t"
-    "attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,"
-    f"registered_worker=1,fallback_hop=same-harness-headless,worker_type=stage,harness={harness},"
-    f"route_id={route['route_id']},route_hash={route['route_hash']},route_node=test,"
-    "parent_attempt_id=att-fallback-parent,parent_sid=fixture-native-parent,launch_head=old-source-head,"
-    f"launch_claimed=1,launch_started=1,terminal_event=result,process_exit=0,{extra}"
-    f"attempt_id={aid},note={note},failure_class={failure}\n")
+    + ",".join(f"{key}={value}" for key,value in metadata.items()) + "\n")
   with self.jobs.open("a") as handle:handle.write("".join(history))
   return "".join(history).encode()
 
@@ -856,7 +882,7 @@ class FallbackTest(unittest.TestCase):
    route=json.loads(path.read_text())
    self.seed_predecessor_markers(path,"plan-check")
    self.seed_parent()
-   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   self.seed_review_rounds(route,"plan-check",1)
    self.seed_plan_marker(route)
    prompt_file=self.repo/"plan-check-prompt.md"
    prompt_file.write_text("BASE PROMPT TEXT\n",encoding="utf-8")
@@ -2635,6 +2661,136 @@ class FallbackTest(unittest.TestCase):
     self.assertIn("worker_failure=interrupted",out.splitlines())
     self.assertNotIn("selected_hop",out)
     self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
+ def test_incomplete_forwarded_output_preserves_receipt_without_settling_or_retrying(self):
+  import json
+  receipt=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
+           "terminal_verdict=PASS\nterminal_note=completed\n")
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   calls=[]
+   no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+   code,out,err=self.start(
+    path,lifecycle=F.FOREGROUND_SCOPED,
+    patches=(self.compiled_order(),self.forwarded(
+     calls,stdout=receipt,stderr="fixture-stderr\n",cleanup_incomplete=True),no_watch))
+  fields=self.cli_verdict(out)
+  self.assertEqual(code,76,out+err)
+  self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
+  self.assertEqual(fields.get("child_spawned"),"unknown",out)
+  self.assertEqual(fields.get("registered"),"unknown",out)
+  self.assertEqual(fields.get("started"),"unknown",out)
+  self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
+  self.assertEqual(fields.get("cleanup"),"incomplete",out)
+  self.assertEqual(fields.get("wrapper_returncode"),"0",out)
+  self.assertEqual(json.loads(fields["wrapper_stdout_json"]),receipt)
+  self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+  self.assertNotIn("selected_hop=",out)
+  self.assertEqual(len(calls),1)
+  self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
+
+ def test_incomplete_forwarded_output_retains_exact_terminal_pass_and_fail(self):
+  import json
+  cases=(
+   ("completed-marker","pass","PASS"),
+   ("dead-worker-fail","fail","FAIL"),
+  )
+  for note,failure_class,verdict in cases:
+   with self.subTest(verdict=verdict),self.dispatch_env():
+    self.jobs.write_text("",encoding="utf-8")
+    path,route,node=self.standard_route()
+    calls=[]
+    ForwardedRun=sys.modules["dispatch_lifecycle"].ForwardedRun
+    def run(cmd,**kwargs):
+     calls.append((cmd,kwargs))
+     aid=self.arg(cmd,"--attempt-id")
+     metadata=(
+      f"attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+      f"route_id={route['route_id']},route_node={node['id']},attempt_id={aid},"
+      f"worker_type=stage,launch_claimed=1,launch_fence=registry-v1,launch_started=1,"
+      f"note={note},failure_class={failure_class}")
+     with self.jobs.open("a",encoding="utf-8") as handle:
+      handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tfixture\t{metadata}\n")
+     receipt=(f"check=ok\nstatus=start\nattempt_id={aid}\nregistered=1\nstarted=1\n"
+              f"child_spawned=1\nterminal_verdict={verdict}\n")
+     return ForwardedRun(returncode=0,stdout=receipt,stderr="fixture-stderr\n",
+                         cleanup_incomplete=True)
+    no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+    code,out,err=self.start(
+     path,lifecycle=F.FOREGROUND_SCOPED,
+     patches=(self.compiled_order(),mock.patch.object(F,"run_forwarding_termination",side_effect=run),no_watch))
+    fields=self.cli_verdict(out)
+    self.assertEqual(code,76,out+err)
+    self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
+    self.assertEqual(fields.get("cleanup"),"incomplete",out)
+    self.assertEqual(fields.get("registered"),"1",out)
+    self.assertEqual(fields.get("started"),"1",out)
+    self.assertEqual(fields.get("child_spawned"),"1",out)
+    self.assertEqual(fields.get("route_id"),route["route_id"],out)
+    self.assertEqual(fields.get("route_node"),node["id"],out)
+    self.assertEqual(fields.get("terminal_verdict"),verdict,out)
+    self.assertEqual(fields.get("terminal_note"),note,out)
+    self.assertEqual(fields.get("attempt_id"),self.arg(calls[0][0],"--attempt-id"),out)
+    self.assertEqual(fields.get("wrapper_returncode"),"0",out)
+    expected_receipt=(f"check=ok\nstatus=start\nattempt_id={fields['attempt_id']}\nregistered=1\nstarted=1\n"
+                      f"child_spawned=1\nterminal_verdict={verdict}\n")
+    self.assertEqual(json.loads(fields["wrapper_stdout_json"]),expected_receipt)
+    self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+    self.assertNotIn("selected_hop=",out)
+    self.assertEqual(len(calls),1)
+
+ def test_incomplete_forwarded_output_retains_proven_launch_without_terminal_row(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   calls=[]
+   ForwardedRun=sys.modules["dispatch_lifecycle"].ForwardedRun
+   def run(cmd,**kwargs):
+    calls.append((cmd,kwargs))
+    aid=self.arg(cmd,"--attempt-id")
+    metadata=(f"attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+              f"route_id={route['route_id']},route_node={node['id']},attempt_id={aid},"
+              "worker_type=stage,launch_claimed=1,launch_fence=registry-v1,launch_started=1")
+    with self.jobs.open("a",encoding="utf-8") as handle:
+     handle.write(f"now\trunning\t{self.repo}\t{self.repo}\tfixture\t{metadata}\n")
+    return ForwardedRun(returncode=0,stdout=(f"check=ok\nstatus=start\nattempt_id={aid}\n"
+                         "registered=1\nstarted=1\nchild_spawned=1\n"),
+                        stderr="",cleanup_incomplete=True)
+   no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+   code,out,err=self.start(
+    path,lifecycle=F.FOREGROUND_SCOPED,
+    patches=(self.compiled_order(),mock.patch.object(F,"run_forwarding_termination",side_effect=run),no_watch))
+  fields=self.cli_verdict(out)
+  self.assertEqual(code,76,out+err)
+  self.assertEqual((fields.get("registered"),fields.get("started"),fields.get("child_spawned")),
+                   ("1","1","1"),out)
+  self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
+  self.assertEqual(fields.get("cleanup"),"incomplete",out)
+  self.assertEqual(fields.get("attempt_id"),self.arg(calls[0][0],"--attempt-id"),out)
+  self.assertEqual(len(calls),1)
+
+ def test_incomplete_forwarded_output_does_not_bind_malformed_or_mismatched_receipts(self):
+  cases=(
+   "check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\nterminal_verdict=PASS\n",
+   "check=ok\nstatus=start\nattempt_id=att-stale\nroute_id=rt-foreign\nroute_node=plan\n"
+   "registered=1\nstarted=1\nchild_spawned=1\nterminal_verdict=PASS\n",
+  )
+  for receipt in cases:
+   with self.subTest(receipt=receipt),self.dispatch_env():
+    path,_route,_node=self.standard_route()
+    calls=[]
+    no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+    code,out,err=self.start(
+     path,lifecycle=F.FOREGROUND_SCOPED,
+     patches=(self.compiled_order(),self.forwarded(
+      calls,stdout=receipt,stderr="fixture-stderr\n",cleanup_incomplete=True),no_watch))
+   fields=self.cli_verdict(out)
+   self.assertEqual(code,76,out+err)
+   self.assertEqual((fields.get("registered"),fields.get("started"),fields.get("child_spawned")),
+                    ("unknown","unknown","unknown"),out)
+   self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
+   self.assertEqual(fields.get("cleanup"),"incomplete",out)
+   self.assertNotEqual(fields.get("attempt_id"),"att-stale")
+   self.assertEqual(len(calls),1)
+
  def test_a_foreground_start_prints_the_notice_first_and_the_parent_notice_second(self):
   ok=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
       "worker_exit=0\nworker_failure=-\n")

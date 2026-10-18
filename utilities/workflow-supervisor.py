@@ -2273,7 +2273,7 @@ def load_interview_artifact(artifact):
     if not path.is_file() or path.suffix.lower() != ".json":
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = INTERVIEW.load_json_file(path)
     except (OSError, ValueError) as exc:
         raise SupervisorError(f"interview-unreadable: {path}: {exc}") from exc
     if not INTERVIEW.is_interview(value):
@@ -2326,7 +2326,8 @@ def release_answers(ledger, gate, decision, answers_path):
             "interview and it is no longer a readable interview file; restore it or release with "
             "revise/stop")
     try:
-        answers = json.loads(Path(answers_path).read_text(encoding="utf-8"))
+        answers = INTERVIEW.load_json_file(
+            answers_path, max_bytes=INTERVIEW.MAX_ANSWERS_BYTES, kind="answers")
     except (OSError, ValueError) as exc:
         raise SupervisorError(f"interview-answers-unreadable: {answers_path}: {exc}") from exc
     errors = INTERVIEW.validate_answers(interview, answers)

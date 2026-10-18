@@ -415,6 +415,12 @@ def main() -> int:
     # bootstrap. Main-only briefing and token context would be duplicate
     # context and can recursively create model work (D-42).
     if is_worker_session():
+        try:
+            sys.path.insert(0, str(ROOT / "utilities"))
+            from peer_obligations import request_obligation_recovery
+            request_obligation_recovery(lifecycle_root=ROOT)
+        except Exception:
+            pass
         return 0
     context_notice = ""
     try:

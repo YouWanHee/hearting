@@ -265,6 +265,19 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
             managed_sealed_batch_id="batch-test", pid="99999999", pid_start="1")
             + row("att-child", pid="99999998", pid_start="1"))
 
+    def test_parent_session_ended_notice_keeps_exact_attempts_without_manual_recovery(self):
+        self._notice_rows()
+        records = supervision.materialize(
+            self.jobs, {"att-child"}, reason="parent-session-ended")
+        receipt = records[0]["receipt"]
+        self.assertEqual(receipt["monitored_attempt_ids"], ["att-child"])
+        self.assertEqual(receipt["reason"], "parent-session-ended")
+        text = supervision.render_text(receipt)
+        self.assertIn("continue unchanged", text)
+        self.assertIn("durable batch record", text)
+        self.assertIn("confirmed same-seat successor", text)
+        self.assertNotIn("run the route's start command", text)
+
     def test_an_answer_from_another_session_reaches_the_parent_as_a_notice(self):
         # RA-10: a non-parent's answer to a BLOCKED owner is not a dead end; the parent is told.
         for kind in ("claude-parent-runtime", "codex-native-queue", "opencode-turn"):
@@ -555,6 +568,49 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
                                                  stop_check=stop_check)
         self.assertEqual(result["state"], "ready")
         self.assertEqual(stop_check.call_count, 0)
+
+    def test_exact_materialization_uses_indexed_attempt_ancestry_on_large_history(self):
+        from dispatch_registry_cache import RegistryRecord, clear_cache, metrics_snapshot, reset_metrics
+
+        self._notice_rows()
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(row(f"att-unrelated-{index:05d}", parent_attempt_id="att-other"))
+        clear_cache()
+        reset_metrics()
+        visited = []
+        original = RegistryRecord.completion_metadata
+
+        def observe(record):
+            metadata = original(record)
+            visited.append(metadata.get("attempt_id"))
+            return metadata
+
+        with mock.patch.object(RegistryRecord, "completion_metadata", observe):
+            first = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")
+            second = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")
+        self.assertEqual(first[0]["delivery_id"], second[0]["delivery_id"])
+        self.assertEqual(len(visited), 4, "each checkpoint should project only child and owner rows")
+        self.assertEqual(set(visited), {"att-child", "att-owner"})
+        metrics = metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        self.assertGreaterEqual(metrics["cache_hits"], 1)
+        clear_cache()
+
+    def test_stop_waiting_aborts_without_materializing_or_retrying(self):
+        self._notice_rows()
+        join = mock.Mock(return_value={"state": "timeout"})
+        with mock.patch.object(supervision, "materialize") as materialize, \
+             mock.patch.object(supervision.time, "sleep") as sleep:
+            with self.assertRaises(supervision.StopWaiting):
+                supervision.wait_for_batch(
+                    join=join, attempts={"att-child"}, jobs=self.jobs,
+                    stop_check=lambda: (_ for _ in ()).throw(
+                        supervision.StopWaiting("observer-ownership-lost")))
+        join.assert_called_once()
+        materialize.assert_not_called()
+        sleep.assert_not_called()
 
 
 

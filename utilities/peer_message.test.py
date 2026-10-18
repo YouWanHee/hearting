@@ -33,6 +33,12 @@ class _TmpRootMixin:
         self.jobs_path = self.tmp_root / "jobs.log"
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
+        for key in tuple(os.environ):
+            if (key.startswith(("AGENT_DISPATCH_", "AGENT_ARTIFACT_", "AGENT_RUNTIME_",
+                                "AGENT_SESSION_", "AGENT_THREAD_", "HERDR_"))
+                    or key in {"AGENT_HOME", "CLAUDE_HOME", "AGENT_SERVICE_CURRENT",
+                               "HEARTING_SERVICE_CURRENT", "SERVICE_CURRENT"}):
+                os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root / "peer-state")
         # C-9 makes `_iter_records` include dispatch and installed-runtime roots.
@@ -41,9 +47,15 @@ class _TmpRootMixin:
         os.environ["HOME"] = str(self.tmp_root / "home")
         os.environ["XDG_STATE_HOME"] = str(self.tmp_root / "xdg-state")
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "xdg-config")
+        os.environ["XDG_DATA_HOME"] = str(self.tmp_root / "xdg-data")
+        os.environ["HARNESS_DATA_ROOT"] = str(self.tmp_root / "harness-data")
         os.environ["HARNESS_STATE_ROOT"] = str(self.tmp_root / "harness-state")
+        os.environ["AGENT_RUNTIME_ROOT"] = str(self.tmp_root / "runtime")
+        os.environ["AGENT_ARTIFACT_ROOT"] = str(self.tmp_root / "artifacts")
+        os.environ["AGENT_ARTIFACT_OUTPUT_DIR"] = str(self.tmp_root / "artifacts" / "output")
         os.environ["CODEX_HOME"] = str(self.tmp_root / "home" / ".codex")
         os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".claude")
+        os.environ["OPENCODE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".config" / "opencode")
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore_environ)
 
@@ -771,6 +783,28 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         quarantine = malformed.parent.parent / "quarantine"
         self.assertEqual(len(list(quarantine.rglob(malformed.name))), 1)
 
+    def test_future_pending_schema_is_preserved_without_quarantine(self):
+        text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_bytes())
+        row["schema_version"] = 2
+        row["future_field"] = {"opaque": [1, 2, 3]}
+        raw = json.dumps(row, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(peer_message.pending_messages(self.recipient), [])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(errors.getvalue(), "")
+        quarantine = path.parent.parent / "quarantine"
+        self.assertFalse(quarantine.exists())
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message._read_pending(ref)
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message.receive_peer_message(text, self.recipient)
+        self.assertEqual(path.read_bytes(), raw)
+
     def test_production_read_scope_source_is_codex_adapter_contract_only(self):
         self.assertTrue(peer_message._codex_model_read_access(self.recipient))
         self.assertFalse(peer_message._codex_model_read_access(
@@ -931,9 +965,12 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def test_sidless_pending_stays_on_its_exact_pane_until_a_session_is_observed(self):
         recipient = {"harness": "codex", "session_id": None, "name": "fresh",
                      "pane_id": "w1:pX"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
         body = "[steer] unresolved pane\n" + "detail " * 400 + "\n실행하지 말 것; STFT 크기 하한 1e-5"
         text, ref = peer_message.prepare_peer_message(
-            body, self.sender, recipient, defer=True)
+            body, self.sender, recipient, defer=True, first_input_process=process)
         row = peer_message._read_pending(ref)
         self.assertEqual(row["state"], "pending")
         self.assertEqual(row["to"], recipient)
@@ -941,9 +978,15 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(peer_message._read_transfer_record(ref).get("body_ref"))
         self.assertIsNone(peer_message.pending_delivery_recipient(row))
         self.assertIsNone(peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"}))
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"},
+            process_proof=process))
+        changed = dict(process, pid=os.getpid() + 1)
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"},
+            process_proof=changed))
         bound = peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"})
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"},
+            process_proof=process)
         self.assertEqual(peer_message.pending_delivery_recipient(bound), bound["bound_to"])
         self.assertEqual(bound["text"], text)
         self.assertIsNone(bound.get("body_ref"))
@@ -951,18 +994,24 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
             text, {"harness": "codex", "session_id": "new-thread"}, include_ref=True)
         self.assertEqual(parsed["transfer_ref"], ref)
         self.assertIsNone(peer_message.bind_pending_recipient(
-            ref, {"harness": "codex", "session_id": "different-thread", "pane_id": "w1:pX"}))
+            ref, {"harness": "codex", "session_id": "different-thread", "pane_id": "w1:pX"},
+            process_proof=process))
 
     def test_no_trailer_pending_is_observed_as_queued_without_claiming_receiver_ack(self):
         recipient = {"harness": "claude", "session_id": None, "name": "fresh",
                      "pane_id": "w2:p1"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "claude",
+                   "pane_id": "w2:p1", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
         text, ref = peer_message.prepare_peer_message(
-            "plain user message", self.sender, recipient, defer=True, with_trailer=False)
+            "plain user message", self.sender, recipient, defer=True, with_trailer=False,
+            first_input_process=process)
         self.assertEqual(text, "plain user message")
         row = peer_message._read_pending(ref)
         self.assertTrue(row["no_trailer"])
         bound = peer_message.bind_pending_recipient(
-            ref, {"harness": "claude", "session_id": "resolved-session", "pane_id": "w2:p1"})
+            ref, {"harness": "claude", "session_id": "resolved-session", "pane_id": "w2:p1"},
+            process_proof=process)
         claim = peer_message.claim_pending_herdr(ref, peer_message.pending_delivery_recipient(bound))
         self.assertIsNotNone(claim)
         self.assertTrue(peer_message.mark_pending_queued(ref))
@@ -971,6 +1020,91 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(current.get("rpc_claim"))
         self.assertIsNone(peer_message.parse_peer_trailer(text, {
             "harness": "claude", "session_id": "resolved-session"}, include_ref=True))
+
+    def test_sidless_first_input_claim_submits_once_and_only_exact_trailer_receives(self):
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        process = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                   "pane_id": "w1:pX", "pid": os.getpid(), "start": "123",
+                   "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        text, ref = peer_message.prepare_peer_message(
+            "[steer] first peer turn", self.sender, recipient, defer=True,
+            first_input_process=process)
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"}))
+        claim = peer_message.claim_pending_first_input(ref,
+            {"harness": "codex", "pane_id": "w1:pX"}, process)
+        self.assertIsNotNone(claim)
+        self.assertIsNone(peer_message.claim_pending_first_input(ref,
+            {"harness": "codex", "pane_id": "w1:pX"}, process))
+        self.assertTrue(peer_message.mark_pending_prompt_queued(
+            ref, claim["rpc_claim"], receipt="native-first-input-submitted"))
+        queued = peer_message._read_pending(ref)
+        self.assertEqual((queued["state"], queued["receipt"]),
+                         ("queued", "native-first-input-submitted"))
+        self.assertNotIn("bound_to", queued)
+        self.assertEqual(peer_message.receive_peer_message("text without the sealed trailer", {
+            "harness": "codex", "session_id": "new-thread"}), 0)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        with mock.patch.object(peer_message, "_first_input_process_is_current", return_value=False):
+            self.assertEqual(peer_message.receive_peer_message(text, {
+                "harness": "codex", "session_id": "new-thread"}), 0)
+        self.assertIsNone(peer_message._read_pending(ref).get("bound_to"))
+        with mock.patch.object(peer_message, "_first_input_process_is_current", return_value=True):
+            self.assertEqual(peer_message.receive_peer_message(text, {
+                "harness": "codex", "session_id": "new-thread"}), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual((received["state"], received["receipt"],
+                          received["bound_to"]["session_id"]),
+                         ("received", "exact-peer-ref", "new-thread"))
+        records = [json.loads(line) for line in
+                   self._ledger_file(self.sender["session_id"]).read_text().splitlines()]
+        notices = [row for row in records
+                   if row.get("transfer_ref") == ref and row.get("kind") == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual((notices[0]["from"]["harness"], notices[0]["from"]["session_id"],
+                          notices[0]["to"]["session_id"]),
+                         (self.sender["harness"], self.sender["session_id"], "new-thread"))
+
+    def test_codex_receiver_proof_matches_original_pid_start_namespace_and_pane(self):
+        if str(_HERE) not in sys.path:
+            sys.path.insert(0, str(_HERE))
+        import pane_ownership
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "w1:pX", "pid": 4242, "start": "123",
+                 "pid_namespace": "pid:[77]"}
+        binding = {"pid": 4242, "pid_start": "123", "pane": "w1:pX"}
+        real_readlink = os.readlink
+        def readlink(target, namespace="pid:[77]", own_namespace="pid:[77]"):
+            if str(target) == "/proc/4242/ns/pid":
+                return namespace
+            if str(target) == "/proc/self/ns/pid":
+                return own_namespace
+            return real_readlink(target)
+        with mock.patch.object(peer_message.os, "readlink", side_effect=readlink), \
+             mock.patch.object(pane_ownership, "codex_tui_process_bindings", return_value=[binding]):
+            self.assertTrue(peer_message._first_input_process_is_current(proof, "thread-new"))
+        for changed in (dict(binding, pid=4243), dict(binding, pid_start="456"),
+                        dict(binding, pane="w1:pOther")):
+            with self.subTest(binding=changed), \
+                 mock.patch.object(peer_message.os, "readlink", side_effect=readlink), \
+                 mock.patch.object(pane_ownership, "codex_tui_process_bindings",
+                                   return_value=[changed]):
+                self.assertFalse(peer_message._first_input_process_is_current(
+                    proof, "thread-new"))
+        with mock.patch.object(peer_message.os, "readlink",
+                               side_effect=lambda target: readlink(target, namespace="pid:[other]")), \
+             mock.patch.object(pane_ownership, "codex_tui_process_bindings", return_value=[binding]):
+            self.assertFalse(peer_message._first_input_process_is_current(proof, "thread-new"))
+
+    def test_sidless_old_rows_without_process_proof_remain_unbindable(self):
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        _text, ref = peer_message.prepare_peer_message(
+            "old pending message", self.sender, recipient, defer=True)
+        self.assertIsNone(peer_message.pending_first_input_process(peer_message._read_pending(ref)))
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"}))
 
     def test_exact_claude_prompt_claim_can_be_queued_but_only_receiver_ref_acks(self):
         recipient = {"harness": "claude", "session_id": "claude-target"}
@@ -1231,16 +1365,98 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
                     self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
                     self.assertEqual(peer_message.parse_peer_trailer(text, recipient, include_ref=True)["transfer_ref"], ref)
 
-    def test_legacy_shell_sender_uses_existing_claude_context_and_codex_queue(self):
+    def test_claude_native_context_delivery_receives_exact_ref(self):
         recipient = dict(self.recipient, harness="claude")
         text, ref = self.legacy_shell_pending(recipient)
         stream = io.StringIO()
-        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream)
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                       native_delivery=True)
         context = json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(context, text)
-        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
-        peer_message.receive_peer_message(context, recipient)
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "exact-peer-ref")
+        self.assertIsNone(peer_message._read_pending(ref)["text"])
+        # A subsequent duplicate hook sees no pending row and cannot rewrite it.
+        duplicate = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=duplicate,
+                                       native_delivery=True)
+        self.assertEqual(duplicate.getvalue(), "")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
+    def test_claude_cli_context_output_and_same_sid_callback_stay_unreceived(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        stream = io.StringIO()
+        peer_message.emit_peer_context(recipient, stream=stream)
+        context = json.loads(stream.getvalue())["context"]
+        self.assertEqual(context, text)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "context-emitted")
+        peer_message.receive_peer_message("ordinary next user prompt", recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+
+    def test_retained_hook_context_row_recovers_only_through_native_boundary(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        with peer_message.pending_lock(ref):
+            row = peer_message._read_pending(ref)
+            peer_message._save_pending(dict(row, state="queued", receipt="hook-context-emitted"))
+        ordinary = io.StringIO()
+        peer_message.emit_peer_context(recipient, stream=ordinary)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "hook-context-emitted")
+        native = io.StringIO()
+        peer_message.emit_peer_context(recipient, "PostToolUse", stream=native,
+                                       native_delivery=True)
+        self.assertEqual(json.loads(native.getvalue())["hookSpecificOutput"]["additionalContext"], text)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        self.assertEqual(peer_message._read_pending(ref)["receipt"], "exact-peer-ref")
+
+    def test_failed_claude_native_flush_keeps_ambiguous_claim_unreceived(self):
+        class PartialFlush:
+            def __init__(self):
+                self.data = ""
+            def write(self, value):
+                self.data += value
+            def flush(self):
+                raise OSError("simulated partial native output")
+
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        stream = PartialFlush()
+        with self.assertRaisesRegex(OSError, "partial native output"):
+            peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                           native_delivery=True)
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["receipt"], "hook-context-inflight")
+        self.assertTrue(row["rpc_claim"])
+        self.assertEqual(row["text"], text)
+
+    def test_claude_native_context_rejects_wrong_target_and_corrupt_body(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        wrong_target = io.StringIO()
+        peer_message.emit_peer_context(
+            dict(recipient, session_id="sid-other"), "UserPromptSubmit",
+            stream=wrong_target, native_delivery=True)
+        self.assertEqual(wrong_target.getvalue(), "")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["text"] = row["text"].replace("external notification", "forged notification")
+        path.write_text(json.dumps(row), encoding="utf-8")
+        stream = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                       native_delivery=True)
+        self.assertEqual(stream.getvalue(), "")
+        self.assertFalse(peer_message._peer_notice_exists(ref, recipient))
+        quarantined = list((peer_message._pending_dir().parent / "quarantine").glob(f"*/{ref}.json"))
+        self.assertEqual(len(quarantined), 1)
+
+    def test_codex_queue_uses_native_consumption_evidence(self):
         import codex_queue_delivery as queue
         text, ref = self.legacy_shell_pending(self.recipient)
         with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
@@ -2134,6 +2350,342 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
                     self.assertEqual(code, 5)
                     marked.assert_not_called()
                     self.assertIn(verdict, line)
+
+
+class PendingLockLifetimeTest(_TmpRootMixin, unittest.TestCase):
+    def lock_path(self, key):
+        return peer_message._pending_dir() / (".lock-" + key)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _old_pending_lock(key):
+        """Literal copy of the pre-change pending_lock body."""
+        if not isinstance(key, str) or not peer_message.re.fullmatch(r"[a-z0-9-]{1,80}", key):
+            raise ValueError("peer-pending-lock-key-invalid")
+        path = peer_message._pending_dir() / (".lock-" + key)
+        fd = peer_message.os.open(path, peer_message.os.O_RDWR | peer_message.os.O_CREAT |
+                                  peer_message.os.O_NOFOLLOW | peer_message.os.O_NONBLOCK, 0o600)
+        try:
+            info = peer_message.os.fstat(fd)
+            if (not peer_message.stat.S_ISREG(info.st_mode) or info.st_uid != peer_message.os.geteuid()
+                    or info.st_mode & 0o077):
+                raise ValueError("peer-pending-lock-unsafe")
+            peer_message.fcntl.flock(fd, peer_message.fcntl.LOCK_EX | peer_message.fcntl.LOCK_NB)
+            yield
+        finally:
+            peer_message.os.close(fd)
+
+    def test_t1_prepare_directory_is_removed_after_normal_and_body_exception(self):
+        path = self.lock_path("prepare-t1")
+        with peer_message.pending_lock("prepare-t1"):
+            self.assertTrue(path.is_dir())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        self.assertFalse(path.exists())
+        with self.assertRaisesRegex(RuntimeError, "body"):
+            with peer_message.pending_lock("prepare-t1"):
+                raise RuntimeError("body")
+        self.assertFalse(path.exists())
+
+    def test_t2_ref_lock_remains_0600_regular_file(self):
+        path = self.lock_path("a" * 32)
+        with peer_message.pending_lock("a" * 32):
+            self.assertTrue(path.is_file())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertTrue(path.is_file())
+
+    def test_t3_existing_regular_file_is_shared_and_preserved(self):
+        path = self.lock_path("prepare-existing")
+        path.touch(mode=0o600)
+        before = path.stat()
+        old_fd = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(old_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-existing"):
+                    pass
+        finally:
+            os.close(old_fd)
+        with peer_message.pending_lock("prepare-existing"):
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino), (before.st_dev, before.st_ino))
+            with self.assertRaises(BlockingIOError):
+                with self._old_pending_lock("prepare-existing"):
+                    pass
+        self.assertTrue(path.is_file())
+
+    def test_t4_old_writer_hits_directory_before_flock(self):
+        path = self.lock_path("prepare-old")
+        seen = []
+        real_flock = fcntl.flock
+        with peer_message.pending_lock("prepare-old"):
+            with mock.patch.object(fcntl, "flock", side_effect=lambda *a: (seen.append(a), real_flock(*a))[1]):
+                with self.assertRaises(IsADirectoryError):
+                    with self._old_pending_lock("prepare-old"):
+                        pass
+        self.assertEqual(seen, [])
+
+    def test_t5_empty_and_sigkill_directory_residue_is_reclaimed(self):
+        import multiprocessing
+        path = self.lock_path("prepare-residue")
+        path.mkdir(mode=0o700)
+        with peer_message.pending_lock("prepare-residue"):
+            self.assertTrue(path.is_dir())
+        self.assertFalse(path.exists())
+
+        child_path = self.lock_path("prepare-killed")
+        ready = multiprocessing.Event()
+        def hold_until_killed():
+            with peer_message.pending_lock("prepare-killed"):
+                ready.set()
+                time.sleep(10)
+        proc = multiprocessing.Process(target=hold_until_killed)
+        proc.start()
+        self.assertTrue(ready.wait(2), "holder did not acquire lock")
+        proc.kill(); proc.join(2)
+        self.assertFalse(proc.is_alive(), "SIGKILL holder did not exit")
+        self.assertNotEqual(proc.exitcode, 0)
+        with peer_message.pending_lock("prepare-killed"):
+            pass
+        self.assertFalse(child_path.exists())
+
+    def test_t6_open_disappearance_and_identity_race_are_busy(self):
+        path = self.lock_path("prepare-race")
+        real_open = os.open
+        def disappear_on_open(name, flags, *args, **kwargs):
+            if os.fspath(name) == str(path):
+                path.rmdir()
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_open(name, flags, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=disappear_on_open):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-race"):
+                    pass
+        self.assertFalse(path.exists())
+
+        successor = self.lock_path("prepare-successor")
+        replaced = []
+        real_flock = fcntl.flock
+        def replace_after_open(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and successor.exists():
+                old = successor.stat()
+                successor.rmdir(); successor.mkdir(mode=0o700)
+                replaced.append((old.st_ino, successor.stat().st_ino))
+            return real_flock(fd, operation)
+        # Instrument only the key directory fd; the pending-dir probe remains real.
+        with mock.patch.object(fcntl, "flock", side_effect=replace_after_open):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-successor"):
+                    pass
+        self.assertTrue(successor.is_dir())
+        successor.rmdir()
+
+    def test_t7_nested_same_key_busy_other_key_independent(self):
+        with peer_message.pending_lock("prepare-a"):
+            with self.assertRaises(BlockingIOError):
+                with peer_message.pending_lock("prepare-a"):
+                    pass
+            with peer_message.pending_lock("prepare-b"):
+                self.assertTrue(self.lock_path("prepare-b").is_dir())
+
+    def test_t8_unsafe_directory_and_fifo_are_unchanged(self):
+        path = self.lock_path("prepare-wide")
+        path.mkdir(mode=0o755); path.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+            with peer_message.pending_lock("prepare-wide"):
+                pass
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        path.rmdir()
+        fifo = self.lock_path("prepare-fifo")
+        os.mkfifo(fifo, 0o600)
+        before = fifo.lstat()
+        with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+            with peer_message.pending_lock("prepare-fifo"):
+                pass
+        after = fifo.lstat()
+        self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
+        owned = self.lock_path("prepare-uid")
+        owned.mkdir(mode=0o700)
+        real_fstat = os.fstat
+        def foreign_owner(fd):
+            info = real_fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (
+                    owned.stat().st_dev, owned.stat().st_ino):
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(os, "fstat", side_effect=foreign_owner):
+            with self.assertRaisesRegex(ValueError, "peer-pending-lock-unsafe"):
+                with peer_message.pending_lock("prepare-uid"):
+                    pass
+        self.assertTrue(owned.is_dir())
+        owned.rmdir()
+
+    def test_t9_probe_unsupported_falls_back_and_probe_contention_selects_directory(self):
+        probe = peer_message._pending_dir()
+        real_flock = fcntl.flock
+        def unsupported(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == probe.stat().st_ino:
+                raise OSError(errno.EBADF, "probe unsupported")
+            return real_flock(fd, operation)
+        path = self.lock_path("prepare-fallback")
+        with mock.patch.object(fcntl, "flock", side_effect=unsupported):
+            with peer_message.pending_lock("prepare-fallback"):
+                self.assertTrue(path.is_file())
+        self.assertTrue(path.is_file())
+
+        def probe_busy(fd, operation):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == probe.stat().st_ino:
+                raise BlockingIOError(errno.EAGAIN, "probe busy")
+            return real_flock(fd, operation)
+        with mock.patch.object(fcntl, "flock", side_effect=probe_busy):
+            with peer_message.pending_lock("prepare-probe-busy"):
+                self.assertTrue(self.lock_path("prepare-probe-busy").is_dir())
+
+    def test_t10_key_flock_error_propagates_and_later_acquisition_reclaims(self):
+        probe = peer_message._pending_dir()
+        path = self.lock_path("prepare-enolck")
+        real_flock = fcntl.flock
+        def key_failure(fd, operation):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and info.st_ino != probe.stat().st_ino:
+                raise OSError(errno.ENOLCK, "key lock unavailable")
+            return real_flock(fd, operation)
+        with mock.patch.object(fcntl, "flock", side_effect=key_failure):
+            with self.assertRaises(OSError) as caught:
+                with peer_message.pending_lock("prepare-enolck"):
+                    pass
+        self.assertEqual(caught.exception.errno, errno.ENOLCK)
+        self.assertTrue(path.is_dir())
+        with peer_message.pending_lock("prepare-enolck"):
+            pass
+        self.assertFalse(path.exists())
+
+    def test_t11_deferred_prepare_deduplicates_and_leaves_no_lock(self):
+        sender = {"harness": "claude", "session_id": "sender"}
+        recipient = {"harness": "claude", "session_id": "recipient"}
+        first = peer_message.prepare_peer_message("same body", sender, recipient, defer=True)
+        second = peer_message.prepare_peer_message("same body", sender, recipient, defer=True)
+        self.assertEqual(first[1], second[1])
+        self.assertTrue(peer_message._read_pending(first[1]))
+        self.assertEqual(list(peer_message._pending_dir().glob(".lock-prepare-*")), [])
+
+    def test_t11b_deferred_prepare_is_busy_when_its_directory_is_held(self):
+        sender = {"harness": "claude", "session_id": "sender"}
+        recipient = {"harness": "claude", "session_id": "recipient"}
+        body = "busy body"
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+        key_data = json.dumps([[sender["harness"], sender["session_id"], None, None],
+                               [recipient["harness"], recipient["session_id"], None, None],
+                               body_hash], ensure_ascii=False)
+        key = "prepare-" + hashlib.sha256(key_data.encode()).hexdigest()
+        with peer_message.pending_lock(key):
+            with self.assertRaises(BlockingIOError):
+                peer_message.prepare_peer_message(body, sender, recipient, defer=True)
+
+    def test_t13_release_window_cannot_be_reopened_by_protocol_writers(self):
+        # Between the release identity check and rmdir, a new writer is busy and an
+        # old writer fails before flock, so neither can swap the held directory.
+        # Only an outside deletion could, and that would split file locks as well.
+        path = self.lock_path("prepare-release")
+        real_rmdir, real_flock = os.rmdir, fcntl.flock
+        seen, old_flocks = [], []
+        def contend_then_remove(target):
+            if os.fspath(target) == str(path):
+                with self.assertRaises(BlockingIOError):
+                    with peer_message.pending_lock("prepare-release"):
+                        pass
+                counted = lambda *a: (old_flocks.append(a), real_flock(*a))[1]
+                with mock.patch.object(fcntl, "flock", side_effect=counted):
+                    with self.assertRaises(IsADirectoryError):
+                        with self._old_pending_lock("prepare-release"):
+                            pass
+                current = path.lstat()
+                seen.append((current.st_dev, current.st_ino))
+            return real_rmdir(target)
+        with mock.patch.object(os, "rmdir", side_effect=contend_then_remove):
+            with peer_message.pending_lock("prepare-release"):
+                holder = path.lstat()
+        self.assertEqual(seen, [(holder.st_dev, holder.st_ino)])
+        self.assertEqual(old_flocks, [])
+        self.assertFalse(path.exists())
+
+    def test_t12_short_mixed_multiprocess_old_and_new_writers(self):
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        keys = ["prepare-mix-a", "prepare-mix-b", "prepare-mix-c"]
+        for key in keys[:2]:
+            self.lock_path(key).mkdir(mode=0o700)
+        self.lock_path(keys[2]).touch(mode=0o600)
+        barrier = ctx.Barrier(4)
+        queue = ctx.Queue()
+        key_dirs = {(p.stat().st_dev, p.stat().st_ino) for p in
+                    (self.lock_path(key) for key in keys[:2])}
+
+        def worker(old, worker_id):
+            real_flock = fcntl.flock
+            old_directory_calls = [0]
+            def observed_flock(fd, operation):
+                info = os.fstat(fd)
+                if old and stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) in key_dirs:
+                    old_directory_calls[0] += 1
+                return real_flock(fd, operation)
+            fcntl.flock = observed_flock
+            successes = 0
+            overlaps = 0
+            try:
+                barrier.wait(timeout=2)
+                for i in range(24):
+                    if old:
+                        key = keys[2] if i % 2 == 0 else keys[(i + worker_id) % 2]
+                    else:
+                        key = keys[2] if i % 2 == 1 else keys[(i + worker_id) % 2]
+                    try:
+                        lock = self._old_pending_lock(key) if old else peer_message.pending_lock(key)
+                        with lock:
+                            marker = peer_message._pending_dir() / (".overlap-" + key)
+                            try:
+                                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                            except FileExistsError:
+                                overlaps += 1
+                                continue
+                            try:
+                                os.write(fd, str(worker_id).encode())
+                                time.sleep(0.001)
+                                successes += 1
+                            finally:
+                                os.close(fd)
+                                marker.unlink()
+                    except BlockingIOError:
+                        pass
+                    except IsADirectoryError:
+                        pass
+            except BaseException as exc:
+                queue.put((worker_id, "error", repr(exc)))
+            else:
+                queue.put((worker_id, successes, overlaps, old_directory_calls[0]))
+            finally:
+                fcntl.flock = real_flock
+
+        procs = [ctx.Process(target=worker, args=(worker_id < 2, worker_id)) for worker_id in range(4)]
+        started = time.monotonic()
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(5)
+        timed_out = [proc.pid for proc in procs if proc.is_alive()]
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate(); proc.join(1)
+        self.assertEqual(timed_out, [], "worker join timeout")
+        self.assertTrue(all(proc.exitcode == 0 for proc in procs))
+        results = [queue.get(timeout=1) for _ in procs]
+        self.assertFalse([r for r in results if len(r) == 3 and r[1] == "error"], results)
+        self.assertEqual(sum(r[2] for r in results if len(r) == 4), 0, results)
+        self.assertEqual(sum(r[3] for r in results if len(r) == 4 and r[0] < 2), 0, results)
+        self.assertGreater(sum(r[1] for r in results if len(r) == 4 and r[0] < 2), 0, results)
+        self.assertGreater(sum(r[1] for r in results if len(r) == 4 and r[0] >= 2), 0, results)
+        self.assertLess(time.monotonic() - started, 5)
 
 
 if __name__ == "__main__":

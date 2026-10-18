@@ -30,6 +30,20 @@ def sanitize_title(title: object) -> str:
     return " ".join(single_line.split())
 
 
+def current_session_subject(runtime_name: object, successful_title: object) -> str:
+    """Choose the current user name, last successful title, or an empty subject.
+
+    This narrow display policy deliberately has no native-title, registry, slug,
+    or cwd fallback. Callers resolve any user-owned name and successful title
+    through their existing source-specific paths before passing them here.
+    """
+    for candidate in (runtime_name, successful_title):
+        cleaned = sanitize_title(candidate)
+        if cleaned:
+            return cleaned
+    return ""
+
+
 def _cell_width(text: str) -> int:
     return sum(0 if unicodedata.combining(ch) else
                (2 if unicodedata.east_asian_width(ch) in "WFA" else 1)

@@ -272,6 +272,61 @@ class CodexDaemonIdentityTest(unittest.TestCase):
         self.assertIs(recheck[0], recheck[1])
         self.assertIsNot(observe[0], recheck[0])
 
+    def test_multi_process_observation_shares_two_fresh_fd_walks(self):
+        observation = codex.DaemonIdentityObservation()
+        seen = []
+        walks = []
+        current_pid = [PID]
+
+        def snapshot(port, scan=None):
+            seen.append((current_pid[0], port, scan))
+            if scan is not None and "owners" not in scan:
+                scan["owners"] = {}
+                walks.append(scan)
+            inode = f"inode-{port}"
+            return frozenset({inode}), frozenset({current_pid[0]})
+
+        origins_by_pid = {
+            pid: {f"thread-{pid}": (41300 + index, "user")}
+            for index, pid in enumerate(range(PID, PID + 5))
+        }
+        with mock.patch.object(codex, "_daemon_thread_origins",
+                               side_effect=lambda _env: origins_by_pid[current_pid[0]]), \
+                mock.patch.object(codex, "_tcp_listener_snapshot", side_effect=snapshot), \
+                mock.patch.object(codex, "_listener_unchanged",
+                                 side_effect=lambda port, observed, scan=None:
+                                 snapshot(port, scan) == observed), \
+                mock.patch.object(codex, "_live_tui_start", return_value="778899"), \
+                mock.patch.object(codex, "_daemon_endpoint_current", return_value=True), \
+                mock.patch.object(procscan, "read_proc_start", return_value="778899"):
+            for pid in range(PID, PID + 5):
+                current_pid[0] = pid
+                self.assertEqual(codex._daemon_session_for_process(
+                    pid, {"CODEX_HOME": "/fake"}, observation=observation), f"thread-{pid}")
+
+        self.assertEqual(len(seen), 10)  # 5 PIDs × initial and fresh port reads
+        initial = [scan for _pid, _port, scan in seen if scan is observation.initial_scan]
+        recheck = [scan for _pid, _port, scan in seen if scan is observation.recheck_scan]
+        self.assertEqual(len(initial), 5)
+        self.assertEqual(len(recheck), 5)
+        self.assertIsNot(observation.initial_scan, observation.recheck_scan)
+        self.assertEqual(walks, [observation.initial_scan, observation.recheck_scan])
+
+    def test_changed_listener_evidence_invalidates_shared_snapshots(self):
+        observation = codex.DaemonIdentityObservation()
+        old = {"owners": {"old": {PID}}}
+        new = {"owners": {"new": {PID}}}
+        observation.initial_scan.update(old)
+        observation.recheck_scan.update(new)
+        replacement = (frozenset({"replacement-inode"}), frozenset({PID}))
+        with mock.patch.object(codex, "_tcp_listener_snapshot",
+                               side_effect=[self.listener, replacement]), \
+                mock.patch.object(procscan, "read_proc_start", return_value="778899"):
+            self.assertIsNone(codex._daemon_session_for_process(
+                PID, {"CODEX_HOME": "/fake"}, observation=observation))
+        self.assertEqual(observation.initial_scan, {})
+        self.assertEqual(observation.recheck_scan, {})
+
     def test_thread_to_process_revalidates_listener_and_pid_start(self):
         replacement = (frozenset({"551144"}), frozenset({PID}))
         with mock.patch.object(codex, "_tcp_listener_snapshot",

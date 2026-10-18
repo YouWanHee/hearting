@@ -33,6 +33,16 @@ SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
 
 
+def request_obligation_reconciliation(*, lifecycle_root: str | Path | None = None) -> None:
+    """Ask the common recovery entry to reconnect observers without holding a hook."""
+    try:
+        import peer_obligations
+        root = lifecycle_root or Path(__file__).resolve().parents[1]
+        peer_obligations.request_obligation_recovery(lifecycle_root=root)
+    except Exception:
+        pass
+
+
 def _append_self_instrumentation(
     root: Path, elapsed_ns: int, entry_count: int, claimed_count: int
 ) -> None:
@@ -48,20 +58,13 @@ def _append_self_instrumentation(
             # `<release>/.dispatch/logs/` on every prompt made every
             # superseded release un-prunable (delta-digest-mismatch).
             return
-        log_dir = root_path / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "ts_ns": time.time_ns(),
-                "elapsed_ns": elapsed_ns,
-                "entries": entry_count,
-                "claimed": 1 if claimed_count else 0,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with open(log_dir / LOG_FILENAME, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        from dispatch_observation_log import append_record
+        append_record(root_path, LOG_FILENAME, {
+            "ts_ns": time.time_ns(),
+            "elapsed_ns": elapsed_ns,
+            "entries": entry_count,
+            "claimed": 1 if claimed_count else 0,
+        })
     except OSError:
         pass
 
@@ -163,8 +166,9 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
     return records, count
 
 
-def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
-    """Reconnect existing courier duties on startup/resume; context alone is not receipt."""
+def activate(root: Path, recipient_kind: str, session_id: str, *,
+             request_recovery: bool = True) -> list[dict]:
+    """Retain this session's duties and request maintenance from its existing runner."""
     records, _ = addressed_records(root, recipient_kind, session_id)
     from peer_obligations import retain_registered_completion
     for record in records:
@@ -176,7 +180,18 @@ def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
                 retain_registered_completion(jobs, attempt, session_id, recipient_kind)
             except (OSError, ValueError):
                 continue
+    if request_recovery:
+        _reconcile_canonical_dispatch_state(root)
     return records
+
+
+def _reconcile_canonical_dispatch_state(root: Path) -> None:
+    """Request recovery without putting global settlement ahead of delivery."""
+    try:
+        from peer_obligations import request_dispatch_reconciliation
+        request_dispatch_reconciliation(root)
+    except Exception:
+        pass
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:
@@ -460,7 +475,8 @@ def main(argv: list[str] | None = None) -> int:
         batches = []
         for root in _state_roots():
             if args.action == "activate":
-                records = activate(root, args.recipient_kind, args.session)
+                records = activate(root, args.recipient_kind, args.session,
+                                   request_recovery=False)
             else:
                 records, _entries = sweep_deliver(root, args.recipient_kind, args.session)
             if records:
@@ -470,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
             "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
                          "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner")}
                         for root, records in batches for record in records],
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), flush=True)
+        if args.action == "activate":
+            request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
         return 0
     try:
         handed = json.load(sys.stdin).get("records") or []

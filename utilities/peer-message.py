@@ -519,7 +519,12 @@ def _pending_dir():
 def pending_lock(key="prepare"):
     if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", key):
         raise ValueError("peer-pending-lock-key-invalid")
-    path = _pending_dir() / (".lock-" + key)
+    pending = _pending_dir()
+    path = pending / (".lock-" + key)
+    if key.startswith("prepare-") and _pending_directory_flock_supported(pending):
+        with _pending_directory_lock(path):
+            yield
+        return
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
@@ -530,6 +535,86 @@ def pending_lock(key="prepare"):
         yield
     finally:
         os.close(fd)
+
+
+def _pending_directory_flock_supported(pending):
+    """Probe directory flock support before creating a preparation lock."""
+    try:
+        fd = os.open(pending, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass  # Another probe holds it, so the filesystem does lock directories.
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+@contextlib.contextmanager
+def _pending_directory_lock(path):
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+
+    try:
+        try:
+            initial = path.lstat()
+        except FileNotFoundError as exc:
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+        if stat.S_ISDIR(initial.st_mode):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        elif stat.S_ISREG(initial.st_mode):
+            # Keep legacy transfer lock files on the exact shared inode.
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        else:
+            raise ValueError("peer-pending-lock-unsafe")
+        fd = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+
+    acquired = False
+    directory = False
+    primary_error = None
+    try:
+        info = os.fstat(fd)
+        directory = stat.S_ISDIR(info.st_mode)
+        if (not (directory or stat.S_ISREG(info.st_mode))
+                or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise ValueError("peer-pending-lock-unsafe")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path)) from exc
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise BlockingIOError(errno.EAGAIN, "pending lock changed", str(path))
+        acquired = True
+        yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            if acquired and directory:
+                try:
+                    # Only an inode's flock holder removes its path, and old releases
+                    # remove none, so only an outside deletion can swap it before rmdir.
+                    current = path.lstat()
+                    if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                        os.rmdir(path)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                if primary_error is None:
+                    raise
 
 
 def _pending_path(ref):
@@ -565,17 +650,87 @@ def pending_delivery_recipient(row):
     return original if _valid_transfer_endpoint(original) else None
 
 
-def bind_pending_recipient(ref, recipient):
-    """Bind one SID-less pending message to the session observed on its same pane."""
+def _valid_first_input_process(proof, original=None):
+    if not isinstance(proof, dict):
+        return False
+    if (proof.get("schema") != "peer-first-input-process-v1"
+            or proof.get("harness") not in ("claude", "codex", "opencode")
+            or type(proof.get("pid")) is not int or proof["pid"] <= 0
+            or not isinstance(proof.get("start"), str)
+            or not proof["start"].isdigit()
+            or not isinstance(proof.get("pid_namespace"), str)
+            or not re.fullmatch(r"pid:\[\d+\]", proof["pid_namespace"])
+            or not isinstance(proof.get("pane_id"), str)
+            or not proof["pane_id"] or len(proof["pane_id"]) > 512):
+        return False
+    return (original is None or
+            (proof["harness"] == original.get("harness")
+             and proof["pane_id"] == original.get("pane_id")))
+
+
+def pending_first_input_process(row):
+    """Return only the original validated foreground-process admission proof."""
+    if not isinstance(row, dict):
+        return None
+    proof = row.get("first_input_process")
+    original = row.get("to") or {}
+    return dict(proof) if (_valid_pane_bound_endpoint(original)
+                          and _valid_first_input_process(proof, original)) else None
+
+
+def first_input_process_matches(expected, observed):
+    """Compare the complete TUI process identity saved at pane-bound admission."""
+    if not _valid_first_input_process(expected) or not _valid_first_input_process(observed):
+        return False
+    return all(expected.get(key) == observed.get(key)
+               for key in ("schema", "harness", "pane_id", "pid", "start", "pid_namespace"))
+
+
+def _first_input_process_is_current(proof, session_id):
+    """Prove that this exact original TUI process now owns the received SID."""
+    if not _valid_first_input_process(proof) or not usable_session_id(session_id):
+        return False
+    try:
+        namespace = os.readlink(f"/proc/{proof['pid']}/ns/pid")
+        if namespace != proof["pid_namespace"] or namespace != os.readlink("/proc/self/ns/pid"):
+            return False
+        tools = str(Path(__file__).resolve().parent.parent / "tools")
+        if tools not in sys.path:
+            sys.path.append(tools)
+        if proof["harness"] == "codex":
+            utilities = str(Path(__file__).resolve().parent)
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            import pane_ownership
+            bindings = pane_ownership.codex_tui_process_bindings(
+                session_id, pane_hint=proof["pane_id"])
+            return any(binding.get("pid") == proof["pid"]
+                       and str(binding.get("pid_start")) == proof["start"]
+                       and binding.get("pane") == proof["pane_id"]
+                       for binding in bindings)
+        from fleet.process_identity import current_launch_context
+        launch = current_launch_context(proof["harness"], session_id)
+        return bool(launch and launch.get("pid") == proof["pid"]
+                    and str(launch.get("proc_start")) == proof["start"])
+    except Exception:
+        return False
+
+
+def bind_pending_recipient(ref, recipient, *, process_proof=None):
+    """Bind a SID-less message only to its prompt-time proven foreground process."""
     if not _valid_transfer_endpoint(recipient):
         return None
     with pending_lock(ref):
         row = _read_pending(ref)
         original = (row or {}).get("to") or {}
-        if not row or row.get("state") != "pending" or not _valid_pane_bound_endpoint(original):
+        if (not row or row.get("state") not in {"pending", "unverified", "queued"}
+                or not _valid_pane_bound_endpoint(original)):
             return None
         if (recipient.get("harness") != original.get("harness")
                 or recipient.get("pane_id") != original.get("pane_id")):
+            return None
+        expected = pending_first_input_process(row)
+        if (expected is None or not first_input_process_matches(expected, process_proof)):
             return None
         bound = row.get("bound_to")
         proposed = {"harness": recipient["harness"], "session_id": recipient["session_id"],
@@ -588,6 +743,35 @@ def bind_pending_recipient(ref, recipient):
         return updated
 
 
+def claim_pending_first_input(ref, recipient, process_proof):
+    """Claim exactly one guarded first-turn submission while the target has no SID."""
+    if (not isinstance(recipient, dict)
+            or recipient.get("harness") not in ("claude", "codex", "opencode")
+            or not isinstance(recipient.get("pane_id"), str)
+            or not _valid_first_input_process(process_proof, recipient)):
+        return None
+    from dispatch_contract import process_start_ticks
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        original = (row or {}).get("to") or {}
+        expected = pending_first_input_process(row)
+        if (not row or row.get("state") != "pending" or row.get("rpc_claim")
+                or not _valid_pane_bound_endpoint(original)
+                or original.get("harness") != recipient["harness"]
+                or original.get("pane_id") != recipient["pane_id"]
+                or expected is None
+                or not first_input_process_matches(expected, process_proof)):
+            return None
+        if _registered_delivery_settled(row):
+            return None
+        claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
+                 "start": process_start_ticks(os.getpid())}
+        updated = dict(row, state="unverified", receipt="native-first-input-inflight",
+                       rpc_claim=claim)
+        _save_pending(updated)
+        return updated
+
+
 def _pending_target_matches(row, recipient):
     target = pending_delivery_recipient(row)
     if not target or not _valid_transfer_endpoint(recipient):
@@ -596,6 +780,10 @@ def _pending_target_matches(row, recipient):
         return False
     original = row.get("to") or {}
     return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
+
+
+class UnsupportedPendingSchema(ValueError):
+    """A valid pending row written by a newer reader; preserve it for takeover."""
 
 
 def _read_pending(ref, *, roots=None):
@@ -612,6 +800,9 @@ def _read_pending(ref, *, roots=None):
     if len(raw) > 65536:
         raise ValueError("peer-pending-oversized")
     row = json.loads(raw)
+    if (isinstance(row, dict) and type(row.get("schema_version")) is int
+            and row["schema_version"] > 1):
+        raise UnsupportedPendingSchema("peer-pending-schema-unsupported")
     transfer = _read_transfer_record(ref, roots=roots)
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
@@ -632,7 +823,13 @@ def _read_pending(ref, *, roots=None):
         raise ValueError("peer-pending-recipient-binding-invalid")
     if (_valid_pane_bound_endpoint(original) and row.get("state") in ("queued", "received")
             and bound is None):
-        raise ValueError("peer-pending-recipient-binding-invalid")
+        submitted_sidless = (
+            row.get("state") == "queued"
+            and row.get("receipt") == "native-first-input-submitted"
+            and pending_first_input_process(row) is not None
+        )
+        if not submitted_sidless:
+            raise ValueError("peer-pending-recipient-binding-invalid")
     no_trailer = row.get("no_trailer", False)
     if type(no_trailer) is not bool:
         raise ValueError("peer-pending-trailer-mode-invalid")
@@ -759,6 +956,10 @@ def _pending_rows(*, recipient=None, sender=None, read_context=None):
         try:
             expected = path.lstat()
             row = _read_pending(path.stem, roots=roots)
+        except UnsupportedPendingSchema:
+            # A newer schema is not evidence of corruption. Leave its bytes
+            # and inode in place for a compatible managed reader to consume.
+            continue
         except (OSError, ValueError) as exc:
             if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
                 # A lock or temporary I/O failure proves no damage; the next
@@ -825,7 +1026,7 @@ def pending_messages(recipient):
 
 
 def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open",
-                         with_trailer=True, reference_evidence=None):
+                         with_trailer=True, reference_evidence=None, first_input_process=None):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
     endpoints_verified = (_valid_transfer_sender(sender)
                           and (_valid_transfer_endpoint(recipient)
@@ -874,6 +1075,9 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
             "state": "pending" if endpoints_verified else "unverified", "text": text,
             "no_trailer": not with_trailer,
             "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"}
+        if (_valid_pane_bound_endpoint(recipient)
+                and _valid_first_input_process(first_input_process, recipient)):
+            pending["first_input_process"] = dict(first_input_process)
         transfer = _read_transfer_record(ref)
         if transfer and transfer.get("body_ref") is not None:
             pending["body_ref"] = transfer["body_ref"]
@@ -937,7 +1141,8 @@ def schedule_acceptance_reply(handoff_ref, sender, recipient):
     return ref
 
 
-def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
+def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
+                        allow_hook_context_recovery=False):
     """Reserve one exact deferred row before any pane input, using the existing claim state.
 
     Other senders and native callbacks cannot submit it again once it is
@@ -949,7 +1154,16 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
     from dispatch_contract import process_start_ticks
     with pending_lock(ref):
         row = _read_pending(ref)
-        if (not row or row["state"] != "pending" or row.get("rpc_claim")
+        recover_hook_context = bool(
+            allow_hook_context_recovery
+            and row
+            and recipient.get("harness") == "claude"
+            and row.get("state") == "queued"
+            and row.get("receipt") == "hook-context-emitted"
+            and not row.get("no_trailer")
+        )
+        if (not row or (row["state"] != "pending" and not recover_hook_context)
+                or row.get("rpc_claim")
                 or not _pending_target_matches(row, recipient)):
             return None
         if _registered_delivery_settled(row):
@@ -972,8 +1186,9 @@ def mark_pending_queued(ref, *, receipt="delivery-observed"):
 
 
 def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitted"):
-    """Record one exact claimed Claude prompt submission, never its consumption."""
-    if receipt != "claude-pty-prompt-submitted" or not isinstance(claim, dict):
+    """Record one exact claimed native prompt submission, never its consumption."""
+    if receipt not in {"claude-pty-prompt-submitted", "native-first-input-submitted"} \
+            or not isinstance(claim, dict):
         return False
     from dispatch_contract import process_start_ticks
     current_pid = os.getpid()
@@ -1390,6 +1605,38 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
 
 def receive_peer_message(text, recipient, project="", *, summary_text=""):
     """Actual receiver observation; rendering a callback is never this boundary."""
+    # A SID-less first-turn message is bound only after the native callback can
+    # prove that the same foreground process admitted it. Pane reuse alone is
+    # never enough, including when an old row has no readable process proof.
+    matches = list(_PEER_TRAILER_RE.finditer(text or ""))
+    if matches and isinstance(recipient, dict) and _valid_transfer_endpoint(recipient):
+        match = matches[-1]
+        _display_name, separator, candidate_ref = (match.group("name") or "").rpartition("; ref=")
+        if (match.group("sid").startswith("[") and separator
+                and re.fullmatch(r"[0-9a-f]{32}", candidate_ref)):
+            try:
+                pending = _read_pending(candidate_ref)
+                original = (pending or {}).get("to") or {}
+                if _valid_pane_bound_endpoint(original):
+                    proof = pending_first_input_process(pending)
+                    if (proof is None or proof["harness"] != recipient.get("harness")
+                            or not _first_input_process_is_current(proof, recipient.get("session_id"))):
+                        return 0
+                    bound = pending_delivery_recipient(pending)
+                    if bound is None:
+                        bound_row = bind_pending_recipient(
+                            candidate_ref,
+                            {"harness": recipient["harness"],
+                             "session_id": recipient["session_id"],
+                             "pane_id": proof["pane_id"]},
+                            process_proof=proof)
+                        bound = pending_delivery_recipient(bound_row)
+                    if (bound is None or bound.get("session_id") != recipient.get("session_id")):
+                        return 0
+            except (OSError, ValueError, KeyError, TypeError):
+                # Preserve the ordinary transfer/body integrity verdict below;
+                # only a readable pane-bound row enters process binding here.
+                pass
     trailer = parse_peer_trailer(text, recipient, include_ref=True)
     if not trailer or not usable_session_id(recipient.get("session_id")):
         return 0
@@ -1469,12 +1716,16 @@ def retry_pending_codex(recipient):
         deliver_pending_codex(row["ref"], timeout=0.25)
 
 
-def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
-    """Use an existing native context boundary, preserving emission vs receipt.
+def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
+                      native_delivery=False):
+    """Use an existing native context boundary, settling only exact Claude delivery.
 
     Only Claude needs body delivery here; the other runtimes retain their native
-    queues. Claims serialize this with pane/native sends. A failed output remains
-    ambiguous, while a successful flush records queued, never received.
+    queues. Claims serialize this with pane/native sends. The Claude hook passes
+    native_delivery only from its UserPromptSubmit/PostToolUse boundary; after a
+    successful flush that boundary is recipient consumption under SD-113. Exact
+    receive validation and its existing writer still own the receipt/obligation
+    transition. CLI rendering and failed flushes remain unreceived.
     """
     if not _valid_transfer_endpoint(recipient):
         return
@@ -1498,8 +1749,11 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
                 parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
                 if not parsed or parsed.get("transfer_ref") != row["ref"]:
                     continue
+            native_boundary = bool(native_delivery and event in {"UserPromptSubmit", "PostToolUse"})
             try:
-                claimed = claim_pending_herdr(row["ref"], recipient, receipt="hook-context-inflight")
+                claimed = claim_pending_herdr(
+                    row["ref"], recipient, receipt="hook-context-inflight",
+                    allow_hook_context_recovery=native_boundary)
             except BlockingIOError:
                 continue
             if claimed:
@@ -1542,11 +1796,21 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
     print(json.dumps(output, ensure_ascii=False), file=stream)
     stream.flush()
     for row in claims:
+        native_boundary = bool(native_delivery and event in {"UserPromptSubmit", "PostToolUse"})
+        if native_boundary and not row.get("no_trailer"):
+            try:
+                receive_peer_message(row["text"], recipient, summary_text="Claude native context received")
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            # Exact validation or durable receipt failure leaves the same
+            # in-flight claim and original body for its normal recovery owner.
+            continue
         with pending_lock(row["ref"]):
             current = _read_pending(row["ref"])
             if (current and current["state"] == "unverified"
                     and current.get("rpc_claim") == row["rpc_claim"]):
-                _save_pending(dict(current, state="queued", rpc_claim=None, receipt="hook-context-emitted"))
+                receipt = "hook-context-emitted" if native_boundary else "context-emitted"
+                _save_pending(dict(current, state="queued", rpc_claim=None, receipt=receipt))
     for ref in warnings:
         with pending_lock(ref):
             current = _read_pending(ref)

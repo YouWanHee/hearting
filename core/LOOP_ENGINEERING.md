@@ -121,10 +121,47 @@ unnecessary. Do not hide a responsibility gap by removing every guard or by only
 adding new refusal rules.
 
 Read-only work shared during one input may reuse that input's parsed snapshot.
-The snapshot is not authority for a later input or a state-changing action:
-claims, acknowledgements, and sends recheck the current row and binding under
-their existing lock. Recovery callbacks reconnect the existing owner of work;
-they do not repeat work already owned by its live runner.
+A shared registry view may live across scan passes while its file generation is
+unchanged; each pass still checks the current generation and re-observes any
+other input it depends on. The snapshot is not authority for a state-changing
+action: claims, acknowledgements, handovers, and sends recheck the current row
+and binding under their existing lock. Recovery callbacks reconnect the
+existing owner of work; they do not repeat work already owned by its live
+runner.
+The runner keeps its lease while any accepted local or external duty remains;
+an unrelated callback must not replace that waiting owner and discard its
+observation state. Code modules use their normal process lifetime, while
+the state and authority those functions observe remain fresh inputs.
+An observer lease transfer publishes the successor's existing PID/start record
+under the duty's existing update lock before that successor can claim it.
+The inherited descriptor and that record carry the transfer without another
+CLI input or a second recovery owner.
+
+Session hooks request that existing recovery runner and return; they do not
+replay global settlement history before delivering and acknowledging the
+session's own notices. The runner retains observation state across requests.
+An idle foreground waiter observes its exact parent's current row without a
+writer lock, and checks process-group cleanup only after its leader exits.
+Registry mutation keeps its fresh authority check inside the existing short
+writer section; observation must remain safe when its caller already holds
+that same registry lock.
+After native idle is confirmed, a watcher with positively pending registered
+work may keep waiting on a fresh observation of that work and the current
+exact pane census. It needs native readiness again when that work stops
+blocking or its identity becomes uncertain. An unrelated pane event alone
+must not restart the native readiness probes while completion is impossible.
+
+Long-lived observers may retain a bounded projection of an immutable result
+while every file generation it depended on remains current. The projection
+must name those dependencies, and a missing, unreadable, retargeted, or
+unstable input discards the prior result instead of turning it into authority.
+Mutable writer documents stay separate from historical read projections.
+Append-only reuse is limited to a continuously observed file whose supported
+writer appends records; a partial byte tail remains data, not a row, until its
+newline arrives. Replacements and uncertain writes rebuild the view. Reusing
+parsed bytes avoids I/O; reusing derived decisions additionally requires
+unchanged dependencies, while live recipients, leases, claims, processes, and
+state transitions remain fresh observations.
 
 Documentation explains behavior and preserves the reasons for decisions. Do not
 build the product on a protocol that only ends cleanly when a model perfectly

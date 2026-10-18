@@ -126,6 +126,18 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertNotIn("# Worker Type: Owner", rendered)
         self.assertNotIn("# Worker Type: Review", rendered)
 
+    def test_task_publication_scope_stays_with_the_approved_owner(self):
+        owner = W.render_worker_bootstrap(ROOT, "owner")
+        self.assertIn("When the sealed entry scope is `complete`", owner)
+        self.assertIn("sealed entry scope is `complete`", owner)
+        self.assertIn("ordinary non-force push", owner)
+        self.assertIn("request wording is not an additional authorization test.", owner)
+        self.assertIn("supervisor responsibilities", owner)
+        for worker_type in ("stage", "review", "support", "frame"):
+            text = W.render_worker_bootstrap(ROOT, worker_type)
+            self.assertIn("Stage, review, support, and frame workers do not publish", text)
+            self.assertNotIn("ordinary non-force push", text)
+
     def test_ordinary_worker_does_not_receive_chain_bookkeeping(self):
         for worker_type in W.WORKER_TYPES:
             text=W.render_worker_bootstrap(ROOT,worker_type)

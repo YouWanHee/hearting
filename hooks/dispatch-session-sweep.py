@@ -30,6 +30,7 @@ from dispatch_session_sweep import (  # noqa: E402
     activate,
     ack_delivered,
     delivery_context,
+    request_obligation_reconciliation,
     sweep_deliver,
 )
 
@@ -61,6 +62,15 @@ def main() -> int:
     if session_id is None:
         return 0
     try:
+        return _process_session(payload, session_id)
+    finally:
+        # The hook owns one detached request after delivery work. This covers
+        # empty context, SessionStart, workers, and root-resolution failures.
+        request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
+
+
+def _process_session(payload: object, session_id: str) -> int:
+    try:
         agent_home = resolve_agent_home()
         roots = dispatch_state_roots(agent_home)
     except Exception:  # noqa: BLE001 -- fail-open, never block the session
@@ -77,7 +87,7 @@ def main() -> int:
             continue
         try:
             if _event_name(payload) == "SessionStart":
-                records = activate(root, RECIPIENT_KIND, session_id)
+                records = activate(root, RECIPIENT_KIND, session_id, request_recovery=False)
             else:
                 records, _entries = sweep_deliver(root, RECIPIENT_KIND, session_id)
         except Exception:  # noqa: BLE001 -- fail-open (§13.33.1-(3))
@@ -90,19 +100,8 @@ def main() -> int:
     #
     # The same activation also reconnects retained registered-batch observers:
     # lock-guarded, completed duties are never replayed and the original
-    # assignment is never relaunched. Fail-open like every other path here.
-    try:
-        from dispatch_batch_obligations import ensure_observers
-    except Exception:
-        ensure_observers = None
-    if ensure_observers is not None:
-        for root in seen:
-            try:
-                jobs_log = Path(root) / "jobs.log"
-                if jobs_log.is_file():
-                    ensure_observers(jobs_log)
-            except Exception:  # noqa: BLE001
-                continue
+    # assignment is never relaunched. The common request below is the single
+    # recovery entry for this hook invocation.
     context = delivery_context(batches)
     if not context:
         return 0
@@ -116,8 +115,10 @@ def main() -> int:
             },
             ensure_ascii=False,
             separators=(",", ":"),
-        )
+        ),
+        flush=True,
     )
+    sys.stdout.flush()
     if _event_name(payload) == "UserPromptSubmit":
         for root, records in batches:
             try:

@@ -73,6 +73,7 @@ import directory_record_index  # noqa: E402
 import dispatch_contract  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
+from runtime_observation import ObservationContext, stable_read_bytes  # noqa: E402
 from dispatch_contract import (  # noqa: E402
     _PROCESS_IDENTITY_METADATA_KEYS,
     REVIEW_GOVERNED_LEASE_KIND,
@@ -87,6 +88,16 @@ from dispatch_contract import (  # noqa: E402
     review_output_write_authorized,
     validate_review_output_binding,
     review_holder_disposition,
+)
+
+
+_HISTORICAL_OBSERVATIONS = ObservationContext(
+    max_entries=48, max_weight=32 * 1024 * 1024
+)
+# Large parsed documents must not evict the small consistency facts and
+# index projections that unchanged historical owners reuse.
+_HISTORICAL_PROJECTIONS = ObservationContext(
+    max_entries=8192, max_weight=8 * 1024 * 1024
 )
 from dispatch_lifecycle import (
     FiniteWatchdogBudget,
@@ -779,6 +790,140 @@ def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
     _write_exclusive(marker, data)
 
 
+@dataclass(frozen=True)
+class _ArtifactIndexObservation:
+    """Small immutable read projection; admission writers keep their own IndexDocument."""
+
+    artifact_root_id: Optional[str]
+    manifests: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...]
+    cycles: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...]
+    cycle_ids: tuple[Any, ...]
+    projected_cycle_ids: tuple[str, ...]
+    matching_cycle_ids: tuple[str, ...]
+    routes_valid: bool
+    schema_error: str
+    weight: int
+    route_cycles: tuple[tuple[str, str], ...] = ()
+
+    def manifest_row(self, cycle_id: str):
+        low, high = 0, len(self.manifests)
+        while low < high:
+            middle = (low + high) // 2
+            key, values = self.manifests[middle]
+            if key < cycle_id:
+                low = middle + 1
+            elif key > cycle_id:
+                high = middle
+            else:
+                return dict(values)
+        return None
+
+    def cycle_row(self, cycle_id: str):
+        low, high = 0, len(self.cycles)
+        while low < high:
+            middle = (low + high) // 2
+            key, values = self.cycles[middle]
+            if key < cycle_id:
+                low = middle + 1
+            elif key > cycle_id:
+                high = middle
+            else:
+                return dict(values)
+        return None
+
+
+def _artifact_index_observation(root: Path, *, cycle_id: str | None = None,
+                                route_ids=None) -> _ArtifactIndexObservation:
+    """Parse one index generation once across different cycle/route queries.
+
+    Stable-id ownership, the bulk of large indexes, is validated but discarded.
+    The bounded cache retains only cycle/manifest/route projections. Writers
+    still load independent mutable IndexDocuments under their admission lock.
+    """
+    root = Path(root).resolve()
+    path = artifact_admission._index_path(root)
+    route_key = None if route_ids is None else tuple(sorted(set(route_ids)))
+    key = ("artifact-index-projection", str(root))
+
+    def load():
+        payload = json.loads(stable_read_bytes(path).decode("utf-8"))
+        schema_error = ""
+        parsed = None
+        try:
+            parsed = artifact_index._parse_owned(payload)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            schema_error = str(exc)
+        if not isinstance(payload, dict):
+            payload = {}
+        manifest_payload = payload.get("manifests") or {}
+        cycle_payload = payload.get("cycles") or {}
+
+        def rows(source):
+            if not isinstance(source, dict):
+                return ()
+            return tuple(sorted((name, tuple(sorted(value.items())))
+                                for name, value in source.items()
+                                if isinstance(name, str) and isinstance(value, dict)))
+
+        try:
+            cycle_ids = tuple(cycle_payload) if cycle_payload else ()
+        except TypeError:
+            cycle_ids = ()
+        projected, route_cycles = set(), set()
+        routes_valid = True
+        projection = payload.get("routes") or {}
+        if not isinstance(projection, dict):
+            routes_valid = False
+        else:
+            for bucket in projection.values():
+                if not isinstance(bucket, dict):
+                    routes_valid = False
+                    break
+                for route_id, item in bucket.items():
+                    if (not isinstance(route_id, str) or not isinstance(item, dict)
+                            or not isinstance(item.get("cycle_id"), str)):
+                        routes_valid = False
+                        break
+                    referenced_cycle = item["cycle_id"]
+                    projected.add(referenced_cycle)
+                    route_cycles.add((route_id, referenced_cycle))
+                if not routes_valid:
+                    break
+        if not routes_valid:
+            projected.clear()
+            route_cycles.clear()
+        manifest_rows = rows(manifest_payload)
+        cycle_rows = rows(cycle_payload)
+        root_id = parsed.artifact_root_id if parsed is not None else payload.get("artifact_root_id")
+        weight = 256
+        for collection in (manifest_rows, cycle_rows):
+            for name, fields in collection:
+                weight += len(name) + 48
+                weight += sum(len(field) + len(str(value)) + 24 for field, value in fields)
+        weight += sum(len(cycle_id) + 48 for cycle_id in projected)
+        weight += sum(len(route) + len(cycle) + 64 for route, cycle in route_cycles)
+        weight += sum(len(str(value)) + 16 for value in cycle_ids)
+        return _ArtifactIndexObservation(
+            root_id, manifest_rows, cycle_rows, cycle_ids,
+            tuple(sorted(projected)), (),
+            routes_valid, schema_error, weight, tuple(sorted(route_cycles)),
+        )
+
+    size_weight = lambda value: value.weight
+    observed = _HISTORICAL_OBSERVATIONS.memoize(
+        key, [path], load, weight=size_weight
+    )
+    if route_key is None:
+        return observed
+    wanted_routes = set(route_key or ())
+    return replace(observed,
+        cycle_ids=observed.cycle_ids if cycle_id is None else (),
+        matching_cycle_ids=tuple(sorted({cycle for route, cycle in observed.route_cycles
+                                        if route in wanted_routes})),
+        projected_cycle_ids=observed.projected_cycle_ids if route_key is not None else (),
+        routes_valid=observed.routes_valid if route_key is not None else True)
+
+
 def list_cycle_records(root: Path, *, route_ids=None) -> List[Dict[str, Any]]:
     directory = producer_dir(root) / "cycles"
     rows: List[Dict[str, Any]] = []
@@ -792,36 +937,24 @@ def list_cycle_records(root: Path, *, route_ids=None) -> List[Dict[str, Any]]:
                 value = _read_json(entry)
                 if value is not None:
                     rows.append(value)
-    index = _read_json(artifact_admission._index_path(root)) or {}
+    try:
+        index = _artifact_index_observation(root, route_ids=route_ids)
+    except (OSError, ValueError, UnicodeError):
+        index = _ArtifactIndexObservation(None, (), (), (), (), (), False, "", 1)
     if route_ids is None:
         known = {row.get("cycle_id") for row in rows}
-        candidates = set(index.get("cycles") or {}) - known
+        candidates = set(index.cycle_ids) - known
     else:
         # Admitted manifests recover removed producer records. Their existing
         # route projection narrows recovery too; unindexed legacy rows retain
         # the original read-and-filter fallback.
-        projected, matching = set(), set()
-        projection = index.get("routes") or {}
-        valid_projection = isinstance(projection, dict)
-        for bucket in projection.values() if valid_projection else ():
-            if not isinstance(bucket, dict):
-                valid_projection = False
-                break
-            for route_id, item in bucket.items():
-                if (not isinstance(route_id, str) or not isinstance(item, dict)
-                        or not isinstance(item.get("cycle_id"), str)):
-                    valid_projection = False
-                    break
-                projected.add(item["cycle_id"])
-                if route_id in route_ids:
-                    matching.add(item["cycle_id"])
-            if not valid_projection:
-                break
-        if not valid_projection:
+        projected = set(index.projected_cycle_ids)
+        matching = set(index.matching_cycle_ids)
+        if not index.routes_valid:
             # A damaged optional projection cannot suppress legacy recovery.
             projected, matching = set(), set()
         known = {row.get("cycle_id") for row in rows}
-        candidates = (matching | (set(index.get("cycles") or {}) - projected)) - known - {None}
+        candidates = (matching | (set(index.cycle_ids) - projected)) - known - {None}
     for cycle_id in sorted(candidates):
         record = read_cycle_record(root, cycle_id)
         if record is not None and (route_ids is None or record.get("route_id") in route_ids):
@@ -5825,31 +5958,55 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
     manifest_path = _record_cycle_manifest_path(root, record)
     directory = manifest_path.parent
     try:
-        raw = manifest_path.read_bytes()
-        document = json.loads(raw.decode("utf-8"))
+        if historical:
+            def load_historical_manifest():
+                raw = stable_read_bytes(manifest_path)
+                document = json.loads(raw.decode("utf-8"))
+                canonical = artifact_manifest.canonical_bytes(document)
+                return (document, raw == canonical,
+                        artifact_manifest.manifest_digest(document))
+
+            observed_document, canonical_match, digest = _HISTORICAL_OBSERVATIONS.memoize(
+                ("sealed-manifest", str(manifest_path.resolve(strict=False))),
+                [manifest_path], load_historical_manifest,
+                weight=lambda value: max(1, manifest_path.stat().st_size * 4),
+            )
+            document = observed_document
+        else:
+            raw = manifest_path.read_bytes()
+            document = json.loads(raw.decode("utf-8"))
+            canonical = artifact_manifest.canonical_bytes(document)
+            canonical_match = raw == canonical
+            digest = artifact_manifest.manifest_digest(document)
     except (OSError, ValueError, UnicodeError) as exc:
         raise ProducerError("already-sealed-mismatch", str(manifest_path)) from exc
-    canonical = artifact_manifest.canonical_bytes(document)
-    digest = artifact_manifest.manifest_digest(document)
-    if raw != canonical or digest != record.get("manifest_digest"):
+    if not canonical_match or digest != record.get("manifest_digest"):
         raise ProducerError("already-sealed-mismatch", "manifest")
     identity = artifact_lifecycle.read_root_identity(root)
     if historical:
         # load_index's missing-index fallback allocates a root identity.
         # Observation must refuse missing/corrupt index bytes without repair.
-        payload = _read_json(artifact_admission._index_path(root))
-        if payload is None:
-            raise ProducerError("already-sealed-mismatch", "index-missing")
-        index = artifact_index._parse_owned(payload)
+        try:
+            index_projection = _artifact_index_observation(
+                root, cycle_id=record["cycle_id"])
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise ProducerError("already-sealed-mismatch", "index-missing") from exc
+        if index_projection.schema_error:
+            raise ValueError(index_projection.schema_error)
+        index_root_id = index_projection.artifact_root_id
+        row = index_projection.manifest_row(record["cycle_id"])
+        cycle_index_row = index_projection.cycle_row(record["cycle_id"])
     else:
         index = artifact_admission.load_index(root)
-    row = index.manifests.get(record["cycle_id"]) if hasattr(index, "manifests") else None
+        index_root_id = index.artifact_root_id
+        row = index.manifests.get(record["cycle_id"]) if hasattr(index, "manifests") else None
+        cycle_index_row = index.cycles.get(record["cycle_id"]) if hasattr(index, "cycles") else None
     if not isinstance(row, dict) or row.get("manifest_digest") != digest:
         raise ProducerError("already-sealed-mismatch", "index")
     if expected_binding is not None:
         cycle_id = record["cycle_id"]
         cycle = document.get("cycle", {})
-        if (identity is None or index.artifact_root_id != identity.artifact_root_id
+        if (identity is None or index_root_id != identity.artifact_root_id
                 or document.get("artifact_root_id") != identity.artifact_root_id
                 or cycle.get("cycle_id") != cycle_id
                 or cycle.get("campaign_id") != record["campaign_id"]
@@ -5858,13 +6015,24 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
         # Use the canonical writer's projection, scoped to this exact cycle.
         # Root-wide rebuild/repair could touch unrelated open cycles and is
         # not evidence that this transaction's two index rows were applied.
-        expected_index = artifact_index.apply(
-            artifact_index.empty(identity.artifact_root_id), document,
-            cycle_path=os.path.relpath(str(directory), str(root)),
-            manifest_digest=digest, idempotency_key=cycle_id,
-        )
-        if (row != expected_index.manifests[cycle_id]
-                or index.cycles.get(cycle_id) != expected_index.cycles[cycle_id]):
+        relative_path = os.path.relpath(str(directory), str(root))
+        def expected_rows():
+            expected = artifact_index.apply(
+                artifact_index.empty(identity.artifact_root_id), document,
+                cycle_path=relative_path, manifest_digest=digest, idempotency_key=cycle_id)
+            return expected.manifests[cycle_id], expected.cycles[cycle_id]
+        if historical:
+            # This pure projection remains reusable even if a later check
+            # rejects the current index/outcome. Rejection stays rejection;
+            # it need not repeat an unchanged manifest's whole-tree apply.
+            expected_manifest, expected_cycle = _HISTORICAL_PROJECTIONS.memoize(
+                ("manifest-index-rows", str(manifest_path.resolve(strict=False)),
+                 cycle_id, digest, identity.artifact_root_id, relative_path),
+                [manifest_path], expected_rows,
+                weight=lambda value: 128 + 3 * len(_canonical(value)))
+        else:
+            expected_manifest, expected_cycle = expected_rows()
+        if row != expected_manifest or cycle_index_row != expected_cycle:
             raise ProducerError("already-sealed-mismatch", "index-projection")
     updated_since = False
     if expected_manifest_digest is not None and expected_manifest_digest != digest:
@@ -7647,8 +7815,38 @@ def observe_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapp
         raise ProducerError("cycle-unknown", cycle_id)
     if record.get("deleted_at"):
         return _verify_deleted_cycle(record, expected_binding, expected_manifest_digest)
-    return _verify_sealed_cycle_locked(root, record, expected_binding,
-                                      expected_manifest_digest=expected_manifest_digest, historical=True)
+    # Cache only the immutable historical consistency proof. Review leases
+    # above and the terminal controller's child/process/claim checks remain
+    # fresh. Missing optional markers/snapshot directories depend on their
+    # nearest existing parent so recreation invalidates the proof as well.
+    dependencies = [cycle_record_path(root, cycle_id),
+                    _record_cycle_manifest_path(root, record),
+                    artifact_admission._index_path(root),
+                    root / artifact_admission.ADMISSION_REL / "root-identity.json"]
+    route_id = expected_binding.get("route_id")
+    if route_id:
+        route_path = route_lineage.canonical_route_path(root, route_id)
+        dependencies.extend((route_path, artifact_lifecycle.canonical_outcome_path(root, route_id)))
+        route = json.loads(route_path.read_text())
+        module = dispatch_terminal_commit._route_module()
+        dependencies.extend(module.completion_dir(route_id) / f"{node['id']}.json"
+                            for node in route.get("nodes", []) if node.get("terminal") is True)
+    snapshots = artifact_lifecycle.manifest_snapshot_dir(root, cycle_id)
+    dependencies.append(snapshots)
+    if snapshots.is_dir():
+        dependencies.extend(path for path in snapshots.iterdir() if path.suffix == ".json")
+    observed_paths = []
+    for dependency in dependencies:
+        while not dependency.exists() and dependency != dependency.parent:
+            dependency = dependency.parent
+        observed_paths.append(dependency)
+    key = ("sealed-cycle-consistency", str(root), cycle_id,
+           _digest(_canonical(record)), _digest(_canonical(dict(expected_binding))),
+           expected_manifest_digest)
+    result = _HISTORICAL_PROJECTIONS.memoize(key, observed_paths,
+        lambda: _verify_sealed_cycle_locked(root, record, expected_binding,
+            expected_manifest_digest=expected_manifest_digest, historical=True), weight=512)
+    return dict(result)
 
 
 def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],

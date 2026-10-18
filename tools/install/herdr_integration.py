@@ -16,18 +16,102 @@ import safe_fs
 
 
 VERSIONS = {"claude": 11, "codex": 10, "opencode": 13}
-CLAUDE_SESSION_COMMAND = 'sh "$HOME/.claude/hooks/run-hook.sh" bash herdr-agent-state.sh session'
+CLAUDE_SESSION_COMMAND = 'bash "$HOME/.claude/hooks/herdr-agent-state.sh" session'
 CODEX_SESSION_COMMAND = (
-    "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do "
-    'if [ -f "$root/core/CORE.md" ] && '
-    '[ -f "$root/adapters/codex/hooks/herdr-agent-state.sh" ]; then '
-    'exec bash "$root/adapters/codex/hooks/herdr-agent-state.sh" session; '
-    'fi; done; echo "agent harness Codex hook launcher not found" >&2; exit 69'
+    'bash "${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh" session'
 )
-OPENCODE_TUI_V1 = "./tui/herdr-tui-session.js"
-OPENCODE_TUI_V2 = "./tui/herdr-opencode"
+OPENCODE_TUI_V1 = "./herdr-tui-session.js"
+OPENCODE_TUI_V2 = "./herdr-opencode"
 OPENCODE_IDENTITY = "./tui/hearting-tui-identity.ts"
 _JSONC_COMMENT = re.compile(r"//|/\*|\*/")
+_HERDR_INSTALL_HEADER = re.compile(r"^(?:#|//)\s*installed by herdr\s*$", re.M)
+_HERDR_INTEGRATION_ID = re.compile(r"^(?:#|//)\s*HERDR_INTEGRATION_ID=(\S+)\s*$", re.M)
+
+
+def installed_by_herdr(path: Path, integration_id: str) -> bool:
+    """Read Herdr's two ownership markers without accepting a similar filename."""
+    try:
+        text = Path(path).read_bytes()[:4096].decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    match = _HERDR_INTEGRATION_ID.search(text)
+    return bool(_HERDR_INSTALL_HEADER.search(text) and match
+                and match.group(1) == integration_id)
+
+
+def project_asset(source: Path, dest: Path, integration_id: str, *,
+                  dry_run: bool = False, allowed_root: Path | None = None) -> dict:
+    """Publish one mutable Herdr-owned runtime asset as a safe regular copy.
+
+    Herdr reinstalls replace these canonical runtime-home files. Keeping the
+    active copy outside the immutable release lets the next Hearting update
+    safely restore its pinned bytes without writing through a release symlink.
+    """
+    source, dest = Path(source), Path(dest)
+    result = {"action": f"herdr-asset-{integration_id}", "source": str(source),
+              "dest": str(dest), "status": "unchanged", "changed": False}
+    if not source.is_file():
+        return {**result, "status": "skipped", "detail": "source asset absent"}
+    if source.is_symlink() or not installed_by_herdr(source, integration_id):
+        return {**result, "status": "blocked", "detail": "source ownership markers invalid"}
+    home = Path(allowed_root).expanduser().absolute() if allowed_root else dest.parent.absolute()
+    try:
+        dest_abs = dest.expanduser().absolute()
+        try:
+            relative = dest_abs.relative_to(home)
+        except ValueError:
+            return {**result, "status": "blocked", "detail": "destination escaped runtime home"}
+        cursor = home
+        for part in relative.parts[:-1]:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                return {**result, "status": "blocked", "detail": "destination parent is a symlink"}
+            if cursor.exists() and not cursor.is_dir():
+                return {**result, "status": "blocked", "detail": "destination parent is not a directory"}
+        if not dry_run:
+            dest_abs.parent.mkdir(parents=True, exist_ok=True)
+        home_resolved = home.resolve(strict=not dry_run)
+        parent_resolved = dest_abs.parent.resolve(strict=not dry_run)
+        if parent_resolved != home_resolved and home_resolved not in parent_resolved.parents:
+            return {**result, "status": "blocked", "detail": "destination escaped runtime home"}
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {**result, "status": "blocked", "detail": type(exc).__name__}
+
+    current = safe_fs.capture_state(dest_abs, include_payload=True)
+    if current.kind not in {"missing", "file", "symlink"}:
+        return {**result, "status": "blocked", "detail": "destination is not a file"}
+    if current.kind == "file" and not installed_by_herdr(dest_abs, integration_id):
+        try:
+            if current.payload != source.read_bytes():
+                return {**result, "status": "blocked", "detail": "destination is user-owned"}
+        except OSError:
+            return {**result, "status": "blocked", "detail": "destination is unreadable"}
+    if current.kind == "symlink":
+        try:
+            if dest_abs.resolve(strict=False) != source.resolve(strict=True):
+                return {**result, "status": "blocked", "detail": "destination symlink is not the pinned source"}
+        except (OSError, RuntimeError):
+            return {**result, "status": "blocked", "detail": "destination symlink is unresolved"}
+    try:
+        payload = source.read_bytes()
+        if current.kind == "file" and current.payload == payload:
+            return result
+        if dry_run:
+            return {**result, "status": "planned", "changed": True}
+        with safe_fs.TargetLock(dest_abs):
+            expected = safe_fs.capture_state(dest_abs, include_payload=True)
+            if expected != current:
+                return {**result, "status": "blocked", "detail": "destination changed during projection"}
+            auth = safe_fs.authority(dest_abs, owner="herdr-integration:asset-projection",
+                                     allowed_paths=(dest_abs,), allow_leaf_symlink=True,
+                                     expected=expected)
+            safe_fs.atomic_write_bytes(
+                auth, payload, source.stat().st_mode & 0o777,
+                expected=expected, create_parents=True,
+            )
+        return {**result, "status": "updated", "changed": True}
+    except (OSError, safe_fs.SafetyError) as exc:
+        return {**result, "status": "blocked", "detail": type(exc).__name__}
 
 
 def _skip_space(text: str, index: int) -> int:
@@ -301,7 +385,8 @@ def _owned_state_hook(command: Any) -> bool:
         return False
     return any(token in command for token in (
         "/.claude/hooks/", "/adapters/codex/hooks/", "$AGENT_HOME/",
-        "${AGENT_HOME}/", "$root/adapters/codex/hooks/",
+        "${AGENT_HOME}/", "$root/adapters/codex/hooks/", "/.codex/herdr-agent-state.sh",
+        "${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh", "$CODEX_HOME/",
     ))
 
 
@@ -417,9 +502,55 @@ def _config_candidates(home: Path, name: str) -> tuple[Path, ...]:
     return (home / f"{stem}.jsonc", home / f"{stem}.json")
 
 
+def _legacy_opencode_tui_ref(value: Any, key: str, home: Path,
+                             source_root: Path) -> bool:
+    """Recognize only Hearting's former OpenCode TUI paths during migration."""
+    if not isinstance(value, str):
+        return False
+    normalized = value.replace("\\", "/").strip().rstrip("/")
+    relative = normalized
+    while relative.startswith("./"):
+        relative = relative[2:]
+    if key == "tui":
+        leaf = "herdr-tui-session.js"
+        aliases = {"tui/herdr-tui-session.js"}
+        suffixes = ("/tui/herdr-tui-session.js",
+                    "/adapters/opencode/tui/herdr-tui-session.js")
+    else:
+        leaf = "herdr-opencode"
+        aliases = {"tui/herdr-opencode", "tui/herdr-opencode/tui.js"}
+        suffixes = ("/tui/herdr-opencode", "/tui/herdr-opencode/tui.js",
+                    "/adapters/opencode/tui/herdr-opencode",
+                    "/adapters/opencode/tui/herdr-opencode/tui.js")
+    if relative in aliases:
+        return True
+    owned_paths = {
+        str(Path(home) / "tui" / leaf).replace("\\", "/"),
+        str(Path(source_root) / "adapters/opencode/tui" / leaf).replace("\\", "/"),
+    }
+    if key == "cli":
+        owned_paths.update({
+            str(Path(home) / "tui/herdr-opencode/tui.js").replace("\\", "/"),
+            str(Path(source_root) / "adapters/opencode/tui/herdr-opencode/tui.js").replace("\\", "/"),
+        })
+    if normalized in owned_paths:
+        return True
+    # Historical release roots vary by version. Match their complete owned
+    # source-relative suffix in absolute and relative references, while
+    # keeping runtime-home suffix matching limited to absolute paths.
+    release_suffixes = tuple(value.lstrip("/") for value in suffixes
+                             if "/adapters/opencode/tui/" in value)
+    if any(relative == suffix or relative.endswith("/" + suffix)
+           for suffix in release_suffixes):
+        return True
+    runtime_suffixes = tuple(value for value in suffixes if value.startswith("/tui/"))
+    return (normalized.startswith(("/", "~/"))
+            and normalized.endswith(runtime_suffixes))
+
+
 def migrate_opencode_configs(home: Path, source_root: Path, *, dry_run: bool = False,
                              previous: dict | None = None) -> dict:
-    """Register the V1 and V2 native TUI entrypoints, preserving JSONC/user entries."""
+    """Register official TUI paths and migrate only Hearting-owned old references."""
     home, source_root = Path(home), Path(source_root)
     tui_asset = source_root / "adapters/opencode/tui/herdr-tui-session.js"
     v2_asset = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
@@ -435,84 +566,128 @@ def migrate_opencode_configs(home: Path, source_root: Path, *, dry_run: bool = F
     )
     receipts = []
     actions = []
-    previous_files = (previous or {}).get("files", {})
+    saved_files = (previous or {}).get("files", {})
+    if isinstance(saved_files, dict):
+        previous_files = saved_files
+    else:
+        previous_files = {}
+        for item in saved_files if isinstance(saved_files, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("path")
+            if isinstance(name, str) and Path(name).name == name:
+                previous_files[name] = item
     for key, template_name, config_key, desired in specs:
         if not desired:
             actions.append({"action": f"herdr-opencode-{key}", "status": "skipped",
                             "detail": "optional integration assets are absent", "changed": False})
             continue
         candidates = _config_candidates(home, template_name)
-        target = next((p for p in candidates if p.exists() or p.is_symlink()), candidates[-1])
+        targets = [p for p in candidates if p.exists() or p.is_symlink()]
+        if not targets:
+            if not desired:
+                actions.append({"action": f"herdr-opencode-{key}", "status": "skipped",
+                                "detail": "optional integration assets are absent", "changed": False})
+                continue
+            targets = [candidates[-1]]
         template = source_root / "adapters" / "opencode" / "tui" / template_name
-        created = False
-        seeded = None
-        added: list[str] = []
-        if target.is_symlink():
-            actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                            "status": "source-managed", "changed": False})
-            continue
-        if target.exists() and not target.is_file():
-            actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                            "status": "blocked", "detail": "configuration is not a regular file"})
-            continue
-        if not target.exists() and not template.is_file():
-            actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                            "status": "skipped", "detail": "optional integration template is absent",
-                            "changed": False})
-            continue
-        try:
-            if target.is_file():
-                before = target.read_bytes()
-                text = before.decode("utf-8")
-                parsed = parse_jsonc(text)
-                if not isinstance(parsed, dict):
-                    raise ValueError("configuration root must be an object")
-                for value in desired:
-                    if value not in parsed.get(config_key, []):
-                        added.append(value)
-                updated_text = edit_plugin_list(text, key=config_key, add=desired)
-                after = updated_text.encode("utf-8")
-            else:
-                before = None
-                template_text = template.read_text(encoding="utf-8")
-                parsed = parse_jsonc(template_text)
-                if not isinstance(parsed, dict) or any(value not in parsed.get(config_key, []) for value in desired):
-                    raise ValueError(f"{template_name} template lacks required plugin registrations")
-                unavailable = tuple(value for value in (OPENCODE_TUI_V1, OPENCODE_TUI_V2,
-                                                        OPENCODE_IDENTITY) if value not in desired)
-                if unavailable:
-                    template_text = edit_plugin_list(template_text, key=config_key, remove=unavailable)
-                after = template_text.encode("utf-8")
-                created = True
-                seeded = after.decode("utf-8")
-                added = list(desired)
-            changed = before != after
-            status = "unchanged"
-            if changed:
-                outcome = _write_config(target, before, after, dry_run=dry_run)
-                status = outcome["status"]
-                if status == "blocked":
-                    raise ValueError(outcome.get("detail", "safe write refused"))
-                if status not in {"updated", "planned"}:
-                    actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                                    "status": "blocked", "detail": status, "changed": False})
-                    continue
-            if changed and not dry_run:
-                record = {"path": target.name, "key": config_key,
-                          "added": added, "created": created}
-                if created:
-                    record["seeded"] = seeded
-                receipts.append(record)
-            elif not changed:
-                old = previous_files.get(target.name) if isinstance(previous_files, dict) else None
-                if isinstance(old, dict):
-                    receipts.append(old)
-            actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                            "status": "planned" if dry_run and changed else status,
-                            "changed": changed})
-        except (OSError, UnicodeError, ValueError, TypeError, safe_fs.SafetyError) as exc:
-            actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
-                            "status": "blocked", "detail": str(exc), "changed": False})
+        for target in targets:
+            created = False
+            seeded = None
+            if target.is_symlink():
+                actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                "status": "source-managed", "changed": False})
+                continue
+            if target.exists() and not target.is_file():
+                actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                "status": "blocked", "detail": "configuration is not a regular file"})
+                continue
+            if not target.exists() and not template.is_file():
+                actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                "status": "skipped", "detail": "optional integration template is absent",
+                                "changed": False})
+                continue
+            try:
+                old_record = previous_files.get(target.name) if isinstance(previous_files, dict) else None
+                if target.is_file():
+                    before = target.read_bytes()
+                    text = before.decode("utf-8")
+                    parsed = parse_jsonc(text)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("configuration root must be an object")
+                    values = parsed.get(config_key, [])
+                    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                        raise ValueError(f"{config_key} property must be an array of strings")
+                    remove = [value for value in values
+                              if _legacy_opencode_tui_ref(value, key, home, source_root)]
+                    # Keep exactly one current Hearting TUI route if a prior
+                    # install or upstream reinstall left duplicate copies.
+                    for value in desired:
+                        if value in {OPENCODE_TUI_V1, OPENCODE_TUI_V2} and values.count(value) > 1:
+                            remove.append(value)
+                    updated_text = edit_plugin_list(text, key=config_key,
+                                                    remove=tuple(dict.fromkeys(remove)))
+                    updated_text = edit_plugin_list(updated_text, key=config_key, add=desired)
+                    after = updated_text.encode("utf-8")
+                    added = [value for value in desired if value not in values]
+                else:
+                    before = None
+                    if not desired:
+                        actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                        "status": "skipped", "detail": "optional integration assets are absent",
+                                        "changed": False})
+                        continue
+                    template_text = template.read_text(encoding="utf-8")
+                    parsed = parse_jsonc(template_text)
+                    if not isinstance(parsed, dict) or any(value not in parsed.get(config_key, []) for value in desired):
+                        raise ValueError(f"{template_name} template lacks required plugin registrations")
+                    unavailable = tuple(value for value in (OPENCODE_TUI_V1, OPENCODE_TUI_V2,
+                                                            OPENCODE_IDENTITY) if value not in desired)
+                    if unavailable:
+                        template_text = edit_plugin_list(template_text, key=config_key, remove=unavailable)
+                    after = template_text.encode("utf-8")
+                    created = True
+                    seeded = after.decode("utf-8")
+                    added = list(desired)
+                changed = before != after
+                status = "unchanged"
+                if changed:
+                    outcome = _write_config(target, before, after, dry_run=dry_run)
+                    status = outcome["status"]
+                    if status == "blocked":
+                        raise ValueError(outcome.get("detail", "safe write refused"))
+                    if status not in {"updated", "planned"}:
+                        actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                        "status": "blocked", "detail": status, "changed": False})
+                        continue
+                if changed and not dry_run:
+                    after_values = parse_jsonc(after.decode("utf-8")).get(config_key, [])
+                    owned_added = []
+                    prior_added = old_record.get("added", []) if isinstance(old_record, dict) else []
+                    for value in prior_added if isinstance(prior_added, list) else []:
+                        replacement = (OPENCODE_TUI_V1 if key == "tui" else OPENCODE_TUI_V2)
+                        if _legacy_opencode_tui_ref(value, key, home, source_root):
+                            value = replacement
+                        if value in after_values and value not in owned_added:
+                            owned_added.append(value)
+                    for value in added:
+                        if value in after_values and value not in owned_added:
+                            owned_added.append(value)
+                    record = dict(old_record) if isinstance(old_record, dict) else {}
+                    record.update({"path": target.name, "key": config_key, "added": owned_added})
+                    if created:
+                        record.update({"created": True, "seeded": seeded})
+                    else:
+                        record.setdefault("created", False)
+                    receipts.append(record)
+                elif not changed and isinstance(old_record, dict):
+                    receipts.append(old_record)
+                actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                "status": "planned" if dry_run and changed else status,
+                                "changed": changed})
+            except (OSError, UnicodeError, ValueError, TypeError, safe_fs.SafetyError) as exc:
+                actions.append({"action": f"herdr-opencode-{key}", "dest": str(target),
+                                "status": "blocked", "detail": str(exc), "changed": False})
     return {"kind": "herdr-opencode-registration", "actions": actions,
             "managed_config": {"files": receipts}}
 
@@ -602,28 +777,45 @@ def version_marker(path: Path, integration_id: str, version: int) -> bool:
         rf"(?m)^{prefix}HERDR_INTEGRATION_VERSION={version}\s*$", text) is not None
 
 
-def manifest_assets(runtime: str, source_root: Path, runtime_home: Path) -> dict:
-    """Return installed-file hashes for pinned Herdr assets in the ownership manifest."""
+def asset_specs(runtime: str, source_root: Path, runtime_home: Path):
+    """The one mapping from pinned sources to Herdr's formal runtime paths."""
     root, home = Path(source_root), Path(runtime_home)
     mapping = {
-        "claude": [("hooks/herdr-agent-state.sh", "hooks/herdr-agent-state.sh")],
-        "codex": [("adapters/codex/hooks/herdr-agent-state.sh", "agent-hooks/herdr-agent-state.sh")],
+        "claude": [("hooks/herdr-agent-state.sh", "hooks/herdr-agent-state.sh", "claude")],
+        "codex": [("adapters/codex/hooks/herdr-agent-state.sh", "herdr-agent-state.sh", "codex")],
         "opencode": [
-            ("adapters/opencode/plugins/herdr-agent-state.js", "plugins/herdr-agent-state.js"),
-            ("adapters/opencode/tui/herdr-tui-session.js", "tui/herdr-tui-session.js"),
-            ("adapters/opencode/tui/herdr-opencode/tui.js", "tui/herdr-opencode/tui.js"),
+            ("adapters/opencode/plugins/herdr-agent-state.js", "plugins/herdr-agent-state.js", "opencode"),
+            ("adapters/opencode/tui/herdr-tui-session.js", "herdr-tui-session.js", "opencode-tui"),
+            ("adapters/opencode/tui/herdr-opencode/tui.js", "herdr-opencode/tui.js", "opencode-tui-v2"),
         ],
     }
+    return [(root / source, home / dest, integration_id)
+            for source, dest, integration_id in mapping[runtime]]
+
+
+def project_assets(runtime: str, source_root: Path, runtime_home: Path, *,
+                   dry_run: bool = False) -> list[dict]:
+    reports = []
+    home = Path(runtime_home)
+    for source, dest, integration_id in asset_specs(runtime, source_root, home):
+        reports.append(project_asset(source, dest, integration_id,
+                                     dry_run=dry_run, allowed_root=home))
+    return reports
+
+
+def manifest_assets(runtime: str, source_root: Path, runtime_home: Path) -> dict:
+    """Return installed-file hashes for pinned Herdr assets in the ownership manifest."""
+    specs = asset_specs(runtime, source_root, runtime_home)
+    home = Path(runtime_home)
     assets = []
-    for source_rel, dest_rel in mapping[runtime]:
-        source, dest = root / source_rel, home / dest_rel
+    for source, dest, _integration_id in specs:
         if not source.is_file() or not dest.is_file():
             continue
         try:
             digest = hashlib.sha256(dest.read_bytes()).hexdigest()
         except OSError:
             continue
-        assets.append({"path": dest_rel, "sha256": digest})
+        assets.append({"path": dest.relative_to(home).as_posix(), "sha256": digest})
     return {"version": VERSIONS[runtime], "assets": assets}
 
 
@@ -675,7 +867,20 @@ def source_checks(runtime: str, source_root: Path) -> list[dict]:
         for name, key, plugins in (("tui.json", "plugin", (OPENCODE_IDENTITY, OPENCODE_TUI_V1)),
                                    ("cli.json", "plugins", (OPENCODE_IDENTITY, OPENCODE_TUI_V2))):
             data = parse_jsonc((root / "adapters/opencode/tui" / name).read_text(encoding="utf-8"))
-            ok = all(plugin in data.get(key, []) for plugin in plugins)
+            values = data.get(key, [])
+            expected_tui = plugins[-1]
+            ok = (all(plugin in values for plugin in plugins)
+                  and values.count(expected_tui) == 1
+                  and not any(_legacy_opencode_tui_ref(value, "tui" if key == "plugin" else "cli",
+                                                       root / "runtime-home", root)
+                              for value in values))
             results.append({"id": f"opencode.herdr.registration.{name}", "ok": ok,
                             "detail": f"{name} registers {', '.join(plugins)}"})
+        for name, key, plugin in (("owned-tui.json", "plugin", "../herdr-tui-session.js"),
+                                  ("owned-cli.json", "plugins", "../herdr-opencode")):
+            data = parse_jsonc((root / "adapters/opencode/tui" / name).read_text(encoding="utf-8"))
+            values = data.get(key, [])
+            ok = values.count(plugin) == 1 and "./hearting-tui-identity.ts" in values
+            results.append({"id": f"opencode.herdr.registration.{name}", "ok": ok,
+                            "detail": f"{name} resolves from the managed tui/ config directory"})
     return results

@@ -25,7 +25,7 @@ class WrapperPreviewTest(unittest.TestCase):
   f=self.f
   with f.dispatch_env():
    path=f.route(same_status='supported',intensity='standard');route=json.loads(path.read_text())
-   f.seed_review_rounds(route['route_id'],'test',2)
+   f.seed_review_rounds(route,'test',2)
    full=dict(action='dry-run',route_file=str(path),route_id=route['route_id'],route_hash=route['route_hash'],
              route_node='test',attempt_id=None,dispatch_depth=2)
    with self.assertRaises(review_input.DC.DispatchContractError) as refused:
@@ -48,7 +48,7 @@ class WrapperPreviewTest(unittest.TestCase):
   f=self.f
   with f.dispatch_env():
    path=f.route(same_status='supported',intensity='standard');route=json.loads(path.read_text())
-   f.seed_parent();evidence=f.seed_plan_marker(route);f.seed_review_rounds(route['route_id'],'plan-check',1)
+   f.seed_parent();evidence=f.seed_plan_marker(route);f.seed_review_rounds(route,'plan-check',1)
    evidence.write_text('Corrected input, preview only.\n')
    marker=fixture.R.completion_dir(route['route_id'],jobs=f.jobs)/'plan.json'
    before={str(p):p.read_bytes() for p in marker.parent.iterdir() if p.is_file()}

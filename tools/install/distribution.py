@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -1474,14 +1475,66 @@ def _merge_registry_rows(
     return merged, ok
 
 
+_REGISTRY_LOCK_LOCAL = threading.local()
+
+
+def _registry_lock_state() -> dict:
+    """Return this process/thread's lock table, dropping fork-inherited fds.
+
+    A thread-local survives ``fork()`` in the calling child thread. Close only
+    the exact handles recorded by the parent before allowing the child to
+    acquire the same lock; the parent's descriptor remains open in its own
+    process and continues to own the flock.
+    """
+    pid = os.getpid()
+    thread_id = threading.get_ident()
+    state = getattr(_REGISTRY_LOCK_LOCAL, "state", None)
+    if state is not None and (state["pid"] != pid or state["thread_id"] != thread_id):
+        for entry in state["owned"].values():
+            try:
+                entry["handle"].close()
+            except OSError:
+                pass
+        state = None
+    if state is None:
+        state = {"pid": pid, "thread_id": thread_id, "owned": {}}
+        _REGISTRY_LOCK_LOCAL.state = state
+    return state
+
+
+def _registry_lock_identity(lock_path: Path) -> str:
+    """Canonical identity used only to deduplicate this process's lock holds."""
+    return os.path.normcase(os.path.realpath(lock_path))
+
+
 @contextlib.contextmanager
 def _registry_lock(jobs: Path):
-    """flock the registry's `<jobs>.lock`, mirroring `_distribution_lock()`."""
+    """flock `<jobs>.lock`, reentrant only for nested calls on this thread.
+
+    Cleanup takes a stable ordered set of registry admission locks while its
+    carry helpers also use `_registry_lock()` for individual merges. The
+    thread-local ownership table lets those nested calls reuse the already-held
+    OS lock. Other threads and processes open their own descriptor and remain
+    serialized by flock.
+    """
     jobs.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(f"{jobs}.lock")
     if lock_path.is_symlink():
         raise OSError(f"dispatch registry lock must not be a symlink: {lock_path}")
+    identity = _registry_lock_identity(lock_path)
+    state = _registry_lock_state()
+    owned = state["owned"]
+    if identity in owned:
+        owned[identity]["depth"] += 1
+        try:
+            yield
+        finally:
+            owned[identity]["depth"] -= 1
+        return
     handle = lock_path.open("a+b")
+    owner_pid = os.getpid()
+    owner_state = state
+    lock_entry = None
     try:
         try:
             import fcntl
@@ -1491,13 +1544,134 @@ def _registry_lock(jobs: Path):
             import msvcrt
 
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        stat = os.fstat(handle.fileno())
+        lock_entry = {
+            "depth": 1,
+            "handle": handle,
+            "fd": handle.fileno(),
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "path": lock_path,
+        }
+        owned[identity] = lock_entry
         yield
     finally:
+        # A forked child may unwind the parent's Python stack after resetting
+        # its inherited ownership table and acquiring its own descriptor.
+        # Only the creating process/state may release this entry.
+        if (os.getpid() == owner_pid
+                and getattr(_REGISTRY_LOCK_LOCAL, "state", None) is owner_state
+                and (lock_entry is None or owned.get(identity) is lock_entry)):
+            owned.pop(identity, None)
+            try:
+                if "fcntl" in sys.modules:
+                    sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _registry_lock_owned_fds() -> dict[int, tuple[int, int]]:
+    """Exact lock descriptors owned by this current process and thread."""
+    state = _registry_lock_state()
+    owned_fds = {}
+    for entry in state["owned"].values():
         try:
-            if "fcntl" in sys.modules:
-                sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
-        finally:
-            handle.close()
+            stat = os.fstat(entry["handle"].fileno())
+        except OSError:
+            continue
+        if (stat.st_dev, stat.st_ino) == (entry["device"], entry["inode"]):
+            owned_fds[entry["fd"]] = (entry["device"], entry["inode"])
+    return owned_fds
+
+
+def _installed_legacy_registry_paths(candidate: Path | None) -> list[Path]:
+    """Enumerate legacy release registries that can admit release-bound work.
+
+    Include every real managed release `.dispatch/jobs.log`, not only the
+    candidate's and current release's registries: a writer may use a pinned
+    legacy jobs path while its `launch_home` names a different release. The
+    stable registry is added separately by `_dispatch_writer_boundary()`.
+    """
+    jobs_paths = set()
+    if candidate is not None:
+        jobs_paths.add(candidate / ".dispatch" / "jobs.log")
+    releases = data_root() / "releases"
+    if releases.is_dir() and not releases.is_symlink():
+        try:
+            with os.scandir(releases) as entries:
+                for entry in entries:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    dispatch = Path(entry.path) / ".dispatch"
+                    # Keep absent registry paths in the ephemeral input index
+                    # too: a newly created legacy registry is a changed input.
+                    jobs_paths.add(dispatch / "jobs.log")
+        except OSError as exc:
+            raise OSError(f"could not enumerate legacy dispatch registries under {releases}") from exc
+    try:
+        live_release = current_path().resolve(strict=True)
+    except OSError:
+        live_release = None
+    if live_release is not None:
+        live_dispatch = live_release / ".dispatch"
+        jobs_paths.add(live_dispatch / "jobs.log")
+    return sorted(jobs_paths, key=lambda jobs: _registry_lock_identity(Path(f"{jobs}.lock")))
+
+
+def _dispatch_writer_boundary_paths(candidate: Path, environ: dict[str, str]) -> list[Path]:
+    """Return the stable and extant legacy admission registries in lock order."""
+    jobs_paths = {stable_state_root(environ) / "jobs.log"}
+    for jobs in _installed_legacy_registry_paths(candidate):
+        if jobs.parent.is_dir() and not jobs.parent.is_symlink():
+            jobs_paths.add(jobs)
+    by_identity = {}
+    for jobs in jobs_paths:
+        lock_path = Path(f"{jobs}.lock")
+        if lock_path.is_symlink():
+            raise OSError(f"dispatch registry lock must not be a symlink: {lock_path}")
+        by_identity.setdefault(_registry_lock_identity(lock_path), jobs)
+    return [by_identity[key] for key in sorted(by_identity)]
+
+
+def _dispatch_cleanup_boundary_paths(
+    environ: dict[str, str], extra_jobs_paths: Iterable[Path] = (),
+    legacy_registry_paths: Iterable[Path] | None = None,
+) -> list[Path]:
+    """Resolve one update's stable and installed legacy admission lock set."""
+    jobs_paths = {stable_state_root(environ) / "jobs.log"}
+    legacy_paths = (legacy_registry_paths if legacy_registry_paths is not None
+                    else _installed_legacy_registry_paths(None))
+    jobs_paths.update(
+        jobs for jobs in legacy_paths
+        if jobs.parent.is_dir() and not jobs.parent.is_symlink()
+    )
+    for jobs in extra_jobs_paths:
+        path = Path(jobs)
+        if path.parent.is_dir() and not path.parent.is_symlink():
+            jobs_paths.add(path)
+    by_identity = {}
+    for jobs in jobs_paths:
+        lock_path = Path(f"{jobs}.lock")
+        if lock_path.is_symlink():
+            raise OSError(f"dispatch registry lock must not be a symlink: {lock_path}")
+        by_identity.setdefault(_registry_lock_identity(lock_path), jobs)
+    return [by_identity[key] for key in sorted(by_identity)]
+
+
+@contextlib.contextmanager
+def _dispatch_writer_boundary(
+    candidate: Path | None,
+    environ: dict[str, str],
+    *,
+    jobs_paths: Iterable[Path] | None = None,
+):
+    """Hold every known stable/legacy admission lock through release removal."""
+    with contextlib.ExitStack() as stack:
+        paths = (list(jobs_paths) if jobs_paths is not None
+                 else _dispatch_writer_boundary_paths(candidate, environ))
+        for jobs in paths:
+            stack.enter_context(_registry_lock(jobs))
+        yield stack
 
 
 # destructive-ok: reason=atomically replace one dispatch registry; boundary=one validated jobs registry and its mkstemp sibling
@@ -1527,10 +1701,10 @@ def _succeed_registry_rows(stale_jobs: Path, live_jobs: Path) -> bool:
     instead of the byte-copy `_succeed_dispatch_state` uses for every other
     file under `.dispatch`. A byte copy either skips the whole live registry
     (destination exists) or clobbers it outright; neither preserves rows the
-    live registry gained after the stale snapshot was taken. Never holds
-    both registries' locks at once: the stale file is read and released
-    before the live lock is acquired, so there is no lock-ordering deadlock
-    surface with any other reader/writer of these two files.
+    live registry gained after the stale snapshot was taken. This helper
+    acquires its stale and live locks one at a time. Cleanup may already hold
+    both through its deterministic outer admission boundary; the nested calls
+    then reuse those same-thread lock descriptors.
     """
     if not stale_jobs.is_file():
         return True
@@ -1695,6 +1869,37 @@ def _alias_digest(hex_digest: str) -> str:
     return "sha256:" + hex_digest
 
 
+def _dispatch_tree_has_unsafe_entries(root: Path) -> bool:
+    """Treat unreadable, symlinked, or special dispatch entries as unknown."""
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return False if directory == root else True
+        except OSError:
+            return True
+        if not stat.S_ISDIR(info.st_mode):
+            return True
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                    except OSError:
+                        return True
+                    if stat.S_ISLNK(mode):
+                        return True
+                    if stat.S_ISDIR(mode):
+                        pending.append(Path(entry.path))
+                    elif not stat.S_ISREG(mode):
+                        return True
+        except OSError:
+            return True
+    return False
+
+
 def _migration_relative_files(root: Path) -> list[str]:
     """Every regular file under `root`, relative-posix, excluding the
     registry (merged separately with terminal precedence, not byte-compared)."""
@@ -1856,12 +2061,15 @@ def _migration_m0_preflight(source_dispatch: Path, stable_root: Path) -> dict:
 
 
 # destructive-ok: reason=commit a verified migration copy; boundary=one destination and its mkstemp sibling under stable state
-def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
+def _atomic_migrate_copy(
+    source: Path, destination: Path, *, replace: bool = True
+) -> bool:
     """M2 per-file atomic copy for the new migration path only (decision 8):
     copy to a same-directory `.tmp`, verify the digest, fsync the file,
     `os.replace`, fsync the parent directory. Cross-device safe -- this never
-    relies on `os.rename` across filesystems, always a real copy. Returns
-    False (leaving no partial destination) on any verification failure."""
+    relies on `os.rename` across filesystems, always a real copy. `replace=False`
+    links the verified temporary file without replacing an existing destination.
+    Returns False (leaving no partial destination) on any verification failure."""
 
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1879,16 +2087,23 @@ def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
             os.fsync(tmp_handle.fileno())
         if _sha256_file(Path(tmp_name)) != source_digest:
             return False
-        os.replace(tmp_name, destination)
+        if replace:
+            os.replace(tmp_name, destination)
+        else:
+            # The observation archive is content-addressed. Never repair or
+            # replace an existing object: the caller must verify its bytes.
+            os.link(tmp_name, destination)
         ok = True
     except OSError:
-        return False
+        ok = False
     finally:
-        if not ok and os.path.exists(tmp_name):
+        if os.path.lexists(tmp_name):
             try:
                 os.unlink(tmp_name)
             except OSError:
-                pass
+                ok = False
+    if not ok:
+        return False
     dir_fd = os.open(str(destination.parent), os.O_RDONLY)
     try:
         os.fsync(dir_fd)
@@ -1897,14 +2112,126 @@ def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
     return True
 
 
-def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
-    """M2 additive copy + the copy-side half of M3 verification, mirroring
-    `_succeed_dispatch_state`'s additive discipline (destination existing
-    wins, nothing already there is ever clobbered) but per-file atomic
-    (`_atomic_migrate_copy`) instead of `shutil.copy2` -- this is the new
-    migration copy path only; `_succeed_dispatch_state`'s own `copy2`
-    semantics are unchanged (decision 8)."""
+_DISPATCH_OBSERVATION_FILES = {"logs/dispatch-session-sweep.log"}
+_DISPATCH_OBSERVATION_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
+
+def _dispatch_observation_file(relative: Path) -> bool:
+    if relative.as_posix() in _DISPATCH_OBSERVATION_FILES:
+        return True
+    parts = relative.parts
+    if len(parts) == 2 and parts[0] == "logs" and parts[1].endswith(".heartbeat"):
+        slug = parts[1][:-len(".heartbeat")]
+        return _DISPATCH_OBSERVATION_SLUG_RE.fullmatch(slug) is not None
+    if len(parts) == 1 and parts[0].startswith("plugin-load.") and parts[0].endswith(".mark"):
+        slug = parts[0][len("plugin-load."):-len(".mark")]
+        return _DISPATCH_OBSERVATION_SLUG_RE.fullmatch(slug) is not None
+    return False
+
+
+def _path_has_symlink_from(path: Path, boundary: Path) -> bool:
+    """Refuse a symlink anywhere below a trusted root, including dangling leaves."""
+    try:
+        relative = path.relative_to(boundary)
+    except ValueError:
+        return True
+    current = boundary
+    if current.is_symlink():
+        return True
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _archive_dispatch_observation(
+    source_root: Path, source: Path, relative: Path, source_digest: str
+) -> bool:
+    """Keep one classified legacy observation without making it dispatch authority."""
+    if not _dispatch_observation_file(relative):
+        return False
+    try:
+        if source.is_symlink() or not stat.S_ISREG(source.lstat().st_mode):
+            return False
+        source_root_real = source_root.resolve(strict=True)
+        source_real = source.resolve(strict=True)
+        expected_source = source_root_real / relative
+        if source_real != expected_source or _path_has_symlink_from(source, source_root):
+            return False
+        if _sha256_file(source) != source_digest:
+            return False
+        state = state_root()
+        archive_root = state / "dispatch-observation-archive"
+        root_digest = hashlib.sha256(os.fsencode(str(source_root_real))).hexdigest()
+        destination = archive_root / root_digest / relative / source_digest
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if state.is_symlink() or not state.is_dir():
+            return False
+        # Build private path components one at a time and never traverse an
+        # existing symlink or replace a corrupt content-addressed object.
+        parent = state
+        for component in destination.parent.relative_to(state).parts:
+            parent /= component
+            if parent.is_symlink():
+                return False
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                if parent.is_symlink() or not parent.is_dir():
+                    return False
+            if stat.S_IMODE(parent.lstat().st_mode) & 0o077:
+                return False
+        if _path_has_symlink_from(destination, state):
+            return False
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            if not _atomic_migrate_copy(source, destination, replace=False):
+                return False
+            info = destination.lstat()
+        if (not stat.S_ISREG(info.st_mode) or destination.is_symlink()
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            return False
+        return _sha256_file(destination) == source_digest
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _dispatch_file_matches(
+    source: Path,
+    destination: Path,
+    source_root: Path,
+    target_root: Path,
+    relative: Path,
+) -> bool:
+    """Verify carry-forward bytes, with one explicit observation exception."""
+    if (source.is_symlink() or destination.is_symlink()
+            or _path_has_symlink_from(source, source_root)
+            or _path_has_symlink_from(destination, target_root)):
+        return False
+    if not stat.S_ISREG(source.lstat().st_mode) or not stat.S_ISREG(destination.lstat().st_mode):
+        return False
+    source_digest = _sha256_file(source)
+    if source_digest == _sha256_file(destination):
+        return True
+    if _dispatch_observation_file(relative):
+        return _archive_dispatch_observation(
+            source_root, source, relative, source_digest
+        )
+    return _semantic_reanchor_equal(source, destination, source_root, target_root)
+
+
+def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
+    """M2 additive copy + the copy-side half of M3 verification.
+
+    Existing destinations are never clobbered. Ordinary collisions must be
+    byte-equal (or exact sidecar re-anchors); the classified observation
+    collision is archived before it can count as reconciled. New files use
+    the per-file atomic copy used by this migration path."""
+
+    if _dispatch_tree_has_unsafe_entries(source_root):
+        return False
     ok = True
     touched_dirs: set[Path] = set()
     for source in source_root.rglob("*"):
@@ -1917,6 +2244,23 @@ def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
             continue
         destination = target_root / relative
         if destination.exists():
+            if source.name.endswith(".attempt.json"):
+                if (_path_has_symlink_from(destination, target_root)
+                        or destination.is_symlink() or not destination.is_file()):
+                    ok = False
+                else:
+                    touched_dirs.add(destination.parent)
+            else:
+                try:
+                    if not _dispatch_file_matches(
+                        source, destination, source_root, target_root, relative
+                    ):
+                        ok = False
+                except OSError:
+                    ok = False
+            continue
+        if _path_has_symlink_from(destination, target_root):
+            ok = False
             continue
         if not _atomic_migrate_copy(source, destination):
             ok = False
@@ -1929,20 +2273,38 @@ def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
             continue
         destination = target_root / source.relative_to(source_root)
         if destination.exists():
-            touched_dirs.add(destination.parent)
+            if (_path_has_symlink_from(destination, target_root)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            else:
+                touched_dirs.add(destination.parent)
     for directory in touched_dirs:
         if not _reanchor_succeeded_attempt_links(directory, source_root, target_root):
+            ok = False
+    for source in source_root.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(source_root)
+        if relative.as_posix() in _REGISTRY_CARRY_NAMES or relative.as_posix() == MIGRATION_JOURNAL_FILENAME:
+            continue
+        try:
+            if not _dispatch_file_matches(
+                source, target_root / relative, source_root, target_root, relative
+            ):
+                ok = False
+        except OSError:
             ok = False
     return ok
 
 
 def _migration_verify(source_root: Path, target_root: Path) -> bool:
-    """M3: every source file (outside the registry-carry set) exists at its
-    destination -- a retry-safe re-check independent of what the copy pass's
-    own return value claimed (mirrors `_succeed_dispatch_state`'s review V-1
-    guard: a no-op retry pass must not read as success unless the files are
-    actually all there)."""
+    """M3: verify carried bytes and the one archived observation exception.
 
+    This retry-safe re-check is independent of what the copy pass returned;
+    a no-op retry cannot succeed unless every source file is reconciled."""
+
+    if _dispatch_tree_has_unsafe_entries(source_root):
+        return False
     for source in source_root.rglob("*"):
         if not source.is_file() or source.is_symlink():
             continue
@@ -1951,7 +2313,12 @@ def _migration_verify(source_root: Path, target_root: Path) -> bool:
             continue
         if relative.as_posix() == MIGRATION_JOURNAL_FILENAME:
             continue
-        if not (target_root / relative).is_file():
+        try:
+            if not _dispatch_file_matches(
+                source, target_root / relative, source_root, target_root, relative
+            ):
+                return False
+        except OSError:
             return False
     return True
 
@@ -2109,27 +2476,33 @@ def _migration_deletion_precondition(candidate: Path, environ: dict[str, str]) -
     legacy-bound writers are quiescent/reconciled -- the caller's
     `_succeed_dispatch_state(candidate)` carry-forward already did that sweep
     (M6) -- and (3) the final delta digest verifies clean here. Any
-    undecidable or failed state is a typed refusal
-    (`dispatch-state-migration-blocked-live-attempt`), never a
-    warn-and-continue; the retention floor in `_cleanup_releases` is a time
-    delay, not evidence, and plays no part in this decision."""
+    undecidable, unsafe, or unreconciled state is a typed refusal
+    (`dispatch-state-migration-blocked-live-attempt`). A regular-file digest
+    mismatch remains a distinct proof-gap result; the prune caller may proceed
+    only through the existing explicit forced-prune gap commit. The retention
+    floor in `_cleanup_releases` is a time delay, not evidence, and plays no
+    part in this decision."""
 
     if not _dispatch_migration_promoted(environ):
         return True, ""
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
         return True, ""
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        return False, "dispatch-state-migration-blocked-live-attempt:delta-unreadable"
     stable_root = stable_state_root(environ)
     for relative in _migration_relative_files(stale_dispatch):
         target = stable_root / relative
         if not target.is_file():
             return False, "dispatch-state-migration-blocked-live-attempt:delta-unreconciled"
         try:
-            if _sha256_file(stale_dispatch / relative) != _sha256_file(target):
-                if _semantic_reanchor_equal(
-                    stale_dispatch / relative, target, stale_dispatch, stable_root
-                ):
-                    continue
+            if not _dispatch_file_matches(
+                stale_dispatch / relative,
+                target,
+                stale_dispatch,
+                stable_root,
+                Path(relative),
+            ):
                 return False, "dispatch-state-migration-blocked-live-attempt:delta-digest-mismatch"
         except OSError:
             return False, "dispatch-state-migration-blocked-live-attempt:delta-unreadable"
@@ -2217,7 +2590,9 @@ def _surviving_dispatch_root(candidate: Path, environ: dict[str, str]) -> Path |
     return live_release / ".dispatch"
 
 
-def _succeed_dispatch_state(candidate: Path) -> bool:
+def _succeed_dispatch_state(
+    candidate: Path, *, return_detail: bool = False
+) -> bool | tuple[bool, bool]:
     """Carry a pruned release's `.dispatch` tree forward into the live
     release before the candidate is deleted.
 
@@ -2234,14 +2609,24 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
     merged row-wise with terminal precedence so a carried snapshot can
     never revert a live terminal row to open.
 
-    Returns False if any file failed to copy, so the caller can leave the
-    candidate release in place instead of rmtree-ing state that was never
-    fully carried forward (review Q-6/P-3).
+    The normal result stays a conservative boolean: any failed carry step or
+    regular-file content mismatch returns False. The prune boundary requests
+    `return_detail=True` to distinguish those cases as
+    `(carry_operations_succeeded, content_matches)`. Only the separate final
+    migration-delta check can authorize a mismatch, and only through its
+    existing explicit forced-prune gap record.
     """
+
+    def result(carry_ok: bool, content_matches: bool = True) -> bool | tuple[bool, bool]:
+        if return_detail:
+            return carry_ok, content_matches
+        return carry_ok and content_matches
 
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
-        return True
+        return result(True)
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        return result(False)
     live_dispatch = _surviving_dispatch_root(candidate, os.environ)
     if live_dispatch is None:
         # base parity (C47-9): when `candidate` is itself the current live
@@ -2253,20 +2638,48 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
         if not _dispatch_migration_promoted(os.environ):
             try:
                 if current_path().resolve(strict=True) == candidate:
-                    return True
+                    return result(True)
             except OSError:
                 pass
-        return False
+        return result(False)
     touched_dirs: set[Path] = set()
     ok = True
+    content_matches = True
     for source in stale_dispatch.rglob("*"):
         if not source.is_file():
             continue
         relative = source.relative_to(stale_dispatch)
         if relative.as_posix() in _REGISTRY_CARRY_NAMES:
             continue
+        if (source.is_symlink() or _path_has_symlink_from(source, stale_dispatch)
+                or not source.is_file()):
+            ok = False
+            continue
         destination = live_dispatch / relative
         if destination.exists():
+            if (_path_has_symlink_from(destination, live_dispatch)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            elif source.name.endswith(".attempt.json"):
+                touched_dirs.add(destination.parent)
+            else:
+                try:
+                    if not _dispatch_file_matches(
+                        source, destination, stale_dispatch, live_dispatch, relative
+                    ):
+                        # A failed observation archive is an actual carry
+                        # failure. Other regular-file mismatches are kept
+                        # separate for the final migration proof and its
+                        # existing explicit gap exception.
+                        if _dispatch_observation_file(relative):
+                            ok = False
+                        else:
+                            content_matches = False
+                except OSError:
+                    ok = False
+            continue
+        if _path_has_symlink_from(destination, live_dispatch):
+            ok = False
             continue
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2292,11 +2705,40 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
             continue
         destination = live_dispatch / source.relative_to(stale_dispatch)
         if destination.exists():
-            touched_dirs.add(destination.parent)
+            if (_path_has_symlink_from(destination, live_dispatch)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            else:
+                touched_dirs.add(destination.parent)
     for directory in touched_dirs:
         if not _reanchor_succeeded_attempt_links(directory, stale_dispatch, live_dispatch):
             ok = False
-    return ok
+    for source in stale_dispatch.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(stale_dispatch)
+        if relative.as_posix() in _REGISTRY_CARRY_NAMES:
+            continue
+        destination = live_dispatch / relative
+        if (source.is_symlink() or _path_has_symlink_from(source, stale_dispatch)
+                or not source.is_file()
+                or _path_has_symlink_from(destination, live_dispatch)
+                or destination.is_symlink() or not destination.is_file()):
+            ok = False
+            continue
+        try:
+            if not _dispatch_file_matches(
+                source, destination, stale_dispatch, live_dispatch, relative
+            ):
+                if _dispatch_observation_file(relative):
+                    ok = False
+                else:
+                    content_matches = False
+        except OSError:
+            ok = False
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        ok = False
+    return result(ok, content_matches)
 
 
 def _stable_registry_snapshot(environ: dict[str, str]) -> list[dict]:
@@ -2368,24 +2810,61 @@ def _stable_registry_snapshot(environ: dict[str, str]) -> list[dict]:
     return [entry for entry in by_attempt.values() if entry["status"] == "open"]
 
 
-def _release_reference_registries(candidate: Path) -> list[Path]:
+def _release_reference_registries(
+    candidate: Path, registry_paths: Iterable[Path] | None = None
+) -> list[Path]:
     """Registries that can name `candidate` as a launch home.
 
-    Two registries can hold an open row pointing at this release: the
-    release's own `.dispatch/jobs.log` (state-root chain (3) -- a session
-    that never had `AGENT_DISPATCH_JOBS` registers directly under whichever
-    release `current` pointed at when it ran), and the live release's
-    `.dispatch/jobs.log` (a row `_succeed_dispatch_state()` already carried
-    forward before this candidate is deleted).
+    Any installed release may still be the pinned `AGENT_DISPATCH_JOBS`
+    writer root while its open row's `launch_home` points elsewhere. Read all
+    extant release-local registries under the writer boundary, alongside the
+    stable registry snapshot, so launch-home and jobs-path identities are not
+    conflated.
     """
+    return (list(registry_paths) if registry_paths is not None
+            else _installed_legacy_registry_paths(candidate))
 
-    registries = [candidate / ".dispatch" / "jobs.log"]
-    try:
-        live_release = current_path().resolve(strict=True)
-    except OSError:
-        return registries
-    registries.append(live_release / ".dispatch" / "jobs.log")
-    return registries
+
+def _release_registry_snapshot(registry_paths: Iterable[Path]) -> list[dict]:
+    """Read and parse every relevant release registry once under admission locks."""
+    snapshot = []
+    for registry in registry_paths:
+        try:
+            registry_stat = registry.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            snapshot.append({"registry": registry, "error": "registry-unreadable"})
+            continue
+        if not stat.S_ISREG(registry_stat.st_mode):
+            snapshot.append({"registry": registry, "error": "registry-row-unparsable"})
+            continue
+        try:
+            text = registry.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            snapshot.append({"registry": registry, "error": "registry-unreadable"})
+            continue
+        rows = []
+        malformed = False
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) < 6:
+                malformed = True
+                break
+            launch_home = None
+            for item in fields[5].split(","):
+                if item.startswith("launch_home="):
+                    launch_home = item[len("launch_home="):]
+                    break
+            rows.append({"fields": fields, "launch_home": launch_home})
+        snapshot.append({
+            "registry": registry,
+            "error": "registry-row-unparsable" if malformed else "",
+            "rows": rows,
+        })
+    return snapshot
 
 
 # SD-115 axis 4 (b): every registry loop above resolves `launch_home` at
@@ -2403,6 +2882,10 @@ def _release_reference_registries(candidate: Path) -> list[Path]:
 # docstring).
 _ROUTE_SCAN_MAX_FILES = 20000  # measured 1909 route files across 10 artifact roots
 _ROUTE_RECORD_MAX_BYTES = 1_048_576  # same cap as claude-session-supervisor.py:107
+_ROUTE_CHAIN_MAX_FILES = 4096
+_ROUTE_CHAIN_MAX_BYTES = 1_048_576
+_ROUTE_CHAIN_MAX_TOTAL_BYTES = 16 * 1_048_576
+_ROUTE_CHAIN_HARNESSES = ("claude", "codex", "opencode")
 
 
 class _Undecidable:
@@ -2415,8 +2898,19 @@ class _Undecidable:
 _UNDECIDABLE = _Undecidable()
 
 
+def _watch_discovery_path(inventory: dict | None, path: Path, *, directory: bool = False) -> None:
+    if inventory is None:
+        return
+    path = Path(path)
+    key = "directories" if directory else "files"
+    inventory[key].add(path)
+    starts = inventory["start_directories" if directory else "start_files"]
+    if path not in starts:
+        starts[path] = _path_fingerprint(path)
+
+
 def _open_route_artifact_roots(
-    environ: dict[str, str],
+    environ: dict[str, str], inventory: dict | None = None,
 ) -> tuple[set[str], list[str], str]:
     """Union of every place an open route's artifact root or route file can
     be discovered from stable per-user state. Returns `(artifact_roots,
@@ -2455,6 +2949,9 @@ def _open_route_artifact_roots(
         return roots, route_files, ""
 
     jobs = state_root / "jobs.log"
+    _watch_discovery_path(inventory, jobs)
+    if inventory is not None:
+        inventory["registries"].add(jobs)
     if jobs.is_file():
         try:
             text = jobs.read_text(encoding="utf-8")
@@ -2473,12 +2970,14 @@ def _open_route_artifact_roots(
                     route_files.append(item[len("owner_route_file="):])
 
     bindings_dir = state_root / "owner-route-bindings"
+    _watch_discovery_path(inventory, bindings_dir, directory=True)
     if bindings_dir.is_dir():
         try:
             binding_files = list(bindings_dir.glob("*.json"))
         except OSError:
             return roots, route_files, f"route-discovery-unreliable:{bindings_dir}"
         for entry in binding_files:
+            _watch_discovery_path(inventory, entry)
             try:
                 payload = json.loads(entry.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -2570,7 +3069,10 @@ def _route_registry_index(text: str) -> dict:
     return index
 
 
-def _read_route_registry_index(jobs_path: str, cache: dict):
+def _read_route_registry_index(
+    jobs_path: str, cache: dict, watched_paths: set[Path] | None = None,
+    inventory: dict | None = None,
+):
     """Cached `_route_registry_index` for one registry path, or `None`.
 
     Keyed on `realpath` so two spellings of one file are one read and therefore
@@ -2586,6 +3088,9 @@ def _read_route_registry_index(jobs_path: str, cache: dict):
         key = os.path.realpath(jobs_path)
     except OSError:
         key = jobs_path
+    if watched_paths is not None:
+        watched_paths.add(Path(jobs_path))
+    _watch_discovery_path(inventory, Path(jobs_path))
     if key not in cache:
         try:
             cache[key] = _route_registry_index(
@@ -2596,7 +3101,11 @@ def _read_route_registry_index(jobs_path: str, cache: dict):
     return cache[key]
 
 
-def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dict):
+def _route_attempts_finished(
+    route_id: str, raw: dict, cache: dict, environ: dict,
+    watched_paths: set[Path] | None = None,
+    inventory: dict | None = None,
+):
     """Is every registry attempt of this route terminal? `None` = cannot tell.
 
     P2, mirroring the registry reference source. A release is pinned by a route
@@ -2621,9 +3130,10 @@ def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dic
     conservative, never release something the sealed registry would have held.
 
     `None` -- no sealed jobs path, unreadable, a malformed row, or **no rows at
-    all** -- keeps the release pinned. Absence of evidence is the one direction
-    that deletes data: a route compiled but not yet launched has no rows, and so
-    does a route whose rows were pruned out from under it.
+    all** -- is not completion evidence. The caller has one separate narrow
+    no-row path for the current direct-inline shape; it also checks all known
+    registries, the session route-chain ledger, and inline-finish state. Every
+    other no-row shape remains pinned.
     """
 
     body_id = raw.get("route_id")
@@ -2636,18 +3146,254 @@ def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dic
     jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
     if not isinstance(jobs_path, str) or not jobs_path:
         return None
-    index = _read_route_registry_index(jobs_path, cache)
+    index = _read_route_registry_index(jobs_path, cache, watched_paths, inventory)
     if index is None or index["malformed"]:
         return None
     # Veto pass: any other registry that still shows this route live keeps the
     # pin, even though only the sealed one may declare it finished.
     for other in _veto_registry_paths(environ):
-        veto = _read_route_registry_index(other, cache)
+        veto = _read_route_registry_index(other, cache, watched_paths, inventory)
         if veto is not None and not veto["malformed"] and route_id in veto["live"] | veto["paused"]:
             return False
     if route_id in index["live"] | index["paused"]:
         return False
     return True if route_id in index["seen"] else None
+
+
+def _historical_inline_route_shape(route_id: str, raw: dict) -> bool:
+    """Whether this is the one supported no-attempt route shape.
+
+    A missing registry row is ambiguous for every staged or older route. The
+    only shape eligible for a separate no-row check is the current schema's
+    direct one-shot owner: one depth-zero inline terminal node with no worker
+    owner. Its route-chain and finish continuation evidence are checked
+    separately. Keep this mirror exact; a new route shape stays protected until
+    its continuation semantics are represented here.
+    """
+
+    nodes = raw.get("nodes")
+    if not (
+        raw.get("schema_version") == 2
+        and raw.get("route_id") == route_id
+        and raw.get("effective_intensity") == "direct"
+        and raw.get("execution_topology") == "inline"
+        and raw.get("owner_dispatch_depth") == 0
+        and raw.get("max_dispatch_depth") == 0
+        and isinstance(nodes, list)
+        and len(nodes) == 1
+    ):
+        return False
+    node = nodes[0]
+    return bool(
+        isinstance(node, dict)
+        and node.get("id") == "inline"
+        and node.get("kind") == "capability-owner"
+        and node.get("dispatch_depth") == 0
+        and node.get("execution_surface") == "inline"
+        and node.get("registered_worker") is False
+        and node.get("terminal") is True
+        and node.get("completion_gate") == "inline-complete"
+        and node.get("terminal_gate") == "inline-complete"
+    )
+
+
+def _inline_finish_absent(
+    route_file: Path, route_id: str, inventory: dict | None = None,
+) -> bool:
+    """Prove no inline finish slot exists, watching its publication path.
+
+    Any existing slot, including a finished or malformed one, is conservative:
+    without the route's close outcome it may represent a continuation or an
+    interrupted finish transaction. Directory fingerprints catch creation of
+    the slot after discovery.
+    """
+
+    runtime_dir = route_file.parent.parent
+    finish_root = runtime_dir / "inline-finish" / "v1"
+    route_dir = finish_root / route_id
+    finish_file = route_dir / "finish.json"
+    for directory in (runtime_dir, finish_root, route_dir):
+        _watch_discovery_path(inventory, directory, directory=True)
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+    _watch_discovery_path(inventory, finish_file)
+    try:
+        finish_file.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _route_chain_absent(
+    route_id: str, environ: dict[str, str], inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
+) -> bool:
+    """Prove no session route-chain entry can resume this open route.
+
+    Depth-zero compose/start writes an existing per-session route-chain ledger,
+    even when a direct inline route has no dispatch attempt row. Any matching
+    entry therefore keeps the sealed launch home. This reader mirrors only the
+    ledger's stable envelope and remains stdlib-only for the embedded installer.
+    """
+
+    try:
+        explicit = environ.get("FLEET_ROUTE_CHAIN_DIR")
+        if explicit:
+            root = Path(os.path.abspath(os.path.expanduser(explicit)))
+        else:
+            state_home = environ.get("XDG_STATE_HOME")
+            if state_home:
+                root = _env_absolute(state_home, "XDG_STATE_HOME") / "agent-fleet" / "route-chains"
+            else:
+                home = environ.get("HOME")
+                if not home:
+                    return False
+                root = _env_absolute(home, "HOME") / ".local" / "state" / "agent-fleet" / "route-chains"
+    except (DistributionError, OSError, ValueError):
+        return False
+    cache_key = os.path.normcase(os.path.abspath(os.fspath(root)))
+    if route_chain_cache is not None and cache_key in route_chain_cache:
+        route_ids = route_chain_cache[cache_key]
+        return route_ids is not None and route_id not in route_ids
+    _watch_discovery_path(inventory, root, directory=True)
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        if route_chain_cache is not None:
+            route_chain_cache[cache_key] = set()
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(root_info.st_mode):
+        return False
+
+    try:
+        with os.scandir(root) as stream:
+            root_entries = list(stream)
+    except OSError:
+        return False
+    for entry in root_entries:
+        try:
+            unexpected_directory = entry.is_dir(follow_symlinks=False) or entry.is_symlink()
+        except OSError:
+            return False
+        if entry.name not in _ROUTE_CHAIN_HARNESSES and unexpected_directory:
+            return False
+
+    scanned = 0
+    scanned_bytes = 0
+    route_ids: set[str] = set()
+    for harness in _ROUTE_CHAIN_HARNESSES:
+        directory = root / harness
+        _watch_discovery_path(inventory, directory, directory=True)
+        try:
+            directory_info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if not stat.S_ISDIR(directory_info.st_mode):
+            return False
+        try:
+            with os.scandir(directory) as stream:
+                entries = [entry for entry in stream if entry.name.endswith(".jsonl")]
+        except OSError:
+            return False
+        for entry in entries:
+            scanned += 1
+            if scanned > _ROUTE_CHAIN_MAX_FILES or entry.is_symlink():
+                return False
+            path = Path(entry.path)
+            _watch_discovery_path(inventory, path)
+            try:
+                before = path.lstat()
+                if not stat.S_ISREG(before.st_mode) or before.st_size > _ROUTE_CHAIN_MAX_BYTES:
+                    return False
+                with path.open("rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        return False
+                    payload = source.read(_ROUTE_CHAIN_MAX_BYTES + 1)
+                if len(payload) > _ROUTE_CHAIN_MAX_BYTES:
+                    return False
+                payload.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+            scanned_bytes += len(payload)
+            if scanned_bytes > _ROUTE_CHAIN_MAX_TOTAL_BYTES:
+                return False
+            for line in payload.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return False
+                if not isinstance(row, dict):
+                    return False
+                value = row.get("route_id")
+                if isinstance(value, str) and value:
+                    route_ids.add(value)
+    if route_chain_cache is not None:
+        route_chain_cache[cache_key] = route_ids
+    return route_id not in route_ids
+
+
+def _historical_inline_route_unused(
+    path: Path, route_id: str, raw: dict, cache: dict, environ: dict,
+    watched_paths: set[Path] | None = None,
+    inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
+) -> bool:
+    """Is an exact direct route merely historical, with no continuation evidence?"""
+
+    if not _historical_inline_route_shape(route_id, raw):
+        return False
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = tuple_.get("jobs_path") if isinstance(tuple_, dict) else None
+    jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
+    if (
+        not isinstance(tuple_, dict)
+        or tuple_.get("contract_version") != 1
+        or not isinstance(jobs, dict)
+        or jobs.get("kind") != "jobs_path"
+        or not isinstance(jobs_path, str)
+        or not os.path.isabs(jobs_path)
+    ):
+        return False
+    sealed = _read_route_registry_index(jobs_path, cache, watched_paths, inventory)
+    if sealed is None or sealed["malformed"] or route_id in sealed["seen"]:
+        return False
+
+    # A different registry cannot certify completion, but any related row or
+    # unreadable registry can still be evidence of a lost owner binding.
+    veto_paths = _veto_registry_paths(environ)
+    if not veto_paths:
+        return False
+    seen_paths: set[str] = set()
+    for registry in veto_paths:
+        try:
+            identity = os.path.realpath(registry)
+        except OSError:
+            identity = registry
+        if identity in seen_paths:
+            continue
+        seen_paths.add(identity)
+        index = _read_route_registry_index(registry, cache, watched_paths, inventory)
+        if index is None or index["malformed"] or route_id in index["seen"]:
+            return False
+
+    if not _route_chain_absent(route_id, environ, inventory, route_chain_cache):
+        return False
+    return _inline_finish_absent(path, route_id, inventory)
 
 
 def _veto_registry_paths(environ: dict) -> list[str]:
@@ -2665,7 +3411,10 @@ def _veto_registry_paths(environ: dict) -> list[str]:
 
 
 def _route_record_launch_home(
-    path: Path, registry_cache: dict | None = None, environ: dict | None = None
+    path: Path, registry_cache: dict | None = None, environ: dict | None = None,
+    watched_paths: set[Path] | None = None,
+    inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
 ):
     """`launch_compatibility_tuple.launch_home.path` from one route record.
 
@@ -2679,9 +3428,10 @@ def _route_record_launch_home(
 
     Also `None` when the route is unclosed but every one of its registry
     attempts is terminal and its current owner has no readable result or launched
-    runtime continuation awaiting correction (`_route_attempts_finished`).
-    "Unclosed" and "still working" are not the same thing, and a route that died
-    at launch is never closed by anyone.
+    runtime continuation awaiting correction (`_route_attempts_finished`), or
+    when the exact direct-inline no-row shape has no route-chain or pending
+    finish continuation. "Unclosed" and "still working" are not the same thing,
+    and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the
@@ -2693,6 +3443,8 @@ def _route_record_launch_home(
     """
 
     outcome = path.with_name(path.stem + ".outcome.json")
+    _watch_discovery_path(inventory, path)
+    _watch_discovery_path(inventory, outcome)
     if outcome.exists():
         return None
     try:
@@ -2710,11 +3462,23 @@ def _route_record_launch_home(
     # Checked only after the record parses and names a launch_home: an
     # undecidable record must stay undecidable, never be released by a
     # terminality answer derived from a body we could not trust.
-    if _route_attempts_finished(
+    attempts_finished = _route_attempts_finished(
         path.stem, raw,
         registry_cache if registry_cache is not None else {},
         environ if environ is not None else os.environ,
-    ) is True:
+        watched_paths,
+        inventory,
+    )
+    if attempts_finished is True:
+        return None
+    if attempts_finished is None and _historical_inline_route_unused(
+        path, path.stem, raw,
+        registry_cache if registry_cache is not None else {},
+        environ if environ is not None else os.environ,
+        watched_paths,
+        inventory,
+        route_chain_cache,
+    ):
         return None
     return value
 
@@ -2764,7 +3528,10 @@ def _unrecognised_open_route_record(path: Path, listed_names: set[str] | None = 
     return "nodes" in record or "launch_compatibility_tuple" in record
 
 
-def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, str]], str]:
+def _open_route_launch_homes(
+    environ: dict[str, str], *, inventory: dict | None = None,
+    registry_cache: dict | None = None, watch_paths: Iterable[Path] = (),
+) -> tuple[list[tuple[str, str]], str]:
     """`([(route_id, launch_home_path), ...], unreliable_reason)`.
 
     An empty `unreliable_reason` means the scan is trustworthy (possibly
@@ -2789,7 +3556,17 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
     by itself (review requirement: explicit non-directory/absent handling).
     """
 
-    roots, explicit_route_files, bindings_unreliable = _open_route_artifact_roots(environ)
+    if inventory is not None:
+        inventory.clear()
+        inventory.update({
+            "files": set(), "directories": set(), "registries": set(),
+            "start_files": {}, "start_directories": {},
+        })
+        for path in watch_paths:
+            _watch_discovery_path(inventory, Path(path))
+    roots, explicit_route_files, bindings_unreliable = _open_route_artifact_roots(
+        environ, inventory
+    )
     if bindings_unreliable:
         return [], bindings_unreliable
     candidates: dict[str, tuple[Path, bool | None]] = {}
@@ -2800,6 +3577,7 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
     scanned = 0
     for root in roots:
         routes_dir = Path(root) / ".runtime" / "routes"
+        _watch_discovery_path(inventory, routes_dir, directory=True)
         if not routes_dir.is_dir():
             continue
         try:
@@ -2843,26 +3621,115 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
             # resolving every route through NFS; an alias may be read twice,
             # but duplicates cannot remove a release-retention reference.
             candidates[os.path.abspath(entry)] = (entry, is_file)
+            _watch_discovery_path(inventory, entry)
     for route_file in explicit_route_files:
         scanned += 1
         if scanned > _ROUTE_SCAN_MAX_FILES:
             return [], "route-discovery-unreliable:scan-cap"
         path = Path(route_file)
         candidates.setdefault(os.path.abspath(path), (path, None))
+        _watch_discovery_path(inventory, path)
+        _watch_discovery_path(inventory, path.parent, directory=True)
 
     results: list[tuple[str, str]] = []
-    registry_cache: dict = {}
+    registry_cache = registry_cache if registry_cache is not None else {}
+    route_chain_cache: dict = {}
     environ = environ or {}
     for path, scanned_file in candidates.values():
         if scanned_file is False or (scanned_file is None and not path.is_file()):
             continue
-        launch_home = _route_record_launch_home(path, registry_cache, environ)
+        launch_home = _route_record_launch_home(
+            path, registry_cache, environ,
+            inventory["registries"] if inventory is not None else None,
+            inventory,
+            route_chain_cache,
+        )
         if launch_home is None:
             continue
         if launch_home is _UNDECIDABLE:
             return [], f"route-record-unparsable:{path}"
         results.append((path.stem, launch_home))
+    if inventory is not None:
+        for collection in ("start_files", "start_directories"):
+            if any(_path_fingerprint(path) != fingerprint
+                   for path, fingerprint in inventory[collection].items()):
+                inventory["unstable"] = True
+        inventory["fingerprints"] = _snapshot_discovery_inputs(inventory, ())
     return results, ""
+
+
+def _path_fingerprint(path: Path) -> tuple | None:
+    """Fingerprint both a path entry and its target for ephemeral refresh."""
+    try:
+        link_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return ("unreadable", exc.errno)
+    link = (link_stat.st_dev, link_stat.st_ino, link_stat.st_mode,
+            link_stat.st_size, link_stat.st_mtime_ns, link_stat.st_ctime_ns)
+    try:
+        target_stat = path.stat()
+    except FileNotFoundError:
+        return (link, None)
+    except OSError as exc:
+        return (link, "unreadable", exc.errno)
+    target = (target_stat.st_dev, target_stat.st_ino, target_stat.st_mode,
+              target_stat.st_size, target_stat.st_mtime_ns, target_stat.st_ctime_ns)
+    return (link, target)
+
+
+def _snapshot_discovery_inputs(inventory: dict, registry_paths: Iterable[Path]) -> dict:
+    paths = set(inventory.get("files", ()))
+    route_registries = set(inventory.get("registries", ()))
+    admission_registries = {Path(path) for path in registry_paths}
+    paths.update(route_registries)
+    paths.update(admission_registries)
+    directories = set(inventory.get("directories", ()))
+    return {
+        "files": {Path(path): _path_fingerprint(Path(path)) for path in paths},
+        "route_registries": {
+            Path(path): _path_fingerprint(Path(path)) for path in route_registries
+        },
+        "admission_registries": {
+            Path(path): _path_fingerprint(Path(path)) for path in admission_registries
+        },
+        "directories": {
+            Path(path): _path_fingerprint(Path(path)) for path in directories
+        },
+        "unstable": bool(inventory.get("unstable")),
+    }
+
+
+def _discovery_inputs_changed(snapshot: dict) -> bool:
+    return bool(snapshot.get("unstable")) or any(
+        _path_fingerprint(path) != fingerprint
+        for collection in (snapshot.get("files", {}), snapshot.get("directories", {}))
+        for path, fingerprint in collection.items()
+    )
+
+
+def _discovery_generation_changed(snapshot: dict) -> bool:
+    """Check cheap publication generations between full global discoveries.
+
+    Route records are immutable write-once files; outcomes and owner bindings
+    publish by atomic rename. Their containing directory generations detect
+    creation, replacement, and removal without statting every route file under
+    each admission hold. Registry files are checked individually because
+    accepted writers may append in place while holding their existing jobs
+    lock. Those locks are held during the final generation check.
+    """
+    if snapshot.get("unstable"):
+        return True
+    return any(
+        _path_fingerprint(path) != fingerprint
+        for collection in (
+            snapshot.get("directories", {}),
+            snapshot.get("route_registries", {}),
+            snapshot.get("admission_registries", {}),
+        )
+        for path, fingerprint in collection.items()
+    )
 
 
 def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
@@ -2898,6 +3765,7 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
         return True, "proc-unreadable"
     uid = os.getuid()
     opaque = 0
+    owned_fds = _registry_lock_owned_fds()
     for entry in entries:
         try:
             if entry.stat().st_uid != uid:
@@ -2940,6 +3808,20 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
             except OSError:
                 continue
             readable = True
+            if entry.name == str(os.getpid()) and link.parent == entry / "fd":
+                try:
+                    fd_number = int(link.name)
+                    descriptor_stat = link.stat()
+                except (OSError, ValueError):
+                    fd_number = -1
+                    descriptor_stat = None
+                exact = owned_fds.get(fd_number)
+                if (exact is not None and descriptor_stat is not None
+                        and (descriptor_stat.st_dev, descriptor_stat.st_ino) == exact):
+                    # Exclude only this thread's exact boundary-owned fd in
+                    # this process. A second open of the same lock inode has
+                    # another descriptor number and remains genuine use.
+                    continue
             if value == real or value.startswith(prefix):
                 return True, f"live-process:{entry.name}"
             if (link.parent == entry / "fd" and Path(value).parent == candidate.parent.resolve()
@@ -2973,17 +3855,16 @@ def _release_in_use(
     candidate: Path,
     stable_snapshot: list[dict],
     route_snapshot: tuple[list[tuple[str, str]], str] | None = None,
+    registry_snapshot: list[dict] | None = None,
 ) -> tuple[bool, str]:
     """Return (in_use, reason). Undecidable evidence returns (True, ...).
 
     `stable_snapshot` is `_stable_registry_snapshot()`'s pre-parsed result --
-    the third reference-registry source (decision 2): the stable per-user
-    registry's `launch_home`-bearing open rows. `launch_home`, `commonpath`,
-    and the two-registry `is_live_registry` branch below are byte-for-byte
-    unchanged; the stable source is purely additive and evaluated after them.
-    A stable-registry open row with no `launch_home` is never candidate-local
-    authority on its own (unlike a candidate-local legacy row) -- it is not
-    scoped to any one release.
+    the stable per-user registry's `launch_home`-bearing open rows. Release-
+    local references are read from every installed legacy registry by
+    `_release_reference_registries()`, so a pinned jobs path remains visible
+    even when its row's `launch_home` names another release. A stable-registry
+    open row with no `launch_home` is not candidate-local authority on its own.
 
     `route_snapshot` is `_open_route_launch_homes()`'s pre-parsed result
     (SD-115 axis 4 (b)) -- the fourth reference source, evaluated last and
@@ -2993,8 +3874,9 @@ def _release_in_use(
     (SD-115 axis 4 (a)) that a plain judgment-time `realpath()` on the
     registry row would otherwise re-resolve to whatever is current now.
     `route_snapshot=None` keeps the existing direct-call/test surface
-    working unchanged; the production caller, `_cleanup_releases`, always
-    passes a real snapshot computed once outside the per-candidate loop.
+    working unchanged. Production pruning takes a fresh route snapshot after
+    acquiring the writer boundary; the earlier snapshot in `_cleanup_releases`
+    is used only by the bounded orphan-cache pass.
     """
 
     try:
@@ -3002,28 +3884,21 @@ def _release_in_use(
     except OSError:
         candidate_real = str(candidate)
 
-    for registry in _release_reference_registries(candidate):
+    references = (registry_snapshot if registry_snapshot is not None
+                  else _release_registry_snapshot(
+                      _release_reference_registries(candidate)
+                  ))
+    for reference in references:
+        registry = reference["registry"]
         is_live_registry = registry.parent.parent != candidate
-        if not registry.is_file():
-            continue
-        try:
-            text = registry.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            return True, f"registry-unreadable:{registry}"
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            if len(fields) < 6:
-                return True, f"registry-row-unparsable:{registry}"
+        if reference.get("error"):
+            return True, f"{reference['error']}:{registry}"
+        for row in reference.get("rows", []):
+            fields = row["fields"]
             if fields[1] != "open":
                 continue
+            launch_home = row["launch_home"]
             pipe = fields[5]
-            launch_home = None
-            for item in pipe.split(","):
-                if item.startswith("launch_home="):
-                    launch_home = item[len("launch_home="):]
-                    break
             if launch_home is not None:
                 try:
                     home_real = os.path.realpath(launch_home)
@@ -3124,44 +3999,101 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
     ).hexdigest()
     inventory_root = state_root / "inventory"
     lock_path = inventory_root / "gaps.lock"
-    inventory_root.mkdir(parents=True, exist_ok=True)
-    with open(str(lock_path), "a+b") as handle:
-        try:
-            import fcntl
+    created_directories = []
+    ancestor = inventory_root
+    while not ancestor.exists():
+        created_directories.append(ancestor)
+        ancestor = ancestor.parent
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except ImportError:
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    def _sync_directory(path: Path) -> None:
+        directory_fd = os.open(str(path), os.O_RDONLY)
         try:
-            row = {
-                "schema_version": 1,
-                "gap_id": _gap_id(from_ts, to_ts, evidence_digest),
-                "from_ts": from_ts,
-                "to_ts": to_ts,
-                "evidence_digest": evidence_digest,
-                "cited_ledger_snapshot_digest": evidence_digest,
-                "recoverable": False,
-                "discovered_by": "forced-prune",
-                "recorded_at": _utc_now(),
-            }
-            row["event_id"] = _gap_event_id(row)
-            try:
-                fd = os.open(str(inventory_root / "gaps.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-                try:
-                    os.write(fd, (_canonical_json(row) + "\n").encode("utf-8"))
-                finally:
-                    os.close(fd)
-            except OSError:
-                return False
-            return True
+            os.fsync(directory_fd)
         finally:
+            os.close(directory_fd)
+
+    try:
+        inventory_root.mkdir(parents=True, exist_ok=True)
+        with open(str(lock_path), "a+b") as handle:
             try:
-                if "fcntl" in sys.modules:
-                    sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
-            except OSError:
-                pass
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                row = {
+                    "schema_version": 1,
+                    "gap_id": _gap_id(from_ts, to_ts, evidence_digest),
+                    "from_ts": from_ts,
+                    "to_ts": to_ts,
+                    "evidence_digest": evidence_digest,
+                    "cited_ledger_snapshot_digest": evidence_digest,
+                    "recoverable": False,
+                    "discovered_by": "forced-prune",
+                    "recorded_at": _utc_now(),
+                }
+                row["event_id"] = _gap_event_id(row)
+                gap_path = inventory_root / "gaps.jsonl"
+                payload = (_canonical_json(row) + "\n").encode("utf-8")
+                sync_directories = [inventory_root]
+                for path in (*created_directories, ancestor, state_root):
+                    if path not in sync_directories:
+                        sync_directories.append(path)
+
+                fd = os.open(
+                    str(gap_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600
+                )
+                original_size = os.fstat(fd).st_size
+                try:
+                    append_payload = payload
+                    if original_size:
+                        if os.lseek(fd, original_size - 1, os.SEEK_SET) != original_size - 1:
+                            raise OSError("forced-prune gap tail position changed")
+                        tail = os.read(fd, 1)
+                        if len(tail) != 1:
+                            raise OSError("forced-prune gap tail could not be read")
+                        if tail != b"\n":
+                            # Keep any interrupted prior bytes verbatim, but
+                            # isolate them from this canonical JSONL row.
+                            append_payload = b"\n" + payload
+                    offset = 0
+                    while offset < len(append_payload):
+                        try:
+                            written = os.write(fd, append_payload[offset:])
+                        except InterruptedError:
+                            continue
+                        if written <= 0:
+                            raise OSError("forced-prune gap append made no progress")
+                        offset += written
+                    os.fsync(fd)
+                    for directory in sync_directories:
+                        _sync_directory(directory)
+                except OSError:
+                    # The gap lock serializes this append with the runtime writer.
+                    # Restore only this attempt's suffix so a normal retry can
+                    # append a fresh complete JSONL row without losing prior rows.
+                    try:
+                        os.ftruncate(fd, original_size)
+                        os.fsync(fd)
+                        for directory in sync_directories:
+                            _sync_directory(directory)
+                    except OSError:
+                        pass
+                    os.close(fd)
+                    return False
+                os.close(fd)
+                return True
+            finally:
+                try:
+                    if "fcntl" in sys.modules:
+                        sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        return False
 
 
 def _release_keep_message(candidate: Path, why: str) -> str:
@@ -3177,106 +4109,552 @@ def _release_keep_message(candidate: Path, why: str) -> str:
         return (f"harness release: {candidate} is still referenced by a live dispatch attempt ({why}); "
                 "keeping it instead of deleting it")
     if kind == "open-route":
-        return (f"harness release: {candidate} is named by a route record that has no closing outcome "
-                f"({why}); no attempt row proves anything runs from it, but an unclosed route may still "
-                "resume there, so it is kept. Close the route once its work is settled "
-                "(capability-route.py close --route <route-file> --summary ...) and the next update prunes it")
+        return (f"harness release: {candidate} is still named by an unresolved route reference "
+                f"({why}); current evidence does not establish that execution or continuation no "
+                "longer needs it, so it is kept")
     return (f"harness release: {candidate} cannot be proved unused ({why}); keeping it instead of "
             "deleting it")
 
 
-# destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root
+# destructive-ok: reason=remove only retention-proved version directories; boundary=canonical release child while stable and legacy admission locks remain held
+def _prune_release_under_writer_boundary(
+    candidate: Path, *, force_prune_unproven: bool = False,
+    writer_boundary_held: bool = False,
+    stable_snapshot: list[dict] | None = None,
+    route_snapshot: tuple[list[tuple[str, str]], str] | None = None,
+    registry_snapshot: list[dict] | None = None,
+    discovery_inputs: dict | None = None,
+) -> tuple[bool, str]:
+    """Carry, refresh deletion evidence, verify, and remove under admission locks.
+
+    `_distribution_lock()` serializes installer operations, while the stable
+    and release-local `<jobs>.lock` files serialize normal dispatch admission.
+    The process and reference scans are repeated after acquiring those locks:
+    an already-admitted legacy writer may write non-registry files without
+    holding the jobs lock, so its pinned environment / argv / cwd / executable
+    / descriptors and its fresh registry or route evidence must also be clear.
+    """
+    environ = os.environ
+    if not writer_boundary_held:
+        try:
+            legacy_paths = _installed_legacy_registry_paths(None)
+            route_inventory: dict = {}
+            stable_jobs = stable_state_root(environ) / "jobs.log"
+            watch_paths = [*legacy_paths, stable_jobs]
+            if environ.get("AGENT_DISPATCH_JOBS"):
+                watch_paths.append(Path(environ["AGENT_DISPATCH_JOBS"]))
+            fresh_routes = _open_route_launch_homes(
+                environ, inventory=route_inventory, watch_paths=watch_paths
+            )
+            route_inventory["registries"].add(stable_jobs)
+            discovery_inputs = _snapshot_discovery_inputs(
+                route_inventory, [*legacy_paths, stable_jobs]
+            )
+            fresh_stable = _stable_registry_snapshot(environ)
+            fresh_registries = _release_registry_snapshot(legacy_paths)
+            if (_discovery_inputs_changed(discovery_inputs)
+                    or route_inventory.get("unstable")):
+                return False, "route-discovery-inputs-changed"
+            paths = _dispatch_cleanup_boundary_paths(
+                environ, route_inventory.get("registries", ()), legacy_paths
+            )
+            with _dispatch_writer_boundary(None, environ, jobs_paths=paths):
+                if _discovery_generation_changed(discovery_inputs):
+                    return False, "route-discovery-inputs-changed"
+                return _prune_release_under_writer_boundary(
+                    candidate,
+                    force_prune_unproven=force_prune_unproven,
+                    writer_boundary_held=True,
+                    stable_snapshot=fresh_stable,
+                    route_snapshot=fresh_routes,
+                    registry_snapshot=fresh_registries,
+                    discovery_inputs=discovery_inputs,
+                )
+        except (OSError, DistributionError) as exc:
+            return False, f"dispatch-writer-boundary-unavailable:{exc}"
+
+    try:
+        in_use, why = _release_in_use(
+            candidate, stable_snapshot or [], route_snapshot, registry_snapshot
+        )
+        if in_use:
+            return False, why
+        held, why = _release_held_by_live_process(candidate)
+        if held:
+            return False, why
+        if _release_projection_referenced(candidate):
+            return False, "runtime-activation-reference"
+
+        # Merge helpers take `_registry_lock()` internally. Its same-thread
+        # reentrancy reuses this boundary's exact descriptors; every other
+        # normal admission waits on the underlying flock.
+        carry_result = _succeed_dispatch_state(candidate, return_detail=True)
+        if isinstance(carry_result, tuple) and len(carry_result) == 2:
+            carry_ok, content_matches = carry_result
+        else:
+            # Keep test seams and compatible wrappers that return the normal
+            # boolean conservative result working as before.
+            carry_ok, content_matches = bool(carry_result), True
+        if not carry_ok:
+            return False, "dispatch-state-carry-forward-incomplete"
+        if not content_matches and not force_prune_unproven:
+            return False, "dispatch-state-carry-forward-incomplete"
+
+        # SD-112 source quiescence and final delta stay inside this same writer
+        # boundary. Only the exact regular-file digest proof gap can use the
+        # existing forced-prune record; unsafe, missing, unreadable, copy,
+        # registry, and re-anchor failures have already refused above or
+        # remain typed refusals here.
+        migration_ok, migration_reason = _migration_deletion_precondition(candidate, environ)
+        unproven_reasons = []
+        if not migration_ok:
+            if (not force_prune_unproven
+                    or migration_reason
+                    != "dispatch-state-migration-blocked-live-attempt:delta-digest-mismatch"):
+                return False, migration_reason
+            unproven_reasons.append(migration_reason)
+        elif not content_matches:
+            # A mismatch outside the promoted migration delta proof is not
+            # force-overridable, even when another retention proof is missing.
+            return False, "dispatch-state-carry-forward-incomplete"
+
+        containment_ok, containment_reason = _retention_containment_precondition(
+            candidate, environ
+        )
+        if not containment_ok:
+            if (not force_prune_unproven
+                    or not containment_reason.startswith(
+                        "dispatch-registry-retention-unproven:missing:"
+                    )):
+                return False, containment_reason
+            unproven_reasons.append(containment_reason)
+
+        for reason in unproven_reasons:
+            if not _commit_forced_prune_gap_record(candidate, environ, reason):
+                return False, "dispatch-registry-gap-record-commit-failed"
+
+        # A route or reference may be published while the candidate's source
+        # state is being carried and verified. Recheck only publication
+        # generations and known registry files here; full route parsing and
+        # refresh happen after this admission epoch is released.
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            return False, "route-discovery-inputs-changed"
+
+        try:
+            shutil.rmtree(candidate)
+        except OSError as exc:
+            return False, f"release-removal-failed:{exc}"
+        if candidate.exists() or candidate.is_symlink():
+            return False, "release-remains-after-prune"
+        return True, ""
+    except (OSError, DistributionError) as exc:
+        return False, f"dispatch-writer-boundary-unavailable:{exc}"
+
+
+def _release_pycache_base() -> Path | None:
+    """Return the default PYTHONPYCACHEPREFIX subtree for managed releases."""
+    try:
+        releases = Path(os.path.abspath(data_root() / "releases"))
+        state = state_root()
+        if not releases.is_absolute() or not state.is_absolute():
+            return None
+        return (state / "pycache").joinpath(*releases.parts[1:])
+    except (OSError, DistributionError, ValueError):
+        return None
+
+
+def _release_pycache_path(release: Path) -> Path | None:
+    releases = Path(os.path.abspath(data_root() / "releases"))
+    candidate = Path(os.path.abspath(release))
+    if (candidate.parent != releases or candidate.name in {"", ".", ".."}
+            or releases.is_symlink()):
+        return None
+    base = _release_pycache_base()
+    return base / candidate.name if base is not None else None
+
+
+def _safe_pycache_path(path: Path) -> bool:
+    state = state_root()
+    return not state.is_symlink() and not _path_has_symlink_from(path, state)
+
+
+# destructive-ok: reason=remove only bytecode derived from one release that was actually pruned; boundary=canonical release-specific subtree under state_root/pycache
+def _remove_release_pycache(release: Path) -> bool:
+    cache = _release_pycache_path(release)
+    if cache is None or not _safe_pycache_path(cache):
+        return False
+    if cache.is_symlink():
+        return False
+    if not cache.exists():
+        return True
+    if not cache.is_dir():
+        return False
+    try:
+        shutil.rmtree(cache)
+    except OSError:
+        return False
+    return not cache.exists() and not cache.is_symlink()
+
+
+def _cleanup_orphan_release_pycache(
+    releases: Path,
+    keep: set[Path],
+    stable_snapshot: list[dict],
+    route_snapshot: tuple[list[tuple[str, str]], str],
+    skip_names: set[str] | None = None,
+    registry_snapshot: list[dict] | None = None,
+    discovery_inputs: dict | None = None,
+) -> None:
+    """Retry release-specific cache cleanup without scanning outside its exact prefix."""
+    base = _release_pycache_base()
+    if (base is None or not _safe_pycache_path(base) or base.is_symlink()
+            or not base.is_dir()):
+        return
+    # A non-symlink current entry is malformed/unknown. Do not infer that any
+    # missing release is unused while the active pointer cannot be resolved.
+    current = current_path()
+    if current.exists() and not current.is_symlink():
+        print(
+            f"harness release: current pointer {current} is not a symlink; "
+            "keeping orphan release caches",
+            file=sys.stderr,
+        )
+        return
+    try:
+        entries = sorted(base.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        print(f"harness release: cannot inspect release pycache {base}: {exc}", file=sys.stderr)
+        return
+    for cache in entries:
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            print(
+                "harness release: orphan pycache scan stopped because reference "
+                "inputs changed; remaining caches will be retried on a later update",
+                file=sys.stderr,
+            )
+            return
+        if skip_names and cache.name in skip_names:
+            continue
+        release = releases / cache.name
+        if (cache.is_symlink() or not cache.is_dir() or release.exists()
+                or release.is_symlink()):
+            continue
+        if Path(os.path.abspath(release)) in {Path(os.path.abspath(item)) for item in keep}:
+            continue
+        in_use, why = _release_in_use(
+            release, stable_snapshot, route_snapshot, registry_snapshot
+        )
+        if in_use:
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                f"because release use is unresolved ({why})",
+                file=sys.stderr,
+            )
+            continue
+        held, why_held = _release_held_by_live_process(release)
+        if held:
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                f"because a live process refers to it ({why_held})",
+                file=sys.stderr,
+            )
+            continue
+        if _release_projection_referenced(release):
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                "because a runtime activation still refers to it",
+                file=sys.stderr,
+            )
+            continue
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            print(
+                f"harness release: orphan pycache for {release} was retained because "
+                "reference inputs changed during the check",
+                file=sys.stderr,
+            )
+            return
+        if not _remove_release_pycache(release):
+            print(
+                f"harness release: could not remove orphan pycache for {release}; "
+                "it will be retried on a later update",
+                file=sys.stderr,
+            )
+
+
 def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) -> None:
     releases = data_root() / "releases"
     if not releases.is_dir() or releases.is_symlink():
         return
-    # Parsed once, outside the per-candidate loop (decision 2) -- an
-    # unreadable/malformed stable registry raises here and aborts the whole
-    # cleanup pass rather than being silently re-attempted per candidate.
-    stable_snapshot = _stable_registry_snapshot(os.environ)
-    # Also parsed once, outside the per-candidate loop -- SD-115 axis 4 (b)'s
-    # fourth reference source (route records; see `_release_in_use`'s
-    # docstring).
-    route_snapshot = _open_route_launch_homes(os.environ)
     candidates = sorted(
         (path for path in releases.iterdir() if path.is_dir() and not path.is_symlink()),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+
+    # Route and artifact discovery is global and may traverse NFS trees. Keep
+    # it outside admission locks, then use publication generations and locked
+    # registry fingerprints to decide whether the update-local index is still
+    # current for each candidate.
+    environ = os.environ
+    legacy_registry_paths = _installed_legacy_registry_paths(None)
+    try:
+        stable_jobs = stable_state_root(environ) / "jobs.log"
+    except DistributionError as exc:
+        for candidate in candidates:
+            if candidate not in keep:
+                print(_release_keep_message(
+                    candidate, f"dispatch-writer-boundary-unavailable:{exc}"
+                ), file=sys.stderr)
+        return
+    admission_registry_paths = [*legacy_registry_paths, stable_jobs]
+    ambient_jobs = environ.get("AGENT_DISPATCH_JOBS")
+    if ambient_jobs:
+        admission_registry_paths.append(Path(ambient_jobs))
+
+    def discover() -> dict:
+        inventory: dict = {}
+        watch_paths = [*legacy_registry_paths, stable_jobs]
+        if ambient_jobs:
+            watch_paths.append(Path(ambient_jobs))
+        route_snapshot = _open_route_launch_homes(
+            environ, inventory=inventory, watch_paths=watch_paths
+        )
+        inventory.setdefault("registries", set()).add(stable_jobs)
+        inputs = inventory.get("fingerprints") or _snapshot_discovery_inputs(
+            inventory, admission_registry_paths
+        )
+        indexed_files = dict(inputs.get("files", {}))
+        indexed_route_registries = dict(inputs.get("route_registries", {}))
+        admission_before = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in admission_registry_paths
+        }
+        route_registry_before = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in inventory.get("registries", ())
+        }
+        try:
+            stable_snapshot = _stable_registry_snapshot(environ)
+            registry_snapshot = _release_registry_snapshot(legacy_registry_paths)
+        except OSError as exc:
+            return {"error": f"dispatch-writer-boundary-unavailable:{exc}"}
+        admission_after = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in admission_registry_paths
+        }
+        route_registry_after = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in inventory.get("registries", ())
+        }
+        inputs["files"] = indexed_files
+        inputs["admission_registries"] = {
+            Path(path): indexed_files.get(Path(path), admission_before[Path(path)])
+            for path in admission_registry_paths
+        }
+        inputs["route_registries"] = {
+            Path(path): indexed_route_registries.get(Path(path), value)
+            for path, value in route_registry_before.items()
+        }
+        if (admission_before != admission_after
+                or route_registry_before != route_registry_after
+                or any(inputs["route_registries"].get(path) != value
+                       for path, value in route_registry_after.items())
+                or any(inputs["admission_registries"].get(path) != value
+                       for path, value in admission_after.items())):
+            inputs["unstable"] = True
+        return {
+            "inventory": inventory,
+            "inputs": inputs,
+            "route_snapshot": route_snapshot,
+            "stable_snapshot": stable_snapshot,
+            "registry_snapshot": registry_snapshot,
+            "unstable": bool(inventory.get("unstable") or inputs.get("unstable")
+                              or _discovery_inputs_changed(inputs)),
+        }
+
+    evidence = discover()
+    if evidence.get("error"):
+        for candidate in candidates:
+            if candidate not in keep:
+                print(_release_keep_message(candidate, evidence["error"]), file=sys.stderr)
+        return
+
+    # The initial observation plus at most three refreshes preserves the
+    # existing bound. Exhaustion is uncertainty, never deletion authority.
+    refreshes = 0
+    while evidence["unstable"] and refreshes < 3:
+        refreshes += 1
+        evidence = discover()
+        if evidence.get("error"):
+            break
+    if evidence.get("error") or evidence.get("unstable"):
+        why = evidence.get("error") or "route-discovery-unstable"
+        for candidate in candidates:
+            if candidate not in keep:
+                print(_release_keep_message(candidate, why), file=sys.stderr)
+        return
+
     retained = 0
+    cache_failures: set[str] = set()
+    pass_uncertain = False
+
+    def note_removed(candidate: Path) -> None:
+        # The source's own legacy registry disappears with it. Incorporate
+        # that expected monotonic change so a quiet later candidate does not
+        # trigger another global route scan. A route that actually depended
+        # on a registry inside this source does require fresh route evidence.
+        inputs = evidence["inputs"]
+        candidate_real = Path(os.path.abspath(candidate))
+        route_registry_removed = False
+        for field in ("files", "directories", "route_registries", "admission_registries"):
+            mapping = inputs.get(field, {})
+            for path in list(mapping):
+                try:
+                    Path(os.path.abspath(path)).relative_to(candidate_real)
+                except ValueError:
+                    continue
+                mapping[path] = None
+                if field == "route_registries":
+                    route_registry_removed = True
+        evidence["registry_snapshot"] = [
+            row for row in evidence["registry_snapshot"]
+            if not Path(os.path.abspath(row["registry"])).is_relative_to(candidate_real)
+        ]
+        if route_registry_removed:
+            evidence["refresh_required"] = True
+
+    def report_kept(candidate: Path, why: str) -> None:
+        if why.startswith("live-process:"):
+            print(
+                f"harness release: {candidate} is still in use by a live process "
+                f"({why}); keeping it instead of deleting it",
+                file=sys.stderr,
+            )
+        elif why.startswith("release-removal-failed:"):
+            print(
+                f"harness release: could not remove {candidate}: {why.partition(':')[2]}; "
+                "keeping its pycache",
+                file=sys.stderr,
+            )
+        elif why == "dispatch-state-carry-forward-incomplete":
+            print(
+                "harness release: dispatch state carry-forward incomplete for "
+                f"{candidate}; keeping it and its pycache",
+                file=sys.stderr,
+            )
+        elif why == "release-remains-after-prune":
+            print(
+                f"harness release: {candidate} {why}; keeping it and its pycache",
+                file=sys.stderr,
+            )
+        else:
+            print(_release_keep_message(candidate, why), file=sys.stderr)
+
     for candidate in candidates:
         if candidate in keep or retained < 2:
             retained += 1
             continue
-        in_use, why = _release_in_use(candidate, stable_snapshot, route_snapshot)
-        if in_use:
-            print(_release_keep_message(candidate, why), file=sys.stderr)
-            continue
-        # A runtime activation is a reference this loop never consulted. That was
-        # survivable while a packaged bundle held its own copy; once a bundle
-        # addresses the release by symlink, deleting the release leaves the
-        # runtime pointing at nothing and `harness runtime status` reports
-        # `missing`. `_release_in_use` cannot see this: it reads dispatch rows and
-        # routes, so it covers a release pinned by an OPEN attempt (SD-115 axis 4)
-        # and not one pinned by an idle activation -- an update that skips a
-        # runtime as `foreign` leaves exactly that shape behind.
-        held, why_held = _release_held_by_live_process(candidate)
-        if held:
-            print(
-                f"harness release: {candidate} is still in use by a live process "
-                f"({why_held}); keeping it instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        if _release_projection_referenced(candidate):
-            print(
-                f"harness release: {candidate} is still the activation source of a "
-                "runtime; keeping it instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        if not _succeed_dispatch_state(candidate):
-            print(
-                f"harness release: dispatch state carry-forward incomplete for "
-                f"{candidate}; keeping the release instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        # Both preconditions are "unproven-ness" checks -- a content mismatch
-        # (real corruption, e.g. B-7/B-8's out-of-band divergent copy) and a
-        # broken/missing dispatch-registry containment proof are the same
-        # kind of gap, and both route through the identical
-        # force_prune_unproven + gap-precommit gate (SD-115 §13.34.3-(2)).
-        # `_release_in_use`/`_succeed_dispatch_state` above are never
-        # force-overridable: those guard live/unmigrated state, not proof.
-        unproven_reasons = []
-        migration_ok, migration_reason = _migration_deletion_precondition(candidate, os.environ)
-        if not migration_ok:
-            unproven_reasons.append(migration_reason)
-        containment_ok, containment_reason = _retention_containment_precondition(candidate, os.environ)
-        if not containment_ok:
-            unproven_reasons.append(containment_reason)
-        if unproven_reasons:
-            if not force_prune_unproven:
-                for reason in unproven_reasons:
-                    print(
-                        f"harness release: {reason} for {candidate}; keeping it "
-                        "instead of deleting it",
-                        file=sys.stderr,
-                    )
+
+        removed = False
+        why = "route-discovery-inputs-changed"
+        refreshed_for_candidate = 0
+        while refreshed_for_candidate <= 3:
+            if evidence.get("error"):
+                why = evidence["error"]
+                pass_uncertain = True
+                break
+            if evidence.get("refresh_required") or _discovery_generation_changed(
+                evidence["inputs"]
+            ):
+                if refreshed_for_candidate == 3:
+                    pass_uncertain = True
+                    why = "route-discovery-refresh-exhausted"
+                    break
+                refreshed_for_candidate += 1
+                evidence = discover()
+                if evidence.get("error") or evidence.get("unstable"):
+                    why = evidence.get("error") or "route-discovery-unstable"
+                    continue
+                evidence.pop("refresh_required", None)
                 continue
-            gap_committed = all(
-                _commit_forced_prune_gap_record(candidate, os.environ, reason)
-                for reason in unproven_reasons
-            )
-            if not gap_committed:
+
+            try:
+                writer_paths = _dispatch_cleanup_boundary_paths(
+                    environ, evidence["inventory"].get("registries", ()),
+                    legacy_registry_paths,
+                )
+                with _dispatch_writer_boundary(None, environ, jobs_paths=writer_paths):
+                    if _discovery_generation_changed(evidence["inputs"]):
+                        why = "route-discovery-inputs-changed"
+                    else:
+                        removed, why = _prune_release_under_writer_boundary(
+                            candidate,
+                            force_prune_unproven=force_prune_unproven,
+                            writer_boundary_held=True,
+                            stable_snapshot=evidence["stable_snapshot"],
+                            route_snapshot=evidence["route_snapshot"],
+                            registry_snapshot=evidence["registry_snapshot"],
+                            discovery_inputs=evidence["inputs"],
+                        )
+            except (OSError, DistributionError) as exc:
+                why = f"dispatch-writer-boundary-unavailable:{exc}"
+                pass_uncertain = True
+
+            if why == "route-discovery-inputs-changed":
+                if refreshed_for_candidate == 3:
+                    pass_uncertain = True
+                    why = "route-discovery-refresh-exhausted"
+                    break
+                refreshed_for_candidate += 1
+                evidence = discover()
+                if evidence.get("error") or evidence.get("unstable"):
+                    why = evidence.get("error") or "route-discovery-unstable"
+                    if evidence.get("error"):
+                        pass_uncertain = True
+                    continue
+                evidence.pop("refresh_required", None)
+                continue
+            break
+
+        if removed:
+            note_removed(candidate)
+            # A derived cache is outside the source admission epoch. The
+            # release was removed while its full state boundary was held.
+            if not _remove_release_pycache(candidate):
+                cache_failures.add(candidate.name)
                 print(
-                    f"harness release: registry-gap record commit failed for {candidate}; "
-                    "keeping it instead of deleting it",
+                    f"harness release: could not remove pycache derived from {candidate}; "
+                    "it will be retried on a later update",
                     file=sys.stderr,
                 )
-                continue
-        shutil.rmtree(candidate, ignore_errors=True)
+        else:
+            report_kept(candidate, why)
+            if pass_uncertain:
+                break
+
+    if pass_uncertain:
+        return
+
+    # A carry-forward may have changed a registry while the source was held.
+    # Refresh outside the epoch before judging orphan caches; if the bounded
+    # refresh cannot establish a current view, leave the remaining caches.
+    refreshed_for_orphans = 0
+    while evidence.get("refresh_required") or _discovery_generation_changed(evidence["inputs"]):
+        if refreshed_for_orphans == 3:
+            return
+        refreshed_for_orphans += 1
+        evidence = discover()
+        if evidence.get("error") or evidence.get("unstable"):
+            return
+        evidence.pop("refresh_required", None)
+
+    _cleanup_orphan_release_pycache(
+        releases, keep, evidence["stable_snapshot"], evidence["route_snapshot"],
+        cache_failures, evidence["registry_snapshot"], evidence["inputs"],
+    )
 
 
 # destructive-ok: reason=rollback or discard one managed release staging transaction; boundary=version target staging root and state leaf selected by this invocation

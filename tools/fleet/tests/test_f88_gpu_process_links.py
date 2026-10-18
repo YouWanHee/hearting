@@ -349,26 +349,34 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
         import session_tidy
+        import session_tidy_clear
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": tmp, "HERDR_PANE_ID": "", "HERDR_SOCKET_PATH": "",
+                "AGENT_HERDR_SESSION": "", "HERDR_ENV": ""}):
             pane = "w1:pFixture"
-            key = session_tidy._digest("pane", pane)
-            folder = Path(tmp) / "hearting/session-tidy/clear"
-            folder.mkdir(parents=True)
-            path = folder / (key + ".json")
+            repository = Path(tmp) / "project"
+            (repository / ".git").mkdir(parents=True)
+            seat = session_tidy._pane_seat_of(pane)
             for harness in ("claude", "codex", "opencode"):
                 with self.subTest(harness=harness):
                     current = Session(harness=harness, pid=101, proc_start="11",
-                                      cwd="/tmp/f88-project", session_id="sid-new",
+                                      cwd=str(repository), session_id="sid-new",
                                       title="current", liveness="working")
                     neighbor = Session(harness=harness, pid=102, proc_start="12",
                                        cwd=current.cwd, session_id="sid-neighbor",
                                        title="neighbor", liveness="working")
+                    with session_tidy.seat_lock(seat):
+                        session_tidy.record_event(seat, harness, "sid-old", "start",
+                                                  source="startup", cwd=current.cwd, now=100)
+                        session_tidy.record_event(seat, harness, "sid-new", "start",
+                                                  source="clear", cwd=current.cwd, now=200)
                     record = {"schema": 1, "harness": harness, "sid": "sid-old",
+                              "nonce": "fixture-clear-booking",
                               "new_session": "sid-new", "status": "cleared",
-                              "seat": {"kind": "pane", "pane": pane},
+                              "seat": seat.as_dict(), "cwd": current.cwd,
                               "observed": {"harness": harness, "sid": "sid-new"}}
-                    path.write_text(json.dumps(record))
+                    session_tidy_clear._write_reservation(record)
                     agents = [{"agent": harness, "pane_id": pane,
                                "agent_session": {"agent": harness, "value": "sid-old"}}]
                     with mock.patch.object(procscan, "read_proc_start", return_value="11"), \
@@ -403,10 +411,10 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                                     next(i for i, row in enumerate(rows) if "● GPU" in row))
                     self.assertEqual(json.dumps(snapshot, sort_keys=True), raw)
                     for bad in ({**record, "status": "reserved"},
-                                {**record, "seat": {"kind": "pane", "pane": "w1:else"}}):
-                        path.write_text(json.dumps(bad))
+                                {**record, "seat": {**seat.as_dict(), "pane": "w1:else"}}):
+                        session_tidy_clear._write_reservation(bad)
                         self.assertEqual(herdr._clear_gpu_session_aliases(harness, "sid-new", pane), [])
-                    path.write_text(json.dumps(record))
+                    session_tidy_clear._write_reservation(record)
                     with mock.patch.object(procscan, "read_proc_start", return_value="reused"):
                         herdr.enrich([current], agents=agents, pids=(set(), {101}),
                                      pane_bindings={101: {pane}})

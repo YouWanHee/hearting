@@ -142,11 +142,12 @@ binds at `one-shot` entry for `quick`, `plan` entry for `standard+`. Legacy
 sealed routes remain unchanged. Depth-0 joins both direction briefs and builds
 `shards/frame/frame-summary.json` (five fields — 방향/대안/위험/범위 변경/비용,
 ≤1KB) plus the **frame interview** `shards/frame/interview.json` (SD-129: a
-one-sentence restatement the user confirms, a plain-language brief, and at most
-`frame_interview.py`'s `QUESTION_CAP` short questions — one topic each, 2–4
-options, one recommended, no harness vocabulary, only decisions the user alone
-can make; `utilities/frame_interview.py validate` is the bar and `gate --block`
-refuses what fails it). Depth-0 puts those questions to the user;
+restatement the user confirms, a readable brief, and at most
+`frame_interview.py`'s `QUESTION_CAP` questions, each with 2–4 options and one
+recommendation, only about decisions the user alone can make;
+`utilities/frame_interview.py validate` checks semantic bindings and finite
+input size. `writing_guidance()` recommends clear, focused wording without
+rejecting a valid question for style. Depth-0 puts those questions to the user;
 the receipt's `resume_command --answers <file>` validates the answers, renders
 `shards/frame/intent.md`, releases the gate and starts the owner.
 
@@ -196,10 +197,21 @@ Additional code-entry gates:
 - detect whether `spec/pipeline_state.yaml` has changed since the last relevant plan and re-read newer spec/design artifacts before editing;
 - for app mode, treat design tokens and handoff artifacts as source contracts, not suggestions;
 - for destructive DB/schema/migration work, explain the command and risk, but do not auto-run destructive operations without explicit user approval;
-- for every approved start whose selected graph changes source, use the common preparation boundary in `core/OPERATIONS.md` before collecting eligibility evidence, sealing, publishing, or launching. It applies to direct and staged work, explicit or omitted primary cwd, framed first legs, and successor/printed next-leg starts. New independent work starts from the commit SHA resolved by a successful fetch of the remote default; explicit approved task worktrees and exact saved route/cursor/receipt/continuation state retain their existing changes and identity. Probe the final cwd and seal only tuples whose `checked_worktree` exactly matches the route `cwd`. Preparation failure prevents publication and launch and remains retryable through the same start.
+- for every approved start whose selected graph changes source, use the common preparation boundary in `core/OPERATIONS.md` before collecting eligibility evidence, sealing, publishing, or launching. It applies to direct and staged work, explicit or omitted primary cwd, framed first legs, and successor/printed next-leg starts. New independent work starts from the commit SHA resolved by a successful fetch of the remote default; when there are no remotes, it uses the primary worktree's current `HEAD` commit without fetching. Explicit approved task worktrees and exact saved route/cursor/receipt/continuation state retain their existing changes and identity. Probe the final cwd and seal only tuples whose `checked_worktree` exactly matches the route `cwd`. Preparation failure prevents publication and launch and remains retryable through the same start.
 - after main/orchestrator merges, verifies the integrated tree, and pushes the
   integration ref, invoke the guarded worktree cleanup check/apply path; never
   infer cleanup eligibility from a runtime session-end event.
+- when the route seals `entry_execution_scope: complete`, the depth-1 owner has
+  capacity to publish only its current task branch, create or update that
+  branch's PR, and observe checks for the final head. This capacity does not
+  authorize performing a command outside the actual request; request wording,
+  negation, and quoted history are not a second permission test. Use an ordinary
+  non-force push. Write the PR body to
+  `$AGENT_ARTIFACT_OUTPUT_DIR/dev_logs/pr-description.md` and pass it with
+  `--body-file` after inspecting any existing PR for that branch. CI fixes stay
+  within the approved scope and return through the existing review/test/commit path.
+  Stage and review workers do not publish; integration push, main merge,
+  release, installation, and cleanup stay with the supervisor.
 
 ## Portable Procedure
 

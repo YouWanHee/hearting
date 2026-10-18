@@ -285,7 +285,7 @@ def main():
             mod = _peer_message_module()
             if mod:
                 mod.emit_peer_context({"harness": "claude", "session_id": payload.get("session_id")},
-                                      "PostToolUse")
+                                      "PostToolUse", native_delivery=True)
     elif mode == "prompt":
         # The cross-session `notice` record path runs first and unconditionally:
         # the sweep must never be able to swallow it.
@@ -310,7 +310,7 @@ def main():
                 cwd=payload.get("cwd") or os.getcwd())]))
         if mod:
             mod.emit_peer_context({"harness": "claude", "session_id": payload.get("session_id")},
-                                  "UserPromptSubmit", extra_context=extra)
+                                  "UserPromptSubmit", extra_context=extra, native_delivery=True)
         elif extra:
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit", "additionalContext": extra}}, ensure_ascii=False))

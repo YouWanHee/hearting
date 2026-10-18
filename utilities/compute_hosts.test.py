@@ -9,7 +9,9 @@ import io
 import json
 import os
 import signal
+import selectors
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,11 +26,98 @@ ROOT = Path(__file__).resolve().parent
 TOOL = ROOT / "compute-hosts.py"
 
 
+def controlled_proc_root(root, processes):
+    """Keep live fixture PID data while placing ancestry behind a test root."""
+    proc_root = root / "proc"
+    proc_root.mkdir()
+    fixture_parent_pid = 2_000_000_000
+    while (Path("/proc") / str(fixture_parent_pid)).exists():
+        fixture_parent_pid -= 1
+
+    parent = proc_root / str(fixture_parent_pid)
+    parent.mkdir()
+    parent_fields = ["S", "0", str(os.getpgrp())] + ["0"] * 17
+    parent_fields[19] = "1"
+    (parent / "stat").write_text(
+        f"{fixture_parent_pid} (probe-fixture-root) {' '.join(parent_fields)}\n",
+        encoding="utf-8",
+    )
+    uid = os.geteuid()
+    (parent / "status").write_text(
+        f"Name:\tprobe-fixture-root\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n",
+        encoding="utf-8",
+    )
+    (parent / "environ").write_bytes(b"")
+    (parent / "cmdline").write_bytes(b"")
+    (parent / "comm").write_text("probe-fixture-root\n", encoding="utf-8")
+
+    for process in processes:
+        live = Path("/proc") / str(process.pid)
+        raw_stat = (live / "stat").read_text(encoding="utf-8")
+        prefix, suffix = raw_stat.rsplit(")", 1)
+        fields = suffix.split()
+        fields[1] = str(fixture_parent_pid)
+        fixture = proc_root / str(process.pid)
+        fixture.mkdir()
+        (fixture / "stat").write_text(
+            prefix + ") " + " ".join(fields) + "\n", encoding="utf-8")
+        for name in ("status", "environ", "cmdline", "comm"):
+            (fixture / name).symlink_to(live / name)
+    return proc_root
+
+
+def terminate_and_reap(process, timeout=2):
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=timeout)
+    if process.stdout is not None:
+        process.stdout.close()
+
+
 def load_module():
     spec = importlib.util.spec_from_file_location("compute_hosts", TOOL)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def install_fake_tmux(fakebin, *, stale_environment=None):
+    fakebin.mkdir(parents=True, exist_ok=True)
+    tmux = fakebin / "tmux"
+    lines = ["#!/bin/sh"]
+    for key, value in (stale_environment or {}).items():
+        lines.append(f"export {key}={shlex.quote(value)}")
+    lines.extend([
+        'if [ "$1" = "-L" ]; then shift 2; fi',
+        'if [ "$1" = "start-server" ]; then exit 0; fi',
+        '[ "$1" = "new-session" ] || exit 1',
+        "shift",
+        "cwd=/",
+        'while [ "$#" -gt 0 ]; do',
+        '  case "$1" in',
+        '    -d) shift ;;',
+        '    -s) run_id=$2; shift 2 ;;',
+        '    -c) cwd=$2; shift 2 ;;',
+        '    -e) export "$2"; shift 2 ;;',
+        '    *) command=$1; break ;;',
+        "  esac",
+        "done",
+        'cd "$cwd" || exit 1',
+        'exec /bin/bash -lc "$command"',
+    ])
+    tmux.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmux.chmod(0o755)
+    return tmux
 
 
 class ComputeRunLauncherIdentityTest(unittest.TestCase):
@@ -373,11 +462,11 @@ class ComputeHostsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_tool(self, *args):
+    def run_tool(self, *args, env=None):
         if args[:1] == ("run",) and "--gpus" not in args:
             args = (*args[:2], "--gpus", "", *args[2:])
         return subprocess.run([sys.executable, str(TOOL), *args],
-                              text=True, capture_output=True, env=self.env)
+                              text=True, capture_output=True, env=env or self.env)
 
     def test_missing_inventory_is_a_typed_failure(self):
         env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.root / "absent.yaml")}
@@ -684,20 +773,32 @@ class ComputeHostsTest(unittest.TestCase):
 
     def test_tmux_run_pins_launcher_session_over_stale_server_environment(self):
         fakebin = self.root / "tmux-bin"
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "CODEX_THREAD_ID=stale-thread CODEX_SESSION_ID=other-stale "
-            "CLAUDE_CODE_SESSION_ID=stale-claude /bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
-        clean = {key: value for key, value in self.env.items()
-                 if key not in dict(load_module().SESSION_ENV_KEYS)}
-        env = {**clean, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
-               "CODEX_THREAD_ID": "launch-thread"}
+        install_fake_tmux(fakebin, stale_environment={
+            "CODEX_THREAD_ID": "stale-thread",
+            "CODEX_SESSION_ID": "other-stale",
+            "CLAUDE_CODE_SESSION_ID": "stale-claude",
+        })
+        session_keys = {key for key, _harness in load_module().SESSION_ENV_KEYS}
+        env = {key: value for key, value in self.env.items()
+               if key not in session_keys
+               and key not in ("AGENT_HOME", "CLAUDE_HOME",
+                               "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_JOBS")}
+        for key in tuple(env):
+            if (key.startswith("AGENT_DISPATCH_")
+                    or key in ("AGENT_OWNER_ROUTE_FILE", "AGENT_ROUTE_FILE",
+                               "AGENT_SESSION_ROLE", "FLEET_ROUTE_CHAIN_DIR",
+                               "FLEET_TITLE_REFRESH")):
+                env.pop(key, None)
+        empty_home = self.root / "empty-home"
+        empty_home.mkdir(exist_ok=True)
+        env.update({
+            "AGENT_DISPATCH_DEPTH": "0",
+            "HOME": str(empty_home),
+            "XDG_DATA_HOME": str(empty_home / ".local" / "share"),
+            "XDG_STATE_HOME": str(empty_home / ".local" / "state"),
+            "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
+            "CODEX_THREAD_ID": "launch-thread",
+        })
         result = subprocess.run(
             [sys.executable, str(TOOL), "run", "here", "--gpus", "", "--name", "tmux-owner",
              "--", "bash", "-c",
@@ -709,11 +810,13 @@ class ComputeHostsTest(unittest.TestCase):
         run_id = result.stdout.split()[1]
         log = (self.run_root / run_id / "log").read_text(encoding="utf-8")
         self.assertEqual(log, "launch-thread||")
+        meta = json.loads((self.run_root / run_id / "meta.json").read_text())
+        self.assertEqual(meta["tmux_transport"]["kind"], "hearting-tmux-v1")
 
     def test_conflicting_launcher_sessions_fail_closed_in_nohup_payload(self):
         fakebin = self.root / "nohup-bin"
         fakebin.mkdir()
-        for command in ("bash", "mkdir", "nohup", "setsid", "python3", "sh"):
+        for command in ("bash", "id", "mkdir", "nohup", "setsid", "python3", "sh", "tr"):
             target = Path("/usr/bin") / command
             if not target.exists():
                 target = Path("/bin") / command
@@ -841,32 +944,39 @@ class ComputeHostsTest(unittest.TestCase):
         }
         clean = {key: value for key, value in os.environ.items() if key not in identity_keys}
         processes = []
+
+        def launch_fixture(process_env, *, stdout=None):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                env=process_env, stdout=stdout or subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(process)
+            return process
+
         try:
             log = self.root / "train.log"
             log.write_text("Epoch 3/200\nTRAIN: 50% loss=0.5\n")
             with log.open("ab") as output:
-                run_proc = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(10)"],
-                    env={**clean, "HEARTING_COMPUTE_RUN_ID": "cnn-run-7",
-                         "HEARTING_COMPUTE_HOST": "cnn"},
-                    stdout=output, stderr=output,
-                )
-            ambiguous_proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(10)"],
-                env={**clean, "CODEX_THREAD_ID": "same-session-token",
-                     "CLAUDE_CODE_SESSION_ID": "same-session-token"},
-            )
-            job_proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(10)"],
-                env={**clean, "AGENT_DISPATCH_ATTEMPT_ID": "att-42",
-                     "AGENT_DISPATCH_SELF_SLUG": "train-test",
-                     "HEARTING_COMPUTE_RUN_ID": "shadowed-run"},
-            )
-            session_proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(10)"],
-                env={**clean, "CODEX_THREAD_ID": "codex-exact-session"},
-            )
-            processes = [run_proc, ambiguous_proc, job_proc, session_proc]
+                run_proc = launch_fixture(
+                    {**clean, "HEARTING_COMPUTE_RUN_ID": "cnn-run-7",
+                     "HEARTING_COMPUTE_HOST": "cnn"}, stdout=output)
+            ambiguous_proc = launch_fixture(
+                {**clean, "CODEX_THREAD_ID": "same-session-token",
+                 "CLAUDE_CODE_SESSION_ID": "same-session-token"})
+            job_proc = launch_fixture(
+                {**clean, "AGENT_DISPATCH_ATTEMPT_ID": "att-42",
+                 "AGENT_DISPATCH_SELF_SLUG": "train-test",
+                 "HEARTING_COMPUTE_RUN_ID": "shadowed-run"})
+            session_proc = launch_fixture(
+                {**clean, "CODEX_THREAD_ID": "codex-exact-session"})
+            probe = probe_namespace()
+            proc_starts = {}
+            for process in processes:
+                observed = probe["proc_stat"](process.pid)
+                self.assertIsNotNone(observed, process.pid)
+                proc_starts[process.pid] = observed["start"]
+            proc_root = controlled_proc_root(self.root, processes)
             env = {
                 **clean,
                 "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
@@ -877,17 +987,18 @@ class ComputeHostsTest(unittest.TestCase):
                     ["GPU-B", session_proc.pid, "python", 512],
                 ]),
             }
+            probe_script = module.PROBE_SCRIPT.replace(
+                'Path("/proc")', f"Path({str(proc_root)!r})")
+            self.assertNotEqual(probe_script, module.PROBE_SCRIPT)
             result = subprocess.run(
-                ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+                ["bash", "-c", probe_script], text=True, capture_output=True,
                 env=env, timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
         finally:
             for process in processes:
-                process.terminate()
-            for process in processes:
-                process.wait(timeout=2)
+                terminate_and_reap(process)
 
         self.assertEqual([gpu["index"] for gpu in payload["gpus"]], [0, 1])
         first, second = payload["gpus"]
@@ -898,15 +1009,21 @@ class ComputeHostsTest(unittest.TestCase):
         by_pid = {row["pid"]: row for row in first["processes"]}
         self.assertEqual(by_pid[run_proc.pid]["owner"]["kind"], "run")
         self.assertEqual(by_pid[run_proc.pid]["owner"]["label"], "run:cnn-run-7")
+        self.assertEqual(by_pid[run_proc.pid]["proc_start"], proc_starts[run_proc.pid])
         self.assertIsNone(by_pid[ambiguous_proc.pid]["owner"])
         self.assertEqual(by_pid[ambiguous_proc.pid]["attribution_reason"],
                          "ambiguous-session")
+        self.assertEqual(by_pid[ambiguous_proc.pid]["proc_start"],
+                         proc_starts[ambiguous_proc.pid])
         second_by_pid = {row["pid"]: row for row in second["processes"]}
         self.assertEqual(second_by_pid[job_proc.pid]["owner"]["kind"], "job")
         self.assertEqual(second_by_pid[job_proc.pid]["owner"]["label"], "job:train-test")
+        self.assertEqual(second_by_pid[job_proc.pid]["proc_start"],
+                         proc_starts[job_proc.pid])
         self.assertEqual(second_by_pid[session_proc.pid]["owner"]["kind"], "session")
         self.assertEqual(second_by_pid[session_proc.pid]["owner"]["label"], "codex:codex-ex")
-        self.assertIsInstance(second_by_pid[job_proc.pid]["proc_start"], int)
+        self.assertEqual(second_by_pid[session_proc.pid]["proc_start"],
+                         proc_starts[session_proc.pid])
         self.assertIsInstance(payload["cpu_count"], int)
         self.assertGreater(payload["cpu_count"], 0)
         self.assertGreaterEqual(payload["cpu_utilization_pct"], 0)
@@ -1006,19 +1123,27 @@ class ComputeHostsTest(unittest.TestCase):
     def test_gpu_probe_cwd_is_absent_when_unreadable_or_gone(self):
         gone = subprocess.Popen([sys.executable, "-c", "pass"])
         gone.wait(timeout=5)
-        rows = [["GPU-A", gone.pid, "python", 64]]
-        if os.geteuid() != 0:
-            rows.append(["GPU-A", 1, "init", 32])
-        payload = self._probe_with_fake_smi(rows, "gone-bin")
+        payload = self._probe_with_fake_smi(
+            [["GPU-A", gone.pid, "python", 64]], "gone-bin")
         by_pid = {row["pid"]: row for row in payload["gpus"][0]["processes"]}
         ended = by_pid[gone.pid]
         for key in ("proc_start", "pgid", "cwd", "elapsed_s"):
             self.assertIsNone(ended[key], key)
-        if 1 in by_pid:
-            other = by_pid[1]
-            self.assertIsNone(other["cwd"])
-            self.assertIsInstance(other["pgid"], int)
-            self.assertIsInstance(other["proc_start"], int)
+
+        probe = probe_namespace()
+        pid = os.getpid()
+        current = probe["proc_stat"](pid)
+        self.assertIsNotNone(current)
+        denied_cwd = f"/proc/{pid}/cwd"
+        readlink = os.readlink
+
+        def fixture_readlink(path, *args, **kwargs):
+            if os.fspath(path) == denied_cwd:
+                raise PermissionError("fixture-controlled proc read denial")
+            return readlink(path, *args, **kwargs)
+
+        with mock.patch.object(probe["os"], "readlink", side_effect=fixture_readlink):
+            self.assertIsNone(probe["process_cwd"](pid, current["start"]))
 
     def test_gpu_probe_omits_training_logs_and_does_not_create_epoch_cache(self):
         log = self.root / "train.log"
@@ -1197,14 +1322,20 @@ class ComputeHostsTest(unittest.TestCase):
     def test_stop_records_sigterm_exit_and_reason(self):
         # `stop` kills the tmux session before the run shell can write its
         # own exit code; the stop itself must leave 143 + a reason behind.
+        if shutil.which("tmux") is None:
+            self.skipTest("tmux is not installed")
         result = self.run_tool("run", "here", "--name", "stopme", "--",
                                "bash", "-c", "sleep 30")
         self.assertEqual(result.returncode, 0, result.stderr)
         run_id = result.stdout.split()[1]
+        meta = json.loads((self.run_root / run_id / "meta.json").read_text())
+        transport = meta["tmux_transport"]
+        self.assertEqual(transport["kind"], "hearting-tmux-v1")
+        server = transport["server"]
         try:
             for _ in range(50):
                 check = subprocess.run(
-                    ["tmux", "has-session", "-t", run_id],
+                    ["tmux", "-L", server, "has-session", "-t", run_id],
                     capture_output=True, timeout=5)
                 if check.returncode == 0:
                     break
@@ -1233,17 +1364,54 @@ class ComputeHostsTest(unittest.TestCase):
             tail = self.run_tool("tail", run_id)
             self.assertIn("exit 143 (stopped)", tail.stdout)
         finally:
-            subprocess.run(["tmux", "kill-session", "-t", run_id],
+            subprocess.run(["tmux", "-L", server, "kill-session", "-t", run_id],
                            capture_output=True, timeout=5)
+            subprocess.run(["tmux", "-L", server, "kill-server"],
+                           capture_output=True, timeout=5)
+
+    def test_tmux_transport_probes_only_the_recorded_managed_server(self):
+        module = load_module()
+        server = "hearting-0123456789abcdefabcd"
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(module, "remote", return_value=completed) as remote:
+            self.assertIs(
+                module._tmux_session_alive(
+                    {"ssh_host": "unused"}, "run-1",
+                    transport={"kind": "hearting-tmux-v1", "server": server},
+                ),
+                False,
+            )
+            self.assertIn(
+                f"tmux -L {server} has-session -t run-1",
+                remote.call_args.args[1],
+            )
+            self.assertIsNone(module._tmux_session_alive(
+                {"ssh_host": "unused"}, "run-1",
+                transport={"kind": "hearting-tmux-v1", "server": "default"},
+            ))
+            self.assertIsNone(module._tmux_session_alive(
+                {"ssh_host": "unused"}, "run-1",
+                transport={"kind": "nohup-v1"},
+            ))
+        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(module._tmux_command_prefix(), ["tmux"])
 
     def test_stop_never_overwrites_a_natural_finish(self):
         run_dir = self.run_root / "natural-20261002-000001-done"
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["true"]}), encoding="utf-8")
+                        "command": ["true"],
+                        "tmux_transport": {"kind": "hearting-tmux-v1",
+                                           "server": "hearting-00000000000000000000"}}),
+            encoding="utf-8")
         (run_dir / "exit_code").write_text("0\n", encoding="utf-8")
-        stopped = self.run_tool("stop", run_dir.name)
+        fakebin = self.root / "natural-fake-tmux"
+        install_fake_tmux(fakebin)
+        stopped = self.run_tool(
+            "stop", run_dir.name,
+            env={**self.env, "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", "")},
+        )
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(
             (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "0")
@@ -1256,19 +1424,25 @@ class ComputeHostsTest(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["bash", "-c", "sleep 30"]}),
+                        "command": ["bash", "-c", "sleep 30"],
+                        "tmux_transport": {"kind": "hearting-tmux-v1",
+                                           "server": "hearting-00000000000000000000"}}),
             encoding="utf-8")
-        listed = self.run_tool("runs")
+        fakebin = self.root / "stale-fake-tmux"
+        install_fake_tmux(fakebin)
+        fixture_env = {**self.env,
+                       "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", "")}
+        listed = self.run_tool("runs", env=fixture_env)
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn("stopped (gone)", listed.stdout)
         self.assertFalse((run_dir / "exit_code").exists())
-        payload = json.loads(self.run_tool("runs", "--json").stdout)
+        payload = json.loads(self.run_tool("runs", "--json", env=fixture_env).stdout)
         row = next(item for item in payload if item["run_id"] == run_dir.name)
         self.assertIsNone(row["exit_code"])
         self.assertEqual(row["state"], "stopped")
         self.assertTrue(row["stale"])
         # An explicit stop then seals the legacy run the same way as new ones.
-        stopped = self.run_tool("stop", run_dir.name)
+        stopped = self.run_tool("stop", run_dir.name, env=fixture_env)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(
             (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "143")
@@ -1282,7 +1456,8 @@ class ComputeHostsTest(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["bash", "-c", "sleep 30"]}),
+                        "command": ["bash", "-c", "sleep 30"],
+                        "tmux_transport": {"kind": "nohup-v1"}}),
             encoding="utf-8")
         with mock.patch.object(module, "_tmux_session_alive", return_value=None):
             config = module.load_config(str(self.config))
@@ -1290,8 +1465,8 @@ class ComputeHostsTest(unittest.TestCase):
             self.assertEqual(state["state"], "running")
             self.assertIsNone(module._tmux_session_alive(object(), "x"))
         listed = self.run_tool("runs", "--host", "here")
-        # With real tmux present and no such session this row shows stale;
-        # the unit point above is that unknown (None) never declares gone.
+        # An explicitly non-tmux transport stays unknown and never probes the
+        # host's default tmux server.
         self.assertEqual(listed.returncode, 0, listed.stderr)
 
     def test_record_stop_writes_once_and_keeps_a_natural_exit(self):
@@ -1511,16 +1686,10 @@ class LauncherProvenanceTest(unittest.TestCase):
         home = self.make_home()
         attempt = "att-9f2c4b1ad34e"
         fakebin = self.root / "tmux-bin"
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "env -u AGENT_HOME -u AGENT_DISPATCH_ATTEMPT_ID "
-            "/bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
+        install_fake_tmux(fakebin, stale_environment={
+            "AGENT_HOME": "/foreign/old-release",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-stale-owner",
+        })
         env = self.scrubbed_env(
             AGENT_HOME=str(home), AGENT_DISPATCH_ATTEMPT_ID=attempt,
             PATH=str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
@@ -1588,24 +1757,12 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", unknown.stdout.split("setup: ", 1)[1])
 
     def run_with_foreign_transport(self, name, env):
-        """Launch through a tmux server that retains unrelated old values.
-
-        A long-lived tmux server keeps the environment of whichever client
-        created it; the fixture pins exactly that: foreign provenance the
-        launcher never issued.
-        """
+        """Exercise a stale server environment against the per-run tmux -e pins."""
         fakebin = self.root / name
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "AGENT_HOME=/foreign/stale-home "
-            "AGENT_DISPATCH_ATTEMPT_ID=att-unrelated-old-owner "
-            "/bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
+        install_fake_tmux(fakebin, stale_environment={
+            "AGENT_HOME": "/foreign/stale-home",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-unrelated-old-owner",
+        })
         env = {**env, "PATH": str(fakebin) + os.pathsep
                + os.environ.get("PATH", "")}
         result = self.run_tool(
@@ -1757,15 +1914,26 @@ class ProbeCommandHashTest(unittest.TestCase):
 
     def spawn(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
-        self.addCleanup(child.wait, 2)
-        self.addCleanup(child.terminate)
+        self.addCleanup(terminate_and_reap, child)
         return child
 
     def test_live_process_hash_matches_cmdline_bytes(self):
         import hashlib
 
-        child = self.spawn()
-        start = self.ns["proc_stat"](child.pid)["start"]
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, time; os.write(1, b'fixture-ready\\n'); time.sleep(10)"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+        )
+        self.addCleanup(terminate_and_reap, child)
+        with selectors.DefaultSelector() as readiness:
+            readiness.register(child.stdout, selectors.EVENT_READ)
+            self.assertTrue(readiness.select(timeout=5), "fixture child did not become ready")
+            self.assertEqual(child.stdout.readline(), b"fixture-ready\n")
+
+        observed = self.ns["proc_stat"](child.pid)
+        self.assertIsNotNone(observed)
+        start = observed["start"]
         expected = hashlib.sha256(
             Path("/proc/%d/cmdline" % child.pid).read_bytes()).hexdigest()
         self.assertEqual(self.ns["process_command_hash"](child.pid, start), expected)

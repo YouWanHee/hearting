@@ -16,7 +16,67 @@ import fixture_env  # noqa: E402
 import codex_hook_trust  # noqa: E402
 
 
+class ManagedCopyProjectionHealthTest(unittest.TestCase):
+    def test_copy_health_requires_matching_regular_file_bytes_and_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.sh"
+            dest = root / "projected.sh"
+            source.write_bytes(b"#!/bin/sh\necho managed\n")
+            source.chmod(0o755)
+            entry = {"source": str(source), "dest": str(dest), "kind": "copy"}
+
+            dest.write_bytes(source.read_bytes())
+            dest.chmod(0o755)
+            self.assertEqual(activation._entries_healthy([entry]), (False, False))
+
+            dest.write_bytes(b"changed bytes\n")
+            dest.chmod(0o755)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+            dest.write_bytes(source.read_bytes())
+            dest.chmod(0o644)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+            # destructive-ok: reason=exercise the missing projected-copy state; boundary=dest leaf under this test's TemporaryDirectory root
+            dest.unlink()
+            self.assertEqual(activation._entries_healthy([entry]), (True, False))
+
+            # Even a symlink to the expected source is the wrong managed kind.
+            dest.symlink_to(source)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), source.resolve())
+
+            foreign = root / "foreign.sh"
+            foreign.write_bytes(source.read_bytes())
+            foreign.chmod(0o755)
+            # destructive-ok: reason=replace this test's expected-source symlink with a foreign symlink; boundary=dest leaf under this test's TemporaryDirectory root
+            dest.unlink()
+            dest.symlink_to(foreign)
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), foreign.resolve())
+
+            # destructive-ok: reason=replace this test's foreign symlink with a directory; boundary=dest leaf under this test's TemporaryDirectory root
+            dest.unlink()
+            dest.mkdir()
+            self.assertEqual(activation._entries_healthy([entry]), (False, True))
+
+
 class CodexHookTrustTest(unittest.TestCase):
+    def test_codex_projection_binds_the_herdr_home_consumer_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "codex"
+            with mock.patch.object(activation.paths, "runtime_home", return_value=home):
+                entries = activation._linked_entries("codex", REPO_ROOT, "global")
+        integration = [entry for entry in entries
+                       if Path(entry["dest"]).name == "herdr-agent-state.sh"]
+        self.assertEqual(len(integration), 1, integration)
+        self.assertEqual(Path(integration[0]["source"]),
+                         REPO_ROOT / "adapters/codex/hooks/herdr-agent-state.sh")
+        self.assertEqual(Path(integration[0]["dest"]), home / "herdr-agent-state.sh")
+
     def test_activation_publishes_the_receipt_and_deactivation_restores_its_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1106,7 +1166,9 @@ class CodexIdentityConfigTest(unittest.TestCase):
                  mock.patch.object(native_context, "project_context_window", return_value=projection):
                 changes = activation._prepare_runtime_config("codex", release, None)
             self.assertTrue(changes[0]["tui_status_line_changed"])
-            parsed = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+            parsed_root = tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertIs(parsed_root["check_for_update_on_startup"], False)
+            parsed = parsed_root["tui"]
             self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
@@ -1120,6 +1182,63 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertNotIn(self.BEGIN, remaining)
+
+    def test_runtime_activation_startup_absent_true_false_dry_run_and_receipt_carry(self):
+        import native_context
+        import stat
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            tui = ('[tui]\nstatus_line = ["thread-title", "git-branch", "context-used", '
+                   '"model-with-reasoning", "five-hour-limit", "weekly-limit", "thread-id"]\n'
+                   'status_line_use_colors = true\n')
+            for label, explicit, expected in (("absent", "", False),
+                                              ("true", "check_for_update_on_startup = true\n", True),
+                                              ("false", "check_for_update_on_startup = false\n", False)):
+                with self.subTest(label=label):
+                    config = root / label / "config.toml"
+                    config.parent.mkdir()
+                    original = explicit + tui
+                    config.write_text(original, encoding="utf-8")
+                    projection = {"native_context": {"codex": {}}, "report_lines": [],
+                                  "pre_projection_exists": True,
+                                  "pre_projection_bytes": original.encode("utf-8")}
+                    with mock.patch.object(activation, "_config_path", return_value=config), \
+                         mock.patch.object(native_context, "project_context_window", return_value=projection):
+                        first = activation._prepare_runtime_config("codex", release, None)
+                    first_state = {"managed_config": {
+                        "codex_identity": first[0].get("managed_config"),
+                        "codex_tui": first[0].get("tui_record")}}
+                    parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+                    self.assertIs(parsed["check_for_update_on_startup"], expected)
+                    first_receipt = (first[0].get("managed_config") or {}).get("startup_default")
+                    self.assertEqual(bool(first_receipt), label == "absent")
+                    once = config.read_bytes()
+
+                    with mock.patch.object(activation, "_config_path", return_value=config), \
+                         mock.patch.object(native_context, "project_context_window", return_value=projection):
+                        second = activation._prepare_runtime_config("codex", release, first_state)
+                    second_receipt = (second[0].get("managed_config") or {}).get("startup_default")
+                    self.assertEqual(bool(second_receipt), label == "absent")
+                    self.assertEqual(config.read_bytes(), once)
+
+                    state = {"managed_config": {
+                        "codex_identity": second[0].get("managed_config"),
+                        "codex_tui": second[0].get("tui_record")}}
+                    before_dry_run = (config.read_bytes(), stat.S_IMODE(config.stat().st_mode),
+                                      config.stat().st_mtime_ns)
+                    with mock.patch.object(activation, "_config_path", return_value=config):
+                        activation._unmerge_codex_identity_config(state, "global", dry_run=True)
+                    self.assertEqual((config.read_bytes(), stat.S_IMODE(config.stat().st_mode),
+                                      config.stat().st_mtime_ns), before_dry_run)
+
+                    with mock.patch.object(activation, "_config_path", return_value=config):
+                        activation._unmerge_codex_identity_config(state, "global")
+                    restored = config.read_text(encoding="utf-8")
+                    self.assertEqual(restored, original)
+                    self.assertEqual((config.parent / activation.CODEX_IDENTITY_BACKUP).read_bytes(),
+                                     original.encode("utf-8"))
 
     def test_runtime_config_preparation_and_deactivation_preserve_symlink(self):
         import native_context
@@ -1146,7 +1265,9 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertTrue(config.is_symlink())
             self.assertEqual(os.readlink(config), link_target)
             applied = target.read_text(encoding="utf-8")
-            parsed = tomllib.loads(applied)["tui"]
+            parsed_root = tomllib.loads(applied)
+            self.assertIs(parsed_root["check_for_update_on_startup"], False)
+            parsed = parsed_root["tui"]
             self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, applied)
@@ -1703,6 +1824,25 @@ class OpencodeTuiSeedTest(unittest.TestCase):
 
 
 class HerdrIntegrationAdoptionTest(unittest.TestCase):
+    def test_official_herdr_assets_are_copied_to_runtime_homes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "runtime-home"
+            with mock.patch.object(activation.paths, "runtime_home", return_value=home):
+                expected = {
+                    "claude": {"hooks/herdr-agent-state.sh"},
+                    "codex": {"herdr-agent-state.sh"},
+                    "opencode": {"plugins/herdr-agent-state.js", "herdr-tui-session.js",
+                                 "herdr-opencode/tui.js"},
+                }
+                for runtime, dests in expected.items():
+                    entries = activation._linked_entries(runtime, REPO_ROOT, "global")
+                    assets = [entry for entry in entries
+                              if Path(entry["dest"]).relative_to(home).as_posix() in dests]
+                    self.assertEqual({Path(entry["dest"]).relative_to(home).as_posix()
+                                      for entry in assets}, dests)
+                    self.assertEqual(len(assets), len(dests), assets)
+                    self.assertTrue(all(entry["kind"] == "copy" for entry in assets), assets)
+
     def _write(self, path, *lines):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines) + "\n")

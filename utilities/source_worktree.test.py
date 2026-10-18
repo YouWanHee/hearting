@@ -37,6 +37,25 @@ class SourceWorktreeFixture(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         base = Path(self.tmp.name)
+        # A direct test invocation can inherit repository redirection from a
+        # hook or caller. Isolate Git before the first fixture Git operation,
+        # not only before the production helper is called.
+        fixture_home = base / "home"
+        fixture_home.mkdir()
+        fixture_env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_",
+                                  "AGENT_ROUTE_", "AGENT_ARTIFACT_"))
+        }
+        fixture_env.update({
+            "HOME": str(fixture_home), "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
+            "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(base / "jobs.log"),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+        })
+        self.env = mock.patch.dict(os.environ, fixture_env, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
         self.origin = base / "origin.git"
         self.primary = base / "repo"
         self.writer = base / "writer"
@@ -71,16 +90,7 @@ class SourceWorktreeFixture(unittest.TestCase):
         self.prompt.write_text("Implement the approved source change.\n", encoding="utf-8")
         self.evidence = base / "primary-evidence.json"
         self.evidence.write_text(json.dumps({"tuples": [{"checked_worktree": str(self.primary)}]}), encoding="utf-8")
-        fixture_env = {key: value for key, value in os.environ.items()
-                       if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_",
-                                              "AGENT_ROUTE_", "AGENT_ARTIFACT_"))}
-        fixture_env.update({
-            "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(self.jobs),
-            "AGENT_ARTIFACT_CHECKPOINT": "off",
-        })
-        self.env = mock.patch.dict(os.environ, fixture_env, clear=True)
-        self.env.start()
-        self.addCleanup(self.env.stop)
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         self.start_calls = []
         self.transport_calls = []
         self.real_start_work = W.start_work
@@ -113,7 +123,7 @@ class SourceWorktreeFixture(unittest.TestCase):
                 mock.patch.object(W, "start_work", side_effect=self.start_work):
             return R.main()
 
-    def start_work(self, route, path, jobs):
+    def start_work(self, route, path, jobs, **_kwargs):
         if route.get("effective_intensity") == "direct":
             self.start_calls.append((route, Path(path)))
             return {"state": "inline", "required_action": "execute-inline", "owner_started": False,
@@ -196,8 +206,55 @@ class SourceWorktreeFixture(unittest.TestCase):
         self.assertEqual(self.start_calls[0][0]["artifact_root"], str(self.artifact_root.resolve()))
 
 class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
+    def test_read_only_changed_file_status_disables_optional_index_refresh(self):
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(R.subprocess, "run", return_value=result) as run:
+            self.assertEqual(R._git_changed_files(self.primary), set())
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+
     def test_compose_start_fetch_failure_retries_same_request_once(self):
         self.assert_failure_then_retry("fetch")
+
+    def test_repository_without_remotes_uses_primary_head_and_reuses_reservation(self):
+        git(self.primary, "remote", "remove", "origin")
+        before = self.primary_fingerprint()
+        real_git = R._worktree_git
+        calls = []
+
+        def record_git(cwd, *args):
+            calls.append(args)
+            return real_git(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=record_git):
+            self.assertEqual(self.main(self.argv()), 0)
+        route, _ = self.start_calls[0]
+        self.assertEqual(git(route["cwd"], "rev-parse", "HEAD"), git(self.primary, "rev-parse", "HEAD"))
+        self.assertNotIn(("ls-remote", "--symref", "origin", "HEAD"), calls)
+        self.assertFalse(any(args[:1] == ("fetch",) for args in calls))
+        self.assertEqual(self.primary_fingerprint(), before)
+        allocated = route["cwd"]
+
+        calls.clear()
+        with mock.patch.object(R, "_worktree_git", side_effect=record_git):
+            self.assertEqual(self.main(self.argv()), 0)
+        self.assertEqual(len(self.route_files()), 1)
+        self.assertEqual(self.start_calls[-1][0]["cwd"], allocated)
+        self.assertNotIn(("ls-remote", "--symref", "origin", "HEAD"), calls)
+        self.assertFalse(any(args[:1] == ("fetch",) for args in calls))
+
+    def test_repository_without_remotes_or_commit_fails_before_publication(self):
+        empty = Path(self.tmp.name) / "empty-repo"
+        empty.mkdir()
+        git(empty, "init", "-q", "-b", "main")
+        base, reason, _ = R._remote_default_base(empty)
+        self.assertIsNone(base)
+        self.assertEqual(reason, "local-default-unresolved")
+        argv = self.argv()
+        argv[argv.index("--cwd") + 1] = str(empty)
+        self.evidence.write_text(json.dumps({"tuples": [{"checked_worktree": str(empty)}]}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "source-worktree-preparation-failed"):
+            self.main(argv)
+        self.assertEqual((self.route_files(), self.start_calls, self.owner_attempt_rows()), ([], [], []))
 
     def test_compose_start_worktree_add_failure_retries_same_request_once(self):
         self.assert_failure_then_retry("add")
@@ -286,6 +343,131 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         self.assertEqual(route["cwd"], str(self.primary.resolve()))
         self.assertFalse((self.primary.parent / "repo-wt").exists())
 
+    def test_nonstart_direct_then_start_route_records_the_existing_cwd_bypass(self):
+        compose_argv = ["capability-route.py", "compose", "--slug", "nonstart-direct",
+                        "--shape", "direct", "--capability", "autopilot-code",
+                        "--prompt-file", str(self.prompt), "--cwd", str(self.primary),
+                        "--artifact-root", str(self.artifact_root), "--unassigned",
+                        "--jobs", str(self.jobs), "--spec-read", "fixture"]
+        self.assertEqual(self.main(compose_argv), 0)
+        route_file, = self.route_files()
+        route = json.loads(route_file.read_text(encoding="utf-8"))
+        self.assertEqual(self.start_calls, [])
+
+        start_argv = ["capability-route.py", "start", "--route", str(route_file),
+                      "--jobs", str(self.jobs)]
+        self.assertEqual(self.main(start_argv), 0)
+        self.assertEqual(len(self.start_calls), 1)
+        started_route, _route_path = self.start_calls[0]
+        observation = {
+            "route_file": str(route_file),
+            "compose_cwd": route["cwd"],
+            "start_cwd": started_route["cwd"],
+            "worktree_prepared": bool((self.primary.parent / "repo-wt").exists()),
+            "primary_cwd": str(self.primary.resolve()),
+        }
+        print("direct-compose-start-route-probe=" + json.dumps(observation, sort_keys=True))
+        # This records what a sealed route does today without asserting that
+        # the unprepared primary cwd is the desired contract. The follow-up
+        # remains outside this execute scope.
+        self.assertEqual(started_route["cwd"], route["cwd"])
+
+
+    def test_explicit_worktree_add_failure_removes_its_new_unchanged_branch(self):
+        before = self.primary_fingerprint()
+        real_git = R._worktree_git
+
+        def explicit_add_failure(cwd, *args):
+            if args[:2] == ("worktree", "add"):
+                return subprocess.CompletedProcess(["git", *args], 128, "", "explicit fixture failure")
+            return real_git(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=explicit_add_failure), \
+                self.assertRaisesRegex(ValueError, "source-worktree-preparation-failed"):
+            self.main(self.argv())
+        record_file, = (self.artifact_root / ".runtime" / "worktree-preparation").glob("*.json")
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "reserved")
+        self.assertFalse(Path(record["path"]).exists())
+        branch = subprocess.run(["git", "-C", str(self.primary), "show-ref", "--verify", "--quiet",
+                                 f"refs/heads/{record['branch']}"], capture_output=True)
+        self.assertEqual(branch.returncode, 1)
+        self.assertEqual(self.primary_fingerprint(), before)
+        self.assertEqual((self.route_files(), self.start_calls, self.owner_attempt_rows()), ([], [], []))
+
+    def test_uncertain_worktree_add_keeps_its_branch_for_normal_resume(self):
+        real_git = R._worktree_git
+
+        def uncertain_add(cwd, *args):
+            if args[:2] == ("worktree", "add"):
+                interrupted = subprocess.CompletedProcess(
+                    ["git", *args], 128, "", "simulated interruption after branch creation")
+                interrupted.git_uncertain = True
+                return interrupted
+            return real_git(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=uncertain_add), \
+                self.assertRaisesRegex(ValueError, "source-worktree-preparation-failed"):
+            self.main(self.argv())
+        record_file, = (self.artifact_root / ".runtime" / "worktree-preparation").glob("*.json")
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "reserved")
+        self.assertEqual(git(self.primary, "rev-parse", f"refs/heads/{record['branch']}"), self.remote_sha)
+        self.assertEqual(self.main(self.argv()), 0)
+        route, = [json.loads(path.read_text(encoding="utf-8")) for path in self.route_files()]
+        self.assertEqual(route["cwd"], record["path"])
+
+    def test_allocator_avoids_tag_dwim_and_default_branch_names(self):
+        git(self.primary, "tag", "opencode")
+        tag_collision = R.prepare_isolated_worktree(
+            self.primary, "opencode", artifact_root=self.artifact_root,
+            preparation_key={"kind": "tag-collision"},
+        )
+        self.assertEqual(tag_collision["state"], "created")
+        self.assertEqual(tag_collision["branch"], "opencode-2")
+        default_collision = R.prepare_isolated_worktree(
+            self.primary, "main", artifact_root=self.artifact_root,
+            preparation_key={"kind": "default-collision"},
+        )
+        self.assertEqual(default_collision["state"], "created")
+        self.assertEqual(default_collision["branch"], "main-2")
+
+    def test_failed_branch_cleanup_preserves_moved_and_checked_out_refs(self):
+        moved = "moved-task"
+        git(self.primary, "branch", moved, "HEAD")
+        moved_result = R._cleanup_failed_worktree_branch(self.primary, moved, "0" * len(self.remote_sha))
+        self.assertEqual(moved_result["state"], "preserved")
+        self.assertEqual(git(self.primary, "rev-parse", f"refs/heads/{moved}"),
+                         git(self.primary, "rev-parse", "HEAD"))
+
+        occupied = "occupied-task"
+        local_head = git(self.primary, "rev-parse", "HEAD")
+        git(self.primary, "branch", occupied, local_head)
+        occupied_path = self.primary.parent / "occupied-worktree"
+        git(self.primary, "worktree", "add", str(occupied_path), f"refs/heads/{occupied}")
+        git(occupied_path, "checkout", "-B", occupied, f"refs/heads/{occupied}")
+        occupied_result = R._cleanup_failed_worktree_branch(self.primary, occupied, local_head)
+        self.assertEqual(occupied_result["state"], "preserved")
+        self.assertEqual(occupied_result["reason"], "branch-worktree-used-or-unobservable")
+        self.assertEqual(git(self.primary, "rev-parse", f"refs/heads/{occupied}"), local_head)
+
+    def test_compare_and_swap_preserves_a_ref_moved_during_cleanup(self):
+        branch = "cas-race"
+        base = git(self.primary, "rev-parse", "HEAD")
+        moved = git(self.primary, "rev-parse", "HEAD^")
+        git(self.primary, "branch", branch, base)
+        real_git = R._worktree_git
+
+        def move_before_cas(cwd, *args):
+            if args[:2] == ("update-ref", "-d"):
+                git(cwd, "branch", "-f", branch, moved)
+            return real_git(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=move_before_cas):
+            result = R._cleanup_failed_worktree_branch(self.primary, branch, base)
+        self.assertEqual((result["state"], result["reason"]), ("preserved", "compare-and-swap-refused"))
+        self.assertEqual(git(self.primary, "rev-parse", f"refs/heads/{branch}"), moved)
+
 
 class Sha256PreparationTest(SourceWorktreeFixture):
     object_format = "sha256"
@@ -306,15 +488,13 @@ class Sha256PreparationTest(SourceWorktreeFixture):
         before = self.primary_fingerprint()
         real_git = R._worktree_git
 
-        def interrupt_after_branch(cwd, *args):
-            if args[:3] == ("worktree", "add", "-b"):
-                branch, _, base_sha = args[3:]
-                git(cwd, "branch", branch, base_sha)
+        def fail_after_ref_allocation(cwd, *args):
+            if args[:2] == ("worktree", "add"):
                 return subprocess.CompletedProcess(
-                    ["git", *args], 128, "", "simulated interruption after branch creation")
+                    ["git", *args], 128, "", "simulated worktree add failure")
             return real_git(cwd, *args)
 
-        with mock.patch.object(R, "_worktree_git", side_effect=interrupt_after_branch), \
+        with mock.patch.object(R, "_worktree_git", side_effect=fail_after_ref_allocation), \
                 self.assertRaisesRegex(ValueError, "source-worktree-preparation-failed"):
             self.main(argv)
         self.assertEqual(self.primary_fingerprint(), before)
@@ -323,13 +503,16 @@ class Sha256PreparationTest(SourceWorktreeFixture):
         record = json.loads(record_file.read_text(encoding="utf-8"))
         self.assertEqual((record["state"], record["base_sha"]), ("reserved", self.remote_sha))
         self.assertFalse(Path(record["path"]).exists())
-        self.assertEqual(git(self.primary, "rev-parse", record["branch"]), self.remote_sha)
+        branch_state = subprocess.run(
+            ["git", "-C", str(self.primary), "show-ref", "--verify", "--quiet",
+             f"refs/heads/{record['branch']}"], capture_output=True, text=True)
+        self.assertNotEqual(branch_state.returncode, 0)
         resumed_adds = []
 
         def resume_existing_branch(cwd, *args):
             self.assertNotIn(args[:1], (("ls-remote",), ("fetch",)))
             if args[:2] == ("worktree", "add"):
-                self.assertEqual(args, ("worktree", "add", record["path"], record["branch"]))
+                self.assertEqual(args, ("worktree", "add", record["path"], f"refs/heads/{record['branch']}"))
                 resumed_adds.append(args)
             return real_git(cwd, *args)
 
@@ -344,6 +527,99 @@ class Sha256PreparationTest(SourceWorktreeFixture):
         self.assertEqual((len(self.start_calls), len(self.owner_attempt_rows())), (1, 1))
         ready = json.loads(record_file.read_text(encoding="utf-8"))
         self.assertEqual((ready["state"], ready["path"]), ("ready", record["path"]))
+
+
+class GitRefNamespacePreparationTest(SourceWorktreeFixture):
+    def test_native_common_git_ref_collision_uses_a_suffix_and_preserves_marker(self):
+        common = Path(git(self.primary, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        local_sha = git(self.primary, "rev-parse", "HEAD")
+        (common / "opencode").write_text(local_sha + "\n", encoding="utf-8")
+        git(self.primary, "tag", "opencode", local_sha)
+        git(self.primary, "pack-refs", "--all")
+        ambiguous_path = Path(self.tmp.name) / "ambiguous-opencode"
+        probe = subprocess.run(
+            ["git", "-C", str(self.primary), "worktree", "add", "-b", "opencode",
+             str(ambiguous_path), local_sha], capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("ambiguous", probe.stderr.lower())
+
+        result = R.prepare_isolated_worktree(
+            self.primary, "opencode", artifact_root=self.artifact_root,
+            preparation_key={"request": "native common ref collision"})
+        self.assertEqual(result["branch"], "opencode-2")
+        self.assertEqual((common / "opencode").read_text(encoding="utf-8"), local_sha + "\n")
+        remote = R.prepare_isolated_worktree(
+            self.primary, "origin", artifact_root=self.artifact_root,
+            preparation_key={"request": "remote ref namespace collision"})
+        self.assertEqual(remote["branch"], "origin-2")
+        git(self.primary, "symbolic-ref", "refs/tags/symbolic-only", "refs/heads/main")
+        symbolic = R.prepare_isolated_worktree(
+            self.primary, "symbolic-only", artifact_root=self.artifact_root,
+            preparation_key={"request": "symbolic tag collision"})
+        self.assertEqual(symbolic["branch"], "symbolic-only-2")
+        git(self.primary, "update-ref", "refs/pseudo-name", local_sha)
+        pseudo = R.prepare_isolated_worktree(
+            self.primary, "pseudo-name", artifact_root=self.artifact_root,
+            preparation_key={"request": "refs root collision"})
+        self.assertEqual(pseudo["branch"], "pseudo-name-2")
+        git(self.primary, "update-ref", "refs/heads/treeish/child", local_sha)
+        directory_conflict = R.prepare_isolated_worktree(
+            self.primary, "treeish", artifact_root=self.artifact_root,
+            preparation_key={"request": "branch d-f collision"})
+        self.assertEqual(directory_conflict["branch"], "treeish-2")
+        git(self.primary, "branch", "branch-only")
+        branch_conflict = R.prepare_isolated_worktree(
+            self.primary, "branch-only", artifact_root=self.artifact_root,
+            preparation_key={"request": "existing head ref"})
+        self.assertEqual(branch_conflict["branch"], "branch-only-2")
+        occupied = Path(self.tmp.name) / "repo-wt" / "path-only"
+        occupied.mkdir(parents=True)
+        (occupied / "preserve.txt").write_text("occupied path\n", encoding="utf-8")
+        path_conflict = R.prepare_isolated_worktree(
+            self.primary, "path-only", artifact_root=self.artifact_root,
+            preparation_key={"request": "occupied worktree path"})
+        self.assertEqual(path_conflict["branch"], "path-only-2")
+        self.assertEqual((occupied / "preserve.txt").read_text(encoding="utf-8"), "occupied path\n")
+
+    def test_concurrent_distinct_preparations_allocate_distinct_refs(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        local_sha = git(self.primary, "rev-parse", "HEAD")
+        preparations = ({"request": "parallel request one"}, {"request": "parallel request two"})
+        with mock.patch.object(R, "_remote_default_base",
+                               return_value=({"branch": "main", "sha": local_sha}, None, None)):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    lambda key: R.prepare_isolated_worktree(
+                        self.primary, "parallel", artifact_root=self.artifact_root,
+                        preparation_key=key), preparations))
+        self.assertEqual({item["state"] for item in results}, {"created"})
+        self.assertEqual({item["branch"] for item in results}, {"parallel", "parallel-2"})
+        self.assertNotEqual(results[0]["path"], results[1]["path"])
+        self.assertEqual({git(item["path"], "rev-parse", "HEAD") for item in results}, {local_sha})
+
+    def test_failed_branch_cleanup_restores_a_concurrently_attached_ref(self):
+        branch = "concurrent-cleanup"
+        local_sha = git(self.primary, "rev-parse", "HEAD")
+        git(self.primary, "update-ref", f"refs/heads/{branch}", local_sha, "0" * len(local_sha))
+        worktree = Path(self.tmp.name) / "concurrent-cleanup-worktree"
+        real = R._worktree_git
+        attached = {"done": False}
+
+        def attach_between_scan_and_cas(cwd, *args):
+            if args[:2] == ("rev-parse", "--verify") and not attached["done"]:
+                attached["done"] = True
+                added = real(self.primary, "worktree", "add", str(worktree), branch)
+                self.assertEqual(added.returncode, 0, added.stderr)
+            return real(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=attach_between_scan_and_cas):
+            removed = R._release_owned_branch(self.primary, branch, local_sha)
+
+        self.assertFalse(removed)
+        self.assertTrue(attached["done"])
+        self.assertEqual(git(self.primary, "rev-parse", "--verify", f"refs/heads/{branch}"), local_sha)
+        self.assertEqual(git(worktree, "symbolic-ref", "--short", "HEAD"), branch)
 
 
 if __name__ == "__main__":

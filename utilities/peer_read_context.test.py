@@ -27,15 +27,17 @@ class PeerReadContextTest(unittest.TestCase):
     def test_attempt_rows_are_indexed_once_and_keep_latest_exact_row(self):
         self.jobs.write_text("\n".join((row("att-a", "queued"), row("att-b"),
                                           row("att-a", "running", slug="latest"))) + "\n")
+        CACHE.reset_metrics()
         context = PeerReadContext()
-        with mock.patch.object(CACHE, "registry_lines", wraps=CACHE.registry_lines) as read:
-            first = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
-            second = JOIN.current_attempt_row(self.jobs, "att-b", read_context=context)
-            again = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+        first = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+        second = JOIN.current_attempt_row(self.jobs, "att-b", read_context=context)
+        again = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
         self.assertEqual((first.status, first.slug, first.order), ("running", "latest", 2))
         self.assertEqual(second.attempt_id, "att-b")
         self.assertEqual(again.raw, first.raw)
-        read.assert_called_once_with(self.jobs)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
 
     def test_unrelated_invalid_schema_is_ignored_and_exact_invalid_schema_fails(self):
         self.jobs.write_text(row("att-good") + "\n" + row("att-bad", schema="1") + "\n")
@@ -74,6 +76,37 @@ class PeerReadContextTest(unittest.TestCase):
         other_scan_loader = mock.Mock(return_value=[])
         self.assertEqual(PeerReadContext().handover_rows(seat, other_scan_loader), ())
         other_scan_loader.assert_called_once_with()
+
+    def test_recipient_census_is_memoized_per_endpoint_and_per_scan(self):
+        context = PeerReadContext()
+        agents = [{"agent": "codex", "agent_session": {"value": "sid-a"}}]
+        loader = mock.Mock(return_value=agents)
+        self.assertIs(context.recipient_census("server-a", loader), agents)
+        self.assertIs(context.recipient_census("server-a", loader), agents)
+        loader.assert_called_once_with()
+
+        other_endpoint = mock.Mock(return_value=[])
+        self.assertEqual(context.recipient_census("server-b", other_endpoint), [])
+        other_endpoint.assert_called_once_with()
+        next_scan = mock.Mock(return_value=agents)
+        self.assertIs(PeerReadContext().recipient_census("server-a", next_scan), agents)
+        next_scan.assert_called_once_with()
+
+    def test_transfer_root_candidates_are_resolved_once_per_scan(self):
+        context = PeerReadContext()
+        roots = [Path(self.tmp.name) / "current", Path(self.tmp.name) / "legacy"]
+        loader = mock.Mock(return_value=(roots, "fixture"))
+
+        first = context.transfer_roots(loader)
+        second = context.transfer_roots(loader)
+
+        self.assertEqual(first, tuple(roots))
+        self.assertIs(first, second)
+        loader.assert_called_once_with()
+
+        next_scan = mock.Mock(return_value=(roots, "fixture"))
+        self.assertEqual(PeerReadContext().transfer_roots(next_scan), tuple(roots))
+        next_scan.assert_called_once_with()
 
 
 if __name__ == "__main__":

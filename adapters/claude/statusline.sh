@@ -27,7 +27,6 @@ model = m.get("display_name") or m.get("id") or "?"
 mid = (m.get("id") or "").lower()
 effort = ((d.get("effort") or {}).get("level") or "")  # reasoning effort: low|medium|high|xhigh|max
 sid = d.get("session_id") or ""
-session_name = d.get("session_name") or ""
 tpath = d.get("transcript_path") or ""
 rl = d.get("rate_limits") or {}
 def rlpct(k):
@@ -81,7 +80,6 @@ print("S_MS=" + shlex.quote(" ".join(ms_parts)))
 print("S_MODEL=" + shlex.quote(model))
 print("S_EFFORT=" + shlex.quote(effort))
 print("S_SID=" + shlex.quote(sid))
-print("S_SESSION_NAME=" + shlex.quote(session_name if isinstance(session_name, str) else ""))
 print("S_TRANSCRIPT=" + shlex.quote(tpath))
 print("S_5H=" + shlex.quote(rlpct("five_hour")))
 print("S_7D=" + shlex.quote(rlpct("seven_day")))
@@ -89,7 +87,7 @@ print("S_5H_RST=" + shlex.quote(rlrem("five_hour")))
 print("S_7D_RST=" + shlex.quote(rlrem("seven_day")))
 print("S_CTX=" + shlex.quote(str(cpct)))
 ' 2>/dev/null)"
-: "${S_CWD:=$PWD}" "${S_MODEL:=?}" "${S_EFFORT:=}" "${S_SID:=}" "${S_SESSION_NAME:=}" "${S_5H:=}" "${S_7D:=}" "${S_5H_RST:=}" "${S_7D_RST:=}" "${S_CTX:=-1}" "${S_MS:=}" "${S_TRANSCRIPT:=}"
+: "${S_CWD:=$PWD}" "${S_MODEL:=?}" "${S_EFFORT:=}" "${S_SID:=}" "${S_5H:=}" "${S_7D:=}" "${S_5H_RST:=}" "${S_7D_RST:=}" "${S_CTX:=-1}" "${S_MS:=}" "${S_TRANSCRIPT:=}"
 
 # F-87/F-99 shared session handle projection; unavailable helpers are deliberately silent.
 # Own pid + /proc starttime (F-26 tier-2 identity — see the tap write below, whose own
@@ -120,28 +118,32 @@ S_SESSION_DISPLAY=""
 session_helper="$AGENT_HOME/tools/fleet/session_handle.py"
 [ -f "$session_helper" ] || session_helper="$(dirname "$AGENT_HOME")/tools/fleet/session_handle.py"
 if [ -n "$S_SID" ] && [ -f "$session_helper" ]; then
-  S_SESSION_DISPLAY=$(python3 - "$session_helper" "$S_SID" "$tap_pid" "$S_CWD" "$S_SESSION_NAME" <<'PY' 2>/dev/null || true
+  S_SESSION_DISPLAY=$(python3 - "$session_helper" "$S_SID" "$tap_pid" "$S_CWD" <<'PY' 2>/dev/null || true
 import importlib.util, sys
 try:
     spec = importlib.util.spec_from_file_location("fleet_session_handle", sys.argv[1])
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    sid, pid_raw, cwd, session_name = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+    sid, pid_raw, cwd = sys.argv[2], sys.argv[3], sys.argv[4]
     pid = int(pid_raw) if pid_raw.isdigit() else None
     inputs = mod.resolve_display_inputs("claude", sid, pid=pid)
-    # `title` carries the stdin session_name (AI-generated title or a not-yet-classified
-    # user name) — it only wins when nameSource left `runtime_name` empty (Amendment 2:
-    # this must NOT be treated as ① unconditionally, or a derived-nameSource session
-    # would show a different string here than Fleet's own title-chain fixture).
-    name = mod.display_name("claude", sid, runtime_name=inputs.get("runtime_name"),
-                             registry_name=inputs.get("registry_name"),
-                             title=session_name or None, slug=None, cwd=cwd)
+    # Import title storage from the same checkout/release tools directory as the
+    # file-path-loaded helper. Native session_name may be an automatic title and
+    # derived labels are not user names, so neither can replace an absent success.
+    import os
+    tools_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[1])))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from fleet.titles import last_title
+    title = last_title(sid, harness="claude")
+    name = mod.current_session_subject(inputs.get("runtime_name"), title)
     # 2026-09-09 사용자 결정: statusline 은 제목만 진다. `[46]` 식별 배지는 herdr pane
     # 상단 제목(`[46] ⚑ claude <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
     # 억지로 신원을 맞추는 대신 세 하네스가 공유하는 바깥 표면 하나에 둔다.
     # 제목이 없어 이름이 디렉토리로 떨어지면 왼쪽 `📁 <dir>` 세그먼트와 같은 말이 되므로
     # 그 경우엔 아무것도 출력하지 않는다.
     base = (cwd or "").rstrip("/").rsplit("/", 1)[-1]
-    if name and name != base:
+    explicit_name = mod.sanitize_title(inputs.get("runtime_name"))
+    if name and (explicit_name or name != base):
         print(mod.clip_cells(name, 48))
 except Exception:
     pass
@@ -410,8 +412,11 @@ def live_stage(jcwd, slug, fb):
     except Exception: pass
     try:   # 워크트리 소스 dirty = execute 중 (디자인팀 직접편집 등 dev_logs 미경유 흐름)
         import subprocess
+        # GIT_OPTIONAL_LOCKS=0: the 2 s timeout SIGKILLs a slow status, and one killed
+        # mid index refresh leaves a holderless index.lock that blocks every later commit there.
         if subprocess.run(["git", "-C", jcwd, "status", "--porcelain", "--untracked-files=no"],
-                          capture_output=True, text=True, timeout=2).stdout.strip():
+                          capture_output=True, text=True, timeout=2,
+                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout.strip():
             return "exec"
     except Exception: pass
     if os.path.exists(pd + "/plan/plan.md"): return "plan"

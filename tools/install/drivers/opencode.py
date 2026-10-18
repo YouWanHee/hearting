@@ -173,6 +173,14 @@ def install(scope="global", plugin=False, dry_run=False):
             )
             continue
 
+        if action == "copy_managed":
+            projected = herdr_integration.project_asset(
+                Path(entry["source"]), Path(entry["dest"]), entry["integration_id"],
+                dry_run=dry_run, allowed_root=paths.runtime_home(RUNTIME, scope))
+            actions.append(projected)
+            blocked = blocked or projected.get("status") == "blocked"
+            continue
+
         if action == "symlink":
             source = Path(entry["source"])
             dest = Path(entry["dest"])
@@ -366,6 +374,15 @@ def checks(scope="global"):
             check_list.append(
                 verifier.check_symlink(check_id, dest, entry["source"])
             )
+        elif action == "copy_managed":
+            dest = Path(entry["dest"])
+            integration_id = entry["integration_id"]
+            check_list.append({
+                "id": f"opencode.herdr.installed.{integration_id}",
+                "ok": herdr_integration.version_marker(
+                    dest, integration_id, herdr_integration.VERSIONS[RUNTIME]),
+                "detail": f"{dest} carries the current {integration_id} integration",
+            })
         elif action == "seed_once":
             check_list.append(
                 user_model_config.verification_check(

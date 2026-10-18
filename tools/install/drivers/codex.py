@@ -97,10 +97,15 @@ def install(scope="global", plugin=False, dry_run=False):
     try:
         tui_result = codex_tui_config.apply_status_line(
             runtime_home / "config.toml", fragment, dry_run=dry_run)
+        detail = "thread-id is last; other items and explicit colors are preserved"
+        if tui_result.get("startup_changed"):
+            detail += "; absent startup-update setting defaults to false"
+        if tui_result.get("startup_error"):
+            detail += f"; startup-update default skipped: {tui_result['startup_error']}"
         tui_action = {"action": "codex-tui-statusline", "dest": tui_result["path"],
                       "status": ("planned" if dry_run and tui_result["changed"] else
                                  "updated" if tui_result["changed"] else "unchanged"),
-                      "detail": "thread-id is last; other items and explicit colors are preserved"}
+                      "detail": detail}
     except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
         tui_action = {"action": "codex-tui-statusline", "dest": str(runtime_home / "config.toml"),
                       "status": "skipped", "detail": str(exc)}
@@ -119,6 +124,12 @@ def install(scope="global", plugin=False, dry_run=False):
                     "detail": entry["reason"],
                 }
             )
+            continue
+
+        if action == "copy_managed":
+            actions.append(herdr_integration.project_asset(
+                Path(entry["source"]), Path(entry["dest"]), entry["integration_id"],
+                dry_run=dry_run, allowed_root=runtime_home))
             continue
 
         if action == "symlink":
@@ -283,6 +294,15 @@ def checks(scope="global"):
             dest_path = Path(dest)
             check_id = f"codex.symlink.{dest_path.parent.name}.{dest_path.name}"
             check_list.append(verifier.check_symlink(check_id, dest, entry["source"]))
+        elif entry["action"] == "copy_managed":
+            dest = Path(entry["dest"])
+            integration_id = entry["integration_id"]
+            check_list.append({
+                "id": f"codex.herdr.installed.{integration_id}",
+                "ok": herdr_integration.version_marker(
+                    dest, integration_id, herdr_integration.VERSIONS[RUNTIME]),
+                "detail": f"{dest} carries the current {integration_id} integration",
+            })
         elif entry["action"] == "seed_once":
             check_list.append(
                 user_model_config.verification_check(

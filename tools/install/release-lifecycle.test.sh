@@ -579,7 +579,11 @@ print("ok - managed release install/update/rollback/security/scheduler/build")
 PY
 
 env -u AGENT_HOME "$ROOT/tools/install/harness.sh" --help >/dev/null
-python3 -m py_compile "$ROOT/tools/install/distribution.py" "$ROOT/tools/install/build-release.py" "$ROOT/tools/install/installer.py"
+# `py_compile` writes explicitly even with PYTHONDONTWRITEBYTECODE; keep its
+# cache inside this test's private fixture rather than an inherited host path.
+PYTHONPYCACHEPREFIX="$TMP/python-pycache" \
+  python3 -m py_compile "$ROOT/tools/install/distribution.py" \
+    "$ROOT/tools/install/build-release.py" "$ROOT/tools/install/installer.py"
 sh -n "$ROOT/install.sh" "$ROOT/tools/install/harness.sh"
 ! grep -Fq "raw.githubusercontent.com" "$ROOT/install.sh"
 echo "ok - release launcher and syntax"

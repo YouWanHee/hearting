@@ -2,6 +2,6 @@
   "$schema": "https://opencode.ai/cli.json",
   "plugins": [
     "./hearting-tui-identity.ts",
-    "./herdr-opencode"
+    "../herdr-opencode"
   ]
 }

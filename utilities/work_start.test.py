@@ -2592,6 +2592,973 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
         self.assertEqual(result["redirected_from"], "att-owner")
 
 
+class NeverStartedReplacementNormalStartTest(unittest.TestCase):
+    """Normal route start follows claim lineage while never-started rows remain reservations."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.jobs = self.root / "jobs.log"
+        self.jobs.touch()
+        self.path = self.root / "route.json"
+        self.route = {}
+        self.calls = []
+        self.ready = False
+        self.released = False
+        self.statuses = {}
+        self.parent = mock.patch.object(W, "default_parent_session_id", return_value="parent")
+        self.parent.start()
+        self.addCleanup(self.parent.stop)
+        import artifact_lifecycle
+        import artifact_producer
+        import session_tidy
+        import dispatch_contract
+        import dispatch_owner_input
+        import dispatch_replacement
+        import route_parent_close
+
+        self.reports = self.root / "reports"
+        self.reports.mkdir()
+        self.private_home = self.root / "agent-home"
+        (self.private_home / "core").mkdir(parents=True)
+        (self.private_home / "core" / "CORE.md").write_text("fixture\n")
+        fixture_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(self.root / "home"),
+            "AGENT_HOME": str(self.private_home),
+            "AGENT_ARTIFACT_ROOT": str(self.reports),
+            "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            "AGENT_CODEX_MANAGED_GATEWAY": "0",
+            "AGENT_DISPATCH_CALLER_HARNESS": "codex",
+            "CODEX_THREAD_ID": "parent",
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_RUNTIME_DIR": str(self.root / "runtime"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "TMPDIR": str(self.root / "tmp"),
+        }
+        self.runtime_environment = mock.patch.dict(os.environ, fixture_env, clear=True)
+        self.runtime_environment.start()
+        self.addCleanup(self.runtime_environment.stop)
+        for name in ("home", "state", "runtime", "cache", "tmp"):
+            (self.root / name).mkdir(mode=0o700)
+        self.join = mock.patch.object(W, "join_selected_attempts", side_effect=self.observe)
+        self.join.start()
+        self.addCleanup(self.join.stop)
+        self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
+        self.current.start()
+        self.addCleanup(self.current.stop)
+        self.gate = mock.patch.object(W, "owner_frame_launch_gate", side_effect=self.owner_gate)
+        self.gate.start()
+        self.addCleanup(self.gate.stop)
+        self.pair = mock.patch.object(W, "completion_marker_gate")
+        self.pair.start()
+        self.addCleanup(self.pair.stop)
+        self.seat_root = mock.patch.object(session_tidy, "state_root", return_value=self.root / "seat-state")
+        self.seat_root.start()
+        self.addCleanup(self.seat_root.stop)
+
+        self._original_owner_continuation_processes = route_parent_close.owner_continuation_processes
+
+        def owner_observation(meta, jobs):
+            if meta.get("pid"):
+                return self._original_owner_continuation_processes(meta, jobs)
+            status = W._rows(jobs).get(meta.get("attempt_id"), ("done", {}))[0]
+            return SimpleNamespace(state="live" if status in {"open", "running"} else "quiescent",
+                                   reason="fixture-observation"), []
+
+        self.process = mock.patch.object(route_parent_close, "owner_continuation_processes",
+                                         side_effect=owner_observation)
+        self.process.start()
+        self.addCleanup(self.process.stop)
+
+        self.route_module = W._route_module()
+        self.producer = artifact_producer
+        self.owner_input = dispatch_owner_input
+        self.replacement = dispatch_replacement
+        self.contract = dispatch_contract
+        self.process_probe = mock.patch.object(
+            dispatch_contract, "attempt_process_quiescence", side_effect=self._fixture_quiescence)
+        self.process_probe.start()
+        self.addCleanup(self.process_probe.stop)
+        self.capacity_probe = mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None)
+        self.capacity_probe.start()
+        self.addCleanup(self.capacity_probe.stop)
+        self._prepare_route(artifact_lifecycle)
+        self.launches = []
+        self.delivered_prompts = {}
+        self.replacement_launches = 0
+        self.timeout_launches = set()
+        self.close_timed_out = True
+
+    def observe(self, **_kwargs):
+        return {"state": "timeout", "children": []}
+
+    def delivery(self, jobs, aid, **_kwargs):
+        row = W._rows(jobs).get(aid)
+        meta = row[1] if row else {}
+        verdict = "BLOCKED" if meta.get("failure_class") == "blocked" else "PASS"
+        values = dict(marker={"artifact": str(self.root / "result.md")},
+                      marker_digest="sha256:fixture", row_revision="1", row_digest="sha256:fixture",
+                      status=row[0] if row else "done", verdict=verdict,
+                      quiescent=bool(row and row[0] == "done"), owned_children=0,
+                      advanced=False, completion_proven=True)
+        values.update(self.statuses.get(aid, {}))
+        return CurrentDeliveryState(**values)
+
+    def owner_gate(self, *_args, **_kwargs):
+        if not self.released:
+            raise W.DispatchContractError("human-gate-unreleased", "fixture-gate")
+
+    @staticmethod
+    def _fixture_quiescence(_metadata, **_kwargs):
+        return SimpleNamespace(state="quiescent", reason="fixture-process-group-empty")
+
+    def _prepare_route(self, artifact_lifecycle):
+        route_module = self.route_module
+        gate = {"spec_read": {"satisfied": True, "source": "fixture"},
+                "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                "artifact_guard": {"satisfied": True, "source": "fixture"}}
+        evidence = {"tuples": [{
+            "parent_harness": "codex", "parent_transport": "headless",
+            "parent_sandbox": route_module.WRAPPER_PARENT_SANDBOXES["codex"][0],
+            "child_harness": "codex", "launch_authority": "conductor", "status": "supported",
+            "probe_source": "fixture", "probe_time": "2026-10-18T00:00:00Z", "failure_class": "",
+            "checked_worktree": str(route_module.ROOT), "failure_scope": "none",
+            "codex_command": "ok", "retry_on_isolated_worktree": 0,
+        }], "native_subagent": []}
+        registered = {"candidates": [{
+            "harness": harness, "transport": "headless", "surface": "registered-headless",
+            "status": "supported", "probe_source": "fixture", "probe_time": "2026-10-18T00:00:00Z",
+        } for harness in ("codex", "claude")]}
+        route = route_module.compile_route(
+            "autopilot-code", "dev", "quick", route_module.ROOT, self.reports,
+            predicates=[], transport=None, tracking="tracked", tracked_gate_evidence=gate,
+            registered_headless_evidence=registered, slug="fixture-task")
+        route["work_request"] = {"text": "Complete the approved code task.", "owner_harness": "codex"}
+        route["route_hash"] = route_module.route_hash(route)
+        route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+        route_module.verify_route(route)
+        self.producer.activate(
+            self.reports, repository_id="repo_" + "a" * 32,
+            artifact_root_id="root_" + "b" * 32,
+            w7={"campaign_id": "camp_" + "c" * 32})
+        binding = artifact_lifecycle.admit_runtime_route(self.reports, route)
+        self.path = Path(binding.route_file)
+        self.route = json.loads(self.path.read_text())
+        self.owner_node_id = next(node["id"] for node in self.route["nodes"]
+                                  if node.get("worker_type") == "owner")
+        self.producer.begin(
+            self.reports, route_file=self.path, capability="autopilot-code", intensity="quick",
+            jobs=self.root / "no-dispatch-registry.log")
+
+    def _argv(self, aid, parent_sid, parent_harness="codex"):
+        return ["--start", "--attempt-id", aid, "--worktree", self.route["cwd"],
+                "--route-file", str(self.path), "--route-id", self.route["route_id"],
+                "--route-hash", self.route["route_hash"], "--capability", self.route["capability"],
+                "--capability-mode", self.route["capability_mode"], "--intensity", "quick",
+                "--dispatch-depth", "1", "--worker-type", "owner", "--unit", "_kernel/owner",
+                "--route-node", self.owner_node_id,
+                "--parent-session-id", parent_sid, "--parent-harness", parent_harness,
+                "--prompt-text", self.route["work_request"]["text"]]
+
+    def _metadata(self, aid, parent_sid="parent", parent_harness="codex", task=None, argv=None,
+                  *, prior=None, record=None, route_source=None):
+        from types import SimpleNamespace
+        route = self.route
+        task = task or route["work_request"]["text"]
+        argv = argv or self._argv(aid, parent_sid, parent_harness)
+        args = SimpleNamespace(
+            attempt_id=aid, jobs_path=self.jobs, worktree=route["cwd"], route_id=route["route_id"],
+            route_hash=route["route_hash"], route_file=str(self.path), route_node=self.owner_node_id,
+            parent_session_id=parent_sid, parent_harness=parent_harness, parent_transport="headless",
+            parent_sandbox=self.route_module.WRAPPER_PARENT_SANDBOXES[parent_harness][0],
+            launch_authority="conductor",
+            sandbox="workspace-write", permission_mode="default", capability=route["capability"],
+            capability_mode=route["capability_mode"], intensity="quick", dispatch_depth=1,
+            worker_type="owner", harness="codex", transport="headless",
+            execution_surface="registered-headless", registered_worker=True,
+            fallback_hop="same-harness-headless", unit="_kernel/owner",
+            replacement_input_argv=argv,
+            owner_route_binding=SimpleNamespace(route_id=route["route_id"]))
+        metadata = {
+            "attempt_id": aid, "attempt_schema_version": "2", "dispatch_depth": "1",
+            "transport": "headless", "execution_surface": "registered-headless",
+            "registered_worker": "1", "fallback_hop": "same-harness-headless",
+            "worker_type": "owner", "unit": "_kernel/owner", "harness": "codex",
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "route_file": str(self.path), "route_node": self.owner_node_id, "owner_route_id": route["route_id"],
+            "owner_route_hash": route["route_hash"], "owner_route_file": str(self.path),
+            "parent_sid": parent_sid, "parent_harness": parent_harness,
+            "parent_transport": "headless", "capability": route["capability"],
+            "capability_mode": route["capability_mode"], "intensity": "quick",
+            "supervisor_lease_nonce": "fixture-" + aid,
+        }
+        if prior:
+            metadata.update(automatic_retry_of=prior,
+                            replacement_family_id=record["family_id"],
+                            replacement_original_attempt_id=prior, replacement_ordinal="1",
+                            replacement_claim_digest=self.replacement._digest(record))
+        metadata.update(self.contract.parse_registry_metadata(
+            self.replacement.seal_launch_input(args, "codex", task)))
+        return metadata
+
+    def _register(self, aid, *, parent_sid="parent", parent_harness="codex", prior=None,
+                  record=None, source=None, started=True, claimed=True):
+        if prior:
+            source = source or self.replacement._rows(self.jobs.read_text().splitlines())[prior][1]
+            replay = self.replacement.launch_input(self.jobs, prior, source)
+            import dispatch_seat_handover
+            parent_sid = dispatch_seat_handover.effective_parent(source, self.jobs) or parent_sid
+            parent_harness = dispatch_seat_handover.effective_parent_harness(source, self.jobs) or parent_harness
+            parent_values = {"parent_session_id": parent_sid, "parent_harness": parent_harness}
+            argv = self.replacement._replacement_argv(record, source, replay, parent_values)
+            task = self.replacement._replacement_task(record, source, replay)
+        else:
+            argv = self._argv(aid, parent_sid, parent_harness)
+            task = self.route["work_request"]["text"]
+        metadata = self._metadata(aid, parent_sid, parent_harness, task, argv,
+                                  prior=prior, record=record)
+        if prior:
+            admitted = self.replacement.admission(self.jobs, self.jobs.read_text().splitlines(), metadata)
+            self.assertEqual(admitted, record)
+        row = "\t".join(("now", "open", self.route["cwd"], self.route["cwd"], "fixture-owner",
+                          ",".join(f"{key}={value}" for key, value in metadata.items())))
+        self.assertTrue(self.contract.claim_attempt_row(self.jobs, aid, row, launch=False))
+        if claimed:
+            self.assertTrue(self.contract.claim_attempt_row(self.jobs, aid, row, launch=True))
+        if started:
+            self.assertTrue(self.contract.annotate_attempt_row(self.jobs, aid, {"launch_started": "1"}))
+            self.owner_input.initialize_owner_input(self.jobs, aid, "codex-active-turn")
+        return metadata, task
+
+    def _seed_initial_owner(self):
+        aid = "att-owner-A"
+        self._register(aid)
+        return aid
+
+    def _finish_blocked(self, aid):
+        self.owner_input.initialize_owner_input(self.jobs, aid, "codex-active-turn")
+        channel = self.owner_input.OwnerInput(self.jobs, aid, "fixture-thread-" + aid,
+                                               "codex-active-turn", lambda _event: None)
+        self.assertTrue(channel.terminal_boundary())
+        self.assertTrue(self.contract.close_attempt_row(
+            self.jobs, aid, "dead-worker-blocked", evidence={"failure_class": "blocked"}))
+        channel.close()
+        state = self.owner_input.inspect(self.jobs, aid)
+        self.assertFalse(state["accepting"])
+        self.assertFalse(state["supervisor_live"])
+
+    def _store(self, aid, text, request_id):
+        receipt = self.owner_input.submit(self.jobs, aid, text, request_id)
+        self.assertTrue(receipt["retained"])
+        return receipt
+
+    def _controlled_runner(self, command, **_kwargs):
+        aid = command[command.index("--attempt-id") + 1]
+        prior = command[command.index("--automatic-retry-of") + 1] if "--automatic-retry-of" in command else ""
+        self.launches.append({"attempt_id": aid, "prior": prior, "command": command})
+        if not prior:
+            self._register(aid)
+            return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+        self.replacement_launches += 1
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[prior][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        started = self.replacement_launches not in self.timeout_launches
+        _metadata, task = self._register(
+            aid, parent_sid=source.get("parent_sid", "parent"),
+            parent_harness=source.get("parent_harness", "codex"), prior=prior,
+            record=record, source=source, started=started, claimed=True)
+        if started:
+            from types import SimpleNamespace
+            instructions = self.replacement.recovery_instructions(SimpleNamespace(
+                automatic_retry_of=prior, attempt_id=aid, jobs_path=self.jobs, worker_type="owner"))
+            self.delivered_prompts[aid] = task + instructions
+        if self.replacement_launches in self.timeout_launches:
+            if self.close_timed_out:
+                self.assertTrue(self.contract.close_attempt_row(
+                    self.jobs, aid, "dead-governor-reservation-transfer",
+                    evidence={"failure_class": "contract"}))
+                self.assertTrue(self.contract.annotate_attempt_row(
+                    self.jobs, aid, {"launch_outcome": "never-launched"}))
+            raise subprocess.TimeoutExpired(command, timeout=60, output=b"admission/registry contention")
+        return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+    def _cli_start(self, runner=None):
+        import contextlib
+        import io
+
+        module = self.route_module
+        stdout, stderr = io.StringIO(), io.StringIO()
+        defaults = dict(W.start_work.__kwdefaults__ or {})
+        W.start_work.__kwdefaults__ = {**defaults, "run": runner or self._controlled_runner}
+        try:
+            with mock.patch.object(sys, "argv", [str(W.ROOT / "utilities/capability-route.py"),
+                    "start", "--route", str(self.path), "--jobs", str(self.jobs)]), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = module.main()
+        finally:
+            W.start_work.__kwdefaults__ = defaults
+        self.assertIn(code, (None, 0), stderr.getvalue() + stdout.getvalue())
+        records = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(records, stderr.getvalue() + stdout.getvalue())
+        return records[-1]
+
+    def _append_legacy_race_event(self, **event):
+        path = self.root / "legacy-race-events.jsonl"
+        raw = (json.dumps(event, sort_keys=True) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, raw)
+        finally:
+            os.close(fd)
+
+    def _legacy_fenced_runner(self, command, **_kwargs):
+        """Launch the fixture payload only through the common registry fence."""
+        aid = command[command.index("--attempt-id") + 1]
+        prior = command[command.index("--automatic-retry-of") + 1]
+        self._append_legacy_race_event(kind="runner-invoked", attempt_id=aid, prior=prior)
+
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[prior][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        replay = self.replacement.launch_input(self.jobs, prior, source)
+        import dispatch_seat_handover
+        parent_sid = dispatch_seat_handover.effective_parent(source, self.jobs) or "parent"
+        parent_harness = dispatch_seat_handover.effective_parent_harness(source, self.jobs) or "codex"
+        argv = self.replacement._replacement_argv(record, source, replay, {
+            "parent_session_id": parent_sid, "parent_harness": parent_harness})
+        task = self.replacement._replacement_task(record, source, replay)
+        metadata = self._metadata(aid, parent_sid, parent_harness, task, argv,
+                                  prior=prior, record=record)
+        row = "\t".join(("now", "open", self.route["cwd"], self.route["cwd"], "fixture-owner",
+                          ",".join(f"{key}={value}" for key, value in metadata.items())))
+
+        if not self.contract.claim_attempt_row(self.jobs, aid, row, launch=False):
+            existing = self.replacement._rows(self.jobs.read_text().splitlines()).get(aid)
+            self.assertIsNotNone(existing, "duplicate caller must find the stable registered D row")
+            self.assertEqual(existing[1].get("automatic_retry_of"), prior)
+            self.assertEqual(existing[1].get("replacement_claim_digest"),
+                             self.replacement._digest(record))
+            self._append_legacy_race_event(kind="registered-row-reused", attempt_id=aid,
+                                           prior=prior)
+            return subprocess.CompletedProcess(
+                command, 0, "registered=1 started=1 child_spawned=0\n", "")
+
+        from types import SimpleNamespace
+        instructions = self.replacement.recovery_instructions(SimpleNamespace(
+            automatic_retry_of=prior, attempt_id=aid, jobs_path=self.jobs, worker_type="owner"))
+        prompt = task + instructions
+        prompt_path = self.root / f"{aid}.prompt.txt"
+        received_path = self.root / f"{aid}.payload-input.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        launch_fence = W.ROOT / "utilities/launch-fence.py"
+        payload_code = (
+            "from pathlib import Path; import sys, time; "
+            "Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes()); time.sleep(30)"
+        )
+
+        def spawn(gate_fd):
+            return subprocess.Popen(
+                [sys.executable, str(launch_fence), "--parent-pid", str(os.getpid()),
+                 "--gate-fd", str(gate_fd), "--", sys.executable, "-c", payload_code,
+                 str(prompt_path), str(received_path)],
+                pass_fds=(gate_fd,), start_new_session=True, env=os.environ.copy())
+
+        proc, identity = self.contract.spawn_claimed_attempt(
+            self.jobs, aid, parent_binding=None, spawn=spawn)
+        self._legacy_race_children.append(proc)
+        self.assertTrue(self.contract.annotate_attempt_row(
+            self.jobs, aid, {"launch_started": "1"}))
+        self.owner_input.initialize_owner_input(self.jobs, aid, "codex-active-turn")
+        self._append_legacy_race_event(kind="fenced-payload-started", attempt_id=aid,
+                                       prior=prior, pid=proc.pid, pid_start=identity["pid_start"])
+        return subprocess.CompletedProcess(
+            command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+    def _legacy_race_start_caller(self, barrier, release, results):
+        import traceback
+        self._legacy_race_children = []
+        try:
+            barrier.wait(timeout=20)
+            receipt = self._cli_start(runner=self._legacy_fenced_runner)
+            results.put({"ok": True, "receipt": receipt})
+        except BaseException:
+            results.put({"ok": False, "error": traceback.format_exc()})
+        finally:
+            release.wait(timeout=30)
+            for proc in self._legacy_race_children:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                self._append_legacy_race_event(kind="payload-cleaned", pid=proc.pid,
+                                               returncode=proc.returncode)
+
+    def _cli_correct(self, aid, message):
+        import contextlib
+        import io
+
+        answer = self.root / "corrected-answer.md"
+        answer.write_text(message)
+        module = self.route_module
+        stdout, stderr = io.StringIO(), io.StringIO()
+        defaults = dict(W.start_work.__kwdefaults__ or {})
+        W.start_work.__kwdefaults__ = {**defaults, "run": self._controlled_runner}
+        try:
+            with mock.patch.object(sys, "argv", [str(W.ROOT / "utilities/capability-route.py"),
+                    "correct", "--attempt-id", aid, "--jobs", str(self.jobs),
+                    "--message-file", str(answer)]), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = module.main()
+        finally:
+            W.start_work.__kwdefaults__ = defaults
+        self.assertIn(code, (None, 0), stderr.getvalue() + stdout.getvalue())
+        records = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(records, stderr.getvalue() + stdout.getvalue())
+        return records[-1]
+
+    def _handover(self, aid, successor="successor"):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        meta = self.replacement._rows(self.jobs.read_text().splitlines())[aid][1]
+        seat = tidy.Seat("pane", "fixture-owner-seat", "wY:p5")
+        binding = handover.binding_of(self.jobs, meta)
+        snapshot = {"schema": handover.SCHEMA,
+                    "seat": {"kind": "pane", "key": seat.key, "pane": seat.pane},
+                    "from": {"sid": meta["parent_sid"]}, "bindings": [binding]}
+        tidy.atomic_write_json(handover._snapshot_path(seat.key), snapshot)
+        ledger = tidy._ledger_path(seat)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({"event": "handover", "from": meta["parent_sid"],
+                                     "sid": successor, "harness": "codex", "ts": 2,
+                                     "bindings": [binding]}) + "\n")
+
+    def _build_unstarted_chain(self, *, leave_open=False, correction_count=1,
+                               legacy_owner_claim=False):
+        owner_a = self._seed_initial_owner()
+        self._finish_blocked(owner_a)
+        self._store(owner_a, "correction for B", "input-a")
+        receipt_b = self._cli_start()
+        owner_b = receipt_b["owner_attempt_id"]
+        self.assertNotEqual(owner_b, owner_a)
+        self._finish_blocked(owner_b)
+        self._store(owner_b, "correction for C", "input-b")
+        for index in range(2, correction_count + 1):
+            self._store(owner_b, f"legacy correction {index}", f"input-b-{index}")
+        self.timeout_launches.add(self.replacement_launches + 1)
+        self.close_timed_out = not leave_open
+        if legacy_owner_claim:
+            logical_key = self.replacement._logical_key
+            with mock.patch.object(self.replacement, "_logical_key",
+                    side_effect=lambda route, meta: {
+                        **logical_key(route, meta), "after_capacity": owner_b}):
+                receipt_c = self._cli_start()
+        else:
+            receipt_c = self._cli_start()
+        self.assertEqual(receipt_c["reason"], "replacement-launch-timeout", receipt_c)
+        owner_c = self.launches[-1]["attempt_id"]
+        c_fields, c_meta = self.replacement._rows(self.jobs.read_text().splitlines())[owner_c]
+        self.assertEqual(c_meta.get("launch_claimed"), "1")
+        self.assertNotEqual(c_meta.get("launch_started"), "1")
+        effective, _lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+        self.assertEqual(effective, {owner_b})
+        self.assertEqual(self.route_module._current_owner_attempt(self.jobs, owner_a), owner_b)
+        if leave_open:
+            return owner_a, owner_b, owner_c, receipt_c
+        self.assertEqual(c_fields[1], "done")
+        self.assertEqual(c_meta.get("launch_outcome"), "never-launched")
+        self.assertEqual(c_meta.get("note"), "dead-governor-reservation-transfer")
+        return owner_a, owner_b, owner_c, receipt_c
+
+    def test_full_blocked_chain_normal_start_carries_late_correction_and_replays_once(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
+        late = self._store(owner_b, "late correction after C reservation", "input-late")
+        self.assertTrue(late["retained"])
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "successor"
+        os.environ["CODEX_THREAD_ID"] = "successor"
+
+        first = self._cli_start()
+        owner_d = first["owner_attempt_id"]
+        self.assertNotEqual(owner_d, owner_c)
+        self.assertTrue(first["owner_started"], first)
+        self.assertEqual(self.launches[-1]["attempt_id"], owner_d)
+        prompt = self.delivered_prompts[owner_d]
+        for correction in ("correction for C", "late correction after C reservation"):
+            self.assertIn(correction, prompt)
+
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        self.assertEqual((rows[owner_a][0][1], rows[owner_a][1]["note"], rows[owner_a][1]["failure_class"]),
+                         ("done", "dead-worker-blocked", "blocked"))
+        self.assertEqual((rows[owner_b][0][1], rows[owner_b][1]["note"], rows[owner_b][1]["failure_class"]),
+                         ("done", "dead-worker-blocked", "blocked"))
+        self.assertIn(owner_c, rows)
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_c), "accepted")
+        effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+        self.assertEqual(effective, {owner_d})
+        self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
+        self.assertEqual(self.route_module._current_owner_attempt(self.jobs, owner_a), owner_d)
+
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[owner_c][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        replay_input = self.replacement.launch_input(self.jobs, owner_c, source)
+        import dispatch_seat_handover
+        parent_sid = dispatch_seat_handover.effective_parent(source, self.jobs)
+        parent_harness = dispatch_seat_handover.effective_parent_harness(source, self.jobs)
+        alternate = "att-competing-successor"
+        argv = self.replacement._replacement_argv(record, source, replay_input, {
+            "parent_session_id": parent_sid, "parent_harness": parent_harness})
+        task = self.replacement._replacement_task(record, source, replay_input)
+        metadata = self._metadata(alternate, parent_sid, parent_harness, task, argv,
+                                  prior=owner_c, record=record)
+        competing_row = "\t".join(("now", "open", self.route["cwd"], self.route["cwd"], "fixture-owner",
+                                   ",".join(f"{key}={value}" for key, value in metadata.items())))
+        with self.assertRaises(self.contract.DispatchContractError) as caught:
+            self.contract.claim_attempt_row(self.jobs, alternate, competing_row, launch=True)
+        self.assertEqual(caught.exception.reason, "automatic-replacement-exhausted")
+        self.assertNotIn(alternate, self.replacement._rows(self.jobs.read_text().splitlines()))
+
+        launches_before_replay = len(self.launches)
+        replay = self._cli_start()
+        self.assertEqual(replay["owner_attempt_id"], owner_d)
+        self.assertTrue(replay["owner_started"])
+        self.assertEqual(len(self.launches), launches_before_replay)
+
+    def test_off_chair_start_retains_correction_without_launching(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
+        self._store(owner_b, "off-chair retained correction", "input-off-chair")
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "stranger"
+        os.environ["CODEX_THREAD_ID"] = "stranger"
+        before = len(self.launches)
+        receipt = self._cli_start()
+        self.assertEqual(receipt["reason"], "replacement-parent-identity-unproven", receipt)
+        self.assertEqual(len(self.launches), before)
+        self.assertIn(owner_c, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertEqual(self.owner_input.retained(self.jobs, owner_b)[-1]["id"], "input-off-chair")
+
+    def test_open_unknown_reservation_does_not_launch_beside_it(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain(leave_open=True)
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "successor"
+        os.environ["CODEX_THREAD_ID"] = "successor"
+        before = len(self.launches)
+        receipt = self._cli_start()
+        self.assertEqual(receipt.get("owner_attempt_id"), owner_c)
+        self.assertFalse(receipt.get("owner_started"))
+        self.assertEqual(len(self.launches), before)
+        self.assertEqual(self.replacement._rows(self.jobs.read_text().splitlines())[owner_c][0][1], "open")
+        self.assertIn(receipt["state"], {"running", "preparing"})
+
+    def test_unverified_cleanup_keeps_never_started_reservation_and_blocks_successor(self):
+        import route_parent_close
+
+        _owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "successor"
+        os.environ["CODEX_THREAD_ID"] = "successor"
+        before = len(self.launches)
+        with mock.patch.object(route_parent_close, "owner_continuation_processes",
+                return_value=(SimpleNamespace(state="unverifiable", reason="fixture-cleanup-pending"), [])):
+            result = self._cli_start()
+        self.assertEqual(result["reason"], "replacement-process-unverifiable", result)
+        self.assertEqual(len(self.launches), before)
+        row = self.replacement._rows(self.jobs.read_text().splitlines())[owner_c]
+        self.assertEqual((row[0][1], row[1].get("launch_claimed"), row[1].get("launch_outcome")),
+                         ("done", "1", "never-launched"))
+        self.assertIsNone(self.replacement.source_reservation(self.jobs, owner_c))
+
+    def test_started_blocked_successor_keeps_its_result_and_is_not_retried(self):
+        owner_a = self._seed_initial_owner()
+        self._finish_blocked(owner_a)
+        self._store(owner_a, "approved correction for B", "input-a")
+        receipt_b = self._cli_start()
+        owner_b = receipt_b["owner_attempt_id"]
+        self._finish_blocked(owner_b)
+        self._store(owner_b, "approved correction for C", "input-b")
+        receipt_c = self._cli_start()
+        owner_c = receipt_c["owner_attempt_id"]
+        self.assertTrue(receipt_c["owner_started"], receipt_c)
+        self._finish_blocked(owner_c)
+        before = len(self.launches)
+        result = self._cli_start()
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "owner-blocked", "answer-blocked-owner"), result)
+        self.assertEqual(len(self.launches), before)
+        self.assertEqual(self.replacement._rows(self.jobs.read_text().splitlines())[owner_c][1]["note"],
+                         "dead-worker-blocked")
+
+
+class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartTest):
+    """Standard node-less owners retain a launcher PID after exact cleanup."""
+
+    def _prepare_route(self, artifact_lifecycle):
+        module = self.route_module
+
+        def tuple_for(child):
+            return {
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": module.WRAPPER_PARENT_SANDBOXES["codex"][0],
+                "child_harness": child, "launch_authority": "conductor", "status": "supported",
+                "probe_source": "fixture-probe", "probe_time": "2026-10-18T00:00:00Z",
+                "failure_class": "", "checked_worktree": str(module.ROOT.resolve()),
+                "failure_scope": "none", "codex_command": "ok" if child == "codex" else "not-applicable",
+                "retry_on_isolated_worktree": 0,
+            }
+
+        evidence = {
+            "tuples": [tuple_for("codex"), tuple_for("claude")],
+            "native_subagent": [{
+                "harness": "codex", "transport": "headless",
+                "execution_surface": "codex-native-subagent", "registered_worker": False,
+                "status": "supported", "check_source": "fixture-native-check",
+            }],
+        }
+        route = module.compose_route(
+            capability="autopilot-code", capability_mode="dev", shape="staged",
+            graph="execute,test,report", slug="fixture-modern-owner", cwd=module.ROOT,
+            artifact_root=self.reports, intensity="standard", spec_read="fixture",
+            drift_verdict="within-spec", tracking="tracked", artifact_guard="fixture",
+            dispatch_evidence=evidence, parent_harness="codex",
+            work_request={"text": "Complete the approved code task.", "owner_harness": "codex"},
+            unassigned=True,
+        )
+        module.verify_route(route)
+        self.producer.activate(
+            self.reports, repository_id="repo_" + "a" * 32,
+            artifact_root_id="root_" + "b" * 32,
+            w7={"campaign_id": "camp_" + "c" * 32})
+        binding = artifact_lifecycle.admit_runtime_route(self.reports, route)
+        self.path = Path(binding.route_file)
+        self.route = json.loads(self.path.read_text())
+        self.owner_node_id = None
+        self.producer.begin(
+            self.reports, route_file=self.path, capability="autopilot-code", intensity="standard",
+            jobs=self.root / "no-dispatch-registry.log")
+
+    def _argv(self, aid, parent_sid, parent_harness="codex"):
+        return ["--start", "--attempt-id", aid, "--worktree", self.route["cwd"],
+                "--route-evidence", str(self.path), "--slug", "fixture-modern-owner",
+                "--capability", self.route["capability"], "--capability-mode", self.route["capability_mode"],
+                "--intensity", "standard", "--dispatch-depth", "1", "--worker-type", "owner",
+                "--unit", "_kernel/owner", "--parent-session-id", parent_sid,
+                "--parent-harness", parent_harness, "--prompt-text", self.route["work_request"]["text"]]
+
+    def _metadata(self, aid, parent_sid="parent", parent_harness="codex", task=None, argv=None,
+                  *, prior=None, record=None, route_source=None):
+        from types import SimpleNamespace
+        route = self.route
+        task = task or route["work_request"]["text"]
+        argv = argv or self._argv(aid, parent_sid, parent_harness)
+        args = SimpleNamespace(
+            attempt_id=aid, attempt_schema_version="2", jobs_path=self.jobs,
+            worktree=route["cwd"], route_id=None, route_hash=None, route_file=None, route_node=None,
+            parent_session_id=parent_sid, parent_harness=parent_harness, parent_transport="headless",
+            parent_sandbox=self.route_module.WRAPPER_PARENT_SANDBOXES[parent_harness][0],
+            launch_authority="conductor", sandbox="workspace-write", permission_mode="default",
+            capability=route["capability"], capability_mode=route["capability_mode"], intensity="standard",
+            dispatch_depth=1, worker_type="owner", harness="codex", transport="headless",
+            execution_surface="registered-headless", registered_worker=True,
+            fallback_hop="same-harness-headless", unit="_kernel/owner", replacement_input_argv=argv,
+            owner_route_binding=SimpleNamespace(route_id=route["route_id"]))
+        metadata = {
+            "attempt_id": aid, "attempt_schema_version": "2", "dispatch_depth": "1",
+            "transport": "headless", "execution_surface": "registered-headless",
+            "registered_worker": "1", "fallback_hop": "same-harness-headless",
+            "worker_type": "owner", "unit": "_kernel/owner", "harness": "codex",
+            "owner_route_id": route["route_id"], "owner_route_hash": route["route_hash"],
+            "owner_route_file": str(self.path), "parent_sid": parent_sid,
+            "parent_harness": parent_harness, "parent_transport": "headless",
+            "capability": route["capability"], "capability_mode": route["capability_mode"],
+            "intensity": "standard", "supervisor_lease_nonce": "fixture-" + aid,
+        }
+        if prior:
+            metadata.update(automatic_retry_of=prior,
+                            replacement_family_id=record["family_id"],
+                            replacement_original_attempt_id=prior, replacement_ordinal="1",
+                            replacement_claim_digest=self.replacement._digest(record))
+        metadata.update(self.contract.parse_registry_metadata(
+            self.replacement.seal_launch_input(args, "codex", task)))
+        return metadata
+
+    def _controlled_runner(self, command, **kwargs):
+        if "--automatic-retry-of" in command:
+            self.assertEqual(Path(command[1]).name, "dispatch-owner.py")
+            self.assertNotIn("--route-node", command)
+        close_attempt = self.contract.close_attempt_row
+
+        def close_after_fixture_carrier(jobs, aid, note, *, evidence=None):
+            if note == "dead-governor-reservation-transfer":
+                carrier = subprocess.Popen(["/bin/sleep", "0.2"], start_new_session=True)
+                try:
+                    pid_ns = self.contract.process_namespace_identity(carrier.pid)
+                    self.assertTrue(self.contract.annotate_attempt_row(jobs, aid, {
+                        "pid": str(carrier.pid),
+                        "pid_start": str(self.contract.process_start_ticks(carrier.pid)),
+                        "pgid": str(carrier.pid), "pid_ns": pid_ns,
+                        "pid_observer_ns": self.contract.process_namespace_identity(),
+                    }))
+                    carrier.wait(timeout=5)
+                finally:
+                    if carrier.poll() is None:
+                        carrier.kill()
+                        carrier.wait(timeout=5)
+                self.assertTrue(self.contract.annotate_attempt_row(
+                    jobs, aid, {"launch_outcome": "never-launched"}))
+            closed = close_attempt(jobs, aid, note, evidence=evidence)
+            if note == "dead-governor-reservation-transfer":
+                c_meta = self.replacement._rows(Path(jobs).read_text().splitlines())[aid][1]
+                self.assertTrue(c_meta.get("pid"))
+                self.assertTrue(c_meta.get("pid_start"))
+                self.assertTrue(c_meta.get("pid_ns"))
+                self.assertNotIn("route_file", c_meta)
+                self.assertNotIn("route_node", c_meta)
+                self.assertTrue(c_meta.get("owner_route_file"))
+                self.assertTrue(self.contract._settled_cleanup_receipt(c_meta))
+            return closed
+
+        with mock.patch.object(self.contract, "close_attempt_row", side_effect=close_after_fixture_carrier):
+            return super()._controlled_runner(command, **kwargs)
+
+    def _build_legacy_claim_with_settled_attention(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain(
+            correction_count=6, legacy_owner_claim=True)
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        c_fields, c_meta = rows[owner_c]
+        binding = self.replacement.source_binding(self.jobs, rows[owner_b][1])
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        self.assertEqual(record["logical_node"], {
+            "root_route_id": self.route["route_id"], "node": "__owner__", "after_capacity": owner_b})
+        self.assertEqual(record["ordinal"], 1)
+        self.assertEqual(record["proof"]["death_kind"], self.replacement.CORRECTED)
+        self.assertTrue(self.replacement.never_started(c_fields[1], c_meta))
+        self.assertTrue(c_meta.get("pid"))
+        self.assertTrue(c_meta.get("pid_start"))
+        self.assertTrue(c_meta.get("pid_ns"))
+        self.assertTrue(self.contract._settled_cleanup_receipt(c_meta))
+        self.replacement._settle_recovery_attention(self.jobs, owner_b, {
+            "reason": "replacement-parent-identity-unproven"})
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+        return owner_a, owner_b, owner_c
+
+    def _assert_legacy_owner_started_with_all_answers(
+            self, owner_a, owner_b, owner_c, receipt, *, expected_answers=7):
+        self.assertTrue(receipt.get("owner_started"), receipt)
+        owner_d = receipt["owner_attempt_id"]
+        self.assertNotEqual(owner_d, owner_c)
+        self.assertEqual(self.launches[-1]["attempt_id"], owner_d)
+        self.assertEqual(self.launches[-1]["prior"], owner_c)
+        answers = self.owner_input.retained(self.jobs, owner_b)
+        self.assertEqual(len(answers), expected_answers)
+        prompt = self.delivered_prompts[owner_d]
+        for answer in answers:
+            self.assertIn(answer["text"], prompt)
+        effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+        self.assertEqual(effective, {owner_d})
+        self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        for aid in (owner_a, owner_b):
+            self.assertEqual((rows[aid][0][1], rows[aid][1].get("note"),
+                              rows[aid][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+        self.assertEqual((rows[owner_c][0][1], rows[owner_c][1].get("launch_outcome"),
+                          rows[owner_c][1].get("launch_started")),
+                         ("done", "never-launched", None))
+        next_edge = self.replacement.source_binding(self.jobs, rows[owner_c][1])
+        next_claim = self.replacement._read(
+            self.replacement._record_path(self.jobs, next_edge[0]))
+        self.assertEqual((next_claim["original_attempt_id"], next_claim["replacement_attempt_id"]),
+                         (owner_c, owner_d))
+        return owner_d
+
+    def test_legacy_settled_owner_normal_start_reuses_one_launch_and_carries_seven_answers(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        attention_path = self.replacement._directory(self.jobs) / "attention/by-source" / (owner_b + ".json")
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[owner_b][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        claim_path = self.replacement._record_path(self.jobs, binding[0])
+        attention_before, claim_before = attention_path.read_bytes(), claim_path.read_bytes()
+
+        first = self._cli_start()
+        owner_d = self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, first)
+        launches_after_first = len(self.launches)
+        replay = self._cli_start()
+        self.assertEqual(replay["owner_attempt_id"], owner_d)
+        self.assertTrue(replay["owner_started"], replay)
+        self.assertEqual(len(self.launches), launches_after_first)
+        self.assertEqual(attention_path.read_bytes(), attention_before)
+        self.assertEqual(claim_path.read_bytes(), claim_before)
+
+    def test_legacy_settled_owner_concurrent_starts_share_one_fenced_payload_and_seven_answers(self):
+        import multiprocessing
+
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        attention_path = self.replacement._directory(self.jobs) / "attention/by-source" / (owner_b + ".json")
+        source_b = self.replacement._rows(self.jobs.read_text().splitlines())[owner_b][1]
+        binding_b = self.replacement.source_binding(self.jobs, source_b)
+        claim_path = self.replacement._record_path(self.jobs, binding_b[0])
+        legacy_claim = self.replacement._read(claim_path)
+        self.assertEqual((legacy_claim["original_attempt_id"],
+                          legacy_claim["replacement_attempt_id"]), (owner_b, owner_c))
+        attention_before, claim_before = attention_path.read_bytes(), claim_path.read_bytes()
+
+        context = multiprocessing.get_context("fork")
+        barrier, release, results = context.Barrier(2), context.Event(), context.Queue()
+        callers = [context.Process(target=self._legacy_race_start_caller,
+                                   args=(barrier, release, results)) for _ in range(2)]
+        outcomes = []
+        try:
+            for caller in callers:
+                caller.start()
+            outcomes = [results.get(timeout=90) for _ in callers]
+            self.assertTrue(all(item.get("ok") for item in outcomes), outcomes)
+            receipts = [item["receipt"] for item in outcomes]
+            events = [json.loads(line) for line in (self.root / "legacy-race-events.jsonl").read_text().splitlines()]
+            starts = [event for event in events if event["kind"] == "fenced-payload-started"]
+            self.assertEqual(len(starts), 1, events)
+            owner_d = starts[0]["attempt_id"]
+            self.assertNotIn(owner_d, {owner_a, owner_b, owner_c})
+            payload_pid = starts[0]["pid"]
+            os.kill(payload_pid, 0)
+
+            rows = self.replacement._rows(self.jobs.read_text().splitlines())
+            self.assertEqual(rows[owner_d][1].get("automatic_retry_of"), owner_c)
+            for receipt in receipts:
+                referenced = {receipt.get("owner_attempt_id")}
+                referenced.update(item.get("replacement_attempt_id")
+                                  for item in receipt.get("replacement_lineage", []))
+                referenced.update(item.get("record", {}).get("replacement_attempt_id")
+                                  for item in receipt.get("replacement_attention", []))
+                self.assertIn(owner_d, referenced,
+                              {key: receipt.get(key) for key in
+                               ("owner_attempt_id", "replacement_lineage", "replacement_attention")})
+            self.assertEqual((rows[owner_a][0][1], rows[owner_a][1].get("note"),
+                              rows[owner_a][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+            self.assertEqual((rows[owner_b][0][1], rows[owner_b][1].get("note"),
+                              rows[owner_b][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+            self.assertEqual((rows[owner_c][0][1], rows[owner_c][1].get("launch_outcome"),
+                              rows[owner_c][1].get("launch_started")),
+                             ("done", "never-launched", None))
+            self.assertEqual((rows[owner_d][1].get("launch_claimed"),
+                              rows[owner_d][1].get("launch_started"),
+                              rows[owner_d][1].get("pid")), ("1", "1", str(payload_pid)))
+
+            next_edge = self.replacement.source_binding(self.jobs, rows[owner_c][1])
+            next_claim = self.replacement._read(self.replacement._record_path(self.jobs, next_edge[0]))
+            self.assertEqual((next_claim["original_attempt_id"], next_claim["replacement_attempt_id"]),
+                             (owner_c, owner_d))
+            effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+            self.assertEqual(effective, {owner_d})
+            self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
+            self.assertEqual(attention_path.read_bytes(), attention_before)
+            self.assertEqual(claim_path.read_bytes(), claim_before)
+
+            answers = self.owner_input.retained(self.jobs, owner_b)
+            self.assertEqual(len(answers), 7)
+            payload_input = self.root / f"{owner_d}.payload-input.txt"
+            deadline = time.monotonic() + 5
+            while not payload_input.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(payload_input.exists(), "the released fixture payload must read D's prompt")
+            delivered = payload_input.read_text(encoding="utf-8")
+            self.assertEqual(delivered, (self.root / f"{owner_d}.prompt.txt").read_text(encoding="utf-8"))
+            for answer in answers:
+                self.assertIn(answer["text"], delivered)
+        finally:
+            release.set()
+            for caller in callers:
+                if caller.pid is not None:
+                    caller.join(timeout=20)
+                    if caller.is_alive():
+                        caller.terminate()
+                        caller.join(timeout=5)
+            results.close()
+            results.join_thread()
+
+        self.assertTrue(all(caller.exitcode == 0 for caller in callers),
+                        [caller.exitcode for caller in callers])
+        events = [json.loads(line) for line in (self.root / "legacy-race-events.jsonl").read_text().splitlines()]
+        cleaned = [event for event in events if event["kind"] == "payload-cleaned"]
+        self.assertEqual(len(cleaned), 1, events)
+        self.assertEqual(cleaned[0]["pid"], payload_pid)
+        self.assertIsNotNone(cleaned[0]["returncode"])
+
+    def test_legacy_settled_owner_correct_carries_eight_retained_answers(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        self.assertEqual(len(self.owner_input.retained(self.jobs, owner_b)), 7)
+
+        corrected = self._cli_correct(owner_b, "legacy correction 8")
+        owner_d = self._assert_legacy_owner_started_with_all_answers(
+            owner_a, owner_b, owner_c, corrected, expected_answers=8)
+        self.assertTrue(corrected["correction"]["retained"])
+        self.assertEqual(corrected["owner_attempt_id"], owner_d)
+
+    def test_legacy_settled_owner_same_seat_successor_can_resume(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "successor"
+        os.environ["CODEX_THREAD_ID"] = "successor"
+
+        receipt = self._cli_start()
+        self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, receipt)
+
+    def test_legacy_settled_owner_correct_starts_with_the_new_answer_in_one_call(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        corrected = self._cli_correct(owner_b, "legacy correction 7")
+        owner_d = self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, corrected)
+        self.assertTrue(corrected["correction"]["retained"])
+        self.assertEqual(corrected["owner_attempt_id"], owner_d)
+
+    def test_legacy_settled_owner_still_rejects_a_different_parent(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        W.default_parent_session_id.return_value = "stranger"
+        os.environ["CODEX_THREAD_ID"] = "stranger"
+        before = len(self.launches)
+
+        receipt = self._cli_start()
+        self.assertEqual(receipt["reason"], "replacement-parent-identity-unproven", receipt)
+        self.assertEqual(len(self.launches), before)
+        self.assertIn(owner_c, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+
+    def test_legacy_settled_owner_does_not_create_a_successor_without_explicit_resume(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        result = self.replacement.advance(self.jobs, owner_b)
+        self.assertEqual(result["state"], "not-applicable")
+        with self.assertRaises(self.contract.DispatchContractError) as caught:
+            self.replacement.claim(self.jobs, owner_c)
+        self.assertEqual(caught.exception.reason, "replacement-duty-settled")
+        self.assertIsNone(self.replacement.source_reservation(self.jobs, owner_c))
+
+    def test_legacy_settled_owner_requires_the_exact_cleanup_receipt(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        before = len(self.launches)
+
+        with mock.patch.object(self.contract, "_settled_cleanup_receipt", return_value=False):
+            receipt = self._cli_start()
+
+        self.assertEqual(len(self.launches), before)
+        self.assertIn(owner_c, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+        self.assertEqual(receipt.get("owner_attempt_id"), owner_c)
+        self.assertFalse(receipt.get("owner_started"), receipt)
+
+
 class CoupledReviewSelfDispositionTest(unittest.TestCase):
     """Public correct/complete, real replacement authority and strict ship consumer."""
 

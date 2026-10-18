@@ -1201,5 +1201,43 @@ class OwnerFormatOnlyEndTest(unittest.TestCase):
                                                                     if k != "worker_type"}))
 
 
+class ResourcePredecessorPidReuseTest(unittest.TestCase):
+    """A finished run whose PID a later process reused is still finished."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.sentinel = Path(directory.name) / "run.log.exit"
+        self.sentinel.write_text("0\n", encoding="utf-8")
+        import resource_run_registry
+        self.live = resource_run_registry.proc_identity(os.getpid())
+        self.namespace = os.readlink("/proc/self/ns/pid")
+
+    def row(self, **changes):
+        row = {"run_id": "finished", "status": "succeeded", "workflow_state": "STAGE_SUCCEEDED",
+               "exit_code": 0, "sentinel": str(self.sentinel), "pid": os.getpid(),
+               "starttime": str(int(self.live["starttime"]) - 1),
+               "command_hash": "recorded-command", "pid_namespace": self.namespace}
+        row.update(changes)
+        return row
+
+    def test_later_process_on_the_same_pid_does_not_keep_the_run_open(self):
+        self.assertTrue(RA.resource_predecessor_finished(self.row()))
+
+    def test_unproven_reuse_stays_unfinished(self):
+        cases = {
+            "exec-same-start": {"starttime": self.live["starttime"]},
+            "earlier-start": {"starttime": str(int(self.live["starttime"]) + 1)},
+            "unparsable-start": {"starttime": "wrong"},
+            "namespace-unrecorded": {"pid_namespace": None},
+            "foreign-namespace": {"pid_namespace": "pid:[1]"},
+            "no-sentinel": {"sentinel": str(self.sentinel) + ".missing"},
+            "sentinel-disagrees": {"exit_code": 3},
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(RA.resource_predecessor_finished(self.row(**change)))
+
+
 if __name__ == "__main__":
     unittest.main()

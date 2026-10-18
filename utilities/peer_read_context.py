@@ -12,51 +12,57 @@ from pathlib import Path
 
 
 class PeerReadContext:
-    def __init__(self):
-        self._attempt_indexes = {}
+    def __init__(self, *, registry_append_only: bool = False):
+        self.registry_append_only = registry_append_only
+        self._registry_views = {}
         self._handover_snapshots = None
         self._handover_ledgers = {}
+        self._recipient_censuses = {}
+        self._transfer_roots = None
 
-    def current_attempt_row(self, jobs: Path, attempt_id: str):
+    def transfer_roots(self, loader):
+        """Reuse candidate ledger roots for exact per-message transfer reads.
+
+        The root list only narrows where each transfer record is read. It does
+        not cache transfer contents or any delivery/recipient authority.
+        """
+        if self._transfer_roots is None:
+            roots, _source = loader()
+            self._transfer_roots = tuple(Path(root) for root in roots)
+        return self._transfer_roots
+
+    def recipient_census(self, endpoint, loader):
+        """Reuse one endpoint's recipient listing within a single read pass."""
+        key = str(endpoint or "default")
+        if key not in self._recipient_censuses:
+            self._recipient_censuses[key] = loader()
+        return self._recipient_censuses[key]
+
+    def current_attempt_row(self, jobs: Path, attempt_id: str, *, append_only=None):
         """Return the latest exact attempt row from this scan's registry view."""
-        from dispatch_completion_join import ChildRow, JoinContractError, _metadata
-        from dispatch_registry_cache import registry_lines
+        from dispatch_completion_join import ChildRow, JoinContractError
+        from dispatch_registry_cache import registry_view
 
         jobs = Path(jobs)
         key = str(jobs.resolve(strict=False))
-        if key not in self._attempt_indexes:
+        if key not in self._registry_views:
             try:
-                lines = registry_lines(jobs)
+                self._registry_views[key] = registry_view(
+                    jobs, append_only=(self.registry_append_only if append_only is None else append_only))
             except FileNotFoundError:
-                self._attempt_indexes[key] = (None, {})
+                self._registry_views[key] = None
             except OSError as exc:
                 raise JoinContractError("registry-unreadable") from exc
-            else:
-                latest = {}
-                errors = {}
-                for order, line in enumerate(lines):
-                    if "attempt_id=" not in line:
-                        continue
-                    fields = line.split("\t")
-                    if len(fields) != 6:
-                        continue
-                    metadata = _metadata(fields[5])
-                    row_attempt = metadata.get("attempt_id")
-                    if not row_attempt:
-                        continue
-                    if metadata.get("attempt_schema_version") != "2":
-                        errors.setdefault(row_attempt, JoinContractError(
-                            "attempt-row-schema-invalid"))
-                        continue
-                    latest[row_attempt] = ChildRow(
-                        order, fields[1], fields[4], row_attempt, line, metadata
-                    )
-                self._attempt_indexes[key] = (latest, errors)
-
-        latest, errors = self._attempt_indexes[key]
-        if attempt_id in errors:
-            raise errors[attempt_id]
-        return latest.get(attempt_id) if latest is not None else None
+        view = self._registry_views[key]
+        if view is None:
+            return None
+        record, error = view.completion_attempt(attempt_id)
+        if error:
+            raise JoinContractError(error)
+        if record is None:
+            return None
+        return ChildRow(record.order, record.status, record.slug, attempt_id,
+                        record.raw, record.completion_metadata())
 
     def handover_snapshots(self, loader):
         if self._handover_snapshots is None:

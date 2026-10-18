@@ -58,6 +58,10 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
     if (meta.get('parent_close_requested') == '1' or
             jobs is not None and route_parent_close.row_requested(meta, jobs)):
         return None
+    if meta.get('worker_type') == 'owner' and DR.never_started(status, meta):
+        # The launch fence is the execution boundary. A reservation may carry a
+        # claim, but its absence of launch_started means it has no worker result.
+        return 'unlaunched'
     if jobs is not None and meta.get('note') == 'dead-worker-blocked':
         found = DR.owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
@@ -74,15 +78,18 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DR.DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
+    if (meta.get('worker_type') == 'owner'
+            and meta.get('note') == 'dead-governor-reservation-transfer'):
+        # This terminal disposition means the replacement never launched. If
+        # its exact cleanup proof is missing, it is unknown rather than a new
+        # silent-death edge; the branch above already returned `unlaunched`
+        # when the complete proof was available.
+        return None
     if meta.get('note') in DR.DEATH_NOTES and status not in {'cancelled', 'killed'}:
         return 'silent'
     if (meta.get('worker_type') == 'owner' and status == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
-    if (meta.get('worker_type') == 'owner' and status == 'done'
-            and meta.get('launch_outcome') == 'never-launched' and meta.get('launch_claimed') == '0'
-            and meta.get('launch_started') != '1' and not meta.get('pid')):
-        return 'unlaunched'  # nothing ran: the log never existed and no process was ever bound
     if meta.get('worker_type') == 'owner' and status == 'done' and meta.get('note') in DR.RUNTIME_DEATH_NOTES:
         return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
     if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
@@ -391,6 +398,26 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
+    if action == "settled-owner-resume":
+        record = facts.get("record") or {}
+        logical = record.get("logical_node") or {}
+        proof = record.get("proof") or {}
+        aid = metadata.get("attempt_id")
+        eligible = (
+            status == "done" and metadata.get("worker_type") == "owner"
+            and bool(answerable_owner_end(status, metadata))
+            and record.get("original_attempt_id") == aid
+            and record.get("ordinal") == 1
+            and proof.get("death_kind") == "corrected"
+            and logical.get("node") == "__owner__"
+            and logical.get("after_capacity") == aid
+            and facts.get("attention_reason") == "replacement-parent-identity-unproven"
+            and facts.get("exact_successor") is True
+            and facts.get("successor_never_started") is True
+            and facts.get("retained_corrections") is True
+        )
+        return ContinuationDecision(eligible, "resume" if eligible else "settled",
+            "" if eligible else "replacement-duty-settled", "start" if eligible else "settle")
     if action == "replacement-progress":
         from dispatch_contract import verdict_pass
         from dispatch_replacement import _plain_retry_successor, _replacement_in_flight
@@ -557,7 +584,8 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             worker = candidate.get("worker_type") or ("review" if candidate.get("kind") == "review-worker" else "test")
             source_digest = None
             current_history = history
-            if candidate.get("kind") == "review-worker":
+            from review_source_subject import has_review_subject
+            if candidate.get("kind") == "review-worker" or has_review_subject(route, candidate, jobs):
                 from review_source_subject import SourceSubjectError, annotate_rows, has_review_subject, observe
                 if has_review_subject(route, candidate, jobs):
                     try:
@@ -612,8 +640,9 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         source_aware = False
         budget_rows = rows
         budget_kinds = kinds
-        if node.get("kind") == "review-worker":
-            from review_source_subject import annotate_rows, has_review_subject, observe
+        from review_source_subject import has_review_subject
+        if node.get("kind") == "review-worker" or has_review_subject(route, node, jobs):
+            from review_source_subject import annotate_rows, observe
             if source_digest is not None or has_review_subject(route, node, jobs):
                 if source_digest is None and jobs is not None:
                     source_digest = observe(route, node, worktree=route.get("cwd"), jobs=jobs)["digest"]
@@ -633,12 +662,14 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             attempt in subject_attempts
             for attempt in (*tuple(revision.get("answers") or ()), *tuple(revision.get("supersedes") or ()))
         )] if source_aware else revisions
+        budget_kinds_for_streak = budget_kinds if source_aware else kinds
+        budget_rows_for_progress = budget_rows if source_aware else rows
         streak = 0
-        for kind in reversed(kinds):
+        for kind in reversed(budget_kinds_for_streak):
             if kind != "verdict-less":
                 break
             streak += 1
-        counted = blocked_progress(route, rows, worker_type=worker_type) if (
+        counted = blocked_progress(route, budget_rows_for_progress, worker_type=worker_type) if (
             streak >= _ROUND.VERDICTLESS_BOUND and route.get("route_plan") is not None) else streak
         state = ("blocked-live" if "live" in kinds else "blocked-unsettled" if "unsettled" in kinds else
                  "verdictless-bound" if counted >= _ROUND.VERDICTLESS_BOUND else
@@ -660,7 +691,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         # number, but until a substantive verdict exists for this subject the
         # next admitted pass is still a full first review.
         round_kind = "closure-check" if closure else "correction" if verdicts else "first"
-        budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
+        budget = _ROUND.RoundBudget(len(verdicts), counted, budget_kinds_for_streak.count("verdict-less"), cap, state,
             len(rows) + 1, len(rows) + 1 if rows else 0,
             round_kind,
             _round_action(state, node.get("kind")), closure, counted < streak)
@@ -682,6 +713,9 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(True, state, budget=budget, census={
             "verdict_rounds": budget.verdict_rounds + (site == "registered"),
             "verdictless_rounds": budget.verdictless_rounds, "cap": budget.cap, "closure_class": closure})
+    if action == "owner-closure" and node.get("completion_gate") == "code-test":
+        return ContinuationDecision(False, "not-review", "owner-closure-node-not-review",
+                                    "settle", detail="code-test remains a test-owned gate")
     if action == "owner-closure":
         allowed = state in {"exhausted", "verdictless-bound"}
         reason = {"blocked-live": "owner-closure-round-still-open", "blocked-unsettled": "owner-closure-round-unsettled",
@@ -1430,14 +1464,38 @@ def continuation_attempt_state(metadata):
     return "unknown"
 
 
+def _recorded_pid_reused(row, identity):
+    """The recorded PID now names a later process in the same PID namespace.
+
+    A later start tick for the same PID in the recorded namespace means the
+    recorded process has ended. A same-start mismatch (an exec), an earlier or
+    unparsable start tick, or an unrecorded or unreadable namespace proves
+    nothing and stays stale.
+    """
+    state, current, reason = identity
+    if state != "stale" or reason != "process-identity-mismatch" or not current:
+        return False
+    if row.get("pid_namespace") is None:
+        return False
+    try:
+        if row["pid_namespace"] != os.readlink("/proc/self/ns/pid"):
+            return False
+        recorded, observed = int(row.get("starttime")), int(current.get("starttime"))
+    except (OSError, TypeError, ValueError):
+        return False
+    return observed > recorded
+
+
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
     from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
     from dispatch_resource_wait import supervisor
     if resource_never_started(row):
         return True
+    identity = classify_identity(row)
     if (row.get("status") == "launching" or row.get("cancel_requested")
-            or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
+            or row.get("parent_close_requested")
+            or (identity[0] != "exited" and not _recorded_pid_reused(row, identity))):
         return False
     if (row.get('status') != 'succeeded' and row.get('exit_code') is None
             and reboot_evidence(row)):

@@ -441,12 +441,14 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
  records nothing more) before deriving the budget, so a closure-check that
  rule 8 just unlocked is visible in the SAME call's `budget.round_kind`.
  """
+ from review_source_subject import has_review_subject
+ source_bound = has_review_subject(route, node, jobs)
  rows = prior_round_attempts(jobs, route["route_id"], node["id"], exclude_slug=exclude_slug,
                              exclude_attempt=exclude_attempt,
-                             route=route if node.get("kind") == "review-worker" else None)
+                             route=route if node.get("kind") == "review-worker" or source_bound else None)
  classified_rows = [(cols[1], meta) for cols, meta in rows]
  source_subject_digest = None
- if node.get("kind") == "review-worker":
+ if source_bound:
   from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding
   if has_review_subject(route, node, jobs):
    try:
@@ -548,7 +550,7 @@ def round_protocol_block(budget, rows, worker_type, node_id):
  history and does not create a correction obligation (SD-153 rule 5).
  """
  if budget.round_kind == "first":
-  if budget.next_round <= 1 or not rows:
+  if not rows:
    return ""
   history_parts=[]
   for cols,meta in rows:

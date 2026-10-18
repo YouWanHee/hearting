@@ -17,6 +17,14 @@ import sys
 import time
 
 
+# Every entry (hook, CLI script, import) resolves `fleet.collectors` here, not
+# only after `_native_session` has run. Appended so `tools/` never shadows a
+# caller's own modules.
+_TOOLS_DIR = str(Path(__file__).resolve().parents[1] / "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.append(_TOOLS_DIR)
+
+
 _THREAD_ID_RE = re.compile(
     r"(?<![0-9A-Za-z-])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9A-Za-z-])"
 )
@@ -156,7 +164,7 @@ def _caller_runtime(pid, harness):
     return None, False
 
 
-def _native_session(pid, harness):
+def _native_session(pid, harness, *, codex_observation=None):
     """Exact native evidence only; no same-directory/start-time rollout guesses."""
     tools = str(Path(__file__).resolve().parents[1] / "tools")
     if tools not in sys.path:
@@ -173,7 +181,7 @@ def _native_session(pid, harness):
                 return record.get("sessionId") or ""
         elif harness == "codex":
             from fleet.process_identity import PROVEN, process_identity
-            found = process_identity(pid, "codex")
+            found = process_identity(pid, "codex", codex_observation=codex_observation)
             return found.session_id if found.confidence == PROVEN else ""
         elif harness == "opencode":
             from fleet.process_identity import process_identity, PROVEN
@@ -251,13 +259,15 @@ def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket
         return ""
     candidates = sorted(foreground_pids if pid is None else foreground_pids & {int(pid)})
     current_ids = set()
+    from fleet.collectors import codex as codex_collector
+    codex_observation = codex_collector.DaemonIdentityObservation()
     for candidate in candidates:
         record = _process(candidate)
         kind, service = _runtime(candidate)
         if (kind != "codex" or service or not record or not record[3]
                 or record[2] != group or record[4] != group or _registered_worker(candidate)):
             continue
-        native_sid = _native_session(candidate, "codex")
+        native_sid = _native_session(candidate, "codex", codex_observation=codex_observation)
         if not native_sid:
             continue
         footer = _read_codex_footer_threads(pane, executable=executable,
@@ -270,7 +280,7 @@ def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket
                     executable=executable, server=server, socket_path=socket_path):
                 continue
         if (_process(candidate) == record
-                and _native_session(candidate, "codex") == native_sid):
+                and _native_session(candidate, "codex", codex_observation=codex_observation) == native_sid):
             current_ids.add(native_sid)
     return next(iter(current_ids)) if len(current_ids) == 1 else ""
 
@@ -292,11 +302,11 @@ def current_codex_thread_for_caller(pane, *, executable=None, server=None, socke
 
 
 def _loader_verified_pane(pane, session_id, owner_pid, owner_start, *,
-                          executable, server=None, socket_path=None):
+                          executable, server=None, socket_path=None, codex_observation=None):
     """Confirm a caller-selected thread's exact loader PID in a herdr pane."""
     if _registered_worker(owner_pid):
         return ""
-    if _native_session(owner_pid, "codex") != session_id:
+    if _native_session(owner_pid, "codex", codex_observation=codex_observation) != session_id:
         return ""
     record = _process(owner_pid)
     kind, service = _runtime(owner_pid)
@@ -331,23 +341,25 @@ def _loader_verified_pane(pane, session_id, owner_pid, owner_start, *,
         return ""
     return pane if (_process(owner_pid) == record and latest_group == group
                     and owner_pid in latest_pids
-                    and _native_session(owner_pid, "codex") == session_id) else ""
+                    and _native_session(owner_pid, "codex", codex_observation=codex_observation) == session_id) else ""
 
 
-def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
-    """Return the unique proven ``(pane, socket_path)`` for a current Codex thread."""
+def codex_tui_process_bindings(session_id, *, pane_hint=None, executable=None):
+    """Return exact live Codex TUI PID/start bindings for one native thread."""
     if not _THREAD_ID_RE.fullmatch(session_id or ""):
-        return None
+        return []
     from fleet.collectors import procscan
 
     executable = executable or shutil.which("herdr")
     if not executable:
-        return None
+        return []
     try:
         process_ids = [int(item) for item in os.listdir("/proc") if item.isdigit()]
     except OSError:
-        return None
-    candidates = set()
+        return []
+    candidates = {}
+    from fleet.collectors import codex as codex_collector
+    codex_observation = codex_collector.DaemonIdentityObservation()
     for owner_pid in process_ids:
         try:
             kind, service = _runtime(owner_pid)
@@ -368,11 +380,50 @@ def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
                 continue  # a named server without its socket path cannot be carried safely
             if _loader_verified_pane(
                     pane, session_id, owner_pid, record[5], executable=executable,
-                    socket_path=socket_path):
-                candidates.add((pane, socket_path))
+                    socket_path=socket_path, codex_observation=codex_observation):
+                binding = (owner_pid, str(record[5]), pane, socket_path)
+                candidates[binding] = {
+                    "pid": owner_pid, "pid_start": str(record[5]),
+                    "session_id": session_id, "pane": pane,
+                    "socket_path": socket_path,
+                }
         except Exception:
             continue
-    return next(iter(candidates)) if len(candidates) == 1 else None
+    return [candidates[key] for key in sorted(candidates)]
+
+
+def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
+    """Return the unique proven ``(pane, socket_path)`` for a current Codex thread."""
+    bindings = codex_tui_process_bindings(
+        session_id, pane_hint=pane_hint, executable=executable)
+    endpoints = {(item["pane"], item["socket_path"]) for item in bindings}
+    return next(iter(endpoints)) if len(endpoints) == 1 else None
+
+
+def codex_tui_processes_for_session(session_id):
+    """Return exact live native Codex TUI process identities for a thread."""
+    if not _THREAD_ID_RE.fullmatch(session_id or ""):
+        return []
+    try:
+        process_ids = [int(item) for item in os.listdir("/proc") if item.isdigit()]
+    except OSError:
+        return []
+    found = []
+    from fleet.collectors import codex as codex_collector
+    codex_observation = codex_collector.DaemonIdentityObservation()
+    for pid in process_ids:
+        try:
+            kind, service = _runtime(pid)
+            record = _process(pid)
+            if kind != "codex" or service or not record or _registered_worker(pid):
+                continue
+            if (_native_session(pid, "codex", codex_observation=codex_observation) != session_id
+                    or _process(pid) != record):
+                continue
+            found.append({"pid": pid, "pid_start": str(record[5]), "session_id": session_id})
+        except Exception:
+            continue
+    return found
 
 
 def _same_socket_endpoint(owner_socket, requested_socket, server):

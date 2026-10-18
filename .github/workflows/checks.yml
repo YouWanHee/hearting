@@ -91,6 +91,7 @@ jobs:
           python3 tools/install/test_safe_fs.py
           python3 tools/install/test_distribution_safe.py
           python3 tools/install/deletion_safety.test.py
+          python3 tools/install/route_release_retention.test.py
           python3 tools/install/installer_runtime.test.py
 
       - name: Run activation and lifecycle suites

@@ -17,7 +17,28 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 # it in a private copy so peer suites never read the live checkout mid-edit
 # (tools/checkout-copy.sh).
 . "$ROOT/tools/checkout-copy.sh"
-checkout_copy "$ROOT" "$TMP/repo" || { rm -rf "$TMP"; echo "not ok - checkout copy" >&2; exit 1; }
+source_git() { git -c "safe.directory=$ROOT" -C "$ROOT" "$@"; }
+SOURCE_GIT_DIR=$(source_git rev-parse --absolute-git-dir)
+SOURCE_COMMON_DIR=$(source_git rev-parse --path-format=absolute --git-common-dir)
+SOURCE_INDEX=$(source_git rev-parse --path-format=absolute --git-path index)
+SOURCE_HEAD=$(source_git rev-parse HEAD)
+SOURCE_REFS=$(source_git show-ref --head | LC_ALL=C sort)
+SOURCE_INDEX_DIGEST=$(sha256sum "$SOURCE_INDEX" | cut -d' ' -f1)
+mkdir -p "$TMP/decoy-objects"
+(
+  GIT_DIR="$SOURCE_GIT_DIR" \
+  GIT_COMMON_DIR="$SOURCE_COMMON_DIR" \
+  GIT_WORK_TREE="$ROOT" \
+  GIT_INDEX_FILE="$SOURCE_INDEX" \
+  GIT_OBJECT_DIRECTORY="$SOURCE_COMMON_DIR/objects" \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES="$TMP/decoy-objects" \
+  GIT_NAMESPACE=checkout-copy-fixture \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=true \
+  checkout_copy "$ROOT" "$TMP/repo"
+) || { rm -rf "$TMP"; echo "not ok - isolated checkout copy" >&2; exit 1; }
+[ "$(source_git rev-parse HEAD)" = "$SOURCE_HEAD" ]
+[ "$(source_git show-ref --head | LC_ALL=C sort)" = "$SOURCE_REFS" ]
+[ "$(sha256sum "$SOURCE_INDEX" | cut -d' ' -f1)" = "$SOURCE_INDEX_DIGEST" ]
 ROOT="$TMP/repo"
 MANIFEST="$ROOT/harness-manifest.json"
 TARGET="$ROOT/adapters/codex/skills/session-tidy/SKILL.md"
@@ -48,6 +69,13 @@ grep -q "GENERATOR_SENTINEL" "$ROOT/adapters/claude/plugin-marketplace/plugins/h
 grep -q "GENERATOR_SENTINEL" "$ROOT/adapters/codex/skills/session-tidy/SKILL.md"
 grep -q "GENERATOR_SENTINEL" "$ROOT/adapters/codex/plugins/hearting-codex/skills/session-tidy/SKILL.md"
 grep -q "GENERATOR_SENTINEL" "$ROOT/adapters/opencode/skills/session-tidy/SKILL.md"
+if grep -q '^name:' "$ROOT/adapters/claude/skills/session-tidy/SKILL.md" \
+  || grep -q '^name:' "$ROOT/skills/session-tidy/SKILL.md"; then
+  echo "not ok - Claude skill names must use their folder while preserving shared identifiers" >&2
+  exit 1
+fi
+grep -q '^name: session-tidy$' "$ROOT/adapters/codex/skills/session-tidy/SKILL.md"
+grep -q '^name: session-tidy$' "$ROOT/adapters/opencode/skills/session-tidy/SKILL.md"
 
 python3 - "$MANIFEST" <<'PY'
 import json, sys

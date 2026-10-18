@@ -61,6 +61,10 @@ report, draft finalize) — it writes for the reader, it does not judge.
   checklists, dev/test logs, review memos, eval tables, figures). Invent nothing beyond
   them; every substantive claim in the report must trace to an input artifact, cited by
   path.
+  Carry the source description and distinguishing comparison condition from those inputs
+  into each independently readable summary. Report completion conditions using their
+  existing text; keep internal IDs only for traceability, and do not infer an
+  unexplained identifier's meaning.
 - **No new QA.** Verification happened upstream. Do not re-review, re-test, or add
   findings. If an input is missing, contradictory, or unreadable, return `blocked` with
   the exact gap instead of papering over it.

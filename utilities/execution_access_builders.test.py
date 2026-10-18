@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -185,7 +186,16 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         for delivery in ("one-shot", "session-resume-supervised"):
             current = self.claude.shell_command(self.claude_args(delivery), prompt, log)
             base = self.claude_base.shell_command(self.claude_args(delivery), prompt, log)
-            self.assertEqual(base, current)
+            if delivery == "session-resume-supervised":
+                current_args = shlex.split(current)
+                base_args = shlex.split(base)
+                self.assertEqual(current_args.count("--turn-transport"), 1)
+                transport_index = current_args.index("--turn-transport")
+                self.assertEqual(current_args[transport_index + 1], "resume-process")
+                del current_args[transport_index:transport_index + 2]
+                self.assertEqual(base_args, current_args)
+            else:
+                self.assertEqual(base, current)
         self.assertEqual(
             self.opencode_base.scoped_external_directory_config(str(self.artifact)),
             self.opencode.scoped_external_directory_config(str(self.artifact)),

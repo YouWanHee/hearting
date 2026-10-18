@@ -244,19 +244,18 @@ check_opencode_projection_targets() {
 }
 
 check_non_claude_projection_runtime_caches() {
-  # A release is `git archive` of a ref (tools/install/build-release.py), so a
-  # cache git ignores can never reach a projection; only a tracked or
-  # un-ignored cache is a boundary violation. Before 2026-09-10 every
-  # `__pycache__` a local test run left behind failed this check (the tests
-  # import the wrappers; the check itself runs with PYTHONDONTWRITEBYTECODE=1,
-  # a suite run beside it does not).
+  # Releases are git archives, which omit untracked runtime caches. In a
+  # checkout, only tracked bytecode can cross the release boundary.
+  if [ ! -e .git ]; then
+    return
+  fi
   cache_paths=$(find adapters/codex adapters/opencode codex_setting opencode_setting \
     \( -type d -name __pycache__ -o -type f -name '*.py[co]' \) -print 2>/dev/null \
     | while IFS= read -r cache_path; do
-        git check-ignore -q -- "$cache_path" 2>/dev/null || printf '%s\n' "$cache_path"
+        git ls-files --error-unmatch -- "$cache_path" >/dev/null 2>&1 && printf '%s\n' "$cache_path"
       done || true)
   if [ -n "$cache_paths" ]; then
-    fail_msg "Codex/OpenCode adapter projections must not expose Python bytecode caches (tracked or not ignored by git):"
+    fail_msg "Codex/OpenCode adapter projections must not expose tracked Python bytecode caches:"
     printf '%s\n' "$cache_paths"
   fi
 }
@@ -2979,11 +2978,11 @@ check_claude_tool_projection() {
   # Apply the three-class contract to tools files at every depth; directories
   # remain concrete containers for collapsed file symlinks.
   for p in $(find tools -mindepth 1 ! -path '*/__pycache__' ! -path '*/__pycache__/*' \
-      ! -path '*/node_modules' ! -path '*/node_modules/*' -print); do
+      ! -name '*.py[co]' ! -path '*/node_modules' ! -path '*/node_modules/*' -print); do
     rel=${p#tools/}
     adapter_p=adapters/claude/tools/$rel
     case "$rel" in
-      generate.py|harness_manifest.py|sync-skill-invocation-policy.py|sync-entry-skill-layer.py|entry-skill-layer.test.py|generated-projections.test.sh|sync-missing-projections.sh|sync-missing-projections.py|context-footprint-baseline.json|surface-budget.json|install/projection-completeness.test.sh|install/test_compute_hosts_launcher.py|release|release/*|render-landing.py|render-fleet-svg.py|lab-config-provenance.py|lab_config_provenance.test.py|artifact-producer-canary.py|artifact-w8-handoff.py|artifact_w8_handoff.test.py|artifact-delta-census.py|artifact_delta_census.test.py|git-hooks|git-hooks/*)
+      generate.py|harness_manifest.py|sync-skill-invocation-policy.py|sync-entry-skill-layer.py|entry-skill-layer.test.py|generated-projections.test.sh|native-skill-discovery.test.py|opencode-text-request.test.py|sync-missing-projections.sh|sync-missing-projections.py|context-footprint-baseline.json|surface-budget.json|install/projection-completeness.test.sh|install/test_compute_hosts_launcher.py|release|release/*|render-landing.py|render-fleet-svg.py|lab-config-provenance.py|lab_config_provenance.test.py|artifact-producer-canary.py|artifact-w8-handoff.py|artifact_w8_handoff.test.py|artifact-delta-census.py|artifact_delta_census.test.py|git-hooks|git-hooks/*)
         # Harness-development, profile acceptance, repository release, Git
         # maintainer hooks, and GitHub Pages docs automation tools are
         # intentionally not runtime projections.

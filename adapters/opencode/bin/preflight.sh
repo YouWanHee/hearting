@@ -156,11 +156,18 @@ EOF
 doctor_check() {
   name=$1
   shift
-  if "$@" >/dev/null 2>&1; then
+  doctor_tmp=$(mktemp "${TMPDIR:-/tmp}/hearting-doctor.XXXXXX") || {
+    printf 'check=%s:failed\n' "$name"
+    return 1
+  }
+  if "$@" >"$doctor_tmp" 2>&1; then
     printf 'check=%s:ok\n' "$name"
+    rm -f "$doctor_tmp"
     return 0
   fi
   printf 'check=%s:failed\n' "$name"
+  "$ROOT/utilities/preflight-doctor-cause.sh" "$name" < "$doctor_tmp"
+  rm -f "$doctor_tmp"
   return 1
 }
 

@@ -95,6 +95,22 @@ class RegistrySnapshotMemoTest(unittest.TestCase):
             M._registry_snapshot(self.jobs)
             M._owner_snapshot(self.jobs, "att-a")
 
+    def test_exact_owner_snapshot_does_not_rebuild_unrelated_history(self):
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(self.ROW % f"att-history-{index:05d}")
+        with mock.patch.object(M, "_registry_snapshot",
+                               side_effect=AssertionError("full registry projection")):
+            fields, metadata = M._owner_snapshot(self.jobs, "att-a")
+        self.assertEqual(fields[1], "open")
+        self.assertEqual(metadata["attempt_id"], "att-a")
+
+    def test_exact_owner_snapshot_still_rejects_duplicate_attempt_rows(self):
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(self.ROW % "att-a")
+        with self.assertRaisesRegex(M.OwnerRouteBindingError, "owner-row-not-unique"):
+            M._owner_snapshot(self.jobs, "att-a")
+
     def test_unreadable_registry_keeps_the_typed_error(self):
         M._registry_snapshot(self.jobs)
         self.jobs.unlink()

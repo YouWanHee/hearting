@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
-import distribution
 import fixture_env
 
 
@@ -29,6 +35,93 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.patch = mock.patch.dict(os.environ, self.environment, clear=True)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+
+    def test_registry_lock_reenters_on_owner_thread_but_blocks_other_threads(self) -> None:
+        jobs = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "registry-boundary" / "jobs.log"
+        started = threading.Event()
+        acquired = threading.Event()
+
+        def competing_admission() -> None:
+            started.set()
+            with distribution._registry_lock(jobs):
+                acquired.set()
+
+        worker = threading.Thread(target=competing_admission)
+        with distribution._registry_lock(jobs):
+            with distribution._registry_lock(jobs):
+                self.assertTrue(Path(f"{jobs}.lock").is_file())
+            worker.start()
+            self.assertTrue(started.wait(timeout=2))
+            self.assertFalse(acquired.wait(timeout=0.1), "another thread bypassed the owner lock")
+
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "competing admission did not resume after unlock")
+        self.assertTrue(acquired.is_set())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork lock ownership is Linux/POSIX-specific")
+    def test_registry_lock_after_fork_waits_for_parent_and_releases_in_child(self) -> None:
+        jobs = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "fork-boundary" / "jobs.log"
+        read_fd, write_fd = os.pipe()
+        child = None
+        try:
+            with distribution._registry_lock(jobs):
+                child = os.fork()
+                if child == 0:
+                    os.close(read_fd)
+                    try:
+                        with distribution._registry_lock(jobs):
+                            os.write(write_fd, b"entered")
+                    finally:
+                        os._exit(0)
+                os.close(write_fd)
+                ready, _, _ = select.select([read_fd], [], [], 0.5)
+                self.assertFalse(ready, "fork child reused its parent's reentrant ownership")
+
+            ready, _, _ = select.select([read_fd], [], [], 3.0)
+            self.assertTrue(ready, "fork child did not enter after parent released the lock")
+            self.assertEqual(os.read(read_fd, 32), b"entered")
+            waited, status = os.waitpid(child, 0)
+            self.assertEqual(waited, child)
+            self.assertEqual(status, 0)
+            child = None
+        finally:
+            os.close(read_fd)
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child, 0)
+
+    def test_process_guard_excludes_only_the_exact_owned_lock_descriptor(self) -> None:
+        candidate = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "descriptor-release"
+        jobs = candidate / ".dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True)
+        with distribution._registry_lock(jobs):
+            self.assertEqual(distribution._release_held_by_live_process(candidate), (False, ""))
+            descriptor_open = threading.Event()
+            release_descriptor = threading.Event()
+
+            def open_independent_descriptor() -> None:
+                with open(f"{jobs}.lock", "a+b"):
+                    descriptor_open.set()
+                    release_descriptor.wait(timeout=2)
+
+            worker = threading.Thread(target=open_independent_descriptor)
+            worker.start()
+            try:
+                self.assertTrue(descriptor_open.wait(timeout=2))
+                held, reason = distribution._release_held_by_live_process(candidate)
+                self.assertTrue(held, "an unowned descriptor of the owned lock path was ignored")
+                self.assertTrue(reason.startswith("live-process:"), reason)
+            finally:
+                release_descriptor.set()
+                worker.join(timeout=3)
+            self.assertFalse(worker.is_alive(), "independent descriptor fixture did not close")
 
     # destructive-ok: reason=install a same-byte foreign successor for CAS verification; boundary=two exact symlink/file fixture leaves below HEARTING_FIXTURE_ROOT
     def test_rollback_preserves_exact_successors(self) -> None:
@@ -60,9 +153,8 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
 
     def test_release_keep_message_names_the_actual_evidence(self) -> None:
         # Only an open attempt row is a "live dispatch attempt". A route record without a
-        # closing outcome, or evidence that could not be read, must be named as what it is,
-        # and the route line says what settles it (2026-10-06: four releases kept for weeks by
-        # route records with no attempt row anywhere, announced as live attempts).
+        # closing outcome, or evidence that could not be read, must be named as what it is;
+        # routine cleanup must not ask a person to close the record manually.
         release = Path("/releases/v9")
         attempt = distribution._release_keep_message(release, "open-attempt:att-123")
         self.assertIn("still referenced by a live dispatch attempt (open-attempt:att-123)", attempt)
@@ -70,8 +162,9 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.assertIn("live dispatch attempt", legacy)
         route = distribution._release_keep_message(release, "open-route:rt-abc")
         self.assertNotIn("live dispatch attempt", route)
-        self.assertIn("route record that has no closing outcome (open-route:rt-abc)", route)
-        self.assertIn("capability-route.py close", route)
+        self.assertIn("unresolved route reference (open-route:rt-abc)", route)
+        self.assertIn("execution or continuation", route)
+        self.assertNotIn("capability-route.py close", route)
         for why in ("registry-unreadable:/x/jobs.log", "registry-row-unparsable:/x/jobs.log",
                     "route-launch-home-unresolvable:rt-abc", "route-discovery-unreliable:/x/bindings"):
             with self.subTest(why=why):
@@ -187,6 +280,258 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 )
                 self.assertEqual(self.source.read_bytes(), self._serialize(self.link))
 
+    def test_observation_collision_is_archived_without_replacing_current_bytes(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        content_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                    / "dispatch-observation-archive" / root_digest
+                    / relative / content_digest)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            self.assertEqual(archived.stat().st_nlink, 1)
+            self.assertEqual(list(archived.parent.iterdir()), [archived])
+            self.assertEqual(
+                distribution._migration_deletion_precondition(
+                    self.candidate, self.environment
+                ),
+                (True, ""),
+            )
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            self.assertEqual(archived.stat().st_nlink, 1)
+            self.assertEqual(list(archived.parent.iterdir()), [archived])
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+        self.assertEqual(archived.read_bytes(), b"legacy observation\n")
+
+    def test_observation_classifier_matches_only_the_verified_name_forms(self) -> None:
+        positives = (
+            Path("logs/dispatch-session-sweep.log"),
+            Path("logs/legacy-worker.heartbeat"),
+            Path("plugin-load.legacy-worker.mark"),
+        )
+        negatives = (
+            Path("logs/dispatch-session-sweep.log.1"),
+            Path("logs/nested/legacy-worker.heartbeat"),
+            Path("logs/legacy-worker.heartbeat.bak"),
+            Path("logs/.heartbeat"),
+            Path("logs/worker name.heartbeat"),
+            Path("plugin-load.legacy-worker.mark.bak"),
+            Path("plugin-load..mark"),
+            Path("plugin-load.worker name.mark"),
+            Path("heartbeats/att-test.json"),
+            Path("completion/proof.json"),
+            Path("unrecognized.log"),
+        )
+        for relative in positives:
+            with self.subTest(relative=relative):
+                self.assertTrue(distribution._dispatch_observation_file(relative))
+        for relative in negatives:
+            with self.subTest(relative=relative):
+                self.assertFalse(distribution._dispatch_observation_file(relative))
+
+    def test_observation_written_after_carry_is_archived_by_final_delta_check(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        archive_root = (Path(self.environment["HARNESS_STATE_ROOT"])
+                        / "dispatch-observation-archive" / root_digest
+                        / relative)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            source.write_bytes(b"legacy observation plus late write\n")
+            self.assertEqual(
+                distribution._migration_deletion_precondition(
+                    self.candidate, self.environment
+                ),
+                (True, ""),
+            )
+        digests = {hashlib.sha256(path.read_bytes()).hexdigest()
+                   for path in archive_root.iterdir()}
+        self.assertEqual(
+            digests,
+            {
+                hashlib.sha256(b"legacy observation\n").hexdigest(),
+                hashlib.sha256(b"legacy observation plus late write\n").hexdigest(),
+            },
+        )
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+
+    def test_completion_proof_collision_still_blocks_release_deletion(self) -> None:
+        relative = Path("completion/proof.json")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b'{"proof":"legacy"}\n')
+        target.write_bytes(b'{"proof":"current"}\n')
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            allowed, reason = distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )
+        self.assertFalse(allowed)
+        self.assertIn("delta-digest-mismatch", reason)
+        self.assertEqual(source.read_bytes(), b'{"proof":"legacy"}\n')
+        self.assertEqual(target.read_bytes(), b'{"proof":"current"}\n')
+        self.assertFalse(
+            (Path(self.environment["HARNESS_STATE_ROOT"])
+             / "dispatch-observation-archive").exists()
+        )
+
+    def test_corrupt_archive_and_archive_write_failure_keep_the_release(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        content_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                    / "dispatch-observation-archive" / root_digest
+                    / relative / content_digest)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            archived.write_bytes(b"corrupt archive")
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            self.assertFalse(distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )[0])
+            archived.write_bytes(b"legacy observation\n")
+            # destructive-ok: reason=inject a missing archive object before the copy-failure case; boundary=one object below this test's temporary state root
+            archived.unlink()
+            with mock.patch.object(distribution, "_atomic_migrate_copy", return_value=False):
+                self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+        self.assertEqual(source.read_bytes(), b"legacy observation\n")
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+
+    def test_archive_link_and_fsync_failures_are_retryable(self) -> None:
+        failures = ("copy", "link", "file-fsync", "directory-fsync")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            for failure in failures:
+                with self.subTest(failure=failure):
+                    relative = Path(f"logs/{failure}-worker.heartbeat")
+                    source = self.source_root / relative
+                    target = self.target_root / relative
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    legacy = f"legacy {failure}\n".encode()
+                    current = f"current {failure}\n".encode()
+                    source.write_bytes(legacy)
+                    target.write_bytes(current)
+                    root_digest = hashlib.sha256(
+                        os.fsencode(str(self.source_root.resolve()))
+                    ).hexdigest()
+                    content_digest = hashlib.sha256(legacy).hexdigest()
+                    archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                                / "dispatch-observation-archive" / root_digest
+                                / relative / content_digest)
+
+                    if failure == "copy":
+                        failure_patch = mock.patch.object(
+                            distribution.shutil, "copyfileobj",
+                            side_effect=OSError("copy fixture"),
+                        )
+                    elif failure == "link":
+                        failure_patch = mock.patch.object(
+                            distribution.os, "link", side_effect=OSError("link fixture")
+                        )
+                    elif failure == "file-fsync":
+                        failure_patch = mock.patch.object(
+                            distribution.os, "fsync", side_effect=OSError("file fsync fixture")
+                        )
+                    else:
+                        real_fsync = os.fsync
+                        calls = 0
+
+                        def fail_directory_fsync(fd):
+                            nonlocal calls
+                            calls += 1
+                            if calls == 2:
+                                raise OSError("directory fsync fixture")
+                            return real_fsync(fd)
+
+                        failure_patch = mock.patch.object(
+                            distribution.os, "fsync", side_effect=fail_directory_fsync
+                        )
+
+                    with failure_patch:
+                        self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+                    self.assertEqual(source.read_bytes(), legacy)
+                    self.assertEqual(target.read_bytes(), current)
+                    self.assertFalse(any(".migrate-" in path.name
+                                         for path in archived.parent.iterdir())
+                                     if archived.parent.exists() else False)
+
+                    self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+                    self.assertEqual(archived.read_bytes(), legacy)
+                    self.assertEqual(archived.stat().st_nlink, 1)
+                    self.assertEqual(list(archived.parent.iterdir()), [archived])
+                    self.assertEqual(target.read_bytes(), current)
+                    self.assertTrue(distribution._migration_deletion_precondition(
+                        self.candidate, self.environment
+                    )[0])
+
+    def test_symlink_in_dispatch_tree_keeps_source_and_refuses_carry(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        outside = self.candidate.parent / "outside-observation.log"
+        outside.write_bytes(b"outside bytes\n")
+        source.symlink_to(outside)
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            allowed, reason = distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )
+        self.assertFalse(allowed)
+        self.assertIn("delta-unreadable", reason)
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside bytes\n")
+
+    def test_symlinked_live_sidecar_is_never_reanchored_outside_target_root(self) -> None:
+        relative = Path("completion/rt-test/plan.att-test.attempt.json")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        outside = self.candidate.parent / "outside-sidecar.json"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            json.dumps({"completion_marker": str(source.parent / "plan.json")}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        outside.write_text('{"completion_marker":"outside"}\n', encoding="utf-8")
+        # destructive-ok: reason=replace the migrated fixture destination with a symlink attack; boundary=one destination below this test's temporary state root
+        target.unlink()
+        target.symlink_to(outside)
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"),
+                         '{"completion_marker":"outside"}\n')
+
     def test_other_sidecar_changes_still_block_deletion(self) -> None:
         original = self.target.read_bytes()
         mutations = {
@@ -240,6 +585,446 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 )[0])
 
 
+class ReleasePycachePruneTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.share = self.root / "share" / "hearting"
+        self.releases = self.share / "releases"
+        self.releases.mkdir(parents=True)
+        self.state = self.root / "state" / "hearting"
+        self.pycache = self.state / "pycache"
+
+    def _cache_for(self, release: Path) -> Path:
+        return self.pycache.joinpath(*self.releases.parts[1:], release.name)
+
+    def _patch_cleanup(self, stack: ExitStack, *, in_use=(False, ""), route=([], "")) -> None:
+        for name, value in {
+            "data_root": self.share,
+            "state_root": self.state,
+            "_stable_registry_snapshot": [],
+            "_open_route_launch_homes": route,
+            "_release_in_use": in_use,
+            "_release_held_by_live_process": (False, ""),
+            "_release_projection_referenced": False,
+            "_succeed_dispatch_state": True,
+            "_migration_deletion_precondition": (True, ""),
+            "_retention_containment_precondition": (True, ""),
+        }.items():
+            if callable(value):
+                stack.enter_context(mock.patch.object(
+                    distribution, name, side_effect=value
+                ))
+            else:
+                stack.enter_context(mock.patch.object(
+                    distribution, name, return_value=value
+                ))
+
+    def _create_release(self, name: str, timestamp: int) -> Path:
+        release = self.releases / name
+        release.mkdir()
+        (release / "cache_probe.py").write_text("VALUE = 42\n", encoding="utf-8")
+        os.utime(release, (timestamp, timestamp))
+        return release
+
+    def test_prune_removes_only_corresponding_default_pycache(self) -> None:
+        old = self._create_release("v-old", 1)
+        middle = self._create_release("v-middle", 2)
+        newest = self._create_release("v-newest", 3)
+        import_env = os.environ.copy()
+        import_env["PYTHONPYCACHEPREFIX"] = str(self.pycache)
+        import_env.pop("PYTHONDONTWRITEBYTECODE", None)
+        imported = subprocess.run(
+            [sys.executable, "-S", "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import cache_probe",
+             str(old)],
+            capture_output=True, text=True, env=import_env, check=False,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        old_cache = self._cache_for(old)
+        self.assertTrue(list(old_cache.rglob("*.pyc")))
+        for release in (middle, newest):
+            cache = self._cache_for(release)
+            cache.mkdir(parents=True)
+            (cache / "retained.pyc").write_bytes(b"retained")
+        sibling = self.pycache.joinpath(*self.releases.parts[1:-1])
+        sibling = sibling / "releases-neighbor" / "v-unrelated"
+        sibling.mkdir(parents=True)
+        (sibling / "unrelated.pyc").write_bytes(b"unrelated")
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+
+        self.assertFalse(old.exists())
+        self.assertFalse(old_cache.exists())
+        self.assertTrue(middle.exists() and self._cache_for(middle).exists())
+        self.assertTrue(newest.exists() and self._cache_for(newest).exists())
+        self.assertTrue((sibling / "unrelated.pyc").is_file())
+
+    def test_cleanup_discovers_unchanged_global_routes_once_for_many_releases(self) -> None:
+        releases = [self._create_release(f"v-{index}", index) for index in range(5)]
+        calls = 0
+
+        def discover(_environ, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return [], ""
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution, "_open_route_launch_homes", side_effect=discover
+            ))
+            distribution._cleanup_releases(set())
+
+        self.assertEqual(calls, 1, "unchanged global route records were rediscovered per release")
+        self.assertEqual(sum(release.exists() for release in releases), 2)
+
+    def test_unrelated_admission_proceeds_during_delayed_global_discovery(self) -> None:
+        releases = [self._create_release(f"v-{index}", index) for index in range(3)]
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        unrelated_jobs.parent.mkdir()
+        discovery_started = threading.Event()
+        allow_discovery = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+
+        def delayed_discovery(_environ, **_kwargs):
+            discovery_started.set()
+            if not allow_discovery.wait(timeout=3):
+                raise TimeoutError("fixture did not release the bounded discovery")
+            return [], ""
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_open_route_launch_homes",
+                        side_effect=delayed_discovery,
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(discovery_started.wait(timeout=2))
+            with distribution._registry_lock(unrelated_jobs):
+                admitted.set()
+            self.assertTrue(admitted.is_set(), "global discovery blocked unrelated admission")
+        finally:
+            allow_discovery.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertEqual(worker_errors, [])
+
+    def test_unrelated_admission_proceeds_during_delayed_refresh(self) -> None:
+        releases = [self._create_release(f"refresh-{index}", index) for index in range(3)]
+        boundary_jobs = releases[0] / ".dispatch" / "jobs.log"
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        boundary_jobs.parent.mkdir()
+        unrelated_jobs.parent.mkdir()
+        for index, release in enumerate(releases):
+            os.utime(release, (index, index))
+        generation_dir = self.root / "refresh-routes"
+        generation_dir.mkdir()
+        refresh_started = threading.Event()
+        allow_refresh = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+        discovery_calls = 0
+
+        def inventory_for_scan(inventory):
+            inventory.clear()
+            inventory.update({
+                "files": set(), "directories": {generation_dir}, "registries": set(),
+                "start_files": {},
+                "start_directories": {
+                    generation_dir: distribution._path_fingerprint(generation_dir)
+                },
+                "unstable": False,
+            })
+            inventory["fingerprints"] = distribution._snapshot_discovery_inputs(
+                inventory, ()
+            )
+
+        def delayed_refresh(_environ, *, inventory, **_kwargs):
+            nonlocal discovery_calls
+            discovery_calls += 1
+            inventory_for_scan(inventory)
+            if discovery_calls == 1:
+                (generation_dir / "published.json").write_text("{}\n", encoding="utf-8")
+            elif discovery_calls == 2:
+                refresh_started.set()
+                if not allow_refresh.wait(timeout=3):
+                    raise TimeoutError("fixture did not release the bounded refresh")
+            return [], ""
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_open_route_launch_homes",
+                        side_effect=delayed_refresh,
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_dispatch_cleanup_boundary_paths",
+                        return_value=[boundary_jobs],
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(refresh_started.wait(timeout=2))
+
+            def admit_unrelated() -> None:
+                with distribution._registry_lock(unrelated_jobs):
+                    admitted.set()
+
+            competitor = threading.Thread(target=admit_unrelated)
+            competitor.start()
+            self.assertTrue(
+                admitted.wait(timeout=1),
+                "delayed refresh held an unrelated dispatch admission lock",
+            )
+            competitor.join(timeout=2)
+            self.assertFalse(competitor.is_alive())
+        finally:
+            allow_refresh.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertEqual(discovery_calls, 2)
+        self.assertEqual(worker_errors, [])
+
+    def test_unrelated_admission_proceeds_during_delayed_cache_deletion(self) -> None:
+        releases = [self._create_release(f"cache-delay-{index}", index) for index in range(3)]
+        boundary_jobs = releases[0] / ".dispatch" / "jobs.log"
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        boundary_jobs.parent.mkdir()
+        unrelated_jobs.parent.mkdir()
+        for index, release in enumerate(releases):
+            os.utime(release, (index, index))
+        cache_started = threading.Event()
+        allow_cache = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+        real_remove_cache = distribution._remove_release_pycache
+
+        def delayed_cache_removal(release):
+            if Path(release) == releases[0]:
+                cache_started.set()
+                if not allow_cache.wait(timeout=3):
+                    raise TimeoutError("fixture did not release cache deletion")
+            return real_remove_cache(release)
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_remove_release_pycache",
+                        side_effect=delayed_cache_removal,
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_dispatch_cleanup_boundary_paths",
+                        return_value=[boundary_jobs],
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(cache_started.wait(timeout=2))
+
+            def admit_unrelated() -> None:
+                with distribution._registry_lock(unrelated_jobs):
+                    admitted.set()
+
+            competitor = threading.Thread(target=admit_unrelated)
+            competitor.start()
+            self.assertTrue(
+                admitted.wait(timeout=1),
+                "delayed cache deletion held an unrelated dispatch admission lock",
+            )
+            competitor.join(timeout=2)
+            self.assertFalse(competitor.is_alive())
+        finally:
+            allow_cache.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertFalse(releases[0].exists())
+        self.assertEqual(worker_errors, [])
+
+    def test_known_observation_collisions_prune_but_completion_conflict_retains(self) -> None:
+        real_succeed_dispatch_state = distribution._succeed_dispatch_state
+        observations = {
+            Path("logs/dispatch-session-sweep.log"): (
+                b"legacy sweep bytes\n", b"current sweep bytes\n"),
+            Path("logs/legacy-worker.heartbeat"): (
+                b"legacy heartbeat bytes\n", b"current heartbeat bytes\n"),
+            Path("plugin-load.legacy-worker.mark"): (
+                b"legacy plugin marker\n", b"current plugin marker\n"),
+        }
+
+        for conflict in (False, True):
+            case_root = self.root / ("proof-conflict" if conflict else "observations-only")
+            self.share = case_root / "share" / "hearting"
+            self.releases = self.share / "releases"
+            self.releases.mkdir(parents=True)
+            self.state = case_root / "state" / "hearting"
+            self.pycache = self.state / "pycache"
+
+            old = self._create_release("v-old", 1)
+            middle = self._create_release("v-middle", 2)
+            newest = self._create_release("v-newest", 3)
+            current = self.share / "current"
+            current.symlink_to(newest)
+
+            source_dispatch = old / ".dispatch"
+            current_dispatch = newest / ".dispatch"
+            for relative, (legacy_bytes, current_bytes) in observations.items():
+                source = source_dispatch / relative
+                target = current_dispatch / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(legacy_bytes)
+                target.write_bytes(current_bytes)
+
+            source_proof = source_dispatch / "completion" / "proof.json"
+            target_proof = current_dispatch / "completion" / "proof.json"
+            source_proof.parent.mkdir(parents=True, exist_ok=True)
+            target_proof.parent.mkdir(parents=True, exist_ok=True)
+            source_proof.write_bytes(b'{"proof":"legacy"}\n')
+            target_proof.write_bytes(
+                b'{"proof":"current"}\n' if conflict else b'{"proof":"legacy"}\n'
+            )
+
+            cache = self._cache_for(old)
+            cache.mkdir(parents=True)
+            (cache / "legacy.pyc").write_bytes(b"derived cache")
+            for release, timestamp in ((old, 1), (middle, 2), (newest, 3)):
+                os.utime(release, (timestamp, timestamp))
+
+            environment = {
+                "HOME": str(case_root / "home"),
+                "XDG_STATE_HOME": str(case_root / "xdg-state"),
+                "HARNESS_DATA_ROOT": str(self.share),
+                "HARNESS_STATE_ROOT": str(self.state),
+            }
+            with mock.patch.dict(os.environ, environment, clear=True), ExitStack() as stack:
+                self._patch_cleanup(stack)
+                stack.enter_context(mock.patch.object(
+                    distribution, "_succeed_dispatch_state",
+                    side_effect=real_succeed_dispatch_state,
+                ))
+                distribution._cleanup_releases(set())
+
+            self.assertEqual(old.exists(), conflict)
+            self.assertEqual(cache.exists(), conflict)
+            self.assertTrue(middle.is_dir() and newest.is_dir())
+            if conflict:
+                self.assertEqual(source_proof.read_bytes(), b'{"proof":"legacy"}\n')
+            else:
+                self.assertFalse(source_proof.exists())
+            self.assertEqual(
+                target_proof.read_bytes(),
+                b'{"proof":"current"}\n' if conflict else b'{"proof":"legacy"}\n',
+            )
+
+            source_digest = hashlib.sha256(os.fsencode(str(source_dispatch.resolve()))).hexdigest()
+            archive_root = self.state / "dispatch-observation-archive" / source_digest
+            for relative, (legacy_bytes, current_bytes) in observations.items():
+                archive = (archive_root / relative
+                           / hashlib.sha256(legacy_bytes).hexdigest())
+                target = current_dispatch / relative
+                self.assertEqual(archive.read_bytes(), legacy_bytes)
+                self.assertEqual(target.read_bytes(), current_bytes)
+                self.assertFalse(any(".migrate-" in path.name
+                                     for path in archive.parent.iterdir()))
+
+    def test_orphan_cache_waits_for_live_or_unresolved_release_evidence(self) -> None:
+        cache = self._cache_for(self.releases / "gone")
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"orphan")
+
+        def prove_use(_release, _stable, route_snapshot, _registry_snapshot=None):
+            if route_snapshot[1]:
+                return True, route_snapshot[1]
+            return True, "open-attempt:att-live"
+
+        for route in (([], ""), ([], "route-discovery-unreliable:/fixture")):
+            with self.subTest(route=route):
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack, in_use=prove_use, route=route)
+                    distribution._cleanup_releases(set())
+                self.assertTrue((cache / "old.pyc").is_file())
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+        self.assertFalse(cache.exists())
+
+    def test_failed_cache_removal_is_retried_on_the_next_cleanup(self) -> None:
+        old = self._create_release("v-old", 1)
+        self._create_release("v-middle", 2)
+        self._create_release("v-newest", 3)
+        cache = self._cache_for(old)
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"old")
+        real_rmtree = distribution.shutil.rmtree
+
+        def fail_cache(path, *args, **kwargs):
+            if Path(path) == cache:
+                raise PermissionError("fixture cache failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution.shutil, "rmtree", side_effect=fail_cache
+            ))
+            distribution._cleanup_releases(set())
+        self.assertFalse(old.exists())
+        self.assertTrue((cache / "old.pyc").is_file())
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+        self.assertFalse(cache.exists())
+
+    def test_release_removal_failure_keeps_its_derived_cache(self) -> None:
+        old = self._create_release("v-old", 1)
+        self._create_release("v-middle", 2)
+        self._create_release("v-newest", 3)
+        cache = self._cache_for(old)
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"old")
+
+        def fail_release(path, *_args, **_kwargs):
+            if Path(path) == old:
+                raise PermissionError("fixture release failure")
+            return None
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution.shutil, "rmtree", side_effect=fail_release
+            ))
+            distribution._cleanup_releases(set())
+        self.assertTrue(old.is_dir())
+        self.assertTrue((cache / "old.pyc").is_file())
+
+
 class ActivationFailureDiagnosticTest(unittest.TestCase):
     def test_stdout_json_precedence_and_last_lines_entry(self) -> None:
         self.assertEqual(
@@ -290,4 +1075,23 @@ class ActivationFailureDiagnosticTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    with tempfile.TemporaryDirectory(prefix="hearting-test-distribution-safe-") as root:
+        fixture_root = Path(root).resolve()
+        with fixture_env.patched_environment(
+            fixture_root / "runtime", Path(__file__).resolve().parents[2]
+        ) as env:
+            private_root = (fixture_root / "runtime").resolve()
+            for key in (
+                "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "HARNESS_STATE_ROOT",
+                "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+            ):
+                Path(env[key]).resolve().relative_to(private_root)
+            print("routine_fixture_roots=" + json.dumps({
+                key: env[key] for key in (
+                    "HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "HARNESS_STATE_ROOT",
+                    "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+                )
+            }, sort_keys=True), flush=True)
+            import distribution
+            unittest.main()

@@ -4,6 +4,13 @@ import { spawnSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, writeFileSync, renameSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync, readdirSync } from "node:fs"
 import { createHash } from "node:crypto"
 
+if (!process.env.PYTHONPYCACHEPREFIX && !process.env.PYTHONDONTWRITEBYTECODE) {
+  const stateRoot = process.env.HARNESS_STATE_ROOT ||
+    (process.env.XDG_STATE_HOME && path.join(process.env.XDG_STATE_HOME, "hearting")) ||
+    (process.env.HOME && path.join(process.env.HOME, ".local", "state", "hearting"))
+  if (stateRoot) process.env.PYTHONPYCACHEPREFIX = path.join(stateRoot, "pycache")
+}
+
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(pluginDir, "../../..")
 const python3 = existsSync("/usr/bin/python3") ? "/usr/bin/python3" : "python3"
@@ -1207,12 +1214,14 @@ function createCompletionCarrier(ctx) {
 
   return {
     async activate(sid) {
-      if (!sid || !available()) return
+      if (!sid || !available()) return false
+      const result = await command("activate", sid)
+      if (result === null) return false
       sessions.add(sid)
-      await command("activate", sid)
       // The existing timer and idle callback deliver the retained receipt;
       // session creation by itself never acknowledges it.
       this.env(sid)
+      return true
     },
     // The env a tool command of `sid` carries: only a runtime that will carry the receipt says so.
     env(sid) {
@@ -1791,13 +1800,16 @@ export const AgentHarnessGuards = async (ctx) => {
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
   const paneBinding = registerPaneContext(ctx)
-  if (!isWorkerSession()) reconnectPeerObligations()
   const completionCarrier = createCompletionCarrier(ctx)
   // Restoring an existing -s/--session TUI does not emit session.created.
   // Reuse the process-bound selector; a directory/SDK root cannot pick a recipient.
   if (paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
-    await completionCarrier.activate(paneNativeOrigin.sid)
+    let activated = false
+    try { activated = await completionCarrier.activate(paneNativeOrigin.sid) } catch {}
+    if (!activated) reconnectPeerObligations()
     scheduleInitialPaneProjection(ctx, paneBinding, paneNativeOrigin.sid)
+  } else {
+    reconnectPeerObligations()
   }
 
   return ({
@@ -1858,10 +1870,13 @@ export const AgentHarnessGuards = async (ctx) => {
       const createdID = info?.id || event.properties?.sessionID || ""
       if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
     }
-    if (event && event.type === "session.created" && !isWorkerSession()) {
-      reconnectPeerObligations()
+    if (event && event.type === "session.created") {
       const sid = event.properties?.info?.id || event.properties?.sessionID || ""
-      await completionCarrier.activate(sid)
+      let activated = false
+      if (!isWorkerSession() && sid) {
+        try { activated = await completionCarrier.activate(sid) } catch {}
+      }
+      if (!activated) reconnectPeerObligations()
     }
     if (event && event.type === "session.compacted") {
       const sid = event.properties?.sessionID || ""

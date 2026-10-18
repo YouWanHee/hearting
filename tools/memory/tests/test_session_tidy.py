@@ -3112,8 +3112,8 @@ class SeatHandoverTest(TidyCase):
         self.assertNotIn("att-unselected", {b["attempt"] for b in rows[0]["bindings"]})
 
     def test_the_clear_start_reads_the_registry_once_and_asks_only_about_new_attempts(self):
-        # The card hook has seconds: one registry read or route verification per binding of the
-        # same job let a cleared supervisor's SessionStart time out and lose its card.
+        # The card hook has seconds: a full registry walk or route verification per binding of
+        # the same job can let a cleared supervisor's SessionStart time out and lose its card.
         route_file = self.open_route("rt-frame", "sha256:frame")
         for index in range(12):
             self.row(f"att-frame-{index}", status="done", route="rt-frame", node="frame", worker="frame",
@@ -3139,7 +3139,7 @@ class SeatHandoverTest(TidyCase):
         self.assertIn("카드 본문", text)
         self.assertIn("[이어받은 진행 작업] route=rt-1", text)
         self.assertEqual(asked, ["att-retry"])
-        self.assertEqual(len(reads), 2)                     # the refresh and the resume line, once each
+        self.assertEqual(len(reads), 1)                     # only resume_line needs the compatibility mapping
         self.assertEqual({b["attempt"] for b in rows[0]["bindings"]},
                          {f"att-frame-{index}" for index in range(12)} | {"att-open", "att-retry"})
 
