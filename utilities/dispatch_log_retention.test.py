@@ -20,6 +20,7 @@ import dispatch_log_retention as R  # noqa: E402
 import dispatch_observation_log as OBS  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
 import dispatch_pending_delivery as PD  # noqa: E402
+import dispatch_retention as SHARED  # noqa: E402
 
 DAY = 86400 * 1_000_000_000
 
@@ -107,6 +108,73 @@ class DispatchLogRetentionTest(unittest.TestCase):
         self.assertEqual(result["removed"], 0)
         self.assertTrue((self.logs / "dispatch-session-sweep.log").exists())
         self.assertTrue((self.logs / "dispatch-pending-delivery.log").exists())
+
+    def test_owned_prompt_sidecars_from_each_adapter_age_out(self):
+        old = self.now - 30 * DAY
+        prompts = []
+        for harness in ("codex", "claude", "opencode"):
+            attempt = f"att-{harness}-prompt-old"
+            log_name = f"job.{attempt}.{harness}.jsonl"
+            prompt_name = f"job.{attempt}.{harness}.prompt.txt"
+            prompts.append(self.log(prompt_name, f"{harness} prompt\n".encode()))
+            self.add_row(attempt, self.logs / log_name, harness=harness, ended=old)
+
+        result = self.sweep()
+
+        self.assertEqual(result["removed"], 3, result)
+        self.assertEqual(result["eligible"], 3)
+        self.assertTrue(all(not path.exists() for path in prompts))
+
+    def test_prompt_sidecars_keep_active_unsettled_unknown_and_unbound_attempts(self):
+        old = self.now - 30 * DAY
+        prompts = []
+        unknown_process_attempts = set()
+        for harness in ("codex", "claude", "opencode"):
+            active = f"att-{harness}-active-prompt"
+            active_path = self.log(f"job.{active}.{harness}.prompt.txt")
+            self.add_row(active, self.logs / f"job.{active}.{harness}.jsonl",
+                         harness=harness, status="running", ended=old)
+            prompts.append(active_path)
+
+            pending = f"att-{harness}-delivery-prompt"
+            pending_path = self.log(f"job.{pending}.{harness}.prompt.txt")
+            self.add_row(
+                pending, self.logs / f"job.{pending}.{harness}.jsonl",
+                harness=harness, ended=old, delivery_intent="1",
+                delivery_id="delivery-" + {"codex": "a", "claude": "b", "opencode": "c"}[harness] * 32,
+                delivery_recipient_digest=PD.recipient_digest("sess-prompt-fixture"),
+                parent_sid="sess-prompt-fixture", parent_attempt_id="att-parent",
+                dispatch_depth="2", route_id="rt-" + "b" * 16, route_node="execute",
+            )
+            prompts.append(pending_path)
+
+            unknown = f"att-{harness}-unknown-process-prompt"
+            unknown_path = self.log(f"job.{unknown}.{harness}.prompt.txt")
+            self.add_row(unknown, self.logs / f"job.{unknown}.{harness}.jsonl",
+                         harness=harness, ended=old)
+            unknown_process_attempts.add(unknown)
+            prompts.append(unknown_path)
+
+            review = f"att-{harness}-review-prompt"
+            review_path = self.log(f"job.{review}.{harness}.prompt.txt")
+            self.add_row(review, self.logs / f"job.{review}.{harness}.jsonl",
+                         harness=harness, ended=old, worker_type="review", failure_class="fail")
+            prompts.append(review_path)
+
+        unbound = self.log("orphan.codex.prompt.txt")
+        with mock.patch.object(
+                DC, "attempt_process_quiescence",
+                side_effect=lambda meta, **_kwargs: (
+                    DC.ProcessQuiescence("unverifiable", "fixture-unknown")
+                    if meta["attempt_id"] in unknown_process_attempts
+                    else DC.ProcessQuiescence("quiescent", "fixture-quiet"))):
+            result = self.sweep()
+
+        self.assertEqual(result["removed"], 0)
+        self.assertTrue(all(path.exists() for path in [*prompts, unbound]))
+        self.assertEqual(result["kept_reasons"].get("delivery-pending"), 3)
+        self.assertEqual(result["kept_reasons"].get("quiescence-unverifiable"), 3)
+        self.assertEqual(result["kept_reasons"].get("review-consumer-open"), 3)
 
     def test_live_and_unverifiable_processes_keep_attempt_logs(self):
         live = self.log("live-process.jsonl")
@@ -216,6 +284,106 @@ class DispatchLogRetentionTest(unittest.TestCase):
             self.assertFalse(R._unlink_if_same(layout, path.name, expected))
         self.assertEqual(path.read_text(encoding="utf-8"), "replacement\n")
 
+    def test_new_writer_at_original_path_survives_quarantine_removal(self):
+        path = self.log("swap-during-unlink.jsonl")
+        expected = R._stamp(os.stat(path, follow_symlinks=False))
+        original_unlink = os.unlink
+        created = []
+
+        def create_new_writer(name, *args, dir_fd=None, **kwargs):
+            if (name == path.name and dir_fd is not None
+                    and os.fstat(dir_fd).st_ino != self.logs.stat().st_ino and not created):
+                path.write_text("new writer\n", encoding="utf-8")
+                created.append(True)
+            return original_unlink(name, *args, dir_fd=dir_fd, **kwargs)
+
+        with R._LogLayout(self.root) as layout, \
+                mock.patch.object(SHARED.os, "unlink", side_effect=create_new_writer):
+            self.assertTrue(R._unlink_if_same(layout, path.name, expected))
+
+        self.assertTrue(created)
+        self.assertEqual(path.read_text(encoding="utf-8"), "new writer\n")
+
+    def test_mismatched_quarantined_inode_is_restored(self):
+        path = self.log("swap-before-quarantine.jsonl")
+        expected = R._stamp(os.stat(path, follow_symlinks=False))
+        replacement = self.root / "replacement.jsonl"
+        replacement.write_text("replacement\n", encoding="utf-8")
+        original_rename = os.rename
+        swapped = []
+
+        def swap_before_move(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            if src == path.name and src_dir_fd == layout.logs_fd and not swapped:
+                os.replace(replacement, path)
+                swapped.append(True)
+            return original_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with R._LogLayout(self.root) as layout, \
+                mock.patch.object(SHARED.os, "rename", side_effect=swap_before_move):
+            self.assertFalse(R._unlink_if_same(layout, path.name, expected))
+
+        self.assertTrue(swapped)
+        self.assertEqual(path.read_text(encoding="utf-8"), "replacement\n")
+        self.assertFalse(list(self.logs.glob(SHARED.QUARANTINE_PREFIX + "*")))
+
+    def test_new_writer_is_never_overwritten_when_mismatch_restore_runs(self):
+        path = self.log("swap-new-writer.jsonl")
+        expected = R._stamp(os.stat(path, follow_symlinks=False))
+        replacement = self.root / "replacement.jsonl"
+        replacement.write_text("moved replacement\n", encoding="utf-8")
+        original_rename = os.rename
+        original_recover = SHARED._recover_quarantine
+        swapped = []
+        wrote_new = []
+
+        def swap_before_move(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            if src == path.name and src_dir_fd == layout.logs_fd and not swapped:
+                os.replace(replacement, path)
+                swapped.append(True)
+            return original_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        def create_new_writer(parent_fd, quarantine_name):
+            if not wrote_new:
+                path.write_text("new writer\n", encoding="utf-8")
+                wrote_new.append(True)
+            return original_recover(parent_fd, quarantine_name)
+
+        with R._LogLayout(self.root) as layout, \
+                mock.patch.object(SHARED.os, "rename", side_effect=swap_before_move), \
+                mock.patch.object(SHARED, "_recover_quarantine", side_effect=create_new_writer):
+            self.assertFalse(R._unlink_if_same(layout, path.name, expected))
+
+        self.assertTrue(swapped and wrote_new)
+        self.assertEqual(path.read_text(encoding="utf-8"), "new writer\n")
+        quarantined = list(self.logs.glob(SHARED.QUARANTINE_PREFIX + "*/*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "moved replacement\n")
+
+    def test_interrupted_quarantine_is_restored_and_retried_next_pass(self):
+        old = self.log("quarantine-retry.jsonl")
+        self.add_row("att-quarantine-retry", old, ended=self.now - 30 * DAY)
+        original_unlink = os.unlink
+        interrupted = []
+
+        def interrupt_first_quarantine_unlink(name, *args, dir_fd=None, **kwargs):
+            if name == old.name and dir_fd is not None and not interrupted:
+                interrupted.append(True)
+                raise OSError("simulated interruption after quarantine move")
+            return original_unlink(name, *args, dir_fd=dir_fd, **kwargs)
+
+        with mock.patch.object(SHARED.os, "unlink", side_effect=interrupt_first_quarantine_unlink):
+            first = self.sweep()
+        self.assertEqual(first["removed"], 0)
+        self.assertFalse(old.exists())
+        quarantined = list(self.logs.glob(SHARED.QUARANTINE_PREFIX + "*/*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "transcript\n")
+
+        second = self.sweep()
+        self.assertEqual(second["removed"], 1)
+        self.assertFalse(old.exists())
+        self.assertFalse(list(self.logs.glob(SHARED.QUARANTINE_PREFIX + "*/*")))
+
 
 class ObservationLogRotationTest(unittest.TestCase):
     def test_concurrent_appends_rotate_only_complete_json_records(self):
@@ -258,6 +426,31 @@ class ObservationLogRotationTest(unittest.TestCase):
             segments = list(logs.glob("dispatch-pending-delivery.log.segment.*"))
             self.assertTrue(any(b"old backlog" in path.read_bytes() for path in segments))
             self.assertEqual(json.loads(active.read_text(encoding="utf-8")), {"event": "new"})
+
+    def test_segment_swap_during_quarantine_keeps_new_writer(self):
+        with tempfile.TemporaryDirectory(prefix="dispatch-observation-swap-") as td:
+            logs = Path(td) / "logs"
+            logs.mkdir()
+            segment = logs / "dispatch-session-sweep.log.segment.expired"
+            segment.write_text("old segment\n", encoding="utf-8")
+            expected = OBS._stamp(os.stat(segment, follow_symlinks=False))
+            logs_fd = os.open(logs, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, logs_fd)
+            original_unlink = os.unlink
+            created = []
+
+            def create_new_segment(name, *args, dir_fd=None, **kwargs):
+                if (name == segment.name and dir_fd is not None
+                        and os.fstat(dir_fd).st_ino != os.fstat(logs_fd).st_ino and not created):
+                    segment.write_text("new segment\n", encoding="utf-8")
+                    created.append(True)
+                return original_unlink(name, *args, dir_fd=dir_fd, **kwargs)
+
+            with mock.patch.object(SHARED.os, "unlink", side_effect=create_new_segment):
+                self.assertTrue(OBS._unlink_segment(logs_fd, segment.name, expected))
+
+            self.assertTrue(created)
+            self.assertEqual(segment.read_text(encoding="utf-8"), "new segment\n")
 
 
 if __name__ == "__main__":

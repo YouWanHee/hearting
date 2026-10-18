@@ -11,6 +11,8 @@ import secrets
 import stat
 import time
 
+from dispatch_retention import recover_quarantines, unlink_same_file
+
 MAX_ACTIVE_BYTES = 16 * 1024 * 1024
 MAX_RETAINED_BYTES = 2 * 1024 * 1024 * 1024
 RETENTION_NS = 14 * 86400 * 1_000_000_000
@@ -26,27 +28,11 @@ def _stamp(info):
 
 
 def _unlink_segment(dir_fd, name, expected):
-    try:
-        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        if (_stamp(current) != expected or not stat.S_ISREG(current.st_mode)
-                or current.st_nlink != 1 or current.st_uid != os.geteuid()):
-            return False
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                     dir_fd=dir_fd)
-        try:
-            if _stamp(os.fstat(fd)) != expected:
-                return False
-            if _stamp(os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) != expected:
-                return False
-            os.unlink(name, dir_fd=dir_fd)
-            return True
-        finally:
-            os.close(fd)
-    except OSError:
-        return False
+    return unlink_same_file(dir_fd, name, expected, _stamp)
 
 
 def _rotate_and_prune(dir_fd, name, now_ns):
+    recover_quarantines(dir_fd)
     try:
         active = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:

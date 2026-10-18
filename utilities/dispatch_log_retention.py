@@ -22,6 +22,11 @@ from dispatch_contract import (
     dispatch_state_root,
     validate_dispatch_log_dir,
 )
+from dispatch_retention import (
+    QUARANTINE_PREFIX,
+    recover_quarantines,
+    unlink_same_file,
+)
 
 RETENTION_NS = 14 * 86400 * 1_000_000_000
 MAX_LOG_BYTES = 2 * 1024 * 1024 * 1024
@@ -157,6 +162,49 @@ def _bound_name(jobs: Path, root: Path, log_file: str):
     return path.name
 
 
+def _prompt_name_for_log_name(log_name, harness):
+    """Derive only the prompt sibling written by a registered adapter."""
+    if harness not in {"claude", "codex", "opencode"}:
+        return None
+    suffix = f".{harness}.jsonl"
+    if not isinstance(log_name, str) or not log_name.endswith(suffix):
+        return None
+    return log_name[:-len(".jsonl")] + ".prompt.txt"
+
+
+def _prompt_name_for_row(jobs, root, attempt, row):
+    if row.meta.get("attempt_id") != attempt:
+        return None
+    harness = row.meta.get("harness")
+    log_name = _bound_name(jobs, root, row.meta.get("log_file"))
+    if log_name is None or harness not in {"claude", "codex", "opencode"}:
+        return None
+    slug = row.fields[4] if len(row.fields) > 4 else ""
+    if not slug or slug in (".", "..") or os.path.basename(slug) != slug:
+        return None
+    writer_names = {
+        f"{slug}.{attempt}.{harness}.jsonl",
+        f"{slug}.{harness}.jsonl",
+    }
+    if log_name not in writer_names:
+        return None
+    return _prompt_name_for_log_name(log_name, harness)
+
+
+def _unknown_prompt_names(jobs, root, unknown_log_refs):
+    names = set()
+    for log_file in unknown_log_refs:
+        log_name = _bound_name(jobs, root, log_file)
+        if log_name is None:
+            continue
+        for harness in ("claude", "codex", "opencode"):
+            prompt_name = _prompt_name_for_log_name(log_name, harness)
+            if prompt_name is not None:
+                names.add(prompt_name)
+                break
+    return names
+
+
 def _log_protection(ctx, attempt, *, probe_processes):
     """Shared attempt decision plus the log-only failing-review consumer."""
     from dispatch_retention import Protection
@@ -174,43 +222,43 @@ def _log_protection(ctx, attempt, *, probe_processes):
 
 
 def _unlink_if_same(layout, name, expected):
-    """Unlink only a pinned regular inode that still occupies the exact name."""
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                     dir_fd=layout.logs_fd)
-    except OSError:
-        return False
-    try:
-        opened = os.fstat(fd)
-        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
-                or opened.st_uid != os.geteuid() or _stamp(opened) != expected):
-            return False
-        current = os.stat(name, dir_fd=layout.logs_fd, follow_symlinks=False)
-        if _stamp(current) != expected:
-            return False
-        os.unlink(name, dir_fd=layout.logs_fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
+    """Remove through a unique quarantine, preserving replacements at name."""
+    return unlink_same_file(layout.logs_fd, name, expected, _stamp)
 
 
-def _fresh_eligible(jobs, root, layout, log_file, expected_rows, expected_stamp, now_ns):
+def _fresh_eligible(jobs, root, layout, candidate_name, expected_rows,
+                    expected_stamp, now_ns, candidate_kind):
     from dispatch_contract import process_table_scan_scope
     from worker_home_retention import _Context, _Snapshot, _declared_index
 
     try:
         snapshot = _Snapshot(jobs)
-        if log_file in snapshot.unknown_log_refs:
-            return False
-        current_refs = snapshot.log_refs.get(log_file, {})
-        if set(current_refs) != set(expected_rows):
-            return False
+        if candidate_kind == "log":
+            log_file = str(root / "logs" / candidate_name)
+            if log_file in snapshot.unknown_log_refs:
+                return False
+            current_refs = snapshot.log_refs.get(log_file, {})
+            if set(current_refs) != set(expected_rows):
+                return False
+        else:
+            if candidate_name in _unknown_prompt_names(jobs, root, snapshot.unknown_log_refs):
+                return False
+            current_refs = {}
+            for attempt, row in snapshot.rows.items():
+                if _prompt_name_for_row(jobs, root, attempt, row) == candidate_name:
+                    current_refs[attempt] = row
+            if set(current_refs) != set(expected_rows):
+                return False
         for attempt, old in expected_rows.items():
             current = snapshot.rows.get(attempt)
-            if (current is None or current.raw != old.raw or current_refs[attempt].raw != old.raw
-                    or current.meta.get("log_file") != log_file):
+            current_ref = current_refs.get(attempt)
+            if (current is None or current_ref is None or current.raw != old.raw
+                    or current_ref.raw != old.raw):
+                return False
+            if candidate_kind == "log" and current.meta.get("log_file") != log_file:
+                return False
+            if (candidate_kind == "prompt"
+                    and _prompt_name_for_row(jobs, root, attempt, current) != candidate_name):
                 return False
         ctx = _Context(jobs, root, layout, snapshot, now_ns)
         ctx.by_key = _declared_index(snapshot, root, ctx.workers_real)
@@ -223,7 +271,7 @@ def _fresh_eligible(jobs, root, layout, log_file, expected_rows, expected_stamp,
                 terminal = _terminal_ns(row.fields[0])
                 if terminal is None or max(terminal, verdict.activity_ns) > now_ns:
                     return False
-        current_stat = os.stat(Path(log_file).name, dir_fd=layout.logs_fd, follow_symlinks=False)
+        current_stat = os.stat(candidate_name, dir_fd=layout.logs_fd, follow_symlinks=False)
         return (_stamp(current_stat) == expected_stamp and stat.S_ISREG(current_stat.st_mode)
                 and current_stat.st_nlink == 1 and current_stat.st_uid == os.geteuid())
     except Exception:  # noqa: BLE001 -- unreadable evidence keeps the bytes
@@ -264,9 +312,15 @@ def _pass(jobs, root, layout, state, now_ns, started):
     from dispatch_contract import process_table_scan_scope
     from worker_home_retention import _Context, _Snapshot
 
+    recovery = recover_quarantines(layout.logs_fd)
     names = []
     with os.scandir(layout.logs_fd) as listing:
         for entry in listing:
+            if (entry.name.startswith(QUARANTINE_PREFIX)
+                    and len(entry.name) == len(QUARANTINE_PREFIX) + 32
+                    and all(ch in "0123456789abcdef"
+                            for ch in entry.name[len(QUARANTINE_PREFIX):])):
+                continue
             names.append(entry.name)
             if len(names) > MAX_DIRECTORY_ENTRIES:
                 result = {"skipped": "directory-limit", "observed_entries": len(names)}
@@ -283,6 +337,7 @@ def _pass(jobs, root, layout, state, now_ns, started):
             continue
         stamps[name] = _stamp(info)
         total_bytes += max(0, info.st_size)
+    total_bytes += recovery["pending_bytes"]
 
     try:
         snapshot = _Snapshot(jobs)
@@ -301,12 +356,27 @@ def _pass(jobs, root, layout, state, now_ns, started):
         if name is None:
             continue
         rows_by_name.setdefault(name, {}).update(rows)
+    prompt_rows_by_name = {}
+    for attempt, row in snapshot.rows.items():
+        name = _prompt_name_for_row(jobs, root, attempt, row)
+        if name is not None:
+            prompt_rows_by_name.setdefault(name, {})[attempt] = row
     unknown_names = {
         name for path in snapshot.unknown_log_refs
         if (name := _bound_name(jobs, root, path)) is not None
     }
+    unknown_prompt_names = _unknown_prompt_names(jobs, root, snapshot.unknown_log_refs)
 
-    referenced_names = set(rows_by_name)
+    candidate_rows = dict(rows_by_name)
+    candidate_kinds = {name: "log" for name in rows_by_name}
+    for name, rows in prompt_rows_by_name.items():
+        if name in candidate_rows:
+            unknown_names.add(name)
+            continue
+        candidate_rows[name] = rows
+        candidate_kinds[name] = "prompt"
+    unknown_names.update(unknown_prompt_names)
+    referenced_names = set(candidate_rows)
     ordered = sorted(referenced_names)
     cursor = state.get("cursor", "")
     after = [name for name in ordered if name > cursor]
@@ -334,7 +404,7 @@ def _pass(jobs, root, layout, state, now_ns, started):
                 protected_names.add(name)
                 unknown_names.add(name)
                 continue
-            rows = rows_by_name[name]
+            rows = candidate_rows[name]
             if len(rows) == 0:
                 protected_names.add(name)
                 continue
@@ -364,15 +434,17 @@ def _pass(jobs, root, layout, state, now_ns, started):
                     break
                 terminal_values.append(settled)
             if all_eligible and terminal_values:
-                eligible.append((name, max(terminal_values), expected_stamp, rows))
+                eligible.append((name, max(terminal_values), expected_stamp, rows,
+                                 candidate_kinds[name]))
             else:
                 protected_names.add(name)
 
     selected_set = set(selected_names)
-    known_names = set(rows_by_name)
+    known_names = set(candidate_rows)
     unknown_names.update(set(stamps) - known_names)
     unknown_names.update(known_names - selected_set)
     unknown_bytes = sum(max(0, stamps[name][4]) for name in unknown_names if name in stamps)
+    unknown_bytes += recovery["pending_bytes"]
     protected_bytes = sum(max(0, stamps[name][4]) for name in protected_names - unknown_names if name in stamps)
     eligible_bytes = sum(max(0, item[2][4]) for item in eligible)
     expired = [item for item in eligible if now_ns - item[1] >= RETENTION_NS]
@@ -388,12 +460,12 @@ def _pass(jobs, root, layout, state, now_ns, started):
     removed = 0
     removed_bytes = 0
     deferred = 0
-    for name, settled, expected_stamp, rows in selected:
+    for name, settled, expected_stamp, rows, candidate_kind in selected:
         if removed >= REMOVE_LIMIT or time.monotonic() - started > MAX_PASS_SECONDS:
             deferred += 1
             continue
-        log_file = str(root / "logs" / name)
-        if not _fresh_eligible(jobs, root, layout, log_file, rows, expected_stamp, now_ns):
+        if not _fresh_eligible(jobs, root, layout, name, rows, expected_stamp,
+                               now_ns, candidate_kind):
             protected_names.add(name)
             unknown_names.add(name)
             deferred += 1
@@ -410,6 +482,8 @@ def _pass(jobs, root, layout, state, now_ns, started):
         "removed": removed, "removed_bytes": removed_bytes, "deferred": deferred,
         "total_bytes": total_bytes, "protected_bytes": protected_bytes,
         "unknown_bytes": unknown_bytes,
+        "quarantine_pending_files": recovery["pending_files"],
+        "quarantine_pending_bytes": recovery["pending_bytes"],
         "over_limit_bytes": max(0, total_bytes - removed_bytes - MAX_LOG_BYTES),
         "kept_reasons": reasons,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
