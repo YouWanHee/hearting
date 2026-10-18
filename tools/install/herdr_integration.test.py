@@ -18,6 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT / "utilities"))
 import herdr_integration as herdr  # noqa: E402
 import fixture_env  # noqa: E402
 import projector  # noqa: E402
@@ -535,7 +536,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         with mock.patch.object(module, "_project", return_value=True) as project, \
-                mock.patch.object(module.subprocess, "Popen"), \
+                mock.patch("peer_obligations.request_obligation_recovery"), \
                 mock.patch.object(module.time, "time_ns", return_value=123456):
             module.project({"hook_event_name": "SessionStart", "source": "resume"}, "ses-A")
         project.assert_called_once_with("codex", "ses-A", worker=False, report_session=True,
