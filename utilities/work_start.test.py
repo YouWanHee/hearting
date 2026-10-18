@@ -2625,9 +2625,13 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.private_home = self.root / "agent-home"
         (self.private_home / "core").mkdir(parents=True)
         (self.private_home / "core" / "CORE.md").write_text("fixture\n")
+        # Trust only this resolved worktree through Git's command-scoped config; keep HOME private.
         fixture_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.root / "home"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(W.ROOT.resolve()),
             "AGENT_HOME": str(self.private_home),
             "AGENT_ARTIFACT_ROOT": str(self.reports),
             "AGENT_DISPATCH_JOBS": str(self.jobs),
