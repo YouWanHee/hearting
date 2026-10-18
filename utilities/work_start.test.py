@@ -2659,9 +2659,11 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.seat_root.start()
         self.addCleanup(self.seat_root.stop)
 
+        self._original_owner_continuation_processes = route_parent_close.owner_continuation_processes
+
         def owner_observation(meta, jobs):
             if meta.get("pid"):
-                return route_parent_close.owner_continuation_processes(meta, jobs)
+                return self._original_owner_continuation_processes(meta, jobs)
             status = W._rows(jobs).get(meta.get("attempt_id"), ("done", {}))[0]
             return SimpleNamespace(state="live" if status in {"open", "running"} else "quiescent",
                                    reason="fixture-observation"), []
@@ -3065,6 +3067,135 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(len(self.launches), before)
         self.assertEqual(self.replacement._rows(self.jobs.read_text().splitlines())[owner_c][1]["note"],
                          "dead-worker-blocked")
+
+
+class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartTest):
+    """Standard node-less owners retain a launcher PID after exact cleanup."""
+
+    def _prepare_route(self, artifact_lifecycle):
+        module = self.route_module
+
+        def tuple_for(child):
+            return {
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": module.WRAPPER_PARENT_SANDBOXES["codex"][0],
+                "child_harness": child, "launch_authority": "conductor", "status": "supported",
+                "probe_source": "fixture-probe", "probe_time": "2026-10-18T00:00:00Z",
+                "failure_class": "", "checked_worktree": str(module.ROOT.resolve()),
+                "failure_scope": "none", "codex_command": "ok" if child == "codex" else "not-applicable",
+                "retry_on_isolated_worktree": 0,
+            }
+
+        evidence = {
+            "tuples": [tuple_for("codex"), tuple_for("claude")],
+            "native_subagent": [{
+                "harness": "codex", "transport": "headless",
+                "execution_surface": "codex-native-subagent", "registered_worker": False,
+                "status": "supported", "check_source": "fixture-native-check",
+            }],
+        }
+        route = module.compose_route(
+            capability="autopilot-code", capability_mode="dev", shape="staged",
+            graph="execute,test,report", slug="fixture-modern-owner", cwd=module.ROOT,
+            artifact_root=self.reports, intensity="standard", spec_read="fixture",
+            drift_verdict="within-spec", tracking="tracked", artifact_guard="fixture",
+            dispatch_evidence=evidence, parent_harness="codex",
+            work_request={"text": "Complete the approved code task.", "owner_harness": "codex"},
+            unassigned=True,
+        )
+        module.verify_route(route)
+        self.producer.activate(
+            self.reports, repository_id="repo_" + "a" * 32,
+            artifact_root_id="root_" + "b" * 32,
+            w7={"campaign_id": "camp_" + "c" * 32})
+        binding = artifact_lifecycle.admit_runtime_route(self.reports, route)
+        self.path = Path(binding.route_file)
+        self.route = json.loads(self.path.read_text())
+        self.owner_node_id = None
+        self.producer.begin(
+            self.reports, route_file=self.path, capability="autopilot-code", intensity="standard",
+            jobs=self.root / "no-dispatch-registry.log")
+
+    def _argv(self, aid, parent_sid, parent_harness="codex"):
+        return ["--start", "--attempt-id", aid, "--worktree", self.route["cwd"],
+                "--route-evidence", str(self.path), "--slug", "fixture-modern-owner",
+                "--capability", self.route["capability"], "--capability-mode", self.route["capability_mode"],
+                "--intensity", "standard", "--dispatch-depth", "1", "--worker-type", "owner",
+                "--unit", "_kernel/owner", "--parent-session-id", parent_sid,
+                "--parent-harness", parent_harness, "--prompt-text", self.route["work_request"]["text"]]
+
+    def _metadata(self, aid, parent_sid="parent", parent_harness="codex", task=None, argv=None,
+                  *, prior=None, record=None, route_source=None):
+        from types import SimpleNamespace
+        route = self.route
+        task = task or route["work_request"]["text"]
+        argv = argv or self._argv(aid, parent_sid, parent_harness)
+        args = SimpleNamespace(
+            attempt_id=aid, attempt_schema_version="2", jobs_path=self.jobs,
+            worktree=route["cwd"], route_id=None, route_hash=None, route_file=None, route_node=None,
+            parent_session_id=parent_sid, parent_harness=parent_harness, parent_transport="headless",
+            parent_sandbox=self.route_module.WRAPPER_PARENT_SANDBOXES[parent_harness][0],
+            launch_authority="conductor", sandbox="workspace-write", permission_mode="default",
+            capability=route["capability"], capability_mode=route["capability_mode"], intensity="standard",
+            dispatch_depth=1, worker_type="owner", harness="codex", transport="headless",
+            execution_surface="registered-headless", registered_worker=True,
+            fallback_hop="same-harness-headless", unit="_kernel/owner", replacement_input_argv=argv,
+            owner_route_binding=SimpleNamespace(route_id=route["route_id"]))
+        metadata = {
+            "attempt_id": aid, "attempt_schema_version": "2", "dispatch_depth": "1",
+            "transport": "headless", "execution_surface": "registered-headless",
+            "registered_worker": "1", "fallback_hop": "same-harness-headless",
+            "worker_type": "owner", "unit": "_kernel/owner", "harness": "codex",
+            "owner_route_id": route["route_id"], "owner_route_hash": route["route_hash"],
+            "owner_route_file": str(self.path), "parent_sid": parent_sid,
+            "parent_harness": parent_harness, "parent_transport": "headless",
+            "capability": route["capability"], "capability_mode": route["capability_mode"],
+            "intensity": "standard", "supervisor_lease_nonce": "fixture-" + aid,
+        }
+        if prior:
+            metadata.update(automatic_retry_of=prior,
+                            replacement_family_id=record["family_id"],
+                            replacement_original_attempt_id=prior, replacement_ordinal="1",
+                            replacement_claim_digest=self.replacement._digest(record))
+        metadata.update(self.contract.parse_registry_metadata(
+            self.replacement.seal_launch_input(args, "codex", task)))
+        return metadata
+
+    def _controlled_runner(self, command, **kwargs):
+        close_attempt = self.contract.close_attempt_row
+
+        def close_after_fixture_carrier(jobs, aid, note, *, evidence=None):
+            if note == "dead-governor-reservation-transfer":
+                carrier = subprocess.Popen(["/bin/sleep", "0.2"], start_new_session=True)
+                try:
+                    pid_ns = self.contract.process_namespace_identity(carrier.pid)
+                    self.assertTrue(self.contract.annotate_attempt_row(jobs, aid, {
+                        "pid": str(carrier.pid),
+                        "pid_start": str(self.contract.process_start_ticks(carrier.pid)),
+                        "pgid": str(carrier.pid), "pid_ns": pid_ns,
+                        "pid_observer_ns": self.contract.process_namespace_identity(),
+                    }))
+                    carrier.wait(timeout=5)
+                finally:
+                    if carrier.poll() is None:
+                        carrier.kill()
+                        carrier.wait(timeout=5)
+                self.assertTrue(self.contract.annotate_attempt_row(
+                    jobs, aid, {"launch_outcome": "never-launched"}))
+            closed = close_attempt(jobs, aid, note, evidence=evidence)
+            if note == "dead-governor-reservation-transfer":
+                c_meta = self.replacement._rows(Path(jobs).read_text().splitlines())[aid][1]
+                self.assertTrue(c_meta.get("pid"))
+                self.assertTrue(c_meta.get("pid_start"))
+                self.assertTrue(c_meta.get("pid_ns"))
+                self.assertNotIn("route_file", c_meta)
+                self.assertNotIn("route_node", c_meta)
+                self.assertTrue(c_meta.get("owner_route_file"))
+                self.assertTrue(self.contract._settled_cleanup_receipt(c_meta))
+            return closed
+
+        with mock.patch.object(self.contract, "close_attempt_row", side_effect=close_after_fixture_carrier):
+            return super()._controlled_runner(command, **kwargs)
 
 
 class CoupledReviewSelfDispositionTest(unittest.TestCase):

@@ -66,9 +66,16 @@ def _id(value):
 
 
 def never_started(status, metadata):
-    """A terminal row whose launch fence proves no payload ever began."""
+    """A terminal row whose launch fence proves no payload ever began.
+
+    Some standard owners retain the launcher/carrier PID after the payload was
+    refused. Keep that identity usable only when its existing exact teardown
+    receipt proves the process group and attempt descendants were cleaned up.
+    The launch and process guards still reobserve liveness before replacement.
+    """
     return (status == 'done' and metadata.get('launch_outcome') == 'never-launched'
-            and metadata.get('launch_started') != '1' and not metadata.get('pid'))
+            and metadata.get('launch_started') != '1'
+            and (not metadata.get('pid') or DC._settled_cleanup_receipt(metadata)))
 
 
 def _once(path, value):
