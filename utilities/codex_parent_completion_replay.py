@@ -983,19 +983,70 @@ def _run_replay(output_dir: Path) -> dict:
                 "receipt_digest": duplicate["receipt_digest"], "state": duplicate["state"],
                 "ack_identity": original_ack_identity,
             })
-            # Admit these records to the candidate consumer before observing
-            # suppression; an unsubmitted empty native queue is not evidence.
-            deliveries, _ = dispatch_session_sweep.sweep_deliver(runtime, "codex-native-queue", thread_id)
-            if deliveries:
-                raise ReplayFailed("late-cleanup-or-duplicate-still-eligible-for-native-delivery")
+            # Exercise the same native courier that will deliver a later
+            # conflict. Its real validator must reject this resolved cleanup
+            # before the queue transport can see it.
+            spec = importlib.util.spec_from_file_location(
+                "codex_parent_replay_managed_completion", UTILITIES / "codex-managed-completion.py")
+            if spec is None or spec.loader is None:
+                raise ReplayBlocked("native-notice-courier-unavailable")
+            managed_completion = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(managed_completion)
+            watcher_args = SimpleNamespace(
+                jobs=jobs.resolve(), parent_session_id=thread_id,
+                sealed_batch_id=metadata["managed_sealed_batch_id"],
+                interval=0.05, queue_socket=endpoint,
+            )
+            watcher = managed_completion.NoticeWatcher(watcher_args, {attempt}, capability=None)
+            cleanup_path = pending_delivery.record_path(runtime, thread_id, cleanup_notice["delivery_id"])
+            watcher._one(cleanup_path)
+            cleanup_record_after_cleanup = pending_delivery.read(
+                runtime, thread_id, cleanup_notice["delivery_id"])
             history_after_cleanup = _all_turns(endpoint, thread_id)
             queue_after_cleanup = codex_queue_delivery.list_queue(endpoint, thread_id, timeout=10)
-            no_extra_turn = len(history_after_cleanup) == 2
+            cleanup_turn_occurrences = sum(
+                1 for turn in history_after_cleanup
+                if _turn_for_client_message([turn], cleanup_notice["delivery_id"]) is not None)
+            no_cleanup_turn = cleanup_turn_occurrences == 0
+            no_extra_turn = (len(history_after_cleanup) == len(history_before_cleanup)
+                             and no_cleanup_turn)
+            no_cleanup_queue_item = not any(
+                item.get("clientUserMessageId") == cleanup_notice["delivery_id"]
+                for item in queue_after_cleanup)
             no_queued_duplicate = not any(
                 item.get("clientUserMessageId") == completion_record["delivery_id"]
                 for item in queue_after_cleanup)
-            if not no_extra_turn or not no_queued_duplicate:
-                raise ReplayFailed("late-cleanup-created-an-unrequested-native-turn-or-queue-item")
+            old_after_cleanup = pending_delivery.read(
+                runtime, thread_id, completion_record["delivery_id"])
+            old_ack_preserved_after_cleanup = (
+                old_after_cleanup is not None
+                and pending_delivery.received_ack_identity(
+                    old_after_cleanup, thread_id, completion_record["delivery_id"])
+                    == original_ack_identity)
+            if (cleanup_record_after_cleanup is None
+                    or cleanup_record_after_cleanup.get("state") != "rejected"
+                    or cleanup_record_after_cleanup.get("expiry_reason") != "supervision-resolved"
+                    or not old_ack_preserved_after_cleanup or not no_extra_turn
+                    or not no_cleanup_queue_item or not no_queued_duplicate):
+                raise ReplayFailed("late-cleanup-native-courier-rejection-or-suppression-failed")
+            cleanup_courier_check = {
+                "delivery_id": cleanup_notice["delivery_id"],
+                "state": cleanup_record_after_cleanup.get("state"),
+                "reason": cleanup_record_after_cleanup.get("expiry_reason"),
+                "old_ack_identity_preserved": old_ack_preserved_after_cleanup,
+                "cleanup_native_turn_occurrences": cleanup_turn_occurrences,
+                "cleanup_native_queue_items": sum(
+                    1 for item in queue_after_cleanup
+                    if item.get("clientUserMessageId") == cleanup_notice["delivery_id"]),
+                "no_additional_native_turn": no_extra_turn,
+                "no_duplicate_completion_queue_item": no_queued_duplicate,
+            }
+            _write_json(output_dir / "late-cleanup-courier.json", cleanup_courier_check)
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "late-cleanup-rejected-by-native-courier",
+                **cleanup_courier_check,
+                "courier": "codex-managed-completion.NoticeWatcher._one",
+            })
 
             # A genuinely new terminal conflict gets a new notice revision.
             # It must reach the still-idle native parent through the existing
@@ -1036,18 +1087,6 @@ def _run_replay(output_dir: Path) -> dict:
                 "old_goal_row_status": late_row[0],
             })
 
-            spec = importlib.util.spec_from_file_location(
-                "codex_parent_replay_managed_completion", UTILITIES / "codex-managed-completion.py")
-            if spec is None or spec.loader is None:
-                raise ReplayBlocked("native-notice-courier-unavailable")
-            managed_completion = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(managed_completion)
-            watcher_args = SimpleNamespace(
-                jobs=jobs.resolve(), parent_session_id=thread_id,
-                sealed_batch_id=metadata["managed_sealed_batch_id"],
-                interval=0.05, queue_socket=endpoint,
-            )
-            watcher = managed_completion.NoticeWatcher(watcher_args, {attempt}, capability=None)
             watcher.start()
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "idle-parent-native-notice-courier-started",
@@ -1191,7 +1230,9 @@ def _run_replay(output_dir: Path) -> dict:
                 "late_cleanup_and_deadline_suppressed_as_duplicate_work": (
                     cleanup_record_after_question is not None
                     and cleanup_record_after_question.get("state") == "rejected"
-                    and no_extra_turn and no_queued_duplicate),
+                    and cleanup_record_after_question.get("expiry_reason") == "supervision-resolved"
+                    and old_ack_preserved_after_cleanup and no_extra_turn and no_cleanup_turn
+                    and no_cleanup_queue_item and no_queued_duplicate),
                 "same_result_redelivery_did_not_reopen_completed_attempt": (
                     duplicate.get("state") == "acked" and late_row[0] == "done"
                     and isinstance(settled_duty, dict) and settled_duty.get("state") == "complete"),
@@ -1233,8 +1274,12 @@ def _run_replay(output_dir: Path) -> dict:
                 "duplicate_record_kept_ack_state": duplicate.get("state") == "acked",
                 "native_history_count_unchanged_before_direct_question": no_extra_turn,
                 "native_queue_has_no_completion_duplicate": no_queued_duplicate,
+                "late_cleanup_native_turn_occurrences": cleanup_turn_occurrences,
+                "late_cleanup_native_queue_items": cleanup_courier_check["cleanup_native_queue_items"],
+                "late_cleanup_rejection_reason": cleanup_record_after_question.get("expiry_reason"),
                 "cleanup_notice_retired_as_resolved": bool(
-                    cleanup_record_after_question and cleanup_record_after_question.get("state") == "rejected"),
+                    cleanup_record_after_question and cleanup_record_after_question.get("state") == "rejected"
+                    and cleanup_record_after_question.get("expiry_reason") == "supervision-resolved"),
                 "late_conflict_delivery_id": late_notice["delivery_id"],
                 "late_conflict_receipt_digest": late_notice["receipt_digest"],
                 "late_conflict_obligation_revision": late_notice["receipt"]["obligation_revision"],

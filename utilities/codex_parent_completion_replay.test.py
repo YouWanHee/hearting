@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import codex_parent_completion_replay as replay
@@ -307,6 +309,31 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertFalse(supervision.notice_is_current(cleanup))
         self.assertIn("retains cleanup observation only",
                       supervision.render_text(cleanup["receipt"]))
+        spec = importlib.util.spec_from_file_location(
+            "codex_parent_replay_courier_test", replay.UTILITIES / "codex-managed-completion.py")
+        courier = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = courier
+        spec.loader.exec_module(courier)
+        watcher_args = SimpleNamespace(
+            jobs=jobs.resolve(), parent_session_id="idle-parent",
+            sealed_batch_id=metadata["managed_sealed_batch_id"],
+            interval=0.05, queue_socket=Path("/isolated-native-queue.sock"),
+        )
+        watcher = courier.NoticeWatcher(watcher_args, {attempt}, capability=None)
+        cleanup_path = pending.record_path(self.root, "idle-parent", cleanup["delivery_id"])
+        with mock.patch.object(courier.codex_queue_delivery, "send_at_least_once") as cleanup_send, \
+             mock.patch.object(courier.codex_queue_delivery, "list_queue") as cleanup_list, \
+             mock.patch.object(courier.codex_queue_delivery, "find_turn_by_client_message_id") as cleanup_find:
+            watcher._one(cleanup_path)
+        cleanup_send.assert_not_called()
+        cleanup_list.assert_not_called()
+        cleanup_find.assert_not_called()
+        rejected_cleanup = pending.read(self.root, "idle-parent", cleanup["delivery_id"])
+        self.assertEqual(rejected_cleanup["state"], "rejected")
+        self.assertEqual(rejected_cleanup["expiry_reason"], "supervision-resolved")
+        old_after_cleanup = pending.read(self.root, "idle-parent", completion["delivery_id"])
+        self.assertEqual(pending.received_ack_identity(
+            old_after_cleanup, "idle-parent", completion["delivery_id"]), old_ack)
         duplicate = pending.create(
             self.root, recipient_kind="codex-native-queue", recipient_key="idle-parent",
             delivery_id=completion["delivery_id"], session_generation="",
@@ -335,8 +362,32 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertNotEqual(late["delivery_id"], completion["delivery_id"])
         self.assertTrue(late["receipt"]["obligation_revision"])
         self.assertTrue(supervision.notice_is_current(late))
-        self.assertTrue(pending.read(self.root, "idle-parent", completion["delivery_id"]))
-        self.assertEqual(pending.read(self.root, "idle-parent", cleanup["delivery_id"])["state"], "pending")
+        self.assertNotEqual(late["delivery_id"], cleanup["delivery_id"])
+        self.assertNotEqual(late["delivery_id"], completion["delivery_id"])
+        self.assertEqual(pending.read(self.root, "idle-parent", cleanup["delivery_id"])["expiry_reason"],
+                         "supervision-resolved")
+        native_turn = {"id": "isolated-native-turn-1", "status": "completed"}
+        late_path = pending.record_path(self.root, "idle-parent", late["delivery_id"])
+        with mock.patch.object(courier.codex_queue_delivery, "send_at_least_once", return_value={
+                 "status": "queued", "already_pending": False,
+                 "queued_submission_id": "isolated-native-turn-1"}) as late_send, \
+             mock.patch.object(courier.codex_queue_delivery, "list_queue", return_value=[]), \
+             mock.patch.object(courier.codex_queue_delivery, "find_turn_by_client_message_id",
+                 return_value=native_turn) as late_find:
+            watcher._one(late_path)
+        late_send.assert_called_once()
+        late_find.assert_called_once()
+        self.assertEqual(late_find.call_args.args[0:2],
+                         (watcher_args.queue_socket, "idle-parent"))
+        self.assertEqual(late_find.call_args.args[2], late["delivery_id"])
+        self.assertEqual(late_find.call_args.kwargs["timeout"], 5.0)
+        late_record = pending.read(self.root, "idle-parent", late["delivery_id"])
+        self.assertEqual(late_record["state"], "acked")
+        self.assertEqual(late_record["acked_by"], watcher.owner)
+        self.assertEqual(native_turn["status"], "completed")
+        old_after_conflict = pending.read(self.root, "idle-parent", completion["delivery_id"])
+        self.assertEqual(pending.received_ack_identity(
+            old_after_conflict, "idle-parent", completion["delivery_id"]), old_ack)
 
     def test_resolver_rejects_symlink_into_group_or_world_writable_directory(self):
         with tempfile.TemporaryDirectory(prefix="parent-replay-unsafe-endpoint-") as temporary:
