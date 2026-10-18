@@ -132,6 +132,10 @@ The runner keeps its lease while any accepted local or external duty remains;
 an unrelated callback must not replace that waiting owner and discard its
 observation state. Code modules use their normal process lifetime, while
 the state and authority those functions observe remain fresh inputs.
+An observer lease transfer publishes the successor's existing PID/start record
+under the duty's existing update lock before that successor can claim it.
+The inherited descriptor and that record carry the transfer without another
+CLI input or a second recovery owner.
 
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the

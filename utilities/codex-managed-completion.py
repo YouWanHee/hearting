@@ -1164,8 +1164,6 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--join-command")
     value.add_argument("--resume-obligation", help=argparse.SUPPRESS)
     value.add_argument("--obligation-lock-fd", type=int, help=argparse.SUPPRESS)
-    value.add_argument("--obligation-parent-pid", type=int, help=argparse.SUPPRESS)
-    value.add_argument("--obligation-parent-start", help=argparse.SUPPRESS)
     value.add_argument("--ensure-obligations", action="store_true", help=argparse.SUPPRESS)
     value.add_argument("--service-current", help=argparse.SUPPRESS)
     return value
@@ -1529,12 +1527,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     inherited_fd = getattr(args, "obligation_lock_fd", None)
     expected_observer = None
-    if (getattr(args, "obligation_parent_pid", None) is not None
-            and getattr(args, "obligation_parent_start", None)):
-        expected_observer = {
-            "pid": args.obligation_parent_pid,
-            "pid_start": args.obligation_parent_start,
-        }
+    if inherited_fd is not None and getattr(args, "resume_obligation", None):
+        expected_observer = {"pid": os.getpid(), "pid_start": batch_obligations._pid_start(os.getpid())}
     if getattr(args, "resume_obligation", None):
         duty_id = args.resume_obligation
         record = batch_obligations.read(args.jobs, duty_id)
@@ -1544,8 +1538,6 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         restored._resume_execution = True
         restored._obligation_id = duty_id
         restored.obligation_lock_fd = inherited_fd
-        restored.obligation_parent_pid = getattr(args, "obligation_parent_pid", None)
-        restored.obligation_parent_start = getattr(args, "obligation_parent_start", None)
         args = restored
     else:
         if args.jobs is None or not Path(args.jobs).is_absolute() or Path(args.jobs).is_symlink() \

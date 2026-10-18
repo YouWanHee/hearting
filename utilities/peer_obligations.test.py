@@ -189,7 +189,7 @@ class ObligationStoreTest(unittest.TestCase):
                  mock.patch.object(batch_obligations, "_jobs_paths", return_value=[jobs]), \
                  mock.patch.object(batch_obligations, "_resume_owner_settlements",
                                    return_value=[]), \
-                 mock.patch.object(batch_obligations, "update",
+                 mock.patch.object(batch_obligations, "_write",
                                    side_effect=batch_obligations.BatchObligationError(
                                        "simulated-record-update-failure")), \
                  mock.patch.object(batch_obligations.subprocess, "Popen",
@@ -242,6 +242,12 @@ class ObligationStoreTest(unittest.TestCase):
             real_popen = subprocess.Popen
 
             def launch_child(_command, **kwargs):
+                probe = os.open(batch_obligations._record_path(jobs, duty_id).with_suffix(".update.lock"), os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(probe)
                 process = real_popen(
                     [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
                 children.append(process)

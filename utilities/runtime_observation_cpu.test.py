@@ -205,6 +205,8 @@ class FakeControlEndpoint:
                 try:
                     connection.settimeout(2)
                     request = FakeObservationEndpoint._read_line(connection)
+                    if not isinstance(request, dict):
+                        continue
                     self.requests += 1
                     if request.get("op") == "status":
                         response = {"schema_version": 1, "status": "ready", "capabilities": {
@@ -1243,7 +1245,7 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                         owner["lease_held"] = lock_held
                     return owners
 
-                owners = _wait_for(observer_snapshot, 20, "eight exact managed observers")
+                owners = _wait_for(observer_snapshot, args.launch_ready_timeout, "eight exact managed observers")
                 terminal_attempts = {item["attempt_id"] for item in observer_workloads
                                      if item["phase"] == "terminal-owner-recipient-busy"}
                 _wait_for(lambda: terminal_attempts <= control_server.deliveries,
