@@ -53,6 +53,7 @@ MAX_DELIVERY_BYTES = 256 * 1024
 MAX_DELIVERY_RECORDS = 4096
 MAX_DEPENDENCY_STAMPS = MAX_DELIVERY_RECORDS * 8
 MAX_TREE_DEPTH = 128
+REGISTRY_LOCK_WAIT_SECONDS = 0.100
 
 KEY_RE = re.compile(r"[0-9a-f]{32}")
 ATTEMPT_RE = re.compile(r"att-[A-Za-z0-9._-]{1,240}")
@@ -72,6 +73,7 @@ SCHEMA = 1
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _DEPENDENCIES = contextvars.ContextVar("retention_dependencies", default=None)
+_REGISTRY_DEADLINE = contextvars.ContextVar("retention_registry_deadline", default=None)
 
 
 def _stamp(path):
@@ -335,7 +337,9 @@ class _Snapshot:
     def __init__(self, jobs: Path):
         self.jobs = jobs
         _track(jobs)
+        self.registry_snapshot: tuple[int, int, int, int, int] | None = None
         self.rows: dict[str, _Row] = {}
+        self.row_offsets: dict[str, int] = {}
         self.open_refs: dict[str, set[str]] = {}
         self.log_refs: dict[str, dict[str, _Row]] = {}
         self.unknown_log_refs: set[str] = set()
@@ -343,17 +347,28 @@ class _Snapshot:
         # parent attempt -> children whose completion delivery was intended
         self.intents: dict[str, set[str]] = {}
         try:
-            size = jobs.stat().st_size
-        except OSError as exc:
-            raise _Unreadable("registry") from exc
-        if size > MAX_REGISTRY_BYTES:
-            raise _Unreadable("registry-oversized")
-        try:
             handle = open(jobs, "rb")
         except OSError as exc:
             raise _Unreadable("registry") from exc
         with handle:
-            for blob in handle:
+            try:
+                info = os.fstat(handle.fileno())
+            except OSError as exc:
+                raise _Unreadable("registry") from exc
+            size = info.st_size
+            if size > MAX_REGISTRY_BYTES:
+                raise _Unreadable("registry-oversized")
+            self.registry_snapshot = (info.st_dev, info.st_ino, size,
+                                      info.st_mtime_ns, info.st_ctime_ns)
+            remaining = size
+            offset = 0
+            while remaining:
+                blob = handle.readline(remaining)
+                if not blob:
+                    raise _Unreadable("registry-unstable")
+                line_offset = offset
+                offset += len(blob)
+                remaining -= len(blob)
                 line = blob.decode("utf-8", "replace").rstrip("\n")
                 fields = line.split("\t")
                 if not blob.endswith(b"\n"):
@@ -364,6 +379,7 @@ class _Snapshot:
                 found = ATTEMPT_ID_RE.search(fields[5])
                 if found:
                     self.rows[found.group(1)] = _Row(line, fields)
+                    self.row_offsets[found.group(1)] = line_offset
                 else:
                     candidate_log = re.search(r"(?:^|,)log_file=([^,]+)", fields[5])
                     if candidate_log:
@@ -552,13 +568,7 @@ def _recipient_group(root: Path, meta: dict):
     return root / "pending-delivery" / recipient_digest(parent)
 
 
-def _candidate_recipient_groups(root: Path, snapshot: _Snapshot, attempt: str,
-                                discovered: dict | None = None):
-    """Producer-bound delivery groups, including absent groups and terminal owners.
-
-    A group discovery already scanned keeps its discovery-time stamp, so a
-    record published into it after discovery invalidates this detach.
-    """
+def _candidate_related_attempts(root: Path, snapshot: _Snapshot, attempt: str) -> set[str]:
     related = {attempt, *snapshot.intents.get(attempt, ())}
     # Replacement successor obligations use the same recipient identities as
     # the exact delivery reads in _replacement_state.
@@ -574,18 +584,26 @@ def _candidate_recipient_groups(root: Path, snapshot: _Snapshot, attempt: str,
                 if isinstance(successor, str) and successor in snapshot.rows:
                     related.add(successor)
                     related.update(snapshot.intents.get(successor, ()))
+    return related
+
+
+def _candidate_recipient_groups(root: Path, snapshot: _Snapshot, attempt: str) -> set[str]:
+    """Producer-bound groups, including absent groups and terminal owners."""
+    groups = set()
     watched = _DEPENDENCIES.get()
-    for identity in related:
+    for identity in _candidate_related_attempts(root, snapshot, attempt):
         row = snapshot.rows.get(identity)
         if row is not None:
             group = _recipient_group(root, row.meta)
             if group is not None:
-                if watched is not None and discovered and group in discovered:
-                    watched.setdefault(group, discovered[group])
-                _track(group)
+                groups.add(group)
+                if watched is not None:
+                    _track_resolver_parent(group)
+    return groups
 
 
-def _delivery_index(root: Path, *, observer=None, activity=None):
+def _delivery_index(root: Path, *, observer=None, activity=None, records=None,
+                    groups_seen=None):
     """(attempt ids in open records, unknown evidence).
 
     `activity`, when given, receives the newest mtime of resolved records per
@@ -607,6 +625,8 @@ def _delivery_index(root: Path, *, observer=None, activity=None):
         try:
             if group.is_symlink() or not group.is_dir(follow_symlinks=False):
                 return refs, True
+            if groups_seen is not None:
+                groups_seen.add(group.name)
             if observer is not None:
                 # Before the scan: a record published into this group later
                 # must still change the stamp a candidate's detach compares.
@@ -646,6 +666,13 @@ def _delivery_index(root: Path, *, observer=None, activity=None):
                     or not isinstance(parent, str) or not parent):
                 return refs, True
             named = [item for item in (*ids, parent) if ATTEMPT_RE.fullmatch(item)]
+            if records is not None:
+                digest = hashlib.sha256(json.dumps(
+                    value, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")).hexdigest()
+                fact = (str(Path(entry.path)), digest, mtime, _stamp(entry.path))
+                for item in named:
+                    records.setdefault(item, {})[fact[0]] = fact[1:]
             if value.get("state") in OPEN_STATES:
                 refs.update(named)
             elif activity is not None:
@@ -785,6 +812,9 @@ class _Context:
         # Every group's discovery-time stamp; a detach seeds only its own groups.
         self.group_stamps = {}
         self.delivery_activity: dict[str, int] = {}
+        self.delivery_records: dict[str, dict[str, tuple]] = {}
+        self.delivery_unknown_global = False
+        self.delivery_groups: set[str] = set()
         self.by_key: dict[str, set[str]] = {}
         self.legacy: dict[tuple, dict[str, set[str]]] = {}
 
@@ -793,9 +823,18 @@ class _Context:
             def observe(kind, path):
                 table = self.group_stamps if kind == "group" else self.discovery_stamps
                 table[path] = _stamp(path)
-            self.delivery = _delivery_index(self.root, observer=observe,
-                                            activity=self.delivery_activity)
-        return self.delivery
+            self.delivery, self.delivery_unknown_global = _delivery_index(
+                self.root, observer=observe, activity=self.delivery_activity,
+                records=self.delivery_records, groups_seen=self.delivery_groups)
+        return self.delivery, self.delivery_unknown_global
+
+    def delivery_projection(self, attempt: str) -> tuple:
+        related = _candidate_related_attempts(self.root, self.snapshot, attempt)
+        return tuple(sorted(
+            (identity, path, *fact)
+            for identity in related
+            for path, fact in self.delivery_records.get(identity, {}).items()
+        ))
 
     def legacy_matches(self, source: str, harness: str, worker_type: str) -> dict[str, set[str]]:
         table = self.legacy.get((source, harness, worker_type))
@@ -807,6 +846,343 @@ class _Context:
                 table.setdefault(key, set()).add(attempt)
             self.legacy[(source, harness, worker_type)] = table
         return table
+
+
+def _registry_projection(snapshot: _Snapshot, key: str, attempt: str,
+                         by_key: dict[str, set[str]]) -> tuple:
+    row = snapshot.rows.get(attempt)
+    if row is None:
+        return (None, (), (), (), ())
+    related_rows = set(snapshot.open_refs.get(attempt, ()))
+    children = set(snapshot.intents.get(attempt, ()))
+    log_file = row.meta.get("log_file", "")
+    aliases = snapshot.log_refs.get(log_file, {}) if log_file else {}
+    return (
+        row.raw,
+        tuple(sorted((identity, snapshot.rows[identity].raw)
+                     for identity in related_rows if identity in snapshot.rows)),
+        tuple(sorted((identity, snapshot.rows[identity].raw)
+                     for identity in children if identity in snapshot.rows)),
+        tuple(sorted((identity, alias.raw) for identity, alias in aliases.items())),
+        tuple(sorted(by_key.get(key, ()))),
+    )
+
+
+def _registry_delta_is_candidate_change(snapshot: _Snapshot, jobs: Path, key: str,
+                                        attempt: str, workers_real: str,
+                                        by_key: dict[str, set[str]],
+                                        deadline: float) -> bool | None:
+    """Inspect only bytes appended after the outside-lock registry snapshot.
+
+    ``True`` means a candidate fact changed, ``False`` means only unrelated
+    complete rows were appended, and ``None`` means the delta was not safely
+    interpretable in the bounded lock window.
+    """
+    before = snapshot.registry_snapshot
+    if before is None:
+        return None
+    try:
+        fd = os.open(jobs, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        current = os.fstat(fd)
+        dev, ino, size, mtime_ns, ctime_ns = before
+        if (current.st_dev != dev or current.st_ino != ino or current.st_size < size):
+            return None
+        row = snapshot.rows.get(attempt)
+        related = {attempt, *snapshot.intents.get(attempt, ())}
+        related.update(snapshot.open_refs.get(attempt, ()))
+        related.update(snapshot.log_refs.get(row.meta.get("log_file", ""), {}) if row else ())
+        related.update(by_key.get(key, ()))
+        if len(related) > 1024:
+            return None
+        for identity in related:
+            old = snapshot.rows.get(identity)
+            offset = snapshot.row_offsets.get(identity)
+            if old is None or offset is None:
+                continue
+            expected = old.raw.encode("utf-8") + b"\n"
+            observed = os.pread(fd, len(expected), offset)
+            if observed != expected:
+                return True
+        if current.st_size == size:
+            return False if (current.st_mtime_ns == mtime_ns
+                             and current.st_ctime_ns == ctime_ns) else None
+        delta_size = current.st_size - size
+        if delta_size > 4 * 1024 * 1024 or time.monotonic() >= deadline:
+            return None
+        os.lseek(fd, size, os.SEEK_SET)
+        chunks, remaining = [], delta_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if time.monotonic() >= deadline:
+                return None
+        data = b"".join(chunks)
+        if data and not data.endswith(b"\n"):
+            return None
+        candidate_log = row.meta.get("log_file", "") if row else ""
+        for blob in data.splitlines(keepends=True):
+            if time.monotonic() >= deadline:
+                return None
+            fields = blob.decode("utf-8", "replace").rstrip("\n").split("\t")
+            if len(fields) != 6:
+                continue
+            metadata = fields[5]
+            identity = ATTEMPT_ID_RE.search(metadata)
+            if identity and identity.group(1) in related:
+                return True
+            named = set(ATTEMPT_RE.findall(metadata))
+            if fields[1] in OPEN and named.intersection(related):
+                return True
+            try:
+                parsed = _parse_metadata(metadata)
+            except Exception:  # noqa: BLE001 -- malformed metadata cannot prove irrelevance
+                if any(item in metadata for item in related):
+                    return None
+                parsed = {}
+            if (parsed.get("delivery_intent") == "1"
+                    and parsed.get("parent_attempt_id") in related):
+                return True
+            raw_home = parsed.get("runtime_home", "")
+            if raw_home and _declared_home(jobs.parent, workers_real, raw_home) == key:
+                return True
+            if candidate_log and parsed.get("log_file") == candidate_log:
+                return True
+        return False
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _parse_metadata(value: str) -> dict[str, str]:
+    from dispatch_contract import parse_registry_metadata
+    return parse_registry_metadata(value)
+
+
+def _delivery_record_relation(path: Path, related: set[str]) -> str:
+    """related | unrelated | unknown for a changed delivery record."""
+    from dispatch_pending_delivery import PendingDeliveryError, _validate_record
+    for attempt in range(2):
+        try:
+            found = _read_json(str(path), MAX_DELIVERY_BYTES)
+            if found is None:
+                return "unrelated"
+            value = found[0]
+            _validate_record(value)
+            if (value.get("delivery_id") != path.name[:-5]
+                    or value.get("recipient_digest") != path.parent.name):
+                return "unknown"
+            ids = value.get("attempt_ids")
+            parent = value.get("parent_attempt_id")
+            if (not isinstance(ids, list) or not isinstance(parent, str)
+                    or not all(isinstance(item, str)
+                               and (ATTEMPT_RE.fullmatch(item) or NOTICE_RE.fullmatch(item))
+                               for item in ids)):
+                return "unknown"
+            return "related" if related.intersection(
+                item for item in (*ids, parent) if ATTEMPT_RE.fullmatch(item)
+            ) else "unrelated"
+        except (_Unreadable, PendingDeliveryError, TypeError, ValueError):
+            if attempt == 0:
+                time.sleep(0.001)
+    return "unknown"
+
+
+def _bounded_directory_entries(path: Path, deadline: float) -> list | None:
+    entries = []
+    try:
+        with os.scandir(path) as listing:
+            for entry in listing:
+                if (len(entries) >= MAX_DELIVERY_RECORDS
+                        or time.monotonic() >= deadline):
+                    return None
+                entries.append(entry)
+    except OSError:
+        return None
+    return entries
+
+
+def _late_delivery_change(ctx: _Context, attempt: str, deadline: float) -> str | None:
+    """Return changed/unknown when candidate evidence moved after discovery.
+
+    The global JSON index is prepared outside the jobs lock. At the final
+    boundary we compare its file generations, then read only changed records
+    and memberships whose directories changed.
+    """
+    base = ctx.root / "pending-delivery"
+    related = _candidate_related_attempts(ctx.root, ctx.snapshot, attempt)
+    candidate_groups = _candidate_recipient_groups(ctx.root, ctx.snapshot, attempt)
+    baseline_files = {path for path in ctx.discovery_stamps
+                      if isinstance(path, Path) and path.suffix == ".json"}
+    group_by_file = {path: path.parent.name for path in baseline_files}
+    candidate_group_names = {path.name for path in candidate_groups}
+
+    # An already-known candidate record is always checked, even if its parent
+    # directory did not change (writers replace record files in place).
+    for identity in related:
+        for raw_path, fact in ctx.delivery_records.get(identity, {}).items():
+            if time.monotonic() >= deadline:
+                return "unknown"
+            path = Path(raw_path)
+            if _stamp(path) != fact[-1]:
+                return "changed"
+
+    # A file rewrite can turn an unrelated record into a reference without
+    # changing its directory. Stat the previously discovered bounded file set,
+    # and parse only changed records.
+    for path in baseline_files:
+        if time.monotonic() >= deadline:
+            return "unknown"
+        before = ctx.discovery_stamps.get(path)
+        after = _stamp(path)
+        if after == before:
+            continue
+        if after is None:
+            if any(str(path) in ctx.delivery_records.get(identity, {}) for identity in related):
+                return "changed"
+            continue
+        relation = _delivery_record_relation(path, related)
+        if relation == "related":
+            return "changed"
+        if relation == "unknown" and group_by_file.get(path) in candidate_group_names:
+            return "unknown"
+
+    # New recipient groups and new files in known groups are identified by
+    # directory membership changes. Unrelated records are read and ignored.
+    try:
+        base_after = _stamp(base)
+        base_before = ctx.discovery_stamps.get(base)
+        groups_now = list(os.scandir(base)) if base_after is not None else []
+    except OSError:
+        return "unknown"
+    if base_after != base_before:
+        for group in groups_now:
+            if group.name in ctx.delivery_groups:
+                continue
+            if time.monotonic() >= deadline:
+                return "unknown"
+            if group.is_symlink() or not group.is_dir(follow_symlinks=False):
+                return "unknown"
+            try:
+                entries = list(os.scandir(group.path))
+            except OSError:
+                return "unknown"
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    return "unknown"
+                if not entry.name.endswith(".json"):
+                    continue
+                relation = _delivery_record_relation(Path(entry.path), related)
+                if relation == "related":
+                    return "changed"
+                if relation == "unknown":
+                    return "unknown"
+        if _stamp(base) != base_after:
+            return "unknown"
+        ctx.discovery_stamps[base] = base_after
+        ctx.delivery_groups = {group.name for group in groups_now}
+
+    for group_path, before in ctx.group_stamps.items():
+        if time.monotonic() >= deadline:
+            return "unknown"
+        after = _stamp(group_path)
+        if after == before:
+            continue
+        try:
+            entries = list(os.scandir(group_path))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "unknown"
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                return "unknown"
+            path = Path(entry.path)
+            if not entry.name.endswith(".json") or path in baseline_files:
+                continue
+            relation = _delivery_record_relation(path, related)
+            if relation == "related":
+                return "changed"
+            if relation == "unknown" and group_path.name in candidate_group_names:
+                return "unknown"
+    return None
+
+
+def _late_candidate_delivery_change(ctx: _Context, attempt: str,
+                                   deadline: float) -> str | None:
+    """Short final check for known records, producer groups, and new groups."""
+    related = _candidate_related_attempts(ctx.root, ctx.snapshot, attempt)
+    candidate_groups = _candidate_recipient_groups(ctx.root, ctx.snapshot, attempt)
+    baseline_files = {path for path in ctx.discovery_stamps
+                      if isinstance(path, Path) and path.suffix == ".json"}
+    for identity in related:
+        for raw_path, fact in ctx.delivery_records.get(identity, {}).items():
+            if time.monotonic() >= deadline:
+                return "unknown"
+            if _stamp(Path(raw_path)) != fact[-1]:
+                return "changed"
+    for group in candidate_groups:
+        if time.monotonic() >= deadline:
+            return "unknown"
+        before = ctx.group_stamps.get(group)
+        after = _stamp(group)
+        if after == before:
+            continue
+        entries = _bounded_directory_entries(group, deadline)
+        if entries is None:
+            if _stamp(group) is None:
+                continue
+            return "unknown"
+        if _stamp(group) is None:
+            continue
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                return "unknown"
+            path = Path(entry.path)
+            if not entry.name.endswith(".json") or path in baseline_files:
+                continue
+            relation = _delivery_record_relation(path, related)
+            if relation == "related":
+                return "changed"
+            if relation == "unknown":
+                return "unknown"
+    base = ctx.root / "pending-delivery"
+    if _stamp(base) != ctx.discovery_stamps.get(base):
+        groups = _bounded_directory_entries(base, deadline)
+        if groups is None:
+            if _stamp(base) is None:
+                groups = []
+            else:
+                return "unknown"
+        elif _stamp(base) is None:
+            groups = []
+        for group in groups:
+            if group.name in ctx.delivery_groups:
+                continue
+            if time.monotonic() >= deadline:
+                return "unknown"
+            if group.is_symlink() or not group.is_dir(follow_symlinks=False):
+                return "unknown"
+            entries = _bounded_directory_entries(Path(group.path), deadline)
+            if entries is None:
+                return "unknown"
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    return "unknown"
+                if not entry.name.endswith(".json"):
+                    continue
+                relation = _delivery_record_relation(Path(entry.path), related)
+                if relation == "related":
+                    return "changed"
+                if relation == "unknown":
+                    return "unknown"
+    return None
 
 
 def _split_credential(home_fd: int) -> bool:
@@ -1098,43 +1474,58 @@ def _resume_leftovers(layout: _Layout, state: dict, budget: int, deadline: float
 
 @contextlib.contextmanager
 def _registry_lock(jobs: Path):
-    """Probe the writers' lock without delaying a carrier or registry writer."""
+    """Acquire the registry lock with a brief bounded wait, never a long stall."""
     fd = os.open(str(jobs) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _Unsafe("registry-lock-invalid")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
+        deadline = _REGISTRY_DEADLINE.get()
+        local_deadline = time.monotonic() + REGISTRY_LOCK_WAIT_SECONDS
+        if isinstance(deadline, (float, int)):
+            local_deadline = min(local_deadline, deadline)
+        while True:
             try:
-                yield True
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = local_deadline - time.monotonic()
+                if remaining <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.01, remaining))
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _registry_lock_until(jobs: Path, deadline: float):
+    token = _REGISTRY_DEADLINE.set(deadline)
+    try:
+        with _registry_lock(jobs) as admitted:
+            yield admitted
+    finally:
+        _REGISTRY_DEADLINE.reset(token)
+
+
 # destructive-ok: reason=detach one expired worker home by pinned rename; boundary=one 32-hex leaf of homes/workers into homes/worker-retention/retiring
 def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
-            first_ns: int) -> str:
-    """Prepare evidence outside the lock; validate its stamps before rename."""
+            first_ns: int, deadline: float | None = None, _rechecks: int = 0) -> str:
+    """Prepare broad evidence outside the lock; recheck candidate facts at rename."""
     layout = ctx.layout
+    if deadline is None:
+        deadline = time.monotonic() + REMOVE_DEADLINE_SECONDS
     lock_file = os.open(str(ctx.jobs) + ".lock",
                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     os.close(lock_file)
     ctx.delivery_index()
-    watched = dict(ctx.discovery_stamps)
-    if len(watched) > MAX_DEPENDENCY_STAMPS:
-        return "late-evidence-overflow"
-    token = _DEPENDENCIES.set(watched)
+    prior_registry = _registry_projection(ctx.snapshot, key, attempt, ctx.by_key)
+    prior_delivery = ctx.delivery_projection(attempt)
+    watched = {}
     try:
-        # Out-of-protocol new files in unrelated historical recipient groups
-        # are caught by next-pass discovery, not per-candidate preparation.
-        _candidate_recipient_groups(ctx.root, ctx.snapshot, attempt, ctx.group_stamps)
-        _track(ctx.root / "supervisor-state" / f"{attempt}.json")
-        _track(ctx.root / "homes" / "workers" / key / "worker-home.json")
         try:
             fresh = _Snapshot(ctx.jobs)
         except _Unreadable:
@@ -1143,40 +1534,84 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
         if row is None:
             return "row-changed"
         current = _Context(ctx.jobs, ctx.root, layout, fresh, ctx.now_ns)
-        current.by_key = _declared_index(fresh, ctx.root, current.workers_real)
-        current.delivery = ctx.delivery
-        current.delivery_activity = ctx.delivery_activity
-        _candidate_recipient_groups(ctx.root, fresh, attempt, ctx.group_stamps)
-        verdict = _protections(current, key, attempt, probe_processes=False)
-        if row.raw != raw or verdict.kind != "eligible":
-            if verdict.kind == "keep":
-                return "protected:" + verdict.reason
-            if verdict.kind == "unknown":
-                return "defer:" + verdict.reason
-            return "activity:row-changed"
-        ended = _ended_ns(row)
-        if ended is not None:
-            first_ns = max(first_ns, ended)
+        token = _DEPENDENCIES.set(watched)
         try:
-            home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
-        except OSError:
-            return "home-gone"
-        try:
-            rebound = _bind(current, key, home)
+            current.by_key = _declared_index(fresh, ctx.root, current.workers_real)
         finally:
-            os.close(home)
-        if isinstance(rebound, _Verdict) or rebound[0] != attempt:
-            return "late-binding"
+            _DEPENDENCIES.reset(token)
+        current.delivery_index()
+        if (_registry_projection(fresh, key, attempt, current.by_key) != prior_registry
+                or current.delivery_projection(attempt) != prior_delivery):
+            return "late-evidence-changed"
+        token = _DEPENDENCIES.set(watched)
+        try:
+            _candidate_recipient_groups(ctx.root, fresh, attempt)
+            _track(ctx.root / "supervisor-state" / f"{attempt}.json")
+            _track(ctx.root / "homes" / "workers" / key / "worker-home.json")
+            verdict = _protections(current, key, attempt, probe_processes=False)
+            if row.raw != raw or verdict.kind != "eligible":
+                if verdict.kind == "keep":
+                    return "protected:" + verdict.reason
+                if verdict.kind == "unknown":
+                    return "defer:" + verdict.reason
+                return "activity:row-changed"
+            ended = _ended_ns(row)
+            if ended is not None:
+                first_ns = max(first_ns, ended)
+            try:
+                home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
+            except OSError:
+                return "home-gone"
+            try:
+                rebound = _bind(current, key, home)
+            finally:
+                os.close(home)
+            if isinstance(rebound, _Verdict) or rebound[0] != attempt:
+                return "late-binding"
+        finally:
+            _DEPENDENCIES.reset(token)
     except (OSError, _Unreadable):
         return "late-evidence-unreadable"
-    finally:
-        _DEPENDENCIES.reset(token)
     if not _fresh(watched):
         return "late-evidence-changed"
-    with _registry_lock(ctx.jobs) as admitted:
+    final_deadline = min(deadline, time.monotonic() + 0.15)
+    # First validate the registry delta and release jobs.log.lock before the
+    # broad delivery generation pass. That pass can inspect changed unrelated
+    # records without extending the writers' critical section.
+    rescan_registry = False
+    with _registry_lock_until(ctx.jobs, deadline) as admitted:
         if admitted is False:
             return "registry-lock-busy"
         if not _fresh(watched):
+            return "late-evidence-changed"
+        delta = _registry_delta_is_candidate_change(
+            fresh, ctx.jobs, key, attempt, current.workers_real,
+            current.by_key, final_deadline)
+        if delta is True:
+            return "late-evidence-changed"
+        if delta is None:
+            rescan_registry = True
+    if rescan_registry:
+        if _rechecks >= 1:
+            return "late-evidence-changed"
+        return _detach(ctx, key, ident, attempt, raw, first_ns, deadline,
+                       _rechecks + 1)
+    late_delivery = _late_delivery_change(current, attempt, deadline)
+    if late_delivery is not None:
+        return ("late-evidence-unreadable" if late_delivery == "unknown"
+                else "late-evidence-changed")
+
+    # Reacquire after the outside-lock delivery refresh and revalidate registry
+    # appends before touching the pinned home.
+    with _registry_lock_until(ctx.jobs, deadline) as admitted:
+        if admitted is False:
+            return "registry-lock-busy"
+        if not _fresh(watched):
+            return "late-evidence-changed"
+        delta = _registry_delta_is_candidate_change(
+            fresh, ctx.jobs, key, attempt, current.workers_real,
+            current.by_key, final_deadline)
+        if delta is not False:
             return "late-evidence-changed"
         with _flock(layout.ret_fd, "view.lock", fcntl.LOCK_EX | fcntl.LOCK_NB) as acquired:
             if not acquired:
@@ -1219,6 +1654,12 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
                     return "mount-unproven"
             finally:
                 os.close(leaf)
+            if not _fresh(watched):
+                return "late-evidence-changed"
+            late_delivery = _late_candidate_delivery_change(current, attempt, final_deadline)
+            if late_delivery is not None:
+                return ("late-evidence-unreadable" if late_delivery == "unknown"
+                        else "late-evidence-changed")
             name = f"{key}.{ctx.now_ns}"
             journal = json.dumps({"schema": SCHEMA, "key": key, "name": name, "identity": ident},
                                  sort_keys=True).encode()
@@ -1388,7 +1829,7 @@ def _pass(jobs: Path, root: Path, layout: _Layout, state: dict, now_ns: int, sta
                 _count(result["kept"], "deferred")
                 continue
             budget -= 1
-            outcome = _detach(ctx, key, ident, verdict.attempt, verdict.raw, start)
+            outcome = _detach(ctx, key, ident, verdict.attempt, verdict.raw, start, deadline)
             if not outcome.startswith("detached:"):
                 if (outcome.startswith("protected:") or outcome in ("home-gone", "identity-changed")
                         or (outcome == "late-evidence-changed" and

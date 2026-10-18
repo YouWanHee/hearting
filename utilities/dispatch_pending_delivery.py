@@ -14,7 +14,7 @@ emit/ack helpers on a record that already exists.
 Base claim/emission state machine (SD-111 §13.33.1-(4)):
 
     None -> pending -> claimed -> {acked | sent-ambiguous | pending (lease reclaim)}
-    sent-ambiguous -> {acked | pending (bounded reclaim)}
+    sent-ambiguous -> {acked | pending (lease reclaim)}
     pending | claimed | sent-ambiguous -> expired
     acked, expired terminal
 
@@ -41,6 +41,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import re
 from dispatch_receipt_identity import CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, receipt_digest
 
 
@@ -111,6 +112,14 @@ REQUIRED_FIELDS = (
     "last_attempt_at_ns", "acked_at_ns", "acked_by", "expiry_reason", "lineage",
 )
 RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
+COURIER_RETRY_FIELD = "courier_retry"
+COURIER_RETRY_FIELDS = frozenset({
+    "schema_version", "context_digest", "failure_digest", "failure_count",
+    "last_failure_at_ns", "next_attempt_at_ns", "delay_ns", "base_delay_ns",
+})
+COURIER_RETRY_SCHEMA = 1
+COURIER_RETRY_MAX_SECONDS = 15.0
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
 
@@ -150,7 +159,8 @@ def _validate_record(value: object) -> dict:
             value.get("recipient_kind"), _LEGACY_CLAIM_AUTHORITY_DEFAULT
         )
         keys = set(value)
-    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - RECOVERY_AUDIT_FIELDS:
+    optional_fields = RECOVERY_AUDIT_FIELDS | {COURIER_RETRY_FIELD}
+    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - optional_fields:
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise PendingDeliveryError("delivery-persistence-refused", "schema-version-invalid")
@@ -162,6 +172,32 @@ def _validate_record(value: object) -> dict:
         raise PendingDeliveryError("delivery-persistence-refused", "attempt-ids-invalid")
     if not isinstance(value.get("attempts"), int):
         raise PendingDeliveryError("delivery-persistence-refused", "attempts-invalid")
+    if COURIER_RETRY_FIELD in value:
+        retry = value[COURIER_RETRY_FIELD]
+        if (not isinstance(retry, dict) or set(retry) != COURIER_RETRY_FIELDS
+                or retry.get("schema_version") != COURIER_RETRY_SCHEMA
+                or not isinstance(retry.get("context_digest"), str)
+                or (retry["context_digest"] and not _SHA256_RE.fullmatch(retry["context_digest"]))
+                or not isinstance(retry.get("failure_digest"), str)
+                or (retry["failure_digest"] and not _SHA256_RE.fullmatch(retry["failure_digest"]))
+                or any(type(retry.get(name)) is not int for name in (
+                    "failure_count", "last_failure_at_ns", "next_attempt_at_ns",
+                    "delay_ns", "base_delay_ns"))
+                or retry["failure_count"] < 0
+                or retry["last_failure_at_ns"] < 0
+                or retry["next_attempt_at_ns"] < 0
+                or retry["delay_ns"] < 0
+                or not (1 <= retry["base_delay_ns"] <= int(COURIER_RETRY_MAX_SECONDS * 1e9))
+                or (retry["failure_count"] == 0 and any((
+                    retry["failure_digest"], retry["last_failure_at_ns"],
+                    retry["next_attempt_at_ns"], retry["delay_ns"])))
+                or (retry["failure_count"] > 0 and (
+                    not retry["failure_digest"] or retry["last_failure_at_ns"] < 1
+                    or retry["next_attempt_at_ns"] < retry["last_failure_at_ns"]
+                    or retry["delay_ns"] < 1
+                    or retry["next_attempt_at_ns"] - retry["last_failure_at_ns"]
+                    != retry["delay_ns"]))):
+            raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-invalid")
     if (
         value.get("state") in {"claimed", "sent-ambiguous", "acked"}
         and value.get("claim_authority") not in CLAIM_AUTHORITIES
@@ -251,6 +287,63 @@ def _write_unlocked(path: Path, record: dict) -> None:
         except OSError:
             pass
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+
+
+def _retry_context_digest(context: str | None) -> str | None:
+    if context is None:
+        return None
+    if not isinstance(context, str) or len(context) > 2048:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-context-invalid")
+    return hashlib.sha256(context.encode("utf-8")).hexdigest()
+
+
+def _new_courier_retry(context_digest: str = "", base_delay_ns: int = 50_000_000) -> dict:
+    return {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "context_digest": context_digest,
+        "failure_digest": "",
+        "failure_count": 0,
+        "last_failure_at_ns": 0,
+        "next_attempt_at_ns": 0,
+        "delay_ns": 0,
+        "base_delay_ns": base_delay_ns,
+    }
+
+
+def _delay_ns(seconds: float) -> int:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError) as exc:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-delay-invalid") from exc
+    if not 0.05 <= value <= COURIER_RETRY_MAX_SECONDS:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-delay-invalid")
+    return int(value * 1_000_000_000)
+
+
+def _advance_courier_retry(retry: dict, failure_reason: str, now_ns: int,
+                           base_delay_ns: int) -> dict:
+    failure_digest = hashlib.sha256(str(failure_reason)[:2048].encode("utf-8")).hexdigest()
+    same = (retry.get("failure_digest") == failure_digest
+            and retry.get("failure_count", 0) > 0
+            and now_ns >= retry.get("last_failure_at_ns", 0))
+    if same:
+        failure_count = retry["failure_count"] + 1
+        previous = max(base_delay_ns, retry.get("delay_ns", base_delay_ns))
+        delay_ns = min(int(COURIER_RETRY_MAX_SECONDS * 1e9), max(
+            base_delay_ns, int(previous * 1.7)))
+    else:
+        failure_count = 1
+        delay_ns = base_delay_ns
+    return {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "context_digest": retry.get("context_digest", ""),
+        "failure_digest": failure_digest,
+        "failure_count": failure_count,
+        "last_failure_at_ns": now_ns,
+        "next_attempt_at_ns": now_ns + delay_ns,
+        "delay_ns": delay_ns,
+        "base_delay_ns": base_delay_ns,
+    }
 
 
 def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
@@ -496,16 +589,22 @@ def claim(
     live_recipient_generation: tuple[str, str] | None = None,
     expected_state: str = "pending",
     jobs: Path | str | None = None,
+    retry_context: str | None = None,
+    retry_base_delay_seconds: float = 0.05,
 ) -> dict:
     """CAS ``expected_state -> claimed`` under one flock (SD-111 §10.2:
     read-check-write inside one lock; ``os.replace`` atomicity alone is not
     CAS). A courier may supply the recipient/generation it just proved through
     the live runtime. That proof belongs to this claim, not to the immutable
     receipt. The courier must first validate the receipt's own binding rules.
+    The durable retry deadline suppresses repeated failed transport attempts;
+    changed context or a backward wall-clock step makes the obligation eligible.
     """
 
     if lease_seconds <= 0:
         raise PendingDeliveryError("pending-delivery-identity-conflict", "lease_seconds")
+    retry_context_digest = _retry_context_digest(retry_context)
+    retry_base_ns = _delay_ns(retry_base_delay_seconds)
     path = record_path(root, recipient_key, delivery_id)
     with _record_lock(path):
         value = _read_unlocked(path)
@@ -530,6 +629,27 @@ def claim(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
+        retry = value.get(COURIER_RETRY_FIELD)
+        now_wall_ns = time.time_ns()
+        if retry is None:
+            retry = _new_courier_retry(retry_context_digest or "", retry_base_ns)
+        elif (retry["failure_count"]
+              and now_wall_ns < retry["last_failure_at_ns"]):
+            # A wall clock moved backward across a process or host restart.
+            # Release the stale deadline once; do not make an obligation wait
+            # indefinitely for a clock value that may never recur.
+            retry = _new_courier_retry(
+                retry_context_digest or retry["context_digest"], retry_base_ns)
+        elif (retry_context_digest is not None
+              and retry_context_digest != retry["context_digest"]):
+            # A changed recipient/queue target is fresh delivery evidence.
+            retry = _new_courier_retry(retry_context_digest, retry_base_ns)
+        elif now_wall_ns < retry["next_attempt_at_ns"]:
+            remaining = retry["next_attempt_at_ns"] - now_wall_ns
+            raise PendingDeliveryError(
+                "pending-delivery-retry-deferred", f"remaining_ns={remaining}"
+            )
+        retry = dict(retry, base_delay_ns=retry_base_ns)
         disposition = _replacement_disposition(root, recipient_key, value, jobs=jobs)
         if disposition:
             if disposition in {"consumed", "superseded"}:
@@ -553,6 +673,7 @@ def claim(
         updated["claim_authority"] = (
             "generation-proven" if require_generation_proof else "deliverer-unproven"
         )
+        updated[COURIER_RETRY_FIELD] = retry
         updated["attempts"] = value["attempts"] + 1
         updated["last_attempt_at_ns"] = now
         _write_unlocked(path, updated)
@@ -604,6 +725,7 @@ def ack(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
         return updated
 
@@ -661,6 +783,7 @@ def ack_received(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
         return updated
 
@@ -693,8 +816,15 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         return updated
 
 
-def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str) -> dict:
-    """Return only this carrier's claim, preserving any successor or real ack."""
+def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
+                  failure_reason: str | None = None,
+                  retry_base_delay_seconds: float | None = None) -> dict:
+    """Return only this carrier's claim and persist its next retry interval.
+
+    Claim counts remain ownership transfers. The mutable courier retry fields
+    delay the same failure without changing receipt identity, delivery state,
+    or the carrier's authority to settle it.
+    """
     path = record_path(root, recipient_key, delivery_id)
     with _record_lock(path):
         value = _read_unlocked(path)
@@ -703,6 +833,13 @@ def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_own
         if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
             return value
         updated = dict(value)
+        retry = value.get(COURIER_RETRY_FIELD) or _new_courier_retry()
+        base_delay_ns = (retry["base_delay_ns"] if retry_base_delay_seconds is None
+                         else _delay_ns(retry_base_delay_seconds))
+        failure = failure_reason or ("sent-ambiguous" if value.get("state") == "sent-ambiguous"
+                                     else "claim-released")
+        updated[COURIER_RETRY_FIELD] = _advance_courier_retry(
+            retry, failure, time.time_ns(), base_delay_ns)
         updated.update(state="pending", claim_owner=None, claim_deadline_ns=None)
         _write_unlocked(path, updated)
         return updated

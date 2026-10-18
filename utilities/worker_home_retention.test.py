@@ -76,6 +76,19 @@ class Fixture(unittest.TestCase):
         self.rows[attempt] = (status, base)
         self.write_rows()
 
+    def append_row(self, attempt, status="done", **meta):
+        base = {"attempt_id": attempt, "harness": "claude", "worker_type": "stage",
+                "launch_outcome": "never-launched"}
+        base.update(meta)
+        self.rows[attempt] = (status, base)
+        pipe = ",".join(f"{key}={value}" for key, value in base.items())
+        timestamp = datetime.fromtimestamp(
+            self.now / 10**9, timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        with self.jobs.open("ab") as handle:
+            handle.write(f"{timestamp}\t{status}\t/repo\t/wt\t{attempt}\t{pipe}\n".encode())
+            handle.flush()
+
     def set_status(self, attempt, status):
         self.rows[attempt] = (status, self.rows[attempt][1])
         self.write_rows()
@@ -1008,16 +1021,36 @@ class Races(Fixture):
                 self.assertFalse(home.exists())
 
     def test_unrelated_append_defers_without_restarting_established_clock(self):
+        # Obsolete expectation retained by name for issue #592 traceability:
+        # an unrelated complete append no longer defers the due candidate.
         home = self.add("att-append")
         self.sweep(0)
         key = home.name
         first = self.state()["eligible_since"][key]
-        with self.landing(lambda: self.row("att-unrelated", "done")):
+        with self.landing(lambda: self.append_row("att-unrelated", "done")):
             result = self.sweep(8)
-        self.assertEqual(result["removed"], 0)
-        self.assertEqual(result["kept"].get("late-evidence-changed"), 1)
-        self.assertEqual(self.state()["eligible_since"][key], first)
-        self.assertEqual(self.sweep(8.1)["removed"], 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(home.exists())
+        self.assertNotIn(key, self.state()["eligible_since"])
+        self.assertEqual(first, self.now)
+
+    def test_unrelated_atomic_registry_replacement_does_not_defer_detach(self):
+        home = self.add("att-atomic-registry")
+        self.sweep(0)
+
+        def replace_registry():
+            timestamp = datetime.fromtimestamp(
+                self.now / 10**9, timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+            line = (f"{timestamp}\tdone\t/repo\t/wt\tatt-atomic-noise\t"
+                    "attempt_id=att-atomic-noise\n").encode()
+            temp = self.root / "jobs.replacement"
+            temp.write_bytes(self.jobs.read_bytes() + line)
+            os.replace(temp, self.jobs)
+
+        with self.landing(replace_registry):
+            result = self.sweep(8)
+        self.assertEqual(result["removed"], 1, result)
         self.assertFalse(home.exists())
 
     def test_producer_bound_recipient_membership_catches_late_gate_record(self):
@@ -1337,11 +1370,43 @@ class Races(Fixture):
         self.assertTrue(home.is_dir())
 
     def test_other_active_delivery_edit_defers_detach(self):
+        # Obsolete expectation retained by name for issue #592 traceability:
+        # an unrelated record rewrite no longer defers the due candidate.
         home = self.add("att-unrelated-active")
         record = self.root / "pending-delivery" / ("e" * 64) / ("delivery-" + "f" * 32 + ".json")
         value = self.delivery_record(record, "att-other")
         self.sweep(0)
         with self.landing(lambda: record.write_text(json.dumps({**value, "state": "pending"}))):
+            result = self.sweep(8)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(home.exists())
+
+    def test_parent_only_delivery_reference_landing_keeps_the_home(self):
+        recipient = "parent-only-owner-session"
+        home = self.add("att-parent-only", worker_type="owner", parent_sid=recipient)
+        group = P.record_directory(self.root, recipient)
+        self.sweep(0)
+
+        def publish():
+            self.delivery_record(group / ("delivery-" + "9" * 32 + ".json"),
+                                 "att-other", "att-parent-only", state="pending")
+
+        with self.landing(publish):
+            result = self.sweep(8)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
+        self.assertTrue(home.is_dir())
+
+    def test_unrelated_record_rewrite_into_candidate_reference_keeps_the_home(self):
+        home = self.add("att-rewritten-reference")
+        record = self.root / "pending-delivery" / ("e" * 64) / ("delivery-" + "8" * 32 + ".json")
+        value = self.delivery_record(record, "att-other", "att-parent", state="acked")
+        self.sweep(0)
+
+        def rewrite():
+            record.write_text(json.dumps({**value, "attempt_ids": ["att-rewritten-reference"]}))
+
+        with self.landing(rewrite):
             result = self.sweep(8)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
@@ -1822,7 +1887,7 @@ class Bounds(Fixture):
                     self.assertEqual(result["removed"], 3, (kind, result))
                     self.assertTrue(all(not home.exists() for home in homes))
                     self.assertEqual(len(preparation), 3)
-                    self.assertEqual(len(holds), 3)
+                    self.assertEqual(len(holds), 6)
                     self.assertLess(max(dependencies), 512)
                     self.assertLess(max(holds), 0.25)
                     self.assertLess(max(preparation), 3.0)
@@ -1995,6 +2060,97 @@ class Bounds(Fixture):
             holder.wait(timeout=3)
             holder.stdout.close()
 
+    def test_brief_registry_lock_release_allows_same_sweep_removal(self):
+        home = self.add("att-brief-lock")
+        self.sweep(0)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,os,sys,time;"
+             "f=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600);"
+             "fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(.05);"
+             "fcntl.flock(f,fcntl.LOCK_UN);os.close(f)", str(self.jobs) + ".lock"],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            began = time.monotonic()
+            result = self.sweep(8)
+            elapsed = time.monotonic() - began
+            holder.wait(timeout=2)
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(result["removed"], 1, result)
+            self.assertFalse(home.exists())
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                holder.wait(timeout=2)
+            holder.stdout.close()
+
+    def test_due_homes_progress_across_busy_and_released_registry_sweeps(self):
+        homes = [self.add(f"att-cursor-{number}") for number in range(6)]
+        self.sweep(0)
+        fd = os.open(str(self.jobs) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            blocked = self.sweep(8)
+            self.assertEqual(blocked["removed"], 0)
+            self.assertGreater(blocked["kept"].get("registry-lock-busy", 0), 0)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        removed = 0
+        for day in (8.1, 8.2, 8.3):
+            removed += self.sweep(day)["removed"]
+        self.assertEqual(removed, len(homes))
+        self.assertFalse(any(home.exists() for home in homes))
+
+    def test_busy_registry_and_continuous_unrelated_delivery_writer_still_remove_home(self):
+        home = self.add("att-concurrent-cleanup")
+        delivery = self.root / "pending-delivery" / ("f" * 64) / ("delivery-" + "7" * 32 + ".json")
+        self.delivery_record(delivery, "att-unrelated-writer", "att-parent", state="acked")
+        self.sweep(0)
+        script = r'''import fcntl, json, os, sys, time
+jobs, record = sys.argv[1:]
+lock_path = record + ".lock"
+raw = open(record, "rb").read()
+needle = b'"attempts": 0'
+offset = raw.find(needle)
+if offset < 0:
+    raise SystemExit("attempts field missing")
+print("ready", flush=True)
+for number in range(300):
+    with open(jobs + ".lock", "a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        with open(jobs, "ab") as registry:
+            registry.write(("2026-10-19T00:00:00Z\tdone\t/repo\t/wt\t"
+                            f"att-noise-{number}\tattempt_id=att-noise-{number}\n").encode())
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    record_fd = os.open(record, os.O_RDWR)
+    os.pwrite(record_fd, str(number % 2).encode(), offset + len(b'"attempts": '))
+    os.close(record_fd)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    time.sleep(0.002)
+print("writes=300", flush=True)
+'''
+        writer = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.jobs), str(delivery)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(writer.stdout.readline().strip(), "ready")
+            time.sleep(0.03)
+            result = self.sweep(8)
+            stdout, stderr = writer.communicate(timeout=3)
+            self.assertEqual(writer.returncode, 0, stderr)
+            self.assertIn("writes=300", stdout)
+            self.assertEqual(result["removed"], 1, result)
+            self.assertFalse(home.exists())
+        finally:
+            if writer.poll() is None:
+                writer.terminate()
+                writer.wait(timeout=2)
+            writer.stdout.close()
+            writer.stderr.close()
+
     def test_large_delivery_index_is_prepared_outside_short_registry_hold(self):
         home = self.add("att-large-index")
         group = self.root / "pending-delivery" / ("c" * 64)
@@ -2031,8 +2187,8 @@ class Bounds(Fixture):
             result = self.sweep(8)
         self.assertEqual(result["removed"], 1)
         self.assertFalse(home.exists())
-        self.assertEqual(len(held), 1)
-        self.assertLess(held[0], 0.25)
+        self.assertEqual(len(held), 2)
+        self.assertTrue(all(duration < 0.25 for duration in held), held)
 
     def test_complete_blank_and_malformed_registry_lines_do_not_poison_pass(self):
         home = self.add("att-noisy")

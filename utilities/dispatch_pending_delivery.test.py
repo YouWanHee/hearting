@@ -356,16 +356,69 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         PD.create(**self.kwargs)
 
-    def test_owner_release_makes_failed_send_immediately_reclaimable(self):
+    def test_owner_release_persists_a_retry_deadline(self):
         did = self.kwargs["delivery_id"]
-        PD.claim(self.root, "sess-claim", did, claim_owner="queue", lease_seconds=86400)
-        result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="queue", lease_seconds=86400)
+            result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
         self.assertEqual(result["state"], "pending")
-        PD.claim(self.root, "sess-claim", did, claim_owner="prompt", lease_seconds=30)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 1_000_000_001):
+            PD.claim(self.root, "sess-claim", did, claim_owner="prompt", lease_seconds=30)
         result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
         self.assertEqual(result["claim_owner"], "prompt")
         PD.ack(self.root, "sess-claim", did, acked_by="prompt")
         self.assertEqual(PD.release_claim(self.root, "sess-claim", did, claim_owner="prompt")["state"], "acked")
+
+    def test_same_failure_backoff_survives_recall_and_restart_until_due(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            first = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="first",
+                failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        retry = first["courier_retry"]
+        self.assertEqual(retry["failure_count"], 1)
+        self.assertEqual(retry["next_attempt_at_ns"], now + retry["delay_ns"])
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 10_000_000):
+            with self.assertRaises(PD.PendingDeliveryError) as caught:
+                PD.claim(self.root, "sess-claim", did, claim_owner="recalled", lease_seconds=30,
+                         retry_context="target-a", retry_base_delay_seconds=0.05)
+        self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["attempts"], 1)
+        due = retry["next_attempt_at_ns"] + 1
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=due):
+            PD.claim(self.root, "sess-claim", did, claim_owner="restarted", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            second = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="restarted",
+                failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        self.assertEqual(second["courier_retry"]["failure_count"], 2)
+        self.assertGreater(second["courier_retry"]["delay_ns"], retry["delay_ns"])
+        self.assertEqual(second["attempts"], 2)
+
+    def test_changed_delivery_context_and_clock_rollback_clear_stale_wait(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            PD.release_claim(self.root, "sess-claim", did, claim_owner="first",
+                             failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 1_000_000):
+            changed = PD.claim(self.root, "sess-claim", did, claim_owner="target-change",
+                               lease_seconds=30, retry_context="target-b",
+                               retry_base_delay_seconds=0.05)
+        self.assertEqual(changed["courier_retry"]["failure_count"], 0)
+        PD.release_claim(self.root, "sess-claim", did, claim_owner="target-change",
+                         failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now - 1_000_000_000):
+            recovered = PD.claim(self.root, "sess-claim", did, claim_owner="clock-recovered",
+                                 lease_seconds=30, retry_context="target-b",
+                                 retry_base_delay_seconds=0.05)
+        self.assertEqual(recovered["courier_retry"]["failure_count"], 0)
 
 
     def test_first_claim_succeeds_second_is_refused(self):

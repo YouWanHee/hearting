@@ -265,6 +265,7 @@ def sweep_deliver(
                 lease_seconds=DELIVER_LEASE_SECONDS,
                 require_generation_proof=False,
                 jobs=jobs,
+                retry_context=f"{recipient_kind}:{session_id}:{now}",
             )
         except pending_delivery.PendingDeliveryError:
             continue
@@ -433,6 +434,7 @@ def sweep(
                     lease_seconds=SWEEP_LEASE_SECONDS,
                     require_generation_proof=True,
                     jobs=jobs,
+                    retry_context=f"{recipient_kind}:{session_id}:{session_generation}:{start_ns}",
                 )
             except pending_delivery.PendingDeliveryError:
                 continue
