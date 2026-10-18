@@ -11166,19 +11166,6 @@ def _continue_after_answer(jobs, attempt_id, correction):
     receipt = start_work(route, route_path, jobs)
     if access_change is not None:
         receipt = {**receipt, "access_change": access_change}
-    if receipt.get("reason") == "replacement-parent-identity-unproven":
-        # Only the route's parent launches the continuation: it is told, so nobody repeats the answer.
-        try:
-            from dispatch_supervision import ANSWER_AWAITING_PARENT, materialize
-            materialize(jobs, {attempt_id}, reason=ANSWER_AWAITING_PARENT)
-            receipt["parent_notified"] = True
-            receipt["next_step"] = ("The answer is kept and this route's parent session was notified; its "
-                "runtime starts the continuation when the notice reaches it, and the new owner receives the "
-                "answer first. Nothing else to run here.")
-        except Exception:  # noqa: BLE001 -- the kept answer and the plain instruction remain
-            receipt["parent_notified"] = False
-            receipt["next_step"] = ("The answer is kept. Only the session that started this route may launch its "
-                "replacement owner: that session continues it with resume_command, and the answer goes first.")
     return {**receipt, "correction": correction}
 
 
