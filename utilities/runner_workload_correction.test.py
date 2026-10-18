@@ -43,7 +43,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.dispatch.mkdir()
         self.home = self.base / "home"
         for path in (self.home, self.home / ".config", self.home / ".local/share",
-                     self.home / ".cache", self.base / "release",
+                     self.home / ".local/state", self.home / ".cache", self.base / "release",
                      self.base / "codex", self.base / "claude", self.base / "opencode"):
             path.mkdir(parents=True, exist_ok=True)
         self.jobs = self.dispatch / "jobs.log"
@@ -59,6 +59,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_DATA_HOME": str(self.home / ".local/share"),
+            "XDG_STATE_HOME": str(self.home / ".local/state"),
             "XDG_CACHE_HOME": str(self.home / ".cache"),
             "AGENT_HOME": str(self.base / "release"),
             "AGENT_PEER_LEDGER_ROOT": str(self.dispatch),

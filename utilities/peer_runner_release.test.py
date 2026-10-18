@@ -117,7 +117,7 @@ _runner_fixture_start_record()
         fixture_wrapper = '''
 _production_resume_message_obligation = _resume_message_obligation
 
-def _fixture_resume_message_obligation(duty, store):
+def _fixture_resume_message_obligation(duty, store, *, read_context=None):
     release = Path(__file__).resolve().parents[1].name
     duty_ref = (duty.get("intent") or {}).get("ref")
     target_ref = os.environ.get("RUNNER_FIXTURE_TARGET_REF")
@@ -157,7 +157,8 @@ def _fixture_resume_message_obligation(duty, store):
                         "ledger_root": str(peer_message.peer_state_root()),
                         "env_ledger_root": os.environ.get("AGENT_PEER_LEDGER_ROOT")},
                        sort_keys=True), encoding="utf-8")
-    result = _production_resume_message_obligation(duty, store)
+    result = _production_resume_message_obligation(
+        duty, store, read_context=read_context)
     if (release in {"A", "B"} and store.get(duty["id"]).get("state") == "complete"
             and (not target_ref or duty_ref == target_ref)):
         received = peer_message._read_pending((duty.get("intent") or {}).get("ref"))

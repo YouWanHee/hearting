@@ -374,27 +374,32 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     # The launcher can inherit a different release path from
                     # the script's source root. Accept that provenance only
                     # when it resolves to this same managed installation.
-                    agent_home = env.get("AGENT_HOME")
-                    if not agent_home:
-                        return None
                     for name in ("AGENT_HOME", "CLAUDE_HOME"):
+                        if name not in env:
+                            continue
                         raw = env.get(name)
                         if not raw:
-                            continue
+                            return None
                         env_root = Path(raw).expanduser().resolve(strict=True)
                         env_layout = _service_layout(env_root)
                         if env_layout is None or env_layout[1:] != source_layout[1:]:
                             return None
-                    data_root_raw = env.get("HARNESS_DATA_ROOT")
-                    if data_root_raw:
-                        observed_data_root = Path(data_root_raw).expanduser()
+                    if "HARNESS_DATA_ROOT" in env:
+                        raw = env["HARNESS_DATA_ROOT"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser()
+                    elif "XDG_DATA_HOME" in env:
+                        raw = env["XDG_DATA_HOME"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser() / "hearting"
                     else:
-                        xdg_data_raw = env.get("XDG_DATA_HOME")
-                        if xdg_data_raw:
-                            observed_data_root = Path(xdg_data_raw).expanduser() / "hearting"
-                        else:
-                            home = Path(env.get("HOME") or Path.home()).expanduser()
-                            observed_data_root = home / ".local" / "share" / "hearting"
+                        home = env.get("HOME")
+                        if not home:
+                            return None
+                        observed_data_root = (
+                            Path(home).expanduser() / ".local" / "share" / "hearting")
                     if (not observed_data_root.is_absolute()
                             or Path(os.path.abspath(os.fspath(observed_data_root)))
                             != source_layout[1]):
