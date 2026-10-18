@@ -691,13 +691,16 @@ courier never reads a composer, relaunches a missing parent or types into a shel
 pane. Unreceived refs stay visible in Fleet until the recipient processes them.
 
 At canonical session activation, Claude, Codex, and OpenCode use the shared
-`dispatch_session_sweep.activate` entry. It retries exact owner settlement from
-the registry rows across configured state roots and invokes the existing
-`reconcile_pending_delivery` actor once for the canonical registry. That actor
-retains sole authority for pending materialization, known-dead expiry, and
-terminal retention pruning. Missing or inaccessible PID evidence stays unknown;
-no prompt callback, Fleet reader, or exact-attempt request runs an unrelated
-bulk mutation.
+`dispatch_session_sweep.activate` entry. The reconnect helper limits exact
+owner-settlement writes to the explicitly selected authoritative registry or,
+when it discovers configured roots, the canonical registry at index 0; discovery
+of a compatibility root never grants registry-write authority. Its independent
+sidecar-recovery pass still visits every configured discovery root. Activation
+invokes the existing `reconcile_pending_delivery` actor once for the canonical
+registry. That actor retains sole authority for pending materialization,
+known-dead expiry, and terminal retention pruning. Missing or inaccessible PID
+evidence stays unknown; no prompt callback, Fleet reader, or exact-attempt
+request runs an unrelated bulk mutation.
 
 When a child already has a committed PASS, join and reap inspect only its exact
 terminal log before cleanup. A valid late FAIL/BLOCKED is recorded through the
