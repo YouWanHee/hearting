@@ -204,6 +204,18 @@ refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no
 supported way forward is a defect in the path, not a task for the operator.
 
+A caller-identity refusal records who may not launch; it does not settle the
+existing recovery duty. An explicit start may re-enter the same exact claim
+when its successor has no row or has launch-fence proof that it never started,
+then must pass the unchanged parent and launch checks. During that same fenced
+launch transaction, its exact successor row may exist before `launch_started`;
+only the existing admission and spawn fence can carry it forward. Read the
+unlaunched hop from that source-row proof even when an older claim recorded
+another death kind. The next owner receives every answer still unconsumed by
+the semantic owner, while claim-pinned answer identities and digests remain
+the minimum integrity check. Keep this lineage and handoff meaning in the
+shared layer for all runtimes.
+
 ## 8. Let real work reshape capabilities and routes
 
 Capabilities, shapes, and routes are revised from the record of real work, not

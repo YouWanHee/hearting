@@ -1956,11 +1956,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         result["replacement_attention"] = [replacement]
         if replacement["reason"] == "replacement-capacity-wait":
             return _capacity_pause(result, replacement, resume)
-        return {**result, "state": "needs-attention", "reason": replacement["reason"],
-                "node": replacement.get("node", ""),
-                "next_action": replacement.get("next_action", "same-command"),
-                "retry_when": replacement.get("retry_when", ""),
-                "next_step": replacement.get("retry_when") or replacement.get("next_step", "Retry resume_command after the exact launch settles.")}
+        attention = {**result, "state": "needs-attention", "reason": replacement["reason"],
+                     "node": replacement.get("node", ""),
+                     "next_action": replacement.get("next_action", "same-command"),
+                     "retry_when": replacement.get("retry_when", ""),
+                     "next_step": replacement.get("retry_when") or replacement.get("next_step", "Retry resume_command after the exact launch settles.")}
+        if replacement["reason"] == "replacement-parent-identity-unproven":
+            attention.pop("next_action", None)
+            attention.pop("retry_when", None)
+        return attention
     if not owner_choice.allowed and owner_choice.state != "settle":
         attention = {**result, "state": "needs-attention", "reason": owner_choice.reason,
                 "next_action": owner_choice.next_action, "retry_when": owner_choice.retry_when,
@@ -2162,6 +2166,17 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                 result.update(_wait_fields(owned, rows, result["resume_command"]))
         except (OSError, ValueError) as observation_error:
             result["observation_error"] = str(observation_error)
+    if result.get("reason") == "replacement-parent-identity-unproven":
+        import dispatch_replacement
+        source_attempt = result.get("source_attempt_id") or result.get("owner_attempt_id")
+        semantic_owner = source_attempt
+        if source_attempt:
+            carried = dispatch_replacement._unstarted_replacement_claim(jobs, source_attempt)
+            if carried:
+                semantic_owner = carried["original_attempt_id"]
+            if semantic_owner:
+                from dispatch_supervision import handover_identity_refusal
+                result.update(handover_identity_refusal(jobs, semantic_owner, result))
     if result["state"] == "needs-attention":
         result["resume_command"] = resume_command(path, jobs, agent_home=ROOT)
         if result.get("reason") == "source-worktree-preparation-failed":

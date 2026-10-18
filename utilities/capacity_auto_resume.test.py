@@ -4,6 +4,7 @@ resumes itself once and tells its session."""
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +79,57 @@ class ArmTest(unittest.TestCase):
         self.assertEqual((armed["state"], armed["cause"]), ("armed", "answer"))
         self.assertEqual(C._epoch(armed["resume_at"]), RETRY_EPOCH - 3600)
         self.assertEqual(len(self.spawned), 1)
+
+    def test_replacement_resume_identity_is_time_independent_and_exact_per_source(self):
+        eligible = {"route_id": "rt-replacement", "route_hash": "sha256:route",
+                    "source_attempt_id": "att-source", "route_file": str(self.route.resolve())}
+        result = {"reason": C.NO_PROGRESS_REASON, "route_id": eligible["route_id"],
+                  "source_attempt_id": eligible["source_attempt_id"]}
+        starts = []
+        with mock.patch("dispatch_replacement.parent_resume_eligibility",
+                        side_effect=lambda _jobs, source, **_kw: {**eligible,
+                            "source_attempt_id": source}):
+            first = C.arm(result, self.route, self.jobs, environ={},
+                          spawn=lambda argv, **kw: starts.append(argv), now=lambda: RETRY_EPOCH - 3600)
+            later = C.arm(result, self.route, self.jobs, environ={},
+                          spawn=lambda argv, **kw: starts.append(argv), now=lambda: RETRY_EPOCH + 60)
+            other = C.arm({**result, "source_attempt_id": "att-other"}, self.route, self.jobs, environ={},
+                          spawn=lambda argv, **kw: starts.append(argv), now=lambda: RETRY_EPOCH + 120)
+        self.assertEqual(first["record"], later["record"])
+        self.assertEqual(later["state"], "already-armed")
+        self.assertNotEqual(first["record"], other["record"])
+        self.assertEqual((len(starts), other["state"]), (2, "armed"))
+        saved = json.loads(Path(first["record"]).read_text())
+        self.assertEqual((saved["cause"], saved["source_attempt_id"], saved["retry_at"]),
+                         ("replacement", "att-source", time.strftime(
+                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(RETRY_EPOCH - 3600))))
+        self.assertIsNone(C.arm({**result, "source_attempt_id": "att-generic"}, self.route,
+                                self.jobs, environ={}, spawn=lambda *a, **k: self.fail("generic notice armed"),
+                                now=lambda: RETRY_EPOCH))
+
+    def test_replacement_uses_route_time_as_deadline_but_not_as_record_identity(self):
+        path = C.replacement_record_path(self.jobs, "rt-replacement", "sha256:route", "att-source")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"state": "armed", "cause": "replacement",
+                                    "route_id": "rt-replacement", "retry_at": "1970-01-01T00:16:40Z",
+                                    "route_file": str(self.route), "jobs": str(self.jobs)}))
+        calls = []
+        clock = [1000.0]
+        with mock.patch.object(C, "_notify") as notify:
+            C.run(path, sleep=lambda seconds: self.fail("replacement resume was delayed"),
+                  now=lambda: clock[0], call=lambda argv, **kw: calls.append(argv) or
+                  SimpleNamespace(returncode=0, stdout='{"state":"running","owner_attempt_id":"att-next"}\n'))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2:4], ["start", "--route"])
+        self.assertEqual(json.loads(path.read_text())["cause"], "replacement")
+        notify.assert_called_once()
+        eligible = {"route_id": "rt-replacement", "route_hash": "sha256:route",
+                    "source_attempt_id": "att-source", "route_file": str(self.route.resolve())}
+        with mock.patch("dispatch_replacement.parent_resume_eligibility", return_value=eligible):
+            replay = C.arm({"reason": C.NO_PROGRESS_REASON, "route_id": "rt-replacement",
+                            "source_attempt_id": "att-source"}, self.route, self.jobs, environ={},
+                           spawn=lambda *a, **k: self.fail("resumed edge spawned again"), now=lambda: 5000)
+        self.assertEqual((replay["record"], replay["state"]), (str(path), "already-armed"))
 
 
 class RunTest(unittest.TestCase):
@@ -274,6 +326,15 @@ class ReceiptAndNoticeTest(unittest.TestCase):
             self.assertIn("start exited 2, run it again: ", text)
             self.assertIn(f"capability-route.py start --route {route}", text)
             self.assertIn("required_action=run-resume-command", text)
+            with mock.patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "sid-9"}, clear=True):
+                C._notify({**record, "retry_at": "2026-10-07T12:03:00Z", "cause": "replacement",
+                           "route_file": str(route), "exit_code": 0},
+                          {"state": "needs-attention", "reason": "replacement-parent-identity-unproven"})
+            claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
+            text = sweep.delivery_context([(jobs.parent, claimed)])
+            self.assertIn("the parent's replacement start needs attention", text)
+            self.assertIn("state needs-attention", text)
+            self.assertNotIn("answer another session sent", text)
 
 
 if __name__ == "__main__":
