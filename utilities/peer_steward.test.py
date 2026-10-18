@@ -3739,40 +3739,6 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((row["state"], row["to"]["session_id"]), ("pending", "proven-thread"))
         self.assertEqual(self._pane_io_calls(calls), [])
 
-    def test_sidless_codex_obligation_binds_the_thread_its_pane_tui_proves(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        payload = _agent_json("codex", None, "fresh", status="idle")
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload)), \
-             mock.patch.object(peer_steward, "_process_session", return_value=None), \
-             mock.patch("builtins.print"):
-            self.assertEqual(peer_steward.main(["prompt", "fresh", "[steer] after the proof"]), 3)
-        ref = self._all_records()[-1]["transfer_ref"]
-        store = peer_steward.peer_obligations.ObligationStore()
-        duty_id = "message-" + ref
-        sidless = {"harness": "codex", "session_id": "-", "pane": "w1:pX", "name": "fresh"}
-        delivered = []
-
-        def deliver(ref_, *, timeout=1.0):
-            row = peer_steward.peer_message._read_pending(ref_)
-            delivered.append(peer_steward.peer_message.pending_delivery_recipient(row)["session_id"])
-            return {"status": "queued"}
-
-        for proof, reason in ((None, "target-session-unresolved"), ("proven-thread", None)):
-            with self.subTest(proof=proof), \
-                 mock.patch.object(peer_steward, "_retire_target",
-                                   return_value=("idle", sidless, 0, None)), \
-                 mock.patch.object(peer_steward, "_process_session", return_value=proof) as resolver, \
-                 mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=deliver):
-                peer_steward._resume_message_obligation(store.get(duty_id), store)
-                resolver.assert_called_once_with("w1:pX", "codex")
-                if reason:
-                    self.assertEqual(store.get(duty_id)["observation"]["reason"], reason)
-        self.assertEqual(delivered, ["proven-thread"])
-        row = peer_steward.peer_message._read_pending(ref)
-        self.assertEqual(row["bound_to"], {"harness": "codex", "session_id": "proven-thread",
-                                           "pane_id": "w1:pX"})
-
     def test_same_sender_recipient_body_retry_reuses_the_same_ref(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         payload = _agent_json("claude", "sid-child", "child", status="idle")
@@ -4455,6 +4421,48 @@ class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
         bind.assert_not_called()
         queue.assert_not_called()
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "queued")
+
+    def test_sidless_codex_obligation_binds_the_thread_its_pane_tui_proves(self):
+        proof, ref, store, duty = self._row_and_duty()
+        sidless = {"harness": "codex", "session_id": "-", "pane": "w1:pX"}
+        delivered = []
+
+        def deliver(ref_, *, timeout=1.0):
+            row = peer_steward.peer_message._read_pending(ref_)
+            delivered.append(peer_steward.peer_message.pending_delivery_recipient(row)["session_id"])
+            return {"status": "queued"}
+
+        for thread, reason in ((None, "target-session-unresolved"), ("proven-thread", None)):
+            with self.subTest(thread=thread), \
+                 mock.patch.object(peer_steward, "_retire_target",
+                                   return_value=("idle", sidless, 0, None)), \
+                 mock.patch.object(peer_steward, "_process_session", return_value=thread) as resolver, \
+                 mock.patch.object(peer_steward, "_foreground_process_proof", return_value=proof), \
+                 mock.patch.object(peer_steward, "_pane_readiness",
+                                   return_value=SimpleNamespace(state="ready", reason="")), \
+                 mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=deliver):
+                peer_steward._resume_message_obligation(store.get(duty["id"]), store)
+                resolver.assert_called_once_with("w1:pX", "codex")
+                if reason:
+                    self.assertEqual(store.get(duty["id"])["observation"]["reason"], reason)
+        self.assertEqual(delivered, ["proven-thread"])
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["bound_to"],
+                         {"harness": "codex", "session_id": "proven-thread", "pane_id": "w1:pX"})
+
+    def test_proven_thread_still_needs_the_original_foreground_process(self):
+        proof, ref, store, duty = self._row_and_duty()
+        changed = {**proof, "pid": 4243, "start": "456"}
+        sidless = {"harness": "codex", "session_id": "-", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", sidless, 0, None)), \
+             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread"), \
+             mock.patch.object(peer_steward, "_foreground_process_proof", return_value=changed), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue, \
+             mock.patch.object(peer_steward, "_ensure_sender_delay_notice"):
+            peer_steward._resume_message_obligation(duty, store)
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"], "target-process-changed")
+        queue.assert_not_called()
+        self.assertIsNone(peer_steward.peer_message._read_pending(ref).get("bound_to"))
 
 
 class NormalProducerRunnerBindingTest(unittest.TestCase):
