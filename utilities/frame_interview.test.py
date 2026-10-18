@@ -126,25 +126,25 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(any("cap 1" in e for e in FI.validate(two, intensity="direct")))
         self.assertEqual(FI.validate(dict(many, questions=[]), intensity="direct"), [])
 
-    def test_harness_words_are_refused_wherever_a_person_reads(self):
+    def test_style_guidance_does_not_turn_wording_preferences_into_a_gate(self):
         for field, text in (
             ("question", "Should the owner re-raise the gate on route rt-da62cded?"),
             ("why", "The dispatch depth is fixed by the harness."),
         ):
             with self.subTest(field=field):
-                bad = good_interview()
-                bad["questions"][0][field] = text
-                errors = FI.validate(bad)
-                self.assertTrue(errors, field)
-                self.assertTrue(all("harness word" in e for e in errors), errors)
+                styled = good_interview()
+                styled["questions"][0][field] = text
+                self.assertTrue(FI.jargon_hits(text))
+                self.assertEqual(FI.validate(styled), [])
         bad = good_interview()
         bad["questions"][0]["options"][0]["means"] = "Spawn the plan node as a worker."
-        self.assertTrue(any("harness word" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         bad = good_interview(understanding="The frame-review gate blocks the plan node.")
-        self.assertTrue(any("harness word" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         bad = good_interview()
         bad["brief"]["problem"] = "The 워커 dies at the 게이트."
-        self.assertEqual(len([e for e in FI.validate(bad) if "harness word" in e]), 2)
+        self.assertEqual(FI.validate(bad), [])
+        self.assertTrue(FI.writing_guidance())
 
     def test_korean_particles_and_identifiers_are_caught(self):
         """review round 1, M4: Korean is agglutinative and identifiers carry `_`/`-`."""
@@ -155,7 +155,7 @@ class ValidateTest(unittest.TestCase):
                 self.assertTrue(FI.jargon_hits(text), text)
         bad = good_interview()
         bad["questions"][0]["question"] = "게이트를 지금 열까요, 나중에 열까요?"
-        self.assertTrue(any("harness word" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         # review round 2, N2: ordinary Korean words that contain a term are not hits
         for text in ("가격이 훅 오를까요?", "마커펜을 쓸까요?", "게이트볼을 할까요?", "노드 대신 마디라고 부를까요?"):
             with self.subTest(text=text):
@@ -180,9 +180,9 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(FI.validate(ok), [])
         bad = good_interview()
         bad["questions"][0]["question"] = "Fix wording? Change schedule?"
-        self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         bad["questions"][0]["question"] = "Should we fix the wording and also change the schedule?"
-        self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         ok = good_interview()
         ok["questions"][0]["question"] = "Should the fix cover the wording and the schedule together?"
         self.assertEqual(FI.validate(ok), [])
@@ -221,14 +221,30 @@ class ValidateTest(unittest.TestCase):
         ok["questions"][0]["topic"] = "Gateway address"
         self.assertEqual(FI.validate(ok), [])
 
-    def test_long_or_double_questions_are_refused(self):
+    def test_long_or_compound_style_remains_valid_within_the_payload_limit(self):
         bad = good_interview()
         bad["questions"][0]["question"] = "x" * 161
-        self.assertTrue(any("> 160" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         bad["questions"][0]["question"] = "One. Two. Three?"
-        self.assertTrue(any("sentences" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
         bad["questions"][0]["question"] = "Keep the old name? and should we also move the files?"
-        self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
+
+    def test_interview_and_answer_json_have_finite_input_size(self):
+        oversized = good_interview(understanding="x" * (FI.MAX_INTERVIEW_BYTES + 1))
+        self.assertTrue(any("bytes >" in error for error in FI.validate(oversized)))
+        interview = good_interview()
+        for actor in ("user", "supervisor"):
+            answers = good_answers(interview, actor_kind=actor)
+            answers["extra"] = "y" * (FI.MAX_ANSWERS_BYTES + 1)
+            self.assertTrue(any("bytes >" in error for error in FI.validate_answers(interview, answers)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interview.json"
+            path.write_bytes(b"x" * (FI.MAX_INTERVIEW_BYTES + 1))
+            with self.assertRaisesRegex(FI.InterviewError, "interview-too-large"):
+                FI.load_json_file(path)
+            with self.assertRaisesRegex(FI.InterviewError, "answers-too-large"):
+                FI.load_json_file(path, max_bytes=FI.MAX_ANSWERS_BYTES, kind="answers")
 
     def test_every_question_needs_a_recommendation_and_a_reason(self):
         bad = good_interview()
@@ -258,7 +274,7 @@ class ValidateTest(unittest.TestCase):
         bad = good_interview(understanding="")
         self.assertTrue(any("restatement is missing" in e for e in FI.validate(bad)))
         bad = good_interview(understanding="First sentence. Second sentence.")
-        self.assertTrue(any("one sentence" in e for e in FI.validate(bad)))
+        self.assertEqual(FI.validate(bad), [])
 
     def test_shape_errors_are_reasons_not_exceptions(self):
         self.assertEqual(FI.validate({"schema": "other"}), [f"schema: expected {FI.SCHEMA!r}"])
@@ -800,7 +816,7 @@ class RouteProposalsTest(unittest.TestCase):
         self.assertEqual(FI.validate(interview), [])              # capability, graph and start_approval are data
         self.assertIn("full-run", json.dumps(interview["route_proposals"]))
         interview["questions"][0]["question"] = "Should the owner re-raise the gate?"
-        self.assertTrue(any("harness word" in e for e in FI.validate(interview)))
+        self.assertEqual(FI.validate(interview), [])
 
     def test_declining_either_answer_is_a_valid_answer(self):
         interview = routed_interview()

@@ -71,6 +71,11 @@ def is_implementation_review(route: dict, node: dict) -> bool:
             or node.get("source_review_kind") == "implementation")
 
 
+def is_source_test(node: dict) -> bool:
+    """Whether this is the code-test gate, independent of its route-local id."""
+    return node.get("completion_gate") == "code-test"
+
+
 def is_deploy_review(route: dict, node: dict) -> bool:
     """A review the ship deploy node depends on: it judges what the deploy runs."""
     if node.get("kind") != "review-worker" or is_implementation_review(route, node):
@@ -128,8 +133,8 @@ def deploy_request_subject(route: dict, node: dict, jobs: str | Path) -> dict | 
 
 
 def has_review_subject(route: dict, node: dict, jobs: str | Path | None = None) -> bool:
-    """Whether this review's round cap and PASS are counted per reviewed subject."""
-    if is_implementation_review(route, node):
+    """Whether launch, round admission, or completion binds to source content."""
+    if is_implementation_review(route, node) or is_source_test(node):
         return True
     return (jobs is not None and is_deploy_review(route, node)
             and deploy_request_subject(route, node, jobs) is not None)
@@ -179,7 +184,8 @@ def source_scopes(route: dict, node: dict) -> tuple[str, ...]:
 def has_source_subject(route: dict, node: dict) -> bool:
     if is_implementation_review(route, node):
         return True
-    if node.get("completion_gate") == "code-execute" or node.get("id") == "execute":
+    if (node.get("completion_gate") in {"code-execute", "code-test"}
+            or node.get("id") == "execute"):
         return True
     return any(scope in _SOURCE_SCOPE_TOKENS
                for scope in node.get("write_scope") or () if isinstance(scope, str))
@@ -569,6 +575,7 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
                      require_new: bool = False) -> dict | None:
     """Registration/launch fence: exact binding integrity and effective bytes."""
     likely_review = (metadata.get("completion_gate") == "code-impl-review"
+                     or metadata.get("completion_gate") == "code-test"
                      or metadata.get("unit") == "qa/code-review"
                      or bool(metadata.get("review_subject_digest")))
     if not likely_review:
@@ -676,12 +683,25 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
     """Subject fields to put on a newly published completion marker."""
     if not has_source_subject(route, node):
         return None
-    if is_implementation_review(route, node):
-        if not jobs or not attempt_metadata:
+    if is_implementation_review(route, node) or is_source_test(node):
+        if not attempt_metadata:
+            if is_source_test(node):
+                raise SourceSubjectError("review-source-binding-missing", str(attempt_id or ""))
             return None
-        record = read_binding(jobs, attempt_metadata, required=False)
+        registered = attempt_metadata.get("registered_worker") in (True, 1, "1", "true")
+        inline = (is_source_test(node) and not registered
+                  and attempt_metadata.get("execution_surface") == "inline")
+        record = (read_binding(jobs, attempt_metadata, required=is_source_test(node) and not inline)
+                  if jobs else None)
         if record is None:
-            return None
+            if not inline:
+                if is_source_test(node):
+                    raise SourceSubjectError("review-source-binding-missing", str(attempt_id or ""))
+                return None
+            current = observe(route, node, worktree=worktree)
+            epoch = source_epoch(route, node, current["digest"], completion_dir)
+            return {"schema_version": SCHEMA_VERSION, "digest": current["digest"],
+                    "epoch": epoch, "manifest_sha256": _sha(_canonical(current["manifest"]))}
         current = observe(route, node, worktree=worktree)
         epoch = source_epoch(route, node, current["digest"], completion_dir)
         if current["digest"] != record["subject_digest"] or epoch != record["source_epoch"]:
@@ -725,11 +745,11 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
                     *, jobs: str | Path | None = None) -> tuple[str, str] | None:
     """Current source identity for a marker, or None for routes outside this contract."""
     # Other scoped markers contribute source generations to the append-only
-    # epoch history, but only implementation reviews consume that source as
-    # evidence. Invalidating plan or execute markers here would make an
-    # unrelated empty Markdown scope stale when a later implementation epoch
-    # advances, and can block normal replacement/replay.
-    if not is_implementation_review(route, node):
+    # epoch history. Only implementation review and code-test gates consume
+    # source currency as a gate result.
+    source_test = is_source_test(node)
+    implementation_review = is_implementation_review(route, node)
+    if not (implementation_review or source_test):
         return None
     subject = marker.get("source_subject")
     if not isinstance(subject, dict):
@@ -742,13 +762,24 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
     if (subject.get("schema_version") != SCHEMA_VERSION
             or subject.get("digest") != current["digest"]
             or subject.get("epoch") != epoch):
-        reason = "completion-review-source-stale" if is_implementation_review(route, node) else "completion-source-stale"
+        reason = ("completion-test-source-stale" if source_test else
+                  "completion-review-source-stale" if implementation_review else
+                  "completion-source-stale")
         return "superseded", reason
-    if is_implementation_review(route, node):
+    if implementation_review or source_test:
         attempt_id = marker.get("attempt_id")
         binding_digest = subject.get("binding_digest")
+        if source_test and not binding_digest:
+            inline = (marker.get("registered_worker") is False
+                      and marker.get("execution_surface") == "inline")
+            if not inline:
+                return "superseded", "completion-test-source-binding-unknown"
+            if subject.get("manifest_sha256") != _sha(_canonical(current["manifest"])):
+                return "integrity-broken:identity-mismatch", "completion-test-source-manifest-invalid"
+            return None
         if not attempt_id or not binding_digest:
-            return "superseded", "completion-review-source-binding-unknown"
+            return "superseded", ("completion-test-source-binding-unknown" if source_test else
+                                   "completion-review-source-binding-unknown")
         # Stay with the resolved consumer path or the route's sealed selection;
         # ambient process state must never redirect exact-row or binding lookup.
         jobs_path = _currency_registry_path(route, completion_dir, jobs)
@@ -762,27 +793,32 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
                 if metadata.get("attempt_id") == attempt_id:
                     exact_rows.append(metadata)
         except OSError:
-            return "integrity-broken:identity-mismatch", "completion-review-source-registry-missing"
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-registry-missing"
         if len(exact_rows) != 1:
-            return "integrity-broken:identity-mismatch", "completion-review-source-row-not-exact"
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-row-not-exact"
         metadata = exact_rows[0]
         if (metadata.get("route_id") != route.get("route_id")
                 or metadata.get("route_hash") != route.get("route_hash")
                 or metadata.get("route_node") != node.get("id")
                 or metadata.get("review_subject_digest") != subject.get("digest")
                 or metadata.get("review_subject_binding_digest") != binding_digest):
-            return "integrity-broken:identity-mismatch", "completion-review-source-row-binding-mismatch"
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-row-binding-mismatch"
         try:
             record = read_binding_record(jobs_path, attempt_id,
                 route_id=route.get("route_id"), route_hash=route.get("route_hash"),
                 node_id=node.get("id"))
         except SourceSubjectError:
-            return "integrity-broken:identity-mismatch", "completion-review-source-binding-missing"
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
         if (record.get("binding_digest") != binding_digest or _binding_digest(record) != binding_digest
                 or record.get("subject_digest") != subject.get("digest")
                 or record.get("attempt_id") != attempt_id
                 or record.get("route_id") != route.get("route_id")
                 or record.get("route_hash") != route.get("route_hash")
                 or record.get("node_id") != node.get("id")):
-            return "integrity-broken:identity-mismatch", "completion-review-source-binding-invalid"
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-binding-invalid"
     return None

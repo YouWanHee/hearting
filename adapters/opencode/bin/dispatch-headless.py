@@ -597,6 +597,29 @@ def qa_track(capability: str) -> str:
     return "general"
 
 
+def _add_task_publish_bash_rules(permission: dict, commands: tuple[str, ...], *, resolve=None) -> bool:
+    """Add exact owner publish commands when no inherited Bash deny exists."""
+    bash = resolve(permission, "bash") if resolve is not None else permission.get("bash")
+    if isinstance(bash, str):
+        if bash == "deny":
+            return False
+        rules = {"*": bash}
+    elif isinstance(bash, dict):
+        rules = dict(bash)
+    elif bash is None:
+        rules = {}
+    else:
+        return False
+    if any(action == "deny" for action in rules.values()):
+        return False
+    for command in commands:
+        rules.pop(command, None)
+        rules[command] = "allow"
+    permission.pop("bash", None)
+    permission["bash"] = rules
+    return True
+
+
 def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
@@ -607,6 +630,8 @@ def scoped_external_directory_config(
     contract_read_roots: tuple[Path, ...] = (),
     worktree: str | None = None,
     selected_agent: str | None = None,
+    task_publish_scope: dict[str, str] | None = None,
+    merge_observation_only: bool = False,
 ) -> str:
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
@@ -648,6 +673,35 @@ def scoped_external_directory_config(
             else:
                 raise ValueError(f"OpenCode {tool} permission must be a string or object")
         return value
+
+    def install_merge_observation_rules(subject, inherited):
+        def has_deny(rules):
+            if isinstance(rules, str):
+                return rules == "deny"
+            return isinstance(rules, dict) and any(value == "deny" for value in rules.values())
+
+        for tool in ("bash", "edit", "write", "patch"):
+            current = effective_tool(subject, tool)
+            parent = effective_tool(inherited, tool)
+            denied = has_deny(current) or has_deny(parent)
+            rules = {"*": "deny"}
+            if not denied and tool == "bash":
+                for command in (
+                    "git status", "git status *", "git diff", "git diff *", "git log *",
+                    "git show *", "git rev-parse *", "git branch --show-current",
+                    "git worktree list", "git worktree list *",
+                ):
+                    rules[command] = "allow"
+            elif not denied and tool in {"edit", "write", "patch"} and artifact_root:
+                root = str(Path(artifact_root).resolve(strict=False))
+                for pattern in (root, f"{root}/**"):
+                    rules[pattern] = "allow"
+                if worktree:
+                    relative = os.path.relpath(root, worktree)
+                    for pattern in (relative, f"{relative}/**"):
+                        rules[pattern] = "allow"
+            subject.pop(tool, None)
+            subject[tool] = rules
 
     # Keep the existing headless projection before normalizing native order:
     # no explicit external rule means deny outside the scoped launch roots,
@@ -764,8 +818,15 @@ def scoped_external_directory_config(
                 edit_rules[pattern] = "allow"
         permission.pop("edit", None)
         permission["edit"] = edit_rules
+    publish_commands = (commit_policy.task_publish_commands(task_publish_scope)
+                        if task_publish_scope is not None else ())
+    publish_global_allowed = bool(publish_commands and _add_task_publish_bash_rules(
+        permission, publish_commands, resolve=effective_tool))
+    if merge_observation_only:
+        install_merge_observation_rules(permission, original_permission)
     config["permission"] = permission
-    if (contract_roots or read_deny_roots) and selected_agent:
+    if (contract_roots or read_deny_roots or publish_global_allowed
+            or merge_observation_only) and selected_agent:
         # Native agent permissions merge after global permissions. Overlay only
         # the selected agent, without giving its other tools a new default.
         agents = config.get("agent", {})
@@ -816,6 +877,10 @@ def scoped_external_directory_config(
         for tool, overlay in overlaid.items():
             local.pop(tool, None)
             local[tool] = overlay
+        if publish_global_allowed:
+            _add_task_publish_bash_rules(local, publish_commands, resolve=effective_tool)
+        if merge_observation_only:
+            install_merge_observation_rules(local, original_permission)
         if write_keep_roots:
             # Write wins inside the selected agent too: explicit edit allow
             # chained after the read deny above, from whatever edit overlay
@@ -1450,6 +1515,8 @@ def main(argv: list[str]) -> int:
         args.execution_access_grant = route_authority.bind_launch_access(
             args, runtime="opencode", default_roots=default_roots)
         grant = args.execution_access_grant
+        args.merge_observation_only = commit_policy.git_operation(args.worktree) is not None
+        args.task_publish_scope = commit_policy.task_publish_scope(args)
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
@@ -1459,6 +1526,8 @@ def main(argv: list[str]) -> int:
             contract_read_roots=args.contract_read_roots,
             worktree=args.worktree,
             selected_agent=args.agent,
+            task_publish_scope=args.task_publish_scope,
+            merge_observation_only=args.merge_observation_only,
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
@@ -1473,6 +1542,10 @@ def main(argv: list[str]) -> int:
         # A no-commit worker (commit_policy) is refused `git commit` by the runtime too.
         args.opencode_config_content = deny_commands(
             args.opencode_config_content, commit_policy.COMMIT_COMMANDS, args.agent)
+    elif (args.worker_type == "owner"
+          and commit_policy.git_operation(args.worktree) is not None):
+        args.opencode_config_content = deny_commands(
+            args.opencode_config_content, commit_policy.MERGE_MUTATION_COMMANDS, args.agent)
     args.nested_runtime_env = {}
     if action == "start" and args.dispatch_depth == 2 and args.parent_harness == "codex":
         try:
@@ -1845,7 +1918,7 @@ def main(argv: list[str]) -> int:
                 jobs=jobs, attempt_id=args.attempt_id, route_id=grant_route_id,
                 route_hash=grant_route_hash, runtime="opencode", sandbox="adapter-default",
                 grant=args.execution_access_grant, default_writable_roots=default_roots,
-                network_allowed=False,
+                network_allowed=bool(getattr(args, "task_publish_scope", None)),
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256

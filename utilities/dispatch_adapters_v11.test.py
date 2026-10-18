@@ -231,13 +231,16 @@ class AdapterV11Test(unittest.TestCase):
    self.assertNotEqual(observed,sealed)
    proc=subprocess.Popen(["sleep","60"]); self.parent_procs.append(proc)
    start=(Path("/proc")/str(proc.pid)/"stat").read_text().split()[21]
+   observer_ns=DC.process_namespace_identity() or ""
+   pgid=os.getpgid(proc.pid)
    jobs.write_text(
     f"2026-07-23T00:00:00Z\topen\t{repo}\t{repo}\towner\t"
     "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
     "execution_surface=registered-headless,registered_worker=1,"
     "fallback_hop=same-harness-headless,worker_type=owner,harness=claude,"
     "runtime_sandbox=adapter-default,"
-    f"attempt_id=att-parent-fixture,pid={proc.pid},pid_start={start}\n")
+    f"attempt_id=att-parent-fixture,pid={proc.pid},pid_start={start},pgid={pgid},"
+    f"pid_ns={observer_ns},pid_observer_ns={observer_ns},pid_scope=namespace-local\n")
    env["AGENT_DISPATCH_ATTEMPT_ID"]="att-parent-fixture"
    env["AGENT_DISPATCH_CHILD"]="1"
    node=next(n for n in route["nodes"] if n["id"]=="plan")
@@ -497,6 +500,25 @@ class AdapterV11Test(unittest.TestCase):
    row=jobs.read_text(encoding="utf-8")
    self.assertIn("supervisor_lease=flock-v1",row)
    self.assertRegex(row,r"supervisor_lease_nonce=[0-9a-f]{64}(?:,|$)")
+ def test_codex_owner_network_is_held_during_an_active_merge(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,_art=self.fixture(root)
+   base_branch=subprocess.run(["git","-C",str(repo),"branch","--show-current"],
+                              text=True,capture_output=True,check=True).stdout.strip()
+   subprocess.run(["git","-C",str(repo),"switch","-c","merge-source"],check=True,capture_output=True)
+   (repo/"x").write_text("incoming\n",encoding="utf-8")
+   subprocess.run(["git","-C",str(repo),"commit","-qam","incoming"],check=True)
+   subprocess.run(["git","-C",str(repo),"switch",base_branch],check=True,capture_output=True)
+   (repo/"x").write_text("current\n",encoding="utf-8")
+   subprocess.run(["git","-C",str(repo),"commit","-qam","current"],check=True)
+   merge=subprocess.run(["git","-C",str(repo),"merge","--no-ff","--no-commit","merge-source"],
+                        text=True,capture_output=True)
+   self.assertNotEqual(merge.returncode,0)
+   wrapper=self.load_wrapper("codex")
+   args=SimpleNamespace(worktree=str(repo),dispatch_depth=1,worker_type="owner",
+                        intensity="standard",sandbox="workspace-write",gpu_execution_scope=False)
+   self.assertFalse(wrapper.nested_headless_network_enabled(args))
+   self.assertEqual(wrapper.effective_runtime_sandbox(args),"read-only")
  def test_codex_and_claude_refuse_depth_two_before_any_row_without_live_parent(self):
   for harness in ("codex","claude"):
    with self.subTest(harness=harness),tempfile.TemporaryDirectory() as td:

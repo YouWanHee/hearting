@@ -84,6 +84,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.route["route_hash"] = route_hash(self.route)
         self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
         self.review_node = self.route["nodes"][2]
+        self.test_node = self.route["nodes"][3]
         self.route_file = self.base / "route.json"
         self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
         env = {
@@ -158,6 +159,11 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         evidence = self.artifact_root / f"{attempt_id}.md"
         evidence.write_text(evidence_text, encoding="utf-8")
         metadata = self._metadata(node, attempt_id, "stage")
+        if SUBJECT.has_review_subject(self.route, node, self.jobs):
+            metadata.update(SUBJECT.seal_attempt(
+                self.jobs, self.route, node, attempt_id, worktree=self.repo,
+            ))
+            self._row(metadata)
         return ROUTE_WRITER._publish_completion_locked(
             self.route, node, node_id, evidence, jobs=self.jobs,
             attempt_id=attempt_id, attempt_metadata=metadata,
@@ -210,6 +216,9 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
 
     def admission(self):
         return DISPATCH_NODE.admit_round(self.route, self.review_node, self.jobs, record_auto_revisions=False)
+
+    def test_admission(self):
+        return DISPATCH_NODE.admit_round(self.route, self.test_node, self.jobs, record_auto_revisions=False)
 
     def current_smoke_markers(self, prefix):
         self.complete_node("execute", f"att-{prefix}-execute", f"execute {prefix}")
@@ -314,6 +323,43 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.assertEqual(self.currency(b_pass).state, "current")
         self.current_smoke_markers("B")
         self.assertEqual(self.currency(b_pass).state, "current")
+
+    def test_merge_conflict_keeps_source_currency_unreadable_and_history_intact(self):
+        self.current_smoke_markers("merge-A")
+        _metadata, marker = self.complete_review("att-review-merge-A")
+        directory = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        marker_path = directory / "impl-review.json"
+        marker_bytes = marker_path.read_bytes()
+        history_bytes = (directory / "impl-review.1.json").read_bytes()
+        registry_bytes = self.jobs.read_bytes()
+
+        base_branch = self.git("branch", "--show-current")
+        self.git("checkout", "-qb", "merge-source")
+        (self.repo / "engine.py").write_text("value = 'incoming'\n", encoding="utf-8")
+        self.git("commit", "-qam", "incoming source")
+        self.git("checkout", "-q", base_branch)
+        (self.repo / "engine.py").write_text("value = 'current'\n", encoding="utf-8")
+        self.git("commit", "-qam", "current source")
+        merge = subprocess.run(["git", "-C", str(self.repo), "merge", "--no-ff", "--no-commit",
+                                "merge-source"], capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0)
+        git_dir = Path(self.git("rev-parse", "--git-dir"))
+        if not git_dir.is_absolute():
+            git_dir = self.repo / git_dir
+        merge_head = (git_dir / "MERGE_HEAD").read_bytes()
+        index = (git_dir / "index").read_bytes()
+        source = (self.repo / "engine.py").read_bytes()
+
+        currency = DC.gate_currency(self.route, self.review_node, marker_path, marker,
+                                    observe=True, jobs=self.jobs)
+        self.assertEqual((currency.state, currency.reason),
+                         ("completion-evidence-unreadable", "review-source-index-unmerged"))
+        self.assertEqual(marker_path.read_bytes(), marker_bytes)
+        self.assertEqual((directory / "impl-review.1.json").read_bytes(), history_bytes)
+        self.assertEqual(self.jobs.read_bytes(), registry_bytes)
+        self.assertEqual((git_dir / "MERGE_HEAD").read_bytes(), merge_head)
+        self.assertEqual((git_dir / "index").read_bytes(), index)
+        self.assertEqual((self.repo / "engine.py").read_bytes(), source)
 
     def test_simultaneous_B_upstream_and_review_completions_converge(self):
         self.current_smoke_markers("A")
@@ -620,6 +666,73 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
                 DC.claim_attempt_row(self.jobs, second_id, second_row, launch=False)
         self.assertEqual(registration_refusal.exception.reason,
                          "review-source-admission-subject-changed")
+
+    def test_code_test_registration_launch_currency_and_source_specific_round_budget(self):
+        self.current_smoke_markers("test-A")
+        first = self.complete_node("test", "att-code-test-A1", "test A pass one")
+        second = self.complete_node("test", "att-code-test-A2", "test A pass two")
+        completion = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        marker_path = completion / "test.json"
+        first_path = completion / f"test.{first['sequence']}.json"
+        self.assertEqual(DC.gate_currency(self.route, self.test_node, marker_path, second,
+                                          observe=True, jobs=self.jobs).state, "current")
+        self.assertEqual(self.test_admission().budget.state, "exhausted")
+
+        (self.repo / "engine.py").write_text("value = 'B'\n", encoding="utf-8")
+        self.assertEqual(DC.gate_currency(self.route, self.test_node, marker_path, second,
+                                          observe=True, jobs=self.jobs).state, "superseded")
+        legacy = self._metadata(self.test_node, "att-code-test-legacy-B", "stage")
+        self._row(legacy, note="completed-marker")  # historical PASS with no subject binding
+        b_admission = self.test_admission()
+        self.assertEqual((b_admission.budget.state, b_admission.budget.verdict_rounds,
+                          b_admission.budget.round_kind), ("admit", 0, "first"))
+
+        observed = SUBJECT.observe(self.route, self.test_node, worktree=self.repo, jobs=self.jobs)
+        attempt = "att-code-test-B-launch-race"
+        metadata = self._metadata(self.test_node, attempt, "stage")
+        metadata.update({
+            "capability": "autopilot-code", "capability_mode": "debug",
+            "qa": "standard", "intensity": "standard", "unit": "qa/test",
+            "write_scope": "test_logs/**", "completion_gate": "code-test",
+            "artifact_root": str(self.artifact_root), "log_file": str(self.base / "worker.log"),
+            "launch_home": str(self.agent_home), "launch_authority": "conductor",
+            "launch_fence": "registry-v1",
+        })
+        row = "\t".join(("fixture", "open", str(self.repo), str(self.repo), attempt,
+                          ",".join(f"{key}={value}" for key, value in metadata.items())))
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_SOURCE_SUBJECT_DIGEST": observed["digest"]}):
+            self.assertTrue(DC.claim_attempt_row(self.jobs, attempt, row, launch=False))
+
+        (self.repo / "engine.py").write_text("value = 'C'\n", encoding="utf-8")
+        spawned = []
+
+        def never_spawn(_fd):
+            spawned.append(True)
+            raise AssertionError("the code-test launch fence must run before spawn")
+
+        with self.assertRaises(DC.DispatchContractError) as refused:
+            DC.spawn_claimed_attempt(self.jobs, attempt, parent_binding=None, spawn=never_spawn)
+        self.assertEqual(refused.exception.reason, "review-source-subject-changed-before-launch")
+        self.assertEqual(spawned, [])
+        self._row(metadata, status="cancelled", note="dead-invalid-envelope")
+
+        (self.repo / "engine.py").write_text("value = 'B'\n", encoding="utf-8")
+        self.current_smoke_markers("test-B")
+        self.complete_node("test", "att-code-test-B1", "test B pass one")
+        self.complete_node("test", "att-code-test-B2", "test B pass two")
+        self.assertEqual(self.test_admission().budget.state, "exhausted")
+        (self.repo / "engine.py").write_text("value = 'A'\n", encoding="utf-8")
+        self.assertEqual(DC.gate_currency(self.route, self.test_node, first_path, first,
+                                          observe=True, jobs=self.jobs).state, "superseded")
+        self.assertEqual(self.test_admission().budget.state, "exhausted")
+        self.assertEqual(self.test_admission().budget.verdict_rounds, 2)
+
+    def test_code_test_owner_closure_remains_refused(self):
+        choice = __import__("route_authority").decide_continuation(
+            self.route, action="owner-closure", node=self.test_node, rows=[], jobs=self.jobs,
+        )
+        self.assertFalse(choice.allowed)
+        self.assertEqual(choice.reason, "owner-closure-node-not-review")
 
     def test_live_and_unsettled_other_subjects_still_block_B_admission(self):
         self.current_smoke_markers("A")

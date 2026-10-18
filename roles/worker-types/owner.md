@@ -15,8 +15,15 @@ after that receipt rather than waiting for training inside a Bash/model turn.
 This registered resource is not a model child and needs no model-child launch tuple. Its typed result resumes
 this owner; apply pending corrections before admitting the declared next work.
 The runtime acknowledges notifications and reconciles exact worker outcomes; inspect the
-reported evidence and decide the authorized next work. Synthesize one owner artifact. Do not
-merge, push, clean worktrees, or create dispatch depth 3.
+reported evidence and decide the authorized next work. Synthesize one owner artifact.
+When the existing work request names PR and CI and the sealed entry scope is `complete`,
+publish this task's branch with an ordinary non-force push, create or update its matching
+PR, and observe CI for the exact final head. Write the PR description to
+`$AGENT_ARTIFACT_OUTPUT_DIR/dev_logs/pr-description.md`; use that canonical file as
+the `--body-file` for create/update. Read the existing branch PR before creating one.
+Keep any CI correction within the approved scope and send it through the existing review, test, and commit path. Integration pushes,
+main merges, releases, installations, worktree cleanup, and dispatch depth 3 remain
+supervisor responsibilities.
 
 When an entry part has `start_approval`, carry the user's complete or report
 choice from the existing start confirmation into the intent, decision record,

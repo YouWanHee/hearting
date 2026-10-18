@@ -142,11 +142,12 @@ binds at `one-shot` entry for `quick`, `plan` entry for `standard+`. Legacy
 sealed routes remain unchanged. Depth-0 joins both direction briefs and builds
 `shards/frame/frame-summary.json` (five fields — 방향/대안/위험/범위 변경/비용,
 ≤1KB) plus the **frame interview** `shards/frame/interview.json` (SD-129: a
-one-sentence restatement the user confirms, a plain-language brief, and at most
-`frame_interview.py`'s `QUESTION_CAP` short questions — one topic each, 2–4
-options, one recommended, no harness vocabulary, only decisions the user alone
-can make; `utilities/frame_interview.py validate` is the bar and `gate --block`
-refuses what fails it). Depth-0 puts those questions to the user;
+restatement the user confirms, a readable brief, and at most
+`frame_interview.py`'s `QUESTION_CAP` questions, each with 2–4 options and one
+recommendation, only about decisions the user alone can make;
+`utilities/frame_interview.py validate` checks semantic bindings and finite
+input size. `writing_guidance()` recommends clear, focused wording without
+rejecting a valid question for style. Depth-0 puts those questions to the user;
 the receipt's `resume_command --answers <file>` validates the answers, renders
 `shards/frame/intent.md`, releases the gate and starts the owner.
 
@@ -200,6 +201,15 @@ Additional code-entry gates:
 - after main/orchestrator merges, verifies the integrated tree, and pushes the
   integration ref, invoke the guarded worktree cleanup check/apply path; never
   infer cleanup eligibility from a runtime session-end event.
+- when the existing request names both PR and CI and the route seals
+  `entry_execution_scope: complete`, the depth-1 owner may publish only its
+  current task branch, create or update that branch's PR, and observe checks
+  for the final head. Use an ordinary non-force push. Write the PR body to
+  `$AGENT_ARTIFACT_OUTPUT_DIR/dev_logs/pr-description.md` and pass it with
+  `--body-file` after inspecting any existing PR for that branch. CI fixes stay
+  within the approved scope and return through the existing review/test/commit path.
+  Stage and review workers do not publish; integration push, main merge,
+  release, installation, and cleanup stay with the supervisor.
 
 ## Portable Procedure
 

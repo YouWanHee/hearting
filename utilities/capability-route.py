@@ -4304,13 +4304,12 @@ def _compose_preparation_key(compose_args, route_plan_binding, prompt_file=None)
     graph = ([part.strip() for part in graph.split(",") if part.strip()]
              if isinstance(graph, str) else list(graph or []))
     caller = _route_chain_identity("compose", None)
-    evidence = json.dumps({"dispatch": compose_args.get("dispatch_evidence"),
-                           "registered_headless": compose_args.get("registered_headless_evidence")},
-                          sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    # Probe receipts can acquire new timestamps between a failed preparation
+    # and its ordinary retry. They describe current launch eligibility, not the
+    # identity of the user's prepared worktree allocation.
     return {"kind": "compose-start", "caller": caller,
             "request_path": str(Path(prompt_file).resolve()) if prompt_file else None,
             "request_sha256": hashlib.sha256(str(text or "").encode("utf-8")).hexdigest(),
-            "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
             "capability": compose_args.get("capability"),
             "mode": compose_args.get("capability_mode"), "shape": compose_args.get("shape"),
             "graph": graph, "slug": compose_args.get("slug"),
@@ -4637,18 +4636,39 @@ COMPOSE_SLUG_WORDS = 6
 def compose_default_slug(task_text, *, capability=None, shape=None):
     """The slug a compose names from its own task, so `--slug` is optional.
 
-    The first line with ASCII words names it (up to six words). A task with
-    none, such as a request written only in Korean, is named by its capability
-    and a short digest of the text, so two such tasks still get different names."""
-    text = task_text or ""
-    for line in text.splitlines()[:40]:
-        words = re.findall(r"[A-Za-z0-9]+", line)
-        if any(re.search(r"[A-Za-z]", word) for word in words):
-            return ARTIFACT_LOCATOR.slugify("-".join(words[:COMPOSE_SLUG_WORDS]))[0]
-    parts = [capability or shape or "work"]
-    if text.strip():
-        parts.append(hashlib.sha256(text.encode("utf-8")).hexdigest()[:6])
-    return ARTIFACT_LOCATOR.slugify("-".join(parts))[0]
+    The readable stem comes from request wording. A digest of the complete
+    nonempty request remains at the end, even when the display stem is clipped,
+    so similar and non-Latin requests retain separate deterministic names."""
+    text = str(task_text or "")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10] if text.strip() else ""
+    words = []
+    ignored = {"a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "into",
+               "is", "it", "of", "on", "or", "the", "to", "with", "work", "task", "please"}
+    for line in text.splitlines()[:80]:
+        candidate = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)+", "", line)
+        candidate = candidate.lstrip("# ").strip()
+        if (not candidate or re.match(r"^\d{4}-\d{2}-\d{2}(?:\b|_)", candidate)
+                or any(token in candidate for token in (".agent_reports/", ".claude_reports/", "/home/"))):
+            continue
+        found = re.findall(r"[A-Za-z][A-Za-z0-9]*", candidate)
+        words.extend(word for word in found
+                     if word.lower() not in ignored and (len(word) > 1 or word.isupper()))
+        if len(words) >= COMPOSE_SLUG_WORDS:
+            break
+    base = ARTIFACT_LOCATOR.slugify("-".join(words[:COMPOSE_SLUG_WORDS]))[0] if words else ""
+    if capability or shape:
+        prefix = ARTIFACT_LOCATOR.slugify(str(capability or shape))[0]
+        stem = "-".join(part for part in (prefix, base) if part)
+    else:
+        stem = base or "work"
+    if not stem:
+        stem = "work"
+    if not digest:
+        return ARTIFACT_LOCATOR.slugify(stem)[0]
+    suffix = "-" + digest
+    max_stem = ARTIFACT_LOCATOR.MAX_SLUG_LENGTH - len(suffix)
+    stem = re.sub(r"-+", "-", stem.lower()).strip("-")[:max_stem].rstrip("-") or "work"
+    return ARTIFACT_LOCATOR.slugify(stem + suffix)[0]
 
 
 def _compose_campaign_line(selection):
@@ -7405,7 +7425,9 @@ def write_completion_marker(
         census_jobs=Path(jobs or _compose_default_jobs())
         if census_jobs.is_file():
             lines=census_jobs.read_text(encoding="utf-8",errors="replace").splitlines()
-            generations = review_lineage_routes(route, node_id) if node.get("kind") == "review-worker" else [route]
+            generations = (review_lineage_routes(route, node_id)
+                          if node.get("kind") == "review-worker"
+                          or node.get("completion_gate") == "code-test" else [route])
             rows = [row for generation in reversed(generations)
                     for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=census_jobs)]
         if owner_override:
@@ -7444,7 +7466,8 @@ def write_completion_marker(
                 if is_deploy_review(route, node):
                     binding = read_review_subject(jobs, attempt_metadata, required=False)
                     census_subject = binding["subject_digest"] if binding else None
-            if census_subject is not None and node.get("kind") == "review-worker" and jobs is not None:
+            if census_subject is not None and (node.get("kind") == "review-worker"
+                                               or node.get("completion_gate") == "code-test") and jobs is not None:
                 from review_source_subject import read_binding as read_review_subject
                 bound_rows = []
                 for status, metadata in rows:
@@ -7461,7 +7484,9 @@ def write_completion_marker(
         )
     if REVIEW_ROUND_CAP.is_round_capped_node(node) and site == "inline":
         ROUTE_AUTHORITY.require_continuation(ROUTE_AUTHORITY.decide_continuation(
-            route, action="complete-inline", node=node, rows=rows, revisions=revisions))
+            route, action="complete-inline", node=node, rows=rows, revisions=revisions,
+            facts=({"source_subject_digest": census_subject}
+                   if census_subject is not None else None)))
     sequence=_next_marker_sequence(directory,node_id)
     if expected_evidence_sha256 is not None and "sha256:"+evidence_digest(evidence) != expected_evidence_sha256:
         raise ValueError("recorded-move-evidence-drift")
@@ -8978,7 +9003,8 @@ def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
     marker published for a closure-check round is labeled
     `closure_class="closure-check"` the same way admission already saw it."""
     lineage = (review_lineage_routes(route, node["id"])
-               if node.get("kind") == "review-worker" else [route])
+               if node.get("kind") == "review-worker"
+               or node.get("completion_gate") == "code-test" else [route])
     dependencies = list(node.get("depends_on", []))
     if (node.get("id")=="plan-check" and route.get("ancestor_plan_refresh") is not None):
         verified_ancestor_plan_refresh(route)
@@ -10352,7 +10378,9 @@ def _worktree_git(cwd, *args):
             result.git_diagnosis = diagnosis if diagnosis and diagnosis.get("state") != "unbound" else None
         return result
     except (OSError, subprocess.SubprocessError) as exc:
-        return subprocess.CompletedProcess(["git", *args], 127, "", str(exc))
+        result = subprocess.CompletedProcess(["git", *args], 127, "", str(exc))
+        result.git_uncertain = True
+        return result
 
 
 def _primary_worktree(cwd, common):
@@ -10417,15 +10445,42 @@ def _prepared_record_worktree(record, common, relative):
     if not path.is_dir():
         return None
     actual_common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    branch = _git(path, "symbolic-ref", "-q", "--short", "HEAD")
+    symbolic = _git(path, "symbolic-ref", "-q", "HEAD")
     head = _git(path, "rev-parse", "HEAD")
+    branch = str(record.get("branch") or "")
+    detached = symbolic is None
     if (not actual_common or os.path.realpath(actual_common) != os.path.realpath(common)
-            or branch != record.get("branch")):
+            or (not detached and symbolic != f"refs/heads/{branch}")):
+        return None
+    if detached and (record.get("state") != "reserved" or head != record.get("base_sha")
+                     or _git(path, "rev-parse", "--verify", f"refs/heads/{branch}") != head):
         return None
     if record.get("state") == "reserved" and head != record.get("base_sha"):
         return None
     return {"path": str(path.resolve()), "cwd": _worktree_cwd(path, relative),
-            "branch": branch, "base": record.get("base_sha"), "base_sha": record.get("base_sha")}
+            "branch": branch, "base": record.get("base_sha"), "base_sha": record.get("base_sha"),
+            **({"detached": True} if detached else {})}
+
+
+def _attach_prepared_branch(record, prepared):
+    """Attach a proven reserved detached worktree to its exact existing branch."""
+    if not prepared or not prepared.get("detached"):
+        return prepared
+    path = Path(prepared["path"])
+    branch = prepared["branch"]
+    expected = record.get("base_sha")
+    branch_tip = _git(path, "rev-parse", "--verify", f"refs/heads/{branch}")
+    current = _git(path, "rev-parse", "HEAD")
+    if not expected or branch_tip != expected or current != expected:
+        return None
+    attached = _worktree_git(path, "checkout", "-B", branch, f"refs/heads/{branch}")
+    if attached.returncode != 0:
+        return None
+    symbolic = _git(path, "symbolic-ref", "-q", "HEAD")
+    head = _git(path, "rev-parse", "HEAD")
+    if symbolic != f"refs/heads/{branch}" or head != expected:
+        return None
+    return {**prepared, "detached": False}
 
 
 def _remote_default_base(top):
@@ -10461,6 +10516,63 @@ def _remote_default_base(top):
 def _existing_local_branch(top, branch):
     result = _worktree_git(top, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
     return result.returncode == 0
+
+
+def _branch_ref_oid(top, branch):
+    result = _worktree_git(top, "show-ref", "--verify", "--hash", f"refs/heads/{branch}")
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _branch_namespaces(top):
+    result = _worktree_git(top, "for-each-ref", "--format=%(refname)")
+    if result.returncode != 0:
+        return None
+    return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
+def _branch_candidate_available(top, branch, protected, refs):
+    if branch in protected:
+        return False
+    checked = _worktree_git(top, "check-ref-format", "--branch", branch)
+    if checked.returncode != 0 or refs is None:
+        return False
+    heads = [ref[len("refs/heads/"):] for ref in refs if ref.startswith("refs/heads/")]
+    other_names = [ref[len("refs/tags/"):]
+                   for ref in refs if ref.startswith("refs/tags/")]
+    for ref in refs:
+        if ref.startswith("refs/remotes/"):
+            remote_branch = ref[len("refs/remotes/"):].partition("/")[2]
+            if remote_branch and remote_branch != "HEAD":
+                other_names.append(remote_branch)
+    if any(name == branch or name.startswith(branch + "/") or branch.startswith(name + "/")
+           for name in heads):
+        return False
+    if any(name == branch for name in other_names):
+        return False
+    return True
+
+
+def _branch_checked_out(top, branch):
+    result = _worktree_git(top, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        return None
+    return any(line.strip() == f"branch refs/heads/{branch}" for line in result.stdout.splitlines())
+
+
+def _cleanup_failed_worktree_branch(top, branch, base_sha):
+    """Delete only a newly-created, unused branch still at its expected base."""
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(base_sha or "")):
+        return {"state": "preserved", "reason": "base-sha-unverified"}
+    current = _branch_ref_oid(top, branch)
+    if current != base_sha:
+        return {"state": "preserved", "reason": "branch-moved-or-missing"}
+    checked_out = _branch_checked_out(top, branch)
+    if checked_out is not False:
+        return {"state": "preserved", "reason": "branch-worktree-used-or-unobservable"}
+    removed = _worktree_git(top, "update-ref", "-d", f"refs/heads/{branch}", base_sha)
+    if removed.returncode == 0:
+        return {"state": "removed", "reason": "owned-unchanged-branch"}
+    return {"state": "preserved", "reason": "compare-and-swap-refused"}
 
 
 def _worktree_collision(result):
@@ -10540,13 +10652,22 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         if topology == "linked" and record:
             reused = _prepared_record_worktree(record, common, os.path.relpath(original, source_top))
             if reused and os.path.commonpath([original, reused["path"]]) == reused["path"]:
-                return {"state": "reused", **reused, "preparation_key": key}
+                attached = _attach_prepared_branch(record, reused)
+                if attached is None:
+                    return {"state": "failed", "reason": "prepared-branch-attach-unverified",
+                            "branch": reused["branch"], "path": reused["path"]}
+                return {"state": "reused", **attached, "preparation_key": key}
         primary = _primary_worktree(original, common)
         if not primary:
             return {"state": "failed", "reason": "primary-worktree-unresolved", "cwd": original}
         primary = os.path.realpath(primary)
         if record and record.get("primary_top") == primary:
             reused = _prepared_record_worktree(record, common, relative)
+            if reused:
+                reused = _attach_prepared_branch(record, reused)
+                if reused is None:
+                    return {"state": "failed", "reason": "prepared-branch-attach-unverified",
+                            "branch": record.get("branch"), "path": record.get("path")}
             if reused and record.get("state") == "ready":
                 return {"state": "reused", **reused, "preparation_key": key}
             if reused and record.get("state") == "reserved":
@@ -10577,6 +10698,11 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         except OSError as exc:
             return {"state": "failed", "reason": "worktree-parent-create-failed", "detail": str(exc)}
         candidates = []
+        observed_branch = _git(primary, "symbolic-ref", "-q", "--short", "HEAD")
+        protected = {"HEAD", "main", "master", "develop", "trunk", "origin"}
+        protected.update(value for value in (observed_branch, base.get("branch"),
+                           (record or {}).get("remote_default")) if value)
+        refs = _branch_namespaces(primary)
         if reserved:
             candidates.append((reserved[0], reserved[1], reserved[2], True))
         if record and record.get("primary_top") == primary and not reserved:
@@ -10588,13 +10714,18 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                                    _existing_local_branch(primary, recorded_branch)))
         for suffix in range(1, 65):
             candidate = slug if suffix == 1 else f"{slug}-{suffix}"
-            if not any(row[0] == candidate for row in candidates):
+            if (_branch_candidate_available(primary, candidate, protected, refs)
+                    and not any(row[0] == candidate for row in candidates)):
                 candidates.append((candidate, worktree_root / candidate, base["sha"], False))
         for branch, path, base_sha, resume_branch in candidates:
+            if _worktree_git(primary, "check-ref-format", "--branch", branch).returncode != 0:
+                continue
             if os.path.lexists(path):
                 if (record and str(path.resolve()) == str(Path(record.get("path") or "").resolve())
                         and record.get("state") == "reserved"):
                     reused = _prepared_record_worktree(record, common, relative)
+                    if reused:
+                        reused = _attach_prepared_branch(record, reused)
                     if reused:
                         record["state"] = "ready"
                         try:
@@ -10615,20 +10746,39 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                 atomic_write(record_path, record)
             except OSError as exc:
                 return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
-            command = (("worktree", "add", str(path), branch) if resume_branch else
+            branch_before = _branch_ref_oid(primary, branch)
+            if not resume_branch:
+                if not _branch_candidate_available(primary, branch, protected,
+                                                   _branch_namespaces(primary)):
+                    continue
+                if branch_before is not None:
+                    continue
+            created_by_attempt = not resume_branch and branch_before is None
+            command = (("worktree", "add", str(path), f"refs/heads/{branch}") if resume_branch else
                        ("worktree", "add", "-b", branch, str(path), base_sha))
             added = _worktree_git(primary, *command)
             if added.returncode != 0:
+                cleanup = (_cleanup_failed_worktree_branch(primary, branch, base_sha)
+                           if created_by_attempt and not getattr(added, "git_uncertain", False)
+                           else {"state": "preserved", "reason": "preparation-outcome-uncertain"})
                 if _worktree_collision(added):
                     continue
                 failed = {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
                           "branch": branch, "base": base_sha,
-                          "detail": (added.stderr or added.stdout).strip()}
+                          "detail": (added.stderr or added.stdout).strip(),
+                          "branch_cleanup": cleanup}
                 if hasattr(added, "git_failure"):
                     failed["git_failure"] = added.git_failure
                 if getattr(added, "git_diagnosis", None):
                     failed["git_diagnosis"] = added.git_diagnosis
                 return failed
+            prepared = _prepared_record_worktree(record, common, relative)
+            if not prepared:
+                return {"state": "failed", "reason": "worktree-branch-identity-unverified",
+                        "path": str(path), "branch": branch, "base": base_sha}
+            if _attach_prepared_branch(record, prepared) is None:
+                return {"state": "failed", "reason": "worktree-branch-attach-unverified",
+                        "path": str(path), "branch": branch, "base": base_sha}
             record["state"] = "ready"
             try:
                 atomic_write(record_path, record)

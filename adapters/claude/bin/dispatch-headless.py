@@ -806,27 +806,39 @@ def _claude_settings_paths(worktree: str | Path | None = None) -> tuple[Path, ..
 
 
 def _allowlist_rules(agent_home: Path, worktree: str | Path | None, artifact_root: str | Path | None,
-                     worker_type: str | None, *, commit_expected: bool = False) -> tuple[str, ...]:
+                     worker_type: str | None, *, commit_expected: bool = False,
+                     task_publish_scope: dict[str, str] | None = None,
+                     merge_observation_only: bool = False) -> tuple[str, ...]:
     """The explicit allow rules a registered worker/owner contractually needs (never bare Bash)."""
     rules: list[str] = []
-    for name in HARNESS_ALLOWLIST_UTILITIES:
-        utility = agent_home / "utilities" / name
-        rules += [
-            f"Bash(python3 {utility} *)",
-            f"Bash(python3 {utility})",
-            f"Bash({utility} *)",
-            f"Bash({utility})",
-        ]
-    rules += list(_READ_ONLY_GIT_RULES)
-    if worker_type == "owner" or commit_expected:
+    if not merge_observation_only:
+        for name in HARNESS_ALLOWLIST_UTILITIES:
+            utility = agent_home / "utilities" / name
+            rules += [
+                f"Bash(python3 {utility} *)",
+                f"Bash(python3 {utility})",
+                f"Bash({utility} *)",
+                f"Bash({utility})",
+            ]
+        rules += list(_READ_ONLY_GIT_RULES)
+    else:
+        rules += ["Bash(git status *)", "Bash(git status)", "Bash(git diff *)", "Bash(git diff)",
+                  "Bash(git log *)", "Bash(git show *)", "Bash(git rev-parse *)",
+                  "Bash(git branch --show-current)", "Bash(git worktree list *)",
+                  "Bash(git worktree list)"]
+    if commit_expected and not merge_observation_only:
         # Route-bound single-session mutation workers may commit when the sealed
         # node says so; declared slices never receive this allowlist.
         rules += list(_OWNER_COMMIT_GIT_RULES)
-    rules += list(_TEST_RUNNER_RULES)
+    if task_publish_scope is not None and not merge_observation_only:
+        rules += [f"Bash({command})" for command in commit_policy.task_publish_commands(task_publish_scope)]
+    if not merge_observation_only:
+        rules += list(_TEST_RUNNER_RULES)
     # Edit rules also govern Write (Write path rules are never consulted);
     # `//` anchors an absolute path. Reads inside the working directory and
     # the `--add-dir` artifact root need no rule.
-    for scope in (worktree, artifact_root):
+    scopes = (artifact_root,) if merge_observation_only else (worktree, artifact_root)
+    for scope in scopes:
         if scope:
             rules.append(f"Edit(//{str(Path(str(scope))).lstrip('/')}/**)")
     return tuple(rules)
@@ -871,7 +883,10 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
         mode, reason = requested, "launch-explicit"
     worktree = getattr(args, "worktree", None)
     settings_paths = _claude_settings_paths(worktree)
-    if mode == "bypass":
+    args.merge_observation_only = commit_policy.git_operation(worktree or "") is not None
+    if args.merge_observation_only:
+        mode, reason = "allowlist", "active-git-operation"
+    elif mode == "bypass":
         # Where bypass cannot apply the runtime refuses to start (root/sudo)
         # or does not enter bypass (disableBypassPermissionsMode in any
         # settings scope); demote to the allowlist posture with a typed reason
@@ -883,9 +898,12 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
     agent_home = Path(str(getattr(args, "agent_home", "") or ROOT))
     worker_type = getattr(args, "worker_type", None)
     commit_expected = commit_policy.may_commit(args)
+    args.task_publish_scope = commit_policy.task_publish_scope(args)
     allowed = _allowlist_rules(
         agent_home, worktree, getattr(args, "artifact_root", None), worker_type,
         commit_expected=commit_expected,
+        task_publish_scope=args.task_publish_scope,
+        merge_observation_only=args.merge_observation_only,
     )
     return {
         "mode": mode,
@@ -1984,7 +2002,8 @@ def main(argv: list[str]) -> int:
                 route_hash=grant_route_hash,
                 runtime=("claude-supervisor" if args.resolved_completion_delivery == "session-resume-supervised" else "claude-cli"),
                 sandbox="adapter-default", grant=args.execution_access_grant,
-                default_writable_roots=default_roots, network_allowed=False,
+                default_writable_roots=default_roots,
+                network_allowed=bool(getattr(args, "task_publish_scope", None)),
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256

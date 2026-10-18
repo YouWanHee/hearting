@@ -32,6 +32,15 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 `code-test` realizes the final `verify` stage for code work. It is concrete verification, not a mandatory second QA pipeline. Intensity-derived rigor changes command breadth, evidence requirements, and whether a separate test-adequacy/security/adversarial review is opened. `quick` may run one focused verify-lite command; `standard+` runs the applicable graduated levels; `thorough|adversarial` may add adequacy, runtime-observation, security, or external adversary review only when the selected intensity/risk calls for it.
 
+Every registered `code-test` node binds the effective source subject at
+admission and rechecks it at registration, launch, completion, and gate
+consumption, regardless of the route-local node id. Each content subject uses
+its own existing finite verdict budget; returning to earlier content keeps that
+content's budget and source epoch, and its old PASS remains historical. A legacy
+PASS without a verified subject binding cannot satisfy a changed-source test
+gate. Live and unsettled attempts still protect the whole node lineage, and a
+test gate cannot use review owner-closure.
+
 
 ## Artifact Ownership
 

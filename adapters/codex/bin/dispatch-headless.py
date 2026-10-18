@@ -835,6 +835,8 @@ def uses_enclosing_codex_sandbox(args: argparse.Namespace) -> bool:
 
 def effective_runtime_sandbox(args: argparse.Namespace) -> str:
     """Avoid nested mounts while preserving caller sandbox constraints."""
+    if commit_policy.git_operation(getattr(args, "worktree", "")) is not None:
+        return "read-only"
     return "danger-full-access" if uses_enclosing_codex_sandbox(args) else args.sandbox
 
 
@@ -1212,8 +1214,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
 
 
 def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
-    """Grant network only to a standard+ dispatch-depth-1 Codex capability owner."""
-
+    """Grant owner network only while the bound worktree has no Git operation."""
+    if commit_policy.git_operation(getattr(args, "worktree", "")) is not None:
+        return False
     return codex_standard_owner_network_enabled(
         dispatch_depth=args.dispatch_depth,
         worker_type=args.worker_type,

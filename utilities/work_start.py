@@ -158,9 +158,9 @@ def native_answer_candidate(route, jobs, asked):
     try:
         if question_path.is_symlink():
             return None
-        if resolution.get("artifact_sha256") and hashlib.sha256(question_path.read_bytes()).hexdigest() != resolution["artifact_sha256"]:
+        question, raw = FI.load_json_file(question_path, return_bytes=True)
+        if resolution.get("artifact_sha256") and hashlib.sha256(raw).hexdigest() != resolution["artifact_sha256"]:
             return None
-        question = json.loads(question_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
     if not FI.is_interview(question) or question.get("route_id") != route["route_id"]:
@@ -168,7 +168,7 @@ def native_answer_candidate(route, jobs, asked):
     manual_answer = question_path.parent / "answers.json"
     if manual_answer.exists():
         try:
-            existing = json.loads(manual_answer.read_text(encoding="utf-8"))
+            existing = FI.load_json_file(manual_answer, max_bytes=FI.MAX_ANSWERS_BYTES, kind="answers")
         except (OSError, ValueError):
             existing = None
         if isinstance(existing, dict) and not FI.validate_answers(question, existing):
@@ -203,9 +203,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     from artifact_producer import ProducerError, prepare_route_artifact_env
     ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
     resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
-    supplied = json.loads(Path(interview).read_text()) if interview else None
+    supplied = FI.load_json_file(interview) if interview else None
     if supplied is None and resolution.get("artifact"):
-        supplied = json.loads(Path(resolution["artifact"]).read_text())
+        supplied = FI.load_json_file(resolution["artifact"])
     if supplied is None:
         if answers:
             raise ValueError("frame-question-required: pass the question already answered with --interview")
@@ -221,6 +221,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         return {"state": "needs-interview", "required_action": "prepare-frame-question",
                 "interview_template": {"understanding": understanding, "brief": brief, "questions": []},
                 "question_example": FI.QUESTION_EXAMPLE,
+                "writing_guidance": list(FI.writing_guidance()),
                 "next_step": "Compare these exact frame results; fill this semantic interview template (its "
                     "understanding and brief are drafts from the request and the frame brief: rewrite them in the "
                     "person's words) and "
@@ -244,7 +245,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         # A submitted answer remains readable after its cycle is sealed. Do not
         # reopen the producer or write into a completed cycle on a lost reply.
         recorded_path = Path(resolution["artifact"])
-        recorded = json.loads(recorded_path.read_text())
+        recorded = FI.load_json_file(recorded_path)
         if "route_proposals" in recorded and "route_proposals" not in supplied:
             # The recorded question carries the mapping the runtime built from these marks.
             supplied = {**supplied, "route_proposals": recorded["route_proposals"]}
@@ -254,8 +255,10 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         recorded_answer = resolution.get("answers")
         if decision == "stop":
             saved_answer = recorded_path.parent / "answers.json"
-            recorded_answer = json.loads(saved_answer.read_text()) if saved_answer.exists() else None
-        response = json.loads(Path(answers).read_text()) if answers else recorded_answer
+            recorded_answer = (FI.load_json_file(saved_answer, max_bytes=FI.MAX_ANSWERS_BYTES,
+                                                 kind="answers") if saved_answer.exists() else None)
+        response = (FI.load_json_file(answers, max_bytes=FI.MAX_ANSWERS_BYTES, kind="answers")
+                    if answers else recorded_answer)
         if normalized != recorded or decision != resolution["status"]:
             raise ValueError("frame-input-conflict: preserve the recorded question and decision")
         if response is not None and FI.validate_answers(recorded, response):
@@ -275,7 +278,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     if not directory.resolve().is_relative_to(Path(output).resolve()):
         raise ValueError("frame-output-outside-cycle")
     question_path, answer_path = directory / "interview.json", directory / "answers.json"
-    original = json.loads(question_path.read_text()) if question_path.exists() else {}
+    original = FI.load_json_file(question_path) if question_path.exists() else {}
     supplied, mark_errors = _marked_route_proposals(route, jobs, supplied)
     question = {**supplied, "schema": FI.SCHEMA, "route_id": route["route_id"], "round": round_no,
                 "self_path": str(question_path), "summary": str(directory / "frame-summary.json"),
@@ -284,7 +287,8 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     native = directory / FI.NATIVE_ANSWERS_NAME
     if not answers and not next_round and resolution["status"] == "blocked" and native.is_file():
         answers = native                    # the person's native reply, recorded when it arrived
-    response = json.loads(Path(answers).read_text()) if answers else None
+    response = (FI.load_json_file(answers, max_bytes=FI.MAX_ANSWERS_BYTES, kind="answers")
+                if answers else None)
     # A native timeout/acknowledgement is not an answer file. Keep the same
     # registered question available for a later ordinary conversation reply.
     unanswered = FI.pending_answer_response(question, response)
@@ -998,7 +1002,7 @@ def _recorded_interview(route, jobs):
     import frame_interview as FI
     answers = FI.recorded_answer_context(resolution.get("answers"),
                                          resolution.get("actor_kind") if resolution.get("status") == "proceed" else None)
-    return json.loads(Path(artifact).read_text()), answers
+    return FI.load_json_file(artifact), answers
 
 
 def _leg_task_text(route, root, output, briefs, intent, approvals, adopted=None):
