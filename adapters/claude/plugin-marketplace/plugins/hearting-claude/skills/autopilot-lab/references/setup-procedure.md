@@ -52,7 +52,7 @@ Proceed? (continue / revise / stop)
 Keep a reference tied to the source document or revision, model description,
 checkpoint and comparison condition in the existing Reference, Motivation, This
 attempt, Dataset and Ablation grid values. For example, distinguish a fixed
-two-speaker, multi-reference run without speaker dropout (E2 best48) from a
+two-speaker, multi-reference run without dropout (E2 best48) from a
 0–3-speaker variable run with reference dropout and fine-tuning (var03 FT LAST3);
 retain the original labels as references and leave an unexplained label unresolved.
 

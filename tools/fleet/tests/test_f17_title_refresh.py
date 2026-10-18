@@ -1491,7 +1491,7 @@ class ValidatorHardeningTest(unittest.TestCase):
         self.assertEqual(rt.DEBOUNCE_SEC, 600)
 
     def test_prompt_keeps_distinct_source_conditions_in_existing_data_blocks(self):
-        source = ("2-speaker fixed, multi-reference, no speaker dropout (E2 best48); "
+        source = ("2-speaker fixed, multi-reference, no dropout (E2 best48); "
                   "0-3-speaker variable, reference-dropout fine-tuning (var03 FT LAST3)")
         prompt = rt._prompt("The evaluation stopped before the second run", anchor=source)
         self.assertIn("=== TASK CONTEXT (DATA; RECENT USER INTENT) ===\n" + source, prompt)

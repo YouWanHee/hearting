@@ -61,7 +61,7 @@ Each clause is one contract line plus the signal that it was violated.
   For the first core subject in a message that must stand on its own, carry the
   source description and the comparison condition that distinguishes it, then
   add its original identifier as a reference: “the fixed two-speaker,
-  multi-reference model without speaker dropout (E2 best48).” Keep the source
+  multi-reference model without dropout (E2 best48).” Keep the source
   document or revision when it changes the meaning; leave an unexplained key
   such as F11 unresolved instead of guessing. Completion conditions are
   reported from their existing text, with internal IDs kept for traceability.
