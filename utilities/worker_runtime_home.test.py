@@ -15,6 +15,7 @@ import worker_runtime_home
 from worker_runtime_home import prepare_worker_home, codex_worker_arguments, claude_worker_arguments
 from worker_bootstrap import render_worker_bootstrap
 from claude_credential_recovery import SECURE_STORAGE_ENV
+import dispatch_capacity_evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,6 +30,14 @@ class WorkerHomes(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _account_defaults(self, accounts):
+        path = self.base / 'dispatch-defaults.yaml'
+        shipped = (ROOT / 'profiles/dispatch-defaults.yaml').read_text(encoding='utf-8')
+        lines = [shipped.rstrip(), '', 'worker_account:']
+        lines.extend(f'  {harness}: {value}' for harness, value in accounts.items())
+        path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        return path
 
     def test_codex_every_type_isolates_global_input_keeps_auth_config_and_hooks(self):
         (self.source / 'agent-config').mkdir()
@@ -57,6 +66,179 @@ class WorkerHomes(unittest.TestCase):
             self.assertIn('mcp_servers={"external"={"command"="true","enabled"=false}}', args)
             self.assertTrue(any('test-skill' in arg for arg in args))
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()})
+
+    def test_worker_accounts_select_only_auth_sources_and_keep_settings_on_parent(self):
+        parent_home = self.base / 'parent-home'
+        parent_codex = self.base / 'parent-codex'
+        parent_claude = self.base / 'parent-claude'
+        parent_opencode_config = self.base / 'parent-opencode-config'
+        parent_xdg_data = self.base / 'parent-xdg-data'
+        selected_codex = self.base / 'accounts/codex'
+        selected_claude = self.base / 'accounts/claude'
+        selected_opencode_data = self.base / 'accounts/opencode-data'
+        parent_store = self.base / 'parent-secure-store'
+        selected_store = self.base / 'selected-secure-store'
+        for path in (parent_home, parent_codex, parent_claude,
+                     parent_opencode_config, parent_xdg_data,
+                     selected_codex, selected_claude, selected_opencode_data,
+                     parent_store, selected_store):
+            path.mkdir(parents=True)
+
+        (parent_codex / 'auth.json').write_text('{"account":"A"}', encoding='utf-8')
+        (parent_codex / 'config.toml').write_text('[user]\nvalue="A"\n', encoding='utf-8')
+        (parent_codex / 'hooks.json').write_text('{"user_guard":true}', encoding='utf-8')
+        (selected_codex / 'auth.json').write_text('{"account":"B"}', encoding='utf-8')
+
+        parent_claude_hooks = parent_claude / 'hooks'
+        parent_claude_hooks.mkdir()
+        (parent_claude_hooks / 'guard.py').write_text('parent guard', encoding='utf-8')
+        parent_settings = {
+            'env': {SECURE_STORAGE_ENV: str(parent_store), 'PARENT_SETTING': 'kept'},
+            'hooks': {'PreToolUse': [{'hooks': [{'command': 'parent-guard'}]}]},
+            'permissions': {'deny': ['Read(secret)']},
+        }
+        (parent_claude / 'settings.json').write_text(json.dumps(parent_settings), encoding='utf-8')
+        parent_claude_account = {'accountUuid': 'account-A', 'organizationUuid': 'org-A'}
+        (parent_claude / '.claude.json').write_text(
+            json.dumps({'oauthAccount': parent_claude_account}), encoding='utf-8')
+        (parent_claude / '.credentials.json').write_text('{"credential":"A"}', encoding='utf-8')
+        selected_claude_account = {'accountUuid': 'account-B', 'organizationUuid': 'org-B'}
+        (selected_claude / '.claude.json').write_text(
+            json.dumps({'oauthAccount': selected_claude_account}), encoding='utf-8')
+        selected_claude_settings = {'env': {SECURE_STORAGE_ENV: str(selected_store)}}
+        (selected_claude / 'settings.json').write_text(
+            json.dumps(selected_claude_settings), encoding='utf-8')
+        (selected_claude / '.credentials.json').write_text('{"credential":"B"}', encoding='utf-8')
+
+        (parent_opencode_config / 'opencode.json').write_text(
+            json.dumps({'model': 'provider/model-A', 'theme': 'parent-theme'}), encoding='utf-8')
+        (parent_xdg_data / 'opencode').mkdir()
+        (parent_xdg_data / 'opencode/auth.json').write_text(
+            '{"account":"A"}', encoding='utf-8')
+        (selected_opencode_data / 'opencode').mkdir(parents=True)
+        (selected_opencode_data / 'opencode/auth.json').write_text(
+            '{"account":"B"}', encoding='utf-8')
+
+        defaults_path = self._account_defaults({
+            'claude': str(selected_claude),
+            'codex': str(selected_codex),
+            'opencode': str(selected_opencode_data),
+        })
+        env = {
+            **self.env,
+            'HOME': str(parent_home),
+            'DISPATCH_DEFAULTS_CONFIG': str(defaults_path),
+            'CODEX_HOME': str(parent_codex),
+            'CLAUDE_CONFIG_DIR': str(parent_claude),
+            'CLAUDE_SECURESTORAGE_CONFIG_DIR': str(parent_store),
+            'OPENCODE_CONFIG_DIR': str(parent_opencode_config),
+            'XDG_CONFIG_HOME': str(self.base / 'parent-xdg-config'),
+            'XDG_DATA_HOME': str(parent_xdg_data),
+        }
+        original_bytes = {
+            path: path.read_bytes()
+            for path in (parent_codex / 'auth.json', parent_codex / 'config.toml',
+                         parent_claude / 'settings.json', parent_claude / '.claude.json',
+                         parent_claude / '.credentials.json',
+                         selected_claude / '.credentials.json',
+                         parent_opencode_config / 'opencode.json',
+                         parent_xdg_data / 'opencode/auth.json',
+                         selected_opencode_data / 'opencode/auth.json')
+        }
+
+        codex = prepare_worker_home(ROOT, 'codex', 'stage', 'account-b-codex', env=env)
+        codex_home = Path(codex['CODEX_HOME'])
+        self.assertEqual((codex_home / 'auth.json').resolve(), (selected_codex / 'auth.json').resolve())
+        self.assertEqual((codex_home / 'config.toml').resolve(), (parent_codex / 'config.toml').resolve())
+        self.assertEqual((codex_home / 'hooks.json').resolve(), (parent_codex / 'hooks.json').resolve())
+        self.assertEqual(codex['HEARTING_MODEL_CONFIG_HOME'], str(parent_codex))
+
+        claude = prepare_worker_home(ROOT, 'claude', 'stage', 'account-b-claude', env=env)
+        claude_home = Path(claude['CLAUDE_CONFIG_DIR'])
+        self.assertEqual(json.loads((claude_home / '.claude.json').read_text()),
+                         {'oauthAccount': selected_claude_account})
+        self.assertEqual(claude[SECURE_STORAGE_ENV], str(selected_store.resolve()))
+        claude_settings = json.loads((claude_home / 'settings.json').read_text())
+        self.assertEqual(claude_settings['env'][SECURE_STORAGE_ENV], str(selected_store.resolve()))
+        self.assertEqual(claude_settings['env']['PARENT_SETTING'], 'kept')
+        self.assertEqual(claude_settings['hooks'], parent_settings['hooks'])
+        self.assertEqual(claude_settings['permissions'], parent_settings['permissions'])
+        self.assertEqual((claude_home / 'hooks/guard.py').resolve(),
+                         (parent_claude_hooks / 'guard.py').resolve())
+        self.assertEqual(dispatch_capacity_evidence.launch_scope(
+            'claude', {**env, **claude})['quota_scope'],
+            dispatch_capacity_evidence.launch_scope(
+                'claude', {**env, 'CLAUDE_CONFIG_DIR': str(selected_claude)})['quota_scope'])
+        self.assertFalse((claude_home / '.credentials.json').exists())
+
+        opencode = prepare_worker_home(ROOT, 'opencode', 'stage', 'account-b-opencode', env=env)
+        opencode_data = Path(opencode['XDG_DATA_HOME']) / 'opencode/auth.json'
+        self.assertEqual(opencode_data.resolve(),
+                         (selected_opencode_data / 'opencode/auth.json').resolve())
+        self.assertEqual(json.loads((Path(opencode['OPENCODE_CONFIG_DIR']) / 'opencode.json').read_text())[
+            'model'], 'provider/model-A')
+
+        nested_opencode = prepare_worker_home(
+            ROOT, 'opencode', 'review', 'nested-account-b-opencode', env={**env, **opencode})
+        nested_auth = Path(nested_opencode['XDG_DATA_HOME']) / 'opencode/auth.json'
+        self.assertEqual(nested_auth.resolve(),
+                         (selected_opencode_data / 'opencode/auth.json').resolve())
+        self.assertEqual(nested_opencode['DISPATCH_DEFAULTS_CONFIG'], str(defaults_path.resolve()))
+
+        nested_claude = prepare_worker_home(
+            ROOT, 'claude', 'review', 'nested-account-b-claude', env={**env, **claude})
+        self.assertEqual(json.loads(
+            (Path(nested_claude['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
+            {'oauthAccount': selected_claude_account})
+        self.assertEqual(nested_claude[SECURE_STORAGE_ENV], str(selected_store.resolve()))
+
+        self.assertEqual({path: path.read_bytes() for path in original_bytes}, original_bytes)
+
+    def test_explicit_missing_codex_account_does_not_fall_back_to_parent_auth(self):
+        parent = self.base / 'parent-codex'
+        selected = self.base / 'missing-codex-account'
+        parent.mkdir()
+        selected.mkdir()
+        (parent / 'auth.json').write_text('{"account":"A"}', encoding='utf-8')
+        (parent / 'config.toml').write_text('[user]\nvalue="A"\n', encoding='utf-8')
+        defaults_path = self._account_defaults({'codex': str(selected)})
+        env = {**self.env, 'HOME': str(self.base / 'home'), 'CODEX_HOME': str(parent),
+               'DISPATCH_DEFAULTS_CONFIG': str(defaults_path)}
+        values = prepare_worker_home(ROOT, 'codex', 'review', 'missing-account', env=env)
+        self.assertFalse((Path(values['CODEX_HOME']) / 'auth.json').exists())
+        self.assertEqual((Path(values['CODEX_HOME']) / 'config.toml').resolve(),
+                         (parent / 'config.toml').resolve())
+
+    def test_worker_account_path_expansion_uses_passed_home_and_launch_cwd(self):
+        home = self.base / 'worker-home-root'
+        launch_cwd = self.base / 'launch-cwd'
+        home.mkdir()
+        launch_cwd.mkdir()
+        (home / 'account-codex').mkdir()
+        (home / 'account-codex/auth.json').write_text('{"account":"tilde"}', encoding='utf-8')
+        relative_account = launch_cwd / 'relative/claude-account'
+        relative_account.mkdir(parents=True)
+        (relative_account / '.claude.json').write_text(json.dumps({
+            'oauthAccount': {'accountUuid': 'relative-account', 'organizationUuid': 'relative-org'}
+        }), encoding='utf-8')
+        defaults_path = self._account_defaults({
+            'codex': '~/account-codex', 'claude': 'relative/claude-account',
+        })
+        env = {**self.env, 'HOME': str(home), 'DISPATCH_DEFAULTS_CONFIG': str(defaults_path)}
+        with patch('pathlib.Path.cwd', return_value=launch_cwd):
+            codex = prepare_worker_home(ROOT, 'codex', 'review', 'expanded-tilde', env=env)
+            claude = prepare_worker_home(ROOT, 'claude', 'review', 'expanded-relative', env=env)
+        self.assertEqual((Path(codex['CODEX_HOME']) / 'auth.json').resolve(),
+                         (home / 'account-codex/auth.json').resolve())
+        claude_config = Path(claude['CLAUDE_CONFIG_DIR']) / '.claude.json'
+        self.assertEqual(claude['HEARTING_MODEL_CONFIG_HOME'],
+                         str((home / '.claude').resolve()))
+        self.assertEqual(json.loads(claude_config.read_text()), {
+            'oauthAccount': {'accountUuid': 'relative-account', 'organizationUuid': 'relative-org'}
+        })
+        self.assertEqual(worker_runtime_home._builder._resolve_worker_account_path(
+            'relative/claude-account', env=env, cwd=launch_cwd),
+            (launch_cwd / 'relative/claude-account').resolve())
 
     def test_claude_guards_permissions_and_credentials_survive_catalog_removal(self):
         (self.source / 'hooks').mkdir()
