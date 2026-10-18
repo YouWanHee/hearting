@@ -3162,6 +3162,9 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         return metadata
 
     def _controlled_runner(self, command, **kwargs):
+        if "--automatic-retry-of" in command:
+            self.assertEqual(Path(command[1]).name, "dispatch-owner.py")
+            self.assertNotIn("--route-node", command)
         close_attempt = self.contract.close_attempt_row
 
         def close_after_fixture_carrier(jobs, aid, note, *, evidence=None):
