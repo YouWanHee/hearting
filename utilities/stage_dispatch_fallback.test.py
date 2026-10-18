@@ -2651,12 +2651,120 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(code,76,out+err)
   self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
   self.assertEqual(fields.get("child_spawned"),"unknown",out)
+  self.assertEqual(fields.get("registered"),"unknown",out)
+  self.assertEqual(fields.get("started"),"unknown",out)
+  self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
   self.assertEqual(fields.get("cleanup"),"incomplete",out)
+  self.assertEqual(fields.get("wrapper_returncode"),"0",out)
   self.assertEqual(json.loads(fields["wrapper_stdout_json"]),receipt)
   self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
   self.assertNotIn("selected_hop=",out)
   self.assertEqual(len(calls),1)
   self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
+
+ def test_incomplete_forwarded_output_retains_exact_terminal_pass_and_fail(self):
+  import json
+  cases=(
+   ("completed-marker","pass","PASS"),
+   ("dead-worker-fail","fail","FAIL"),
+  )
+  for note,failure_class,verdict in cases:
+   with self.subTest(verdict=verdict),self.dispatch_env():
+    self.jobs.write_text("",encoding="utf-8")
+    path,route,node=self.standard_route()
+    calls=[]
+    ForwardedRun=sys.modules["dispatch_lifecycle"].ForwardedRun
+    def run(cmd,**kwargs):
+     calls.append((cmd,kwargs))
+     aid=self.arg(cmd,"--attempt-id")
+     metadata=(
+      f"attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+      f"route_id={route['route_id']},route_node={node['id']},attempt_id={aid},"
+      f"worker_type=stage,launch_claimed=1,launch_fence=registry-v1,launch_started=1,"
+      f"note={note},failure_class={failure_class}")
+     with self.jobs.open("a",encoding="utf-8") as handle:
+      handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tfixture\t{metadata}\n")
+     receipt=(f"check=ok\nstatus=start\nattempt_id={aid}\nregistered=1\nstarted=1\n"
+              f"child_spawned=1\nterminal_verdict={verdict}\n")
+     return ForwardedRun(returncode=0,stdout=receipt,stderr="fixture-stderr\n",
+                         cleanup_incomplete=True)
+    no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+    code,out,err=self.start(
+     path,lifecycle=F.FOREGROUND_SCOPED,
+     patches=(self.compiled_order(),mock.patch.object(F,"run_forwarding_termination",side_effect=run),no_watch))
+    fields=self.cli_verdict(out)
+    self.assertEqual(code,76,out+err)
+    self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
+    self.assertEqual(fields.get("cleanup"),"incomplete",out)
+    self.assertEqual(fields.get("registered"),"1",out)
+    self.assertEqual(fields.get("started"),"1",out)
+    self.assertEqual(fields.get("child_spawned"),"1",out)
+    self.assertEqual(fields.get("route_id"),route["route_id"],out)
+    self.assertEqual(fields.get("route_node"),node["id"],out)
+    self.assertEqual(fields.get("terminal_verdict"),verdict,out)
+    self.assertEqual(fields.get("terminal_note"),note,out)
+    self.assertEqual(fields.get("attempt_id"),self.arg(calls[0][0],"--attempt-id"),out)
+    self.assertEqual(fields.get("wrapper_returncode"),"0",out)
+    expected_receipt=(f"check=ok\nstatus=start\nattempt_id={fields['attempt_id']}\nregistered=1\nstarted=1\n"
+                      f"child_spawned=1\nterminal_verdict={verdict}\n")
+    self.assertEqual(json.loads(fields["wrapper_stdout_json"]),expected_receipt)
+    self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+    self.assertNotIn("selected_hop=",out)
+    self.assertEqual(len(calls),1)
+
+ def test_incomplete_forwarded_output_retains_proven_launch_without_terminal_row(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   calls=[]
+   ForwardedRun=sys.modules["dispatch_lifecycle"].ForwardedRun
+   def run(cmd,**kwargs):
+    calls.append((cmd,kwargs))
+    aid=self.arg(cmd,"--attempt-id")
+    metadata=(f"attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+              f"route_id={route['route_id']},route_node={node['id']},attempt_id={aid},"
+              "worker_type=stage,launch_claimed=1,launch_fence=registry-v1,launch_started=1")
+    with self.jobs.open("a",encoding="utf-8") as handle:
+     handle.write(f"now\trunning\t{self.repo}\t{self.repo}\tfixture\t{metadata}\n")
+    return ForwardedRun(returncode=0,stdout=(f"check=ok\nstatus=start\nattempt_id={aid}\n"
+                         "registered=1\nstarted=1\nchild_spawned=1\n"),
+                        stderr="",cleanup_incomplete=True)
+   no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+   code,out,err=self.start(
+    path,lifecycle=F.FOREGROUND_SCOPED,
+    patches=(self.compiled_order(),mock.patch.object(F,"run_forwarding_termination",side_effect=run),no_watch))
+  fields=self.cli_verdict(out)
+  self.assertEqual(code,76,out+err)
+  self.assertEqual((fields.get("registered"),fields.get("started"),fields.get("child_spawned")),
+                   ("1","1","1"),out)
+  self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
+  self.assertEqual(fields.get("cleanup"),"incomplete",out)
+  self.assertEqual(fields.get("attempt_id"),self.arg(calls[0][0],"--attempt-id"),out)
+  self.assertEqual(len(calls),1)
+
+ def test_incomplete_forwarded_output_does_not_bind_malformed_or_mismatched_receipts(self):
+  cases=(
+   "check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\nterminal_verdict=PASS\n",
+   "check=ok\nstatus=start\nattempt_id=att-stale\nroute_id=rt-foreign\nroute_node=plan\n"
+   "registered=1\nstarted=1\nchild_spawned=1\nterminal_verdict=PASS\n",
+  )
+  for receipt in cases:
+   with self.subTest(receipt=receipt),self.dispatch_env():
+    path,_route,_node=self.standard_route()
+    calls=[]
+    no_watch=mock.patch.object(F,"watch_launched_attempt",side_effect=AssertionError("must not settle"))
+    code,out,err=self.start(
+     path,lifecycle=F.FOREGROUND_SCOPED,
+     patches=(self.compiled_order(),self.forwarded(
+      calls,stdout=receipt,stderr="fixture-stderr\n",cleanup_incomplete=True),no_watch))
+   fields=self.cli_verdict(out)
+   self.assertEqual(code,76,out+err)
+   self.assertEqual((fields.get("registered"),fields.get("started"),fields.get("child_spawned")),
+                    ("unknown","unknown","unknown"),out)
+   self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
+   self.assertEqual(fields.get("cleanup"),"incomplete",out)
+   self.assertNotEqual(fields.get("attempt_id"),"att-stale")
+   self.assertEqual(len(calls),1)
+
  def test_a_foreground_start_prints_the_notice_first_and_the_parent_notice_second(self):
   ok=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
       "worker_exit=0\nworker_failure=-\n")

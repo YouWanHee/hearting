@@ -1023,25 +1023,31 @@ def _close_forwarded_pipe(selector: selectors.BaseSelector, stream: Any) -> None
 def _drain_forwarded_pipes(
     selector: selectors.BaseSelector,
 ) -> bool:
-    """Collect available bytes without blocking; report read anomalies."""
+    """Read at most one bounded chunk per ready pipe before deadline checks.
+
+    A busy writer may keep a nonblocking pipe readable indefinitely. Reading
+    only one chunk from each ready stream lets the caller poll the wrapper and
+    check its fixed timeout/signal deadlines between drain turns.
+    """
 
     incomplete = False
     for key, _events in selector.select(timeout=0):
         stream = key.fileobj
         sink = key.data
-        while True:
-            try:
-                chunk = os.read(stream.fileno(), 65536)
-            except BlockingIOError:
-                break
-            except (OSError, ValueError):
-                incomplete = True
-                _close_forwarded_pipe(selector, stream)
-                break
-            if not chunk:
-                _close_forwarded_pipe(selector, stream)
-                break
-            sink.append(chunk)
+        try:
+            # The descriptor is nonblocking and each read is capped at 64 KiB.
+            # The selector will report any remaining bytes on the next turn.
+            chunk = os.read(stream.fileno(), 65536)
+        except BlockingIOError:
+            continue
+        except (OSError, ValueError):
+            incomplete = True
+            _close_forwarded_pipe(selector, stream)
+            continue
+        if not chunk:
+            _close_forwarded_pipe(selector, stream)
+            continue
+        sink.append(chunk)
     return incomplete
 
 

@@ -642,6 +642,64 @@ class ForwardingTerminationTest(unittest.TestCase):
         self.assertTrue(run.cleanup_incomplete)
         self.assertLess(elapsed, 0.8)
 
+    def test_finite_large_output_is_fully_drained_across_bounded_turns(self):
+        output = "o" * (256 * 1024)
+        error = "e" * (192 * 1024)
+        self.script.write_text(
+            "import sys\n"
+            f"sys.stdout.write({output!r} + '\\nreceipt=complete\\n'); sys.stdout.flush()\n"
+            f"sys.stderr.write({error!r} + '\\nreceipt=stderr-complete\\n'); sys.stderr.flush()\n",
+            encoding="utf-8",
+        )
+        run = L.run_forwarding_termination(
+            [sys.executable, str(self.script)], capture=True, timeout=5,
+        )
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout, output + "\nreceipt=complete\n")
+        self.assertEqual(run.stderr, error + "\nreceipt=stderr-complete\n")
+        self.assertFalse(run.cleanup_incomplete)
+
+    def test_sustained_output_cannot_starve_the_outer_timeout(self):
+        self.script.write_text(
+            "import os, pathlib, sys\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "chunk = b'x' * 65536\n"
+            "while True: os.write(1, chunk)\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            L.run_forwarding_termination(
+                [sys.executable, str(self.script), str(self.marker)],
+                capture=True, timeout=0.25, poll_interval=0.01,
+            )
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_sustained_output_cannot_starve_the_fixed_signal_grace(self):
+        self.script.write_text(
+            "import os, pathlib, signal, sys\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "chunk = b'x' * 65536\n"
+            "while True: os.write(1, chunk)\n",
+            encoding="utf-8",
+        )
+        thread, sent = self.send_after_ready([signal.SIGTERM])
+        try:
+            run = L.run_forwarding_termination(
+                [sys.executable, str(self.script), str(self.marker) + ".ready"],
+                capture=True, timeout=10, grace=0.3, poll_interval=0.01,
+            )
+            ended = time.monotonic()
+        finally:
+            thread.join()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(run.received_signal, signal.SIGTERM)
+        self.assertEqual(run.returncode, -signal.SIGKILL)
+        self.assertTrue(run.cleanup_incomplete)
+        self.assertGreaterEqual(ended - sent[0], 0.3)
+        self.assertLess(ended - sent[0], 1.5)
+
     def test_post_exit_pipe_cancellation_leaves_no_reader_thread_or_fd(self):
         before_threads = {thread.ident for thread in threading.enumerate()}
         before_fds = self.fd_count()
