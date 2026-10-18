@@ -185,13 +185,40 @@ console.log(JSON.stringify(calls[0]));
             "observer_generation": generation,
         }
 
+    def _v33533_watch_argv(self, watch_id, arm, *, rearm_count, initial):
+        """Reproduce the frozen v3.35.33 initial/restart builders verbatim."""
+        agent = arm["agent"]
+        steward = arm["steward"]
+        argv = [
+            "__watch-run", "--watch-id", watch_id,
+            "--target", arm["target"], "--server", arm["server"],
+            "--expected-harness", agent["harness"],
+            "--expected-session-id", agent["session_id"],
+            "--expected-pane", agent["pane"],
+            "--steward-harness", steward["harness"],
+            "--steward-session-id", steward["session_id"],
+            "--steward-project", steward["project"],
+            "--armed-ts", arm["armed_ts"], "--rearm-count", str(rearm_count),
+        ]
+        for state in arm["until"]:
+            argv.extend(("--until", state))
+        if initial and arm.get("timeout") is not None:
+            argv.extend(("--timeout", str(arm["timeout"])))
+        for ref in arm["refs"]:
+            argv.extend(("--ref", ref))
+        if not initial and arm.get("timeout") is not None:
+            argv.extend(("--timeout", str(arm["timeout"])))
+        if initial and arm.get("rearmed_from"):
+            argv.extend(("--rearmed-from", arm["rearmed_from"]))
+        return argv
+
     def _fixture_watch_script(self, code_root, source):
         path = code_root / "utilities/peer-steward.py"
         path.write_text(source, encoding="utf-8")
         return path
 
     def _start_fixture_watch(self, code_root, duty_argv, *, suffix, extra_env=None,
-                             program_source=None):
+                             program_source=None, remove_env=()):
         script = code_root / "utilities/peer-steward.py"
         ready = self.base / (suffix + "-ready")
         source = program_source or (
@@ -212,6 +239,8 @@ console.log(JSON.stringify(calls[0]));
         args = [*duty_argv[:first_repeated], "--lock-fd", str(fd),
                 *duty_argv[first_repeated:]]
         env = dict(self._environment(code_root), FIXTURE_READY=str(ready))
+        for key in remove_env:
+            env.pop(key, None)
         if extra_env:
             env.update(extra_env)
         process = subprocess.Popen(
@@ -227,13 +256,97 @@ console.log(JSON.stringify(calls[0]));
             self.fail(f"fixture watch did not acquire its lock: {suffix}")
         return process, lock_path
 
-    def _replace_fixture_watch(self, process, lock_path, arm, expected_argvs, *, root=None):
+    def _start_inherited_fixture_watch(self, code_root, duty_argv, *, lock_path,
+                                       environment, suffix):
+        """Transfer a real locked open description from an exiting starter."""
+        script = code_root / "utilities/peer-steward.py"
+        ready = self.base / (suffix + "-ready")
+        source = (
+            "import sys, time\n"
+            f"open({str(ready)!r}, 'w', encoding='utf-8').write('ready')\n"
+            "while True: time.sleep(0.1)\n"
+        )
+        self._fixture_watch_script(code_root, source)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        starter_source = (
+            "import fcntl, json, os, sys\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "if fd != 5:\n"
+            "    os.dup2(fd, 5, inheritable=True)\n"
+            "    os.close(fd)\n"
+            "fcntl.flock(5, fcntl.LOCK_EX)\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    null = os.open(os.devnull, os.O_WRONLY)\n"
+            "    os.dup2(null, 1)\n"
+            "    os.dup2(null, 2)\n"
+            "    os.execve(sys.executable, [sys.executable, sys.argv[2], "
+            "*json.loads(sys.argv[3]), '--lock-fd', '5'], os.environ)\n"
+            "print(json.dumps({'watcher': child, 'starter': os.getpid()}), flush=True)\n"
+            "os.close(5)\n"
+        )
+        starter = None
+        process = None
+        try:
+            starter = subprocess.Popen(
+                [sys.executable, "-c", starter_source, str(lock_path), str(script),
+                 json.dumps(list(duty_argv))], env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            output, error = starter.communicate(timeout=5)
+            self.assertEqual(starter.returncode, 0, error)
+            info = json.loads(output.strip())
+            watcher_pid = info["watcher"]
+            starter_pid = info["starter"]
+            self.assertFalse(Path(f"/proc/{starter_pid}").exists(),
+                             "starter must be gone while the observer keeps its lock")
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                os.kill(watcher_pid, signal.SIGTERM)
+                self.fail(f"inherited-lock fixture did not start: {suffix}")
+            start = obligations._proc_start_identity(watcher_pid)
+
+            class ForkedObserver:
+                def __init__(self):
+                    self.pid = watcher_pid
+
+                def poll(self):
+                    return None if obligations._proc_start_identity(self.pid) == start \
+                        else -signal.SIGTERM
+
+                def terminate(self):
+                    if self.poll() is None:
+                        os.kill(self.pid, signal.SIGTERM)
+
+                def wait(self, timeout=None):
+                    deadline = None if timeout is None else time.monotonic() + timeout
+                    while self.poll() is None:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise subprocess.TimeoutExpired("inherited-watch", timeout)
+                        time.sleep(0.01)
+                    return -signal.SIGTERM
+
+            process = ForkedObserver()
+            return process, starter_pid, ready
+        finally:
+            if process is None and starter is not None and starter.poll() is None:
+                starter.terminate()
+                starter.wait(timeout=5)
+
+    def _replace_fixture_watch(self, process, lock_path, arm, expected_argvs, *, root=None,
+                               stored_start=Ellipsis, requested_lock=None):
         with mock.patch.object(obligations, "__file__",
                                str(self.a / "utilities/peer_obligations.py")), \
              mock.patch.dict(os.environ, self._environment(self.a), clear=True):
             binding = obligations.managed_service_binding(self.a)
+            expected_start = (obligations._proc_start_identity(process.pid)
+                              if stored_start is Ellipsis else stored_start)
             return obligations.replace_managed_observer(
-                process.pid, obligations._proc_start_identity(process.pid), lock_path,
+                process.pid, expected_start, requested_lock or lock_path,
                 "utilities/peer-steward.py", expected_argvs[0], binding,
                 lock_fd_option="--lock-fd", exact_arguments=True,
                 argument_variants=expected_argvs[1:], root=root or self.a)
@@ -499,7 +612,10 @@ console.log(JSON.stringify(calls[0]));
                     "--expected-harness", "codex",
                     "--expected-session-id", "sid-watch")
         command = [sys.executable, str(script), *required, "--lock-fd", str(fd)]
-        env = dict(self._environment(self.a), FIXTURE_READY=str(ready))
+        # The selected caller release may differ from the observer's script
+        # root while both roots still belong to the same managed install.
+        env = dict(self._environment(self.a), FIXTURE_READY=str(ready),
+                   AGENT_HOME=str(self.b))
         process = subprocess.Popen(command, pass_fds=(fd,), env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
@@ -536,18 +652,123 @@ console.log(JSON.stringify(calls[0]));
             process.wait(timeout=5)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_pid_only_old_completion_writer_resumes_under_its_exact_locked_duty(self):
+        import dispatch_batch_obligations as batch
+
+        from types import SimpleNamespace
+
+        self._point_current(self.b)
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.write_text("fixture\n", encoding="utf-8")
+        duty_args = SimpleNamespace(
+            jobs=self.jobs, sealed_batch_id="sealed-pid-only",
+            parent_attempt_id="att-parent", parent_session_id="sid-parent",
+            attempt_id=["att-child"], delivery_parent_id="att-parent",
+            control_socket=None, queue_socket=None, thread_id=None,
+            interval=1.0, timeout=2.0,
+        )
+        duty_id, _created = batch.create(duty_args)
+        outcome = {"state": "ready", "children": [
+            {"attempt_id": "att-child", "status": "done"},
+        ]}
+        batch.update(self.jobs, duty_id, state="delivery-pending", outcome=outcome,
+                     reason="observing")
+        record_path = batch._root(self.jobs) / (duty_id + ".json")
+        lock_path = batch._root(self.jobs) / (duty_id + ".lease")
+        ready = self.base / "pid-only-old-writer-ready"
+        old_writer = self.a / "utilities/codex-managed-completion.py"
+        replacement = self.b / "utilities/codex-managed-completion.py"
+        old_writer.write_text(
+            "import fcntl, json, os, sys, time\n"
+            "from pathlib import Path\n"
+            "fd = int(sys.argv[sys.argv.index('--obligation-lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "record = Path(os.environ['FIXTURE_RECORD'])\n"
+            "data = json.loads(record.read_text())\n"
+            "data['observer'] = {'pid': os.getpid()}\n"
+            "temp = record.with_suffix('.tmp')\n"
+            "temp.write_text(json.dumps(data, sort_keys=True))\n"
+            "os.replace(temp, record)\n"
+            "Path(os.environ['FIXTURE_READY']).write_text('ready')\n"
+            "while True: time.sleep(0.1)\n", encoding="utf-8")
+        replacement.write_text("# isolated current completion observer target\n", encoding="utf-8")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        process = None
+        try:
+            old_env = dict(self._environment(self.a),
+                           FIXTURE_RECORD=str(record_path), FIXTURE_READY=str(ready))
+            process = subprocess.Popen(
+                [sys.executable, str(old_writer), "--jobs", str(self.jobs),
+                 "--resume-obligation", duty_id, "--obligation-lock-fd", str(lock_fd)],
+                pass_fds=(lock_fd,), env=old_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            os.close(lock_fd)
+            lock_fd = None
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "old writer did not persist its PID-only row")
+            before = batch.read(self.jobs, duty_id)
+            self.assertEqual(before["observer"], {"pid": process.pid})
+            old_argv = (Path(f"/proc/{process.pid}/cmdline").read_bytes()
+                        .decode().rstrip("\0").split("\0"))
+            old_lock_fd = old_argv[old_argv.index("--obligation-lock-fd") + 1]
+            self.assertTrue(obligations._process_holds_flock(
+                process.pid, lock_path, old_lock_fd))
+
+            class Launched:
+                pid = 987654321
+
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, self._environment(self.a), clear=True):
+                binding = obligations.managed_service_binding(self.a)
+                with mock.patch.object(batch, "_pid_start", return_value="fixture-start"), \
+                     mock.patch.object(batch.subprocess, "Popen", return_value=Launched()) as launch:
+                    self.assertEqual(batch.ensure_observers(
+                        self.jobs, service_current=binding), 1)
+            self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+            after = batch.read(self.jobs, duty_id)
+            self.assertEqual(after["observer"], {"pid": Launched.pid,
+                                                  "pid_start": "fixture-start"})
+            self.assertEqual(after["state"], "delivery-pending")
+            for field in ("identity", "effective_attempts", "outcome", "delivery",
+                          "recipient", "parent_attempt_id", "parent_session_id", "ack"):
+                if field in before or field in after:
+                    self.assertEqual(after.get(field), before.get(field), field)
+            command = launch.call_args.args[0]
+            self.assertEqual(Path(command[1]), replacement)
+            self.assertEqual(command[command.index("--resume-obligation") + 1], duty_id)
+            self.assertEqual(command[-2:], ["--service-current", binding])
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=5)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
     def test_watch_takeover_accepts_complete_initial_and_advanced_legacy_argv(self):
         self._point_current(self.b)
         cases = (
-            (self._watch_arm(generation=1, rearm_count=4), 4, True, False),
-            (self._watch_arm(generation=3, rearm_count=17), 2, False, True),
+            (self._watch_arm(generation=1, rearm_count=4), 4, True),
+            # v3.35.33 persisted generation/count after spawn; the live
+            # generation-2 observer therefore carries rearm-count 1.
+            (self._watch_arm(generation=2, rearm_count=1), 1, False),
+            (self._watch_arm(generation=3, rearm_count=17), 2, False),
         )
-        for index, (arm, accepted_generation, initial_layout, old_restart) in enumerate(cases):
+        for index, (arm, accepted_generation, initial_layout) in enumerate(cases):
             with self.subTest(observer_generation=arm["observer_generation"]):
-                actual = peer_steward._watch_observer_duty_argv(
-                    arm["watch_id"], arm, rearm_generation=accepted_generation,
-                    timeout_before_refs=initial_layout,
-                    include_rearmed_from=not old_restart)
+                # These arrays are copied from v3.35.33's cmd_watch and
+                # _spawn_watch_observer layouts, not generated by the current
+                # selector under test.
+                actual = self._v33533_watch_argv(
+                    arm["watch_id"], arm, rearm_count=accepted_generation,
+                    initial=initial_layout)
                 accepted = peer_steward._watch_observer_takeover_argvs(arm["watch_id"], arm)
                 self.assertIn(actual, accepted)
                 process, lock_path = self._start_fixture_watch(
@@ -557,12 +778,425 @@ console.log(JSON.stringify(calls[0]));
                     self.assertTrue(obligations._process_holds_flock(
                         process.pid, lock_path, str(self._fixture_fd(process.pid))))
                     self.assertEqual(self._replace_fixture_watch(
-                        process, lock_path, arm, accepted), "replaced")
+                        process, lock_path, arm, accepted, stored_start=None), "replaced")
                     self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
                 finally:
                     if process.poll() is None:
                         process.terminate()
                     process.wait(timeout=5)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(os, "fork"),
+                         "Linux pidfd and inherited flock handoff")
+    def test_host_legacy_watch_without_agent_home_is_taken_over_under_inherited_lock(self):
+        host_home = self.base / "legacy-host-home"
+        host_data = host_home / ".local" / "share" / "hearting"
+        host_releases = host_data / "releases"
+        host_a = host_releases / "A"
+        host_b = host_releases / "B"
+        host_releases.mkdir(parents=True)
+        shutil.copytree(self.a, host_a)
+        shutil.copytree(self.b, host_b)
+        current = host_data / "current"
+        current.symlink_to(host_b, target_is_directory=True)
+
+        host_state = host_home / ".local" / "state" / "hearting" / "dispatch"
+        host_watch_root = host_state / "peer-watches"
+        watch_id = "legacy-host-watch"
+        arm = self._watch_arm(generation=2, rearm_count=1)
+        arm["watch_id"] = watch_id
+        actual_legacy_argv = self._v33533_watch_argv(
+            watch_id, arm, rearm_count=1, initial=False)
+        self.assertNotIn("--generation", actual_legacy_argv)
+
+        caller_env = self._environment(host_a)
+        caller_env.update({
+            "HOME": str(host_home),
+            "HARNESS_DATA_ROOT": str(host_data),
+            "XDG_STATE_HOME": str(host_home / ".local" / "state"),
+            "AGENT_PEER_LEDGER_ROOT": str(host_state),
+        })
+        legacy_env = {
+            "HOME": str(host_home),
+            "XDG_STATE_HOME": str(host_home / ".local" / "state"),
+            "PATH": "/usr/bin:/bin",
+        }
+        for absent in ("AGENT_HOME", "CLAUDE_HOME", "HARNESS_DATA_ROOT", "XDG_DATA_HOME"):
+            self.assertNotIn(absent, legacy_env)
+
+        paths = peer_steward._watch_paths(watch_id, host_watch_root)
+        paths.arm.parent.mkdir(parents=True, exist_ok=True)
+        old_source = (
+            "import sys, time\n"
+            "int(sys.argv[sys.argv.index('--lock-fd') + 1])\n"
+            "while True: time.sleep(0.1)\n"
+        )
+        self._fixture_watch_script(host_a, old_source)
+        new_ready = self.base / "host-current-watch-ready"
+        new_source = (
+            "import fcntl, sys, time\n"
+            "fd = int(sys.argv[sys.argv.index('--lock-fd') + 1])\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            f"open({str(new_ready)!r}, 'w', encoding='utf-8').write('ready')\n"
+            "while True: time.sleep(0.1)\n"
+        )
+        self._fixture_watch_script(host_b, new_source)
+
+        process, stale_owner_pid, _old_ready = self._start_inherited_fixture_watch(
+            host_a, actual_legacy_argv, lock_path=paths.lock,
+            environment=legacy_env, suffix="host-legacy-watch")
+        old_pid = process.pid
+        old_start = obligations._proc_start_identity(old_pid)
+        arm["watcher"] = {"pid": old_pid, "pid_start": old_start}
+        paths.arm.write_text(json.dumps(arm, sort_keys=True), encoding="utf-8")
+
+        spawned_current = []
+
+        class CapturingSubprocess:
+            def __getattr__(self, name):
+                return getattr(subprocess, name)
+
+            def Popen(self, *args, **kwargs):
+                proc = subprocess.Popen(*args, **kwargs)
+                spawned_current.append(proc)
+                return proc
+
+        def cleanup_fixture_watchers():
+            latest = peer_steward._read_json(paths.arm) or {}
+            current_pid = (latest.get("watcher") or {}).get("pid")
+            for current_process in spawned_current:
+                if current_process.poll() is None:
+                    current_process.terminate()
+                current_process.wait(timeout=5)
+            for pid in {old_pid, current_pid}:
+                if not isinstance(pid, int) or not obligations._proc_start_identity(pid):
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while current_pid and obligations._proc_start_identity(current_pid) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.addCleanup(cleanup_fixture_watchers)
+
+        lock_stat = paths.lock.stat()
+        old_fdinfo = Path(f"/proc/{old_pid}/fdinfo/5").read_text(encoding="ascii")
+        flock = next(line.split() for line in old_fdinfo.splitlines()
+                     if line.startswith("lock:"))
+        self.assertEqual(flock[2], "FLOCK")
+        # The kernel's FLOCK owner-PID projection varies after fork/exit. The
+        # takeover proof relies on the live fd's exact open lock and inode.
+        self.assertEqual(flock[6],
+                         f"{os.major(lock_stat.st_dev):02x}:{os.minor(lock_stat.st_dev):02x}:"
+                         f"{lock_stat.st_ino}")
+        self.assertFalse(Path(f"/proc/{stale_owner_pid}").exists())
+        self.assertEqual(Path(f"/proc/{old_pid}/fd/5").resolve(), paths.lock.resolve())
+        self.assertTrue(obligations._process_holds_flock(old_pid, paths.lock, "5"))
+        self.assertEqual(old_start, obligations._proc_start_identity(old_pid))
+
+        accepted_argvs = peer_steward._watch_observer_takeover_argvs(watch_id, arm)
+        self.assertIn(actual_legacy_argv, accepted_argvs)
+        with mock.patch.object(obligations, "__file__",
+                               str(host_a / "utilities/peer_obligations.py")), \
+             mock.patch.object(peer_steward, "__file__",
+                               str(host_a / "utilities/peer-steward.py")), \
+             mock.patch.dict(os.environ, caller_env, clear=True), \
+             mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                               return_value=False), \
+             mock.patch.object(peer_steward.herdr_observation,
+                               "socket_path_for_endpoint", return_value=None), \
+             mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+             mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "subprocess", CapturingSubprocess()):
+            binding = obligations.managed_service_binding(host_a)
+            self.assertEqual(binding, str(current))
+            peer_steward._ensure_watch_observers(service_current=binding)
+
+        self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+        updated_arm = peer_steward._read_json(paths.arm)
+        new_pid = (updated_arm.get("watcher") or {}).get("pid")
+        self.assertIsInstance(new_pid, int)
+        deadline = time.monotonic() + 5
+        while not new_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(new_ready.exists(), "current release was not started after lock handoff")
+        self.assertFalse(obligations._proc_start_identity(old_pid))
+        self.assertEqual(Path(f"/proc/{new_pid}/cmdline").read_bytes()
+                         .decode().rstrip("\0").split("\0")[1],
+                         str(host_b / "utilities/peer-steward.py"))
+        self.assertTrue(obligations._process_holds_flock(
+            new_pid, paths.lock, self._fixture_fd(new_pid)))
+        new_fd = self._fixture_fd(new_pid)
+        new_fdinfo = Path(f"/proc/{new_pid}/fdinfo/{new_fd}").read_text(encoding="ascii")
+        new_flock = next(line.split() for line in new_fdinfo.splitlines()
+                         if line.startswith("lock:"))
+        self.assertEqual(new_flock[6], flock[6], "handoff changed the locked inode")
+        self.assertEqual((updated_arm["watch_id"], updated_arm["target"],
+                          updated_arm["server"], updated_arm["agent"],
+                          updated_arm["steward"], updated_arm["armed_ts"],
+                          updated_arm["until"], updated_arm["refs"]),
+                         (arm["watch_id"], arm["target"], arm["server"], arm["agent"],
+                          arm["steward"], arm["armed_ts"], arm["until"], arm["refs"]))
+        self.assertEqual(updated_arm["observer_generation"], 3)
+        self.assertEqual(updated_arm["rearm_count"], 2)
+        self.assertFalse(paths.receipt.exists(), "observer replacement must not settle the watch")
+        self.assertFalse(paths.ack.exists(), "observer replacement must not create an ACK")
+        probe = os.open(paths.lock, os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_managed_runner_reuses_external_discovery_for_real_legacy_process_census(self):
+        import dispatch_batch_obligations as batch
+
+        watch_root = self.base / "watch-census"
+        watch_root.mkdir()
+        ready_root = self.base / "observer-ready"
+        ready_root.mkdir()
+        fixture_source = (
+            "import fcntl, os, sys, time\n"
+            "if '--lock-fd' in sys.argv:\n"
+            "    fd = int(sys.argv[sys.argv.index('--lock-fd') + 1])\n"
+            "    kind = 'watch'\n"
+            "    identity = sys.argv[sys.argv.index('--watch-id') + 1]\n"
+            "else:\n"
+            "    fd = int(sys.argv[sys.argv.index('--obligation-lock-fd') + 1])\n"
+            "    kind = 'batch'\n"
+            "    identity = sys.argv[sys.argv.index('--resume-obligation') + 1]\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "ready = os.environ.get('FIXTURE_READY') or os.path.join(os.environ['FIXTURE_READY_ROOT'], kind + '-' + identity + '-' + str(os.getpid()))\n"
+            "open(ready, 'w').close()\n"
+            "while True: time.sleep(0.2)\n"
+        )
+        for release in (self.a, self.b):
+            (release / "utilities/peer-steward.py").write_text(fixture_source, encoding="utf-8")
+            (release / "utilities/codex-managed-completion.py").write_text(
+                fixture_source, encoding="utf-8")
+        self._point_current(self.b)
+
+        # Retain the prior measurement's large registry input and model sixteen
+        # simultaneously live duties: nine watch owners and seven completion
+        # observers. The fixture processes hold real FLOCKs in this PID namespace.
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.write_text("x" * 23_000_000, encoding="utf-8")
+        env = dict(self._environment(self.a), FIXTURE_READY_ROOT=str(ready_root))
+        old_processes = []
+        current_processes = []
+        lock_paths = []
+
+        def cleanup_fixture_processes():
+            for process in (*old_processes, *current_processes):
+                if process.poll() is None:
+                    process.terminate()
+            for process in (*old_processes, *current_processes):
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+        self.addCleanup(cleanup_fixture_processes)
+
+        def start_old(script, args, lock_path, lock_option, ready_path):
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            command_args = list(args)
+            if lock_option == "--lock-fd":
+                repeated = {"--until", "--ref", "--timeout", "--rearmed-from"}
+                index = next((i for i, value in enumerate(command_args) if value in repeated),
+                             len(command_args))
+            else:
+                index = len(command_args)
+            command_args[index:index] = [lock_option, str(fd)]
+            process = subprocess.Popen(
+                [sys.executable, str(script), *command_args], pass_fds=(fd,),
+                env=dict(env, FIXTURE_READY=str(ready_path)),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.close(fd)
+            deadline = time.monotonic() + 5
+            while not ready_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready_path.exists():
+                process.terminate()
+                process.wait(timeout=5)
+                self.fail(f"fixture observer did not acquire its lock: {ready_path.name}")
+            old_processes.append(process)
+            lock_paths.append(lock_path)
+            return process
+
+        watches = []
+        for index in range(9):
+            watch_id = f"watch-legacy-{index}"
+            arm = self._watch_arm(generation=3, rearm_count=17)
+            arm["watch_id"] = watch_id
+            lock_path = watch_root / f"{watch_id}.lock"
+            actual = self._v33533_watch_argv(watch_id, arm, rearm_count=2, initial=False)
+            process = start_old(
+                self.a / "utilities/peer-steward.py", actual, lock_path, "--lock-fd",
+                ready_root / f"watch-{watch_id}-PLACEHOLDER")
+            # The process name includes its PID; wait by the stable prefix.
+            self.assertTrue(any(ready_root.glob(f"watch-{watch_id}-*")))
+            arm["watcher"] = {
+                "pid": process.pid,
+                "pid_start": obligations._proc_start_identity(process.pid),
+            }
+            (watch_root / f"{watch_id}.json").write_text(
+                json.dumps(arm), encoding="utf-8")
+            watches.append((watch_id, lock_path, process))
+
+        batches = []
+        for index in range(7):
+            args = SimpleNamespace(
+                jobs=self.jobs, sealed_batch_id=f"sealed-legacy-{index}",
+                parent_attempt_id="att-parent", parent_session_id=None,
+                attempt_id=[f"att-legacy-{index}"], delivery_parent_id="att-parent",
+                control_socket=None, queue_socket=None, thread_id=None,
+                interval=1.0, timeout=2.0,
+            )
+            duty_id, _record = batch.create(args)
+            state_root = batch._root(self.jobs)
+            lock_path = state_root / f"{duty_id}.lease"
+            old_args = ["--jobs", str(self.jobs), "--resume-obligation", duty_id]
+            process = start_old(
+                self.a / "utilities/codex-managed-completion.py", old_args, lock_path,
+                "--obligation-lock-fd", ready_root / f"batch-{duty_id}-PLACEHOLDER")
+            batch.update(self.jobs, duty_id, observer={
+                "pid": process.pid,
+                "pid_start": obligations._proc_start_identity(process.pid),
+            })
+            batches.append((duty_id, lock_path, process))
+
+        store = obligations.ObligationStore(self.state)
+        runner_lock = store.root / obligations.RUNNER_LOCK_NAME
+        runner_lock.parent.mkdir(parents=True, exist_ok=True)
+        runner_fd = os.open(runner_lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(runner_fd, fcntl.LOCK_EX)
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, env, clear=True):
+            binding = obligations.managed_service_binding(self.a)
+        self.assertEqual(binding, str(self.current))
+
+        stop_at = time.monotonic() + 20.0
+        real_sleep = time.sleep
+        real_popen = subprocess.Popen
+        watch_scans = []
+        batch_scans = []
+        registry_reads = []
+        passes = []
+        original_watch_entries = peer_steward._watch_entries
+        original_batch_records = batch._read_only_records
+        original_reconcile = peer_steward._reconcile_external_obligations
+        original_read_text = Path.read_text
+
+        def count_watch_scan(root):
+            watch_scans.append(root)
+            return original_watch_entries(root)
+
+        def count_batch_scan(path):
+            batch_scans.append(path)
+            return original_batch_records(path)
+
+        def count_registry_read(path, *args, **kwargs):
+            if path.resolve(strict=False) == self.jobs.resolve(strict=False):
+                registry_reads.append(path)
+            return original_read_text(path, *args, **kwargs)
+
+        def count_reconcile(*args, **kwargs):
+            passes.append(1)
+            return original_reconcile(*args, **kwargs)
+
+        class StopRunnerWindow(Exception):
+            pass
+
+        def measured_sleep(delay):
+            if delay < 0.5:
+                return real_sleep(delay)
+            remaining = stop_at - time.monotonic()
+            if remaining <= 0:
+                raise StopRunnerWindow()
+            real_sleep(min(delay, remaining))
+            if time.monotonic() >= stop_at:
+                raise StopRunnerWindow()
+
+        def track_current(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            current_processes.append(process)
+            return process
+
+        def process_ticks():
+            raw = Path(f"/proc/{os.getpid()}/stat").read_text()
+            return raw[raw.rfind(")") + 2:].split()
+
+        cpu_fields = process_ticks()
+        start_tick = cpu_fields[19]
+        cpu_before = int(cpu_fields[11]) + int(cpu_fields[12])
+        started = time.monotonic()
+        try:
+            with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+                 mock.patch.object(peer_steward, "_watch_entries", side_effect=count_watch_scan), \
+                 mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(batch, "_jobs_paths",
+                                   side_effect=lambda jobs=None, strict=True: [
+                                       Path(jobs).resolve(strict=False) if jobs else self.jobs.resolve()
+                                   ]), \
+                 mock.patch.object(batch, "_read_only_records", side_effect=count_batch_scan), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations",
+                                   side_effect=count_reconcile), \
+                 mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.object(obligations, "exec_service_runner", return_value=False), \
+                 mock.patch.object(Path, "read_text", count_registry_read), \
+                 mock.patch.object(subprocess, "Popen", side_effect=track_current), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=measured_sleep):
+                try:
+                    peer_steward.cmd_obligation_runner(SimpleNamespace(
+                        state_root=self.state, lock_fd=runner_fd,
+                        service_current=binding))
+                except StopRunnerWindow:
+                    pass
+        finally:
+            old_exit_codes = [process.poll() for process in old_processes]
+            for process in (*old_processes, *current_processes):
+                if process.poll() is None:
+                    process.terminate()
+            for process in (*old_processes, *current_processes):
+                process.wait(timeout=5)
+            fcntl.flock(runner_fd, fcntl.LOCK_UN)
+            os.close(runner_fd)
+
+        elapsed = time.monotonic() - started
+        cpu_fields = process_ticks()
+        self.assertEqual(cpu_fields[19], start_tick)
+        cpu_after = int(cpu_fields[11]) + int(cpu_fields[12])
+        hz = os.sysconf("SC_CLK_TCK")
+        cpu_percent = (cpu_after - cpu_before) * 100.0 / (hz * elapsed)
+        self.assertGreaterEqual(elapsed, 19.0)
+        self.assertGreaterEqual(len(passes), 3)
+        self.assertEqual(len(current_processes), 16)
+        self.assertGreaterEqual(len(watch_scans), len(passes))
+        self.assertLessEqual(len(watch_scans), len(passes) + 1)
+        self.assertEqual(len(batch_scans), len(watch_scans))
+        self.assertEqual(len(registry_reads), 1)
+        print(
+            f"runner_idle_window=20s one_core=100% child_cpu=excluded "
+            f"cpu={cpu_percent:.3f}% passes={len(passes)} "
+            f"watch_scans={len(watch_scans)} batch_scans={len(batch_scans)} "
+            f"jobs_registry_reads={len(registry_reads)} live_legacy=16"
+        )
+        self.assertLess(cpu_percent, 15.0,
+                        f"steady runner consumed {cpu_percent:.2f}% of one core")
+        self.assertEqual(old_exit_codes, [-signal.SIGTERM] * 16)
 
     def _fixture_fd(self, pid):
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
@@ -632,7 +1266,7 @@ console.log(JSON.stringify(calls[0]));
                     self.assertTrue(obligations._process_holds_flock(
                         process.pid, lock_path, fd_number))
                     self.assertFalse(self._replace_fixture_watch(
-                        process, lock_path, arm, accepted))
+                        process, lock_path, arm, accepted, stored_start=None))
                     self.assertIsNone(process.poll(), "mismatched duty must remain live")
                     self.assertEqual(start, obligations._proc_start_identity(process.pid))
                     self.assertTrue(obligations._process_holds_flock(
@@ -658,19 +1292,29 @@ console.log(JSON.stringify(calls[0]));
         foreign = foreign_releases / "Foreign"
         shutil.copytree(self.a, foreign)
         (foreign_data / "current").symlink_to(foreign, target_is_directory=True)
-        for name, source_root, extra_env in (
-                ("checkout", checkout, None),
-                ("foreign", foreign, {"HARNESS_DATA_ROOT": str(foreign_data)})):
+        for name, source_root, extra_env, remove_env in (
+                ("checkout", checkout, None, ()),
+                ("foreign", foreign, {"HARNESS_DATA_ROOT": str(foreign_data)}, ()),
+                ("foreign-data-root", self.a,
+                 {"HARNESS_DATA_ROOT": str(foreign_data)}, ()),
+                ("foreign-agent-home", self.a, {"AGENT_HOME": str(checkout)}, ()),
+                ("empty-agent-home", self.a, {"AGENT_HOME": ""}, ()),
+                ("empty-claude-home", self.a, {"CLAUDE_HOME": ""}, ()),
+                ("contradictory-agent-homes", self.a,
+                 {"CLAUDE_HOME": str(checkout)}, ()),
+                ("missing-default-data-root-proof", self.a, None,
+                 ("HOME", "AGENT_HOME", "CLAUDE_HOME", "HARNESS_DATA_ROOT", "XDG_DATA_HOME"))):
             with self.subTest(root=name):
                 process, lock_path = self._start_fixture_watch(
-                    source_root, actual, suffix=f"watch-root-{name}", extra_env=extra_env)
+                    source_root, actual, suffix=f"watch-root-{name}", extra_env=extra_env,
+                    remove_env=remove_env)
                 try:
                     start = obligations._proc_start_identity(process.pid)
                     fd_number = self._fixture_fd(process.pid)
                     self.assertTrue(obligations._process_holds_flock(
                         process.pid, lock_path, fd_number))
                     self.assertFalse(self._replace_fixture_watch(
-                        process, lock_path, arm, accepted))
+                        process, lock_path, arm, accepted, stored_start=None))
                     self.assertIsNone(process.poll())
                     self.assertEqual(start, obligations._proc_start_identity(process.pid))
                     self.assertTrue(obligations._process_holds_flock(
@@ -679,6 +1323,74 @@ console.log(JSON.stringify(calls[0]));
                     if process.poll() is None:
                         process.terminate()
                     process.wait(timeout=5)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_takeover_keeps_stale_identity_and_unlocked_observers_untouched(self):
+        self._point_current(self.b)
+        arm = self._watch_arm(generation=3, rearm_count=17)
+        accepted = peer_steward._watch_observer_takeover_argvs(arm["watch_id"], arm)
+        actual = peer_steward._watch_observer_duty_argv(
+            arm["watch_id"], arm, rearm_generation=2, include_rearmed_from=False)
+
+        def replace(process, lock_path, *, expected_start=Ellipsis, requested_lock=None,
+                    missing_start=False):
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, self._environment(self.a), clear=True):
+                binding = obligations.managed_service_binding(self.a)
+                if missing_start:
+                    expected_start = None
+                elif expected_start is Ellipsis:
+                    expected_start = obligations._proc_start_identity(process.pid)
+                return obligations.replace_managed_observer(
+                    process.pid, expected_start,
+                    requested_lock or lock_path, "utilities/peer-steward.py",
+                    accepted[0], binding, lock_fd_option="--lock-fd",
+                    exact_arguments=True, argument_variants=accepted[1:], root=self.a)
+
+        process, lock_path = self._start_fixture_watch(
+            self.a, actual, suffix="watch-stale-start")
+        wrong_lock = lock_path.with_name("watch-other.lock")
+        wrong_lock.touch()
+        try:
+            start = obligations._proc_start_identity(process.pid)
+            self.assertFalse(replace(process, lock_path, expected_start=str(int(start) + 1)))
+            self.assertFalse(replace(process, lock_path, requested_lock=wrong_lock,
+                                     missing_start=True))
+            self.assertFalse(replace(process, lock_path, expected_start="malformed-start"))
+            with mock.patch.object(obligations, "__file__",
+                                   str(self.a / "utilities/peer_obligations.py")), \
+                 mock.patch.dict(os.environ, self._environment(self.a), clear=True):
+                binding = obligations.managed_service_binding(self.a)
+                self.assertFalse(obligations.replace_managed_observer(
+                    2**30, None, lock_path, "utilities/peer-steward.py", accepted[0],
+                    binding, lock_fd_option="--lock-fd", exact_arguments=True,
+                    argument_variants=accepted[1:], root=self.a))
+            self.assertIsNone(process.poll())
+            self.assertEqual(obligations._proc_start_identity(process.pid), start)
+            self.assertTrue(obligations._process_holds_flock(
+                process.pid, lock_path, self._fixture_fd(process.pid)))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+        no_flock_source = (
+            "import os, sys, time\n"
+            "open(os.environ['FIXTURE_READY'], 'w').write('ready')\n"
+            "time.sleep(30)\n"
+        )
+        process, lock_path = self._start_fixture_watch(
+            self.a, actual, suffix="watch-no-flock", program_source=no_flock_source)
+        try:
+            self.assertFalse(replace(process, lock_path, missing_start=True))
+            self.assertIsNone(process.poll())
+            self.assertFalse(obligations._process_holds_flock(
+                process.pid, lock_path, self._fixture_fd(process.pid)))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
     def test_watch_takeover_keeps_exact_current_observer(self):

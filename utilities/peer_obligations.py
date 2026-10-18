@@ -261,7 +261,7 @@ def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
     return False
 
 
-def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
+def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | Path,
                              relative_script: str | Path, required_arguments: Iterable[str],
                              service_current: str | Path, *, lock_fd_option: str,
                              root=None, timeout: float = 2.0,
@@ -274,12 +274,20 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
     that exact process exits, and ``False`` when any part of the proof is
     unavailable. No duty data is changed here.
     """
+    if pid_start is not None and (
+            not isinstance(pid_start, str) or not pid_start.isdecimal()):
+        return False
+    if (isinstance(pid, bool) or not isinstance(pid, (int, str))
+            or (isinstance(pid, str) and not pid.isdecimal())):
+        return False
     try:
         code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
         if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
             return False
         pid = int(pid)
-        expected_start = str(pid_start)
+        if pid <= 0:
+            return False
+        expected_start = pid_start
         lock = Path(lock_path).resolve(strict=True)
         relative = Path(relative_script)
         expected_args = list(map(str, required_arguments))
@@ -289,6 +297,7 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
         pidfd = os.pidfd_open(pid)
         try:
             def inspect():
+                nonlocal expected_start
                 # Resolve the managed target for every inspection. Activation
                 # may change the current release between the initial check and
                 # the pidfd signal boundary.
@@ -296,7 +305,15 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                 target_root = active_service_root(binding, root=code_root) if binding else None
                 if target_root is None:
                     return None
-                if _proc_start_identity(pid) != expected_start:
+                observed_start = _proc_start_identity(pid)
+                if not observed_start:
+                    return None
+                if expected_start is None:
+                    # PID-only historical rows may bind only to the process
+                    # behind this newly opened pidfd. Subsequent inspections
+                    # must retain that exact birth identity.
+                    expected_start = observed_start
+                elif observed_start != expected_start:
                     return None
                 namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
                 if namespace != os.stat("/proc/self/ns/pid").st_ino:
@@ -314,6 +331,7 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                 target_layout = _service_layout(code_root)
                 if (source_layout is None or target_layout is None
                         or source_layout[1] != target_layout[1]
+                        or source_layout[2] != target_layout[2]
                         or source_layout[3] != target_layout[3]):
                     return None
                 lock_fd_number = None
@@ -353,7 +371,38 @@ def replace_managed_observer(pid: int, pid_start: str, lock_path: str | Path,
                         if b"=" in item:
                             key, value = item.split(b"=", 1)
                             env[key.decode()] = value.decode(errors="replace")
-                    if Path(env.get("AGENT_HOME", "")).expanduser().resolve(strict=True) != source_root:
+                    # The launcher can inherit a different release path from
+                    # the script's source root. Accept that provenance only
+                    # when it resolves to this same managed installation.
+                    for name in ("AGENT_HOME", "CLAUDE_HOME"):
+                        if name not in env:
+                            continue
+                        raw = env.get(name)
+                        if not raw:
+                            return None
+                        env_root = Path(raw).expanduser().resolve(strict=True)
+                        env_layout = _service_layout(env_root)
+                        if env_layout is None or env_layout[1:] != source_layout[1:]:
+                            return None
+                    if "HARNESS_DATA_ROOT" in env:
+                        raw = env["HARNESS_DATA_ROOT"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser()
+                    elif "XDG_DATA_HOME" in env:
+                        raw = env["XDG_DATA_HOME"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser() / "hearting"
+                    else:
+                        home = env.get("HOME")
+                        if not home:
+                            return None
+                        observed_data_root = (
+                            Path(home).expanduser() / ".local" / "share" / "hearting")
+                    if (not observed_data_root.is_absolute()
+                            or Path(os.path.abspath(os.fspath(observed_data_root)))
+                            != source_layout[1]):
                         return None
                 except (OSError, RuntimeError, ValueError):
                     return None
@@ -750,7 +799,8 @@ class ObligationStore:
                observation: dict | None = None, result: str | None = None,
                delivery: str | None = None, cleanup: str | None = None,
                observer_error: str | None = None,
-               expected_phases: set[str] | None = None) -> dict:
+               expected_phases: set[str] | None = None,
+               skip_unchanged: bool = False) -> dict:
         if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
             raise ObligationError("peer-obligation-state-invalid")
         path = self._record_path(duty_id)
@@ -774,16 +824,24 @@ class ObligationStore:
                                "reason": observer_error}
             if result is not None and record.get("result") not in {None, result}:
                 raise ObligationError("peer-obligation-result-conflict")
-            if state is not None:
+            changed = False
+            if state is not None and record.get("state") != state:
                 record["state"] = state
-            if observation is not None:
+                changed = True
+            if observation is not None and record.get("observation") != observation:
                 record["observation"] = observation
-            if result is not None:
+                changed = True
+            if result is not None and record.get("result") != result:
                 record["result"] = result
-            if delivery is not None:
+                changed = True
+            if delivery is not None and record.get("delivery") != delivery:
                 record["delivery"] = delivery
-            if cleanup is not None:
+                changed = True
+            if cleanup is not None and record.get("cleanup") != cleanup:
                 record["cleanup"] = cleanup
+                changed = True
+            if skip_unchanged and not changed:
+                return record
             record["revision"] = int(record.get("revision", 0)) + 1
             record["updated_at"] = time.time()
             _write_atomic(path, record)

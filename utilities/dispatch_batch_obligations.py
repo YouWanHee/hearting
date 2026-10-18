@@ -354,27 +354,43 @@ def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     return False
 
 
-def ensure_observers(jobs: str | Path | None = None, *, service_current=None) -> int:
+def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
+                     observer_snapshot=None, settlement_context=None) -> int:
     """Resume unfinished exact batches through the existing completion sidecar."""
     launched = 0
     import peer_obligations
     script, child_env, binding = peer_obligations.service_script(
         "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
+    settlement_signatures = []
     for jobs_path in jobs_paths:
         try:
-            _resume_owner_settlements(jobs_path)
+            settlement_signatures.extend(
+                _resume_owner_settlements(jobs_path, context=settlement_context))
         except (OSError, UnicodeError):
             # Keep this root's sidecar scan and later independent roots reachable.
+            settlement_signatures.append((str(jobs_path), "owner-settlement-unavailable"))
             continue
+    if observer_snapshot is not None and settlement_signatures:
+        observer_snapshot["signature"] = tuple(sorted(
+            (*observer_snapshot.get("signature", ()), *settlement_signatures)))
     for jobs_path in jobs_paths:
         try:
             root = _root(jobs_path)
-            records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
+            snapshot_paths = None
+            if observer_snapshot is not None:
+                key = str(jobs_path.resolve(strict=False))
+                snapshot_paths = observer_snapshot.get("paths_by_jobs", {}).get(key)
+            records = (sorted(root.glob("batch-*.json")) if snapshot_paths is None
+                       else list(snapshot_paths)) if root.is_dir() else []
         except (OSError, BatchObligationError):
             continue
         for path in records:
             try:
+                if path.parent.resolve(strict=True) != root.resolve(strict=True):
+                    continue
+                # A per-pass snapshot selects candidates only. Re-read the
+                # exact durable row before acquiring or replacing its owner.
                 record = _read(path)
                 if not record or record.get("state") not in _PENDING:
                     continue
@@ -386,14 +402,23 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None) ->
                 fd = acquire(jobs_path, duty_id)
                 if fd is None:
                     observer = record.get("observer") or {}
-                    if not binding or not observer.get("pid") or not observer.get("pid_start"):
+                    if (not isinstance(observer, dict) or not binding
+                            or not observer.get("pid")):
                         continue
+                    if "pid_start" in observer:
+                        observer_start = observer["pid_start"]
+                        if (not isinstance(observer_start, str)
+                                or not observer_start.isdecimal()):
+                            continue
+                    else:
+                        observer_start = None
                     replaced = peer_obligations.replace_managed_observer(
-                        observer["pid"], observer["pid_start"],
+                        observer["pid"], observer_start,
                         root / (duty_id + ".lease"),
                         "utilities/codex-managed-completion.py",
                         ("--jobs", str(jobs_path), "--resume-obligation", duty_id),
                         binding, lock_fd_option="--obligation-lock-fd",
+                        exact_arguments=True,
                     )
                     if replaced != "replaced":
                         continue
@@ -426,6 +451,60 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None) ->
             except (OSError, ValueError, BatchObligationError):
                 continue
     return launched
+
+
+def _registry_stamp(path: Path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _directory_stamp(path: Path):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+
+class OwnerSettlementReadContext:
+    """Reuse unchanged settlement discovery while rechecking observed leases."""
+
+    def __init__(self):
+        self._seen = {}
+
+    def needs_scan(self, jobs: Path, lease_is_held) -> bool:
+        key = str(jobs.resolve(strict=False))
+        prior = self._seen.get(key)
+        stamp = _registry_stamp(jobs)
+        if prior is None or stamp is None or stamp != prior[0]:
+            return True
+        for metadata in prior[1]:
+            try:
+                if not lease_is_held(jobs, metadata):
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def cached_signatures(self, jobs: Path):
+        prior = self._seen.get(str(jobs.resolve(strict=False)))
+        return () if prior is None else prior[2]
+
+    def remember(self, jobs: Path, before_stamp, live_leases, retry_required=False,
+                 signatures=()):
+        key = str(jobs.resolve(strict=False))
+        after_stamp = _registry_stamp(jobs)
+        if retry_required or before_stamp is None or after_stamp != before_stamp:
+            self._seen.pop(key, None)
+            return
+        self._seen[key] = (after_stamp, tuple(live_leases), tuple(signatures))
 
 
 def _pending_owner_settlements(jobs: Path):
@@ -467,28 +546,78 @@ def _pending_owner_settlements(jobs: Path):
     return tuple(pending)
 
 
-def _resume_owner_settlements(jobs: Path) -> None:
-    """Retry retained owner work through its existing terminal transaction."""
+def _resume_owner_settlements(jobs: Path, *, context=None) -> None:
+    """The open registry row retains a failed supervisor settlement itself.
+
+    Resume through the same writer on ordinary reconnection, including older
+    owners with no batch sidecar record. Storage failure keeps it open for
+    the next existing callback; this never launches model work.
+    """
+    from dispatch_contract import supervisor_lease_is_held
     from dispatch_completion_join import (
-        ChildRow, exact_attempt_row, materialize_after_terminal_close, settle_finished_attempt,
+        ChildRow, materialize_after_terminal_close, settle_finished_attempt,
     )
-    for order, status, raw, meta, lease_held in _pending_owner_settlements(jobs):
+    lease_is_held = supervisor_lease_is_held
+    if context is not None and not context.needs_scan(jobs, lease_is_held):
+        return context.cached_signatures(jobs)
+    before_stamp = _registry_stamp(jobs)
+    try:
+        pending = _pending_owner_settlements(jobs)
+    except (OSError, UnicodeError):
+        if context is not None:
+            context.remember(jobs, before_stamp, (), retry_required=True)
+        return ((str(jobs), "owner-settlement-unavailable"),)
+    live_leases = []
+    retry_required = False
+    signatures = []
+    for order, status, raw, meta, lease_held in pending:
         if lease_held:
+            live_leases.append(meta)
+            if status == "done":
+                signatures.append((str(jobs), "owner-settlement",
+                                   meta.get("attempt_id", ""), status,
+                                   meta.get("workflow_completion", ""),
+                                   meta.get("note", "")))
             continue
         try:
+            settlement_stamp = _registry_stamp(jobs)
             if status == "done":
                 materialize_after_terminal_close(jobs, meta["attempt_id"])
-                continue
-            settle_finished_attempt(jobs, ChildRow(order, status, raw.split("\t")[4],
-                                                   meta["attempt_id"], raw, meta))
-            current = exact_attempt_row(jobs, meta["attempt_id"])
-            if (current.status == "done"
-                    and current.metadata.get("workflow_completion") == "runtime-v1"):
                 from dispatch_terminal_commit import owner_completion_pending
-                if owner_completion_pending(jobs, current.status, current.metadata):
-                    materialize_after_terminal_close(jobs, current.attempt_id)
-        except (OSError, ValueError, RuntimeError):
+                try:
+                    if owner_completion_pending(jobs, status, meta):
+                        retry_required = True
+                        signatures.append((str(jobs), "owner-settlement",
+                                           meta.get("attempt_id", ""), status,
+                                           meta.get("workflow_completion", ""),
+                                           meta.get("note", "")))
+                except Exception:
+                    retry_required = True
+                    signatures.append((str(jobs), "owner-settlement",
+                                       meta.get("attempt_id", ""), status,
+                                       meta.get("workflow_completion", ""),
+                                       meta.get("note", "")))
+            else:
+                result = settle_finished_attempt(
+                    jobs, ChildRow(order, status, raw.split("\t")[4],
+                                   meta["attempt_id"], raw, meta))
+                if not isinstance(result, dict) or not result.get("closed"):
+                    signatures.append((str(jobs), "owner-settlement",
+                                       meta.get("attempt_id", ""), status,
+                                       meta.get("workflow_completion", ""),
+                                       meta.get("note", "")))
+            if _registry_stamp(jobs) == settlement_stamp:
+                retry_required = True
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            retry_required = True
+            signatures.append((str(jobs), "owner-settlement",
+                               meta.get("attempt_id", ""), status,
+                               meta.get("workflow_completion", ""),
+                               meta.get("note", "")))
             continue
+    if context is not None:
+        context.remember(jobs, before_stamp, live_leases, retry_required, signatures)
+    return tuple(signatures)
 
 
 def has_unowned_work(jobs: str | Path | None = None) -> bool:
@@ -503,7 +632,7 @@ def has_unowned_work(jobs: str | Path | None = None) -> bool:
 
         try:
             records = _read_only_records(jobs_path)
-        except (OSError, BatchObligationError):
+        except (OSError, UnicodeError, BatchObligationError):
             return True
         for _path, record, error in records:
             if error is not None:
@@ -519,46 +648,80 @@ def has_unowned_work(jobs: str | Path | None = None) -> bool:
     return False
 
 
-def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, ...]:
-    """Describe pending completion duties for the existing managed reconciler.
+def pending_observer_snapshot(jobs: str | Path | None = None, *,
+                              include_owner_settlements: bool = False):
+    """Read one pass of pending records for reconciliation and idle signature.
 
     This is read-only liveness input. It carries no delivery or execution
     authority and deliberately excludes sealed arguments and route identity.
+    ``paths_by_jobs`` only selects candidates; ``ensure_observers`` rereads each
+    selected record before acquiring its lease or replacing an observer.
     """
     signature = []
+    paths_by_jobs = {}
+    roots_by_jobs = {}
+    root_stamps = {}
+    cacheable = True
     for jobs_path in _jobs_paths(jobs, strict=False):
+        key = str(jobs_path.resolve(strict=False))
+        root_path = jobs_path.resolve(strict=False).parent / "supervisor-state" / "obligations"
+        roots_by_jobs[key] = root_path
+        before_stamp = _directory_stamp(root_path)
         unavailable = False
-        try:
-            owner_settlements = _pending_owner_settlements(jobs_path)
-        except (OSError, UnicodeError):
-            signature.append((str(jobs_path), "unavailable"))
-            unavailable = True
-            owner_settlements = ()
+        owner_settlements = ()
+        if include_owner_settlements:
+            try:
+                owner_settlements = _pending_owner_settlements(jobs_path)
+            except (OSError, UnicodeError):
+                signature.append((str(jobs_path), "unavailable"))
+                unavailable = True
+                cacheable = False
         try:
             records = _read_only_records(jobs_path)
         except (OSError, UnicodeError, BatchObligationError):
             if not unavailable:
                 signature.append((str(jobs_path), "unavailable"))
-            records = ()
+            paths_by_jobs[key] = None
+            root_stamps[key] = _directory_stamp(root_path)
+            cacheable = False
+            continue
+        after_stamp = _directory_stamp(root_path)
+        root_stamps[key] = after_stamp
+        if before_stamp is None or before_stamp != after_stamp:
+            cacheable = False
         for _order, status, _raw, meta, lease_held in owner_settlements:
             if not lease_held:
                 signature.append((str(jobs_path), "owner-settlement",
                                   meta.get("attempt_id", ""), status,
                                   meta.get("workflow_completion", ""),
                                   meta.get("note", "")))
+        pending_paths = []
         for path, record, error in records:
             if error is not None:
                 signature.append((str(jobs_path), path.name, "unreadable"))
+                pending_paths.append(path)
+                cacheable = False
                 continue
             if not record or record.get("state") not in _PENDING:
                 continue
+            pending_paths.append(path)
             observer = record.get("observer") or {}
             signature.append((
                 str(jobs_path), record.get("id", path.stem), record.get("state"),
                 record.get("delivery"), observer.get("pid"),
                 observer.get("pid_start"),
             ))
-    return tuple(sorted(signature))
+        paths_by_jobs[key] = tuple(pending_paths)
+    return {
+        "signature": tuple(sorted(signature)), "paths_by_jobs": paths_by_jobs,
+        "roots_by_jobs": roots_by_jobs, "root_stamps": root_stamps,
+        "cacheable": cacheable,
+    }
+
+
+def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, ...]:
+    """Describe pending completion duties without granting mutation authority."""
+    return pending_observer_snapshot(jobs, include_owner_settlements=True)["signature"]
 
 
 def _pid_start(pid: int) -> str:
