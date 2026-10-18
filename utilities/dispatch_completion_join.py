@@ -8,24 +8,64 @@ typed harvest, and emits one bounded JSON receipt for the session supervisor.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import signal
 import sys
 
-# Capture before importing the join machinery so an early parent exit is
-# detectable after PR_SET_PDEATHSIG is installed at the CLI entry point.
-_CLI_PARENT_PID = os.getppid() if __name__ == "__main__" else None
+
+def _cli_guard_failure(message: str) -> None:
+    sys.stderr.write(f"dispatch-completion-join: {message}\n")
+    raise SystemExit(70)
+
+
+def _cli_parent_fence() -> None:
+    """Bind this CLI waiter to its direct consumer before project imports."""
+    raw_expected = os.environ.get("HEARTING_JOIN_CONSUMER_PID")
+    if raw_expected is None:
+        expected_parent = os.getppid()
+    elif not (raw_expected.isascii() and raw_expected.isdecimal()):
+        _cli_guard_failure("invalid consumer pid")
+    else:
+        expected_parent = int(raw_expected)
+        if expected_parent <= 0:
+            _cli_guard_failure("invalid consumer pid")
+
+    if os.getppid() != expected_parent:
+        _cli_guard_failure("consumer pid mismatch")
+    if sys.platform != "linux":
+        sys.stderr.write(
+            "dispatch-completion-join: parent-lifetime guarantee is unproven on "
+            f"{sys.platform}; continuing with existing join behavior\n"
+        )
+        return
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Linux PR_SET_PDEATHSIG. Install before project imports or registry
+        # access, then reread PPID to close the setup race.
+        result = libc.prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (AttributeError, OSError) as exc:
+        _cli_guard_failure(f"parent-death guard failed: {exc}")
+    if result != 0:
+        err = ctypes.get_errno()
+        _cli_guard_failure(f"parent-death guard failed: {os.strerror(err)}")
+    if os.getppid() != expected_parent:
+        _cli_guard_failure("consumer exited during guard setup")
+
+
+if __name__ == "__main__":
+    _cli_parent_fence()
 
 import argparse
 import base64
 from contextlib import contextmanager
-import ctypes
 from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
 from pathlib import Path
 import shlex
-import signal
 import subprocess
 import tempfile
 import time
@@ -151,22 +191,6 @@ class JoinContractError(RuntimeError):
 
 class CompletionDeferred(JoinContractError):
     """Cancellation cleanup is retained by the existing execution observer."""
-
-
-def _bind_cli_to_direct_parent(expected_parent: int | None = None) -> None:
-    """Make only this result-consuming CLI die with its direct OS parent."""
-    if sys.platform != "linux":
-        raise OSError("direct-parent-death-guard-unsupported")
-    if expected_parent is None:
-        expected_parent = os.getppid()
-    libc = ctypes.CDLL(None, use_errno=True)
-    # Linux PR_SET_PDEATHSIG. Set it before opening the registry, then recheck
-    # PPID to close the parent-exits-between-check-and-prctl race.
-    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
-        errno = ctypes.get_errno()
-        raise OSError(errno, os.strerror(errno))
-    if os.getppid() != expected_parent:
-        raise SystemExit(0)
 
 
 def canonical_delivery_receipt(receipt: dict[str, object]) -> dict[str, object]:
@@ -4623,10 +4647,4 @@ def reconcile_finished_children(
 
 
 if __name__ == "__main__":
-    try:
-        _bind_cli_to_direct_parent(_CLI_PARENT_PID)
-    except OSError:
-        # Running without the parent lifetime fence would leave an unowned
-        # result waiter. Fail before opening jobs.log instead.
-        raise SystemExit(70)
     raise SystemExit(main())

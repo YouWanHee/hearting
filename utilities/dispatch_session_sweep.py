@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 
@@ -34,19 +33,13 @@ SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
 
 
-def request_obligation_reconciliation() -> None:
-    """Ask the shared recovery entry to reconnect observers without holding a hook."""
+def request_obligation_reconciliation(*, lifecycle_root: str | Path | None = None) -> None:
+    """Ask the common recovery entry to reconnect observers without holding a hook."""
     try:
-        script = Path(__file__).resolve().with_name("peer-steward.py")
-        subprocess.Popen(
-            [sys.executable, str(script), "__ensure-obligations"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        import peer_obligations
+        root = lifecycle_root or Path(__file__).resolve().parents[1]
+        peer_obligations.request_obligation_recovery(lifecycle_root=root)
+    except Exception:
         pass
 
 
@@ -210,7 +203,7 @@ def _reconcile_canonical_dispatch_state(root: Path) -> None:
         reconcile_pending_delivery(jobs)
     except Exception:
         pass
-    request_obligation_reconciliation()
+    request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:

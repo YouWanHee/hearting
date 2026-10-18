@@ -20,6 +20,7 @@ import threading
 import time
 import typing
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 import sys
 
@@ -162,17 +163,285 @@ class DispatchCompletionJoinTest(unittest.TestCase):
     def test_cli_parent_fence_rechecks_parent_after_setting_signal(self):
         libc = mock.Mock()
         libc.prctl.return_value = 0
-        with mock.patch.object(JOIN.os, "getppid", return_value=456), \
-             mock.patch.object(JOIN.ctypes, "CDLL", return_value=libc):
+        with mock.patch.dict(os.environ, {"HEARTING_JOIN_CONSUMER_PID": "123"}), \
+             mock.patch.object(JOIN.os, "getppid", side_effect=(123, 456)), \
+             mock.patch.object(JOIN.ctypes, "CDLL", return_value=libc), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit) as stopped:
-                JOIN._bind_cli_to_direct_parent(123)
-        self.assertEqual(stopped.exception.code, 0)
+                JOIN._cli_parent_fence()
+        self.assertEqual(stopped.exception.code, 70)
+        self.assertIn("consumer exited during guard setup", stderr.getvalue())
         self.assertEqual(libc.prctl.call_args.args[:2], (1, signal.SIGTERM))
 
-    def test_cli_refuses_parentless_join_on_non_linux_platform(self):
-        with mock.patch.object(JOIN.sys, "platform", "darwin"):
-            with self.assertRaisesRegex(OSError, "direct-parent-death-guard-unsupported"):
-                JOIN._bind_cli_to_direct_parent(123)
+    def test_cli_rejects_malformed_or_mismatched_expected_consumer_before_registry(self):
+        for value in ("", "-1", "1.5", "１２３", "0"):
+            with self.subTest(value=value), \
+                 mock.patch.dict(os.environ, {"HEARTING_JOIN_CONSUMER_PID": value}), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as stopped:
+                    JOIN._cli_parent_fence()
+                self.assertEqual(stopped.exception.code, 70)
+        with mock.patch.dict(os.environ, {"HEARTING_JOIN_CONSUMER_PID": "99999999"}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                JOIN._cli_parent_fence()
+            self.assertEqual(stopped.exception.code, 70)
+
+    @unittest.skipUnless(sys.platform == "linux", "PR_SET_PDEATHSIG is Linux-specific")
+    def test_linux_guard_installation_failure_is_fast_and_diagnostic(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = -1
+        with mock.patch.dict(os.environ, {"HEARTING_JOIN_CONSUMER_PID": str(os.getppid())}), \
+             mock.patch.object(JOIN.ctypes, "CDLL", return_value=libc), \
+             mock.patch.object(JOIN.ctypes, "get_errno", return_value=1), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as stopped:
+                JOIN._cli_parent_fence()
+        self.assertEqual(stopped.exception.code, 70)
+        self.assertIn("parent-death guard failed", stderr.getvalue())
+
+    def test_non_linux_cli_keeps_timeout_receipt_behavior_and_discloses_limit(self):
+        self.jobs.write_text(row("open", "att-a", "att-parent", "a"), encoding="utf-8")
+        runner = (
+            "import runpy,sys; sys.platform='darwin'; "
+            "sys.argv=[%r,'--jobs',%r,'--parent-attempt-id','att-parent',"
+            "'--interval','0.02','--timeout','0.08']; "
+            "runpy.run_path(%r,run_name='__main__')"
+        ) % (str(HERE / "dispatch_completion_join.py"), str(self.jobs),
+             str(HERE / "dispatch_completion_join.py"))
+        env = os.environ.copy()
+        env["HEARTING_JOIN_CONSUMER_PID"] = str(os.getpid())
+        result = subprocess.run(
+            [sys.executable, "-c", runner], text=True, capture_output=True,
+            env=env, check=False, timeout=3,
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["state"], "timeout")
+        self.assertIn("parent-lifetime guarantee is unproven on darwin", result.stderr)
+
+    def test_all_production_join_callers_refresh_pid_env_and_keep_custom_argv(self):
+        callers = (
+            ("claude-session-supervisor.py", {
+                "join_interval": 0.02, "join_timeout": 1,
+            }),
+            ("codex-app-server-supervisor.py", {
+                "join_interval": 0.02, "join_timeout": 1,
+            }),
+            ("codex-managed-completion.py", {
+                "interval": 0.02, "timeout": 1, "parent_session_id": None,
+                "queue_socket": None,
+            }),
+        )
+        class CapturedCall(Exception):
+            pass
+
+        old = os.environ.get("HEARTING_JOIN_CONSUMER_PID")
+        os.environ["HEARTING_JOIN_CONSUMER_PID"] = "stale-parent"
+        os.environ["JOIN_ENV_FIXTURE"] = "preserved"
+        try:
+            for filename, timing in callers:
+                with self.subTest(caller=filename):
+                    path = HERE / filename
+                    spec = importlib.util.spec_from_file_location(
+                        "join_caller_" + filename.replace("-", "_"), path
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    assert spec.loader is not None
+                    spec.loader.exec_module(module)
+                    args = SimpleNamespace(
+                        join_command="custom-join --keep-this", jobs=str(self.jobs),
+                        parent_attempt_id="att-parent", **timing,
+                    )
+                    captured = {}
+
+                    def stop_before_wait(command, **kwargs):
+                        captured["command"] = command
+                        captured.update(kwargs)
+                        raise CapturedCall()
+
+                    with mock.patch.object(module.subprocess, "run", side_effect=stop_before_wait), \
+                         mock.patch.object(module, "emit", lambda *_a, **_k: None) if hasattr(module, "emit") else contextlib.nullcontext():
+                        with self.assertRaises(CapturedCall):
+                            module.run_join(args, {"att-child"})
+                    self.assertEqual(captured["command"][:2], ["custom-join", "--keep-this"])
+                    self.assertEqual(captured["env"]["HEARTING_JOIN_CONSUMER_PID"], str(os.getpid()))
+                    self.assertEqual(captured["env"]["JOIN_ENV_FIXTURE"], "preserved")
+                    self.assertIsNot(captured["env"], os.environ)
+        finally:
+            if old is None:
+                os.environ.pop("HEARTING_JOIN_CONSUMER_PID", None)
+            else:
+                os.environ["HEARTING_JOIN_CONSUMER_PID"] = old
+            os.environ.pop("JOIN_ENV_FIXTURE", None)
+
+    @staticmethod
+    def _wait_pid_stopped(pid: int, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                stat_line = Path(f"/proc/{pid}/stat").read_text()
+            except FileNotFoundError:
+                return True
+            if stat_line.rsplit(") ", 1)[1][0] == "Z":
+                return True
+            time.sleep(0.02)
+        return False
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process guard evidence")
+    def test_parent_loss_before_interpreter_start_is_rejected_before_registry_access(self):
+        original_jobs = row("open", "att-a", "att-parent", "a").encode()
+        self.jobs.write_bytes(original_jobs)
+        wrapper = self.root / "late-python"
+        wrapper.write_text(
+            "#!/bin/sh\nsleep 0.25\nexec " + shlex.quote(sys.executable) + " "
+            + shlex.quote(str(HERE / "dispatch_completion_join.py"))
+            + " \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        command = [str(wrapper), "--jobs", str(self.jobs), "--parent-attempt-id",
+                   "att-parent", "--interval", "0.02", "--timeout", "60"]
+        parent_script = (
+            "import os,subprocess,sys\n"
+            "env=os.environ.copy(); env['HEARTING_JOIN_CONSUMER_PID']=str(os.getpid())\n"
+            "child=subprocess.Popen(%r,env=env,stdin=subprocess.DEVNULL,"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+            "print(child.pid,flush=True)\n"
+        ) % command
+        result = subprocess.run(
+            [sys.executable, "-c", parent_script], capture_output=True, text=True,
+            check=False, timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self._wait_pid_stopped(int(result.stdout.strip())))
+        self.assertEqual(self.jobs.read_bytes(), original_jobs)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process guard evidence")
+    def test_parent_loss_after_guard_install_and_during_project_import_exits_join(self):
+        original_jobs = row("open", "att-a", "att-parent", "a").encode()
+        self.jobs.write_bytes(original_jobs)
+        cases = ("after-install", "slow-import")
+        for case in cases:
+            with self.subTest(window=case):
+                fixture = self.root / case
+                fixture.mkdir()
+                marker = fixture / "entered"
+                if case == "after-install":
+                    sitecustomize = (
+                        "import os,sys,time\n"
+                        "def trace(frame,event,arg):\n"
+                        "  if frame.f_code.co_name=='_cli_parent_fence' and event=='return':\n"
+                        "    open(os.environ['JOIN_WINDOW_MARKER'],'w').write('installed')\n"
+                        "    time.sleep(30)\n"
+                        "  return trace\n"
+                        "sys.setprofile(trace)\n"
+                    )
+                else:
+                    sitecustomize = (
+                        "import builtins,os,time\n"
+                        "original=builtins.__import__\n"
+                        "def delayed(name,*args,**kwargs):\n"
+                        "  if name=='dispatch_attempt_policy':\n"
+                        "    open(os.environ['JOIN_WINDOW_MARKER'],'w').write('importing')\n"
+                        "    time.sleep(30)\n"
+                        "  return original(name,*args,**kwargs)\n"
+                        "builtins.__import__=delayed\n"
+                    )
+                (fixture / "sitecustomize.py").write_text(sitecustomize, encoding="utf-8")
+                join_command = [
+                    sys.executable, str(HERE / "dispatch_completion_join.py"),
+                    "--jobs", str(self.jobs), "--parent-attempt-id", "att-parent",
+                    "--interval", "0.02", "--timeout", "60",
+                ]
+                parent_script = (
+                    "import os,subprocess,sys,time\n"
+                    "env=os.environ.copy(); env['HEARTING_JOIN_CONSUMER_PID']=str(os.getpid())\n"
+                    "child=subprocess.Popen(%r,env=env,stdin=subprocess.DEVNULL,"
+                    "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                    "print(child.pid,flush=True); time.sleep(30)\n"
+                ) % join_command
+                env = os.environ.copy()
+                env["PYTHONPATH"] = str(fixture)
+                env["JOIN_WINDOW_MARKER"] = str(marker)
+                parent = subprocess.Popen(
+                    [sys.executable, "-c", parent_script], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                child_pid = int(parent.stdout.readline().strip())
+                try:
+                    deadline = time.monotonic() + 4
+                    while time.monotonic() < deadline and not marker.exists():
+                        time.sleep(0.01)
+                    self.assertTrue(marker.exists(), f"join never reached {case} window")
+                    parent.kill()
+                    parent.wait(timeout=3)
+                    self.assertTrue(self._wait_pid_stopped(child_pid),
+                                    f"join remained alive after parent loss in {case}")
+                    self.assertEqual(self.jobs.read_bytes(), original_jobs)
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                        parent.wait(timeout=3)
+                    parent.stdout.close()
+                    parent.stderr.close()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux child-subreaper evidence")
+    def test_expected_parent_fence_survives_subreaper_reparenting(self):
+        self.jobs.write_text(row("open", "att-a", "att-parent", "a"), encoding="utf-8")
+        fixture = self.root / "subreaper"
+        fixture.mkdir()
+        marker = fixture / "installed"
+        (fixture / "sitecustomize.py").write_text(
+            "import os,sys,time\n"
+            "def trace(frame,event,arg):\n"
+            "  if frame.f_code.co_name=='_cli_parent_fence' and event=='return':\n"
+            "    open(os.environ['JOIN_WINDOW_MARKER'],'w').write('ready')\n"
+            "    time.sleep(30)\n"
+            "  return trace\n"
+            "sys.setprofile(trace)\n",
+            encoding="utf-8",
+        )
+        join_command = [
+            sys.executable, str(HERE / "dispatch_completion_join.py"),
+            "--jobs", str(self.jobs), "--parent-attempt-id", "att-parent",
+            "--interval", "0.02", "--timeout", "60",
+        ]
+        parent_script = (
+            "import os,subprocess,sys,time\n"
+            "env=os.environ.copy(); env['HEARTING_JOIN_CONSUMER_PID']=str(os.getpid())\n"
+            "child=subprocess.Popen(%r,env=env,stdin=subprocess.DEVNULL,"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+            "print(child.pid,flush=True); time.sleep(30)\n"
+        ) % join_command
+        controller = (
+            "import ctypes,os,subprocess,sys,time\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "if libc.prctl(36,1,0,0,0)!=0: raise SystemExit(77)\n"
+            "parent=subprocess.Popen([sys.executable,'-c',%r],stdout=subprocess.PIPE,"
+            "stderr=subprocess.PIPE,text=True)\n"
+            "pid=int(parent.stdout.readline().strip())\n"
+            "deadline=time.monotonic()+5\n"
+            "while not os.path.exists(os.environ['JOIN_WINDOW_MARKER']) and time.monotonic()<deadline: time.sleep(.01)\n"
+            "if not os.path.exists(os.environ['JOIN_WINDOW_MARKER']): raise SystemExit(78)\n"
+            "parent.kill(); parent.wait(timeout=3)\n"
+            "deadline=time.monotonic()+3\n"
+            "while time.monotonic()<deadline:\n"
+            "  try: got,status=os.waitpid(pid,os.WNOHANG)\n"
+            "  except ChildProcessError: raise SystemExit(79)\n"
+            "  if got: print(os.waitstatus_to_exitcode(status)); raise SystemExit(0)\n"
+            "  time.sleep(.02)\n"
+            "raise SystemExit(80)\n"
+        ) % parent_script
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(fixture)
+        env["JOIN_WINDOW_MARKER"] = str(marker)
+        result = subprocess.run([sys.executable, "-c", controller], env=env,
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 77:
+            self.skipTest("PR_SET_CHILD_SUBREAPER is unavailable")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(-signal.SIGTERM))
+        self.assertEqual(self.jobs.read_bytes(), row("open", "att-a", "att-parent", "a").encode())
 
     @unittest.skipUnless(sys.platform == "linux", "PR_SET_PDEATHSIG is Linux-specific")
     def test_cli_exits_when_its_direct_result_consumer_dies(self):

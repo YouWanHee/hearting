@@ -536,9 +536,12 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     ]
     for attempt_id in sorted(attempts):
         command += ["--attempt-id", attempt_id]
+    join_env = os.environ.copy()
+    join_env["HEARTING_JOIN_CONSUMER_PID"] = str(os.getpid())
     try:
         result = subprocess.run(
             command,
+            env=join_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

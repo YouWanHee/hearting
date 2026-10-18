@@ -3765,21 +3765,34 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                             {"harness": "codex", "session_id": "sid-fixture"}, {})
         return store, duty
 
-    def test_concurrent_recovery_entry_is_single_and_holder_exit_releases_lock(self):
+    def test_shared_recovery_entry_lock_covers_contexts_and_releases_on_all_holder_exits(self):
         release = self.tmp_root / "release-reconcile"
-        first_marker = self.tmp_root / "first-entered"
-        second_marker = self.tmp_root / "second-entered"
-        third_marker = self.tmp_root / "third-entered"
-        child_pid_file = self.tmp_root / "inherited-child.pid"
+        shared_peer_root = self.tmp_root / "peer-shared"
+        alternate_peer_root = self.tmp_root / "peer-independent"
+        shared_peer_root.mkdir()
+        alternate_peer_root.mkdir()
+        jobs_a = self.tmp_root / "jobs-a.log"
+        jobs_b = self.tmp_root / "jobs-b.log"
+        jobs_a.touch()
+        jobs_b.touch()
+        store = peer_steward.peer_obligations.ObligationStore(shared_peer_root)
+        pending = store.create("message-pending", "message",
+                               {"harness": "codex", "session_id": "recipient-pending"},
+                               {"attempt_ids": ["att-pending"]})
+        unknown = store.create("batch-unknown", "registered-batch",
+                               {"delivery_parent_id": "recipient-unknown"},
+                               {"attempt_ids": ["att-unknown"]})
+        unknown = store.update(unknown["id"], state="unknown", observer_error="fixture-unknown")
+        pending_before = store.get(pending["id"])
+        unknown_before = store.get(unknown["id"])
+
         script = (
             "import importlib.util,os,subprocess,sys,time\n"
             "from pathlib import Path\n"
             "spec=importlib.util.spec_from_file_location('peer_steward_test',%r)\n"
-            "m=importlib.util.module_from_spec(spec)\n"
-            "sys.modules[spec.name]=m\n"
-            "spec.loader.exec_module(m)\n"
+            "m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)\n"
             "def reconcile(_store, **_kwargs):\n"
-            "    Path(os.environ['RECONCILE_MARKER']).write_text('entered')\n"
+            "    Path(os.environ['RECONCILE_MARKER']).write_text(os.environ['RECOVERY_ADAPTER'])\n"
             "    child_file=os.environ.get('RECONCILE_CHILD_PID')\n"
             "    if child_file:\n"
             "        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
@@ -3788,61 +3801,125 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
             "        Path(child_file).write_text(str(child.pid))\n"
             "    release=os.environ.get('RECONCILE_RELEASE')\n"
             "    deadline=time.monotonic()+5\n"
-            "    while release and not Path(release).exists() and time.monotonic()<deadline:\n"
-            "        time.sleep(.01)\n"
-            "m._reconcile_external_obligations=reconcile\n"
-            "m._runner_duties=lambda _store: []\n"
-            "raise SystemExit(m.main(['__ensure-obligations']))\n"
+            "    while release and not Path(release).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+            "    if os.environ.get('RECONCILE_MODE')=='error': raise RuntimeError('fixture-reconcile-error')\n"
+            "m._reconcile_external_obligations=reconcile; m._runner_duties=lambda _store: []\n"
+            "m.peer_obligations.ensure_normal_runner=lambda *a,**k: True\n"
+            "m.peer_obligations.ensure_runner=lambda *a,**k: True\n"
+            "argv=['__ensure-obligations','--lifecycle-root',os.environ['RECOVERY_LIFECYCLE_ROOT']]\n"
+            "raise SystemExit(m.main(argv))\n"
         ) % str(_HERE / "peer-steward.py")
 
-        def env_for(marker, *, held=False, child=False):
+        def env_for(marker, *, peer_root=shared_peer_root, jobs=jobs_a, adapter="claude-sessionstart",
+                    mode="normal", held=False, child_file=None):
             env = dict(os.environ)
-            env["RECONCILE_MARKER"] = str(marker)
-            env["RECONCILE_RELEASE"] = str(release) if held else ""
-            env["RECONCILE_CHILD_PID"] = str(child_pid_file) if child else ""
+            env.update({
+                "AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                "AGENT_DISPATCH_JOBS": str(jobs),
+                "HARNESS_STATE_ROOT": str(self.tmp_root / "harness-state"),
+                "XDG_STATE_HOME": str(self.tmp_root / "xdg-state"),
+                "RECOVERY_LIFECYCLE_ROOT": str(self.tmp_root / ("lifecycle-" + adapter)),
+                "RECOVERY_ADAPTER": adapter,
+                "RECONCILE_MARKER": str(marker),
+                "RECONCILE_RELEASE": str(release) if held else "",
+                "RECONCILE_CHILD_PID": str(child_file) if child_file else "",
+                "RECONCILE_MODE": mode,
+            })
             return env
 
-        holder = subprocess.Popen(
-            [sys.executable, "-c", script], env=env_for(first_marker, held=True, child=True),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        child_pid = None
-        try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not first_marker.exists():
-                time.sleep(.01)
-            self.assertTrue(first_marker.exists(), "first recovery call never entered")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not child_pid_file.exists():
-                time.sleep(.01)
-            child_pid = int(child_pid_file.read_text())
-
-            second = subprocess.run(
-                [sys.executable, "-c", script], env=env_for(second_marker),
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
-            )
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertFalse(second_marker.exists(), "contending caller ran recovery body")
-
-            holder.terminate()
-            holder.wait(timeout=3)
-            third = subprocess.run(
-                [sys.executable, "-c", script], env=env_for(third_marker),
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
-            )
-            self.assertEqual(third.returncode, 0, third.stderr)
-            self.assertTrue(third_marker.exists(), "recovery lock stayed held after owner exit")
-        finally:
-            if holder.poll() is None:
-                holder.kill()
-                holder.wait(timeout=3)
-            if child_pid is None and child_pid_file.exists():
-                child_pid = int(child_pid_file.read_text())
-            if child_pid is not None:
+        shared_lock = store.root / "ensure-obligations.lock"
+        normal_inode = None
+        for mode in ("normal", "error", "sigkill"):
+            with self.subTest(holder_exit=mode):
+                release.unlink(missing_ok=True)
+                first_marker = self.tmp_root / f"{mode}-holder-entered"
+                blocked_marker = self.tmp_root / f"{mode}-blocked-entered"
+                independent_marker = self.tmp_root / f"{mode}-independent-entered"
+                released_marker = self.tmp_root / f"{mode}-released-entered"
+                child_pid_file = self.tmp_root / f"{mode}-inherited-child.pid"
+                holder = subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    env=env_for(first_marker, jobs=jobs_a, adapter="claude-sessionstart",
+                                mode=mode, held=True,
+                                child_file=child_pid_file if mode in {"normal", "sigkill"} else None),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                child_pid = None
                 try:
-                    os.kill(child_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not first_marker.exists(): time.sleep(.01)
+                    self.assertTrue(first_marker.exists(), "common recovery body did not enter")
+                    if mode in {"normal", "sigkill"}:
+                        deadline = time.monotonic() + 3
+                        while time.monotonic() < deadline and not child_pid_file.exists(): time.sleep(.01)
+                        child_pid = int(child_pid_file.read_text())
+                    inode = shared_lock.stat().st_ino
+                    if normal_inode is None:
+                        normal_inode = inode
+                    self.assertEqual(inode, normal_inode)
+
+                    blocked = subprocess.run(
+                        [sys.executable, "-c", script],
+                        env=env_for(blocked_marker, jobs=jobs_b, adapter="opencode-session.created"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+                    )
+                    self.assertEqual(blocked.returncode, 0, blocked.stderr)
+                    self.assertFalse(blocked_marker.exists(),
+                                     "same peer root with different jobs entered concurrently")
+
+                    independent = subprocess.run(
+                        [sys.executable, "-c", script],
+                        env=env_for(independent_marker, peer_root=alternate_peer_root,
+                                    jobs=jobs_b, adapter="codex-worker-prompt"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+                    )
+                    self.assertEqual(independent.returncode, 0, independent.stderr)
+                    self.assertTrue(independent_marker.exists(), "independent peer root was serialized")
+                    self.assertNotEqual(
+                        (alternate_peer_root / "peer-steward/obligations/ensure-obligations.lock").stat().st_ino,
+                        inode,
+                    )
+
+                    if mode == "sigkill":
+                        holder.kill()
+                        self.assertEqual(holder.wait(timeout=3), -signal.SIGKILL)
+                    else:
+                        release.touch()
+                        self.assertEqual(holder.wait(timeout=3), 0)
+                    released = subprocess.run(
+                        [sys.executable, "-c", script],
+                        env=env_for(released_marker, jobs=jobs_b, adapter="codex-worker-sessionstart"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+                    )
+                    self.assertEqual(released.returncode, 0, released.stderr)
+                    self.assertTrue(released_marker.exists(), f"lock stayed held after {mode} exit")
+                    self.assertEqual(shared_lock.stat().st_ino, inode, "lock inode was replaced")
+                    self.assertNotEqual(shared_lock.name, peer_steward.peer_obligations.RUNNER_LOCK_NAME)
+                    pending_after = store.get(pending["id"])
+                    unknown_after = store.get(unknown["id"])
+                    for field in ("state", "intent", "delivery", "cleanup", "result"):
+                        self.assertEqual(pending_after[field], pending_before[field], field)
+                        self.assertEqual(unknown_after[field], unknown_before[field], field)
+                    self.assertEqual(pending_after["state"], "pending")
+                    self.assertEqual(unknown_after["state"], "unknown")
+                    self.assertEqual((unknown_after.get("observation") or {}).get("reason"),
+                                     "fixture-unknown")
+                    if child_pid is not None:
+                        try:
+                            os.kill(child_pid, 0)
+                        except ProcessLookupError:
+                            self.fail("long-lived child unexpectedly ended with lock holder")
+                finally:
+                    if holder.poll() is None:
+                        holder.kill()
+                        holder.wait(timeout=3)
+                    if child_pid is None and child_pid_file.exists():
+                        child_pid = int(child_pid_file.read_text())
+                    if child_pid is not None:
+                        try:
+                            os.kill(child_pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
 
     def test_existing_lifecycle_callback_reconnects_through_one_runner(self):
         self.pending_message()

@@ -61,6 +61,7 @@ def main() -> int:
     session_id = _session_id(payload)
     if session_id is None:
         return 0
+    request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
     try:
         agent_home = resolve_agent_home()
         roots = dispatch_state_roots(agent_home)
@@ -92,8 +93,6 @@ def main() -> int:
     # The same activation also reconnects retained registered-batch observers:
     # lock-guarded, completed duties are never replayed and the original
     # assignment is never relaunched. Fail-open like every other path here.
-    if _event_name(payload) != "SessionStart":
-        request_obligation_reconciliation()
     context = delivery_context(batches)
     if not context:
         return 0
@@ -109,6 +108,7 @@ def main() -> int:
             separators=(",", ":"),
         )
     )
+    sys.stdout.flush()
     if _event_name(payload) == "UserPromptSubmit":
         for root, records in batches:
             try:
