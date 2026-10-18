@@ -9,6 +9,7 @@ import io
 import json
 import os
 import signal
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -25,43 +26,62 @@ ROOT = Path(__file__).resolve().parent
 TOOL = ROOT / "compute-hosts.py"
 
 
-class ReparentedFixtureProcess:
-    def __init__(self, pid):
-        self.pid = pid
+def controlled_proc_root(root, processes):
+    """Keep live fixture PID data while placing ancestry behind a test root."""
+    proc_root = root / "proc"
+    proc_root.mkdir()
+    fixture_parent_pid = 2_000_000_000
+    while (Path("/proc") / str(fixture_parent_pid)).exists():
+        fixture_parent_pid -= 1
 
-    def terminate(self):
+    parent = proc_root / str(fixture_parent_pid)
+    parent.mkdir()
+    parent_fields = ["S", "0", str(os.getpgrp())] + ["0"] * 17
+    parent_fields[19] = "1"
+    (parent / "stat").write_text(
+        f"{fixture_parent_pid} (probe-fixture-root) {' '.join(parent_fields)}\n",
+        encoding="utf-8",
+    )
+    uid = os.geteuid()
+    (parent / "status").write_text(
+        f"Name:\tprobe-fixture-root\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n",
+        encoding="utf-8",
+    )
+    (parent / "environ").write_bytes(b"")
+    (parent / "cmdline").write_bytes(b"")
+    (parent / "comm").write_text("probe-fixture-root\n", encoding="utf-8")
+
+    for process in processes:
+        live = Path("/proc") / str(process.pid)
+        raw_stat = (live / "stat").read_text(encoding="utf-8")
+        prefix, suffix = raw_stat.rsplit(")", 1)
+        fields = suffix.split()
+        fields[1] = str(fixture_parent_pid)
+        fixture = proc_root / str(process.pid)
+        fixture.mkdir()
+        (fixture / "stat").write_text(
+            prefix + ") " + " ".join(fields) + "\n", encoding="utf-8")
+        for name in ("status", "environ", "cmdline", "comm"):
+            (fixture / name).symlink_to(live / name)
+    return proc_root
+
+
+def terminate_and_reap(process, timeout=2):
+    if process.poll() is None:
         try:
-            os.kill(self.pid, signal.SIGTERM)
+            process.terminate()
         except ProcessLookupError:
             pass
-
-    def wait(self, timeout=None):
-        timeout = timeout or 5
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                with open(f"/proc/{self.pid}/stat", encoding="utf-8") as proc:
-                    if proc.read().rsplit(")", 1)[1].split()[0] == "Z":
-                        return
-            except OSError:
-                return
-            time.sleep(.01)
-        raise subprocess.TimeoutExpired("fixture", timeout)
-
-
-def start_reparented_fixture(env, *, stdout=None):
-    """Launch via a short lived clean-env parent; the runner is not an ancestor."""
-    launcher = (
-        "import json,subprocess,sys; "
-        "out=open(sys.argv[2],'ab') if sys.argv[2] else subprocess.DEVNULL; "
-        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(10)'], "
-        "env=json.loads(sys.argv[1]),stdout=out,stderr=out,start_new_session=True); "
-        "print(child.pid)"
-    )
-    result = subprocess.run([sys.executable, "-c", launcher, json.dumps(env),
-                             str(stdout) if stdout else ""],
-                            text=True, capture_output=True, check=True)
-    return ReparentedFixtureProcess(int(result.stdout.strip()))
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=timeout)
+    if process.stdout is not None:
+        process.stdout.close()
 
 
 def load_module():
@@ -924,22 +944,39 @@ class ComputeHostsTest(unittest.TestCase):
         }
         clean = {key: value for key, value in os.environ.items() if key not in identity_keys}
         processes = []
+
+        def launch_fixture(process_env, *, stdout=None):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                env=process_env, stdout=stdout or subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(process)
+            return process
+
         try:
             log = self.root / "train.log"
             log.write_text("Epoch 3/200\nTRAIN: 50% loss=0.5\n")
-            run_proc = start_reparented_fixture(
-                {**clean, "HEARTING_COMPUTE_RUN_ID": "cnn-run-7",
-                 "HEARTING_COMPUTE_HOST": "cnn"}, stdout=log)
-            ambiguous_proc = start_reparented_fixture(
+            with log.open("ab") as output:
+                run_proc = launch_fixture(
+                    {**clean, "HEARTING_COMPUTE_RUN_ID": "cnn-run-7",
+                     "HEARTING_COMPUTE_HOST": "cnn"}, stdout=output)
+            ambiguous_proc = launch_fixture(
                 {**clean, "CODEX_THREAD_ID": "same-session-token",
                  "CLAUDE_CODE_SESSION_ID": "same-session-token"})
-            job_proc = start_reparented_fixture(
+            job_proc = launch_fixture(
                 {**clean, "AGENT_DISPATCH_ATTEMPT_ID": "att-42",
                  "AGENT_DISPATCH_SELF_SLUG": "train-test",
                  "HEARTING_COMPUTE_RUN_ID": "shadowed-run"})
-            session_proc = start_reparented_fixture(
+            session_proc = launch_fixture(
                 {**clean, "CODEX_THREAD_ID": "codex-exact-session"})
-            processes = [run_proc, ambiguous_proc, job_proc, session_proc]
+            probe = probe_namespace()
+            proc_starts = {}
+            for process in processes:
+                observed = probe["proc_stat"](process.pid)
+                self.assertIsNotNone(observed, process.pid)
+                proc_starts[process.pid] = observed["start"]
+            proc_root = controlled_proc_root(self.root, processes)
             env = {
                 **clean,
                 "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
@@ -950,17 +987,18 @@ class ComputeHostsTest(unittest.TestCase):
                     ["GPU-B", session_proc.pid, "python", 512],
                 ]),
             }
+            probe_script = module.PROBE_SCRIPT.replace(
+                'Path("/proc")', f"Path({str(proc_root)!r})")
+            self.assertNotEqual(probe_script, module.PROBE_SCRIPT)
             result = subprocess.run(
-                ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+                ["bash", "-c", probe_script], text=True, capture_output=True,
                 env=env, timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
         finally:
             for process in processes:
-                process.terminate()
-            for process in processes:
-                process.wait(timeout=2)
+                terminate_and_reap(process)
 
         self.assertEqual([gpu["index"] for gpu in payload["gpus"]], [0, 1])
         first, second = payload["gpus"]
@@ -971,15 +1009,21 @@ class ComputeHostsTest(unittest.TestCase):
         by_pid = {row["pid"]: row for row in first["processes"]}
         self.assertEqual(by_pid[run_proc.pid]["owner"]["kind"], "run")
         self.assertEqual(by_pid[run_proc.pid]["owner"]["label"], "run:cnn-run-7")
+        self.assertEqual(by_pid[run_proc.pid]["proc_start"], proc_starts[run_proc.pid])
         self.assertIsNone(by_pid[ambiguous_proc.pid]["owner"])
         self.assertEqual(by_pid[ambiguous_proc.pid]["attribution_reason"],
                          "ambiguous-session")
+        self.assertEqual(by_pid[ambiguous_proc.pid]["proc_start"],
+                         proc_starts[ambiguous_proc.pid])
         second_by_pid = {row["pid"]: row for row in second["processes"]}
         self.assertEqual(second_by_pid[job_proc.pid]["owner"]["kind"], "job")
         self.assertEqual(second_by_pid[job_proc.pid]["owner"]["label"], "job:train-test")
+        self.assertEqual(second_by_pid[job_proc.pid]["proc_start"],
+                         proc_starts[job_proc.pid])
         self.assertEqual(second_by_pid[session_proc.pid]["owner"]["kind"], "session")
         self.assertEqual(second_by_pid[session_proc.pid]["owner"]["label"], "codex:codex-ex")
-        self.assertIsInstance(second_by_pid[job_proc.pid]["proc_start"], int)
+        self.assertEqual(second_by_pid[session_proc.pid]["proc_start"],
+                         proc_starts[session_proc.pid])
         self.assertIsInstance(payload["cpu_count"], int)
         self.assertGreater(payload["cpu_count"], 0)
         self.assertGreaterEqual(payload["cpu_utilization_pct"], 0)
@@ -1079,19 +1123,27 @@ class ComputeHostsTest(unittest.TestCase):
     def test_gpu_probe_cwd_is_absent_when_unreadable_or_gone(self):
         gone = subprocess.Popen([sys.executable, "-c", "pass"])
         gone.wait(timeout=5)
-        rows = [["GPU-A", gone.pid, "python", 64]]
-        if os.geteuid() != 0:
-            rows.append(["GPU-A", 1, "init", 32])
-        payload = self._probe_with_fake_smi(rows, "gone-bin")
+        payload = self._probe_with_fake_smi(
+            [["GPU-A", gone.pid, "python", 64]], "gone-bin")
         by_pid = {row["pid"]: row for row in payload["gpus"][0]["processes"]}
         ended = by_pid[gone.pid]
         for key in ("proc_start", "pgid", "cwd", "elapsed_s"):
             self.assertIsNone(ended[key], key)
-        if 1 in by_pid:
-            other = by_pid[1]
-            self.assertIsNone(other["cwd"])
-            self.assertIsInstance(other["pgid"], int)
-            self.assertIsInstance(other["proc_start"], int)
+
+        probe = probe_namespace()
+        pid = os.getpid()
+        current = probe["proc_stat"](pid)
+        self.assertIsNotNone(current)
+        denied_cwd = f"/proc/{pid}/cwd"
+        readlink = os.readlink
+
+        def fixture_readlink(path, *args, **kwargs):
+            if os.fspath(path) == denied_cwd:
+                raise PermissionError("fixture-controlled proc read denial")
+            return readlink(path, *args, **kwargs)
+
+        with mock.patch.object(probe["os"], "readlink", side_effect=fixture_readlink):
+            self.assertIsNone(probe["process_cwd"](pid, current["start"]))
 
     def test_gpu_probe_omits_training_logs_and_does_not_create_epoch_cache(self):
         log = self.root / "train.log"
@@ -1862,15 +1914,26 @@ class ProbeCommandHashTest(unittest.TestCase):
 
     def spawn(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
-        self.addCleanup(child.wait, 2)
-        self.addCleanup(child.terminate)
+        self.addCleanup(terminate_and_reap, child)
         return child
 
     def test_live_process_hash_matches_cmdline_bytes(self):
         import hashlib
 
-        child = self.spawn()
-        start = self.ns["proc_stat"](child.pid)["start"]
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, time; os.write(1, b'fixture-ready\\n'); time.sleep(10)"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+        )
+        self.addCleanup(terminate_and_reap, child)
+        with selectors.DefaultSelector() as readiness:
+            readiness.register(child.stdout, selectors.EVENT_READ)
+            self.assertTrue(readiness.select(timeout=5), "fixture child did not become ready")
+            self.assertEqual(child.stdout.readline(), b"fixture-ready\n")
+
+        observed = self.ns["proc_stat"](child.pid)
+        self.assertIsNotNone(observed)
+        start = observed["start"]
         expected = hashlib.sha256(
             Path("/proc/%d/cmdline" % child.pid).read_bytes()).hexdigest()
         self.assertEqual(self.ns["process_command_hash"](child.pid, start), expected)
