@@ -44,6 +44,53 @@ def _stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _utf8_status(data: bytes) -> tuple[bool, bool]:
+    """Return whether bytes contain invalid UTF-8 or end in an incomplete scalar."""
+    invalid = False
+    incomplete = False
+    index = 0
+    size = len(data)
+    while index < size:
+        lead = data[index]
+        if lead <= 0x7F:
+            index += 1
+            continue
+        if 0xC2 <= lead <= 0xDF:
+            length, second_low, second_high = 2, 0x80, 0xBF
+        elif 0xE0 <= lead <= 0xEF:
+            length, second_low, second_high = 3, 0x80, 0xBF
+            if lead == 0xE0:
+                second_low = 0xA0
+            elif lead == 0xED:
+                second_high = 0x9F
+        elif 0xF0 <= lead <= 0xF4:
+            length, second_low, second_high = 4, 0x80, 0xBF
+            if lead == 0xF0:
+                second_low = 0x90
+            elif lead == 0xF4:
+                second_high = 0x8F
+        else:
+            invalid = True
+            index += 1
+            continue
+
+        valid = True
+        for offset in range(1, length):
+            if index + offset >= size:
+                incomplete = True
+                break
+            byte = data[index + offset]
+            low, high = ((second_low, second_high) if offset == 1 else (0x80, 0xBF))
+            if not low <= byte <= high:
+                invalid = True
+                valid = False
+                break
+        if incomplete:
+            break
+        index += length if valid else 1
+    return invalid, incomplete
+
+
 def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     values = {}
     for part in raw.split(","):
@@ -223,7 +270,8 @@ class RegistryView:
 
     __slots__ = ("path_identity", "resolved_path", "signature", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
-                 "last_observed_at", "_has_duplicate_attempts")
+                 "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
+                 "has_invalid_utf8")
 
     def __init__(self, path_identity: str, resolved_path: str, signature: tuple,
                  raw: bytes, *, previous: "RegistryView | None" = None):
@@ -233,6 +281,9 @@ class RegistryView:
         self.last_observed_at = time.monotonic()
         self._has_duplicate_attempts = None
         if previous is None:
+            invalid_utf8, incomplete_utf8 = _utf8_status(raw)
+            self._invalid_utf8_prefix = invalid_utf8
+            self.has_invalid_utf8 = invalid_utf8 or incomplete_utf8
             boundary = raw.rfind(b"\n") + 1
             complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
             tail = raw[boundary:]
@@ -244,6 +295,9 @@ class RegistryView:
             # The caller supplied only bytes appended to a continuously observed,
             # trusted append-only registry. Rejoin its pending UTF-8 byte tail.
             combined = previous._tail + raw
+            invalid_utf8, incomplete_utf8 = _utf8_status(combined)
+            self._invalid_utf8_prefix = previous._invalid_utf8_prefix or invalid_utf8
+            self.has_invalid_utf8 = self._invalid_utf8_prefix or incomplete_utf8
             pieces = combined.split(b"\n")
             complete_bytes, tail = pieces[:-1], pieces[-1]
             complete = tuple(piece.decode("utf-8", errors="replace") for piece in complete_bytes)

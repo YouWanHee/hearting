@@ -666,7 +666,10 @@ def _pending_owner_settlements(jobs: Path):
 
     try:
         from dispatch_registry_cache import registry_view
-        candidates = registry_view(jobs).settlement_owner_candidates()
+        view = registry_view(jobs)
+        if view.has_invalid_utf8:
+            raise UnicodeError("dispatch-registry-invalid-utf8")
+        candidates = view.settlement_owner_candidates()
     except FileNotFoundError:
         return ()
     pending = []

@@ -15,6 +15,43 @@ import dispatch_registry_cache as CACHE  # noqa: E402
 
 
 class RegistryLinesCacheTest(unittest.TestCase):
+    def test_utf8_status_accepts_literal_replacement_and_malformed_historical_rows(self):
+        self.jobs.write_bytes(
+            b"t\topen\t/repo\t/wt\towner\tnote=" + "\ufffd".encode("utf-8")
+            + b"\nmalformed\n")
+
+        view = CACHE.registry_view(self.jobs)
+
+        self.assertFalse(view.has_invalid_utf8)
+        self.assertEqual(view.malformed_rows, 1)
+
+    def test_split_utf8_append_tail_becomes_valid_without_full_generation_loss(self):
+        prefix = b"t\topen\t/repo\t/wt\towner\tnote="
+        self.jobs.write_bytes(prefix + b"\xef")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertTrue(first.has_invalid_utf8)
+
+        with self.jobs.open("ab") as stream:
+            stream.write(b"\xbf\xbd\n")
+        second = CACHE.registry_view(self.jobs, append_only=True)
+
+        self.assertFalse(second.has_invalid_utf8)
+        self.assertEqual(second.lines, (prefix.decode("utf-8") + "\ufffd",))
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 1)
+
+    def test_invalid_utf8_replacement_generation_does_not_inherit_old_status(self):
+        self.jobs.write_bytes(b"t\topen\t/repo\t/wt\towner\tnote=\xff\n")
+        invalid = CACHE.registry_view(self.jobs)
+        self.assertTrue(invalid.has_invalid_utf8)
+
+        staged = self.jobs.with_name("replacement.log")
+        staged.write_bytes(b"t\topen\t/repo\t/wt\towner\tnote=valid\n")
+        os.replace(staged, self.jobs)
+        replacement = CACHE.registry_view(self.jobs, append_only=True)
+
+        self.assertFalse(replacement.has_invalid_utf8)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
+
     def test_route_and_owner_candidates_keep_conflicts_duplicates_and_append_rows(self):
         def row(aid, extra):
             return ("now\tdone\t/repo\t/wt\tfixture\tattempt_schema_version=2,"
