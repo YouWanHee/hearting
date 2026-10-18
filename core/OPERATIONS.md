@@ -73,7 +73,16 @@ are resumed before new preparation, so resuming an existing task does not
 require another network fetch. Occupied worktree names are skipped with an
 automatically chosen suffix; preparation failure prevents route publication
 and launch and can be retried through the same start with its existing
-decision and approval.
+decision and approval. Candidate allocation checks the full Git ref namespace,
+including pseudo-refs, packed and symbolic refs, remote/tag names, branch
+prefix conflicts, and occupied paths before asking Git to resolve a short
+revision. If worktree creation fails after this invocation created its new
+branch, it removes that branch only when the ref still has the expected commit
+and is not attached to a worktree; a moved, existing, reserved, or uncertain
+ref is preserved. A successfully created worktree keeps its reserved identity
+when later publication fails, so retry resumes the same work. This applies to
+SHA-1 and SHA-256 repositories and does not alter approved dirty work or the
+primary checkout.
 
 Preparation does not run for preview, explain, a non-start compose, or the
 low-level `compile` interface. These paths remain read-only, and a sealed route
@@ -373,6 +382,31 @@ also carries the sweep when normal work invokes it. Neither carrier promises a
 wall-clock cleanup deadline on a machine with no later normal work. Older
 cross-namespace owner evidence without a host-visible death receipt remains
 unknown and keeps its home.
+
+**Dispatch log retention.** Only regular Hearting attempt logs bound by an
+exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are
+eligible for automatic retirement. A log becomes eligible only after its
+attempt is terminal and its route, delivery/ACK, review/replay, replacement,
+summary, lease, and process obligations are settled and the writer is proven
+quiescent. Missing, conflicting, malformed, shared-with-protected, linked,
+replaced, or otherwise uncertain evidence keeps the bytes. Eligible logs age
+from the latest verified terminal/settlement time: retain at least 14 days,
+then retire the oldest eligible logs as needed to approach 2 GiB. Protected
+and unknown bytes take precedence, so totals above 2 GiB are expected when
+needed. The bounded pass reuses one evidence snapshot, rechecks identity
+immediately before unlink, and resumes on the next normal cadence after
+interruption. It runs beside the existing post-exit reaper and selector-free
+`reconcile --apply`; exact-attempt transactions remain scoped to their attempt.
+The append-only session-sweep and pending-delivery observation logs rotate at
+complete record boundaries under their writer lock, retaining a bounded set of
+closed segments. Their active inode and authoritative receipts/ACK records are
+not removed by this policy.
+
+Preflight doctors share the same failure presentation: preserve the check's
+exit status, report a bounded cause excerpt when available (favoring explicit
+reason/error lines and otherwise the final lines), and identify empty output.
+The adapter supplies only its runtime label and invokes its normal checks once;
+diagnosis does not retry the failed check or alter its result.
 
 **Inline exceptions.** Main or a dispatch-depth-1 owner may run such work inline only when at least one holds: the work is `direct` scale or a micro-stage inside the checked `quick` one-shot owner; file or state boundaries make it genuinely non-separable; every route-sealed registered-headless candidate has a typed hard-unavailable result and the compiled fallback policy reaches inline; the work is tightly coupled to external GPU or process state a worker cannot reach; the user explicitly requires main-session execution; or the stage is so small that dispatch overhead clearly exceeds it. A native-subagent restriction is surface-local and is never evidence that registered headless is unavailable. A failed hook-trust or worktree-safety check is a stop/re-isolate condition, not inline authority; `failure_scope=exact-worktree,retry_on_isolated_worktree=1` retains the stricter fail-close rule below. Running `standard+` separable work inline without recording the concrete reason — in `plans/<slug>/_internal/metrics.md` for code cycles, or the experiment `_RUNLOG`/`_internal` for lab cycles — is a contract violation; this generalizes SD-17 beyond code stages.
 

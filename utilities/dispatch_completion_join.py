@@ -299,21 +299,14 @@ def _log_pending_delivery_refusal(jobs: Path, attempt_id: str, reason: str) -> N
     (2026-08-29: three owner terminals refused, zero trace). Never raises."""
 
     try:
-        root = jobs.resolve(strict=False).parent
-        log_dir = root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "ts": time.time(),
-                "event": "delivery-persistence-refused",
-                "attempt_id": attempt_id,
-                "reason": reason,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with open(log_dir / PENDING_DELIVERY_LOG, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        from dispatch_contract import dispatch_state_root
+        from dispatch_observation_log import append_record
+        append_record(dispatch_state_root(jobs), PENDING_DELIVERY_LOG, {
+            "ts": time.time(),
+            "event": "delivery-persistence-refused",
+            "attempt_id": attempt_id,
+            "reason": reason,
+        })
     except OSError:
         pass
 
