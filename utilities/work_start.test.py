@@ -2906,6 +2906,29 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertTrue(records, stderr.getvalue() + stdout.getvalue())
         return records[-1]
 
+    def _cli_correct(self, aid, message):
+        import contextlib
+        import io
+
+        answer = self.root / "corrected-answer.md"
+        answer.write_text(message)
+        module = self.route_module
+        stdout, stderr = io.StringIO(), io.StringIO()
+        defaults = dict(W.start_work.__kwdefaults__ or {})
+        W.start_work.__kwdefaults__ = {**defaults, "run": self._controlled_runner}
+        try:
+            with mock.patch.object(sys, "argv", [str(W.ROOT / "utilities/capability-route.py"),
+                    "correct", "--attempt-id", aid, "--jobs", str(self.jobs),
+                    "--message-file", str(answer)]), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = module.main()
+        finally:
+            W.start_work.__kwdefaults__ = defaults
+        self.assertIn(code, (None, 0), stderr.getvalue() + stdout.getvalue())
+        records = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(records, stderr.getvalue() + stdout.getvalue())
+        return records[-1]
+
     def _handover(self, aid, successor="successor"):
         import dispatch_seat_handover as handover
         import session_tidy as tidy
@@ -2922,7 +2945,8 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
                                      "sid": successor, "harness": "codex", "ts": 2,
                                      "bindings": [binding]}) + "\n")
 
-    def _build_unstarted_chain(self, *, leave_open=False):
+    def _build_unstarted_chain(self, *, leave_open=False, correction_count=1,
+                               legacy_owner_claim=False):
         owner_a = self._seed_initial_owner()
         self._finish_blocked(owner_a)
         self._store(owner_a, "correction for B", "input-a")
@@ -2931,9 +2955,18 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertNotEqual(owner_b, owner_a)
         self._finish_blocked(owner_b)
         self._store(owner_b, "correction for C", "input-b")
+        for index in range(2, correction_count + 1):
+            self._store(owner_b, f"legacy correction {index}", f"input-b-{index}")
         self.timeout_launches.add(self.replacement_launches + 1)
         self.close_timed_out = not leave_open
-        receipt_c = self._cli_start()
+        if legacy_owner_claim:
+            logical_key = self.replacement._logical_key
+            with mock.patch.object(self.replacement, "_logical_key",
+                    side_effect=lambda route, meta: {
+                        **logical_key(route, meta), "after_capacity": owner_b}):
+                receipt_c = self._cli_start()
+        else:
+            receipt_c = self._cli_start()
         self.assertEqual(receipt_c["reason"], "replacement-launch-timeout", receipt_c)
         owner_c = self.launches[-1]["attempt_id"]
         c_fields, c_meta = self.replacement._rows(self.jobs.read_text().splitlines())[owner_c]
@@ -3199,6 +3232,128 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
 
         with mock.patch.object(self.contract, "close_attempt_row", side_effect=close_after_fixture_carrier):
             return super()._controlled_runner(command, **kwargs)
+
+    def _build_legacy_claim_with_settled_attention(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain(
+            correction_count=6, legacy_owner_claim=True)
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        c_fields, c_meta = rows[owner_c]
+        binding = self.replacement.source_binding(self.jobs, rows[owner_b][1])
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        self.assertEqual(record["logical_node"], {
+            "root_route_id": self.route["route_id"], "node": "__owner__", "after_capacity": owner_b})
+        self.assertEqual(record["ordinal"], 1)
+        self.assertEqual(record["proof"]["death_kind"], self.replacement.CORRECTED)
+        self.assertTrue(self.replacement.never_started(c_fields[1], c_meta))
+        self.assertTrue(c_meta.get("pid"))
+        self.assertTrue(c_meta.get("pid_start"))
+        self.assertTrue(c_meta.get("pid_ns"))
+        self.assertTrue(self.contract._settled_cleanup_receipt(c_meta))
+        self.replacement._settle_recovery_attention(self.jobs, owner_b, {
+            "reason": "replacement-parent-identity-unproven"})
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+        return owner_a, owner_b, owner_c
+
+    def _assert_legacy_owner_started_with_all_answers(self, owner_a, owner_b, owner_c, receipt):
+        self.assertTrue(receipt.get("owner_started"), receipt)
+        owner_d = receipt["owner_attempt_id"]
+        self.assertNotEqual(owner_d, owner_c)
+        self.assertEqual(self.launches[-1]["attempt_id"], owner_d)
+        self.assertEqual(self.launches[-1]["prior"], owner_c)
+        answers = self.owner_input.retained(self.jobs, owner_b)
+        self.assertEqual(len(answers), 7)
+        prompt = self.delivered_prompts[owner_d]
+        for answer in answers:
+            self.assertIn(answer["text"], prompt)
+        effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+        self.assertEqual(effective, {owner_d})
+        self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        for aid in (owner_a, owner_b):
+            self.assertEqual((rows[aid][0][1], rows[aid][1].get("note"),
+                              rows[aid][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+        self.assertEqual((rows[owner_c][0][1], rows[owner_c][1].get("launch_outcome"),
+                          rows[owner_c][1].get("launch_started")),
+                         ("done", "never-launched", None))
+        next_edge = self.replacement.source_binding(self.jobs, rows[owner_c][1])
+        next_claim = self.replacement._read(
+            self.replacement._record_path(self.jobs, next_edge[0]))
+        self.assertEqual((next_claim["original_attempt_id"], next_claim["replacement_attempt_id"]),
+                         (owner_c, owner_d))
+        return owner_d
+
+    def test_legacy_settled_owner_normal_start_reuses_one_launch_and_carries_seven_answers(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        attention_path = self.replacement._directory(self.jobs) / "attention/by-source" / (owner_b + ".json")
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[owner_b][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        claim_path = self.replacement._record_path(self.jobs, binding[0])
+        attention_before, claim_before = attention_path.read_bytes(), claim_path.read_bytes()
+
+        first = self._cli_start()
+        owner_d = self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, first)
+        launches_after_first = len(self.launches)
+        replay = self._cli_start()
+        self.assertEqual(replay["owner_attempt_id"], owner_d)
+        self.assertTrue(replay["owner_started"], replay)
+        self.assertEqual(len(self.launches), launches_after_first)
+        self.assertEqual(attention_path.read_bytes(), attention_before)
+        self.assertEqual(claim_path.read_bytes(), claim_before)
+
+    def test_legacy_settled_owner_same_seat_successor_can_resume(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        self._handover(owner_b)
+        W.default_parent_session_id.return_value = "successor"
+        os.environ["CODEX_THREAD_ID"] = "successor"
+
+        receipt = self._cli_start()
+        self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, receipt)
+
+    def test_legacy_settled_owner_correct_starts_with_the_new_answer_in_one_call(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        corrected = self._cli_correct(owner_b, "legacy correction 7")
+        owner_d = self._assert_legacy_owner_started_with_all_answers(owner_a, owner_b, owner_c, corrected)
+        self.assertTrue(corrected["correction"]["retained"])
+        self.assertEqual(corrected["owner_attempt_id"], owner_d)
+
+    def test_legacy_settled_owner_still_rejects_a_different_parent(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        W.default_parent_session_id.return_value = "stranger"
+        os.environ["CODEX_THREAD_ID"] = "stranger"
+        before = len(self.launches)
+
+        receipt = self._cli_start()
+        self.assertEqual(receipt["reason"], "replacement-parent-identity-unproven", receipt)
+        self.assertEqual(len(self.launches), before)
+        self.assertIn(owner_c, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+
+    def test_legacy_settled_owner_does_not_create_a_successor_without_explicit_resume(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        result = self.replacement.advance(self.jobs, owner_b)
+        self.assertEqual(result["state"], "not-applicable")
+        with self.assertRaises(self.contract.DispatchContractError) as caught:
+            self.replacement.claim(self.jobs, owner_c)
+        self.assertEqual(caught.exception.reason, "replacement-duty-settled")
+        self.assertIsNone(self.replacement.source_reservation(self.jobs, owner_c))
+
+    def test_legacy_settled_owner_requires_the_exact_cleanup_receipt(self):
+        _owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        before = len(self.launches)
+
+        with mock.patch.object(self.contract, "_settled_cleanup_receipt", return_value=False):
+            receipt = self._cli_start()
+
+        self.assertEqual(len(self.launches), before)
+        self.assertIn(owner_c, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+        self.assertEqual(receipt.get("owner_attempt_id"), owner_c)
+        self.assertFalse(receipt.get("owner_started"), receipt)
 
 
 class CoupledReviewSelfDispositionTest(unittest.TestCase):
