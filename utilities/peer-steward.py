@@ -3958,6 +3958,7 @@ def cmd_watch_run(args):
                                 expected_harness=expected["harness"],
                                 expected_sid=expected["session_id"],
                                 expected_pane=expected["pane"],
+                                registry_append_only=True,
                             )
                             if readiness.state == "ready":
                                 state, agent = result_state, wait_record.get("agent") or expected_agent
@@ -4019,6 +4020,7 @@ def cmd_watch_run(args):
                                 expected_harness=expected["harness"],
                                 expected_sid=expected["session_id"],
                                 expected_pane=expected["pane"],
+                                registry_append_only=True,
                             )
                             if readiness.state == "ready":
                                 state, agent = result_state, wait_record.get("agent") or expected_agent
@@ -4902,7 +4904,7 @@ def _bottom_form_tokens(target, window=15):
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
                     purpose="completion", target_observation=None, pane_info=None,
-                    native_session_id=None):
+                    native_session_id=None, registry_append_only=False):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session. The session the
@@ -4960,7 +4962,8 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
                                 peer_obligations.bound_work_for_pane(
                                     pane or "", harness or "", sid or "",
                                     execution_attempt_ids=execution_ids,
-                                    include_parent=purpose != "input"))
+                                    include_parent=purpose != "input",
+                                    registry_append_only=registry_append_only))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
@@ -5641,7 +5644,7 @@ def cmd_obligation_runner(args):
         store.begin_read_pass()
         duties = store.list()
         from peer_read_context import PeerReadContext
-        read_context = PeerReadContext()
+        read_context = PeerReadContext(registry_append_only=True)
         _reconcile_obligations(store, duties, read_context=read_context)
         if service_current:
             peer_obligations.exec_service_runner(
@@ -5682,6 +5685,9 @@ def cmd_obligation_runner(args):
             except BlockingIOError:
                 return 0
             if _runner_duties(store, latest_duties):
+                # The lock-free final read found newly accepted local work.
+                # Process that work immediately; no-progress and external-only
+                # passes fall through to the common bounded wait below.
                 continue
             current_duties = latest_duties
             external_signature = latest_external

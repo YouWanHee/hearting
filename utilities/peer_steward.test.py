@@ -2681,6 +2681,7 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
     def test_receipt_is_atomic_complete_and_text_free(self):
         proc = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(proc.stdout)["watch_id"]
+        self._wait_for_wait_calls(1)
         self._release()
         receipt = self._wait_for_receipt(watch_id)
 
@@ -2926,6 +2927,7 @@ class JoinTest(_WatchMixin, unittest.TestCase):
     def test_join_returns_on_the_watcher_exit_event(self):
         armed = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(armed.stdout)["watch_id"]
+        self._wait_for_wait_calls(1)
         joiner = subprocess.Popen(
             [sys.executable, str(_HERE / "peer-steward.py"), "join", watch_id],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self._env("held"),
@@ -2972,6 +2974,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
     def test_alive_needs_pid_starttime_and_lock_together(self):
         fields = self._arm()
         self._wait_for_lock(fields["watch_id"])
+        self._wait_for_wait_calls(1)
         arm = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
         self.assertTrue(peer_steward._alive(arm, self.watch_root), "live watcher holding the lock")
 

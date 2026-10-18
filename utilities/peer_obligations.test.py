@@ -658,6 +658,8 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
                     "dispatch_depth": "1", "transport": "headless",
                     "execution_surface": "registered-headless", "registered_worker": "1",
                     "fallback_hop": "same-harness-headless", "harness": "codex",
+                    "worker_type": "dev/backend", "owner_route_id": "route-fixture",
+                    "owner_route_hash": "sha256:" + "a" * 64, "route_node": "execute",
                     "attempt_id": "att-fixture-1", "parent_sid": "sid-1",
                     "parent_harness": "codex", **process_launch_identity(os.getpid())}
         self.assertNotIn("parent_pane", metadata)
@@ -682,7 +684,9 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         for harness, sid in (("codex", "unrelated"), ("claude", "sid-1")):
             self.assertEqual(obligations.bound_work_for_pane(
                 "w1:p4", harness, sid, jobs=self.jobs), ((), "observed"))
-        with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"), \
+        with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
+                        return_value=(("route-fixture", "sha256:" + "a" * 64, "execute"),)), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"), \
              mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="claude"):
             work, state = obligations.bound_work_for_pane(
                 "w2:p7", "claude", "successor", jobs=self.jobs)

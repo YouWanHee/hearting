@@ -5957,6 +5957,47 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"no-match": 1})
 
 
+class HistoricalObservationCacheTest(ProducerTestBase):
+    def test_historical_index_projection_is_cached_and_separate_from_writer_document(self):
+        digest = "sha256:" + "a" * 64
+
+        def index_document(digest_value):
+            return P.artifact_index.IndexDocument(
+                schema_version=1, artifact_root_id=ROOT_ID,
+                stable_ids={}, routes={}, event_ids={}, streams={},
+                manifests={"cyc_fixture": {
+                    "manifest_id": "man_fixture",
+                    "manifest_revision_id": "mrev_fixture",
+                    "cycle_id": "cyc_fixture", "manifest_digest": digest_value,
+                    "idempotency_key": "cyc_fixture",
+                }},
+                cycles={"cyc_fixture": {
+                    "campaign_id": "camp_fixture",
+                    "cycle_path": "campaigns/camp_fixture/cyc_fixture",
+                    "manifest_digest": digest_value,
+                }},
+            )
+
+        P._HISTORICAL_OBSERVATIONS.clear()
+        adm._write_index(self.root, index_document(digest))
+        first = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
+        cached = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
+        self.assertIs(first, cached)
+        self.assertEqual(first.manifest_row("cyc_fixture")["manifest_digest"], digest)
+
+        writer = adm.load_index(self.root)
+        self.assertIsNot(writer, first)
+        writer.manifests["cyc_fixture"]["manifest_digest"] = "writer-mutation"
+        self.assertEqual(first.manifest_row("cyc_fixture")["manifest_digest"], digest)
+
+        replacement_digest = "sha256:" + "b" * 64
+        adm._write_index(self.root, index_document(replacement_digest))
+        fresh = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
+        self.assertIsNot(first, fresh)
+        self.assertEqual(fresh.manifest_row("cyc_fixture")["manifest_digest"], replacement_digest)
+        self.assertGreaterEqual(P._HISTORICAL_OBSERVATIONS.metrics_snapshot()["hits"], 1)
+
+
 class RouteLineageBindingTest(ProducerTestBase):
     """SD-155/D-120 (artifact-path-contract A-25): a route's verified lineage
     binds an already-open cycle. Every route in this fixture is published by

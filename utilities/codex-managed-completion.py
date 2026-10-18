@@ -511,13 +511,63 @@ def wait_for_session_launch_claims(
 
 
 def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
+    if not args.join_command:
+        # The normal path stays in this observer process so its immutable file
+        # views and bounded settlement/recovery backoff survive each short
+        # supervision checkpoint. Explicit external join commands retain their
+        # existing argv, timeout, output-size, JSON, and error boundary below.
+        import dispatch_completion_join as completion_join
+        from runtime_observation import ObservationContext
+
+        observation_context = getattr(args, "_join_observation_context", None)
+        if observation_context is None:
+            observation_context = ObservationContext(max_entries=8)
+            args._join_observation_context = observation_context
+        try:
+            if args.parent_session_id:
+                receipt = completion_join.join_session_batch(
+                    jobs=args.jobs,
+                    parent_session_id=args.parent_session_id,
+                    expected_attempts=set(attempts),
+                    parent_completion_delivery=(
+                        CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                        else MANAGED_SESSION_PARENT_DELIVERY
+                    ),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                    recover_receiptless=True,
+                    observation_context=observation_context,
+                    registry_append_only=True,
+                )
+            else:
+                receipt = completion_join.join_batch(
+                    jobs=args.jobs,
+                    parent_attempt_id=args.parent_attempt_id,
+                    expected_attempts=set(attempts),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                    recover_receiptless=True,
+                    observation_context=observation_context,
+                    registry_append_only=True,
+                )
+        except completion_join.JoinContractError as exc:
+            raise CompletionError("join-contract-failed") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CompletionError("join-process-failed") from exc
+        if not isinstance(receipt, dict):
+            raise CompletionError("join-response-shape-invalid")
+        try:
+            encoded_size = len(json.dumps(receipt, separators=(",", ":"),
+                                          sort_keys=True).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise CompletionError("join-response-json-invalid") from exc
+        if encoded_size > 65536:
+            raise CompletionError("join-response-oversized")
+        return receipt
+
     command = (
         shlex.split(args.join_command)
-        if args.join_command
-        else [
-            sys.executable,
-            str(ROOT / "utilities" / "dispatch_completion_join.py"),
-        ]
+        if args.join_command else []
     )
     command += ["--jobs", str(args.jobs)]
     if args.parent_session_id:

@@ -1192,6 +1192,8 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
                         jobs: str | Path | None = None,
                         execution_attempt_ids: tuple[str, ...] = (),
                         include_parent: bool = True,
+                        read_context=None,
+                        registry_append_only: bool = False,
                         ) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
     """Read exact executor, registered-parent or handed-over attempt bindings.
 
@@ -1205,8 +1207,8 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         resolve_dispatch_state_root,
     )
     from dispatch_terminal_commit import owner_completion_state
-    from route_authority import owns
-    from dispatch_seat_handover import effective_parent_harness
+    from dispatch_seat_handover import effective_parent, effective_parent_harness
+    from dispatch_registry_cache import registry_view
 
     if jobs is None:
         state_root = resolve_dispatch_state_root(resolve_agent_home())
@@ -1215,21 +1217,57 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         jobs_path = Path(jobs).expanduser().resolve()
         state_root = jobs_path.parent
     try:
-        lines = jobs_path.read_text(encoding="utf-8").splitlines() if jobs_path.exists() else []
+        view = registry_view(jobs_path, append_only=registry_append_only)
+    except FileNotFoundError:
+        view = None
     except OSError:
         return (), "unknown"
+    if view is None:
+        return (), "observed"
+    if view.malformed_rows or view.has_partial_tail:
+        return (), "unknown"
+
+    if read_context is None:
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext(registry_append_only=registry_append_only)
+    candidates = {}
+    for attempt_id in execution_attempt_ids:
+        for record in view.completion_attempt_records(attempt_id):
+            candidates[record.order] = record
+    if include_parent:
+        for record in view.completion_parent_records(session_id):
+            candidates[record.order] = record
+        try:
+            from dispatch_seat_handover import _handover_binding_keys_for_session
+            binding_keys = _handover_binding_keys_for_session(
+                jobs_path, session_id, read_context=read_context)
+            for _status, record in view.handover_candidates(session_id, binding_keys):
+                candidates[record.order] = record
+        except (OSError, ValueError, TypeError):
+            # The current registered-parent rows remain visible; a failed
+            # handover observation cannot grant inherited ownership.
+            pass
+
     result: list[RegisteredWorkObservation] = []
-    for line in lines:
-        fields = line.split("\t")
-        if len(fields) != 6:
-            return (), "unknown"
+    for record in (candidates[key] for key in sorted(candidates)):
+        fields = record.fields
         status = fields[1]
         metadata = parse_registry_metadata(fields[5])
         executor = (metadata.get("attempt_id") in execution_attempt_ids
                     and metadata.get("harness") == harness)
-        parent = (include_parent and owns(metadata, session_id, jobs_path)
-                  and (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
-                       else effective_parent_harness(metadata, jobs_path)) in {None, "", harness})
+        if metadata.get("parent_sid") == session_id:
+            parent_harness = metadata.get("parent_harness")
+            parent_owned = True
+        elif include_parent:
+            parent_owned = effective_parent(metadata, jobs_path,
+                                            read_context=read_context) == session_id
+            parent_harness = effective_parent_harness(
+                metadata, jobs_path, read_context=read_context)
+        else:
+            parent_owned = False
+            parent_harness = ""
+        parent = (include_parent and parent_owned
+                  and parent_harness in {None, "", harness})
         if not executor and not parent:
             continue
         attempt_id = metadata.get("attempt_id", "")

@@ -129,6 +129,18 @@ and binding under their existing lock. Recovery callbacks reconnect the
 existing owner of work; they do not repeat work already owned by its live
 runner.
 
+Long-lived observers may retain a bounded projection of an immutable result
+while every file generation it depended on remains current. The projection
+must name those dependencies, and a missing, unreadable, retargeted, or
+unstable input discards the prior result instead of turning it into authority.
+Mutable writer documents stay separate from historical read projections.
+Append-only reuse is limited to a continuously observed file whose supported
+writer appends records; a partial byte tail remains data, not a row, until its
+newline arrives. Replacements and uncertain writes rebuild the view. Reusing
+parsed bytes avoids I/O; reusing derived decisions additionally requires
+unchanged dependencies, while live recipients, leases, claims, processes, and
+state transitions remain fresh observations.
+
 Documentation explains behavior and preserves the reasons for decisions. Do not
 build the product on a protocol that only ends cleanly when a model perfectly
 remembers long operating documents.

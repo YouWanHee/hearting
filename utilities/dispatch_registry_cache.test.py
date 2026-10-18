@@ -88,6 +88,103 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(len(second.lines), 2)
         self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
 
+    def test_trusted_append_reads_only_new_bytes_and_does_not_promote_partial_row(self):
+        base = "job\topen\t/repo\ttime\towner\tattempt_id=base,attempt_schema_version=2\n"
+        self.jobs.write_bytes(base.encode() +
+                              b"job\topen\t/repo\ttime\towner\tattempt_id=n\xc3")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(first.completion_attempt("néxt"), (None, None))
+        suffix = b"\xa9xt,attempt_schema_version=2\n"
+        with self.jobs.open("ab") as stream:
+            stream.write(suffix)
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        row, error = second.completion_attempt("néxt")
+        self.assertIsNone(error)
+        self.assertIsNotNone(row)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        self.assertEqual(metrics["delta_reads"], 1)
+        self.assertEqual(metrics["delta_bytes_read"], len(suffix))
+        self.assertEqual(metrics["metadata_rows_parsed"], 2)
+        self.assertEqual(second.lines, tuple(base.splitlines() +
+                                              ["job\topen\t/repo\ttime\towner\tattempt_id=néxt,attempt_schema_version=2"]))
+
+    def test_atomic_replacement_forces_full_rebuild_even_on_append_path(self):
+        self.jobs.write_text("old\topen\t/repo\ttime\towner\tf=1\n", encoding="utf-8")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        staged = self.jobs.with_name("jobs.new")
+        staged.write_text("old\topen\t/repo\ttime\towner\tf=1\nnew\topen\t/repo\ttime\towner\tf=2\n",
+                          encoding="utf-8")
+        os.replace(staged, self.jobs)
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertIsNot(first, second)
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 2)
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 0)
+
+    def test_handover_candidate_index_drops_attempt_after_parent_binding_changes(self):
+        self.jobs.write_text(
+            "job\topen\t/repo\ttime\towner\tattempt_id=one,parent_sid=old,"
+            "owner_route_id=route,owner_route_hash=hash,route_node=execute\n",
+            encoding="utf-8")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(len(first.handover_candidates("old")), 1)
+        with self.jobs.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "job\topen\t/repo\ttime\towner\tattempt_id=one,parent_sid=new,"
+                "owner_route_id=route,owner_route_hash=hash,route_node=execute\n")
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(second.handover_candidates("old"), ())
+        self.assertEqual(len(second.handover_candidates("new")), 1)
+
+    def test_append_after_observation_gap_rebuilds_instead_of_using_old_prefix(self):
+        self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        first.last_observed_at -= CACHE._APPEND_OBSERVATION_GAP_SECONDS + 1
+        with self.jobs.open("a", encoding="utf-8") as stream:
+            stream.write("a\tb\tc\td\te\tf=2\n")
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertIsNot(first, second)
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 0)
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 2)
+
+    def test_path_cache_retains_a_bounded_lru(self):
+        for number in range(CACHE._CACHE_MAX_PATHS + 1):
+            path = Path(self.tmp.name) / f"jobs-{number}.log"
+            path.write_text(f"a\tb\tc\td\te\tf={number}\n", encoding="utf-8")
+            CACHE.registry_view(path)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["cache_entries"], CACHE._CACHE_MAX_PATHS)
+        self.assertEqual(metrics["cache_evictions"], 1)
+
+    def test_registry_cache_bytes_are_bounded_even_for_one_oversized_path(self):
+        with mock.patch.object(CACHE, "_CACHE_MAX_BYTES", 8):
+            self.jobs.write_text("large\topen\t/repo\ttime\towner\tf=1\n", encoding="utf-8")
+            view = CACHE.registry_view(self.jobs)
+            self.assertEqual(view.lines[0].split("\t", 1)[0], "large")
+            self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
+            self.assertEqual(CACHE.metrics_snapshot()["cache_bytes"], 0)
+
+    def test_append_segments_compact_indexes_without_reparsing_history(self):
+        self.jobs.write_text(
+            "job\topen\t/repo\ttime\towner\tattempt_id=att-000,attempt_schema_version=2\n",
+            encoding="utf-8")
+        view = CACHE.registry_view(self.jobs, append_only=True)
+        for number in range(1, 301):
+            with self.jobs.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"job\topen\t/repo\ttime\towner\tattempt_id=att-{number:03d},"
+                    "attempt_schema_version=2\n")
+            view = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertLessEqual(len(view._segments), CACHE._MAX_SEGMENTS)
+        self.assertEqual(view.record_count, 301)
+        self.assertEqual(view.completion_attempt("att-000")[0].order, 0)
+        self.assertEqual(view.completion_attempt("att-300")[0].order, 300)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        self.assertEqual(metrics["metadata_rows_parsed"], 301)
+        self.assertEqual(metrics["delta_reads"], 300)
+        self.assertGreater(metrics["segment_compactions"], 0)
+
     def test_unstable_read_retries_and_returns_only_the_new_generation(self):
         self.jobs.write_text("old\topen\t/repo\ttime\towner\tf=1\n", encoding="utf-8")
         real_read = os.read
@@ -129,6 +226,10 @@ class RegistryLinesCacheTest(unittest.TestCase):
         )
         second = CACHE.registry_lines(self.jobs)
         self.assertEqual(len(second), 2)
+        # This fixture rewrites the file directly; size growth alone is not
+        # writer evidence for the append-only fast path.
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 0)
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 2)
         self.jobs.write_text("a\tb\tc\td\te\tf=3\n", encoding="utf-8")
         self.assertEqual(len(CACHE.registry_lines(self.jobs)), 1)
 
