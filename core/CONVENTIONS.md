@@ -283,9 +283,10 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
     gate. Live/unsettled protections remain lineage-wide, and test owner-closure
     is unavailable.
 18. Task-branch publication, matching PR creation/update, and final-head CI
-    observation belong to the depth-1 `autopilot-code` owner only when the
-    existing request names PR and CI and the sealed entry scope is complete.
-    Stage/review worker scope excludes publication. Main integration, merges,
+    observation belong to a depth-1 `autopilot-code` owner whose sealed entry
+    scope is complete. This route authority supplies tool capacity; the owner
+    performs publication only when it is part of the actual requested task.
+    Request wording is not a second authorization test. Stage/review worker scope excludes publication. Main integration, merges,
     release, installation, and worktree cleanup stay with the supervisor.
 
 Token-budget accounting is observation, not attribution. Hook invocations,

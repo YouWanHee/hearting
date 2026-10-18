@@ -705,7 +705,9 @@ PERMISSION_POSTURES = ("bypass", "allowlist")
 # and everything else is decided by the explicit allow rules below -- so a
 # denied command is a plain tool refusal the model can route around, never a
 # classifier cascade.
-PERMISSION_MODE_FLAG_VALUES = {"bypass": "bypassPermissions", "allowlist": "acceptEdits"}
+PERMISSION_MODE_FLAG_VALUES = {
+    "bypass": "bypassPermissions", "allowlist": "acceptEdits", "plan": "plan",
+}
 
 # A headless session ends when its turn ends, so a Bash call Claude Code moves
 # to the background (at the tool timeout, or on request) is lost with it: ~22
@@ -883,9 +885,10 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
         mode, reason = requested, "launch-explicit"
     worktree = getattr(args, "worktree", None)
     settings_paths = _claude_settings_paths(worktree)
-    args.merge_observation_only = commit_policy.git_operation(worktree or "") is not None
+    projection = commit_policy.runtime_permission_projection(args)
+    args.merge_observation_only = bool(projection["observation_only"])
     if args.merge_observation_only:
-        mode, reason = "allowlist", "active-git-operation"
+        mode, reason = "plan", "active-git-operation"
     elif mode == "bypass":
         # Where bypass cannot apply the runtime refuses to start (root/sudo)
         # or does not enter bypass (disableBypassPermissionsMode in any
@@ -897,8 +900,8 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
             mode, reason = "allowlist", "settings-disable-bypass"
     agent_home = Path(str(getattr(args, "agent_home", "") or ROOT))
     worker_type = getattr(args, "worker_type", None)
-    commit_expected = commit_policy.may_commit(args)
-    args.task_publish_scope = commit_policy.task_publish_scope(args)
+    commit_expected = bool(projection["may_commit"])
+    args.task_publish_scope = projection["task_publish_scope"]
     allowed = _allowlist_rules(
         agent_home, worktree, getattr(args, "artifact_root", None), worker_type,
         commit_expected=commit_expected,
@@ -1166,6 +1169,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--parent-attempt-id", args.attempt_id or "unassigned",
             "--state-file", str(completion_state_path(args)),
             "--lease-file", str(completion_lease_path(args)),
+            # Refresh permissions on the existing same-session resume path.
+            "--turn-transport", "resume-process",
             "--add-dir", str(args.artifact_root),
         ]
         if getattr(args, "report_bundle_root", None) is not None:
@@ -1814,6 +1819,11 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_PARENT_ATTEMPT_ID": args.parent_attempt_id or "",
             "AGENT_DISPATCH_PARENT_SESSION_ID": args.parent_session_id or "",
             "AGENT_DISPATCH_WORKER_TYPE": args.worker_type,
+            **commit_policy.runtime_permission_context_env(
+                args, adapter="claude",
+                permission_mode_requested=getattr(args, "permission_mode", None) or "config",
+                agent_home=str(args.agent_home),
+            ),
             "AGENT_DISPATCH_ASSIGNED_CONTRACT": args.assigned_contract,
             "AGENT_DISPATCH_OWNER": args.capability_owner or "",
             "AGENT_DISPATCH_OWNER_HARNESS": args.owner_harness or "",

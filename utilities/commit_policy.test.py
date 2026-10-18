@@ -143,8 +143,9 @@ class CommitPolicyTest(unittest.TestCase):
         self.assertEqual(commit_policy.commit_git_metadata_dirs(stage), ())
         self.assertEqual(commit_policy.commit_git_metadata_dirs(self.args("owner", worktree=self.primary)), ())
 
-    def test_task_publish_scope_uses_existing_complete_pr_and_ci_approval(self):
+    def test_task_publish_scope_uses_sealed_complete_scope_without_wording_gate(self):
         base = Path(self._tmp.name)
+        from route_identity import route_hash, route_id_from_hash
         origin = base / "origin.git"
         subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(origin)], check=True)
         git = ["git", "-C", str(self.primary)]
@@ -153,18 +154,24 @@ class CommitPolicyTest(unittest.TestCase):
         subprocess.run([*git, "fetch", "-q", "origin", "main"], check=True)
         subprocess.run([*git, "remote", "set-head", "origin", "main"], check=True)
         route = {
-            "route_id": "rt-publication", "route_hash": "sha256:publication",
             "capability": "autopilot-code", "cwd": str(self.linked),
             "artifact_root": str(base / ".agent_reports"),
             "entry_scope_contract_version": 1, "entry_execution_scope": "complete",
             "work_request": {"text": "Publish this approved task branch PR and verify its final CI."},
         }
         route_file = base / "route.json"
-        route_file.write_text(json.dumps(route), encoding="utf-8")
         output_dir = Path(route["artifact_root"]) / "campaigns" / "fixture" / "cycle" / "artifacts"
         output_dir.mkdir(parents=True)
-        binding = SimpleNamespace(route_file=str(route_file), route_id=route["route_id"],
-                                  route_hash=route["route_hash"])
+        binding = SimpleNamespace(route_file=str(route_file), route_id="", route_hash="")
+
+        def write_route():
+            route["route_hash"] = route_hash(route)
+            route["route_id"] = route_id_from_hash(route["route_hash"])
+            binding.route_id = route["route_id"]
+            binding.route_hash = route["route_hash"]
+            route_file.write_text(json.dumps(route), encoding="utf-8")
+
+        write_route()
         args = argparse.Namespace(worker_type="owner", dispatch_depth=1,
             owner_route_binding=binding, route_file=None, route_id=None, route_hash=None,
             worktree=str(self.linked))
@@ -178,18 +185,48 @@ class CommitPolicyTest(unittest.TestCase):
         self.assertIn(f"gh pr create --base main --head fx --body-file {output_dir}/dev_logs/pr-description.md",
                       commands)
         self.assertFalse(any("force" in command for command in commands))
+        context = {"route_file": str(route_file), "route_id": route["route_id"],
+                   "route_hash": route["route_hash"], "worktree": str(self.linked),
+                   "capability": "autopilot-code", "artifact_root": route["artifact_root"]}
+        self.assertTrue(commit_policy.runtime_permission_context_is_current(context))
+        original_text = route["work_request"]["text"]
+        route["work_request"]["text"] = "route file changed after binding"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        self.assertFalse(commit_policy.runtime_permission_context_is_current(context))
+        self.assertIsNone(commit_policy.task_publish_scope(args))
+        route["work_request"]["text"] = original_text
+        write_route()
 
         route["entry_execution_scope"] = "report"
-        route_file.write_text(json.dumps(route), encoding="utf-8")
+        write_route()
         self.assertIsNone(commit_policy.task_publish_scope(args))
         route["entry_execution_scope"] = "complete"
-        route["work_request"]["text"] = "Publish the branch and wait for CI."
-        route_file.write_text(json.dumps(route), encoding="utf-8")
-        self.assertIsNone(commit_policy.task_publish_scope(args))
-        route["work_request"]["text"] = "Publish the PR and wait for CI."
+        for wording in (
+            "Create a pull request and verify automated checks.",
+            "Finish the requested task through PR·CI까지.",
+            "Do not publish; this sentence quotes an older PR and CI request.",
+            "진행한 변경을 확인하고 전달해 주세요.",
+        ):
+            with self.subTest(wording=wording):
+                route["work_request"]["text"] = wording
+                write_route()
+                wording_scope = commit_policy.task_publish_scope(args)
+                self.assertEqual((wording_scope["branch"], wording_scope["base"],
+                                  wording_scope["body_file"]),
+                                 (scope["branch"], scope["base"], scope["body_file"]))
         route["capability"] = "autopilot-ship"
-        route_file.write_text(json.dumps(route), encoding="utf-8")
+        write_route()
         self.assertIsNone(commit_policy.task_publish_scope(args))
+
+    def test_unreadable_git_state_keeps_the_projection_fail_closed(self):
+        owner = self.args("owner", dispatch_depth=1)
+        with mock.patch.object(commit_policy, "worktree_git_dirs", return_value=None):
+            projection = commit_policy.runtime_permission_projection(owner)
+            self.assertFalse(projection["git_state_known"])
+            self.assertTrue(projection["observation_only"])
+            self.assertFalse(projection["may_commit"])
+            self.assertIsNone(projection["task_publish_scope"])
+            self.assertFalse(commit_policy.may_commit(owner))
 
     def test_merge_state_keeps_owner_in_observation_mode(self):
         git = ["git", "-C", str(self.linked)]
@@ -217,7 +254,7 @@ class CommitPolicyTest(unittest.TestCase):
             route_hash=None, owner_route_binding=None, permission_mode="config")
         with mock.patch.object(claude, "_configured_permission_posture", return_value=("bypass", "fixture")):
             posture = claude.resolve_permission_posture(claude_args)
-        self.assertEqual((posture["mode"], posture["reason"]), ("allowlist", "active-git-operation"))
+        self.assertEqual((posture["mode"], posture["reason"]), ("plan", "active-git-operation"))
         self.assertNotIn(f"Edit(//{str(self.linked).lstrip('/')}/**)", posture["allowed_tools"])
         self.assertIn(f"Edit(//{str(self.primary).lstrip('/')}/**)", posture["allowed_tools"])
 
@@ -251,8 +288,9 @@ class CommitPolicyTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 used = calls(harness) | shared
                 self.assertLessEqual({"prompt_clause", "registry_fragment"}, used)
-        # the allowlist realization asks the shared answer instead of re-deriving it
-        self.assertIn("may_commit", calls("claude"))
+        # Each adapter reads the same Git-state and publication projection.
+        for harness in HARNESSES:
+            self.assertIn("runtime_permission_projection", calls(harness))
 
 
 

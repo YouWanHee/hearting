@@ -33,8 +33,9 @@ evidence but must not rewrite source or another stage's evidence class. This is
 the report half of the stage ownership contract in `core/OPERATIONS.md` §5.10.
 
 The report stage does not publish a task branch or PR. The capability owner
-handles publication only when the existing approved request includes PR and CI
-within its complete entry scope; integration and merge stay with the supervisor.
+receives task-publication capacity from the route's sealed complete entry scope
+and performs publication only when those actions are part of the actual request.
+Integration and merge stay with the supervisor.
 
 The stage returns the canonical `final_report.md` source path to the
 dispatch-depth-1 capability owner. It does not independently invoke an artifact

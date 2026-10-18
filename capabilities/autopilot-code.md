@@ -201,10 +201,12 @@ Additional code-entry gates:
 - after main/orchestrator merges, verifies the integrated tree, and pushes the
   integration ref, invoke the guarded worktree cleanup check/apply path; never
   infer cleanup eligibility from a runtime session-end event.
-- when the existing request names both PR and CI and the route seals
-  `entry_execution_scope: complete`, the depth-1 owner may publish only its
-  current task branch, create or update that branch's PR, and observe checks
-  for the final head. Use an ordinary non-force push. Write the PR body to
+- when the route seals `entry_execution_scope: complete`, the depth-1 owner has
+  capacity to publish only its current task branch, create or update that
+  branch's PR, and observe checks for the final head. This capacity does not
+  authorize performing a command outside the actual request; request wording,
+  negation, and quoted history are not a second permission test. Use an ordinary
+  non-force push. Write the PR body to
   `$AGENT_ARTIFACT_OUTPUT_DIR/dev_logs/pr-description.md` and pass it with
   `--body-file` after inspecting any existing PR for that branch. CI fixes stay
   within the approved scope and return through the existing review/test/commit path.

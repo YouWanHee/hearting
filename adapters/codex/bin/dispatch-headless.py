@@ -835,8 +835,13 @@ def uses_enclosing_codex_sandbox(args: argparse.Namespace) -> bool:
 
 def effective_runtime_sandbox(args: argparse.Namespace) -> str:
     """Avoid nested mounts while preserving caller sandbox constraints."""
-    if commit_policy.git_operation(getattr(args, "worktree", "")) is not None:
+    if commit_policy.runtime_permission_projection(args)["observation_only"]:
         return "read-only"
+    return base_runtime_sandbox(args)
+
+
+def base_runtime_sandbox(args: argparse.Namespace) -> str:
+    """Return the route/parent sandbox before the temporary Git-state overlay."""
     return "danger-full-access" if uses_enclosing_codex_sandbox(args) else args.sandbox
 
 
@@ -866,7 +871,11 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     may need downstream. A pure query -- see `ensure_owner_writable_dirs` for the
     one place these directories are created before launch."""
 
-    if not getattr(args, "nested_headless_network", False):
+    network_eligible = getattr(
+        args, "nested_headless_network_eligible",
+        getattr(args, "nested_headless_network", False),
+    )
+    if not network_eligible:
         return ()
     claude_config = Path(
         os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
@@ -1214,9 +1223,15 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
 
 
 def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
-    """Grant owner network only while the bound worktree has no Git operation."""
-    if commit_policy.git_operation(getattr(args, "worktree", "")) is not None:
-        return False
+    """Apply the shared current-state fence to the existing owner network grant."""
+    projection = commit_policy.runtime_permission_projection(args)
+    return ((nested_headless_network_eligible(args)
+             or bool(projection["task_publish_scope"]))
+            and not projection["observation_only"])
+
+
+def nested_headless_network_eligible(args: argparse.Namespace) -> bool:
+    """Resolve the route's stable network capacity, before Git-state projection."""
     return codex_standard_owner_network_enabled(
         dispatch_depth=args.dispatch_depth,
         worker_type=args.worker_type,
@@ -1793,6 +1808,11 @@ def main(argv: list[str]) -> int:
             )
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
+    permission_projection = commit_policy.runtime_permission_projection(args)
+    args.task_publish_scope = permission_projection["task_publish_scope"]
+    args.nested_headless_network_eligible = (
+        nested_headless_network_eligible(args) or bool(args.task_publish_scope)
+    )
     args.nested_headless_network = nested_headless_network_enabled(args)
     try:
         default_roots = adapter_default_roots(
@@ -1966,6 +1986,11 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_PARENT_SESSION_ID": args.parent_session_id or "",
             "AGENT_DISPATCH_PARENT_CWD": (_effective_parent_cwd(args) if (args.parent_slug or args.parent_session_id) else ""),
             "AGENT_DISPATCH_WORKER_TYPE": args.worker_type,
+            **commit_policy.runtime_permission_context_env(
+                args, adapter="codex",
+                base_sandbox=base_runtime_sandbox(args),
+                network_eligible=bool(args.nested_headless_network_eligible),
+            ),
             "AGENT_DISPATCH_ASSIGNED_CONTRACT": args.assigned_contract,
             "AGENT_DISPATCH_OWNER": args.capability_owner or "",
             "AGENT_DISPATCH_OWNER_HARNESS": args.owner_harness or "",

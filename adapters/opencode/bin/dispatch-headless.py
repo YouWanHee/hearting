@@ -1515,8 +1515,10 @@ def main(argv: list[str]) -> int:
         args.execution_access_grant = route_authority.bind_launch_access(
             args, runtime="opencode", default_roots=default_roots)
         grant = args.execution_access_grant
-        args.merge_observation_only = commit_policy.git_operation(args.worktree) is not None
-        args.task_publish_scope = commit_policy.task_publish_scope(args)
+        args.opencode_config_base_content = os.environ.get("OPENCODE_CONFIG_CONTENT", "")
+        projection = commit_policy.runtime_permission_projection(args)
+        args.merge_observation_only = bool(projection["observation_only"])
+        args.task_publish_scope = projection["task_publish_scope"]
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
@@ -1542,8 +1544,7 @@ def main(argv: list[str]) -> int:
         # A no-commit worker (commit_policy) is refused `git commit` by the runtime too.
         args.opencode_config_content = deny_commands(
             args.opencode_config_content, commit_policy.COMMIT_COMMANDS, args.agent)
-    elif (args.worker_type == "owner"
-          and commit_policy.git_operation(args.worktree) is not None):
+    elif (args.worker_type == "owner" and args.merge_observation_only):
         args.opencode_config_content = deny_commands(
             args.opencode_config_content, commit_policy.MERGE_MUTATION_COMMANDS, args.agent)
     args.nested_runtime_env = {}
@@ -1778,6 +1779,27 @@ def main(argv: list[str]) -> int:
                 "supervised" if _supervised_owner(args) else "poll"
             ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
+            **commit_policy.runtime_permission_context_env(
+                args, adapter="opencode",
+                agent_home=str(args.agent_home),
+                opencode_config_base=args.opencode_config_base_content,
+                report_bundle_root=(str(args.report_bundle_root)
+                                    if args.report_bundle_root is not None else None),
+                execution_access_roots=[
+                    str(value) for value in (
+                        args.execution_access_grant.additional_writable_roots
+                        if args.execution_access_grant is not None else ()
+                    )
+                ],
+                execution_access_read_roots=[
+                    str(value) for value in (
+                        args.execution_access_grant.read_roots
+                        if args.execution_access_grant is not None else ()
+                    )
+                ],
+                contract_read_roots=[str(value) for value in args.contract_read_roots],
+                selected_agent=str(args.agent),
+            ),
             **args.nested_runtime_env,
             # Headless liveness contract: the OpenCode runtime child exposes
             # the dispatch slug to the plugin, which records a plugin-load

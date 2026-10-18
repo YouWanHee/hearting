@@ -42,6 +42,7 @@ MERGE_MUTATION_COMMANDS = (
     "git reset", "git checkout", "git switch", "git restore", "git apply",
     "git stash", "git clean", "git update-index", "gh pr create", "gh pr edit",
 )
+RUNTIME_PERMISSION_CONTEXT_ENV = "AGENT_OWNER_RUNTIME_PERMISSION_CONTEXT"
 
 
 def worktree_mutating_write_scope(write_scope: str | None) -> bool:
@@ -83,29 +84,149 @@ def is_linked_worktree(worktree, agent_home=None) -> bool:
 
 def git_operation(worktree) -> str | None:
     """Read the current Git operation without changing the worktree."""
+    operation, known = git_operation_state(worktree)
+    return operation if known else None
+
+
+def git_operation_state(worktree) -> tuple[str | None, bool]:
+    """Return the observed operation and whether Git state was readable.
+
+    Permission projection must fail closed when Git metadata cannot be read:
+    treating an unreadable ``MERGE_HEAD`` as an idle worktree would widen the
+    same owner session while its safety state is unknown.
+    """
     dirs = worktree_git_dirs(worktree)
     if dirs is None:
-        return None
+        return None, False
     git_dir, _common = dirs
     for operation, marker in (("merge", "MERGE_HEAD"), ("rebase", "rebase-merge"),
                               ("rebase", "rebase-apply"), ("cherry-pick", "CHERRY_PICK_HEAD")):
-        if (git_dir / marker).exists():
-            return operation
-    return None
+        try:
+            (git_dir / marker).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None, False
+        return operation, True
+    return None, True
+
+
+def runtime_permission_projection(args) -> dict[str, object]:
+    """Project shared mutation/publication state for launch and same-session resume."""
+    operation, known = git_operation_state(getattr(args, "worktree", ""))
+    observation_only = not known or operation is not None
+    authorized_commit = (
+        getattr(args, "worker_type", None) == "owner" or stage_commit_enabled(args)
+    )
+    return {
+        "git_operation": operation,
+        "git_state_known": known,
+        "observation_only": observation_only,
+        "may_commit": authorized_commit and not observation_only,
+        "task_publish_scope": (
+            task_publish_scope(args)
+            if not observation_only and getattr(args, "worker_type", None) == "owner"
+            else None
+        ),
+    }
+
+
+def runtime_permission_context_env(args, **adapter_context) -> dict[str, str]:
+    """Pass existing owner binding facts to its supervised same-session runtime.
+
+    This is runtime transport for reprojection, not an authorization record:
+    route authority remains the already-bound route and the shared projection
+    above rechecks current Git state whenever the session resumes.
+    """
+    if (getattr(args, "worker_type", None) != "owner"
+            or getattr(args, "dispatch_depth", None) != 1):
+        return {RUNTIME_PERMISSION_CONTEXT_ENV: ""}
+    binding = getattr(args, "owner_route_binding", None)
+    route_file = (getattr(args, "route_file", None)
+                  or getattr(binding, "route_file", None)
+                  or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    route_id = (getattr(args, "route_id", None)
+                or getattr(binding, "route_id", None)
+                or os.environ.get("AGENT_OWNER_ROUTE_ID"))
+    route_hash = (getattr(args, "route_hash", None)
+                  or getattr(binding, "route_hash", None)
+                  or os.environ.get("AGENT_OWNER_ROUTE_HASH"))
+    if not route_file or not route_id or not route_hash:
+        return {RUNTIME_PERMISSION_CONTEXT_ENV: ""}
+    context = {
+        "worker_type": "owner",
+        "dispatch_depth": 1,
+        "capability": str(getattr(args, "capability", "") or ""),
+        "worktree": str(Path(str(getattr(args, "worktree", ""))).resolve()),
+        "route_file": str(Path(str(route_file)).resolve()),
+        "route_id": str(route_id),
+        "route_hash": str(route_hash),
+        "artifact_root": str(getattr(args, "artifact_root", "") or ""),
+        "artifact_output_dir": str(
+            getattr(args, "artifact_output_dir", None)
+            or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR", "")
+        ),
+        "attempt_id": str(getattr(args, "attempt_id", "") or ""),
+    }
+    context.update(adapter_context)
+    return {RUNTIME_PERMISSION_CONTEXT_ENV: json.dumps(
+        context, sort_keys=True, separators=(",", ":"))}
+
+
+def read_runtime_permission_context(environ=None) -> dict[str, object] | None:
+    """Read the internal owner-session projection context, rejecting corruption."""
+    source = os.environ if environ is None else environ
+    raw = source.get(RUNTIME_PERMISSION_CONTEXT_ENV, "")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("owner-runtime-permission-context-invalid") from exc
+    required = ("worker_type", "dispatch_depth", "capability", "worktree",
+                "route_file", "route_id", "route_hash", "attempt_id")
+    if (not isinstance(value, dict)
+            or any(not isinstance(value.get(key), str) for key in required if key != "dispatch_depth")
+            or value.get("worker_type") != "owner"
+            or value.get("dispatch_depth") != 1
+            or not value.get("route_file") or not value.get("route_id")
+            or not value.get("route_hash") or not value.get("attempt_id")):
+        raise ValueError("owner-runtime-permission-context-invalid")
+    return value
+
+
+def runtime_permission_context_is_current(context: dict[str, object]) -> bool:
+    """Confirm that a resumed session still carries its exact sealed route."""
+    try:
+        route = json.loads(Path(str(context["route_file"])).read_text(encoding="utf-8"))
+        from route_identity import route_hash as canonical_route_hash, route_id_from_hash
+        actual_hash = canonical_route_hash(route)
+        return (
+            route.get("route_hash") == context.get("route_hash") == actual_hash
+            and route.get("route_id") == context.get("route_id") == route_id_from_hash(actual_hash)
+            and Path(str(route.get("cwd") or "")).resolve() == Path(str(context["worktree"])).resolve()
+            and route.get("capability") == context.get("capability")
+            and Path(str(route.get("artifact_root") or "")).resolve()
+                == Path(str(context.get("artifact_root") or "")).resolve()
+        )
+    except (ImportError, KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def may_commit(args) -> bool:
     """An owner or commit-expected stage, when Git has no operation in progress."""
     authorized = getattr(args, "worker_type", None) == "owner" or stage_commit_enabled(args)
-    return authorized and git_operation(getattr(args, "worktree", "")) is None
+    operation, known = git_operation_state(getattr(args, "worktree", ""))
+    return authorized and known and operation is None
 
 
 def task_publish_scope(args) -> dict[str, str] | None:
     """Resolve the existing approval for a code owner to publish this task PR.
 
-    The source of authority is the sealed complete entry scope plus the stored
-    request that names both PR and CI. Stage/review workers, other capabilities,
-    and task branches that resolve to a protected/default ref receive no scope.
+    The source of authority is the sealed complete entry scope. The approved
+    task itself determines whether the owner performs a publication command;
+    request wording is not a second authorization check. Stage/review workers,
+    other capabilities, and protected/default refs receive no scope.
     """
     if (getattr(args, "worker_type", None) != "owner"
             or getattr(args, "dispatch_depth", None) != 1):
@@ -119,6 +240,14 @@ def task_publish_scope(args) -> dict[str, str] | None:
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
+    try:
+        from route_identity import route_hash as canonical_route_hash, route_id_from_hash
+        actual_route_hash = canonical_route_hash(route)
+        if (route.get("route_hash") != actual_route_hash
+                or route.get("route_id") != route_id_from_hash(actual_route_hash)):
+            return None
+    except (ImportError, TypeError, ValueError):
+        return None
     route_id = getattr(args, "route_id", None) or getattr(binding, "route_id", None)
     route_hash = getattr(args, "route_hash", None) or getattr(binding, "route_hash", None)
     worktree = Path(str(getattr(args, "worktree", ""))).resolve(strict=False)
@@ -130,12 +259,6 @@ def task_publish_scope(args) -> dict[str, str] | None:
             or Path(str(route.get("cwd") or "")).resolve(strict=False) != worktree
             or route.get("entry_scope_contract_version") != 1
             or route.get("entry_execution_scope") != "complete"):
-        return None
-    request = route.get("work_request")
-    text = request.get("text", "") if isinstance(request, dict) else ""
-    if (not isinstance(text, str)
-            or not re.search(r"\b(?:PR|pull request)\b", text, re.IGNORECASE)
-            or not re.search(r"\bCI\b|continuous integration", text, re.IGNORECASE)):
         return None
     output_value = (getattr(args, "artifact_output_dir", None)
                     or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR"))
@@ -150,7 +273,8 @@ def task_publish_scope(args) -> dict[str, str] | None:
     except ValueError:
         return None
     try:
-        if git_operation(worktree) is not None:
+        operation, known = git_operation_state(worktree)
+        if not known or operation is not None:
             return None
         symbolic = subprocess.run(["git", "-C", str(worktree), "symbolic-ref", "-q", "HEAD"],
                                   text=True, capture_output=True, check=True, timeout=5).stdout.strip()
@@ -232,7 +356,8 @@ def commit_git_metadata_dirs(args) -> tuple[Path, ...]:
 
 
 def prompt_clause(args) -> str:
-    if git_operation(getattr(args, "worktree", "")) is not None:
+    operation, known = git_operation_state(getattr(args, "worktree", ""))
+    if not known or operation is not None:
         return MERGE_OBSERVATION_CLAUSE
     return PROMPT_CLAUSE if no_commit_stage(args) else ""
 
