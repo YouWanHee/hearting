@@ -222,4 +222,3 @@ class ObservationContext:
             self._entries.clear()
             self._states.clear()
             self._weight = 0
-
