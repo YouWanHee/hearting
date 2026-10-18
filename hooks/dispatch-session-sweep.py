@@ -30,6 +30,7 @@ from dispatch_session_sweep import (  # noqa: E402
     activate,
     ack_delivered,
     delivery_context,
+    request_obligation_reconciliation,
     sweep_deliver,
 )
 
@@ -60,6 +61,7 @@ def main() -> int:
     session_id = _session_id(payload)
     if session_id is None:
         return 0
+    request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
     try:
         agent_home = resolve_agent_home()
         roots = dispatch_state_roots(agent_home)
@@ -91,18 +93,6 @@ def main() -> int:
     # The same activation also reconnects retained registered-batch observers:
     # lock-guarded, completed duties are never replayed and the original
     # assignment is never relaunched. Fail-open like every other path here.
-    try:
-        from dispatch_batch_obligations import ensure_observers
-    except Exception:
-        ensure_observers = None
-    if ensure_observers is not None and _event_name(payload) != "SessionStart":
-        for root in seen:
-            try:
-                jobs_log = Path(root) / "jobs.log"
-                if jobs_log.is_file():
-                    ensure_observers(jobs_log)
-            except Exception:  # noqa: BLE001
-                continue
     context = delivery_context(batches)
     if not context:
         return 0
@@ -118,6 +108,7 @@ def main() -> int:
             separators=(",", ":"),
         )
     )
+    sys.stdout.flush()
     if _event_name(payload) == "UserPromptSubmit":
         for root, records in batches:
             try:

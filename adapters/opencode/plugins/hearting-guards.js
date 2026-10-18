@@ -1798,7 +1798,7 @@ export const AgentHarnessGuards = async (ctx) => {
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
   const paneBinding = registerPaneContext(ctx)
-  if (!isWorkerSession()) reconnectPeerObligations()
+  reconnectPeerObligations()
   const completionCarrier = createCompletionCarrier(ctx)
   // Restoring an existing -s/--session TUI does not emit session.created.
   // Reuse the process-bound selector; a directory/SDK root cannot pick a recipient.
@@ -1865,10 +1865,12 @@ export const AgentHarnessGuards = async (ctx) => {
       const createdID = info?.id || event.properties?.sessionID || ""
       if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
     }
-    if (event && event.type === "session.created" && !isWorkerSession()) {
+    if (event && event.type === "session.created") {
       reconnectPeerObligations()
-      const sid = event.properties?.info?.id || event.properties?.sessionID || ""
-      await completionCarrier.activate(sid)
+      if (!isWorkerSession()) {
+        const sid = event.properties?.info?.id || event.properties?.sessionID || ""
+        await completionCarrier.activate(sid)
+      }
     }
     if (event && event.type === "session.compacted") {
       const sid = event.properties?.sessionID || ""

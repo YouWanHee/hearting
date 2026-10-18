@@ -5694,39 +5694,72 @@ def cmd_obligation_runner(args):
         time.sleep(delay)
 
 
+def _acquire_ensure_obligations_lock(store):
+    """Try the shared recovery lock without waiting or unlinking its inode."""
+    store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = store.root / "ensure-obligations.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        # This descriptor belongs only to this short call. A detached observer
+        # or runner must never keep the shared exclusion alive after we exit.
+        os.set_inheritable(fd, False)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def cmd_ensure_obligations(_args):
     """Reconnect existing recovery owners from one shared runner entry."""
     store = peer_obligations.ObligationStore()
     try:
-        lifecycle_root = getattr(_args, "lifecycle_root", None)
-        service_current = (peer_obligations.managed_service_binding(lifecycle_root)
-                           if lifecycle_root is not None else None)
-        # An already-running peer runner does not own watch/batch recovery.
-        # Check those families on this callback even while a peer duty is pending.
-        _reconcile_external_obligations(store, service_current=service_current)
-        if not _runner_duties(store):
-            if lifecycle_root is not None:
-                # Preserve the existing managed-current binding for later
-                # producers even while no recovery work needs a runner.
-                external_pending = (any(_external_obligation_signature())
-                                    if service_current else False)
-                peer_obligations.ensure_normal_runner(
-                    lifecycle_root=lifecycle_root,
-                    reconciliation_required=external_pending,
-                )
-            return 0
-        if lifecycle_root is None:
-            started = peer_obligations.ensure_runner(reconciliation_required=True)
-        else:
-            started = peer_obligations.ensure_normal_runner(
-                lifecycle_root=lifecycle_root, reconciliation_required=True)
-        # A legacy runner without the current reconciliation code, or a runtime
-        # without pidfd takeover support, leaves the established fallback here.
-        if not started:
-            _reconcile_obligations(store)
+        lock_fd = _acquire_ensure_obligations_lock(store)
     except Exception:
-        pass
-    return 0
+        return 0
+    if lock_fd is None:
+        return 0
+    try:
+        try:
+            lifecycle_root = getattr(_args, "lifecycle_root", None)
+            service_current = (peer_obligations.managed_service_binding(lifecycle_root)
+                               if lifecycle_root is not None else None)
+            # An already-running peer runner does not own watch/batch recovery.
+            # Check those families on this callback even while a peer duty is pending.
+            _reconcile_external_obligations(store, service_current=service_current)
+            if not _runner_duties(store):
+                if lifecycle_root is not None:
+                    # Preserve the existing managed-current binding for later
+                    # producers even while no recovery work needs a runner.
+                    external_pending = (any(_external_obligation_signature())
+                                        if service_current else False)
+                    peer_obligations.ensure_normal_runner(
+                        lifecycle_root=lifecycle_root,
+                        reconciliation_required=external_pending,
+                    )
+                return 0
+            if lifecycle_root is None:
+                started = peer_obligations.ensure_runner(reconciliation_required=True)
+            else:
+                started = peer_obligations.ensure_normal_runner(
+                    lifecycle_root=lifecycle_root, reconciliation_required=True)
+            # A legacy runner without the current reconciliation code, or a runtime
+            # without pidfd takeover support, leaves the established fallback here.
+            if not started:
+                _reconcile_obligations(store)
+        except Exception:
+            pass
+        return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
 
 
 def receiver_idle(recipient, pane, *, peer=True):

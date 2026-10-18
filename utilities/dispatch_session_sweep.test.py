@@ -9,11 +9,13 @@ temp tree and appends the actual values to evidence/sd111/fixture_env.tsv
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import select
 from pathlib import Path
 import sys
 import tempfile
@@ -37,7 +39,10 @@ def _load(name: str, path: Path):
 
 PD = _load("dispatch_pending_delivery", HERE / "dispatch_pending_delivery.py")
 SWEEP = _load("dispatch_session_sweep", HERE / "dispatch_session_sweep.py")
+HOOK = _load("dispatch_session_sweep_hook", ROOT / "hooks/dispatch-session-sweep.py")
+REQUEST_RECONNECT = SWEEP.request_obligation_reconciliation
 import dispatch_batch_obligations as OBLIGATIONS  # noqa: E402
+import peer_obligations  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -63,6 +68,15 @@ class IsolatedRootMixin:
             "HOME": str(home),
             "XDG_STATE_HOME": str(xdg),
             "HARNESS_STATE_ROOT": str(harness),
+            "AGENT_DISPATCH_JOBS": str(harness / "dispatch" / "jobs.log"),
+            "AGENT_PEER_LEDGER_ROOT": str(harness / "peer-ledger"),
+            "AGENT_HOME": str(ROOT),
+            # A registered worker's inherited role flags alter nested lifecycle
+            # behavior. The suite starts as a main session; adapter tests opt
+            # into worker mode explicitly in their subprocess environments.
+            "AGENT_SESSION_ROLE": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "",
         }
         self._saved_env = {k: os.environ.get(k) for k in self._env_patch}
         os.environ.update(self._env_patch)
@@ -70,6 +84,7 @@ class IsolatedRootMixin:
             "dispatch_session_sweep.test.py", str(home), str(xdg), str(harness)
         )
         self.root = harness / "dispatch"
+        self.enterContext(mock.patch.object(SWEEP, "request_obligation_reconciliation"))
 
     def tearDown(self):
         for key, value in self._saved_env.items():
@@ -330,18 +345,15 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
 
     def test_hook_injects_additional_context_and_acks(self):
         self._seed()
-        hook = Path(__file__).resolve().parents[1] / "hooks" / "dispatch-session-sweep.py"
-        env = dict(os.environ)
-        env["XDG_STATE_HOME"] = str(self.root.parent)
-        env["HARNESS_STATE_ROOT"] = str(self.root)
-        env["AGENT_DISPATCH_JOBS"] = str(self.root / "jobs.log")
-        proc = subprocess.run(
-            [sys.executable, str(hook)],
-            input=json.dumps({"session_id": "sess-owner", "hook_event_name": "UserPromptSubmit"}),
-            capture_output=True, text=True, env=env, check=False,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(HOOK, "request_obligation_reconciliation"), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "sess-owner", "hook_event_name": "UserPromptSubmit",
+             }))), contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK.main(), 0)
+        payload = json.loads(output.getvalue())
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         self.assertIn("att-0000000000000000000000000000bbbb", context)
@@ -350,18 +362,181 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 
+    def test_reconnect_request_uses_detached_common_recovery_entry(self):
+        with mock.patch.object(peer_obligations.subprocess, "Popen") as launch:
+            REQUEST_RECONNECT(lifecycle_root=ROOT)
+        command = launch.call_args.args[0]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(Path(command[1]), ROOT / "utilities/peer-steward.py")
+        self.assertEqual(command[2:], ["__ensure-obligations", "--lifecycle-root", str(ROOT)])
+        self.assertEqual(launch.call_args.kwargs["cwd"], str(ROOT))
+        self.assertEqual(launch.call_args.kwargs["env"], os.environ.copy())
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+        self.assertTrue(launch.call_args.kwargs["close_fds"])
+        self.assertIs(launch.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(launch.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(launch.call_args.kwargs["stderr"], subprocess.DEVNULL)
+
+    def test_user_prompt_flushes_real_pipe_before_ack_and_finishes_with_slow_recovery(self):
+        self._seed()
+        fixture = self.root.parent / "slow-recovery-fixture.py"
+        gate = self.root.parent / "allow-ack"
+        ack_entered = self.root.parent / "ack-entered"
+        child_pid_file = self.root.parent / "recovery-child.pid"
+        fixture.write_text(
+            "import json,os,time\n"
+            "open(os.environ['SLOW_RECOVERY_PID'],'w').write(str(os.getpid()))\n"
+            "open(os.environ['SLOW_RECOVERY_ENV'],'w').write(json.dumps({k:os.environ.get(k) for k in "
+            "('AGENT_DISPATCH_JOBS','HARNESS_STATE_ROOT','AGENT_PEER_LEDGER_ROOT','XDG_STATE_HOME','AGENT_HOME','FIXTURE_LIFECYCLE_ROOT')}))\n"
+            "time.sleep(15)\n",
+            encoding="utf-8",
+        )
+        harness = self.root.parent / "run-hook-fixture.py"
+        harness.write_text(
+            "import importlib.util,json,os,subprocess,sys,time\n"
+            "from pathlib import Path\n"
+            f"root=Path({str(ROOT)!r}); hook_path=root/'hooks/dispatch-session-sweep.py'\n"
+            "sys.path.insert(0,str(root/'utilities'))\n"
+            "spec=importlib.util.spec_from_file_location('fixture_hook',hook_path); hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)\n"
+            "fixture=Path(os.environ['SLOW_RECOVERY_SCRIPT'])\n"
+            "def request(*,lifecycle_root=None):\n"
+            " env=os.environ.copy(); env['FIXTURE_LIFECYCLE_ROOT']=str(lifecycle_root)\n"
+            " p=subprocess.Popen([sys.executable,str(fixture)],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,start_new_session=True)\n"
+            " Path(os.environ['SLOW_RECOVERY_PID_FILE']).write_text(str(p.pid))\n"
+            " p.returncode=0\n"
+            "hook.request_obligation_reconciliation=request\n"
+            "hook.resolve_agent_home=lambda:Path(os.environ['FIXTURE_AGENT_HOME'])\n"
+            "hook.dispatch_state_roots=lambda _home:(Path(os.environ['FIXTURE_DISPATCH_ROOT']),)\n"
+            "real_ack=hook.ack_delivered\n"
+            "def ack(*args,**kwargs):\n"
+            " Path(os.environ['ACK_ENTERED']).write_text(str(time.monotonic_ns()))\n"
+            " deadline=time.monotonic()+5\n"
+            " while not Path(os.environ['ACK_GATE']).exists() and time.monotonic()<deadline: time.sleep(.005)\n"
+            " result=real_ack(*args,**kwargs)\n"
+            " Path(os.environ['ACK_COMMITTED']).write_text(str(time.monotonic_ns()))\n"
+            " return result\n"
+            "hook.ack_delivered=ack\n"
+            "sys.stdin=__import__('io').StringIO(json.dumps({'session_id':'sess-owner','hook_event_name':'UserPromptSubmit'}))\n"
+            "raise SystemExit(hook.main())\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update({
+            "FIXTURE_AGENT_HOME": str(self.root.parent),
+            "FIXTURE_DISPATCH_ROOT": str(self.root),
+            "AGENT_HOME": str(ROOT),
+            "SLOW_RECOVERY_SCRIPT": str(fixture),
+            "SLOW_RECOVERY_PID_FILE": str(child_pid_file),
+            "SLOW_RECOVERY_PID": str(self.root.parent / "slow-recovery.pid"),
+            "SLOW_RECOVERY_ENV": str(self.root.parent / "slow-recovery-env.json"),
+            "ACK_GATE": str(gate),
+            "ACK_ENTERED": str(ack_entered),
+            "ACK_COMMITTED": str(self.root.parent / "ack-committed"),
+        })
+        started = time.monotonic()
+        hook_process = subprocess.Popen(
+            [sys.executable, str(harness)], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
+        child_pid = None
+        try:
+            fd = hook_process.stdout.fileno()
+            collected = bytearray()
+            deadline = started + 5
+            while b"\n" not in collected and time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if ready:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    collected.extend(chunk)
+            self.assertIn(b"\n", collected, "hook output did not reach the pipe promptly")
+            output_at = time.monotonic()
+            output_line = bytes(collected).split(b"\n", 1)[0] + b"\n"
+            output_payload = json.loads(output_line)
+            self.assertEqual(output_payload["hookSpecificOutput"]["hookEventName"],
+                             "UserPromptSubmit")
+            self.assertIn("att-0000000000000000000000000000bbbb",
+                          output_payload["hookSpecificOutput"]["additionalContext"])
+            self.assertTrue(ack_entered.exists(), "hook did not reach its ACK call")
+            self.assertEqual(PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"],
+                             "claimed", "ACK state changed before the pipe reader received output")
+            gate.touch()
+            child_pid = int(child_pid_file.read_text())
+            tail, err = hook_process.communicate(timeout=8)
+            hook_exit_at = time.monotonic()
+            elapsed = hook_exit_at - started
+            self.assertEqual(hook_process.returncode, 0, err.decode("utf-8", "replace"))
+            self.assertLess(elapsed, 10.0, f"output, ACK, and hook exit took {elapsed:.3f}s")
+            ack_at = int(Path(env["ACK_COMMITTED"]).read_text()) / 1_000_000_000
+            self.assertLess(output_at, ack_at, "ACK committed before pipe output arrived")
+            self.assertLess(ack_at, hook_exit_at, "hook exited before the exact ACK committed")
+            self.assertLess(output_at - started, 10.0)
+            self.assertLess(ack_at - started, 10.0)
+            self.assertLess(hook_exit_at - started, 10.0)
+            self.assertEqual(PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"],
+                             "acked")
+            self.assertTrue(tail == b"" or tail.endswith(b"\n"))
+            self.assertTrue(self._pid_alive(child_pid), "slow recovery did not outlive hook exit")
+            child_env = json.loads((self.root.parent / "slow-recovery-env.json").read_text())
+            self.assertEqual(child_env, {
+                "AGENT_DISPATCH_JOBS": env["AGENT_DISPATCH_JOBS"],
+                "HARNESS_STATE_ROOT": env["HARNESS_STATE_ROOT"],
+                "AGENT_PEER_LEDGER_ROOT": env["AGENT_PEER_LEDGER_ROOT"],
+                "XDG_STATE_HOME": env["XDG_STATE_HOME"],
+                "AGENT_HOME": env["AGENT_HOME"],
+                "FIXTURE_LIFECYCLE_ROOT": str(ROOT),
+            })
+        finally:
+            if hook_process.poll() is None:
+                hook_process.kill()
+                hook_process.wait(timeout=3)
+            if child_pid is None and child_pid_file.exists():
+                child_pid = int(child_pid_file.read_text())
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, 15)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 2
+                while self._pid_alive(child_pid) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def test_reconnect_is_requested_without_a_delivery_projection(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(HOOK, "sweep_deliver", return_value=([], 0)), \
+             mock.patch.object(HOOK, "request_obligation_reconciliation") as request, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "worker-session", "hook_event_name": "UserPromptSubmit",
+             }))), contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK.main(), 0)
+        request.assert_called_once_with(lifecycle_root=ROOT)
+        self.assertEqual(output.getvalue(), "")
+
     def test_startup_and_resume_context_never_ack_or_take_a_delivery_lease(self):
         self._seed()
-        hook = ROOT / "hooks/dispatch-session-sweep.py"
-        env = {**os.environ, "AGENT_DISPATCH_JOBS": str(self.root / "jobs.log"),
-               "HARNESS_STATE_ROOT": str(self.root)}
         before = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)
         for source in ("startup", "resume"):
-            proc = subprocess.run([sys.executable, str(hook)], capture_output=True, text=True,
-                                  env=env, input=json.dumps({"session_id": "sess-owner",
-                                  "hook_event_name": "SessionStart", "source": source}))
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("att-0000000000000000000000000000bbbb", proc.stdout)
+            output = io.StringIO()
+            with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+                 mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+                 mock.patch.object(HOOK, "request_obligation_reconciliation"), \
+                 mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sess-owner",
+                     "hook_event_name": "SessionStart", "source": source}))), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(HOOK.main(), 0)
+            self.assertIn("att-0000000000000000000000000000bbbb", output.getvalue())
             self.assertEqual(PD.read(self.root, "sess-owner", before["delivery_id"]), before)
         self.test_hook_injects_additional_context_and_acks()
 
@@ -904,11 +1079,13 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
              mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
             SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
         reconcile.assert_called_once_with(jobs)
-        ensure.assert_called_once_with()
+        request.assert_called_once_with(lifecycle_root=ROOT)
+        ensure.assert_not_called()
 
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -945,33 +1122,270 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
         other_args.control_socket = secondary / "control.sock"
         other_duty_id, _other_record = OBLIGATIONS.create(other_args)
 
-        class Launched:
-            pid = 902343
-
-        service_script = self.root.parent / "release" / "utilities" / "codex-managed-completion.py"
         with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
-             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
-             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
-             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
-             mock.patch.object(OBLIGATIONS.subprocess, "Popen", return_value=Launched()) as launch:
+             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
+             mock.patch.object(OBLIGATIONS.subprocess, "Popen") as launch:
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
         reconcile.assert_called_once_with(jobs)
+        request.assert_called_once_with(lifecycle_root=ROOT)
         settle.assert_not_called()
-        self.assertEqual(launch.call_count, 2)
-        launches = [call.args[0] for call in launch.call_args_list]
-        self.assertEqual(
-            {argv[argv.index("--jobs") + 1] for argv in launches},
-            {str(jobs), str(other_jobs)},
-        )
-        self.assertTrue(any(duty_id in argv for argv in launches))
-        self.assertTrue(any(other_duty_id in argv for argv in launches))
+        launch.assert_not_called()
         self.assertEqual(jobs.read_bytes(), unreadable)
         self.assertEqual(other_jobs.read_bytes(), other_before)
+
+
+class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
+    def test_codex_worker_prompt_and_sessionstart_request_recovery_without_main_context(self):
+        prompt = _load("codex_userprompt_recovery_test",
+                       ROOT / "adapters/codex/hooks/userprompt-lifecycle.py")
+        sessionstart = _load("codex_sessionstart_recovery_test",
+                             ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py")
+        worker_env = {
+            "AGENT_SESSION_ROLE": "worker",
+            "AGENT_DISPATCH_CHILD": "1",
+            "AGENT_DISPATCH_DEPTH": "2",
+        }
+        with mock.patch.dict(os.environ, worker_env), \
+             mock.patch.object(peer_obligations, "request_obligation_recovery") as request, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "codex-worker"}))), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(prompt.main(), 0)
+        request.assert_called_once_with(lifecycle_root=ROOT)
+        self.assertEqual(output.getvalue(), "")
+
+        request.reset_mock()
+        with mock.patch.dict(os.environ, worker_env), \
+             mock.patch.object(peer_obligations, "request_obligation_recovery") as request_start, \
+             mock.patch.object(sessionstart, "run_preflight", side_effect=AssertionError("main memory path")), \
+             mock.patch.object(sessionstart, "local_evidence_context",
+                               side_effect=AssertionError("main context path")), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "codex-worker"}))), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sessionstart.main(), 0)
+        request_start.assert_called_once_with(lifecycle_root=ROOT)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_claude_sessionstart_requests_recovery_before_missing_root_return(self):
+        with mock.patch.object(HOOK, "request_obligation_reconciliation") as request, \
+             mock.patch.object(HOOK, "resolve_agent_home", side_effect=RuntimeError("no projection")), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "claude-session", "hook_event_name": "SessionStart",
+             }))):
+            self.assertEqual(HOOK.main(), 0)
+        request.assert_called_once_with(lifecycle_root=ROOT)
+
+    def test_opencode_worker_init_and_session_created_use_shared_recovery_entry(self):
+        capture = self.root.parent / "opencode-recovery-calls.tsv"
+        bin_dir = self.root.parent / "fixture-bin"
+        bin_dir.mkdir()
+        fake_python = bin_dir / "python3"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do if [ \"$arg\" = '__ensure-obligations' ]; then\n"
+            "printf '%s\\t%s\\t%s\\t%s\\t%s\\t' \"$AGENT_DISPATCH_JOBS\" \"$HARNESS_STATE_ROOT\" \"$AGENT_PEER_LEDGER_ROOT\" \"$XDG_STATE_HOME\" \"$AGENT_HOME\" >> \"$RECOVERY_CAPTURE\"\n"
+            "for item in \"$@\"; do printf '%s ' \"$item\" >> \"$RECOVERY_CAPTURE\"; done\n"
+            "printf '\\n' >> \"$RECOVERY_CAPTURE\"; fi; done\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        env = os.environ.copy()
+        env.update({
+            "AGENT_SESSION_ROLE": "worker",
+            "AGENT_DISPATCH_CHILD": "1",
+            "AGENT_DISPATCH_DEPTH": "2",
+            "AGENT_DISPATCH_JOBS": str(self.root / "jobs.log"),
+            "HARNESS_STATE_ROOT": str(self.root.parent / "harness-state"),
+            "AGENT_PEER_LEDGER_ROOT": str(self.root.parent / "peer-ledger"),
+            "XDG_STATE_HOME": str(self.root.parent / "xdg-state"),
+            "AGENT_HOME": str(ROOT),
+            "RECOVERY_CAPTURE": str(capture),
+            "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        })
+        script = f'''import {{ pathToFileURL }} from "node:url";
+const {{ AgentHarnessGuards }} = await import(pathToFileURL({json.dumps(str(ROOT / "adapters/opencode/plugins/hearting-guards.js"))}));
+const hooks = await AgentHarnessGuards({{client: {{app: {{log: async () => {{}}}}, session: {{}}}}, directory: process.cwd()}});
+await hooks.event({{event: {{type: "session.created", properties: {{info: {{id: "worker-session"}}}}}}}});
+hooks.dispose();
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", script], env=env,
+                             cwd=str(self.root), capture_output=True, text=True, timeout=20)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (not capture.exists() or len(capture.read_text().splitlines()) < 2):
+            time.sleep(0.02)
+        calls = capture.read_text().splitlines()
+        self.assertEqual(len(calls), 2, calls)
+        for call in calls:
+            jobs, state, peer, xdg, agent_home, command = call.split("\t", 5)
+            self.assertEqual((jobs, state, peer, xdg, agent_home), (
+                env["AGENT_DISPATCH_JOBS"], env["HARNESS_STATE_ROOT"],
+                env["AGENT_PEER_LEDGER_ROOT"], env["XDG_STATE_HOME"], env["AGENT_HOME"],
+            ))
+            self.assertIn("__ensure-obligations", command)
+            self.assertIn("--lifecycle-root", command)
+            self.assertIn(str(ROOT.resolve()), command)
+
+
+class DetachedCommonRecoveryTest(IsolatedRootMixin, unittest.TestCase):
+    def test_real_detached_common_entry_reconnects_the_same_pending_batch_after_hook_exit(self):
+        jobs_path = self.root / "jobs.log"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text("".join(
+            "2026-10-18T00:00:00Z\topen\t/repo\t/wt\t" + attempt + "\t" + ",".join((
+                "attempt_schema_version=2", "dispatch_depth=2", "transport=headless",
+                "execution_surface=registered-headless", "registered_worker=1",
+                f"attempt_id={attempt}", "parent_attempt_id=att-r6-parent", "note=fixture",
+            )) + "\n" for attempt in ("att-r6-a", "att-r6-b")
+        ), encoding="utf-8")
+        args = SimpleNamespace(
+            jobs=jobs_path,
+            sealed_batch_id="batch-r6-fixture",
+            parent_attempt_id="att-r6-parent",
+            parent_session_id=None,
+            attempt_id=["att-r6-a", "att-r6-b"],
+            delivery_parent_id="att-r6-parent",
+            control_socket=self.root.parent / "control.sock",
+            queue_socket=None,
+            thread_id=None,
+            interval=0.05,
+            timeout=120.0,
+        )
+        duty_id, before = OBLIGATIONS.create(args)
+        original_jobs = jobs_path.read_bytes()
+
+        lifecycle_root = self.root.parent / "fixture-lifecycle"
+        fixture_utilities = lifecycle_root / "utilities"
+        fixture_utilities.mkdir(parents=True)
+        (lifecycle_root / "hooks").mkdir()
+        for source in (ROOT / "utilities").iterdir():
+            if source.name == "peer-steward.py":
+                continue
+            target = fixture_utilities / source.name
+            target.symlink_to(source, target_is_directory=source.is_dir())
+        shutil.copyfile(ROOT / "hooks/dispatch-session-sweep.py",
+                        lifecycle_root / "hooks/dispatch-session-sweep.py")
+        wrapper_pid_file = self.root.parent / "common-entry.pid"
+        wrapper_env_file = self.root.parent / "common-entry-env.json"
+        exec_marker = self.root.parent / "common-entry-exec.ns"
+        real_entry = ROOT / "utilities/peer-steward.py"
+        (fixture_utilities / "peer-steward.py").write_text(
+            "import json,os,sys,time\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['COMMON_ENTRY_PID_FILE']).write_text(str(os.getpid()))\n"
+            "Path(os.environ['COMMON_ENTRY_ENV_FILE']).write_text(json.dumps({"
+            "'env':{k:os.environ.get(k) for k in ('AGENT_DISPATCH_JOBS','HARNESS_STATE_ROOT','AGENT_PEER_LEDGER_ROOT','XDG_STATE_HOME','AGENT_HOME')},"
+            "'args':sys.argv[1:]}))\n"
+            "time.sleep(1.5)\n"
+            "Path(os.environ['COMMON_ENTRY_EXEC_MARKER']).write_text(str(time.monotonic_ns()))\n"
+            f"os.execv(sys.executable,[sys.executable,{str(real_entry)!r},*sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        (lifecycle_root / "core").mkdir()
+        fixture_agent_home = self.root.parent / "fixture-agent-home"
+        (fixture_agent_home / "core").mkdir(parents=True)
+        (fixture_agent_home / "core/CORE.md").write_text("fixture home\n")
+        harness = self.root.parent / "run-real-hook.py"
+        harness.write_text(
+            "import importlib.util,json,os,sys\n"
+            "from pathlib import Path\n"
+            f"hook_path=Path({str(lifecycle_root / 'hooks/dispatch-session-sweep.py')!r})\n"
+            f"sys.path.insert(0,{str(lifecycle_root / 'utilities')!r})\n"
+            "spec=importlib.util.spec_from_file_location('r6_hook',hook_path); hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)\n"
+            "sys.stdin=__import__('io').StringIO(json.dumps({'session_id':'fixture-session','hook_event_name':'UserPromptSubmit'}))\n"
+            "raise SystemExit(hook.main())\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.root.parent / "home"),
+            "XDG_STATE_HOME": str(self.root.parent / "xdg-state"),
+            "HARNESS_STATE_ROOT": str(self.root.parent / "harness-state"),
+            "AGENT_PEER_LEDGER_ROOT": str(self.root.parent / "peer-ledger"),
+            "AGENT_DISPATCH_JOBS": str(jobs_path),
+            "AGENT_HOME": str(fixture_agent_home),
+            "COMMON_ENTRY_PID_FILE": str(wrapper_pid_file),
+            "COMMON_ENTRY_ENV_FILE": str(wrapper_env_file),
+            "COMMON_ENTRY_EXEC_MARKER": str(exec_marker),
+        })
+        wrapper_pid = observer_pid = None
+        try:
+            started_ns = time.monotonic_ns()
+            hook = subprocess.Popen([sys.executable, str(harness)], env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            output, error = hook.communicate(timeout=5)
+            hook_exit_ns = time.monotonic_ns()
+            self.assertEqual(hook.returncode, 0, error.decode("utf-8", "replace"))
+            self.assertLess(hook_exit_ns - started_ns, 10_000_000_000)
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not exec_marker.exists():
+                time.sleep(0.02)
+            self.assertTrue(exec_marker.exists(), "detached request did not reach the real common entry")
+            wrapper_pid = int(wrapper_pid_file.read_text())
+            exec_ns = int(exec_marker.read_text())
+            self.assertGreater(exec_ns, hook_exit_ns,
+                               "real common entry began before its requesting hook exited")
+            snapshot = json.loads(wrapper_env_file.read_text())
+            self.assertEqual(snapshot["env"], {
+                "AGENT_DISPATCH_JOBS": env["AGENT_DISPATCH_JOBS"],
+                "HARNESS_STATE_ROOT": env["HARNESS_STATE_ROOT"],
+                "AGENT_PEER_LEDGER_ROOT": env["AGENT_PEER_LEDGER_ROOT"],
+                "XDG_STATE_HOME": env["XDG_STATE_HOME"],
+                "AGENT_HOME": env["AGENT_HOME"],
+            })
+            self.assertEqual(snapshot["args"], [
+                "__ensure-obligations", "--lifecycle-root", str(lifecycle_root),
+            ])
+
+            deadline = time.monotonic() + 5
+            after = OBLIGATIONS.read(jobs_path, duty_id)
+            while (after is None or not after.get("observer")) and time.monotonic() < deadline:
+                time.sleep(0.02)
+                after = OBLIGATIONS.read(jobs_path, duty_id)
+            self.assertIsNotNone(after)
+            observer = after["observer"]
+            self.assertIsInstance(observer.get("pid"), int)
+            observer_pid = observer["pid"]
+            self.assertEqual(after["id"], before["id"])
+            self.assertEqual(after["identity"], before["identity"])
+            self.assertEqual(after["identity"]["attempt_ids"], ["att-r6-a", "att-r6-b"])
+            self.assertEqual(after["identity"]["delivery_parent_id"], "att-r6-parent")
+            self.assertEqual(after["effective_attempts"], ["att-r6-a", "att-r6-b"])
+            self.assertEqual(after["state"], "observing")
+            self.assertIsNone(after["outcome"])
+            self.assertEqual(after["delivery"], "pending")
+            self.assertEqual(jobs_path.read_bytes(), original_jobs,
+                             "recovery replayed or rewrote a worker assignment")
+            cmdline = Path(f"/proc/{observer_pid}/cmdline").read_bytes().replace(b"\0", b" ")
+            self.assertIn(b"codex-managed-completion.py", cmdline)
+            self.assertIn(b"--resume-obligation", cmdline)
+            self.assertNotIn(b"dispatch-headless", cmdline)
+            self.assertTrue(output == b"" or output.endswith(b"\n"))
+        finally:
+            for pid in (observer_pid, wrapper_pid):
+                if pid is not None:
+                    try:
+                        os.kill(pid, 15)
+                    except ProcessLookupError:
+                        pass
+            for pid in (observer_pid, wrapper_pid):
+                if pid is None:
+                    continue
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
 
 
 if __name__ == "__main__":

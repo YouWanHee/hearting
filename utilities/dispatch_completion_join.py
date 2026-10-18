@@ -8,6 +8,55 @@ typed harvest, and emits one bounded JSON receipt for the session supervisor.
 
 from __future__ import annotations
 
+import ctypes
+import os
+import signal
+import sys
+
+
+def _cli_guard_failure(message: str) -> None:
+    sys.stderr.write(f"dispatch-completion-join: {message}\n")
+    raise SystemExit(70)
+
+
+def _cli_parent_fence() -> None:
+    """Bind this CLI waiter to its direct consumer before project imports."""
+    raw_expected = os.environ.get("HEARTING_JOIN_CONSUMER_PID")
+    if raw_expected is None:
+        expected_parent = os.getppid()
+    elif not (raw_expected.isascii() and raw_expected.isdecimal()):
+        _cli_guard_failure("invalid consumer pid")
+    else:
+        expected_parent = int(raw_expected)
+        if expected_parent <= 0:
+            _cli_guard_failure("invalid consumer pid")
+
+    if os.getppid() != expected_parent:
+        _cli_guard_failure("consumer pid mismatch")
+    if sys.platform != "linux":
+        sys.stderr.write(
+            "dispatch-completion-join: parent-lifetime guarantee is unproven on "
+            f"{sys.platform}; continuing with existing join behavior\n"
+        )
+        return
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Linux PR_SET_PDEATHSIG. Install before project imports or registry
+        # access, then reread PPID to close the setup race.
+        result = libc.prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (AttributeError, OSError) as exc:
+        _cli_guard_failure(f"parent-death guard failed: {exc}")
+    if result != 0:
+        err = ctypes.get_errno()
+        _cli_guard_failure(f"parent-death guard failed: {os.strerror(err)}")
+    if os.getppid() != expected_parent:
+        _cli_guard_failure("consumer exited during guard setup")
+
+
+if __name__ == "__main__":
+    _cli_parent_fence()
+
 import argparse
 import base64
 from contextlib import contextmanager
@@ -15,13 +64,11 @@ from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import shlex
 import subprocess
 import tempfile
 import time
-import sys
 from typing import Callable
 
 

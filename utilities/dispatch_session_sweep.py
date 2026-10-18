@@ -33,6 +33,16 @@ SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
 
 
+def request_obligation_reconciliation(*, lifecycle_root: str | Path | None = None) -> None:
+    """Ask the common recovery entry to reconnect observers without holding a hook."""
+    try:
+        import peer_obligations
+        root = lifecycle_root or Path(__file__).resolve().parents[1]
+        peer_obligations.request_obligation_recovery(lifecycle_root=root)
+    except Exception:
+        pass
+
+
 def _append_self_instrumentation(
     root: Path, elapsed_ns: int, entry_count: int, claimed_count: int
 ) -> None:
@@ -193,11 +203,7 @@ def _reconcile_canonical_dispatch_state(root: Path) -> None:
         reconcile_pending_delivery(jobs)
     except Exception:
         pass
-    try:
-        from dispatch_batch_obligations import ensure_observers
-        ensure_observers()
-    except Exception:
-        pass
+    request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:

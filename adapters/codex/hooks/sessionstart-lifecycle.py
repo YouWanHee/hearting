@@ -165,7 +165,15 @@ def emit_context(event_name: str, parts: list[str]) -> None:
 def main() -> int:
     payload = load_payload()
     current_cwd = cwd(payload)
-    if not is_worker_session():
+    worker = is_worker_session()
+    if worker:
+        try:
+            sys.path.insert(0, str(ROOT / "utilities"))
+            from peer_obligations import request_obligation_recovery
+            request_obligation_recovery(lifecycle_root=ROOT)
+        except Exception:
+            pass
+    else:
         try:
             from herdr_session_projection import project
             project(payload, session_id(payload), worker=False)
@@ -173,7 +181,7 @@ def main() -> int:
             pass
 
     parts = []
-    if not is_worker_session():
+    if not worker:
         forget_shown_candidates(payload)
         parts.append(card_context(payload, current_cwd))
         try:
