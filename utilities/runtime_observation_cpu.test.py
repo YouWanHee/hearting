@@ -1036,34 +1036,50 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     if str(observer.get("pid", "")).isdigit():
                         groups.add(int(observer["pid"]))
                 temp_prefix = str(temp_root) + os.sep
-                for name in os.listdir("/proc"):
-                    if not name.isdigit():
-                        continue
-                    pid = int(name)
-                    try:
-                        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
-                            errors="replace").split("\0")
-                    except OSError:
-                        continue
-                    command = " ".join(argv)
-                    if (temp_prefix in command and any(
-                            marker in command for marker in (
-                                "codex-managed-completion.py", "peer-steward.py", "/bin/herdr"))):
-                        identity = _proc_stat(pid)
-                        if identity is not None:
-                            groups.add(identity["pgrp"])
+                def fixture_process_groups():
+                    found = set()
+                    for name in os.listdir("/proc"):
+                        if not name.isdigit():
+                            continue
+                        pid = int(name)
+                        try:
+                            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+                                errors="replace").split("\0")
+                        except OSError:
+                            continue
+                        command = " ".join(argv)
+                        if (temp_prefix in command and any(
+                                marker in command for marker in (
+                                    "codex-managed-completion.py", "peer-steward.py", "/bin/herdr"))):
+                            identity = _proc_stat(pid)
+                            if identity is not None:
+                                found.add(identity["pgrp"])
+                    return found
+
+                groups.update(fixture_process_groups())
                 for pgid in groups:
                     with contextlib.suppress(ProcessLookupError, PermissionError):
                         os.killpg(pgid, signal.SIGTERM)
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
-                    alive = []
-                    for pgid in groups:
-                        with contextlib.suppress(ProcessLookupError, PermissionError):
-                            os.killpg(pgid, 0)
-                            alive.append(pgid)
-                    if not alive:
+                    discovered = fixture_process_groups()
+                    if not discovered:
                         break
+                    for pgid in discovered:
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            os.killpg(pgid, signal.SIGTERM)
+                    time.sleep(0.05)
+                # An observer can start its one same-duty retry while its old
+                # lease holder exits. Re-scan after signaling so a child that
+                # appeared during teardown is also stopped before temp_root is
+                # removed.
+                for _ in range(20):
+                    discovered = fixture_process_groups()
+                    if not discovered:
+                        break
+                    for pgid in discovered:
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            os.killpg(pgid, signal.SIGKILL)
                     time.sleep(0.05)
                 for pgid in groups:
                     with contextlib.suppress(ProcessLookupError, PermissionError):
