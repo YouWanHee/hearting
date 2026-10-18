@@ -98,6 +98,48 @@ class ResponsibilityTest(unittest.TestCase):
             "family_id":"fam-a", "claim_digest":"digest-a",
         }])
 
+    def test_no_progress_parent_consumer_uses_the_existing_route_start_contract(self):
+        route_file = self.root / "route.json"
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        metadata = {**CURRENT, "attempt_id": "att-owner", "worker_type": "owner",
+                    "parent_sid": "parent", "owner_route_id": "rt-owner"}
+        record = {"receipt": {"kind": supervision.KIND, "reason": "no-progress",
+                               "job_registry": str(jobs), "owner_attempt_id": "att-owner"}}
+        seen = []
+
+        def arm(result, path, registry, *, environ=None):
+            seen.append((result, path, registry, environ))
+            return {"state": "armed", "cause": "replacement"}
+
+        with mock.patch.object(supervision, "_rows", return_value={"att-owner": ("done", metadata)}), \
+             mock.patch("dispatch_replacement._route", return_value=(route_file, {"route_id": "rt-owner"})):
+            continued = supervision.continue_for_parent(record, session_id="parent",
+                recipient_kind="codex-managed-gateway", environ={}, arm=arm)
+        self.assertEqual(continued, {"state": "armed", "cause": "replacement"})
+        self.assertEqual(seen[0][0], {"reason": "no-progress", "route_id": "rt-owner",
+                                      "source_attempt_id": "att-owner"})
+        self.assertEqual((seen[0][1], seen[0][2]), (route_file, jobs))
+        self.assertEqual(seen[0][3]["CODEX_THREAD_ID"], "parent")
+        with mock.patch("dispatch_replacement.parent_resume_obligation", return_value={}), \
+             mock.patch("route_parent_close.row_requested", return_value=False):
+            self.assertTrue(supervision._pending({"att-owner": ("done", metadata)},
+                ["att-owner"], jobs, reason="no-progress"))
+        with mock.patch("dispatch_replacement.parent_resume_obligation", return_value=None), \
+             mock.patch("route_parent_close.row_requested", return_value=False):
+            self.assertFalse(supervision._pending({"att-owner": ("done", metadata)},
+                ["att-owner"], jobs, reason="no-progress"))
+
+    def test_identity_refusal_hands_answerless_duty_to_parent_without_new_receipt_kind(self):
+        refusal = {"state": "needs-attention", "reason": "replacement-parent-identity-unproven"}
+        with mock.patch("dispatch_owner_input.retained", return_value=[]), \
+             mock.patch.object(supervision, "materialize", return_value=[{}]) as materialize:
+            handed = supervision.handover_identity_refusal(self.jobs, "att-owner", refusal)
+        self.assertEqual(materialize.call_args.kwargs["reason"], "no-progress")
+        self.assertTrue(handed["parent_notified"])
+        self.assertEqual(set(handed), {"parent_notified", "next_step"})
+        self.assertIn("does not claim that a worker launched", handed["next_step"])
+
     def test_exact_retry_claim_converges_across_competing_processes(self):
         self.jobs.write_text(row("att-failed", status="done", note="dead-launch-error", launch_outcome="never-launched"))
         script = """import sys,json; from pathlib import Path
@@ -306,8 +348,8 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
                 for path in (self.root / "pending-delivery").rglob("*.json"):
                     path.unlink()
 
-    def test_the_parents_carrier_starts_the_answered_route_itself(self):
-        # D1: the carrier that hands the parent this notice runs the start it used to ask for.
+    def test_the_parents_carrier_arms_the_answered_route_under_parent_identity(self):
+        # The carrier records the parent's start; the later run owns execution and result delivery.
         from session_identity import session_env
         kept = [{"id": "input-1", "digest": "d1", "text": "use the smaller batch"}]
         cases = [("claude-parent-runtime", "claude", {"state": "armed", "cause": "answer"}),
@@ -337,7 +379,8 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
                 self.assertEqual((env[session_env()[harness][0]], env["AGENT_DISPATCH_CALLER_HARNESS"]),
                                  ("parent-test", harness))
                 if outcome:
-                    self.assertIn("started the route's continuation", text)
+                    self.assertIn("scheduled the route's start under the parent's identity", text)
+                    self.assertIn("not completion", text)
                     self.assertNotIn("start --route", text)
                 else:  # nothing could be armed: the notice keeps the start command
                     self.assertIn("start --route /r/route.json", text)

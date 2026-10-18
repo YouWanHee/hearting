@@ -1698,7 +1698,7 @@ class ReplacementTest(unittest.TestCase):
                      lease_seconds=30, jobs=self.jobs)
         self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'rejected')
 
-    def test_authority_loss_settles_once_and_unknown_registry_reenters_same_duty(self):
+    def test_identity_refusal_does_not_settle_or_spawn_the_existing_duty(self):
         import dispatch_completion_join as JOIN
         import dispatch_pending_delivery as PD
 
@@ -1707,12 +1707,11 @@ class ReplacementTest(unittest.TestCase):
         result=R.advance(self.jobs, 'att-source', authority_check=lambda *_: False, run=no_spawn)
         self.assertEqual(result['reason'], 'replacement-parent-identity-unproven')
         no_spawn.assert_not_called()
-        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'settled')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
         replay=R.advance(self.jobs, 'att-source', run=no_spawn)
-        self.assertEqual(replay['state'], 'not-applicable')
+        self.assertEqual(replay['reason'], 'replacement-parent-identity-unproven')
         no_spawn.assert_not_called()
-        delivered, _receiver=self._sweep_and_ack_one('att-source')
-        self.assertEqual(delivered['delivery_id'], source['delivery_id'])
+        self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'pending')
 
     def test_unknown_registry_reenters_same_duty_without_false_ack_or_spawn(self):
         import dispatch_completion_join as JOIN

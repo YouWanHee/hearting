@@ -79,6 +79,22 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertEqual(refused.exception.reason, "replacement-parent-identity-unproven")
         RA.require_replacement_parent(None, {}, self.OWNER, current_session=lambda: "codex-sid")
 
+    def test_identity_refusal_reentry_depends_on_exact_lineage_not_old_claim_shape(self):
+        metadata = {"attempt_id": "att-owner", "worker_type": "owner"}
+        facts = {"exact_claim": True, "identity_refusal": True,
+                 "source_replacement_eligible": True, "successor_unstarted_or_absent": True}
+        decision = RA.decide_continuation(action="identity-refusal-reentry", status="done",
+                                          metadata=metadata, facts=facts)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.next_action, "start")
+        for field in facts:
+            with self.subTest(field=field):
+                refused = RA.decide_continuation(action="identity-refusal-reentry", status="done",
+                    metadata=metadata, facts={**facts, field: False})
+                self.assertFalse(refused.allowed)
+        self.assertFalse(RA.decide_continuation(action="identity-refusal-reentry", status="open",
+            metadata=metadata, facts=facts).allowed)
+
     def test_replacement_lineage_compares_the_registered_parent_exactly(self):
         self.assertTrue(RA.lineage_parent_matches(self.OWNER, thread_id="codex-sid", parent_attempt_id=None))
         self.assertFalse(RA.lineage_parent_matches(self.OWNER, thread_id="claude-sid", parent_attempt_id=None))

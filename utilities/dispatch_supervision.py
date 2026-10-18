@@ -94,6 +94,14 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         return any(unresolved(jobs, aid) for aid in attempts)
     if reason == ANSWER_AWAITING_PARENT:
         return any(_awaiting_answers(jobs, aid) for aid in attempts)
+    if reason == "no-progress":
+        from dispatch_replacement import parent_resume_obligation
+        for aid in attempts:
+            meta = (rows.get(aid) or (None, {}))[1]
+            route_id = meta.get("owner_route_id") or meta.get("route_id")
+            if parent_resume_obligation(jobs, aid, route_id=route_id) is not None:
+                return True
+        return False
     from dispatch_contract import observed_attempt_liveness
     from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
@@ -179,6 +187,27 @@ def materialize(jobs: Path, attempts: set[str], *, reason: str) -> list[dict]:
             row_revisions={owner: "supervision:" + key})
         results.append(record)
     return results
+
+
+def handover_identity_refusal(jobs: Path, owner_attempt_id: str, start_receipt: dict) -> dict:
+    """Durably hand an identity-only replacement refusal to its route parent."""
+    if start_receipt.get("reason") != "replacement-parent-identity-unproven":
+        return {}
+    from dispatch_owner_input import retained
+    reason = ANSWER_AWAITING_PARENT if retained(jobs, owner_attempt_id) else "no-progress"
+    try:
+        records = materialize(Path(jobs), {owner_attempt_id}, reason=reason)
+        if records:
+            return {"parent_notified": True,
+                    "next_step": ("The route parent has a durable notice to continue this exact replacement. "
+                                  "Its runtime will recheck the existing route start and parent authority when "
+                                  "the notice is consumed; this receipt does not claim that a worker launched.")}
+    except (OSError, ValueError, SupervisionError):
+        pass
+    return {"parent_notified": False,
+            "next_step": ("The route parent remains the only session allowed to start this replacement, but "
+                          "no durable parent notice was recorded. Continue with the existing route start from "
+                          "that parent; no launch-settlement wait is required.")}
 
 
 def validate(receipt: dict, *, expected_thread: str | None = None,
@@ -316,19 +345,18 @@ CONTINUED_KEY = "parent_continuation"
 
 def continue_for_parent(record: dict, *, session_id: str, recipient_kind: str,
                         environ=None, arm=None) -> dict | None:
-    """Start an answered BLOCKED owner's continuation from the carrier that hands its parent the notice.
+    """Let the route parent resume an answer or exact resultless replacement notice.
 
     Only the route's parent launches it (`route_authority.require_replacement_parent`). The carrier
-    that kept its claim on an `answer-awaiting-parent` record for `session_id` runs for that session,
-    so it arms the route's `start` once under this session's own identity (`capacity_auto_resume`)
-    instead of asking the parent to run it. None when the record is another notice or nothing could
-    be armed; the notice then keeps its start command."""
+    that kept its claim for `session_id` runs under that session's own identity and arms the route's
+    existing `start` path. Exact replacement records use their source edge; ordinary answers keep
+    their existing answer-resume behavior."""
     receipt = record.get("receipt") if isinstance(record, dict) else None
     if (not session_id or not isinstance(receipt, dict) or receipt.get("kind") != KIND
-            or receipt.get("reason") != ANSWER_AWAITING_PARENT):
+            or receipt.get("reason") not in {ANSWER_AWAITING_PARENT, "no-progress"}):
         return None
     try:
-        from dispatch_replacement import _route
+        from dispatch_replacement import _route, source_reservation
         from session_identity import session_env
         harness = recipient_kind.split("-", 1)[0]
         jobs = Path(receipt["job_registry"])
@@ -338,8 +366,10 @@ def continue_for_parent(record: dict, *, session_id: str, recipient_kind: str,
                session_env()[harness][0]: session_id, "AGENT_DISPATCH_CALLER_HARNESS": harness}
         if arm is None:
             from capacity_auto_resume import arm
-        return arm({"reason": ANSWER_AWAITING_PARENT, "route_id": route.get("route_id")},
-                   route_file, jobs, environ=env)
+        result = {"reason": receipt["reason"], "route_id": route.get("route_id")}
+        if receipt["reason"] == "no-progress" or source_reservation(jobs, owner):
+            result["source_attempt_id"] = owner
+        return arm(result, route_file, jobs, environ=env)
     except Exception:  # noqa: BLE001 -- the notice still carries the start command
         return None
 
@@ -349,14 +379,25 @@ def render_text(receipt: dict, *, continued: dict | None = None) -> str:
     if receipt["reason"] == ANSWER_AWAITING_PARENT:
         if continued:
             return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
-                    "the answer is kept. This session's runtime started the route's continuation, and its "
-                    "new owner receives the answer first; the result arrives here as a notice. Tell the user "
-                    "in one line; there is nothing to run and no answer to ask for again.")
+                    "the answer is kept. This session's runtime scheduled the route's start under the parent's "
+                    "identity; the existing launch checks still decide whether a new owner starts. The result "
+                    "will arrive through the existing notice path. This is a handoff, not completion; do not "
+                    "ask for the answer again.")
         command = _resume_text(receipt)
         return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
                 "the answer is kept. Only this route's parent session launches its continuation, so "
                 "continue the work with the route's start command: the new owner receives the answer "
                 "first. Do not ask for the answer again." + (" " + command if command else ""))
+    if receipt["reason"] == "no-progress":
+        if continued:
+            return ("The route parent has an armed start for the remaining replacement work. Its runtime "
+                    "will recheck the exact process, claim, and parent authority before launching; this is "
+                    "handoff evidence, not worker completion. The result will arrive through the existing "
+                    "notice path.")
+        command = _resume_text(receipt)
+        return ("A resultless replacement still needs its route parent to continue it. No parent start "
+                "was observed; the exact process, claim, and launch checks remain in force. "
+                + ("Use the route start command: " + command if command else "Inspect the exact route and owner."))
     if receipt["reason"] == "owner-input-undelivered":
         command = shlex.join(["python3", _printed("capability-route.py"),
                               "correct", "--jobs", receipt["job_registry"],

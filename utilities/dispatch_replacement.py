@@ -871,7 +871,7 @@ def claim(jobs: Path, aid: str, *, resume_capacity=False) -> dict:
         binding = source_binding(jobs, meta)
         if not binding and not resume_capacity and meta.get('worker_type') == 'owner':
             carried = _unstarted_replacement_claim(jobs, aid)
-            if carried and _settled_legacy_owner_resume(
+            if carried and _identity_refusal_reentry(
                     jobs, lines, carried['original_attempt_id'], carried):
                 raise DC.DispatchContractError('replacement-duty-settled')
         if binding:
@@ -1020,12 +1020,11 @@ def recovery_delivery_state(jobs, aid):
         return 'unknown'
 
 
-def _settled_legacy_owner_resume(jobs, lines, aid, record=None):
-    """Whether an explicit owner resume may recheck one settled legacy edge.
-
-    The attention remains a completed failure delivery. This predicate only
-    preserves the exact B->C claim as lineage when C was claimed but never
-    started; the caller still performs the current parent and launch checks.
+def _identity_refusal_reentry(jobs, lines, aid, record=None, *, allow_registered=False,
+                              allow_launch_claimed=False):
+    """Whether the same exact replacement duty may be re-entered after an
+    identity-only refusal. This proves lineage and source eligibility; it does
+    not grant launch authority or replace the current parent check.
     """
     try:
         rows = _rows(lines)
@@ -1046,20 +1045,33 @@ def _settled_legacy_owner_resume(jobs, lines, aid, record=None):
                 or binding != (family, record.get('replacement_attempt_id'), digest)):
             return False
         target = rows.get(record.get('replacement_attempt_id'))
-        if target is None:
+        exact_successor = target is None
+        successor_unstarted = target is None
+        if target is not None:
+            target_fields, target_meta = target
+            exact_successor = (
+                target_meta.get('attempt_id') == record['replacement_attempt_id']
+                and target_meta.get('automatic_retry_of') == aid
+                and target_meta.get('replacement_original_attempt_id') == aid
+                and target_meta.get('replacement_family_id') == family
+                and target_meta.get('replacement_ordinal') == '1'
+                and target_meta.get('replacement_claim_digest') == digest
+                and route_authority.replacement_parent_matches(source, target_meta, jobs, lineage=True)
+                and all(target_meta.get(key) == source.get(key) for key in ('worker_type', 'dispatch_depth'))
+            )
+            successor_unstarted = exact_successor and (
+                never_started(target_fields[1], target_meta)
+                or allow_registered and target_fields[1] in {'open', 'running'}
+                and target_meta.get('launch_started') != '1'
+                and not target_meta.get('pid')
+                and (allow_launch_claimed or target_meta.get('launch_claimed') != '1'))
+        if not exact_successor:
             return False
-        target_fields, target_meta = target
-        exact_successor = (
-            target_meta.get('attempt_id') == record['replacement_attempt_id']
-            and target_meta.get('automatic_retry_of') == aid
-            and target_meta.get('replacement_original_attempt_id') == aid
-            and target_meta.get('replacement_family_id') == family
-            and target_meta.get('replacement_ordinal') == '1'
-            and target_meta.get('replacement_claim_digest') == digest
-        )
+        _no_competing_successor(rows, aid, record['replacement_attempt_id'])
         saved = _read(_directory(jobs) / 'attention/by-source' / (_id(aid) + '.json'))
         attention = (saved or {}).get('attention') or {}
         proof = (saved or {}).get('proof') or {}
+        expected_node = source.get('route_node') or '__owner__'
         exact_attention = (
             set(saved or {}) == {'attention', 'proof'}
             and set(proof) == {'family_id', 'claim_digest'}
@@ -1069,16 +1081,18 @@ def _settled_legacy_owner_resume(jobs, lines, aid, record=None):
             and attention.get('source_attempt_id') == aid
             and attention.get('state') == 'needs-attention'
             and attention.get('reason') == 'replacement-parent-identity-unproven'
-            and attention.get('node') == '__owner__'
+            and attention.get('node') == expected_node
             and isinstance(attention.get('failure'), str)
         )
-        decision = route_authority.decide_continuation(action='settled-owner-resume',
+        if not exact_attention:
+            return False
+        source_proof = death_proof(fields, source, jobs=jobs, lines=lines)
+        decision = route_authority.decide_continuation(action='identity-refusal-reentry',
             status=fields[1], metadata=source, facts={
-                'record': record,
-                'attention_reason': attention.get('reason') if exact_attention else '',
-                'exact_successor': exact_successor,
-                'successor_never_started': never_started(target_fields[1], target_meta),
-                'retained_corrections': bool((record.get('proof') or {}).get('corrections')),
+                'exact_claim': True,
+                'identity_refusal': True,
+                'source_replacement_eligible': bool(source_proof.get('death_kind')),
+                'successor_unstarted_or_absent': successor_unstarted,
             })
         return decision.allowed
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
@@ -1440,7 +1454,8 @@ def validate_claim_source(jobs, lines, record):
         raise DC.DispatchContractError('replacement-claim-drift')
     rows = _rows(lines); prior = record['original_attempt_id']
     if (recovery_delivery_state(jobs, prior) == 'settled'
-            and not _settled_legacy_owner_resume(jobs, lines, prior, record)):
+            and not _identity_refusal_reentry(jobs, lines, prior, record, allow_registered=True,
+                                              allow_launch_claimed=True)):
         raise DC.DispatchContractError('replacement-duty-settled')
     if prior not in rows:
         raise DC.DispatchContractError('replacement-source-missing')
@@ -1468,6 +1483,91 @@ def validate_claim_source(jobs, lines, record):
     if source.get('worker_type') == 'owner' and any(g['status'] == 'blocked' for g in current_reuse.get('gates',[])):
         raise DC.DispatchContractError('replacement-human-gate-pending')
     return fields, source, replay
+
+
+def parent_resume_obligation(jobs, aid, *, route_id=None):
+    """Read-only structural proof that an exact replacement edge remains unstarted.
+
+    This keeps a no-progress parent notice alive even when the source cannot
+    automatically resume (for example, an unanswered semantic BLOCKED result).
+    It grants no launch authority; the stricter eligibility check and ordinary
+    start decide whether execution may proceed.
+    """
+    try:
+        jobs = Path(jobs).resolve()
+        lines = jobs.read_text().splitlines()
+        rows = _rows(lines)
+        if aid not in rows:
+            return None
+        fields, source = rows[aid]
+        if fields[1] != 'done' or source.get('worker_type') != 'owner' or source.get('dispatch_depth') != '1':
+            return None
+        import route_parent_close
+        if route_parent_close.row_requested(source, jobs):
+            return None
+        path, route = _route(jobs, aid, source)
+        if (route_id and route.get('route_id') != route_id) or path.with_suffix('.outcome.json').exists():
+            return None
+        family = (source_reservation(jobs, aid) or {}).get('family_id')
+        binding = source_binding(jobs, source)
+        if not family or not binding or binding[0] != family:
+            return None
+        record = _check_record(_read(_record_path(jobs, family)), family)
+        digest = _digest(record)
+        if (record.get('original_attempt_id') != aid
+                or binding != (family, record.get('replacement_attempt_id'), digest)):
+            return None
+        target = rows.get(record['replacement_attempt_id'])
+        if target is not None:
+            target_fields, target_meta = target
+            if (target_meta.get('attempt_id') != record['replacement_attempt_id']
+                    or target_meta.get('automatic_retry_of') != aid
+                    or target_meta.get('replacement_original_attempt_id') != aid
+                    or target_meta.get('replacement_family_id') != family
+                    or target_meta.get('replacement_ordinal') != '1'
+                    or target_meta.get('replacement_claim_digest') != digest
+                    or not route_authority.replacement_parent_matches(source, target_meta, jobs, lineage=True)
+                    or any(target_meta.get(key) != source.get(key) for key in ('worker_type', 'dispatch_depth'))
+                    or not never_started(target_fields[1], target_meta)):
+                return None
+        _no_competing_successor(rows, aid, record['replacement_attempt_id'])
+        return {'source_attempt_id': aid, 'route_id': route['route_id'],
+                'route_hash': route['route_hash'], 'route_file': str(path),
+                'replacement_attempt_id': record['replacement_attempt_id'], 'claim': record,
+                'jobs': jobs, 'lines': lines, 'rows': rows, 'fields': fields, 'source': source}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
+        return None
+
+
+def parent_resume_eligibility(jobs, aid, *, route_id=None, environ=None, require_parent=False):
+    """Read-only proof that a parent may arm the exact resultless replacement.
+
+    This is scheduling eligibility, not launch authority. The normal start
+    repeats admission, access, capacity, and parent checks before execution.
+    """
+    obligation = parent_resume_obligation(jobs, aid, route_id=route_id)
+    if obligation is None:
+        return None
+    jobs, lines, rows = obligation['jobs'], obligation['lines'], obligation['rows']
+    fields, source, record = obligation['fields'], obligation['source'], obligation['claim']
+    try:
+        if death_kind(fields, source, jobs=jobs, lines=lines) is None:
+            return None
+        death_proof(fields, source, jobs=jobs, lines=lines)
+        validate_claim_source(jobs, lines, record)
+        _children_quiescent(rows, aid)
+        if require_parent:
+            from session_identity import identity
+            caller = identity(environ)
+            if not caller.known or not caller.session_id:
+                return None
+            route_authority.require_replacement_parent(
+                jobs, rows, source, current_session=lambda: caller.session_id)
+        return {key: obligation[key] for key in
+                ('source_attempt_id', 'route_id', 'route_hash', 'route_file',
+                 'replacement_attempt_id', 'claim')}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
+        return None
 
 
 def admission(jobs, lines, metadata):
@@ -1832,7 +1932,8 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
     if aid not in rows:
         return {'state':'unavailable','reason':'replacement-source-missing'}
     if (recovery_delivery_state(jobs, aid) == 'settled'
-            and not (resume_capacity and _settled_legacy_owner_resume(jobs, lines, aid))):
+            and not (resume_capacity and _identity_refusal_reentry(
+                jobs, lines, aid, allow_registered=True))):
         return {'state': 'not-applicable'}
     fields, source = rows[aid]
     kind = death_kind(fields, source, jobs=jobs)
@@ -2005,7 +2106,6 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         )
         definitive = (
             reason in {
-                'replacement-parent-identity-unproven',
                 'replacement-human-gate-pending',
                 'replacement-workflow-not-open',
                 'pin-ignored-for-replacement',
@@ -2205,7 +2305,8 @@ def recovery_instructions(args):
     completed = ', '.join(str(row['node']) for row in current_reuse['completed']) or '(none)'
     invalidated = ', '.join(str(row['node']) for row in current_reuse.get('invalidated', []))
     pending = ', '.join(str(node) for node in current_reuse.get('pending', [])) or '(none)'
-    kind = (record.get('proof') or {}).get('death_kind')
+    source_fields, source = _rows(lines)[prior]
+    kind = death_kind(source_fields, source, jobs=jobs, lines=lines)
     fix = kind == CORRECTED and (record.get('proof') or {}).get('source_result') == 'FAIL'
     if fix:
         opening = (f'The previous owner {prior} ended FAIL and a person approved a fix for it; this continues '
@@ -2318,7 +2419,7 @@ def _gate_context(jobs, record):
 
 def _unstarted_replacement_claim(jobs, aid):
     """The claim that created replacement ``aid``, when ``aid`` closed before it spawned;
-    through a run of such replacements, the first claim that is not itself `unlaunched`."""
+    through a run of such replacements, the first source row that actually ran."""
     try:
         rows = _rows(Path(jobs).read_text().splitlines())
     except (OSError, DC.DispatchContractError):
@@ -2344,21 +2445,35 @@ def _unstarted_replacement_claim(jobs, aid):
                 or not route_authority.replacement_parent_matches(original[1], meta, jobs, lineage=True)
                 or any(meta.get(key) != original[1].get(key) for key in ('worker_type', 'dispatch_depth'))):
             return None
-        if (claim.get('proof') or {}).get('death_kind') != 'unlaunched':
+        original_id = claim['original_attempt_id']
+        original_fields, original_meta = original
+        if not never_started(original_fields[1], original_meta):
             return claim
-        aid = claim['original_attempt_id']
+        # The launch fence on the source row owns execution truth. Legacy
+        # claims may have recorded `silent` before the successor's
+        # never-launched disposition was settled.
+        aid = original_id
     return None
 
 
 def _correction_context(jobs, prior, proof):
-    """The pinned answers, exactly as sent, and what they answer."""
+    """All currently unconsumed answers, after verifying the claim's pinned floor."""
     from dispatch_owner_input import OwnerInput
-    kept = {item['id']: item for item in _retained_corrections(jobs, prior)}
-    items = []
+    retained = _retained_corrections(jobs, prior)
+    kept = {item['id']: item for item in retained}
+    seen = {}
     for pinned in proof.get('corrections') or []:
         item = kept.get(pinned.get('id'))
         if item is None or item['digest'] != pinned.get('digest'):
             raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
+    items = []
+    for item in retained:
+        old = seen.get(item['id'])
+        if old is not None:
+            if old != item['digest']:
+                raise DC.DispatchContractError('replacement-correction-drift', str(item['id']))
+            continue
+        seen[item['id']] = item['digest']
         items.append(item)
     handoff = proof.get('handoff')
     if proof.get('source_result') == 'EXITED':

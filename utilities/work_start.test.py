@@ -135,8 +135,11 @@ class WorkStartTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "started=1\n", "")
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            for name in list(os.environ):
+                if name.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_")):
+                    os.environ.pop(name, None)
             result = W._start(route, route_file, self.jobs, "owner", "codex", run)
+            W._start(route, route_file, self.jobs, "owner", "codex", run)
         self.assertEqual("", result.get("execution_access_diagnostic", ""))
         self.assertIn("--execution-access-file", calls[0])
         request_path = Path(calls[0][calls[0].index("--execution-access-file") + 1])
@@ -148,7 +151,6 @@ class WorkStartTest(unittest.TestCase):
 
         # start and resume use the same preparation entry point and therefore
         # reuse the exact route-bound request, including its full digest.
-        W._start(route, route_file, self.jobs, "owner", "codex", run)
         self.assertEqual(2, len(calls))
         self.assertEqual(calls[0][calls[0].index("--execution-access-file") + 1],
                          calls[1][calls[1].index("--execution-access-file") + 1])
@@ -2557,23 +2559,23 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
         self.assertEqual(result["correction"], {"retained": True, "request_id": "input-1"})
 
     def test_another_session_s_answer_is_kept_and_its_parent_is_told(self):
-        # RA-10: the route's parent receives a notice instead of the sender getting a dead end.
+        # `correct` returns the common start receipt; it does not publish a second notice.
         receipt = {"state": "needs-attention", "reason": "replacement-parent-identity-unproven",
-                   "next_step": "generic"}
-        with mock.patch("dispatch_supervision.materialize", return_value=[{}]) as told:
+                   "parent_notified": True, "parent_notice_reason": "answer-awaiting-parent",
+                   "next_step": "The parent has a durable notice; this receipt does not claim a launch."}
+        with mock.patch("dispatch_supervision.materialize") as told:
             code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=dict(receipt))
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(told.call_args.kwargs["reason"], "answer-awaiting-parent")
-        self.assertEqual(told.call_args.args[1], {"att-owner"})
+        told.assert_not_called()
         self.assertTrue(result["parent_notified"])
-        self.assertIn("parent session was notified", result["next_step"])
+        self.assertIn("durable notice", result["next_step"])
         self.assertTrue(result["correction"]["retained"])
-        # A parent with no carrier (bounded wait) keeps the plain instruction.
-        with mock.patch("dispatch_supervision.materialize", side_effect=ValueError("supervision-parent-carrier-unbound")):
-            code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=dict(receipt))
+        # When start cannot record its common handover, correct preserves that truth.
+        receipt.update(parent_notified=False, next_step="The parent must use the existing route start.")
+        code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=dict(receipt))
         self.assertFalse(result["parent_notified"])
-        self.assertIn("session that started this route", result["next_step"])
+        self.assertIn("existing route start", result["next_step"])
 
     def test_an_answer_to_a_live_owner_is_only_queued(self):
         code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False})
@@ -3278,6 +3280,7 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
             "parent_harness": parent_harness, "parent_transport": "headless",
             "capability": route["capability"], "capability_mode": route["capability_mode"],
             "intensity": "standard", "supervisor_lease_nonce": "fixture-" + aid,
+            "parent_completion_delivery": "codex-managed-gateway",
         }
         if prior:
             metadata.update(automatic_retry_of=prior,
@@ -3348,6 +3351,35 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
         return owner_a, owner_b, owner_c
 
+    def _build_claim_only_operational_shape(self):
+        owner_a, owner_b, owner_c, _ = self._build_unstarted_chain(correction_count=1)
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        logical = self.replacement._logical_key(self.route, rows[owner_c][1])
+        logical = {**logical, "after_death": owner_c}
+        with mock.patch.object(self.replacement, "_logical_key", return_value=logical), \
+             mock.patch.object(self.replacement, "death_kind", return_value="silent"):
+            claim_cd = self.replacement.claim(self.jobs, owner_c, resume_capacity=True)
+        self.assertEqual(claim_cd["logical_node"], logical)
+        self.assertEqual(claim_cd["proof"]["death_kind"], "silent")
+        self.assertNotIn("carried_continuation", claim_cd["proof"])
+        self.assertEqual(claim_cd["original_attempt_id"], owner_c)
+        self.assertNotIn(claim_cd["replacement_attempt_id"],
+                         self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.replacement._settle_recovery_attention(self.jobs, owner_b, {
+            "reason": "replacement-parent-identity-unproven"})
+        self.replacement._settle_recovery_attention(self.jobs, owner_c, {
+            "reason": "replacement-parent-identity-unproven"})
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        self.assertEqual([rows[owner_a][0][1], rows[owner_b][0][1]], ["done", "done"])
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
+        self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_c), "settled")
+        attention_paths = [self.replacement._directory(self.jobs) / "attention/by-source" / (aid + ".json")
+                           for aid in (owner_b, owner_c)]
+        claim_paths = [self.replacement._record_path(self.jobs, self.replacement.source_reservation(
+            self.jobs, aid)["family_id"]) for aid in (owner_b, owner_c)]
+        preserved = {path: path.read_bytes() for path in [*attention_paths, *claim_paths]}
+        return owner_a, owner_b, owner_c, claim_cd, preserved
+
     def _assert_legacy_owner_started_with_all_answers(
             self, owner_a, owner_b, owner_c, receipt, *, expected_answers=7):
         self.assertTrue(receipt.get("owner_started"), receipt)
@@ -3357,9 +3389,13 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         self.assertEqual(self.launches[-1]["prior"], owner_c)
         answers = self.owner_input.retained(self.jobs, owner_b)
         self.assertEqual(len(answers), expected_answers)
+        answer_ids = [answer["id"] for answer in answers]
+        self.assertEqual(len(answer_ids), len(set(answer_ids)))
         prompt = self.delivered_prompts[owner_d]
+        positions = []
         for answer in answers:
-            self.assertIn(answer["text"], prompt)
+            positions.append(prompt.index(answer["text"]))
+        self.assertEqual(positions, sorted(positions))
         effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
         self.assertEqual(effective, {owner_d})
         self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
@@ -3396,6 +3432,156 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         self.assertEqual(len(self.launches), launches_after_first)
         self.assertEqual(attention_path.read_bytes(), attention_before)
         self.assertEqual(claim_path.read_bytes(), claim_before)
+
+    def test_claim_only_operational_shape_starts_existing_successor_with_all_retained_answers(self):
+        owner_a, owner_b, owner_c, claim_cd, preserved = self._build_claim_only_operational_shape()
+        for index in range(2, 9):
+            self._store(owner_b, f"operational correction {index}", f"input-b-{index}")
+        answers = self.owner_input.retained(self.jobs, owner_b)
+        self.assertEqual(len(answers), 8)
+        claim_bc = self.replacement._read(self.replacement._record_path(
+            self.jobs, self.replacement.source_reservation(self.jobs, owner_b)["family_id"]))
+        self.assertEqual(len(claim_bc["proof"]["corrections"]), 1)
+
+        receipt = self._cli_start()
+        owner_d = self._assert_legacy_owner_started_with_all_answers(
+            owner_a, owner_b, owner_c, receipt, expected_answers=8)
+        self.assertEqual(owner_d, claim_cd["replacement_attempt_id"])
+        self.assertEqual(len([item for item in self.launches if item["attempt_id"] == owner_d]), 1)
+        for path, original in preserved.items():
+            self.assertEqual(path.read_bytes(), original, str(path))
+
+    def test_silent_legacy_claim_walk_uses_each_predecessor_launch_fence(self):
+        _owner_a, owner_b, owner_c, claim_cd, _preserved = self._build_claim_only_operational_shape()
+        owner_d = claim_cd["replacement_attempt_id"]
+        self._register(owner_d, prior=owner_c, record=claim_cd, started=False, claimed=False)
+        self.assertTrue(self.contract.close_attempt_row(
+            self.jobs, owner_d, "dead-governor-reservation-transfer",
+            evidence={"failure_class": "contract"}))
+        self.assertTrue(self.contract.annotate_attempt_row(
+            self.jobs, owner_d, {"launch_outcome": "never-launched"}))
+        rows = self.replacement._rows(self.jobs.read_text().splitlines())
+        self.assertTrue(self.replacement.never_started(rows[owner_d][0][1], rows[owner_d][1]))
+        carried = self.replacement._unstarted_replacement_claim(self.jobs, owner_d)
+        self.assertEqual((carried["original_attempt_id"], carried["replacement_attempt_id"]),
+                         (owner_b, owner_c))
+
+    def test_identity_refusal_hands_exact_edge_to_parent_carrier_and_resumes_once(self):
+        import capacity_auto_resume as capacity
+        import dispatch_session_sweep as sweep
+
+        owner_a, owner_b, owner_c, claim_cd, preserved = self._build_claim_only_operational_shape()
+        for index in range(2, 9):
+            self._store(owner_b, f"carrier correction {index}", f"input-b-{index}")
+
+        launches_before = len(self.launches)
+        automatic = self.replacement.advance(self.jobs, owner_b)
+        self.assertEqual(automatic["state"], "not-applicable")
+        self.assertEqual(len(self.launches), launches_before)
+
+        W.default_parent_session_id.return_value = "stranger"
+        os.environ["CODEX_THREAD_ID"] = "stranger"
+        refused = self._cli_start()
+        self.assertEqual(refused["reason"], "replacement-parent-identity-unproven", refused)
+        self.assertEqual(len(self.launches), launches_before)
+        self.assertTrue(refused["parent_notified"], refused)
+        for path, original in preserved.items():
+            self.assertEqual(path.read_bytes(), original, str(path))
+
+        W.default_parent_session_id.return_value = "parent"
+        os.environ["CODEX_THREAD_ID"] = "parent"
+        meta_b = self.replacement._rows(self.jobs.read_text().splitlines())[owner_b][1]
+        recipient = meta_b["parent_completion_delivery"]
+        spawned = []
+        real_arm = capacity.arm
+        arm_epoch = capacity._epoch("2026-10-19T00:00:00Z")
+
+        def controlled_arm(result, route_file, jobs, *, environ=None):
+            return real_arm(result, route_file, jobs, environ=environ,
+                            spawn=lambda argv, **kw: spawned.append((argv, kw["env"])),
+                            now=lambda: arm_epoch)
+
+        with mock.patch.object(capacity, "arm", side_effect=controlled_arm):
+            claimed, _ = sweep.sweep_deliver(self.jobs.parent, recipient, "parent")
+        self.assertEqual(len(claimed), 1)
+        continued = claimed[0]["parent_continuation"]
+        self.assertEqual((continued["state"], continued["cause"]), ("armed", "replacement"))
+        self.assertEqual(len(spawned), 1)
+        resume_path = Path(continued["record"])
+        resume_record = json.loads(resume_path.read_text())
+        self.assertEqual(resume_record["source_attempt_id"], owner_b)
+        self.assertEqual(resume_record["cause"], "replacement")
+
+        def controlled_start(argv, **_kwargs):
+            self.assertEqual(argv[2:4], ["start", "--route"])
+            receipt = self._cli_start()
+            return SimpleNamespace(returncode=0, stdout=json.dumps(receipt) + "\n", stderr="")
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "parent",
+                                          "AGENT_DISPATCH_CALLER_HARNESS": "codex"}, clear=False):
+            capacity.run(resume_path, now=lambda: capacity._epoch(resume_record["retry_at"]) + 1,
+                         sleep=lambda _seconds: self.fail("replacement start was delayed"),
+                         call=controlled_start)
+        owner_d = claim_cd["replacement_attempt_id"]
+        self.assertEqual(self.launches[-1]["attempt_id"], owner_d)
+        self.assertEqual(self.launches[-1]["prior"], owner_c)
+        self.assertEqual(len([launch for launch in self.launches if launch["attempt_id"] == owner_d]), 1)
+        prompt = self.delivered_prompts[owner_d]
+        for answer in self.owner_input.retained(self.jobs, owner_b):
+            self.assertIn(answer["text"], prompt)
+        for path, original in preserved.items():
+            self.assertEqual(path.read_bytes(), original, str(path))
+
+        launches_after_resume = len(self.launches)
+        repeated = self._cli_start()
+        self.assertEqual(repeated["owner_attempt_id"], owner_d)
+        self.assertEqual(len(self.launches), launches_after_resume)
+
+    def test_claim_only_operational_shape_concurrent_parent_starts_share_one_fenced_d(self):
+        import multiprocessing
+
+        owner_a, owner_b, owner_c, claim_cd, preserved = self._build_claim_only_operational_shape()
+        for index in range(2, 9):
+            self._store(owner_b, f"race correction {index}", f"input-b-{index}")
+        context = multiprocessing.get_context("fork")
+        barrier, release, results = context.Barrier(2), context.Event(), context.Queue()
+        callers = [context.Process(target=self._legacy_race_start_caller,
+                                   args=(barrier, release, results)) for _ in range(2)]
+        try:
+            for caller in callers:
+                caller.start()
+            outcomes = [results.get(timeout=90) for _ in callers]
+            self.assertTrue(all(item.get("ok") for item in outcomes), outcomes)
+            events = [json.loads(line) for line in
+                      (self.root / "legacy-race-events.jsonl").read_text().splitlines()]
+            started = [event for event in events if event["kind"] == "fenced-payload-started"]
+            self.assertEqual(len(started), 1, events)
+            self.assertEqual(started[0]["attempt_id"], claim_cd["replacement_attempt_id"])
+            self.assertEqual(started[0]["prior"], owner_c)
+            payload_pid = started[0]["pid"]
+            os.kill(payload_pid, 0)
+            payload_input = self.root / f"{claim_cd['replacement_attempt_id']}.payload-input.txt"
+            deadline = time.monotonic() + 5
+            while not payload_input.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(payload_input.exists())
+            delivered = payload_input.read_text(encoding="utf-8")
+            for answer in self.owner_input.retained(self.jobs, owner_b):
+                self.assertIn(answer["text"], delivered)
+            for path, original in preserved.items():
+                self.assertEqual(path.read_bytes(), original, str(path))
+        finally:
+            release.set()
+            for caller in callers:
+                if caller.pid is not None:
+                    caller.join(timeout=20)
+                    if caller.is_alive():
+                        caller.terminate()
+                        caller.join(timeout=5)
+            results.close()
+            results.join_thread()
+        self.assertTrue(all(caller.exitcode == 0 for caller in callers),
+                        [caller.exitcode for caller in callers])
 
     def test_legacy_settled_owner_concurrent_starts_share_one_fenced_payload_and_seven_answers(self):
         import multiprocessing

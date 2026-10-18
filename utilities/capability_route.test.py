@@ -7107,7 +7107,12 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
    "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"]}
   if ship:
    import artifact_producer
-   begun=artifact_producer.begin(artifact,route_file=path,capability="autopilot-ship",intensity="standard",jobs=self.jobs)
+   # This historical fixture owns its own registry identity; do not let the
+   # test runner's active dispatch attempt bind its unrelated empty jobs file.
+   with mock.patch.dict(os.environ,{},clear=False):
+    os.environ.pop("AGENT_DISPATCH_ATTEMPT_ID",None)
+    os.environ.pop("AGENT_DISPATCH_PARENT_ATTEMPT_ID",None)
+    begun=artifact_producer.begin(artifact,route_file=path,capability="autopilot-ship",intensity="standard",jobs=self.jobs)
    output=Path(begun["env"]["AGENT_ARTIFACT_OUTPUT_DIR"])
    self.producer=begun
    owner_child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
