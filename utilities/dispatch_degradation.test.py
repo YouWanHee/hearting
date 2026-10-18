@@ -26,6 +26,43 @@ ROOT = UTILITIES.parent
 
 
 class DegradationWriterTest(unittest.TestCase):
+    def test_candidate_outcomes_are_bounded_with_truthful_omission_count(self):
+        with tempfile.TemporaryDirectory() as home:
+            jobs = os.path.join(home, 'dispatch', 'jobs.log')
+            candidates = [{'ordinal': n, 'tuple': 't' * 500, 'attempted': False,
+                           'reason': 'skip' * 100, 'detail': 'd' * 1000}
+                          for n in range(35)]
+            path = record_degradation(
+                agent_home=home, jobs=jobs, route_id='rt-bounds', route_node='execute',
+                route_hash='sha256:fixture', dispatch_depth=2, fallback_hop='inline',
+                execution_surface='inline', writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, candidate_outcomes_omitted=2)
+            row = json.loads(Path(path).read_text().splitlines()[0])
+            self.assertEqual(len(row['candidate_outcomes']), 32)
+            self.assertEqual(row['candidate_outcomes_omitted'], 5)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['tuple']), 160)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['reason']), 160)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['detail']), 512)
+
+    def test_candidate_outcomes_keep_attempt_and_skip_separate(self):
+        with tempfile.TemporaryDirectory() as home:
+            jobs = os.path.join(home, 'dispatch', 'jobs.log')
+            candidates = [
+                {'ordinal': 1, 'tuple': 'codex/headless', 'attempted': True,
+                 'attempt_id': 'att-real', 'exit': '65',
+                 'reason': 'unsafe-git-operation', 'detail': 'cherry-pick'},
+                {'ordinal': 2, 'tuple': 'claude/headless', 'attempted': False,
+                 'attempt_id': '', 'exit': '', 'reason': 'parent-runtime-mismatch', 'detail': ''},
+            ]
+            path = record_degradation(
+                agent_home=home, jobs=jobs, route_id='rt-candidates', route_node='execute',
+                route_hash='sha256:fixture', dispatch_depth=2, fallback_hop='inline',
+                execution_surface='inline', writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, last_direct_failure='unsafe-git-operation:exit-65')
+            row = json.loads(Path(path).read_text().splitlines()[0])
+            self.assertEqual(row['candidate_outcomes'], candidates)
+            self.assertEqual(row['last_direct_failure'], 'unsafe-git-operation:exit-65')
+
     def setUp(self):
         # record_degradation() resolves the dispatch state root ahead of
         # agent_home/.dispatch, preferring an inherited AGENT_DISPATCH_JOBS --

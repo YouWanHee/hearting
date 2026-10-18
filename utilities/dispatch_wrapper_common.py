@@ -855,8 +855,10 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
     if result.returncode:
         if result.stdout: print(result.stdout, end="")
         if result.stderr: print(result.stderr, end="", file=sys.stderr)
+        reason, detail = _route_guard_refusal(result.stderr)
         return fail(
-            "worker-route-validation-failed", result.returncode,
+            reason, result.returncode,
+            detail=detail,
             route_file=args.route_file, registered="0", started="0",
             child_spawned="0",
         )
@@ -870,6 +872,23 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
         reason, code, fields = refusal
         return fail(reason, code, **fields)
     return 0
+
+
+def _route_guard_refusal(stderr: str) -> tuple[str, str]:
+    """Carry a bounded, typed guard refusal across the common wrapper boundary."""
+    for line in reversed(stderr.splitlines()):
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(row, dict) or row.get("status") != "blocked":
+            continue
+        reason, detail = row.get("reason"), row.get("detail")
+        if (isinstance(reason, str) and 1 <= len(reason) <= 128
+                and all(ch.islower() or ch.isdigit() or ch == "-" for ch in reason)
+                and isinstance(detail, str)):
+            return reason, detail.replace("\n", " ").replace("\r", " ")[:512]
+    return "worker-route-validation-failed", "guard output lacked a typed refusal"
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace, *, probe) -> str:

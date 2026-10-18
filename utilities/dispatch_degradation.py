@@ -26,7 +26,7 @@ _WRITERS = {
     "dispatch-reap-watch.py",
     "dispatch_completion_join.py",
 }
-_OPTIONAL = {"fallback_ordinal", "fleet_visibility", "reason", "detail", "registered_worker", "capability", "completion_gate", "route_file", "parent", "parent_attempt_id", "parent_pid", "parent_pid_start", "harness", "attempt_trace", "prior_attempt_ids", "last_direct_failure", "child_proof", "parallel_group", "parallel_leg_index", "parallel_leg_count", "attempt_id", "exit_code", "launch_state", "event_id", "leg_class", "auxiliary_check", "parent_cross", "cause", "sole_gate", "subsession_id", "slice_manifest_sha256"}
+_OPTIONAL = {"fallback_ordinal", "fleet_visibility", "reason", "detail", "registered_worker", "capability", "completion_gate", "route_file", "parent", "parent_attempt_id", "parent_pid", "parent_pid_start", "harness", "attempt_trace", "prior_attempt_ids", "last_direct_failure", "candidate_outcomes", "candidate_outcomes_omitted", "child_proof", "parallel_group", "parallel_leg_index", "parallel_leg_count", "attempt_id", "exit_code", "launch_state", "event_id", "leg_class", "auxiliary_check", "parent_cross", "cause", "sole_gate", "subsession_id", "slice_manifest_sha256"}
 
 def _home():
     return str(_resolve_agent_home())
@@ -97,6 +97,32 @@ def record_degradation(*, route_id=None, route_node=None, route_hash=None, dispa
         for key, limit in (("reason", 160), ("detail", 512), ("attempt_trace", 2048)):
             if key in row:
                 row[key] = _clip(row[key], limit)
+        if "candidate_outcomes" in row:
+            if not isinstance(row["candidate_outcomes"], list):
+                row.pop("candidate_outcomes")
+            else:
+                outcomes = row["candidate_outcomes"]
+                omitted = len(outcomes) - min(len(outcomes), 32)
+                bounded = []
+                for item in outcomes[:32]:
+                    if not isinstance(item, dict):
+                        omitted += 1
+                        continue
+                    bounded.append({
+                        "ordinal": item.get("ordinal") if isinstance(item.get("ordinal"), int) else 0,
+                        "tuple": _clip(item.get("tuple", ""), 160),
+                        "attempted": item.get("attempted") is True,
+                        "attempt_id": _clip(item.get("attempt_id", ""), 120),
+                        "exit": _clip(item.get("exit", ""), 16),
+                        "reason": _clip(item.get("reason", ""), 160),
+                        "detail": _clip(item.get("detail", ""), 512),
+                    })
+                row["candidate_outcomes"] = bounded
+                try:
+                    omitted += max(0, int(row.get("candidate_outcomes_omitted", 0)))
+                except (TypeError, ValueError):
+                    pass
+                row["candidate_outcomes_omitted"] = omitted
         row["event_id"] = fields.get("event_id") or _event_id(row)
         payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         filename = route_id + ".jsonl" if isinstance(route_id, str) and route_id else "_unattributed.jsonl"

@@ -2782,6 +2782,8 @@ PRELAUNCH_WAIT_INTERVAL_MAX_SECONDS = 2.0
 # observed (13.59.3 "관측"), and a new member here must be added by name so
 # an unclassified reason cannot silently fall through to the descent path.
 ROUTE_STATE_REFUSAL_REASONS = (
+    "unsafe-git-operation",
+    "unsafe-git-state",
     "completion-marker-missing",
     "completion-marker-integrity-broken",
     "completion-evidence-superseded",

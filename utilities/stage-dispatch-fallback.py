@@ -170,7 +170,9 @@ def wrapper_interrupted(result, fields: dict[str, str]) -> bool:
     )
 
 
-def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]) -> int:
+def report_interrupted(result, output: str, attempt_id: str, attempts: list[str],
+                       candidate_outcomes: "CandidateOutcomes", direct_failures: list[dict],
+                       route: dict, node: dict, hop: dict) -> int:
     """Stop the chain where the caller stopped it: no next hop is tried.
 
     The interrupted attempt keeps its own row (``dead-interrupted``); a later
@@ -178,11 +180,16 @@ def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]
     """
     signum = getattr(result, "received_signal", None)
     extra = {"cleanup": "incomplete"} if getattr(result, "cleanup_incomplete", False) else {}
+    _record_leg_failure(route, node, hop, "interrupted",
+                        "the call was stopped, so the worker was stopped with it",
+                        candidate_outcomes, direct_failures)
     code = fail(
         "interrupted", 128 + int(signum) if signum else 130,
         interrupted="1", **extra, attempt_id=attempt_id,
         detail="the call was stopped, so the worker was stopped with it",
         attempt_trace="|".join(attempts),
+        candidate_outcomes=candidate_outcomes,
+        **_last_failure_fields(direct_failures),
     )
     if output:
         print(output)
@@ -270,6 +277,10 @@ def report_forwarding_cleanup_incomplete(
 def fail(reason: str, code: int, **fields: str) -> int:
     print("check=failed")
     print(f"reason={reason}")
+    outcomes = fields.pop("candidate_outcomes", None)
+    if isinstance(outcomes, CandidateOutcomes):
+        fields["candidate_outcomes"] = json.dumps(outcomes, separators=(",", ":"))
+        fields["candidate_outcomes_omitted"] = str(outcomes.omitted)
     for key, value in fields.items():
         print(f"{key}={value}")
     return code
@@ -277,6 +288,75 @@ def fail(reason: str, code: int, **fields: str) -> int:
 
 def output_fields(output: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+
+class CandidateOutcomes(list):
+    """Bounded receipt rows with an explicit count of omitted candidates."""
+
+    def __init__(self):
+        super().__init__()
+        self.omitted = 0
+
+
+def _print_candidate_outcomes(rows: CandidateOutcomes) -> None:
+    print("candidate_outcomes=" + json.dumps(rows, separators=(",", ":")))
+    print(f"candidate_outcomes_omitted={rows.omitted}")
+
+
+def _candidate_outcome(rows: CandidateOutcomes, ordinal: int, key: str, *, attempted: bool,
+                      attempt_id: str = "", exit_code: int | str = "",
+                      reason: str, detail: str = "") -> None:
+    """Record bounded candidate evidence without turning a skip into a failure."""
+    if len(rows) < 32:
+        rows.append({"ordinal": ordinal, "tuple": key[:160], "attempted": attempted,
+                     "attempt_id": attempt_id[:120] if attempted else "",
+                     "exit": str(exit_code)[:16] if attempted else "",
+                     "reason": reason[:160], "detail": detail[:512]})
+    else:
+        rows.omitted += 1
+
+
+def _last_failure_fields(failures: list[dict]) -> dict[str, str]:
+    if not failures:
+        return {}
+    return {f"last_direct_failure_{key}": failures[-1][key]
+            for key in ("attempt_id", "exit", "reason", "detail")}
+
+
+def _print_last_failure(failures: list[dict]) -> None:
+    for key, value in _last_failure_fields(failures).items():
+        print(f"{key}={value}")
+
+
+def _failed_attempt(rows: CandidateOutcomes, failures: list[dict], ordinal: int,
+                    key: str, attempt_id: str, exit_code: int | str,
+                    reason: str, detail: str) -> None:
+    _candidate_outcome(rows, ordinal, key, attempted=True, attempt_id=attempt_id,
+                       exit_code=exit_code, reason=reason, detail=detail)
+    failures.append({"attempt_id": attempt_id, "exit": str(exit_code),
+                     "reason": reason, "detail": detail})
+
+
+def _record_leg_failure(route: dict, node: dict, hop: dict, reason: str,
+                        detail: str, rows: CandidateOutcomes, failures: list[dict]) -> None:
+    record_degradation(
+        route_id=route.get("route_id"), route_node=node.get("id"),
+        route_hash=route.get("route_hash"), dispatch_depth=node.get("dispatch_depth", 2),
+        fallback_hop=hop["fallback_hop"], execution_surface="registered-headless",
+        writer="stage-dispatch-fallback.py", kind="leg-failure", reason=reason,
+        detail=detail, candidate_outcomes=rows, candidate_outcomes_omitted=rows.omitted,
+        last_direct_failure=(f"{failures[-1]['reason']}:exit-{failures[-1]['exit']}"
+                             if failures else None),
+    )
+
+
+def _typed_stop_code(reason: str, *, direct: bool = False) -> int | None:
+    """Classify an actual wrapper refusal by its typed reason, not exit code."""
+    if reason in ROUTE_STATE_REFUSAL_REASONS:
+        return 65
+    if reason in PRELAUNCH_PROCESS_BLOCK_REASONS or (direct and reason.startswith("retry-")):
+        return 78
+    return None
 
 
 def compact_diagnostic(output: str, limit: int = 1000) -> str:
@@ -838,7 +918,8 @@ def registry_has_attempt(jobs: Path, attempt_id: str) -> bool:
 
 def _report_launched(args, route, node, allocation_context, row, hop, ordinal, attempt_id,
                      attempts, prior_failures, output, *, terminal_note=None,
-                     review_verdict=None, watch_fields=None) -> int:
+                     review_verdict=None, watch_fields=None, candidate_outcomes=None,
+                     direct_failures=None) -> int:
     """The one success receipt of a launched attempt -- a plain start, or a
     worker that already finished with a verdict."""
     watch_fields = watch_fields or {}
@@ -864,6 +945,13 @@ def _report_launched(args, route, node, allocation_context, row, hop, ordinal, a
             print(f"{key}={watch_fields.get(key, '-')}")
     print(f"job_registry={args.jobs}")
     print("attempt_trace=" + "|".join(attempts))
+    _print_candidate_outcomes(candidate_outcomes or CandidateOutcomes())
+    if direct_failures:
+        last = direct_failures[-1]
+        print(f"last_direct_failure_attempt_id={last['attempt_id']}")
+        print(f"last_direct_failure_exit={last['exit']}")
+        print(f"last_direct_failure_reason={last['reason']}")
+        print(f"last_direct_failure_detail={last['detail']}")
     print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
     if output:
         print(output)
@@ -1647,17 +1735,35 @@ def capacity_retry(
     ordinal: int,
     failed: dict[str, str],
     attempts: list[str],
+    candidate_outcomes: CandidateOutcomes | None = None,
+    direct_failures: list[dict] | None = None,
 ) -> tuple[str, dict[str, str], str]:
     """Run or reuse the single canonical SD-59 retry for this route node."""
+    if candidate_outcomes is None:
+        candidate_outcomes = CandidateOutcomes()
+    if direct_failures is None:
+        direct_failures = []
+    key = tuple_key(row)
     context = capacity_context(args.jobs, route["route_id"], node["id"])
     existing = context["retries"]
     if existing:
         retry = existing[-1]
+        retry_id = retry.get("attempt_id", "")
         attempts.append(
-            f"{ordinal}:{tuple_key(row)}:capacity-retry-existing:attempt-{retry.get('attempt_id', 'unknown')}"
+            f"{ordinal}:{key}:capacity-retry-existing:attempt-{retry_id or 'unknown'}"
         )
         if retry.get("_status") in {"open", "running"} or not retry.get("note", "").startswith("dead-"):
+            _candidate_outcome(candidate_outcomes, ordinal, key, attempted=bool(retry_id),
+                               attempt_id=retry_id, exit_code=retry.get("worker_exit", ""),
+                               reason="capacity-retry-existing", detail=retry.get("_status", "unknown"))
             return "existing", retry, ""
+        if retry_id:
+            _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                            retry.get("worker_exit", ""), retry.get("note", "capacity-retry-terminal"),
+                            "existing retry is terminal")
+        else:
+            _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                               reason="capacity-retry-terminal", detail="existing retry has no attempt ID")
         return "descend", retry, "capacity-retry-terminal"
 
     harness = row["child_harness"]
@@ -1668,6 +1774,8 @@ def capacity_retry(
         # rate-limited. A silent step down to the deep tier would hand them a
         # review they did not ask for under the name they did.
         attempts.append(f"{ordinal}:{tuple_key(row)}:capacity-alternative-top-profile")
+        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                           reason="capacity-alternative-top-profile")
         return "descend", {}, "capacity-alternative-top-profile"
     # The alternative comes from an explicit --capacity-model, else the adapter
     # config capacity cascade (SD-59): a rate-limited model is switched, not
@@ -1687,6 +1795,7 @@ def capacity_retry(
         rejected = "capacity-alternative-unproved"
     if rejected:
         attempts.append(f"{ordinal}:{tuple_key(row)}:{rejected}")
+        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False, reason=rejected)
         return "descend", {}, rejected
 
     from dispatch_capacity_evidence import active_limits
@@ -1695,33 +1804,51 @@ def capacity_retry(
     if quota:
         reason = f"capacity-quota-until-{quota['reset_epoch']}"
         attempts.append(f"{ordinal}:{tuple_key(row)}:{reason}")
+        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False, reason=reason)
         return "descend", {"quota_reset_epoch": str(quota["reset_epoch"])}, reason
 
     retry_id = capacity_attempt_identity(
         args, route, node, row, ordinal, f"{alt_model}/{alt_paired}"
     )
-    retry_command = wrapper_command(
-        args, route, node, row, ordinal, retry_id,
-        (alt_model, alt_paired), failed,
-    )
     try:
+        retry_command = wrapper_command(
+            args, route, node, row, ordinal, retry_id,
+            (alt_model, alt_paired), failed,
+        )
         retry = run_wrapper(args, retry_command)
     except subprocess.TimeoutExpired:
+        attempts.append(f"{ordinal}:{key}:capacity-retry-timeout:attempt-{retry_id}")
         if registry_has_attempt(args.jobs, retry_id):
+            _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                            "timeout", "capacity-launch-outcome-unknown", "wrapper timed out")
             return "fail-closed", {"attempt_id": retry_id}, "capacity-launch-outcome-unknown"
-        return "descend", {}, "capacity-launch-timeout"
+        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                        "timeout", "capacity-launch-timeout", "wrapper timed out")
+        return "descend", {"attempt_id": retry_id}, "capacity-launch-timeout"
+    except (OSError, ValueError) as exc:
+        attempts.append(f"{ordinal}:{key}:capacity-retry-error-{type(exc).__name__}")
+        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                           reason="capacity-launch-error", detail=type(exc).__name__)
+        return "descend", {}, "capacity-launch-error"
     retry_output = (retry.stdout + retry.stderr).strip()
     retry_fields = output_fields(retry_output)
     attempts.append(
         f"{ordinal}:{tuple_key(row)}:capacity-retry:exit-{retry.returncode}:attempt-{retry_id}"
     )
     if wrapper_interrupted(retry, retry_fields):
+        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                        retry.returncode, "interrupted", "capacity retry was stopped")
         return "interrupted", {"attempt_id": retry_id, "_run": retry}, retry_output
     if retry_fields.get("duplicate_attempt") == "1":
         refreshed = capacity_context(args.jobs, route["route_id"], node["id"])["retries"]
         if refreshed:
+            _candidate_outcome(candidate_outcomes, ordinal, key, attempted=True,
+                               attempt_id=retry_id, exit_code=retry.returncode,
+                               reason="capacity-retry-existing", detail="duplicate attempt claimed")
             return "existing", refreshed[-1], retry_output
-        return "fail-closed", retry_fields, "capacity-exclusive-claim-lost"
+        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                        retry.returncode, "capacity-exclusive-claim-lost", "duplicate claim has no row")
+        return "fail-closed", {**retry_fields, "attempt_id": retry_id}, "capacity-exclusive-claim-lost"
     if (retry.returncode == 0 and retry_fields.get("early_death", "-") == "-"
             and retry_fields.get("check") != "failed"
             and retry_fields.get("worker_failure", "-") == "-"):
@@ -1731,15 +1858,62 @@ def capacity_retry(
             )
             attempts.append(f"{ordinal}:{tuple_key(row)}:capacity-watchdog-{watch_state}")
             if watch_state == "fallback":
-                return "descend", watch_fields, retry_output
+                _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                                retry.returncode,
+                                watch_fields.get("failure_class") or watch_fields.get("note") or "watchdog-fallback",
+                                watch_fields.get("process_reason") or watch_fields.get("action", "watchdog fallback"))
+                return "descend", {**watch_fields, "attempt_id": retry_id}, retry_output
             if watch_state == "capacity":
-                return "descend", watch_fields, retry_output
+                _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                                retry.returncode, "capacity", watch_fields.get("note", "capacity death"))
+                return "descend", {**watch_fields, "attempt_id": retry_id}, retry_output
             if watch_state == "fail-closed":
-                return "fail-closed", watch_fields, "capacity-watchdog-fail-closed"
+                _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                                retry.returncode, "capacity-watchdog-fail-closed",
+                                watch_fields.get("action", "unknown"))
+                return "fail-closed", {**watch_fields, "attempt_id": retry_id}, "capacity-watchdog-fail-closed"
+        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=True,
+                           attempt_id=retry_id, exit_code=retry.returncode, reason="launched")
         return "success", {**retry_fields, "attempt_id": retry_id}, retry_output
     # The wrapper already closed a second capacity death. Exactly one retry
     # has now been consumed; ordinary SD-50 descent owns the next action.
+    reason = next((value for value in (retry_fields.get("reason"),
+                   retry_fields.get("worker_failure"), retry_fields.get("early_death"))
+                   if value and value != "-"), "capacity-retry-failed")
+    detail = retry_fields.get("detail") or compact_diagnostic(retry_output)
+    _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                    retry.returncode, reason, detail)
+    stop_code = _typed_stop_code(reason)
+    if stop_code is not None:
+        return "typed-stop", {**retry_fields, "attempt_id": retry_id,
+                              "reason": reason, "detail": retry_fields.get("detail", "-"),
+                              "stop_code": str(stop_code)}, retry_output
     return "descend", retry_fields, retry_output
+
+
+def report_capacity_stop(state: str, fields: dict, output: str, attempts: list[str],
+                         rows: CandidateOutcomes, failures: list[dict],
+                         route: dict, node: dict, hop: dict, args: argparse.Namespace) -> int:
+    """Report either terminal retry result with the same bounded evidence."""
+    if state == "interrupted":
+        return report_interrupted(fields["_run"], output, fields["attempt_id"],
+                                  attempts, rows, failures, route, node, hop)
+    if state == "typed-stop":
+        reason, detail = fields["reason"], fields["detail"]
+        code = int(fields["stop_code"])
+        _record_leg_failure(route, node, hop, reason, detail, rows, failures)
+        extra = ({"next_action": fields.get("next_action") or route_state_next_action(
+            reason, detail, str(args.route), node)} if code == 65 else {})
+        return fail(reason, code, attempt_id=fields["attempt_id"],
+                    child_spawned="0", detail=detail, candidate_outcomes=rows,
+                    attempt_trace="|".join(attempts),
+                    **_last_failure_fields(failures), **extra)
+    reason = failures[-1]["reason"] if failures else output or "capacity-retry-fail-closed"
+    detail = failures[-1]["detail"] if failures else output
+    _record_leg_failure(route, node, hop, reason, detail, rows, failures)
+    return fail(reason, 76, attempt_id=fields.get("attempt_id", ""),
+                candidate_outcomes=rows, attempt_trace="|".join(attempts),
+                **_last_failure_fields(failures))
 
 
 def start_parallel_group(args: argparse.Namespace, group: str) -> int:
@@ -1997,6 +2171,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
+    candidate_outcomes = CandidateOutcomes()
     fallback_hops, allocation_context = ordered_fallback_hops(
         route, node, args.jobs, parent_identity=parent_identity, recheck=args.action != "dry-run"
     )
@@ -2038,6 +2213,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 attempts.append(
                     f"{ordered_hop['ordinal']}:{key}:skipped-prior-unchanged-failure"
                 )
+                _candidate_outcome(candidate_outcomes, int(ordered_hop['ordinal']), key,
+                                  attempted=False, reason="prior-unchanged-failure")
                 recorded_prior_skips.add(key)
     pin_skipped = False
     for hop in fallback_hops:
@@ -2052,6 +2229,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 key = tuple_key(row)
                 if row.get("_worker_pin_skip"):
                     attempts.append(f"{ordinal}:{key}:skipped-worker-pin")
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                      reason="worker-pin")
                     pin_skipped = True
                     continue
                 # Re-read after an early failure too: a whole-account quota
@@ -2066,6 +2245,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     attempts.append(
                         f"{ordinal}:{key}:skipped-{row['_allocation_skip']}"
                     )
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                      reason=str(row['_allocation_skip']))
                     # P1 (B47-1/2): allocation-skip has exact pre-launch
                     # tuple evidence at this point -- record it.
                     p1_result = LAUNCH_TUPLE.record_rejection(
@@ -2082,6 +2263,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     reason = "prior-unchanged-failure" if key in failed_tuples else row.get("failure_class") or row.get("status")
                     if key not in recorded_prior_skips:
                         attempts.append(f"{ordinal}:{key}:skipped-{reason}")
+                        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                          reason=str(reason))
                     if unsupported:
                         # P2 (B47-1/2/10): only the `unsupported` branch has
                         # exact evidence -- a pure `key in failed_tuples`
@@ -2102,12 +2285,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                                 attempt_trace="|".join(attempts))
                 if parent_failure:
                     attempts.append(f"{ordinal}:{key}:skipped-{parent_failure}")
-                    direct_failures.append({
-                        "attempt_id": "-",
-                        "exit": "73",
-                        "reason": parent_failure,
-                        "detail": "sealed parent identity is not the live dispatch-depth-1 owner",
-                    })
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                      reason=parent_failure,
+                                      detail="sealed parent identity is not the live dispatch-depth-1 owner")
                     # P3 (B47-1/2): only the CANDIDATE_SCOPED_PARENT_FAILURES
                     # branch reaches here -- the non-scoped case already
                     # returned via fail() above.
@@ -2140,7 +2320,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 ]
                 if pending_capacity:
                     retry_state, retry_fields, retry_output = capacity_retry(
-                        args, route, node, row, ordinal, pending_capacity[-1], attempts
+                        args, route, node, row, ordinal, pending_capacity[-1], attempts,
+                        candidate_outcomes, direct_failures,
                     )
                     if retry_state in {"success", "existing"}:
                         print("check=ok")
@@ -2157,17 +2338,15 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         print(f"selected_model={retry_fields.get('model', args.capacity_model or 'existing')}")
                         print(f"attempt_id={retry_fields.get('attempt_id', 'existing')}")
                         print("attempt_trace=" + "|".join(attempts))
+                        _print_candidate_outcomes(candidate_outcomes)
+                        _print_last_failure(direct_failures)
                         if retry_output:
                             print(retry_output)
                         return 0
-                    if retry_state == "interrupted":
-                        return report_interrupted(
-                            retry_fields["_run"], retry_output, retry_fields["attempt_id"], attempts)
-                    if retry_state == "fail-closed":
-                        return fail(
-                            retry_output or "capacity-retry-fail-closed", 76,
-                            attempt_trace="|".join(attempts),
-                        )
+                    if retry_state in {"interrupted", "fail-closed", "typed-stop"}:
+                        return report_capacity_stop(
+                            retry_state, retry_fields, retry_output, attempts,
+                            candidate_outcomes, direct_failures, route, node, hop, args)
                     failed_tuples.add(key)
                     continue
                 attempt_id = attempt_identity(
@@ -2203,17 +2382,27 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             node=node, output=output, interrupted=interrupted,
                         )
                     if interrupted:
-                        return report_interrupted(result, output, attempt_id, attempts)
+                        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                        attempt_id, result.returncode, "interrupted",
+                                        "the call was stopped, so the worker was stopped with it")
+                        return report_interrupted(result, output, attempt_id, attempts,
+                                                  candidate_outcomes, direct_failures,
+                                                  route, node, hop)
                     verdict_row = (finished_verdict_row(args.jobs, route["route_id"], node["id"], attempt_id)
                                    if worker_failure != "-" else None)
                     if verdict_row is not None:
                         note = verdict_row.get("note", worker_failure)
+                        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=True,
+                                          attempt_id=attempt_id, exit_code=result.returncode,
+                                          reason="terminal-verdict")
                         return _report_launched(
                             args, route, node, allocation_context, row, hop, ordinal, attempt_id,
                             attempts, prior_failures, output,
                             terminal_note=note,
                             review_verdict=(readable_result(verdict_row)
                                             or ("FAIL" if note == REVIEW_BLOCKING_NOTE else "PASS")),
+                            candidate_outcomes=candidate_outcomes,
+                            direct_failures=direct_failures,
                         )
                     if (result.returncode != 0 or fields.get("check") == "failed"
                             or worker_failure != "-"):
@@ -2221,52 +2410,52 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             fields.get("reason")
                             or (worker_failure if worker_failure != "-" else "wrapper-exit")
                         )
-                        if failure_reason in PRELAUNCH_PROCESS_BLOCK_REASONS or failure_reason.startswith("retry-"):
-                            return fail(
-                                failure_reason,
-                                78,
-                                attempt_id=attempt_id,
-                                child_spawned="0",
-                                detail=fields.get("detail", "-"),
-                                attempt_trace="|".join(attempts),
-                            )
-                        if failure_reason in ROUTE_STATE_REFUSAL_REASONS:
-                            # SD-154/B-2 (defect #2): the wrapper's own
-                            # `completion_marker_gate` (or round admission)
-                            # already proved this is the ROUTE's recorded
-                            # state, not a runtime that is merely unavailable
-                            # right now -- stop here, never fall through to
-                            # the candidate loop's eventual inline hop.
+                        failure_detail = fields.get("detail") or compact_diagnostic(output)
+                        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                        attempt_id, result.returncode,
+                                        failure_reason, failure_detail)
+                        stop_code = _typed_stop_code(failure_reason, direct=True)
+                        if stop_code is not None:
                             detail = fields.get("detail", "-")
-                            next_action = fields.get("next_action") or route_state_next_action(
-                                failure_reason, detail, str(args.route), node,
-                            )
-                            return fail(
-                                failure_reason,
-                                65,
-                                attempt_id=attempt_id,
-                                child_spawned="0",
-                                detail=detail,
-                                next_action=next_action,
-                                attempt_trace="|".join(attempts),
-                            )
-                        direct_failures.append({
-                            "attempt_id": attempt_id,
-                            "exit": str(result.returncode),
-                            "reason": failure_reason,
-                            "detail": fields.get("detail") or compact_diagnostic(output),
-                        })
+                            _record_leg_failure(route, node, hop, failure_reason, detail,
+                                                candidate_outcomes, direct_failures)
+                            extra = ({"next_action": fields.get("next_action") or route_state_next_action(
+                                failure_reason, detail, str(args.route), node)}
+                                     if stop_code == 65 else {})
+                            return fail(failure_reason, stop_code, attempt_id=attempt_id,
+                                        child_spawned="0", detail=detail,
+                                        candidate_outcomes=candidate_outcomes,
+                                        attempt_trace="|".join(attempts),
+                                        **_last_failure_fields(direct_failures), **extra)
                 except subprocess.TimeoutExpired as exc:
                     attempts.append(f"{ordinal}:{key}:direct-timeout:attempt-{attempt_id}")
+                    _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                    attempt_id, "timeout", "direct-timeout", "wrapper timed out")
                     if registry_has_attempt(args.jobs, attempt_id):
+                        record_degradation(
+                            route_id=route.get("route_id"), route_node=node.get("id"),
+                            route_hash=route.get("route_hash"),
+                            dispatch_depth=node.get("dispatch_depth", 2),
+                            fallback_hop=hop["fallback_hop"],
+                            execution_surface="registered-headless", writer="stage-dispatch-fallback.py",
+                            kind="leg-failure", reason="direct-launch-outcome-unknown",
+                            candidate_outcomes=candidate_outcomes,
+                            candidate_outcomes_omitted=candidate_outcomes.omitted,
+                            last_direct_failure="direct-timeout:exit-timeout",
+                        )
                         return fail(
                             "direct-launch-outcome-unknown", 76,
                             attempt_id=attempt_id, child_spawned="unknown",
+                            candidate_outcomes=candidate_outcomes,
                             attempt_trace="|".join(attempts),
+                            **_last_failure_fields(direct_failures),
                         )
                     continue
                 except (OSError, ValueError) as exc:
                     attempts.append(f"{ordinal}:{key}:direct-error-{type(exc).__name__}:attempt-{attempt_id}")
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                      reason="direct-launch-error",
+                                      detail=type(exc).__name__)
                     continue
                 if (result.returncode == 0 and early == "-"
                         and fields.get("check") != "failed" and worker_failure == "-"):
@@ -2276,17 +2465,33 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             args, route, node, attempt_id, fields)
                         attempts.append(f"{ordinal}:{key}:watchdog-{watch_state}")
                         if watch_state == "fallback":
+                            _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                            attempt_id, result.returncode,
+                                            watch_fields.get("failure_class") or watch_fields.get("note") or "watchdog-fallback",
+                                            watch_fields.get("process_reason") or watch_fields.get("action", "watchdog fallback"))
                             failed_tuples.add(key)
                             continue
                         if watch_state == "capacity":
                             early = "capacity"
                             fields = {**fields, **watch_fields, "early_death": "capacity"}
                         if watch_state == "fail-closed":
+                            _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                            attempt_id, result.returncode,
+                                            "progress-watchdog-fail-closed",
+                                            watch_fields.get("action", "unknown"))
+                            _record_leg_failure(route, node, hop, "progress-watchdog-fail-closed",
+                                                watch_fields.get("action", "unknown"),
+                                                candidate_outcomes, direct_failures)
                             return fail("progress-watchdog-fail-closed", 76,
                                         attempt_id=attempt_id,
                                         watchdog_action=watch_fields.get("action", "unknown"),
-                                        attempt_trace="|".join(attempts))
+                                        candidate_outcomes=candidate_outcomes,
+                                        attempt_trace="|".join(attempts),
+                                        **_last_failure_fields(direct_failures))
                     if early != "capacity":
+                        _candidate_outcome(candidate_outcomes, ordinal, key, attempted=True,
+                                          attempt_id=attempt_id, exit_code=result.returncode,
+                                          reason="launched")
                         return _report_launched(
                             args, route, node, allocation_context, row, hop, ordinal, attempt_id,
                             attempts, prior_failures, output,
@@ -2297,20 +2502,23 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                                            if watch_fields.get("review_verdict") else None),
                             review_verdict=watch_fields.get("review_verdict"),
                             watch_fields=watch_fields,
+                            candidate_outcomes=candidate_outcomes,
+                            direct_failures=direct_failures,
                         )
                 if registry_has_attempt(args.jobs, attempt_id):
                     args.automatic_retry_of = attempt_id
                 if early == "capacity":
+                    _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                    attempt_id, result.returncode, "capacity",
+                                    fields.get("detail") or fields.get("early_death", "capacity"))
                     failed = {
                         **fields, "attempt_id": attempt_id,
                         "model": fields.get("model", "unknown"),
                     }
                     retry_state, retry_fields, retry_output = capacity_retry(
-                        args, route, node, row, ordinal, failed, attempts
+                        args, route, node, row, ordinal, failed, attempts,
+                        candidate_outcomes, direct_failures,
                     )
-                    if retry_state == "interrupted":
-                        return report_interrupted(
-                            retry_fields["_run"], retry_output, retry_fields["attempt_id"], attempts)
                     if retry_state in {"success", "existing"}:
                         print("check=ok")
                         _emit_child_success(
@@ -2326,14 +2534,15 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         print(f"selected_model={retry_fields.get('model', args.capacity_model or 'existing')}")
                         print(f"attempt_id={retry_fields.get('attempt_id', 'existing')}")
                         print("attempt_trace=" + "|".join(attempts))
+                        _print_candidate_outcomes(candidate_outcomes)
+                        _print_last_failure(direct_failures)
                         if retry_output:
                             print(retry_output)
                         return 0
-                    if retry_state == "fail-closed":
-                        return fail(
-                            retry_output or "capacity-retry-fail-closed", 76,
-                            attempt_trace="|".join(attempts),
-                        )
+                    if retry_state in {"interrupted", "fail-closed", "typed-stop"}:
+                        return report_capacity_stop(
+                            retry_state, retry_fields, retry_output, attempts,
+                            candidate_outcomes, direct_failures, route, node, hop, args)
                     failed_tuples.add(key)
                     # Exactly one retry. A second capacity death descends through SD-50.
         elif hop["fallback_hop"] == "native-subagent":
@@ -2353,6 +2562,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     print(f"native_harness={candidate['harness']}")
                     print(f"child_proof={proof}")
                     print("attempt_trace=" + "|".join(attempts))
+                    _print_candidate_outcomes(candidate_outcomes)
                     print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
                     ledger = record_degradation(
                         route_id=route.get("route_id"), route_node=node.get("id"),
@@ -2360,6 +2570,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         fallback_hop="native-subagent", execution_surface=surface,
                         writer="stage-dispatch-fallback.py", reason="native-subagent-degraded",
                         detail=proof, attempt_trace="|".join(attempts),
+                        candidate_outcomes=candidate_outcomes,
+                        candidate_outcomes_omitted=candidate_outcomes.omitted,
                         fallback_ordinal=ordinal, fleet_visibility="degraded",
                         registered_worker=0, route_file=str(args.route),
                         completion_gate=node.get("completion_gate"),
@@ -2381,6 +2593,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             print(f"route_file={args.route}")
             print(f"completion_gate={node['completion_gate']}")
             print("attempt_trace=" + "|".join(attempts))
+            _print_candidate_outcomes(candidate_outcomes)
             print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
             if direct_failures:
                 last = direct_failures[-1]
@@ -2400,6 +2613,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 fallback_hop="inline", execution_surface="inline",
                 writer="stage-dispatch-fallback.py", reason=hop.get("reason_enum") or "inline-degraded",
                 attempt_trace="|".join(attempts), fallback_ordinal=ordinal,
+                candidate_outcomes=candidate_outcomes,
+                candidate_outcomes_omitted=candidate_outcomes.omitted,
                 fleet_visibility="none", registered_worker=0, route_file=str(args.route),
                 completion_gate=node.get("completion_gate"), parent=args.parent,
                 last_direct_failure=(
@@ -2422,9 +2637,15 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             route_hash=route.get("route_hash"), dispatch_depth=node.get("dispatch_depth", 2),
             writer="stage-dispatch-fallback.py", kind="chain-exhausted",
             reason="worker-pin-unavailable", detail=detail, attempt_trace="|".join(attempts),
+            candidate_outcomes=candidate_outcomes,
+            candidate_outcomes_omitted=candidate_outcomes.omitted,
+            last_direct_failure=(
+                f"{direct_failures[-1]['reason']}:exit-{direct_failures[-1]['exit']}"
+                if direct_failures else None),
             route_file=str(args.route), completion_gate=node.get("completion_gate"), parent=args.parent,
         )
         return fail("worker-pin-unavailable", 79, detail=detail, worker_pin=worker_pin,
+                    candidate_outcomes=candidate_outcomes,
                     attempt_trace="|".join(attempts),
                     degradation_ledger=str(ledger) if ledger else "-")
     ledger = record_degradation(
@@ -2432,9 +2653,15 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
         route_hash=route.get("route_hash"), dispatch_depth=node.get("dispatch_depth", 2),
         writer="stage-dispatch-fallback.py", kind="chain-exhausted",
         reason="fallback-chain-exhausted", attempt_trace="|".join(attempts),
+        candidate_outcomes=candidate_outcomes,
+        candidate_outcomes_omitted=candidate_outcomes.omitted,
+        last_direct_failure=(
+            f"{direct_failures[-1]['reason']}:exit-{direct_failures[-1]['exit']}"
+            if direct_failures else None),
         route_file=str(args.route), completion_gate=node.get("completion_gate"), parent=args.parent,
     )
     return fail("fallback-chain-exhausted", 79, attempt_trace="|".join(attempts),
+                candidate_outcomes=candidate_outcomes,
                 degradation_ledger=str(ledger) if ledger else "-")
 
 

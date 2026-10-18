@@ -50,6 +50,41 @@ class WrapperCommonTest(unittest.TestCase):
             source = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
             target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
+    def test_guard_refusal_keeps_typed_reason_and_bounded_detail(self):
+        stderr = '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n'
+        self.assertEqual(C._route_guard_refusal(stderr),
+                         ("unsafe-git-operation", "cherry-pick"))
+        self.assertEqual(C._route_guard_refusal('{"reason":{},"detail":"x"}'),
+                         ("worker-route-validation-failed", "guard output lacked a typed refusal"))
+        self.assertEqual(C._route_guard_refusal('broken'),
+                         ("worker-route-validation-failed", "guard output lacked a typed refusal"))
+        self.assertEqual(C._route_guard_refusal('{"status":"blocked","reason":"safe","detail":"x\\ny"}'),
+                         ("safe", "x y"))
+
+    def test_route_validation_receipt_uses_guard_reason(self):
+        from unittest import mock
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            route = Path(temp) / 'route.json'
+            route.write_text(json.dumps({'schema_version': 2}))
+            args = argparse.Namespace(route_id='rt-fixture', route_hash='sha256:fixture',
+                route_node='execute', registry_digest='fixture', write_scope='source/**',
+                route_file=str(route), worktree=temp, artifact_root=temp,
+                capability='autopilot-code', intensity='standard', unit='dev/backend',
+                action='start', model_role='fast implementer', model_profile='balanced',
+                attempt_id=None)
+            result = subprocess.CompletedProcess([], 65, '',
+                '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n')
+            out = io.StringIO()
+            with mock.patch.object(C, 'validate_runtime_requirements'), \
+                 mock.patch.object(C, 'validate_route_mode_axes'), \
+                 mock.patch.object(C.subprocess, 'run', return_value=result), \
+                 redirect_stdout(out):
+                self.assertEqual(C.validate_route_record(args, marker_gate=lambda *_: None), 65)
+            self.assertIn('reason=unsafe-git-operation\n', out.getvalue())
+            self.assertIn('detail=cherry-pick\n', out.getvalue())
+            self.assertNotIn('reason=worker-route-validation-failed', out.getvalue())
+
     def test_every_wrapper_keeps_the_old_names_as_the_shared_functions(self):
         for harness in ("claude", "codex", "opencode"):
             wrapper = load(harness)
