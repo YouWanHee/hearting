@@ -306,7 +306,7 @@ class PaneContinuityTest(unittest.TestCase):
                            "session_id": current_thread}
                 self.assertEqual(lifecycle.session_id(payload), current_thread)
                 with mock.patch.object(projection, "_project", return_value=True) as publish, \
-                        mock.patch.object(projection.subprocess, "Popen"):
+                        mock.patch("peer_obligations.request_obligation_recovery"):
                     self.assertTrue(projection.project(payload, current_thread))
                 args, kwargs = publish.call_args
                 self.assertEqual(args, ("codex", current_thread))
@@ -330,7 +330,7 @@ class PaneContinuityTest(unittest.TestCase):
             with mock.patch.dict(os.environ, env), \
                  mock.patch.object(projection, "_may_report", return_value=True), \
                  mock.patch.object(projection, "_project", return_value=True) as publish, \
-                 mock.patch.object(projection.subprocess, "Popen"):
+                 mock.patch("peer_obligations.request_obligation_recovery"):
                 projection.project(payload, "thread-A")
         kwargs = publish.call_args.kwargs
         self.assertIs(kwargs["report_session"], False)

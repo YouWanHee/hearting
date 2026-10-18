@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import sys
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -45,7 +44,8 @@ def _state_hook_owns_report(payload: dict[str, Any] | None, session_id: str,
         return False
 
 
-def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = False) -> bool:
+def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = False,
+            request_recovery: bool = True) -> bool:
     lifecycle = {}
     if isinstance(payload, dict) and payload.get("hook_event_name") == "SessionStart":
         source = payload.get("source")
@@ -57,14 +57,13 @@ def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = F
     report_session = not _state_hook_owns_report(payload, session_id, worker=worker)
     projected = _project("codex", session_id, worker=worker,
                          report_session=report_session, **lifecycle)
-    if not worker and session_id:
+    if request_recovery and not worker and session_id:
         try:
-            subprocess.Popen(
-                [sys.executable, str(ROOT / "utilities" / "peer-steward.py"),
-                 "__ensure-obligations", "--lifecycle-root", str(ROOT)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
-            )
-        except (OSError, subprocess.SubprocessError):
+            utilities = ROOT / "utilities"
+            if str(utilities) not in sys.path:
+                sys.path.insert(0, str(utilities))
+            from peer_obligations import request_obligation_recovery
+            request_obligation_recovery(lifecycle_root=ROOT)
+        except Exception:
             pass
     return projected

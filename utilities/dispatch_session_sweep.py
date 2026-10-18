@@ -33,6 +33,16 @@ SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
 
 
+def request_obligation_reconciliation(*, lifecycle_root: str | Path | None = None) -> None:
+    """Ask the common recovery entry to reconnect observers without holding a hook."""
+    try:
+        import peer_obligations
+        root = lifecycle_root or Path(__file__).resolve().parents[1]
+        peer_obligations.request_obligation_recovery(lifecycle_root=root)
+    except Exception:
+        pass
+
+
 def _append_self_instrumentation(
     root: Path, elapsed_ns: int, entry_count: int, claimed_count: int
 ) -> None:
@@ -156,8 +166,9 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
     return records, count
 
 
-def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
-    """Reconnect activation duties and run canonical bounded maintenance once per session start."""
+def activate(root: Path, recipient_kind: str, session_id: str, *,
+             request_recovery: bool = True) -> list[dict]:
+    """Retain this session's duties and request maintenance from its existing runner."""
     records, _ = addressed_records(root, recipient_kind, session_id)
     from peer_obligations import retain_registered_completion
     for record in records:
@@ -169,33 +180,16 @@ def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
                 retain_registered_completion(jobs, attempt, session_id, recipient_kind)
             except (OSError, ValueError):
                 continue
-    _reconcile_canonical_dispatch_state(root)
+    if request_recovery:
+        _reconcile_canonical_dispatch_state(root)
     return records
 
 
 def _reconcile_canonical_dispatch_state(root: Path) -> None:
-    """Use the existing activation event to reach shared settlement and expiry owners."""
+    """Request recovery without putting global settlement ahead of delivery."""
     try:
-        from dispatch_contract import dispatch_state_roots, resolve_agent_home
-        roots = dispatch_state_roots(resolve_agent_home())
-        if not roots or Path(root).resolve(strict=False) != Path(roots[0]).resolve(strict=False):
-            return
-        jobs = Path(roots[0]) / "jobs.log"
-        if not jobs.is_file():
-            return
-    except Exception:
-        return
-    # This remains the single dispatch-reconcile actor for materialize,
-    # known-dead expiry, and retention pruning. A failure here does not prevent
-    # the independent owner-settlement reconnect below.
-    try:
-        from dispatch_completion_join import reconcile_pending_delivery
-        reconcile_pending_delivery(jobs)
-    except Exception:
-        pass
-    try:
-        from dispatch_batch_obligations import ensure_observers
-        ensure_observers()
+        from peer_obligations import request_dispatch_reconciliation
+        request_dispatch_reconciliation(root)
     except Exception:
         pass
 
@@ -481,7 +475,8 @@ def main(argv: list[str] | None = None) -> int:
         batches = []
         for root in _state_roots():
             if args.action == "activate":
-                records = activate(root, args.recipient_kind, args.session)
+                records = activate(root, args.recipient_kind, args.session,
+                                   request_recovery=False)
             else:
                 records, _entries = sweep_deliver(root, args.recipient_kind, args.session)
             if records:
@@ -491,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
             "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
                          "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner")}
                         for root, records in batches for record in records],
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), flush=True)
+        if args.action == "activate":
+            request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
         return 0
     try:
         handed = json.load(sys.stdin).get("records") or []

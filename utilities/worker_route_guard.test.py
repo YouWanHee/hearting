@@ -13,6 +13,14 @@ def dispatch(worktree):
  return {"tuples":[{"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":"codex","launch_authority":"conductor","status":"supported","probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"","checked_worktree":str(Path(worktree).resolve()),"failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0}],"native_subagent":[]}
 
 class WorkerRouteGuardTest(unittest.TestCase):
+ def setUp(self):
+  # This suite asserts the repository's guarded launch behavior. Keep the
+  # existing gate setting inside the fixture so cleared owner environments do
+  # not silently switch these expectations to the compatibility path.
+  self.gates_env=mock.patch.dict(os.environ,{"HEARTING_GATES":"on"})
+  self.gates_env.start()
+  self.addCleanup(self.gates_env.stop)
+
  def route(self):
   # A guarded worker needs a branch, but the source running this suite may be
   # an exact-SHA (detached) CI checkout. Own that worktree precondition instead
@@ -42,9 +50,12 @@ class WorkerRouteGuardTest(unittest.TestCase):
     self.reseal(route); path=Path(td)/"route.json"; path.write_text(json.dumps(route))
     # Plain material/spec callers remain compatible with legacy route records.
     if case=="absent":
+     # This no-phase read is only the legacy material/spec compatibility
+     # check; launch refusal below must exercise the actual start boundary.
      _,node,_=G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree)
      self.assertEqual(node["id"],"execute")
     with self.assertRaises(G.WorkerRouteError) as ctx:
+     # Keep incompatible and absent tuple cases on the same real launch path.
      G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree,launch_phase="start")
     self.assertEqual(ctx.exception.reason,expected)
     if case=="incompatible":

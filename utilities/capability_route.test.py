@@ -2692,8 +2692,8 @@ class TestContinuation(unittest.TestCase):
    "attempt_id":attempt_id,"route_id":route["route_id"],
    "route_hash":route["route_hash"],"route_node":node["id"],
   }
-  from review_source_subject import is_implementation_review,seal_attempt
-  if is_implementation_review(route,node):
+  from review_source_subject import is_implementation_review,is_source_test,seal_attempt
+  if is_implementation_review(route,node) or is_source_test(node):
    metadata.update(seal_attempt(jobs,route,node,attempt_id,worktree=route["cwd"]))
    # This fixture models a settled completion, not the child lifecycle. Use
    # the common marker writer with the exact source binding; the matching
@@ -8154,13 +8154,30 @@ class ComposeRouteTest(TestRoute):
        mock.patch.object(R,"_turn_peer_source",return_value="peer:source·ref"):
    self.assertEqual(R.compose_observations(route)["confirmation"]["method"],"user-card")
  def test_compose_names_its_slug_from_the_task(self):
-  self.assertEqual(R.compose_default_slug("# Fix the streaming window sim for r5 today\nmore"),"fix-the-streaming-window-sim-for")
-  self.assertEqual(R.compose_default_slug("표면 정리\nPR #197 검증 요청"),"pr-197")
+  import hashlib
+  text="# Fix the streaming window sim for r5 today\nmore"
+  slug=R.compose_default_slug(text)
+  self.assertTrue(slug.startswith("fix-streaming-window-sim-r5-today-"),slug)
+  self.assertTrue(slug.endswith(hashlib.sha256(text.encode()).hexdigest()[:10]))
+  self.assertEqual(slug,R.compose_default_slug(text))
+  self.assertEqual(R.compose_default_slug("표면 정리\nPR #197 검증 요청"),
+                   "pr-"+hashlib.sha256("표면 정리\nPR #197 검증 요청".encode()).hexdigest()[:10])
   korean=R.compose_default_slug("표면 정리 갈래 시작",capability="autopilot-code")
-  self.assertRegex(korean,r"^autopilot-code-[0-9a-f]{6}$")
+  self.assertRegex(korean,r"^autopilot-code-[0-9a-f]{10}$")
   self.assertNotEqual(korean,R.compose_default_slug("다른 작업",capability="autopilot-code"))
   self.assertEqual(R.compose_default_slug("",shape="framed"),"framed")
-  self.assertEqual(R.compose_default_slug("2026-09-10 r5 window"),"2026-09-10-r5-window")  # the route drops the date
+  dated="2026-09-10 r5 window"
+  self.assertEqual(R.compose_default_slug(dated),"work-"+hashlib.sha256(dated.encode()).hexdigest()[:10])
+  same_stem_a="Repair worker handoff and retry safely. Details A."
+  same_stem_b="Repair worker handoff and retry safely. Details B."
+  self.assertNotEqual(R.compose_default_slug(same_stem_a),R.compose_default_slug(same_stem_b))
+  long_text="Restore verified task branch publication and final CI checks "*12
+  long_slug=R.compose_default_slug(long_text,capability="autopilot-code")
+  self.assertLessEqual(len(long_slug),R.ARTIFACT_LOCATOR.MAX_SLUG_LENGTH)
+  self.assertTrue(long_slug.endswith(hashlib.sha256(long_text.encode()).hexdigest()[:10]))
+  mixed=R.compose_default_slug("한국어 작업 설명\nOpenCode owner permission boundary",capability="autopilot-code")
+  self.assertIn("opencode",mixed)
+  self.assertNotEqual(mixed,"opencode")
  def test_a_folder_name_or_near_spelling_joins_the_existing_stream(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)
@@ -8211,7 +8228,8 @@ class ComposeRouteTest(TestRoute):
          mock.patch.object(R,"cwd_campaign_keys",return_value=folder), \
          contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
      self.assertEqual(R.main(),0)
-    self.assertEqual((seen[-1]["slug"],seen[-1]["campaign_key"]),("fix-the-streaming-window","tts-v6-release"))
+    self.assertRegex(seen[-1]["slug"],r"^autopilot-code-fix-streaming-window-[0-9a-f]{10}$")
+    self.assertEqual(seen[-1]["campaign_key"],"tts-v6-release")
     self.assertIn(note,err.getvalue())
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])

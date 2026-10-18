@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 from typing import Any
+from types import SimpleNamespace
+import commit_policy
 from dispatch_receipt_identity import JOIN_REASONS, COMPLETION_ACTIONS
 from dispatch_owner_input import OwnerInput
 import dispatch_resource_wait as RESOURCE_WAIT
@@ -483,9 +485,12 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     ]
     for attempt in sorted(attempts):
         command += ["--attempt-id", attempt]
+    join_env = os.environ.copy()
+    join_env["HEARTING_JOIN_CONSUMER_PID"] = str(os.getpid())
     try:
         result = subprocess.run(
             command,
+            env=join_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -701,6 +706,52 @@ def sandbox_policy(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def apply_owner_runtime_permissions(args: argparse.Namespace) -> None:
+    """Refresh this owner's native permission projection at the same-thread boundary."""
+    try:
+        context = commit_policy.read_runtime_permission_context()
+    except ValueError as exc:
+        raise SupervisorError(str(exc)) from exc
+    if context is None or context.get("adapter") != "codex":
+        args.owner_runtime_permission_state = None
+        return
+    if (context.get("attempt_id") != args.parent_attempt_id
+            or Path(str(context.get("worktree"))).resolve() != Path(args.worktree).resolve()):
+        raise SupervisorError("owner-runtime-permission-context-binding-mismatch")
+    if not commit_policy.runtime_permission_context_is_current(context):
+        raise SupervisorError("owner-runtime-permission-route-changed")
+    projection_args = SimpleNamespace(
+        worker_type=context["worker_type"],
+        dispatch_depth=context["dispatch_depth"],
+        capability=context["capability"],
+        worktree=context["worktree"],
+        route_file=context["route_file"],
+        route_id=context["route_id"],
+        route_hash=context["route_hash"],
+        artifact_root=context.get("artifact_root"),
+        artifact_output_dir=context.get("artifact_output_dir"),
+        owner_route_binding=None,
+    )
+    state = commit_policy.runtime_permission_projection(projection_args)
+    if state["observation_only"]:
+        args.sandbox = "read-only"
+        args.network_access = False
+    else:
+        args.sandbox = str(context.get("base_sandbox") or args.sandbox)
+        args.network_access = bool(context.get("network_eligible")) or bool(
+            state["task_publish_scope"]
+        )
+    roots = list(getattr(args, "base_writable_root", args.writable_root))
+    if state["may_commit"]:
+        commit_args = SimpleNamespace(
+            worker_type=context["worker_type"], worktree=context["worktree"],
+            dispatch_depth=context["dispatch_depth"],
+        )
+        roots.extend(str(path) for path in commit_policy.commit_git_metadata_dirs(commit_args))
+    args.writable_root = list(dict.fromkeys(roots))
+    args.owner_runtime_permission_state = state
+
+
 def resource_sandbox_command(args, row):
     """Apply this owner's selected native policy; no tool namespace inheritance."""
     from codex_permission_profile import PROFILE_NAME
@@ -734,14 +785,19 @@ def run_turn(
     prompt: str,
     args: argparse.Namespace,
 ) -> tuple[str | None, dict[str, Any] | None]:
+    apply_owner_runtime_permissions(args)
     params: dict[str, Any] = {
         "threadId": thread_id,
         "input": [{"type": "text", "text": prompt, "text_elements": []}],
         "cwd": args.worktree,
     }
-    if getattr(args, "native_permission_profile", None) is None:
+    # Keep an active named profile authoritative on ordinary turns. A
+    # per-turn Git/task overlay is valid only after the exact owner context
+    # above has revalidated its route and current worktree state.
+    owner_projection = getattr(args, "owner_runtime_permission_state", None)
+    if owner_projection is not None or getattr(args, "native_permission_profile", None) is None:
         params["sandboxPolicy"] = sandbox_policy(args)
-    if args.approval != "inherit":
+    if args.approval != "inherit" and getattr(args, "native_permission_profile", None) is None:
         params["approvalPolicy"] = args.approval
     if args.model:
         params["model"] = args.model
@@ -908,6 +964,8 @@ def run_one_turn(args: argparse.Namespace) -> int:
     command = shlex.split(args.app_server_command) if args.app_server_command else [
         "codex", "app-server", "--listen", "stdio://"
     ]
+    args.base_writable_root = list(args.writable_root)
+    apply_owner_runtime_permissions(args)
     args.native_permission_profile = commit_profile_config(
         args.worktree, args.writable_root, args.sandbox, args.network_access,
         primary_commit=args.primary_git_commit,
