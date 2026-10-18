@@ -922,9 +922,17 @@ def _batch_receipt_projection(
                 return None
             if (record.get("state") == "acked"
                     and not _received_ack_actor_valid(record.get("acked_by"),
-                        parent_completion_delivery, recipient_sid)):
+                        parent_completion_delivery, recipient_sid, jobs=jobs, record=record)):
                 return None
             receipt = record.get("receipt")
+            if (isinstance(receipt, dict) and receipt.get("schema_version") == 2
+                    and receipt.get("state") == "delivered"
+                    and receipt.get("job_registry") == "" and receipt.get("parent_attempt_id") == ""):
+                # Legacy per-child delivery kept scope in the validated pending
+                # identity instead of its body. Project it; never rewrite the
+                # stored receipt/digest or treat a prefix alone as a peer ACK.
+                receipt = {**receipt, "state": "ready", "job_registry": str(jobs.resolve(strict=True)),
+                           "parent_attempt_id": parent_attempt_id}
             if (not isinstance(receipt, dict) or receipt.get("schema_version") != 2
                     or receipt.get("state") != "ready"
                     or receipt.get("parent_attempt_id") != parent_attempt_id
@@ -958,7 +966,12 @@ def _batch_receipt_projection(
     return first
 
 
-def _received_ack_actor_valid(acked_by: object, carrier: str, recipient_sid: str) -> bool:
+def _received_ack_actor_valid(acked_by: object, carrier: str, recipient_sid: str, *, jobs=None, record=None) -> bool:
+    if isinstance(acked_by, str) and acked_by.startswith("peer-received:"):
+        if jobs is None or record is None:
+            return False
+        from peer_obligations import received_registered_ack
+        return received_registered_ack(jobs, record, recipient_sid)
     if carrier == "codex-native-queue":
         return (acked_by == "codex-native-prompt:" + recipient_sid
                 or isinstance(acked_by, str)
@@ -1020,7 +1033,7 @@ def acknowledged_attempt_receipt(
                 or record.get("receipt_digest") != meta["delivery_receipt_digest"]
                 or record.get("row_revisions", {}).get(attempt_id) != meta["delivery_row_revision"]
                 or not _received_ack_actor_valid(record.get("acked_by"), carrier=parent_completion_delivery,
-                                                 recipient_sid=recipient_sid)):
+                                                 recipient_sid=recipient_sid, jobs=jobs, record=record)):
             return None
         route_id, route_node, parent_attempt = pending_record_identity(meta, jobs)
         identity = pending.received_ack_identity(record, storage, meta["delivery_id"])

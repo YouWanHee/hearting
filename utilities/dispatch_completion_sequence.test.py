@@ -184,6 +184,68 @@ class ExactCompletionSequenceTest(unittest.TestCase):
                    "monitored_attempt_ids": [self.attempts[0], "att-unreceived"], "reason": "join-deadline"}
         self.assertIsNone(supervision._cleanup_only_result(receipt))
 
+    def test_legacy_delivered_peer_ack_recovers_only_with_exact_durable_peer_binding(self):
+        # Shape observed read-only in the reported operating duty: the old body
+        # omitted jobs/parent, while the pending identity held their scope.
+        import peer_obligations as obligations
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        jobs = legacy_root / "jobs.log"
+        aid, sid, did, ref = "att-legacy", "codex-legacy-parent", "delivery-legacy", "a" * 32
+        receipt = {"schema_version": 2, "state": "delivered", "job_registry": "",
+            "parent_attempt_id": "", "delivery_classification": "success", "children": [{
+                "attempt_id": aid, "status": "done", "readiness": "ready", "harness": "claude",
+                "required_action": "advance-completed", "delivery_classification": "success"}]}
+        digest = pending._canonical_receipt_digest(receipt)
+        metadata = {"attempt_schema_version": "2", "attempt_id": aid, "dispatch_depth": "1",
+            "worker_type": "owner", "parent_sid": sid, "parent_attempt_id": "-",
+            "parent_completion_delivery": "codex-native-queue", "delivery_intent": "1",
+            "delivery_id": did, "delivery_receipt_digest": digest, "delivery_row_revision": "legacy-rev",
+            "route_id": "rt-legacy", "route_node": "_owner", "note": "completed-supervisor"}
+        jobs.write_text("t\tdone\t/r\t/w\towner\t" + ",".join(f"{k}={v}" for k,v in metadata.items()) + "\n")
+        record = pending.create(legacy_root, recipient_kind="codex-native-queue", recipient_key=sid,
+            delivery_id=did, session_generation="", session_generation_supported="0", attempt_ids=[aid],
+            parent_attempt_id="-", route_id="rt-legacy", route_node="_owner", receipt=receipt,
+            receipt_digest=digest, row_revisions={aid: "legacy-rev"})
+        pending.claim(legacy_root, sid, did, claim_owner="fixture", lease_seconds=30)
+        record = pending.ack(legacy_root, sid, did, acked_by="peer-received:" + ref)
+        store = obligations.ObligationStore(legacy_root)
+        duty = store.create("registered-batch-legacy", "registered-batch", {"jobs": str(jobs),
+            "attempt_id": aid, "session_id": sid, "harness": "codex", "server": "default"},
+            {"carrier": "codex-native-queue"})
+        store.update(duty["id"], state="complete", delivery="acknowledged")
+        to = {"harness": "codex", "session_id": sid, "name": None}
+        sender = {"harness": "claude", "session_id": "fixture-source-parent", "name": None}
+        message = {"schema_version": 1, "ref": ref, "state": "received", "receipt": "exact-peer-ref",
+            "created": 1.0, "from": sender, "to": to, "refs": [duty["id"]], "body_sha256": "b" * 64,
+            "body_ref": None, "dispatch_notice": {"duty_id": duty["id"], "jobs": str(jobs),
+                "attempt_id": aid, "carrier": "codex-native-queue", "recipient_sid": sid,
+                "storage_recipient": sid, "delivery_id": did,
+                "claim_owner": "retained-rewake:" + duty["id"]}}
+        for bucket, body in (("pending", message), ("transfers", {"schema_version": 1, "message_id": ref,
+                "from": sender, "to": to, "body_sha256": "b" * 64, "body_ref": None})):
+            directory = legacy_root / "peer-messages" / bucket
+            directory.mkdir(mode=0o700, parents=True)
+            path = directory / (ref + ".json")
+            path.write_text(json.dumps(body)); path.chmod(0o600)
+        before = pending.record_path(legacy_root, sid, did).read_bytes()
+        recovered = join.recover_acknowledged_batch_outcome(jobs, {aid}, recipient_sid=sid,
+            parent_attempt_id="parent-session-legacy", parent_completion_delivery="codex-native-queue")
+        self.assertIsNotNone(recovered)
+        self.assertEqual((recovered["state"], recovered["job_registry"], recovered["parent_attempt_id"]),
+                         ("ready", str(jobs), "parent-session-legacy"))
+        self.assertEqual(recovered["children"], receipt["children"])
+        self.assertEqual(pending.record_path(legacy_root, sid, did).read_bytes(), before)
+        peer_path = legacy_root / "peer-messages/pending" / (ref + ".json")
+        for change in ({"receipt": "unverified"}, {"dispatch_notice": {
+                **message["dispatch_notice"], "delivery_id": "delivery-other"}}):
+            peer_path.write_text(json.dumps({**message, **change}))
+            self.assertIsNone(join.recover_acknowledged_batch_outcome(jobs, {aid}, recipient_sid=sid,
+                parent_attempt_id="parent-session-legacy", parent_completion_delivery="codex-native-queue"))
+        peer_path.unlink()  # A peer-received prefix without its evidence proves nothing.
+        self.assertIsNone(join.recover_acknowledged_batch_outcome(jobs, {aid}, recipient_sid=sid,
+            parent_attempt_id="parent-session-legacy", parent_completion_delivery="codex-native-queue"))
+
 
 if __name__ == "__main__":
     unittest.main()

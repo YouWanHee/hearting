@@ -826,6 +826,36 @@ def registered_delivery_settled(message, *, roots=None, read_context=None):
                in _registered_delivery_bindings(message, roots, read_context=read_context))
 
 
+def received_registered_ack(jobs, record, recipient_sid) -> bool:
+    """Read an exact peer receipt without ACKing it or advancing any duty."""
+    import dispatch_pending_delivery as pending
+    actor = record.get("acked_by")
+    if not isinstance(actor, str) or not actor.startswith("peer-received:"):
+        return False
+    ref = actor.removeprefix("peer-received:")
+    if not re.fullmatch(r"[0-9a-f]{32}", ref):
+        return False
+    root = Path(jobs).resolve(strict=True).parent
+    spec = importlib.util.spec_from_file_location("_registered_ack_reader", _code_root() / "utilities/peer-message.py")
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    try:
+        message = module._read_pending(ref, roots=[root], state_root=root)
+        if not message or (message.get("to") or {}).get("session_id") != recipient_sid:
+            return False
+        for _store, _duty, _row, exact, _root, storage, delivery_id in _registered_delivery_bindings(
+                message, roots=[root], received_only=True):
+            if pending.received_ack_identity(exact, storage, delivery_id) == pending.received_ack_identity(
+                    record, storage, delivery_id):
+                return True
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+    return False
+
+
 def acknowledge_registered_delivery(message, *, roots=None):
     """Settle only a delivery proven by this exact recipient-side peer receipt.
 
