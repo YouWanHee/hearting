@@ -361,8 +361,8 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None) ->
     script, child_env, binding = peer_obligations.service_script(
         "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
-    if jobs_paths:
-        _resume_owner_settlements(jobs_paths[0])
+    for jobs_path in jobs_paths:
+        _resume_owner_settlements(jobs_path)
     for jobs_path in jobs_paths:
         try:
             root = _root(jobs_path)
@@ -424,67 +424,78 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None) ->
     return launched
 
 
-def _resume_owner_settlements(jobs: Path) -> None:
-    """The open registry row retains a failed supervisor settlement itself.
-
-    Resume through the same writer on ordinary reconnection, including older
-    owners with no batch sidecar record. Storage failure keeps it open for
-    the next existing callback; this never launches model work.
-    """
+def _pending_owner_settlements(jobs: Path):
+    """Return exact owner rows whose existing terminal path still owes work."""
     from dispatch_contract import (
         SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
     )
-    from dispatch_completion_join import ChildRow, settle_finished_attempt
+    from dispatch_terminal_commit import owner_completion_pending
+
     try:
-        lines = jobs.read_text().splitlines()
-    except OSError:
-        return
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ()
+    pending = []
     for order, raw in enumerate(lines):
         fields = raw.split("\t")
-        if len(fields) != 6 or fields[1] not in {"open", "running"}:
+        if len(fields) != 6 or fields[1] not in {"open", "running", "done"}:
             continue
         meta = parse_registry_metadata(fields[5])
         if (meta.get("worker_type") != "owner" or meta.get("launch_started") != "1"
                 or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
-                or not meta.get("supervisor_lease_file")
-                or not meta.get("log_file") or not meta.get("attempt_id")):
+                or not meta.get("supervisor_lease_file") or not meta.get("log_file")
+                or not meta.get("attempt_id")):
+            continue
+        if fields[1] == "done":
+            if meta.get("workflow_completion") != "runtime-v1":
+                continue
+            try:
+                if not owner_completion_pending(jobs, fields[1], meta):
+                    continue
+            except Exception:
+                # An unavailable observation remains a retryable obligation.
+                pass
+        try:
+            lease_held = supervisor_lease_is_held(jobs, meta)
+        except (OSError, ValueError):
+            lease_held = True
+        pending.append((order, fields[1], raw, meta, lease_held))
+    return tuple(pending)
+
+
+def _resume_owner_settlements(jobs: Path) -> None:
+    """Retry retained owner work through its existing terminal transaction."""
+    from dispatch_completion_join import (
+        ChildRow, exact_attempt_row, materialize_after_terminal_close, settle_finished_attempt,
+    )
+    for order, status, raw, meta, lease_held in _pending_owner_settlements(jobs):
+        if lease_held:
             continue
         try:
-            if supervisor_lease_is_held(jobs, meta):
+            if status == "done":
+                materialize_after_terminal_close(jobs, meta["attempt_id"])
                 continue
-            settle_finished_attempt(jobs, ChildRow(order, fields[1], fields[4],
-                                                 meta["attempt_id"], raw, meta))
-        except (OSError, ValueError):
+            settle_finished_attempt(jobs, ChildRow(order, status, raw.split("\t")[4],
+                                                   meta["attempt_id"], raw, meta))
+            current = exact_attempt_row(jobs, meta["attempt_id"])
+            if (current.status == "done"
+                    and current.metadata.get("workflow_completion") == "runtime-v1"):
+                from dispatch_terminal_commit import owner_completion_pending
+                if owner_completion_pending(jobs, current.status, current.metadata):
+                    materialize_after_terminal_close(jobs, current.attempt_id)
+        except (OSError, ValueError, RuntimeError):
             continue
 
 
 def has_unowned_work(jobs: str | Path | None = None) -> bool:
     """Read-only check for batch or owner settlement work without a live owner."""
-    from dispatch_contract import (
-        SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
-    )
-
     for jobs_path in _jobs_paths(jobs, strict=False):
         try:
-            lines = jobs_path.read_text().splitlines()
-        except FileNotFoundError:
-            lines = ()
+            owner_settlements = _pending_owner_settlements(jobs_path)
         except (OSError, UnicodeError):
             return True
-        for raw in lines:
-            fields = raw.split("\t")
-            if len(fields) != 6 or fields[1] not in {"open", "running"}:
-                continue
-            meta = parse_registry_metadata(fields[5])
-            if (meta.get("worker_type") == "owner" and meta.get("launch_started") == "1"
-                    and meta.get("supervisor_lease") == SUPERVISOR_LEASE_KIND
-                    and meta.get("supervisor_lease_file") and meta.get("log_file")
-                    and meta.get("attempt_id")):
-                try:
-                    if not supervisor_lease_is_held(jobs_path, meta):
-                        return True
-                except (OSError, ValueError):
-                    continue
+        if any(not lease_held for _order, _status, _raw, _meta, lease_held in owner_settlements):
+            return True
 
         try:
             records = _read_only_records(jobs_path)
@@ -513,10 +524,17 @@ def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, .
     signature = []
     for jobs_path in _jobs_paths(jobs, strict=False):
         try:
+            owner_settlements = _pending_owner_settlements(jobs_path)
             records = _read_only_records(jobs_path)
         except (OSError, BatchObligationError):
             signature.append((str(jobs_path), "unavailable"))
             continue
+        for _order, status, _raw, meta, lease_held in owner_settlements:
+            if not lease_held:
+                signature.append((str(jobs_path), "owner-settlement",
+                                  meta.get("attempt_id", ""), status,
+                                  meta.get("workflow_completion", ""),
+                                  meta.get("note", "")))
         for path, record, error in records:
             if error is not None:
                 signature.append((str(jobs_path), path.name, "unreadable"))

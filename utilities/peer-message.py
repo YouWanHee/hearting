@@ -782,6 +782,10 @@ def _pending_target_matches(row, recipient):
     return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
 
 
+class UnsupportedPendingSchema(ValueError):
+    """A valid pending row written by a newer reader; preserve it for takeover."""
+
+
 def _read_pending(ref, *, roots=None):
     path = _pending_path(ref)
     try:
@@ -796,6 +800,9 @@ def _read_pending(ref, *, roots=None):
     if len(raw) > 65536:
         raise ValueError("peer-pending-oversized")
     row = json.loads(raw)
+    if (isinstance(row, dict) and type(row.get("schema_version")) is int
+            and row["schema_version"] > 1):
+        raise UnsupportedPendingSchema("peer-pending-schema-unsupported")
     transfer = _read_transfer_record(ref, roots=roots)
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
@@ -949,6 +956,10 @@ def _pending_rows(*, recipient=None, sender=None, read_context=None):
         try:
             expected = path.lstat()
             row = _read_pending(path.stem, roots=roots)
+        except UnsupportedPendingSchema:
+            # A newer schema is not evidence of corruption. Leave its bytes
+            # and inode in place for a compatible managed reader to consume.
+            continue
         except (OSError, ValueError) as exc:
             if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
                 # A lock or temporary I/O failure proves no damage; the next

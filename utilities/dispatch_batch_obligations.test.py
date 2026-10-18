@@ -31,6 +31,41 @@ class BatchObligationTest(unittest.TestCase):
             thread_id=None, interval=0.1, timeout=1.0,
         )
 
+    def _runtime_owner_row(self, attempt="att-owner", *, status="done"):
+        metadata = ",".join((
+            "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
+            "launch_started=1", "supervisor_lease=flock-v1",
+            "supervisor_lease_file=/fixture/owner.lease", "log_file=/fixture/owner.log",
+            f"attempt_id={attempt}", "workflow_completion=runtime-v1",
+            "note=completed-supervisor",
+        ))
+        return f"2026-10-18T00:00:00Z\t{status}\t/repo\t/wt\towner\t{metadata}"
+
+    def test_done_runtime_owner_without_sidecar_remains_discoverable_and_retries(self):
+        self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        with mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
+            self.assertTrue(obligations.has_unowned_work(self.jobs))
+            self.assertIn((str(self.jobs), "owner-settlement", "att-owner", "done",
+                           "runtime-v1", "completed-supervisor"),
+                          obligations.pending_observer_signature(self.jobs))
+            obligations._resume_owner_settlements(self.jobs)
+        settle.assert_called_once_with(self.jobs, "att-owner")
+
+    def test_reconnection_checks_every_registry_root(self):
+        other_jobs = self.base / "other-jobs.log"
+        other_jobs.write_text(self._runtime_owner_row("att-second") + "\n", encoding="utf-8")
+        self.jobs.write_text(self._runtime_owner_row("att-first") + "\n", encoding="utf-8")
+        with mock.patch.object(obligations, "_jobs_paths", return_value=[self.jobs, other_jobs]), \
+             mock.patch("peer_obligations.service_script", return_value=(Path("/unused"), {}, None)), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
+            self.assertEqual(obligations.ensure_observers(), 0)
+        self.assertEqual([call.args for call in settle.call_args_list],
+                         [(self.jobs, "att-first"), (other_jobs, "att-second")])
+
     def test_exact_identity_and_settled_result_are_immutable(self):
         duty_id, record = obligations.create(self.args)
         self.assertEqual(record["identity"]["attempt_ids"], ["att-child"])

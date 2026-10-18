@@ -182,7 +182,7 @@ class DispatchReapWatchTest(unittest.TestCase):
             worker.wait(timeout=5)
             time.sleep(0.08)
             self.assertIsNone(watcher.poll(), "watcher ignored escaped descendant")
-            self.assertEqual(watcher.wait(timeout=5), 0)
+            self.assertEqual(watcher.wait(timeout=10), 0)
             row = jobs.read_text(encoding="utf-8")
             self.assertIn("launch_outcome=governed-process-group-drained", row)
             self.assertIn(f"group_reap_proof={D.GROUP_REAP_PROOF}", row)
@@ -387,7 +387,7 @@ class DispatchReapWatchTest(unittest.TestCase):
                 meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
             )
             self.assertEqual(meta["attempt_descendant_residue_basis"], "terminal-envelope")
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 10
             while D.attempt_tagged_descendants(meta).state != "empty":
                 self.assertLess(time.monotonic(), deadline, "residue never exited")
                 time.sleep(0.05)

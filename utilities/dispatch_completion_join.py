@@ -4189,6 +4189,52 @@ def settle_exited_owner_terminal(row: ChildRow, *, jobs: str | Path) -> str | No
     return "" if closed else "owner-terminal-revalidation-pending"
 
 
+def _reconcile_late_terminal_conflict(row: ChildRow, *, jobs: str | Path) -> str | None:
+    """Record an exact late negative envelope without rewriting a committed PASS."""
+    try:
+        current = exact_attempt_row(Path(jobs), row.attempt_id)
+        from dispatch_attempt_policy import committed_outcome
+        from dispatch_contract import terminal_conflict_pending
+        if current.status not in {"done", "killed", "cancelled"}:
+            return None
+        if launched_attempt_identity(current.raw.split("\t")) != launched_attempt_identity(row.raw.split("\t")):
+            return None
+        if terminal_conflict_pending(current.metadata):
+            return "terminal-evidence-conflict"
+        if current.metadata.get("terminal_conflict") == "1":
+            return None
+        if committed_outcome(current.status, current.metadata) != "succeeded":
+            return None
+        if not current.metadata.get("log_file"):
+            return None
+        terminal = inspect_terminal_attempt(
+            current.metadata.get("log_file"),
+            worktree=_row_worktree(current),
+            artifact_root_metadata=current.metadata.get("artifact_root"),
+            worker_type=current.metadata.get("worker_type"),
+            artifact_binding=current.metadata,
+        )
+        if terminal.get("state") != "valid" or terminal.get("verdict") not in {"FAIL", "BLOCKED"}:
+            return None
+        note = str(terminal.get("failure_note") or "")
+        failure_class = str(terminal.get("failure_class") or "")
+        if not note or failure_class not in {"fail", "blocked", "sandbox-init"}:
+            return None
+        evidence = {
+            "failure_class": failure_class,
+            "classifier_source": "completion-join-late-terminal-v1",
+            "reconcile_reason": f"late-terminal-envelope:{terminal.get('verdict')}",
+        }
+        if note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
+            evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
+        reconcile_attempt_terminal(Path(jobs), current.attempt_id, note, evidence=evidence)
+        updated = exact_attempt_row(Path(jobs), current.attempt_id)
+        return ("terminal-evidence-conflict"
+                if terminal_conflict_pending(updated.metadata) else None)
+    except (DispatchContractError, JoinContractError, OSError, ValueError, RuntimeError):
+        return None
+
+
 def close_finished_child(
     row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None,
     correct_recorded_move: bool = False,
@@ -4200,6 +4246,10 @@ def close_finished_child(
     """
 
     metadata = getattr(row, "metadata", {}) or {}
+    late_conflict = _reconcile_late_terminal_conflict(row, jobs=jobs)
+    if late_conflict:
+        cleanup = resolve_attempt_cleanup(Path(jobs), row.attempt_id, apply=True)
+        return late_conflict if cleanup["settled"] else str(cleanup["reason"])
     from route_authority import decide_continuation
     obligation = decide_continuation(action="attempt-action", status=row.status, metadata=metadata)
     if (obligation.next_action not in {"complete-open", "complete-deferred"}

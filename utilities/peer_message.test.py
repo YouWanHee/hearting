@@ -771,6 +771,28 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         quarantine = malformed.parent.parent / "quarantine"
         self.assertEqual(len(list(quarantine.rglob(malformed.name))), 1)
 
+    def test_future_pending_schema_is_preserved_without_quarantine(self):
+        text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_bytes())
+        row["schema_version"] = 2
+        row["future_field"] = {"opaque": [1, 2, 3]}
+        raw = json.dumps(row, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(peer_message.pending_messages(self.recipient), [])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(errors.getvalue(), "")
+        quarantine = path.parent.parent / "quarantine"
+        self.assertFalse(quarantine.exists())
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message._read_pending(ref)
+        with self.assertRaises(peer_message.UnsupportedPendingSchema):
+            peer_message.receive_peer_message(text, self.recipient)
+        self.assertEqual(path.read_bytes(), raw)
+
     def test_production_read_scope_source_is_codex_adapter_contract_only(self):
         self.assertTrue(peer_message._codex_model_read_access(self.recipient))
         self.assertFalse(peer_message._codex_model_read_access(
@@ -1331,7 +1353,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
                     self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
                     self.assertEqual(peer_message.parse_peer_trailer(text, recipient, include_ref=True)["transfer_ref"], ref)
 
-    def test_legacy_shell_sender_uses_existing_claude_context_and_codex_queue(self):
+    def test_claude_context_emission_stays_queued_without_native_receive_evidence(self):
         recipient = dict(self.recipient, harness="claude")
         text, ref = self.legacy_shell_pending(recipient)
         stream = io.StringIO()
@@ -1339,8 +1361,13 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         context = json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(context, text)
         self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
-        peer_message.receive_peer_message(context, recipient)
-        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        # A later callback for the same SID is not proof that Claude consumed
+        # the injected system context. Only a native exact receive can ACK it.
+        peer_message.receive_peer_message("ordinary next user prompt", recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+
+    def test_codex_queue_uses_native_consumption_evidence(self):
         import codex_queue_delivery as queue
         text, ref = self.legacy_shell_pending(self.recipient)
         with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:

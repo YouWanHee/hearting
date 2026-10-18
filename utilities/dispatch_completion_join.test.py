@@ -3054,6 +3054,46 @@ class FinishedChildClosure(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("complete", calls[0])
 
+    def test_late_fail_and_blocked_envelopes_record_consumable_conflicts(self):
+        import route_authority
+
+        for index, verdict in enumerate(("FAIL", "BLOCKED")):
+            attempt_id = f"att-late-negative-{index}"
+            row = self.child(verdict="PASS", quiescent=True, attempt_id=attempt_id)
+            self.jobs.write_text(row.raw + "\n", encoding="utf-8")
+            self.assertTrue(D.close_attempt_row(
+                self.jobs, attempt_id, "completed-marker",
+                evidence={"failure_class": "pass", "classifier_source": "fixture-marker"},
+            ))
+            committed = JOIN.exact_attempt_row(self.jobs, attempt_id)
+            Path(row.metadata["log_file"]).write_text(
+                json.dumps({"type": "system", "subtype": "init"}) + "\n"
+                + json.dumps({
+                    "type": "result", "subtype": "success", "is_error": False,
+                    "result": f"artifact: {self.artifact / 'brief.md'}\n"
+                              f"verdict: {verdict}\nblocker: late result",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            reason = JOIN.close_finished_child(committed, jobs=self.jobs)
+            current = JOIN.exact_attempt_row(self.jobs, attempt_id)
+            self.assertEqual(reason, "terminal-evidence-conflict")
+            self.assertEqual(current.status, "done")
+            self.assertEqual(current.metadata.get("note"), "completed-marker")
+            self.assertEqual(current.metadata.get("failure_class"), "pass")
+            self.assertTrue(D.terminal_conflict_pending(current.metadata))
+            decision = route_authority.decide_continuation(
+                action="attempt", status=current.status, metadata=current.metadata,
+                facts={"process_state": "quiescent"},
+            )
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "terminal-evidence-conflict")
+            conflicts = current.metadata.get("terminal_conflicts_b64")
+            self.assertEqual(JOIN.close_finished_child(current, jobs=self.jobs),
+                             "terminal-evidence-conflict")
+            replay = JOIN.exact_attempt_row(self.jobs, attempt_id)
+            self.assertEqual(replay.metadata.get("terminal_conflicts_b64"), conflicts)
+
     def test_pass_verdict_behaviour_unchanged(self):
         reason = JOIN.close_finished_child(self.child(artifact=None), jobs=self.jobs)
         self.assertTrue(reason.startswith("evidence-"), reason)

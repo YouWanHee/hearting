@@ -95,7 +95,7 @@ def main() -> int:
         from dispatch_batch_obligations import ensure_observers
     except Exception:
         ensure_observers = None
-    if ensure_observers is not None:
+    if ensure_observers is not None and _event_name(payload) != "SessionStart":
         for root in seen:
             try:
                 jobs_log = Path(root) / "jobs.log"

@@ -892,5 +892,23 @@ process.exit(0);
             self.assertIsNotNone(liveness.heartbeat_age_min(release, "oc-worker", time.time()))
 
 
+class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
+    def test_only_canonical_session_activation_runs_existing_reconcile_owners(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        secondary = self.root.parent / "secondary-dispatch"
+        secondary.mkdir()
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
+             mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
+             mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
+            SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
+            SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
+        reconcile.assert_called_once_with(jobs)
+        ensure.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
