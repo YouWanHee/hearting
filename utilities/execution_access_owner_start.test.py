@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -161,8 +162,36 @@ class OwnerGrantStartTest(unittest.TestCase):
                 return fields, metadata
         self.fail("attempt has no row: " + attempt)
 
+    def make_release_fixture(self, release):
+        release.mkdir(parents=True)
+        (release / ".hearting-release.json").write_text(
+            '{"schema":1,"version":"fixture"}\n', encoding="utf-8")
+        (release / "harness-manifest.json").symlink_to(ROOT / "harness-manifest.json")
+        for name in ("capabilities", "core", "profiles", "roles", "tools", "utilities"):
+            (release / name).symlink_to(ROOT / name, target_is_directory=True)
+        adapters = release / "adapters"
+        adapters.mkdir()
+        for harness in ("claude", "codex", "opencode"):
+            source = ROOT / "adapters" / harness
+            target = adapters / harness
+            target.mkdir()
+            for entry in source.iterdir():
+                if entry.name != "bin":
+                    (target / entry.name).symlink_to(
+                        entry, target_is_directory=entry.is_dir())
+                    continue
+                target_bin = target / "bin"
+                target_bin.mkdir()
+                for executable in entry.iterdir():
+                    destination = target_bin / executable.name
+                    if executable.name == "dispatch-headless.py":
+                        shutil.copy2(executable, destination)
+                    else:
+                        destination.symlink_to(
+                            executable, target_is_directory=executable.is_dir())
+
     def start(self, adapter, attempt, request, *, route=None, owner=None,
-              action="start", parent_adapter="codex"):
+              action="start", parent_adapter="codex", release_pair=None):
         wrapper = self.wrappers[adapter]
         marker = self.root / (attempt + ".started")
         release = self.root / (attempt + ".release")
@@ -203,6 +232,12 @@ class OwnerGrantStartTest(unittest.TestCase):
                        AGENT_DISPATCH_CURRENT_SANDBOX=parent_sandbox,
                        AGENT_NESTED_HEADLESS_NETWORK="1")
         stdout, stderr = io.StringIO(), io.StringIO()
+        exec_calls = []
+
+        class SimulatedExec(BaseException):
+            def __init__(self, result):
+                self.result = result
+
         with ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
             stack.enter_context(redirect_stdout(stdout))
@@ -217,8 +252,10 @@ class OwnerGrantStartTest(unittest.TestCase):
             if hasattr(wrapper, "check_runtime_projection"):
                 stack.enter_context(mock.patch.object(wrapper, "check_runtime_projection", return_value=0))
             if hasattr(wrapper, "prepare_nested_codex_home"):
+                nested_home = self.home / (
+                    ".codex-" + attempt if release_pair is not None else ".codex")
                 stack.enter_context(mock.patch.object(wrapper, "prepare_nested_codex_home",
-                                                      return_value=self.home / ".codex"))
+                                                      return_value=nested_home))
                 stack.enter_context(mock.patch.object(wrapper, "_core_grounding_dir",
                                                       return_value=self.root / "bootstrap/core"))
             stack.enter_context(mock.patch.object(wrapper.shutil, "which", return_value=sys.executable))
@@ -240,8 +277,27 @@ class OwnerGrantStartTest(unittest.TestCase):
             access = stack.enter_context(mock.patch.object(
                 wrapper.route_authority, "bind_launch_access",
                 wraps=wrapper.route_authority.bind_launch_access))
-            result = wrapper.main(argv)
+            if release_pair is not None:
+                source_root, sealed_root = release_pair
+                stack.enter_context(mock.patch.object(wrapper, "ROOT", source_root))
+
+                def simulate_exec(executable, vector):
+                    exec_calls.append((executable, list(vector)))
+                    target = Path(vector[1])
+                    if not target.is_file():
+                        raise AssertionError("sealed release wrapper is missing")
+                    with mock.patch.object(wrapper, "ROOT", sealed_root):
+                        nested_result = wrapper.main([str(target), *vector[2:]])
+                    raise SimulatedExec(nested_result)
+
+                stack.enter_context(mock.patch.object(
+                    wrapper.WRAPPER_COMMON.os, "execv", side_effect=simulate_exec))
+            try:
+                result = wrapper.main(argv)
+            except SimulatedExec as completed:
+                result = completed.result
             self.last_access_args = access.call_args.args[0] if access.call_args else None
+        self.last_exec_calls = exec_calls
         try:
             _, metadata = self.row(attempt)
             if metadata.get("pid"):
@@ -395,6 +451,46 @@ class OwnerGrantStartTest(unittest.TestCase):
                             and Path(call.args[1]).resolve() == ROOT.resolve()
                             and call.args[3][0] == "--start"
                             for call in reexec.call_args_list))
+
+    def test_sibling_release_reexec_keeps_one_registration_and_pins_child_home(self):
+        releases = self.root / "managed" / "releases"
+        releases.mkdir(parents=True)
+        release_a, release_b = releases / "vA", releases / "vB"
+        self.make_release_fixture(release_a)
+        self.make_release_fixture(release_b)
+        self.worker.write_text(
+            "import os,pathlib,sys,time\n"
+            "pathlib.Path(sys.argv[1] + '.home').write_text(os.environ.get('AGENT_HOME', ''))\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(.01)\n")
+        self.env["AGENT_HOME"] = str(ROOT)
+
+        for adapter in ("claude", "codex", "opencode"):
+            for source, sealed in ((release_a, release_b), (release_b, release_a)):
+                with self.subTest(adapter=adapter, source=source.name, sealed=sealed.name):
+                    route = self.route(adapter)
+                    self.env["AGENT_HOME"] = str(sealed)
+                    attempt = "att-" + hashlib.sha256(
+                        (adapter + source.name + sealed.name).encode()).hexdigest()[:32]
+                    result, output = self.start(
+                        adapter, attempt, None, route=route,
+                        release_pair=(source, sealed),
+                    )
+                    self.assertEqual(result, 0, output)
+                    self.assertIn("started=1", output)
+                    _fields, row = self.row(attempt)
+                    self.assertEqual(row["launch_home"], str(sealed.resolve()))
+                    self.assertEqual((self.root / (attempt + ".started.home")).read_text(),
+                                     str(sealed.resolve()))
+                    self.assertEqual(len(self.last_exec_calls), 1)
+                    executable, vector = self.last_exec_calls[0]
+                    self.assertEqual(executable, sys.executable)
+                    self.assertEqual(Path(vector[1]).resolve(),
+                                     (sealed / "adapters" / adapter / "bin" /
+                                      "dispatch-headless.py").resolve())
+                    registered = [line for line in self.jobs.read_text(encoding="utf-8").splitlines()
+                                  if f"attempt_id={attempt}" in line]
+                    self.assertEqual(len(registered), 1)
 
     def test_owner_without_request_keeps_default_grants(self):
         route = self.route("codex")
