@@ -17,6 +17,18 @@ class PeerReadContext:
         self._handover_snapshots = None
         self._handover_ledgers = {}
         self._recipient_censuses = {}
+        self._transfer_roots = None
+
+    def transfer_roots(self, loader):
+        """Reuse candidate ledger roots for exact per-message transfer reads.
+
+        The root list only narrows where each transfer record is read. It does
+        not cache transfer contents or any delivery/recipient authority.
+        """
+        if self._transfer_roots is None:
+            roots, _source = loader()
+            self._transfer_roots = tuple(Path(root) for root in roots)
+        return self._transfer_roots
 
     def recipient_census(self, endpoint, loader):
         """Reuse one endpoint's recipient listing within a single read pass."""

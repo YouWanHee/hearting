@@ -50,6 +50,19 @@ class ObligationStoreTest(unittest.TestCase):
         os.environ.update(self._saved_env)
         self.temp.cleanup()
 
+    def test_skip_unchanged_preserves_default_revision_updates(self):
+        duty = self.store.create("message-noop", "message", {}, {})
+        observation = {"ref": "r" * 32, "reason": "target-identity-changed"}
+        updated = self.store.update(duty["id"], state="unknown", observation=observation)
+
+        same = self.store.update(duty["id"], state="unknown", observation=observation,
+                                 skip_unchanged=True)
+        self.assertEqual(same, updated)
+
+        default_update = self.store.update(duty["id"], state="unknown", observation=observation)
+        self.assertEqual(default_update["revision"], updated["revision"] + 1)
+        self.assertGreaterEqual(default_update["updated_at"], updated["updated_at"])
+
     def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
         self.store.create("message-reconnect", "message", {"session_id": "parent"},
                           {"ref": "a" * 32})

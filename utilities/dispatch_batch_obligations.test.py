@@ -104,6 +104,27 @@ class BatchObligationTest(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_malformed_present_observer_start_is_not_treated_as_missing(self):
+        duty_id, _record = obligations.create(self.args)
+        outcome = {"state": "ready", "children": [
+            {"attempt_id": "att-child", "status": "done"},
+        ]}
+        obligations.update(self.jobs, duty_id, state="delivery-pending", outcome=outcome,
+                           observer={"pid": 321, "pid_start": ""})
+        binding = "/fixture/managed/current"
+        with mock.patch("peer_obligations.service_script",
+                        return_value=(Path("/fixture/current/codex-managed-completion.py"),
+                                      {}, binding)), \
+             mock.patch.object(obligations, "acquire", return_value=None), \
+             mock.patch("peer_obligations.replace_managed_observer") as replace, \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertEqual(obligations.ensure_observers(
+                self.jobs, service_current=binding), 0)
+        replace.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(obligations.read(self.jobs, duty_id)["observer"],
+                         {"pid": 321, "pid_start": ""})
+
     def test_complete_duty_is_not_replayed(self):
         duty_id, _record = obligations.create(self.args)
         obligations.update(self.jobs, duty_id, state="complete", outcome={"state": "ready"},
@@ -153,12 +174,16 @@ class BatchObligationTest(unittest.TestCase):
             self.assertEqual(obligations.pending_observer_signature(self.jobs),
                              ((str(self.jobs), "unavailable"),))
             self.assertTrue(obligations.has_unowned_work(self.jobs))
+            snapshot = obligations.pending_observer_snapshot(self.jobs)
+            self.assertFalse(snapshot["cacheable"])
+            self.assertEqual(snapshot["paths_by_jobs"][str(self.jobs)], None)
 
         malformed = root / "batch-malformed.json"
         malformed.write_text("{not-json", encoding="utf-8")
         self.assertEqual(obligations.pending_observer_signature(self.jobs),
                          ((str(self.jobs), malformed.name, "unreadable"),))
         self.assertTrue(obligations.has_unowned_work(self.jobs))
+        self.assertFalse(obligations.pending_observer_snapshot(self.jobs)["cacheable"])
 
         protected_jobs = self.base / "protected" / "jobs.log"
         protected_jobs.parent.mkdir(parents=True)
@@ -170,6 +195,44 @@ class BatchObligationTest(unittest.TestCase):
         protected_root.symlink_to(target, target_is_directory=True)
         self.assertEqual(obligations.pending_observer_signature(protected_jobs),
                          ((str(protected_jobs), "unavailable"),))
+        self.assertFalse(obligations.pending_observer_snapshot(protected_jobs)["cacheable"])
+
+    def test_pending_snapshot_reuses_only_stable_readable_directory_pair(self):
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending",
+                           reason="awaiting-recipient")
+        original = obligations._read_only_records
+        key = str(self.jobs.resolve(strict=False))
+
+        with mock.patch.object(obligations, "_read_only_records", wraps=original) as scan:
+            snapshot = obligations.pending_observer_snapshot(self.jobs)
+            self.assertTrue(snapshot["cacheable"])
+            self.assertIn(duty_id, [item[1] for item in snapshot["signature"]])
+            self.assertEqual(snapshot["root_stamps"][key], obligations._directory_stamp(
+                snapshot["roots_by_jobs"][key]))
+            scan.assert_called_once_with(self.jobs)
+
+    def test_sidecar_created_between_scan_and_after_stamp_forces_refresh(self):
+        original = obligations._read_only_records
+        created = []
+
+        def scan_then_publish(jobs):
+            records = original(jobs)
+            if not created:
+                duty_id, _record = obligations.create(self.args)
+                obligations.update(jobs, duty_id, state="delivery-pending",
+                                   reason="accepted-during-snapshot")
+                created.append(duty_id)
+            return records
+
+        with mock.patch.object(obligations, "_read_only_records", side_effect=scan_then_publish):
+            stale = obligations.pending_observer_snapshot(self.jobs)
+        self.assertFalse(stale["cacheable"])
+        self.assertNotIn(created[0], [item[1] for item in stale["signature"]])
+
+        refreshed = obligations.pending_observer_snapshot(self.jobs)
+        self.assertTrue(refreshed["cacheable"])
+        self.assertIn(created[0], [item[1] for item in refreshed["signature"]])
 
     def test_unowned_work_probe_is_read_only_and_uses_exact_observer_identity(self):
         duty_id, _record = obligations.create(self.args)
@@ -183,6 +246,46 @@ class BatchObligationTest(unittest.TestCase):
         self.assertFalse(obligations.has_unowned_work(self.jobs))
         obligations.update(self.jobs, duty_id, state="complete")
         self.assertFalse(obligations.has_unowned_work(self.jobs))
+
+    def test_owner_settlement_scan_reuses_unchanged_registry_but_rechecks_leases(self):
+        from dispatch_contract import SUPERVISOR_LEASE_KIND
+
+        row = (
+            "t\topen\t/repo\t/wt\towner\t"
+            f"worker_type=owner,launch_started=1,supervisor_lease={SUPERVISOR_LEASE_KIND},"
+            "supervisor_lease_file=attempt.lock,log_file=attempt.log,attempt_id=att-owner\n"
+        )
+        self.jobs.write_text(row, encoding="utf-8")
+        context = obligations.OwnerSettlementReadContext()
+        original_read_text = Path.read_text
+        reads = []
+
+        def count_registry_read(path, *args, **kwargs):
+            if path == self.jobs:
+                reads.append(path)
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", count_registry_read), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True) as lease, \
+             mock.patch("dispatch_completion_join.settle_finished_attempt") as settle:
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(lease.call_count, 2)
+            settle.assert_not_called()
+
+            # A registry change forces a fresh full read on the next pass.
+            with self.jobs.open("a", encoding="utf-8") as handle:
+                handle.write("t\tdone\t/repo\t/wt\tchild\tattempt_id=att-child\n")
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 2)
+
+            # Lease release is checked even while the registry stamp is stable.
+            lease.return_value = False
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_called_once()
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 4, "an unresolved unowned row stays retryable")
 
     def test_parent_ended_duty_waits_dormant_until_recipient_returns(self):
         args = Namespace(**vars(self.args))
