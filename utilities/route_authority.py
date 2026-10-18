@@ -398,24 +398,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
-    if action == "settled-owner-resume":
-        record = facts.get("record") or {}
-        logical = record.get("logical_node") or {}
-        proof = record.get("proof") or {}
-        aid = metadata.get("attempt_id")
-        eligible = (
-            status == "done" and metadata.get("worker_type") == "owner"
-            and bool(answerable_owner_end(status, metadata))
-            and record.get("original_attempt_id") == aid
-            and record.get("ordinal") == 1
-            and proof.get("death_kind") == "corrected"
-            and logical.get("node") == "__owner__"
-            and logical.get("after_capacity") == aid
-            and facts.get("attention_reason") == "replacement-parent-identity-unproven"
-            and facts.get("exact_successor") is True
-            and facts.get("successor_never_started") is True
-            and facts.get("retained_corrections") is True
-        )
+    if action == "identity-refusal-reentry":
+        eligible = (status == "done" and metadata.get("worker_type") == "owner"
+                    and facts.get("exact_claim") is True
+                    and facts.get("identity_refusal") is True
+                    and facts.get("source_replacement_eligible") is True
+                    and facts.get("successor_unstarted_or_absent") is True)
         return ContinuationDecision(eligible, "resume" if eligible else "settled",
             "" if eligible else "replacement-duty-settled", "start" if eligible else "settle")
     if action == "replacement-progress":
