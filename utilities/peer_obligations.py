@@ -557,6 +557,29 @@ def obligations_root(root: str | Path | None = None) -> Path:
     return directory
 
 
+def request_obligation_recovery(*, lifecycle_root: str | Path | None = None) -> bool:
+    """Start the common recovery entry detached with its caller environment."""
+    root = Path(lifecycle_root).expanduser().resolve(strict=False) if lifecycle_root is not None else _code_root()
+    script = root / "utilities" / "peer-steward.py"
+    command = [sys.executable, str(script), "__ensure-obligations"]
+    if lifecycle_root is not None:
+        command.extend(["--lifecycle-root", str(root)])
+    try:
+        subprocess.Popen(
+            command,
+            cwd=str(root),
+            env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _safe_id(value: str) -> str:
     if not isinstance(value, str) or not _SAFE_ID.fullmatch(value):
         raise ObligationError("peer-obligation-id-invalid")

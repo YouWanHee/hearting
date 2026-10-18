@@ -208,20 +208,32 @@ process termination defers replacement. Snapshot modes and development checkouts
 keep their original source. This shared viewer behavior adds no option or step
 to any runtime, and does not move a pinned dispatch tree.
 
-A route's `launch_compatibility_tuple.launch_home.path` is also the source of
-its contract read access. A replacement or child launched after activation
-retains read access to that sealed home's `capabilities/`, alongside its own
-launch home's contracts; it needs no file hash comparison or correction from
-the parent. The installer protects that same sealed home while its route is
-in use, including an unclosed route whose current owner awaits correction to
-a readable BLOCKED or FAIL result, or whose turn ended normally without a final
-result in the three-line handoff format and awaits an answer through `correct`.
-The format failure stays recorded and nothing retries automatically. A superseded owner's pause does not retain
-the release after its successor finishes, and closed routes and stale launch
-deaths still release it. Claude projects these directories with edit denies, OpenCode
-allows their external reads with edit denies, and Codex's sandbox already
-permits these reads without adding writable roots. No whole release tree or
-task write scope is granted by this contract access.
+A route's `launch_compatibility_tuple.launch_home.path` is the source of its
+contract read access when that route actually launches a replacement or child.
+That continuation retains read access to the sealed home's `capabilities/`,
+alongside its own launch home's contracts; it needs no file hash comparison or
+correction from the parent. The recorded launch path alone is not proof that
+the route still needs that release. Installer cleanup keeps it for a live
+attempt or process, a pending owner continuation, a contract reader, or other
+positive execution evidence. It may release a schema 2 direct route with its
+exact terminal depth 0 inline owner shape when its sealed and veto registries
+are readable and contain no related rows, and no unfinished inline finish
+exists or session route-chain entry points to it. Staged, malformed,
+unsupported, unreadable, or otherwise uncertain records remain protected.
+The installer watches inline-finish and route-chain state through the existing
+discovery fingerprint and writer boundary, so a state change during pruning
+retains the release.
+
+The same protection applies to an unclosed route whose current owner awaits
+correction to a readable BLOCKED or FAIL result, or whose turn ended normally
+without a final result in the three-line handoff format and awaits an answer
+through `correct`. The format failure stays recorded and nothing retries
+automatically. A superseded owner's pause does not retain the release after its
+successor finishes, and closed routes and stale launch deaths still release
+it. Claude projects these directories with edit denies, OpenCode allows their
+external reads with edit denies, and Codex's sandbox already permits these
+reads without adding writable roots. No whole release tree or task write
+scope is granted by this contract access.
 
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
