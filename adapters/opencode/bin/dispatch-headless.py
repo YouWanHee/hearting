@@ -1289,6 +1289,7 @@ def main(argv: list[str]) -> int:
     # path reaches the child environment, its allow rules and the row, whichever spelling
     # (`hearting run`, a `current` pointer) the caller exported.
     args.agent_home = sealed_launch_home(resolve_agent_home())
+    WRAPPER_COMMON.reexec_for_sealed_release(ROOT, args.agent_home, "opencode", argv[1:])
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)

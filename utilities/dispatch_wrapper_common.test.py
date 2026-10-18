@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,17 @@ def load(harness: str):
 
 
 class WrapperCommonTest(unittest.TestCase):
+    def make_release(self, root: Path):
+        root.mkdir(parents=True)
+        (root / ".hearting-release.json").write_text(
+            '{"schema":1,"version":"fixture"}\n', encoding="utf-8"
+        )
+        for harness in ("claude", "codex", "opencode"):
+            target = root / "adapters" / harness / "bin" / "dispatch-headless.py"
+            target.parent.mkdir(parents=True)
+            source = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
     def test_every_wrapper_keeps_the_old_names_as_the_shared_functions(self):
         for harness in ("claude", "codex", "opencode"):
             wrapper = load(harness)
@@ -74,6 +86,66 @@ class WrapperCommonTest(unittest.TestCase):
                 with mock.patch.object(C, "bind_internal_eligibility_probe") as probe:
                     wrapper.bind_internal_eligibility_probe(args)
                 probe.assert_called_once_with(args, harness)
+
+    def test_reexecs_between_sibling_releases_in_both_directions_for_each_harness(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            releases = Path(tmp) / "releases"
+            releases.mkdir()
+            release_a = releases / "vA"
+            release_b = releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            argv = ["--start", "--slug", "space preserving value"]
+            with mock.patch.dict(os.environ, {"AGENT_HOME": "/ambient/home"}, clear=False), \
+                 mock.patch.object(C.os, "execv") as execv:
+                for harness in ("claude", "codex", "opencode"):
+                    for source, sealed in ((release_a, release_b), (release_b, release_a)):
+                        with self.subTest(harness=harness, source=source.name, sealed=sealed.name):
+                            self.assertTrue(C.reexec_for_sealed_release(
+                                source, sealed, harness, argv
+                            ))
+                            self.assertEqual(os.environ["AGENT_HOME"], str(sealed.resolve()))
+                            self.assertEqual(
+                                execv.call_args,
+                                mock.call(sys.executable, [
+                                    sys.executable,
+                                    str(sealed / "adapters" / harness / "bin" / "dispatch-headless.py"),
+                                    *argv,
+                                ]),
+                            )
+                self.assertEqual(execv.call_count, 6)
+
+    def test_reexec_skips_same_root_checkouts_other_installs_missing_markers_and_targets(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases = root / "managed" / "releases"
+            releases.mkdir(parents=True)
+            release_a = releases / "vA"
+            release_b = releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            other_releases = root / "other" / "releases"
+            other_releases.mkdir(parents=True)
+            other = other_releases / "vC"
+            self.make_release(other)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            with mock.patch.object(C.os, "execv") as execv:
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_a, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(checkout, release_b, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(release_a, other, "codex", []))
+                marker = release_a / ".hearting-release.json"
+                marker.unlink()
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "codex", []))
+                marker.write_text('{"schema":1}\n', encoding="utf-8")
+                (release_b / "adapters" / "codex" / "bin" / "dispatch-headless.py").unlink()
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "invalid", []))
+                execv.assert_not_called()
 
     def test_owner_input_opens_only_for_a_supervised_owner(self):
         from unittest import mock

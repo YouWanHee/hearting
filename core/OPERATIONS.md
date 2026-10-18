@@ -190,6 +190,16 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+When a dispatch wrapper's code root and sealed launch home are different
+releases in the same managed `releases/` directory, the wrapper replaces itself
+with the corresponding harness wrapper from the sealed release before registry,
+lock, or child-launch work. It keeps the original argument vector and sets
+`AGENT_HOME` to the sealed real path; the target then follows the existing
+validation and registration path once. Checkouts, different installations,
+same-root launches, and roots without both release markers keep their existing
+behavior. This aligns code with the launch already selected and does not create
+a new attempt or alter the route's sealed launch tuple.
+
 Release cleanup retains trees used by live processes, including their working
 directories and open files. Shared Python dispatch code holds its resolved code
 root open for the process lifetime, so a hook launched through a rotating runtime

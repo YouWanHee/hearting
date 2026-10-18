@@ -375,14 +375,26 @@ class OwnerGrantStartTest(unittest.TestCase):
             "pathlib.Path(sys.argv[1] + '.home').write_text(os.environ.get('AGENT_HOME', ''))\n"
             "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
             "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(.01)\n")
-        for adapter in ("claude", "codex", "opencode"):
-            with self.subTest(adapter=adapter):
-                attempt = "att-" + hashlib.sha256(("pin-" + adapter).encode()).hexdigest()[:32]
-                result, output = self.start(adapter, attempt, None, route=self.route(adapter))
-                self.assertEqual(0, result, output)
-                _, row = self.row(attempt)
-                self.assertEqual(str(ROOT.resolve()), row["launch_home"])
-                self.assertEqual(str(ROOT.resolve()), (self.root / (attempt + ".started.home")).read_text())
+        wrapper_common = self.wrappers["claude"].WRAPPER_COMMON
+        with mock.patch.object(
+            wrapper_common, "reexec_for_sealed_release",
+            wraps=wrapper_common.reexec_for_sealed_release,
+        ) as reexec:
+            for adapter in ("claude", "codex", "opencode"):
+                with self.subTest(adapter=adapter):
+                    attempt = "att-" + hashlib.sha256(("pin-" + adapter).encode()).hexdigest()[:32]
+                    result, output = self.start(adapter, attempt, None, route=self.route(adapter))
+                    self.assertEqual(0, result, output)
+                    _, row = self.row(attempt)
+                    self.assertEqual(str(ROOT.resolve()), row["launch_home"])
+                    self.assertEqual(str(ROOT.resolve()), (self.root / (attempt + ".started.home")).read_text())
+        self.assertEqual(reexec.call_count, 3)
+        self.assertEqual([call.args[2] for call in reexec.call_args_list],
+                         ["claude", "codex", "opencode"])
+        self.assertTrue(all(Path(call.args[0]).resolve() == ROOT.resolve()
+                            and Path(call.args[1]).resolve() == ROOT.resolve()
+                            and call.args[3][0] == "--start"
+                            for call in reexec.call_args_list))
 
     def test_owner_without_request_keeps_default_grants(self):
         route = self.route("codex")
