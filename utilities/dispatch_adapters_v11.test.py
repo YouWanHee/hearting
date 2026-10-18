@@ -544,17 +544,19 @@ class AdapterV11Test(unittest.TestCase):
   self.assertNotIn(f"--add-dir {ROOT / '.dispatch'}",command)
   self.assertNotIn("network_access=true",command)
  def test_foreground_codex_child_reuses_checked_outer_sandbox(self):
-  wrapper=self.load_wrapper("codex")
-  args=type("Args",(),{
-   "worktree":"/work/repo","artifact_root":"/artifacts","nested_headless_network":False,
-   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
-   "sandbox":"workspace-write","launch_lifecycle":"foreground-scoped",
-   "parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write",
-   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
-  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False):
-   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
-   self.assertEqual(wrapper.effective_runtime_sandbox(args),"danger-full-access")
-  self.assertIn("--sandbox danger-full-access",command)
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);repo,_art=self.fixture(root)
+   wrapper=self.load_wrapper("codex")
+   args=type("Args",(),{
+    "worktree":str(repo),"artifact_root":"/artifacts","nested_headless_network":False,
+    "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
+    "sandbox":"workspace-write","launch_lifecycle":"foreground-scoped",
+    "parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write",
+    "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False):
+    command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+    self.assertEqual(wrapper.effective_runtime_sandbox(args),"danger-full-access")
+   self.assertIn("--sandbox danger-full-access",command)
  def test_background_governor_does_not_hold_orchestrator_capture_pipes(self):
   for harness in ADAPTERS:
    with self.subTest(harness=harness):

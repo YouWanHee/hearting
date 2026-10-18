@@ -141,6 +141,7 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
         with self.assertRaises(Captured):
             supervisor.run_turn(server, thread_id="fixture", prompt="fixture", args=args)
         self.assertNotIn("sandboxPolicy", server.request.call_args.args[1])
+        self.assertNotIn("approvalPolicy", server.request.call_args.args[1])
         args.native_permission_profile = None
         with self.assertRaises(Captured):
             supervisor.run_turn(server, thread_id="fixture", prompt="fixture", args=args)

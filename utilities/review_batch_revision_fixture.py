@@ -22,6 +22,7 @@ import dispatch_contract as DC
 import dispatch_replacement as REPLACEMENT
 import dispatch_replacement_batch as REPLACEMENT_BATCH
 import dispatch_owner_input as OWNER_INPUT
+import review_source_subject as SUBJECT
 
 spec = importlib.util.spec_from_file_location("revision_route", ROOT / "utilities/capability-route.py")
 ROUTE = importlib.util.module_from_spec(spec)
@@ -442,8 +443,9 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
                     self.fail('missing disposable fixture row ' + attempt)
 
     def replace_owner(self):
-        # Synthetic physical owner observation is fixture setup. The correction,
-        # immutable inputs, reservation, reciprocal binding and claim are real.
+        # The controlled process crosses the real launch-start writer, exits,
+        # and is closed as an executed BLOCKED owner before its correction.
+        # Reservation, reciprocal binding and successor claim remain real.
         args = SimpleNamespace(attempt_id=self.owner, jobs_path=self.jobs,
             worktree=str(self.repo), owner_route_binding=SimpleNamespace(route_id=self.route['route_id']),
             replacement_input_argv=['--start', '--attempt-id', self.owner,
@@ -453,9 +455,37 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         with mock.patch.dict(os.environ, self.env, clear=True):
             fragment = REPLACEMENT.seal_launch_input(args, 'codex', 'Continue this route')
             self.fixture_row(self.owner, **DC.parse_registry_metadata(fragment))
+            owner_process = subprocess.Popen(
+                [sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={**self.env, 'AGENT_DISPATCH_ATTEMPT_ID': self.owner},
+                start_new_session=True,
+            )
+
+            def close_fixture_owner():
+                if owner_process.poll() is None:
+                    if owner_process.stdin and not owner_process.stdin.closed:
+                        owner_process.stdin.close()
+                    try:
+                        owner_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        owner_process.terminate()
+                        owner_process.wait(timeout=5)
+
+            self.addCleanup(close_fixture_owner)
+            identity = DC.process_launch_identity(owner_process.pid)
+            self.fixture_row(self.owner, status='open',
+                remove=('pid', 'pid_start', 'pgid', 'pid_ns', 'pid_observer_ns'),
+                **identity, launch_claimed='1', launch_started='0',
+                launch_fence='registry-v1')
+            DC.mark_attempt_launch_started(self.jobs, self.owner, owner_process.pid)
             OWNER_INPUT.initialize_owner_input(self.jobs, self.owner, 'codex-app-server')
-            self.fixture_row(self.owner, status='done', remove=('pid', 'pid_start'),
-                note='dead-worker-blocked', failure_class='blocked', launch_outcome='never-launched')
+            owner_process.stdin.close()
+            self.assertEqual(owner_process.wait(timeout=5), 0)
+            self.assertTrue(DC.close_attempt_row(
+                self.jobs, self.owner, 'dead-worker-blocked',
+                evidence={'failure_class': 'blocked'}))
             correction = OWNER_INPUT.submit(self.jobs, self.owner,
                 'Preserve completed reviews; correct execute and run bounded closure.', 'correction-1')
             self.assertTrue(correction['retained'])
@@ -783,18 +813,39 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.assert_atomic_refusal(reason='round-unsettled')
         self.jobs.write_bytes(rows)
         self.fixture_row(target, note='dead-invalid-envelope', failure_class='contract')
-        fields, meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[target]
-        meta = {**meta, 'attempt_id': 'att-fixture-verdictless-2', 'note': 'dead-missing-result'}
-        # This synthetic physical observation has no immutable source binding;
-        # it must remain legacy-unknown rather than borrowing the original
-        # attempt's exact subject digest under a different attempt id.
-        meta.pop('review_subject_digest', None)
-        meta.pop('review_subject_binding_digest', None)
-        # This extra physical fixture record never had a native launch claim.
-        meta.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
+        fields, unknown = REPLACEMENT._rows(self.jobs.read_text().splitlines())[target]
+        unknown = {**unknown, 'attempt_id': 'att-fixture-unknown-binding-2',
+                   'note': 'dead-missing-result'}
+        # Unknown history stays unknown under a new identity and refuses before
+        # it can be counted against the current source subject.
+        unknown.pop('review_subject_digest', None)
+        unknown.pop('review_subject_binding_digest', None)
+        unknown.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
         for key in ('pid', 'pid_start', 'pgid', 'log_file', 'completion_marker'):
-            meta.pop(key, None)
-        fields[5] = ','.join(k + '=' + v for k, v in meta.items())
+            unknown.pop(key, None)
+        fields[5] = ','.join(k + '=' + v for k, v in unknown.items())
+        unknown_row = '\t'.join(fields)
+        settled = self.jobs.read_bytes()
+        with self.jobs.open('a') as handle:
+            handle.write(unknown_row + '\n')
+        refusal = self.assert_atomic_refusal(reason='batch-prior-binding-drift')
+        self.assertTrue(refusal)
+        self.jobs.write_bytes(settled)
+
+        fields, bound = REPLACEMENT._rows(self.jobs.read_text().splitlines())[target]
+        attempt_id = 'att-fixture-verdictless-bound-2'
+        node = next(item for item in self.route['nodes'] if item['id'] == bound['route_node'])
+        bound = {**bound, 'attempt_id': attempt_id, 'note': 'dead-missing-result'}
+        bound.pop('review_subject_digest', None)
+        bound.pop('review_subject_binding_digest', None)
+        # Seal this attempt from the current source with the production writer;
+        # never transfer another attempt's digest or sidecar.
+        bound.update(SUBJECT.seal_attempt(
+            self.jobs, self.route, node, attempt_id, worktree=self.repo))
+        bound.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
+        for key in ('pid', 'pid_start', 'pgid', 'log_file', 'completion_marker'):
+            bound.pop(key, None)
+        fields[5] = ','.join(k + '=' + v for k, v in bound.items())
         with self.jobs.open('a') as handle:
             handle.write('\t'.join(fields) + '\n')
         refusal = self.assert_atomic_refusal(reason='review-verdictless-bound')

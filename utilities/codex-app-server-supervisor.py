@@ -710,6 +710,7 @@ def apply_owner_runtime_permissions(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SupervisorError(str(exc)) from exc
     if context is None or context.get("adapter") != "codex":
+        args.owner_runtime_permission_state = None
         return
     if (context.get("attempt_id") != args.parent_attempt_id
             or Path(str(context.get("worktree"))).resolve() != Path(args.worktree).resolve()):
@@ -787,10 +788,13 @@ def run_turn(
         "input": [{"type": "text", "text": prompt, "text_elements": []}],
         "cwd": args.worktree,
     }
-    # App Server supports a per-turn sandbox override. Reapply it to the same
-    # thread so a settled merge can restore the route's current owner scope.
-    params["sandboxPolicy"] = sandbox_policy(args)
-    if args.approval != "inherit":
+    # Keep an active named profile authoritative on ordinary turns. A
+    # per-turn Git/task overlay is valid only after the exact owner context
+    # above has revalidated its route and current worktree state.
+    owner_projection = getattr(args, "owner_runtime_permission_state", None)
+    if owner_projection is not None or getattr(args, "native_permission_profile", None) is None:
+        params["sandboxPolicy"] = sandbox_policy(args)
+    if args.approval != "inherit" and getattr(args, "native_permission_profile", None) is None:
         params["approvalPolicy"] = args.approval
     if args.model:
         params["model"] = args.model

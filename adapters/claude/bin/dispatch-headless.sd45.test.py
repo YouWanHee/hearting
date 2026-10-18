@@ -855,9 +855,32 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
 
     HARNESS = {"/tmp/fixture-agent-home/utilities/" + n for n in WH.HARNESS_ALLOWLIST_UTILITIES}
 
+    def setUp(self):
+        self.worktree_temp = tempfile.TemporaryDirectory(prefix="claude-permission-git-")
+        self.addCleanup(self.worktree_temp.cleanup)
+        self.default_worktree = Path(self.worktree_temp.name) / "worktree"
+        self._initialize_idle_worktree(self.default_worktree)
+
+    def _initialize_idle_worktree(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        probe = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-dir"],
+                               text=True, capture_output=True)
+        if probe.returncode == 0:
+            return path
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email",
+                        "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name",
+                        "Fixture"], check=True)
+        (path / "fixture.txt").write_text("known idle worktree\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "fixture.txt"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-qm", "fixture"], check=True)
+        return path
+
     def _ns(self, mode, **overrides):
         base = dict(permission_mode=mode, agent_home=Path("/tmp/fixture-agent-home"),
-                    worktree="/tmp/fixture-worktree", artifact_root="/tmp/fixture-artifacts",
+                    worktree=str(self.default_worktree), artifact_root="/tmp/fixture-artifacts",
                     worker_type="stage")
         base.update(overrides)
         return argparse.Namespace(**base)
@@ -887,7 +910,7 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
                          ("allowlist", "launch-explicit", "acceptEdits"))
         rules = posture["allowed_tools"]
         self.assertEqual(self._harness_rules(rules), set(WH.HARNESS_ALLOWLIST_UTILITIES))
-        self.assertIn("Edit(//tmp/fixture-worktree/**)", rules)        # Edit also governs Write
+        self.assertIn(f"Edit(//{str(self.default_worktree).lstrip('/')}/**)", rules)  # Edit also governs Write
         self.assertIn("Edit(//tmp/fixture-artifacts/**)", rules)
         self.assertIn("Bash(git status *)", rules)
         self.assertIn("Bash(python3 -m unittest *)", rules)
@@ -957,6 +980,7 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
             with self.subTest(scope=scope), tempfile.TemporaryDirectory() as cfg, \
                  tempfile.TemporaryDirectory() as wt, \
                  mock.patch.object(WH, "_MANAGED_SETTINGS_PATHS", ()):
+                self._initialize_idle_worktree(wt)
                 target = {
                     "user": Path(cfg) / "settings.json",
                     "project": Path(wt) / ".claude" / "settings.json",
@@ -972,6 +996,7 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
 
     def test_m5_managed_scope_is_read_too(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            self._initialize_idle_worktree(cfg)
             managed = Path(td) / "managed-settings.json"
             managed.write_text(json.dumps({"permissions": {"disableBypassPermissionsMode": "disable"}}))
             with mock.patch.object(WH, "_MANAGED_SETTINGS_PATHS", (managed,)), \
@@ -982,6 +1007,7 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
     def test_inherited_default_mode_is_recorded_from_the_highest_precedence_scope(self):
         with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as wt, \
              mock.patch.object(WH, "_MANAGED_SETTINGS_PATHS", ()):
+            self._initialize_idle_worktree(wt)
             (Path(cfg) / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "auto"}}))
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg}):
                 posture = WH.resolve_permission_posture(self._ns("bypass", worktree=wt))

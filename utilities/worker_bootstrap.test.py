@@ -128,9 +128,10 @@ class WorkerBootstrapTest(unittest.TestCase):
 
     def test_task_publication_scope_stays_with_the_approved_owner(self):
         owner = W.render_worker_bootstrap(ROOT, "owner")
-        self.assertIn("existing work request names PR and CI", owner)
+        self.assertIn("When the sealed entry scope is `complete`", owner)
         self.assertIn("sealed entry scope is `complete`", owner)
         self.assertIn("ordinary non-force push", owner)
+        self.assertIn("request wording is not an additional authorization test.", owner)
         self.assertIn("supervisor responsibilities", owner)
         for worker_type in ("stage", "review", "support", "frame"):
             text = W.render_worker_bootstrap(ROOT, worker_type)
