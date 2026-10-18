@@ -1430,14 +1430,38 @@ def continuation_attempt_state(metadata):
     return "unknown"
 
 
+def _recorded_pid_reused(row, identity):
+    """The recorded PID now names a later process in the same PID namespace.
+
+    A later start tick for the same PID in the recorded namespace means the
+    recorded process has ended. A same-start mismatch (an exec), an earlier or
+    unparsable start tick, or an unrecorded or unreadable namespace proves
+    nothing and stays stale.
+    """
+    state, current, reason = identity
+    if state != "stale" or reason != "process-identity-mismatch" or not current:
+        return False
+    if row.get("pid_namespace") is None:
+        return False
+    try:
+        if row["pid_namespace"] != os.readlink("/proc/self/ns/pid"):
+            return False
+        recorded, observed = int(row.get("starttime")), int(current.get("starttime"))
+    except (OSError, TypeError, ValueError):
+        return False
+    return observed > recorded
+
+
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
     from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
     from dispatch_resource_wait import supervisor
     if resource_never_started(row):
         return True
+    identity = classify_identity(row)
     if (row.get("status") == "launching" or row.get("cancel_requested")
-            or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
+            or row.get("parent_close_requested")
+            or (identity[0] != "exited" and not _recorded_pid_reused(row, identity))):
         return False
     if (row.get('status') != 'succeeded' and row.get('exit_code') is None
             and reboot_evidence(row)):
