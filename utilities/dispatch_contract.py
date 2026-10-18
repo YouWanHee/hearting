@@ -2734,6 +2734,16 @@ def process_group_members(pgid: int) -> tuple[tuple[int, str, str], ...]:
 
 
 ATTEMPT_DESCENDANT_ENV = "AGENT_DISPATCH_ATTEMPT_ID"
+
+
+def governance_environment(environ=None):
+    """Copy an environment for governance helpers without the caller attempt tag."""
+    source = os.environ if environ is None else environ
+    result = dict(source)
+    result.pop(ATTEMPT_DESCENDANT_ENV, None)
+    return result
+
+
 ATTEMPT_DESCENDANT_PROOF = "attempt-tagged-empty-v1"
 # SD-OPEN-47 (H7): the detached drain observer seals this instead of the
 # empty proof when the governed leader and its process group are gone, the
@@ -11199,11 +11209,7 @@ def launch_reap_watch(
     # A direct wrapper can inherit the same attempt tag that supplied its
     # default --attempt-id; retaining it here would make the observer discover
     # itself forever and prevent the empty receipt it exists to issue.
-    watcher_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key != ATTEMPT_DESCENDANT_ENV
-    }
+    watcher_env = governance_environment()
     try:
         proc = subprocess.Popen(
             [

@@ -128,16 +128,40 @@ class DispatchReapWatchTest(unittest.TestCase):
 
     def test_launcher_strips_attempt_tag_from_observer_environment(self):
         fake = mock.Mock(pid=37)
-        with mock.patch.dict(
-            os.environ, {D.ATTEMPT_DESCENDANT_ENV: "att-observer-self"}
-        ), mock.patch.object(D.subprocess, "Popen", return_value=fake) as spawn:
+        with mock.patch.dict(os.environ, {
+            D.ATTEMPT_DESCENDANT_ENV: "att-observer-self", "HEARTING_FIXTURE_KEEP": "1",
+        }), mock.patch.object(D.subprocess, "Popen", return_value=fake) as spawn:
+            self.assertEqual(os.environ.get(D.ATTEMPT_DESCENDANT_ENV), "att-observer-self")
             self.assertEqual(
                 D.launch_reap_watch(
                     Path("/tmp/jobs.log"), "att-observer-self", 19, "200", 19
                 ),
                 37,
             )
+            self.assertEqual(os.environ.get(D.ATTEMPT_DESCENDANT_ENV), "att-observer-self")
         self.assertNotIn(D.ATTEMPT_DESCENDANT_ENV, spawn.call_args.kwargs["env"])
+        self.assertEqual(spawn.call_args.kwargs["env"]["HEARTING_FIXTURE_KEEP"], "1")
+
+    def test_governance_environment_copies_parent_or_service_environment(self):
+        with mock.patch.dict(os.environ, {
+            D.ATTEMPT_DESCENDANT_ENV: "att-parent", "HEARTING_FIXTURE_KEEP": "parent",
+        }, clear=True):
+            parent_before = dict(os.environ)
+            parent_env = D.governance_environment()
+            self.assertEqual(parent_env, {"HEARTING_FIXTURE_KEEP": "parent"})
+            self.assertEqual(dict(os.environ), parent_before)
+
+        self.assertEqual(D.governance_environment({}), {})
+        service = {
+            D.ATTEMPT_DESCENDANT_ENV: "att-service",
+            "AGENT_HOME": "/fixture/releases/B",
+            "HEARTING_FIXTURE_KEEP": "service",
+        }
+        service_before = dict(service)
+        self.assertEqual(D.governance_environment(service), {
+            "AGENT_HOME": "/fixture/releases/B", "HEARTING_FIXTURE_KEEP": "service",
+        })
+        self.assertEqual(service, service_before)
 
     def test_foreground_launch_requires_the_locked_seal_and_rejects_stale_digest(self):
         with tempfile.TemporaryDirectory() as td:

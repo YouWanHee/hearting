@@ -288,6 +288,81 @@ class BatchObligationTest(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], str(self.jobs))
         self.assertEqual(obligations.read(self.jobs, duty_id)["identity"]["attempt_ids"], ["att-child"])
 
+    def test_observer_does_not_inherit_the_callers_attempt_tag(self):
+        from dispatch_contract import ATTEMPT_DESCENDANT_ENV
+        obligations.create(self.args)
+        calls = []
+
+        class Launched:
+            pid = 901234
+
+        with mock.patch.dict(os.environ, {ATTEMPT_DESCENDANT_ENV: "att-worker", "HEARTING_FIXTURE_KEEP": "1"}), \
+                mock.patch.object(obligations.subprocess, "Popen",
+                                  side_effect=lambda *a, **k: calls.append((a, k)) or Launched()):
+            self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+            env = dict(calls[0][1].get("env", os.environ))
+        self.assertNotIn(ATTEMPT_DESCENDANT_ENV, env.keys())
+        self.assertEqual(env.get("HEARTING_FIXTURE_KEEP"), "1")
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+
+    def test_service_environment_also_loses_the_attempt_tag(self):
+        from dispatch_contract import ATTEMPT_DESCENDANT_ENV
+        obligations.create(self.args)
+        calls = []
+        environment = {"AGENT_HOME": "/fixture/releases/B", ATTEMPT_DESCENDANT_ENV: "att-worker"}
+
+        class Launched:
+            pid = 901235
+
+        with mock.patch("peer_obligations.service_script",
+                        return_value=(Path("/fixture/releases/B/utilities/codex-managed-completion.py"),
+                                      environment, None)), \
+                mock.patch.object(obligations.subprocess, "Popen",
+                                  side_effect=lambda *a, **k: calls.append((a, k)) or Launched()):
+            self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+        self.assertEqual(calls[0][1]["env"], {"AGENT_HOME": "/fixture/releases/B"})
+
+    def test_handoff_observer_does_not_inherit_attempt_tag(self):
+        from dispatch_contract import ATTEMPT_DESCENDANT_ENV
+
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(
+            self.jobs, duty_id, state="delivery-pending",
+            observer={"pid": os.getpid(), "pid_start": obligations._pid_start(os.getpid())},
+        )
+        fd = obligations.acquire(self.jobs, duty_id)
+        self.assertIsNotNone(fd)
+        environment = {
+            "AGENT_HOME": "/fixture/releases/B",
+            ATTEMPT_DESCENDANT_ENV: "att-worker",
+            "HEARTING_FIXTURE_KEEP": "service-value",
+        }
+        calls = []
+
+        class Launched:
+            pid = 901236
+
+        try:
+            with mock.patch(
+                "peer_obligations.service_script",
+                return_value=(Path("/fixture/releases/B/utilities/codex-managed-completion.py"),
+                              environment, None),
+            ), mock.patch.object(
+                obligations.subprocess, "Popen",
+                side_effect=lambda *a, **kw: calls.append((a, kw)) or Launched(),
+            ):
+                self.assertTrue(obligations.handoff_observer(self.jobs, duty_id, fd))
+        finally:
+            os.close(fd)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["env"], {
+            "AGENT_HOME": "/fixture/releases/B",
+            "HEARTING_FIXTURE_KEEP": "service-value",
+        })
+        self.assertIn(ATTEMPT_DESCENDANT_ENV, environment)
+        self.assertEqual(environment[ATTEMPT_DESCENDANT_ENV], "att-worker")
+
     def test_verified_service_replaces_exact_live_observer_and_passes_control_binding(self):
         duty_id, _record = obligations.create(self.args)
         obligations.update(self.jobs, duty_id, state="delivery-pending",
