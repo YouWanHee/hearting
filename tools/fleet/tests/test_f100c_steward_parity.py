@@ -681,7 +681,10 @@ class LineageConsumerWiringTest(unittest.TestCase):
             Session(harness="codex", pid=1, cwd=cwd, session_id="live-old"),
             Session(harness="codex", pid=2, cwd=cwd, session_id="current"),
         ]
+        markers = {("codex", "current"): {"harness": "codex", "session_id": "current",
+                                            "targets": {}}}
         with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w:p"}), \
+             mock.patch.object(steward, "read_markers", return_value=markers), \
              mock.patch.object(herdr, "_clear_gpu_session_aliases",
                                return_value=["live-old", "ended-old"]) as lineage, \
              mock.patch.object(steward, "_projection_sessions", return_value=sessions), \

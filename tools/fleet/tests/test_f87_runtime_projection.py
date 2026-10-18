@@ -315,6 +315,16 @@ class RuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(agent, "[3a] ⚑ codex")
         self.assertLess(len(title), 80)
 
+    def test_marker_free_steward_lookup_skips_live_session_snapshot(self):
+        from fleet.collectors import steward
+        from tools.fleet.herdr_projection import is_steward
+
+        with unittest.mock.patch.object(steward, "read_markers", return_value={}) as read_markers, \
+             unittest.mock.patch.object(steward, "_projection_sessions") as projection_sessions:
+            self.assertFalse(is_steward("claude", "session-without-role-evidence"))
+        read_markers.assert_called_once_with()
+        projection_sessions.assert_not_called()
+
     def test_claude_display_hook_publishes_metadata_without_duplicate_session_lifecycle(self):
         """The native SessionStart integration owns lifecycle; Hearting paints metadata."""
         with tempfile.TemporaryDirectory() as td:

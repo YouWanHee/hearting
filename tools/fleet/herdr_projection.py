@@ -234,6 +234,9 @@ def is_steward(harness: str, session_id: str) -> bool:
     try:
         from fleet.collectors.herdr import _clear_gpu_session_aliases
         from fleet.collectors import steward as steward_collector
+        markers = steward_collector.read_markers()
+        if not markers:
+            return False
         cwd = os.getcwd()
         harness_key = str(harness or "").lower()
         aliases = _clear_gpu_session_aliases(harness, session_id,
@@ -242,7 +245,6 @@ def is_steward(harness: str, session_id: str) -> bool:
         live = {(str(getattr(row, "harness", "") or "").lower(),
                  getattr(row, "session_id", None)) for row in sessions}
         aliases = [sid for sid in aliases if (harness_key, sid) not in live]
-        markers = steward_collector.read_markers()
         targets = steward_collector.role_targets(
             harness, session_id, aliases=aliases, markers=markers, cwd=cwd,
             sessions=sessions, include_native=True)
