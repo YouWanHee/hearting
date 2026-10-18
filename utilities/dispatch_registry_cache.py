@@ -202,7 +202,7 @@ class RegistryView:
 
     __slots__ = ("path_identity", "resolved_path", "signature", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
-                 "last_observed_at")
+                 "last_observed_at", "_has_duplicate_attempts")
 
     def __init__(self, path_identity: str, resolved_path: str, signature: tuple,
                  raw: bytes, *, previous: "RegistryView | None" = None):
@@ -210,6 +210,7 @@ class RegistryView:
         self.resolved_path = resolved_path
         self.signature = signature
         self.last_observed_at = time.monotonic()
+        self._has_duplicate_attempts = None
         if previous is None:
             boundary = raw.rfind(b"\n") + 1
             complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
@@ -261,6 +262,23 @@ class RegistryView:
     @property
     def records(self) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments for record in segment.records)
+
+    @property
+    def has_duplicate_attempts(self) -> bool:
+        """Whether any exact attempt key occurs more than once in this generation."""
+        if self._has_duplicate_attempts is None:
+            seen = set()
+            duplicate = False
+            for segment in self._segments:
+                for attempt, records in segment.completion_all.items():
+                    if len(records) > 1 or attempt in seen:
+                        duplicate = True
+                        break
+                    seen.add(attempt)
+                if duplicate:
+                    break
+            self._has_duplicate_attempts = duplicate
+        return self._has_duplicate_attempts
 
     def completion_attempt(self, attempt_id: str):
         latest, error = None, None

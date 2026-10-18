@@ -58,6 +58,18 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(row.completion_metadata()["parent_sid"], "exact")
         self.assertEqual(row.handover_metadata()["parent_sid"], "trimmed")
 
+    def test_duplicate_attempt_projection_is_generation_cached_across_segments(self):
+        self.jobs.write_text(
+            "a\topen\t/repo\t/wt\ta\tattempt_id=att-a,parent_attempt_id=\n",
+            encoding="utf-8")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertFalse(first.has_duplicate_attempts)
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write("b\tdone\t/repo\t/wt\tb\tattempt_id=att-a,parent_attempt_id=\n")
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertTrue(second.has_duplicate_attempts)
+        self.assertFalse(first.has_duplicate_attempts)
+
     def test_same_size_rewrite_and_atomic_replace_rebuild_views(self):
         original = "job\topen\t/repo\ttime\towner\tf=1\n"
         replacement = "job	done\t/repo\ttime\towner\tf=1\n"

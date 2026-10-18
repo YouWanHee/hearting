@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import peer_obligations as obligations
+import dispatch_batch_obligations as batch_obligations
 
 _HERE = Path(__file__).resolve().parent
 _STEWARD_SPEC = importlib.util.spec_from_file_location(
@@ -111,6 +112,176 @@ class ObligationStoreTest(unittest.TestCase):
         default_update = self.store.update(duty["id"], state="unknown", observation=observation)
         self.assertEqual(default_update["revision"], updated["revision"] + 1)
         self.assertGreaterEqual(default_update["updated_at"], updated["updated_at"])
+
+    def test_inherited_batch_lease_requires_flock_and_exact_observer_row(self):
+        from types import SimpleNamespace
+
+        jobs = self.jobs
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        jobs.touch(exist_ok=True)
+        args = SimpleNamespace(
+            jobs=jobs, sealed_batch_id="sealed-lease-fixture",
+            parent_attempt_id="att-lease-parent", parent_session_id=None,
+            attempt_id=["att-lease-child"], control_socket=None, queue_socket=None,
+            thread_id=None, interval=1.0, timeout=30.0,
+        )
+        duty_id, _record = batch_obligations.create(args)
+        lease_path = batch_obligations._root(jobs) / (duty_id + ".lease")
+        lease_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(lease_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            self.assertIsNone(batch_obligations.acquire(jobs, duty_id, fd))
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(batch_obligations.acquire(jobs, duty_id, fd), fd)
+            claimed = batch_obligations.update_for_observer(
+                jobs, duty_id, fd, claim=True, reason="observing")
+            self.assertIsNotNone(claimed)
+            self.assertTrue(batch_obligations.observer_owns_current(jobs, duty_id, fd))
+
+            batch_obligations.update(jobs, duty_id, state="unknown",
+                                     observer={"pid": 1, "pid_start": "1"})
+            before = batch_obligations.read(jobs, duty_id)
+            self.assertFalse(batch_obligations.observer_owns_current(jobs, duty_id, fd))
+            self.assertIsNone(batch_obligations.update_for_observer(
+                jobs, duty_id, fd, claim=True,
+                expected_observer={"pid": os.getpid(),
+                                   "pid_start": batch_obligations._pid_start(os.getpid())},
+                reason="replacement-race"))
+            self.assertIsNone(batch_obligations.update_for_observer(
+                jobs, duty_id, fd, state="complete", reason="stale-observer"))
+            self.assertEqual(batch_obligations.read(jobs, duty_id), before)
+        finally:
+            batch_obligations.release(fd, lease_path)
+
+        reused = os.open(jobs, os.O_RDONLY)
+        try:
+            self.assertIsNone(batch_obligations.acquire(jobs, duty_id, reused))
+            batch_obligations.release(reused, lease_path)
+            os.fstat(reused)
+        finally:
+            os.close(reused)
+
+    def test_post_spawn_record_failure_keeps_child_lease_locked(self):
+        from types import SimpleNamespace
+
+        jobs = self.jobs
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        jobs.touch(exist_ok=True)
+        args = SimpleNamespace(
+            jobs=jobs, sealed_batch_id="sealed-spawn-failure",
+            parent_attempt_id="att-spawn-parent", parent_session_id=None,
+            attempt_id=["att-spawn-child"], control_socket=None, queue_socket=None,
+            thread_id=None, interval=1.0, timeout=30.0,
+        )
+        duty_id, _record = batch_obligations.create(args)
+        lease_path = batch_obligations._root(jobs) / (duty_id + ".lease")
+        real_popen = subprocess.Popen
+        children = []
+
+        def launch_child(_command, **kwargs):
+            child = real_popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+            children.append(child)
+            return child
+
+        try:
+            with mock.patch.object(obligations, "service_script",
+                                   return_value=(Path("/fixture/sidecar.py"), {}, None)), \
+                 mock.patch.object(batch_obligations, "_jobs_paths", return_value=[jobs]), \
+                 mock.patch.object(batch_obligations, "_resume_owner_settlements",
+                                   return_value=[]), \
+                 mock.patch.object(batch_obligations, "update",
+                                   side_effect=batch_obligations.BatchObligationError(
+                                       "simulated-record-update-failure")), \
+                 mock.patch.object(batch_obligations.subprocess, "Popen",
+                                   side_effect=launch_child):
+                self.assertEqual(batch_obligations.ensure_observers(jobs), 0)
+
+            self.assertEqual(len(children), 1)
+            probe = os.open(lease_path, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+            children[0].terminate()
+            children[0].wait(timeout=5)
+            probe = os.open(lease_path, os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            finally:
+                os.close(probe)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
+    def test_retry_handoff_keeps_the_lease_with_the_successor(self):
+        from types import SimpleNamespace
+
+        jobs = self.jobs
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        jobs.touch(exist_ok=True)
+        args = SimpleNamespace(
+            jobs=jobs, sealed_batch_id="sealed-handoff",
+            parent_attempt_id="att-handoff-parent", parent_session_id=None,
+            attempt_id=["att-handoff-child"], control_socket=None, queue_socket=None,
+            thread_id=None, interval=1.0, timeout=30.0,
+        )
+        duty_id, _record = batch_obligations.create(args)
+        lease_path = batch_obligations._root(jobs) / (duty_id + ".lease")
+        fd = batch_obligations.acquire(jobs, duty_id)
+        self.assertIsNotNone(fd)
+        child = None
+        children = []
+        try:
+            self.assertIsNotNone(batch_obligations.update_for_observer(
+                jobs, duty_id, fd, claim=True, reason="observing"))
+            real_popen = subprocess.Popen
+
+            def launch_child(_command, **kwargs):
+                process = real_popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+                children.append(process)
+                return process
+
+            with mock.patch.object(obligations, "service_script",
+                                   return_value=(Path("/fixture/sidecar.py"), {}, None)), \
+                 mock.patch.object(batch_obligations.subprocess, "Popen",
+                                   side_effect=launch_child):
+                self.assertTrue(batch_obligations.handoff_observer(
+                    jobs, duty_id, fd))
+            child = children[0]
+            owner = batch_obligations.read(jobs, duty_id)["observer"]
+            self.assertEqual(owner["pid"], child.pid)
+            self.assertTrue(owner["pid_start"].isdecimal())
+            self.assertTrue(batch_obligations._fd_holds_lease(fd, lease_path))
+
+            os.close(fd)
+            fd = None
+            probe = os.open(lease_path, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+            child.terminate()
+            child.wait(timeout=5)
+            probe = os.open(lease_path, os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            finally:
+                os.close(probe)
+        finally:
+            if fd is not None:
+                batch_obligations.release(fd, lease_path)
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
 
     def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
         self.store.create("message-reconnect", "message", {"session_id": "parent"},

@@ -17,6 +17,7 @@ import time
 
 import dispatch_contract as DC
 import workflow_state as WS
+from dispatch_registry_cache import registry_view
 
 NOTE = "cancelled-by-parent"
 OPEN = {"open", "running"}
@@ -88,7 +89,8 @@ def _current_owner_intent(metadata, jobs):
     # Attachments and adopted advances leave launch rows unchanged. Resolve
     # their current owner before accepting an old child's late result.
     try:
-        rows = _rows(Path(jobs))
+        attempt = metadata.get("attempt_id")
+        rows = _rows(Path(jobs), {attempt} if attempt else set())
     except (OSError, ValueError):
         return None  # Ordinary join owns its registry-shape refusal.
     current, seen = metadata, set()
@@ -106,19 +108,42 @@ def _current_owner_intent(metadata, jobs):
     return intent({"route_id": binding.route_id, "route_hash": binding.route_hash}, jobs) if binding else None
 
 
-def _rows(jobs):
-    rows = {}
+def _rows(jobs, attempts=None):
     if not jobs.exists():
-        return rows
-    for line in jobs.read_text().splitlines():
-        fields = line.split("\t")
-        if len(fields) == 6:
-            meta = DC.parse_registry_metadata(fields[5])
-            aid = meta.get("attempt_id")
-            if aid:
-                if aid in rows:
-                    raise ValueError("parent-close-attempt-not-unique")
-                rows[aid] = (fields, meta)
+        return {}
+    view = registry_view(jobs)
+    if view.has_duplicate_attempts:
+        raise ValueError("parent-close-attempt-not-unique")
+    if attempts is None:
+        selected = ((record, record.completion_metadata()) for record in view.records)
+    else:
+        pending = list(dict.fromkeys(attempts))
+        seen = set()
+        selected = []
+        while pending:
+            aid = pending.pop()
+            if aid in seen:
+                continue
+            seen.add(aid)
+            candidates = view.completion_attempt_records(aid)
+            if len(candidates) > 1:
+                raise ValueError("parent-close-attempt-not-unique")
+            if not candidates:
+                continue
+            record = candidates[0]
+            metadata = record.completion_metadata()
+            selected.append((record, metadata))
+            parent = metadata.get("parent_attempt_id")
+            if parent not in (None, "", "-"):
+                pending.append(parent)
+    rows = {}
+    for record, metadata in selected:
+        fields = list(record.fields)
+        aid = metadata.get("attempt_id")
+        if aid:
+            if aid in rows:
+                raise ValueError("parent-close-attempt-not-unique")
+            rows[aid] = (fields, metadata)
     return rows
 
 

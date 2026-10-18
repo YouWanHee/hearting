@@ -23,6 +23,7 @@ from typing import Callable
 
 import dispatch_contract as DC
 from artifact_receipt import _write_once
+from dispatch_registry_cache import registry_view
 import route_authority
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1866,11 +1867,39 @@ def effective_attempts(jobs, attempts):
 
 def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run):
     """Runtime-only checkpoint; no model turn or new polling service."""
-    attention=[]
+    jobs_path = Path(jobs)
+    if not attempts:
+        return set(), [], []
+    try:
+        view = registry_view(jobs_path)
+    except OSError:
+        view = None
+    attention = []
+    needs_projection = False
     for aid in sorted(attempts):
+        if view is not None:
+            records = view.completion_attempt_records(aid)
+            if len(records) == 1:
+                record = records[0]
+                metadata = record.completion_metadata()
+                has_lineage = bool(source_binding(jobs_path, metadata) or any(
+                    metadata.get(key) for key in (
+                        "replacement_original_attempt_id", "replacement_family_id",
+                        "replacement_attempt_id", "replacement_claim_digest")))
+                if (record.status in {"open", "running"} and not has_lineage
+                        and death_kind(list(record.fields), metadata, jobs=jobs_path) is None):
+                    # A live exact attempt with no replacement evidence has no
+                    # replacement work. The completion join already performed
+                    # its fresh process/recipient checks for this checkpoint.
+                    continue
+                needs_projection = True
         step=advance(jobs,aid,authority_check=authority_check,run=run)
         if step.get('state')=='needs-attention':
             attention.append(step)
+        else:
+            needs_projection = True
+    if not needs_projection:
+        return set(attempts), [], attention
     effective,mapping=effective_attempts(jobs,attempts)
     return effective,mapping,attention
 

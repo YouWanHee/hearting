@@ -45,6 +45,34 @@ class ReplacementTest(unittest.TestCase):
 
     def claim(self):return R.claim(self.jobs,'att-source')
 
+    def test_advance_batch_skips_replacement_rescan_for_live_exact_attempt(self):
+        import dispatch_registry_cache as cache
+
+        live = {**self.meta, **D.process_launch_identity(os.getpid()),
+                "note": "", "launch_outcome": "spawned"}
+        self.write(live, status="running")
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(
+                    f"now\tdone\t{self.root}\t{self.root}\thistory-{index}\t"
+                    f"attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                    "execution_surface=registered-headless,registered_worker=1,"
+                    f"attempt_id=att-history-{index:05d},parent_attempt_id=att-foreign,"
+                    "worker_type=stage,note=old\n")
+        cache.clear_cache()
+        cache.reset_metrics()
+        with mock.patch.object(R, "advance",
+                               side_effect=AssertionError("live attempt reached launcher")), \
+             mock.patch.object(R, "effective_attempts",
+                               side_effect=AssertionError("live attempt rescanned history")):
+            effective, lineage, attention = R.advance_batch(self.jobs, {"att-source"})
+        self.assertEqual(effective, {"att-source"})
+        self.assertEqual(lineage, [])
+        self.assertEqual(attention, [])
+        metrics = cache.metrics_snapshot()
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        cache.clear_cache()
+
     def bind_fixture_route(self):
         """Publish the fixture's final draft with the production hash/identity before its first claim."""
         import route_lineage
