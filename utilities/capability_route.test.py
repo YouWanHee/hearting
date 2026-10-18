@@ -2692,8 +2692,8 @@ class TestContinuation(unittest.TestCase):
    "attempt_id":attempt_id,"route_id":route["route_id"],
    "route_hash":route["route_hash"],"route_node":node["id"],
   }
-  from review_source_subject import is_implementation_review,seal_attempt
-  if is_implementation_review(route,node):
+  from review_source_subject import is_implementation_review,is_source_test,seal_attempt
+  if is_implementation_review(route,node) or is_source_test(node):
    metadata.update(seal_attempt(jobs,route,node,attempt_id,worktree=route["cwd"]))
    # This fixture models a settled completion, not the child lifecycle. Use
    # the common marker writer with the exact source binding; the matching
@@ -8228,7 +8228,8 @@ class ComposeRouteTest(TestRoute):
          mock.patch.object(R,"cwd_campaign_keys",return_value=folder), \
          contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
      self.assertEqual(R.main(),0)
-    self.assertEqual((seen[-1]["slug"],seen[-1]["campaign_key"]),("fix-the-streaming-window","tts-v6-release"))
+    self.assertRegex(seen[-1]["slug"],r"^autopilot-code-fix-streaming-window-[0-9a-f]{10}$")
+    self.assertEqual(seen[-1]["campaign_key"],"tts-v6-release")
     self.assertIn(note,err.getvalue())
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])

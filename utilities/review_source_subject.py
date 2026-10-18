@@ -175,8 +175,9 @@ def source_scopes(route: dict, node: dict) -> tuple[str, ...]:
                      and str(scope) not in _ARTIFACT_ROOT_FILES
                      and PurePosixPath(str(scope).split("*", 1)[0].rstrip("/")).parts[:1]
                      not in (("dev_logs",), ("test_logs",), ("evidence",), ("_internal",), ("shards",))})
-    if is_implementation_review(route, node) and not scopes:
-        # Historical implementation-review gates predate explicit source scopes.
+    if (is_implementation_review(route, node) or is_source_test(node)) and not scopes:
+        # Historical implementation-review gates predate explicit source scopes,
+        # and a continuation can resume at test without the execute ancestor.
         return ("source/**",)
     return tuple(scopes)
 
