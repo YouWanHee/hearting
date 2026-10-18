@@ -200,17 +200,14 @@ class DirectoryLookupTest(F.ProducerTestBase):
     def test_damaged_admission_route_projection_retains_removed_record_recovery(self):
         cycle_id, route_id = self.cycle["cycle_id"], self.a["route_id"]
         P.cycle_record_path(self.root, cycle_id).unlink()
-        index_path, original = P.artifact_admission._index_path(self.root), P._read_json
+        index_path = P.artifact_admission._index_path(self.root)
         damages = ([1], {"root": [1]}, {"root": {route_id: []}},
                    {"root": {route_id: {"cycle_id": []}}})
         for projection in damages:
             with self.subTest(projection=projection):
-                def read(path):
-                    if Path(path) == index_path:
-                        return {"cycles": {cycle_id: {}}, "routes": projection}
-                    return original(path)
-                with mock.patch.object(P, "_read_json", side_effect=read), \
-                        mock.patch.object(P, "read_cycle_record", return_value=self.record) as recover:
+                index_path.write_text(json.dumps(
+                    {"cycles": {cycle_id: {}}, "routes": projection}))
+                with mock.patch.object(P, "read_cycle_record", return_value=self.record) as recover:
                     self.assertEqual(P.list_cycle_records(self.root, route_ids={route_id}), [self.record])
                     recover.assert_called_once_with(self.root, cycle_id)
 

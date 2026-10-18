@@ -2837,6 +2837,7 @@ def current_children(
     *,
     route_id: str | None = None,
     route_hash: str | None = None,
+    registry_append_only: bool = False,
 ) -> list[ChildRow]:
     """Return latest exact-attempt rows owned by ``parent_attempt_id``.
 
@@ -2849,7 +2850,7 @@ def current_children(
     if bool(route_id) != bool(route_hash):
         raise JoinContractError("route-selection-identity-incomplete")
     try:
-        view = registry_view(jobs)
+        view = registry_view(jobs, append_only=registry_append_only)
     except FileNotFoundError:
         view = None
     except OSError as exc:
@@ -2901,13 +2902,14 @@ def current_children(
     return sorted(latest.values(), key=lambda row: row.order)
 
 
-def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
+def exact_attempt_row(jobs: Path, attempt_id: str, *,
+                      registry_append_only: bool = False) -> ChildRow:
     """Read one unique current registry row by immutable attempt identity."""
 
     if not attempt_id:
         raise JoinContractError("attempt-id-missing")
     try:
-        view = registry_view(jobs)
+        view = registry_view(jobs, append_only=registry_append_only)
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     matches: list[ChildRow] = []
@@ -2931,15 +2933,17 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     return matches[0]
 
 
-def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> ChildRow | None:
+def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None,
+                        registry_append_only: bool = False) -> ChildRow | None:
     """Return the latest exact registry row for one attempt identity."""
 
     if not _safe_identity(attempt_id):
         raise JoinContractError("attempt-id-invalid")
     if read_context is not None:
-        return read_context.current_attempt_row(jobs, attempt_id)
+        return read_context.current_attempt_row(
+            jobs, attempt_id, append_only=registry_append_only)
     try:
-        view = registry_view(jobs)
+        view = registry_view(jobs, append_only=registry_append_only)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -3030,6 +3034,8 @@ def current_session_children(
     parent_session_id: str,
     expected_attempts: set[str] | None = None,
     parent_completion_delivery: str = SESSION_PARENT_DELIVERY,
+    *,
+    registry_append_only: bool = False,
 ) -> list[ChildRow]:
     """Return exact direct children owned by one interactive Codex session.
 
@@ -3044,17 +3050,17 @@ def current_session_children(
     if parent_completion_delivery not in SESSION_PARENT_DELIVERIES:
         raise JoinContractError("parent-completion-delivery-invalid")
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs, append_only=registry_append_only)
     except FileNotFoundError:
-        lines = []
+        view = None
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
 
     latest: dict[str, ChildRow] = {}
-    for order, line in enumerate(lines):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
+    records = (view.completion_parent_records(parent_session_id) if view else ())
+    for record in records:
+        fields = record.fields
+        line = record.raw
         meta = _metadata(fields[5])
         if (
             meta.get("parent_sid") != parent_session_id
@@ -3081,7 +3087,7 @@ def current_session_children(
         if expected_attempts is not None and attempt_id not in expected_attempts:
             continue
         latest[attempt_id] = ChildRow(
-            order=order,
+            order=record.order,
             status=fields[1],
             slug=fields[4],
             attempt_id=attempt_id,
@@ -3349,6 +3355,8 @@ def _join_snapshot(
     recovery: Callable[[ChildRow], dict[str, object]] | None = None,
     observation_jobs: Path | None = None,
     settlement: Callable[[ChildRow], dict[str, object]] | None = None,
+    observation_context=None,
+    registry_append_only: bool = False,
 ) -> dict[str, object]:
     """Join one immutable exact-attempt snapshot."""
 
@@ -3362,20 +3370,45 @@ def _join_snapshot(
             "children": [],
         }
     snapshot = {row.attempt_id for row in initial}
-    started = time.monotonic()
-    last_recovery: dict[str, float] = {}
-    last_settlement: dict[str, float] = {}
-    settlement_backoff: dict[str, dict[str, object]] = {}
-    recovery_results: dict[str, dict[str, object]] = {}
-    last_observation = float("-inf")
-    last_signature = ""
-    observation_error = ""
-    notice_published = False
-    last_notice_attempt = float("-inf")
-    blocked_notice_published = False
-    last_blocked_notice_attempt = float("-inf")
-
+    if observation_context is None:
+        from runtime_observation import ObservationContext
+        observation_context = ObservationContext(max_entries=8)
+    state_key = ("join", str(Path(jobs).resolve(strict=False)),
+                 tuple(sorted(snapshot)), tuple(sorted(identity.items())))
+    state = observation_context.state(state_key, lambda: {
+        "started": time.monotonic(), "last_recovery": {}, "last_settlement": {},
+        "settlement_backoff": {}, "recovery_results": {},
+        "last_observation": float("-inf"), "last_signature": "",
+        "observation_error": "", "notice_published": False,
+        "last_notice_attempt": float("-inf"), "blocked_notice_published": False,
+        "last_blocked_notice_attempt": float("-inf"), "registry_generation": None,
+    })
+    started = state["started"]
+    last_recovery = state["last_recovery"]
+    last_settlement = state["last_settlement"]
+    settlement_backoff = state["settlement_backoff"]
+    recovery_results = state["recovery_results"]
+    last_observation = state["last_observation"]
+    last_signature = state["last_signature"]
+    observation_error = state["observation_error"]
+    notice_published = state["notice_published"]
+    last_notice_attempt = state["last_notice_attempt"]
+    blocked_notice_published = state["blocked_notice_published"]
+    last_blocked_notice_attempt = state["last_blocked_notice_attempt"]
     while True:
+        try:
+            jobs_stat = Path(jobs).stat()
+            current_registry_generation = (jobs_stat.st_dev, jobs_stat.st_ino,
+                                           jobs_stat.st_size, jobs_stat.st_mtime_ns,
+                                           jobs_stat.st_ctime_ns)
+        except OSError:
+            current_registry_generation = None
+        if state["registry_generation"] != current_registry_generation:
+            # Changed registry evidence gets a prompt fresh settlement or
+            # recovery observation. The process, claim and recipient checks
+            # below remain fresh on every pass regardless of this cache.
+            last_recovery.clear()
+            state["registry_generation"] = current_registry_generation
         rows = refresh(snapshot)
         children: list[dict[str, str]] = []
         blocked_attempt_ids: set[str] = set()
@@ -3387,7 +3420,8 @@ def _join_snapshot(
             import route_parent_close
             if route_parent_close.row_requested(row.metadata, jobs):
                 outcome = route_parent_close.recover_attempt(jobs, row.metadata)
-                current = current_attempt_row(jobs, row.attempt_id)
+                current = current_attempt_row(
+                    jobs, row.attempt_id, registry_append_only=registry_append_only)
                 settled = bool(outcome and outcome.get("state") == "cancelled" and current
                                and current.metadata.get("parent_close_settled") == "1")
                 pending = pending or not settled
@@ -3531,23 +3565,29 @@ def _join_snapshot(
                 # A display record never owns the child's lifetime or verdict.
                 observation_error = "join-observation-write-failed"
             last_signature, last_observation = signature, time.monotonic()
+            state["last_signature"], state["last_observation"] = last_signature, last_observation
+            state["observation_error"] = observation_error
         if (not notice_published and observation_jobs is not None and elapsed >= 30
                 and time.monotonic() - last_notice_attempt >= 30
                 and any(child["reason"] == "process-unverifiable" for child in children)):
             last_notice_attempt = time.monotonic()
+            state["last_notice_attempt"] = last_notice_attempt
             try:
                 from dispatch_supervision import materialize
                 materialize(observation_jobs, snapshot, reason="process-unverifiable")
                 notice_published = True
+                state["notice_published"] = True
             except (OSError, ValueError, pending_delivery.PendingDeliveryError) as exc:
                 observation_error = "supervision-notice-unpersisted:" + str(exc)
         if (not blocked_notice_published and observation_jobs is not None and blocked_attempt_ids
                 and time.monotonic() - last_blocked_notice_attempt >= 30):
             last_blocked_notice_attempt = time.monotonic()
+            state["last_blocked_notice_attempt"] = last_blocked_notice_attempt
             try:
                 from dispatch_supervision import materialize
                 materialize(observation_jobs, blocked_attempt_ids, reason="closure-blocked")
                 blocked_notice_published = True
+                state["blocked_notice_published"] = True
             except (OSError, ValueError, pending_delivery.PendingDeliveryError) as exc:
                 observation_error = "supervision-notice-unpersisted:" + str(exc)
         if not pending:
@@ -3574,7 +3614,8 @@ def _join_snapshot(
 
 def join_selected_attempts(*, jobs: Path, expected_attempts: set[str],
                            timeout: float = 0.0, interval: float = 2.0,
-                           recover: bool = True) -> dict[str, object]:
+                           recover: bool = True, observation_context=None,
+                           registry_append_only: bool = False) -> dict[str, object]:
     """Use the runtime join for an operator's exact selected attempts too.
 
     Selection is done by the caller; subsequent observations keep that fixed
@@ -3582,7 +3623,8 @@ def join_selected_attempts(*, jobs: Path, expected_attempts: set[str],
     No parent runtime or completion-note vocabulary is inferred here.
     """
     def refresh(attempts):
-        return [exact_attempt_row(jobs, attempt) for attempt in sorted(attempts)]
+        return [exact_attempt_row(jobs, attempt, registry_append_only=registry_append_only)
+                for attempt in sorted(attempts)]
 
     return _join_snapshot(
         jobs=jobs,
@@ -3593,6 +3635,8 @@ def join_selected_attempts(*, jobs: Path, expected_attempts: set[str],
         recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover else None,
         observation_jobs=jobs if recover else None,
         settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover else None,
+        observation_context=observation_context,
+        registry_append_only=registry_append_only,
     )
 
 
@@ -3606,14 +3650,18 @@ def join_batch(
     liveness_command: list[str] | None = None,
     env: dict[str, str] | None = None,
     recover_receiptless: bool = False,
+    observation_context=None,
+    registry_append_only: bool = False,
 ) -> dict[str, object]:
     """Join one immutable child batch sealed to an exact parent attempt."""
 
-    initial = current_children(jobs, parent_attempt_id, expected_attempts)
+    initial = current_children(jobs, parent_attempt_id, expected_attempts,
+                               registry_append_only=registry_append_only)
     return _join_snapshot(
         jobs=jobs,
         initial=initial,
-        refresh=lambda snapshot: current_children(jobs, parent_attempt_id, snapshot),
+        refresh=lambda snapshot: current_children(
+            jobs, parent_attempt_id, snapshot, registry_append_only=registry_append_only),
         identity={"parent_attempt_id": parent_attempt_id},
         interval=interval,
         timeout=timeout,
@@ -3623,6 +3671,8 @@ def join_batch(
         recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover_receiptless else None,
         observation_jobs=jobs if recover_receiptless else None,
         settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover_receiptless else None,
+        observation_context=observation_context,
+        registry_append_only=registry_append_only,
     )
 
 
@@ -3637,6 +3687,8 @@ def join_session_batch(
     liveness_command: list[str] | None = None,
     env: dict[str, str] | None = None,
     recover_receiptless: bool = False,
+    observation_context=None,
+    registry_append_only: bool = False,
 ) -> dict[str, object]:
     """Join one exact batch sealed to an interactive parent session."""
 
@@ -3645,6 +3697,7 @@ def join_session_batch(
         parent_session_id,
         expected_attempts,
         parent_completion_delivery,
+        registry_append_only=registry_append_only,
     )
     return _join_snapshot(
         jobs=jobs,
@@ -3654,6 +3707,7 @@ def join_session_batch(
             parent_session_id,
             snapshot,
             parent_completion_delivery,
+            registry_append_only=registry_append_only,
         ),
         identity={"parent_session_id": parent_session_id},
         interval=interval,
@@ -3664,6 +3718,8 @@ def join_session_batch(
         recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover_receiptless else None,
         observation_jobs=jobs if recover_receiptless else None,
         settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover_receiptless else None,
+        observation_context=observation_context,
+        registry_append_only=registry_append_only,
     )
 
 
@@ -3723,6 +3779,7 @@ def main(argv: list[str] | None = None) -> int:
                 interval=args.interval,
                 timeout=args.timeout,
                 liveness_command=liveness,
+                registry_append_only=True,
             )
         else:
             receipt = join_batch(
@@ -3735,6 +3792,7 @@ def main(argv: list[str] | None = None) -> int:
                 interval=args.interval,
                 timeout=args.timeout,
                 liveness_command=liveness,
+                registry_append_only=True,
             )
     except JoinContractError as exc:
         receipt = {

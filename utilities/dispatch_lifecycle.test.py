@@ -21,6 +21,26 @@ SPEC.loader.exec_module(L)
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_live_leader_does_not_repeat_the_global_process_group_scan(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(.15)"],
+                                 start_new_session=True)
+        real_scan = L._group_empty
+        scans = []
+        def scan(pgid):
+            self.assertIsNotNone(child.poll(), "live leader already proves nonempty")
+            scans.append(pgid)
+            return real_scan(pgid)
+        try:
+            with mock.patch.object(L, "_group_empty", side_effect=scan):
+                result = L.wait_foreground(child, 3, poll_interval=.01)
+            self.assertEqual(result.failure, "")
+            self.assertTrue(result.group_empty)
+            self.assertTrue(scans, "exit still requires the full fresh cleanup observation")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
     def _run_fake_runtime_chain(self, harness, mode):
         from foreground_activity import ForegroundActivityContext
         with tempfile.TemporaryDirectory() as td:

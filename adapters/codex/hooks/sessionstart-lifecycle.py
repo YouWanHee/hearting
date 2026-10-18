@@ -159,48 +159,64 @@ def emit_context(event_name: str, parts: list[str]) -> None:
     context = "\n".join(part.strip() for part in parts if part.strip())
     if not context:
         return
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}, ensure_ascii=False))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}},
+                     ensure_ascii=False), flush=True)
+
+
+def request_lifecycle_recovery() -> None:
+    """Ask the existing detached recovery owner once for this lifecycle event."""
+    try:
+        utilities = ROOT / "utilities"
+        if str(utilities) not in sys.path:
+            sys.path.insert(0, str(utilities))
+        from peer_obligations import request_obligation_recovery
+        request_obligation_recovery(lifecycle_root=ROOT)
+    except Exception:
+        pass
 
 
 def main() -> int:
     payload = load_payload()
     current_cwd = cwd(payload)
+    sid = session_id(payload)
     worker = is_worker_session()
     if worker:
-        try:
-            sys.path.insert(0, str(ROOT / "utilities"))
-            from peer_obligations import request_obligation_recovery
-            request_obligation_recovery(lifecycle_root=ROOT)
-        except Exception:
-            pass
+        request_lifecycle_recovery()
     else:
         try:
             from herdr_session_projection import project
-            project(payload, session_id(payload), worker=False)
+            project(payload, sid, worker=False, request_recovery=False)
         except Exception:
             pass
 
     parts = []
-    if not worker:
-        forget_shown_candidates(payload)
-        parts.append(card_context(payload, current_cwd))
+    try:
+        if not worker:
+            forget_shown_candidates(payload)
+            parts.append(card_context(payload, current_cwd))
+            try:
+                utilities = ROOT / "utilities"
+                if str(utilities) not in sys.path:
+                    sys.path.insert(0, str(utilities))
+                from dispatch_contract import dispatch_state_roots, resolve_agent_home
+                from dispatch_session_sweep import activate, delivery_context
+                if sid:
+                    batches = [(root, activate(root, "codex-native-queue", sid,
+                                                request_recovery=False))
+                               for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home()))
+                               if root.is_dir()]
+                    parts.append(delivery_context(batches))
+            except Exception:
+                pass
+            if env_truthy("CODEX_SESSION_MEMORY_INJECT"):
+                parts.append(run_preflight("memory", current_cwd))
+            parts.append(local_evidence_context(current_cwd))
+    finally:
         try:
-            utilities = ROOT / "utilities"
-            sys.path.insert(0, str(utilities))
-            from dispatch_contract import dispatch_state_roots, resolve_agent_home
-            from dispatch_session_sweep import activate, delivery_context
-            sid = session_id(payload)
-            if sid:
-                batches = [(root, activate(root, "codex-native-queue", sid))
-                           for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home()))
-                           if root.is_dir()]
-                parts.append(delivery_context(batches))
-        except Exception:
-            pass
-        if env_truthy("CODEX_SESSION_MEMORY_INJECT"):
-            parts.append(run_preflight("memory", current_cwd))
-        parts.append(local_evidence_context(current_cwd))
-    emit_context("SessionStart", parts)
+            emit_context("SessionStart", parts)
+        finally:
+            if not worker:
+                request_lifecycle_recovery()
     return 0
 
 

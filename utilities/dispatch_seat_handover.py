@@ -424,7 +424,10 @@ def _handover_binding_keys_for_session(jobs, sid: str, *, read_context=None) -> 
 
 def _handover_candidate_rows(jobs, sid: str, *, read_context=None):
     from dispatch_registry_cache import registry_view
-    view = registry_view(Path(jobs))
+    view = registry_view(
+        Path(jobs),
+        append_only=bool(getattr(read_context, "registry_append_only", False)),
+    )
     keys = _handover_binding_keys_for_session(jobs, sid, read_context=read_context)
     return view.handover_candidates(sid, keys)
 

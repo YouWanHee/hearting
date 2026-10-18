@@ -445,6 +445,33 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(result["owner_attempt_id"], self.aid("att-owner"))
         self.assertEqual(CLOSE._rows(self.jobs)[self.aid("att-route-free")][0][1], "open")
 
+    def test_row_requested_uses_indexed_owner_ancestry_on_unrelated_history(self):
+        import owner_route_binding as OWNER
+        import dispatch_registry_cache as CACHE
+
+        owner_process = self.process("att-owner")
+        self.row("att-owner", process=owner_process)
+        child_process = self.process("att-child")
+        child = self.row("att-child", parent="att-owner", process=child_process)
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(
+                    f"now\tdone\t{self.base}\t{self.base}\told-{index}\t"
+                    f"attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                    "execution_surface=registered-headless,registered_worker=1,"
+                    f"attempt_id=att-unrelated-{index:05d},parent_attempt_id=att-foreign,"
+                    "worker_type=stage,note=history\n")
+        CACHE.clear_cache()
+        CACHE.reset_metrics()
+        with mock.patch.object(OWNER, "_registry_snapshot",
+                               side_effect=AssertionError("full registry snapshot")), \
+             mock.patch.object(DC, "parse_registry_metadata",
+                               side_effect=AssertionError("full metadata reparse")):
+            self.assertFalse(CLOSE.row_requested(child, self.jobs))
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+
     def test_current_incomplete_binding_still_refuses_without_intent(self):
         self.row("att-owner", owner_route_id="", owner_route_hash="")
         with self.assertRaisesRegex(ValueError, "current-owner-unobservable.*binding-incomplete"):
