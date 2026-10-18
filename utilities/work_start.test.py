@@ -2886,14 +2886,14 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
             raise subprocess.TimeoutExpired(command, timeout=60, output=b"admission/registry contention")
         return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
 
-    def _cli_start(self):
+    def _cli_start(self, runner=None):
         import contextlib
         import io
 
         module = self.route_module
         stdout, stderr = io.StringIO(), io.StringIO()
         defaults = dict(W.start_work.__kwdefaults__ or {})
-        W.start_work.__kwdefaults__ = {**defaults, "run": self._controlled_runner}
+        W.start_work.__kwdefaults__ = {**defaults, "run": runner or self._controlled_runner}
         try:
             with mock.patch.object(sys, "argv", [str(W.ROOT / "utilities/capability-route.py"),
                     "start", "--route", str(self.path), "--jobs", str(self.jobs)]), \
@@ -2905,6 +2905,100 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         records = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
         self.assertTrue(records, stderr.getvalue() + stdout.getvalue())
         return records[-1]
+
+    def _append_legacy_race_event(self, **event):
+        path = self.root / "legacy-race-events.jsonl"
+        raw = (json.dumps(event, sort_keys=True) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, raw)
+        finally:
+            os.close(fd)
+
+    def _legacy_fenced_runner(self, command, **_kwargs):
+        """Launch the fixture payload only through the common registry fence."""
+        aid = command[command.index("--attempt-id") + 1]
+        prior = command[command.index("--automatic-retry-of") + 1]
+        self._append_legacy_race_event(kind="runner-invoked", attempt_id=aid, prior=prior)
+
+        source = self.replacement._rows(self.jobs.read_text().splitlines())[prior][1]
+        binding = self.replacement.source_binding(self.jobs, source)
+        record = self.replacement._read(self.replacement._record_path(self.jobs, binding[0]))
+        replay = self.replacement.launch_input(self.jobs, prior, source)
+        import dispatch_seat_handover
+        parent_sid = dispatch_seat_handover.effective_parent(source, self.jobs) or "parent"
+        parent_harness = dispatch_seat_handover.effective_parent_harness(source, self.jobs) or "codex"
+        argv = self.replacement._replacement_argv(record, source, replay, {
+            "parent_session_id": parent_sid, "parent_harness": parent_harness})
+        task = self.replacement._replacement_task(record, source, replay)
+        metadata = self._metadata(aid, parent_sid, parent_harness, task, argv,
+                                  prior=prior, record=record)
+        row = "\t".join(("now", "open", self.route["cwd"], self.route["cwd"], "fixture-owner",
+                          ",".join(f"{key}={value}" for key, value in metadata.items())))
+
+        if not self.contract.claim_attempt_row(self.jobs, aid, row, launch=False):
+            existing = self.replacement._rows(self.jobs.read_text().splitlines()).get(aid)
+            self.assertIsNotNone(existing, "duplicate caller must find the stable registered D row")
+            self.assertEqual(existing[1].get("automatic_retry_of"), prior)
+            self.assertEqual(existing[1].get("replacement_claim_digest"),
+                             self.replacement._digest(record))
+            self._append_legacy_race_event(kind="registered-row-reused", attempt_id=aid,
+                                           prior=prior)
+            return subprocess.CompletedProcess(
+                command, 0, "registered=1 started=1 child_spawned=0\n", "")
+
+        from types import SimpleNamespace
+        instructions = self.replacement.recovery_instructions(SimpleNamespace(
+            automatic_retry_of=prior, attempt_id=aid, jobs_path=self.jobs, worker_type="owner"))
+        prompt = task + instructions
+        prompt_path = self.root / f"{aid}.prompt.txt"
+        received_path = self.root / f"{aid}.payload-input.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        launch_fence = W.ROOT / "utilities/launch-fence.py"
+        payload_code = (
+            "from pathlib import Path; import sys, time; "
+            "Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes()); time.sleep(30)"
+        )
+
+        def spawn(gate_fd):
+            return subprocess.Popen(
+                [sys.executable, str(launch_fence), "--parent-pid", str(os.getpid()),
+                 "--gate-fd", str(gate_fd), "--", sys.executable, "-c", payload_code,
+                 str(prompt_path), str(received_path)],
+                pass_fds=(gate_fd,), start_new_session=True, env=os.environ.copy())
+
+        proc, identity = self.contract.spawn_claimed_attempt(
+            self.jobs, aid, parent_binding=None, spawn=spawn)
+        self._legacy_race_children.append(proc)
+        self.assertTrue(self.contract.annotate_attempt_row(
+            self.jobs, aid, {"launch_started": "1"}))
+        self.owner_input.initialize_owner_input(self.jobs, aid, "codex-active-turn")
+        self._append_legacy_race_event(kind="fenced-payload-started", attempt_id=aid,
+                                       prior=prior, pid=proc.pid, pid_start=identity["pid_start"])
+        return subprocess.CompletedProcess(
+            command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+    def _legacy_race_start_caller(self, barrier, release, results):
+        import traceback
+        self._legacy_race_children = []
+        try:
+            barrier.wait(timeout=20)
+            receipt = self._cli_start(runner=self._legacy_fenced_runner)
+            results.put({"ok": True, "receipt": receipt})
+        except BaseException:
+            results.put({"ok": False, "error": traceback.format_exc()})
+        finally:
+            release.wait(timeout=30)
+            for proc in self._legacy_race_children:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                self._append_legacy_race_event(kind="payload-cleaned", pid=proc.pid,
+                                               returncode=proc.returncode)
 
     def _cli_correct(self, aid, message):
         import contextlib
@@ -3254,14 +3348,15 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         self.assertEqual(self.replacement.recovery_delivery_state(self.jobs, owner_b), "settled")
         return owner_a, owner_b, owner_c
 
-    def _assert_legacy_owner_started_with_all_answers(self, owner_a, owner_b, owner_c, receipt):
+    def _assert_legacy_owner_started_with_all_answers(
+            self, owner_a, owner_b, owner_c, receipt, *, expected_answers=7):
         self.assertTrue(receipt.get("owner_started"), receipt)
         owner_d = receipt["owner_attempt_id"]
         self.assertNotEqual(owner_d, owner_c)
         self.assertEqual(self.launches[-1]["attempt_id"], owner_d)
         self.assertEqual(self.launches[-1]["prior"], owner_c)
         answers = self.owner_input.retained(self.jobs, owner_b)
-        self.assertEqual(len(answers), 7)
+        self.assertEqual(len(answers), expected_answers)
         prompt = self.delivered_prompts[owner_d]
         for answer in answers:
             self.assertIn(answer["text"], prompt)
@@ -3301,6 +3396,114 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         self.assertEqual(len(self.launches), launches_after_first)
         self.assertEqual(attention_path.read_bytes(), attention_before)
         self.assertEqual(claim_path.read_bytes(), claim_before)
+
+    def test_legacy_settled_owner_concurrent_starts_share_one_fenced_payload_and_seven_answers(self):
+        import multiprocessing
+
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        attention_path = self.replacement._directory(self.jobs) / "attention/by-source" / (owner_b + ".json")
+        source_b = self.replacement._rows(self.jobs.read_text().splitlines())[owner_b][1]
+        binding_b = self.replacement.source_binding(self.jobs, source_b)
+        claim_path = self.replacement._record_path(self.jobs, binding_b[0])
+        legacy_claim = self.replacement._read(claim_path)
+        self.assertEqual((legacy_claim["original_attempt_id"],
+                          legacy_claim["replacement_attempt_id"]), (owner_b, owner_c))
+        attention_before, claim_before = attention_path.read_bytes(), claim_path.read_bytes()
+
+        context = multiprocessing.get_context("fork")
+        barrier, release, results = context.Barrier(2), context.Event(), context.Queue()
+        callers = [context.Process(target=self._legacy_race_start_caller,
+                                   args=(barrier, release, results)) for _ in range(2)]
+        outcomes = []
+        try:
+            for caller in callers:
+                caller.start()
+            outcomes = [results.get(timeout=90) for _ in callers]
+            self.assertTrue(all(item.get("ok") for item in outcomes), outcomes)
+            receipts = [item["receipt"] for item in outcomes]
+            events = [json.loads(line) for line in (self.root / "legacy-race-events.jsonl").read_text().splitlines()]
+            starts = [event for event in events if event["kind"] == "fenced-payload-started"]
+            self.assertEqual(len(starts), 1, events)
+            owner_d = starts[0]["attempt_id"]
+            self.assertNotIn(owner_d, {owner_a, owner_b, owner_c})
+            payload_pid = starts[0]["pid"]
+            os.kill(payload_pid, 0)
+
+            rows = self.replacement._rows(self.jobs.read_text().splitlines())
+            self.assertEqual(rows[owner_d][1].get("automatic_retry_of"), owner_c)
+            for receipt in receipts:
+                referenced = {receipt.get("owner_attempt_id")}
+                referenced.update(item.get("replacement_attempt_id")
+                                  for item in receipt.get("replacement_lineage", []))
+                referenced.update(item.get("record", {}).get("replacement_attempt_id")
+                                  for item in receipt.get("replacement_attention", []))
+                self.assertIn(owner_d, referenced,
+                              {key: receipt.get(key) for key in
+                               ("owner_attempt_id", "replacement_lineage", "replacement_attention")})
+            self.assertEqual((rows[owner_a][0][1], rows[owner_a][1].get("note"),
+                              rows[owner_a][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+            self.assertEqual((rows[owner_b][0][1], rows[owner_b][1].get("note"),
+                              rows[owner_b][1].get("failure_class")),
+                             ("done", "dead-worker-blocked", "blocked"))
+            self.assertEqual((rows[owner_c][0][1], rows[owner_c][1].get("launch_outcome"),
+                              rows[owner_c][1].get("launch_started")),
+                             ("done", "never-launched", None))
+            self.assertEqual((rows[owner_d][1].get("launch_claimed"),
+                              rows[owner_d][1].get("launch_started"),
+                              rows[owner_d][1].get("pid")), ("1", "1", str(payload_pid)))
+
+            next_edge = self.replacement.source_binding(self.jobs, rows[owner_c][1])
+            next_claim = self.replacement._read(self.replacement._record_path(self.jobs, next_edge[0]))
+            self.assertEqual((next_claim["original_attempt_id"], next_claim["replacement_attempt_id"]),
+                             (owner_c, owner_d))
+            effective, lineage = self.replacement.effective_attempts(self.jobs, {owner_a})
+            self.assertEqual(effective, {owner_d})
+            self.assertEqual(lineage[0]["replacement_attempt_id"], owner_d)
+            self.assertEqual(attention_path.read_bytes(), attention_before)
+            self.assertEqual(claim_path.read_bytes(), claim_before)
+
+            answers = self.owner_input.retained(self.jobs, owner_b)
+            self.assertEqual(len(answers), 7)
+            payload_input = self.root / f"{owner_d}.payload-input.txt"
+            deadline = time.monotonic() + 5
+            while not payload_input.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(payload_input.exists(), "the released fixture payload must read D's prompt")
+            delivered = payload_input.read_text(encoding="utf-8")
+            self.assertEqual(delivered, (self.root / f"{owner_d}.prompt.txt").read_text(encoding="utf-8"))
+            for answer in answers:
+                self.assertIn(answer["text"], delivered)
+        finally:
+            release.set()
+            for caller in callers:
+                if caller.pid is not None:
+                    caller.join(timeout=20)
+                    if caller.is_alive():
+                        caller.terminate()
+                        caller.join(timeout=5)
+            results.close()
+            results.join_thread()
+
+        self.assertTrue(all(caller.exitcode == 0 for caller in callers),
+                        [caller.exitcode for caller in callers])
+        events = [json.loads(line) for line in (self.root / "legacy-race-events.jsonl").read_text().splitlines()]
+        cleaned = [event for event in events if event["kind"] == "payload-cleaned"]
+        self.assertEqual(len(cleaned), 1, events)
+        self.assertEqual(cleaned[0]["pid"], payload_pid)
+        self.assertIsNotNone(cleaned[0]["returncode"])
+
+    def test_legacy_settled_owner_correct_carries_eight_retained_answers(self):
+        owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
+        self._store(owner_b, "legacy correction 7", "input-b-7")
+        self.assertEqual(len(self.owner_input.retained(self.jobs, owner_b)), 7)
+
+        corrected = self._cli_correct(owner_b, "legacy correction 8")
+        owner_d = self._assert_legacy_owner_started_with_all_answers(
+            owner_a, owner_b, owner_c, corrected, expected_answers=8)
+        self.assertTrue(corrected["correction"]["retained"])
+        self.assertEqual(corrected["owner_attempt_id"], owner_d)
 
     def test_legacy_settled_owner_same_seat_successor_can_resume(self):
         owner_a, owner_b, owner_c = self._build_legacy_claim_with_settled_attention()
