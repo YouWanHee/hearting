@@ -701,7 +701,10 @@ D.fcntl.flock = flock
 def expired(*_):
     raise TimeoutError("registration-lock-deadline")
 signal.signal(signal.SIGALRM, expired)
+preclaim_calls = 0
 def preclaim(lines):
+    global preclaim_calls
+    preclaim_calls += 1
     if not D.parent_attempt_binding_is_live(jobs, binding):
         raise AssertionError("exact parent lost while registering")
     # Both public observations must be safe inside a normal registration's
@@ -715,7 +718,9 @@ row = ("now\topen\t" + os.environ["AGENT_HOME"] + "\t" + os.environ["AGENT_HOME"
 start = time.monotonic()
 signal.alarm(4)
 try:
-    registered = D.claim_attempt_row(jobs, aid, row, preclaim=preclaim)
+    registered = D.claim_attempt_row(jobs, aid, row, launch=True, preclaim=preclaim)
+    if preclaim_calls != 1:
+        raise AssertionError("registration did not exercise its locked observations")
     result = {"registered": registered, "state": "returned"}
 except TimeoutError:
     result = {"registered": False, "state": "lock-timeout"}
@@ -726,6 +731,7 @@ for call in calls:
     call["acquire_wait_seconds"] = None if call["acquired"] is None else call["acquired"] - call["requested"]
     call["hold_seconds_upper_bound"] = None if call["acquired"] is None else end - call["acquired"]
 result.update(elapsed_seconds=end-start, jobs_lock_requests=calls,
+              preclaim_calls=preclaim_calls,
               nested_lock_request=any(call["held_other_fds"] for call in calls))
 print(json.dumps(result), flush=True)
 '''
