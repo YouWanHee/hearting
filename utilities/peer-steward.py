@@ -2504,7 +2504,7 @@ def _watch_terminal_from_view(view, expected, server, transport=None):
 
 def _watch_registered_work_pending(view, expected, server):
     """A fresh blocking fact can defer readiness, never authorize completion."""
-    if (view is None or view.complete is not True
+    if (view is None or getattr(view, "complete", False) is not True
             or herdr_observation.endpoint_name(view.endpoint) !=
                herdr_observation.endpoint_name(server)):
         return False
