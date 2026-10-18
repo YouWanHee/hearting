@@ -9,6 +9,7 @@ temp tree and appends the actual values to evidence/sd111/fixture_env.tsv
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import io
 import json
 import os
@@ -37,6 +38,8 @@ def _load(name: str, path: Path):
 
 PD = _load("dispatch_pending_delivery", HERE / "dispatch_pending_delivery.py")
 SWEEP = _load("dispatch_session_sweep", HERE / "dispatch_session_sweep.py")
+HOOK = _load("dispatch_session_sweep_hook", ROOT / "hooks/dispatch-session-sweep.py")
+REQUEST_RECONNECT = SWEEP.request_obligation_reconciliation
 import dispatch_batch_obligations as OBLIGATIONS  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
@@ -63,6 +66,8 @@ class IsolatedRootMixin:
             "HOME": str(home),
             "XDG_STATE_HOME": str(xdg),
             "HARNESS_STATE_ROOT": str(harness),
+            "AGENT_DISPATCH_JOBS": str(harness / "dispatch" / "jobs.log"),
+            "AGENT_PEER_LEDGER_ROOT": str(harness / "peer-ledger"),
         }
         self._saved_env = {k: os.environ.get(k) for k in self._env_patch}
         os.environ.update(self._env_patch)
@@ -70,6 +75,7 @@ class IsolatedRootMixin:
             "dispatch_session_sweep.test.py", str(home), str(xdg), str(harness)
         )
         self.root = harness / "dispatch"
+        self.enterContext(mock.patch.object(SWEEP, "request_obligation_reconciliation"))
 
     def tearDown(self):
         for key, value in self._saved_env.items():
@@ -330,18 +336,15 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
 
     def test_hook_injects_additional_context_and_acks(self):
         self._seed()
-        hook = Path(__file__).resolve().parents[1] / "hooks" / "dispatch-session-sweep.py"
-        env = dict(os.environ)
-        env["XDG_STATE_HOME"] = str(self.root.parent)
-        env["HARNESS_STATE_ROOT"] = str(self.root)
-        env["AGENT_DISPATCH_JOBS"] = str(self.root / "jobs.log")
-        proc = subprocess.run(
-            [sys.executable, str(hook)],
-            input=json.dumps({"session_id": "sess-owner", "hook_event_name": "UserPromptSubmit"}),
-            capture_output=True, text=True, env=env, check=False,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(HOOK, "request_obligation_reconciliation"), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "sess-owner", "hook_event_name": "UserPromptSubmit",
+             }))), contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK.main(), 0)
+        payload = json.loads(output.getvalue())
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         self.assertIn("att-0000000000000000000000000000bbbb", context)
@@ -350,18 +353,89 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 
+    def test_reconnect_request_uses_detached_common_recovery_entry(self):
+        with mock.patch.object(SWEEP.subprocess, "Popen") as launch:
+            REQUEST_RECONNECT()
+        command = launch.call_args.args[0]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(Path(command[1]), ROOT / "utilities/peer-steward.py")
+        self.assertEqual(command[2:], ["__ensure-obligations"])
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+        self.assertTrue(launch.call_args.kwargs["close_fds"])
+        self.assertIs(launch.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(launch.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(launch.call_args.kwargs["stderr"], subprocess.DEVNULL)
+
+    def test_user_prompt_output_and_ack_finish_while_reconnect_child_is_slow(self):
+        self._seed()
+        output = io.StringIO()
+        children = []
+        requested = []
+        real_ack = HOOK.ack_delivered
+
+        def slow_reconnect_request():
+            requested.append(True)
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            ))
+
+        def acknowledge_after_output(root, session_id, records, *, acked_by):
+            self.assertIn("hookSpecificOutput", output.getvalue())
+            self.assertTrue(children, "reconnect was not requested")
+            self.assertIsNone(children[0].poll(), "slow reconnect unexpectedly finished first")
+            return real_ack(root, session_id, records, acked_by=acked_by)
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+                 mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+                 mock.patch.object(HOOK, "request_obligation_reconciliation",
+                                   side_effect=slow_reconnect_request), \
+                 mock.patch.object(HOOK, "ack_delivered", side_effect=acknowledge_after_output), \
+                 mock.patch("sys.stdin", io.StringIO(json.dumps({
+                     "session_id": "sess-owner", "hook_event_name": "UserPromptSubmit",
+                 }))), contextlib.redirect_stdout(output):
+                self.assertEqual(HOOK.main(), 0)
+            elapsed = time.monotonic() - started
+            self.assertEqual(requested, [True])
+            self.assertLess(elapsed, 10.0, f"hook took {elapsed:.3f}s")
+            self.assertEqual(PD.read(
+                self.root, "sess-owner", "delivery-" + "a" * 32)["state"], "acked")
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=3)
+
+    def test_reconnect_is_requested_without_a_delivery_projection(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(HOOK, "sweep_deliver", return_value=([], 0)), \
+             mock.patch.object(HOOK, "request_obligation_reconciliation") as request, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "worker-session", "hook_event_name": "UserPromptSubmit",
+             }))), contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK.main(), 0)
+        request.assert_called_once_with()
+        self.assertEqual(output.getvalue(), "")
+
     def test_startup_and_resume_context_never_ack_or_take_a_delivery_lease(self):
         self._seed()
-        hook = ROOT / "hooks/dispatch-session-sweep.py"
-        env = {**os.environ, "AGENT_DISPATCH_JOBS": str(self.root / "jobs.log"),
-               "HARNESS_STATE_ROOT": str(self.root)}
         before = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)
         for source in ("startup", "resume"):
-            proc = subprocess.run([sys.executable, str(hook)], capture_output=True, text=True,
-                                  env=env, input=json.dumps({"session_id": "sess-owner",
-                                  "hook_event_name": "SessionStart", "source": source}))
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("att-0000000000000000000000000000bbbb", proc.stdout)
+            output = io.StringIO()
+            with mock.patch.object(HOOK, "resolve_agent_home", return_value=self.root.parent), \
+                 mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+                 mock.patch.object(HOOK, "request_obligation_reconciliation"), \
+                 mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sess-owner",
+                     "hook_event_name": "SessionStart", "source": source}))), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(HOOK.main(), 0)
+            self.assertIn("att-0000000000000000000000000000bbbb", output.getvalue())
             self.assertEqual(PD.read(self.root, "sess-owner", before["delivery_id"]), before)
         self.test_hook_injects_additional_context_and_acks()
 
@@ -904,11 +978,13 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
              mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
             SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
         reconcile.assert_called_once_with(jobs)
-        ensure.assert_called_once_with()
+        request.assert_called_once_with()
+        ensure.assert_not_called()
 
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -945,31 +1021,19 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
         other_args.control_socket = secondary / "control.sock"
         other_duty_id, _other_record = OBLIGATIONS.create(other_args)
 
-        class Launched:
-            pid = 902343
-
-        service_script = self.root.parent / "release" / "utilities" / "codex-managed-completion.py"
         with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
-             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
-             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
-             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
-             mock.patch.object(OBLIGATIONS.subprocess, "Popen", return_value=Launched()) as launch:
+             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
+             mock.patch.object(OBLIGATIONS.subprocess, "Popen") as launch:
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
         reconcile.assert_called_once_with(jobs)
+        request.assert_called_once_with()
         settle.assert_not_called()
-        self.assertEqual(launch.call_count, 2)
-        launches = [call.args[0] for call in launch.call_args_list]
-        self.assertEqual(
-            {argv[argv.index("--jobs") + 1] for argv in launches},
-            {str(jobs), str(other_jobs)},
-        )
-        self.assertTrue(any(duty_id in argv for argv in launches))
-        self.assertTrue(any(other_duty_id in argv for argv in launches))
+        launch.assert_not_called()
         self.assertEqual(jobs.read_bytes(), unreadable)
         self.assertEqual(other_jobs.read_bytes(), other_before)
 

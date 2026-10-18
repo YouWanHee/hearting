@@ -12,6 +12,7 @@ import json
 import os
 os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 import shlex
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -145,6 +146,86 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.live = self.root / "live.sh"
         self.live.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.live.chmod(0o755)
+
+    def test_cli_still_waits_for_a_live_parent_and_returns_its_receipt(self):
+        self.jobs.write_text(row("open", "att-a", "att-parent", "a"), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(HERE / "dispatch_completion_join.py"),
+             "--jobs", str(self.jobs), "--parent-attempt-id", "att-parent",
+             "--interval", "0.02", "--timeout", "0.08"],
+            text=True, capture_output=True, check=False, timeout=3,
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["state"], "timeout")
+
+    @unittest.skipUnless(sys.platform == "linux", "PR_SET_PDEATHSIG is Linux-specific")
+    def test_cli_parent_fence_rechecks_parent_after_setting_signal(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = 0
+        with mock.patch.object(JOIN.os, "getppid", return_value=456), \
+             mock.patch.object(JOIN.ctypes, "CDLL", return_value=libc):
+            with self.assertRaises(SystemExit) as stopped:
+                JOIN._bind_cli_to_direct_parent(123)
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(libc.prctl.call_args.args[:2], (1, signal.SIGTERM))
+
+    def test_cli_refuses_parentless_join_on_non_linux_platform(self):
+        with mock.patch.object(JOIN.sys, "platform", "darwin"):
+            with self.assertRaisesRegex(OSError, "direct-parent-death-guard-unsupported"):
+                JOIN._bind_cli_to_direct_parent(123)
+
+    @unittest.skipUnless(sys.platform == "linux", "PR_SET_PDEATHSIG is Linux-specific")
+    def test_cli_exits_when_its_direct_result_consumer_dies(self):
+        self.jobs.write_text(row("open", "att-a", "att-parent", "a"), encoding="utf-8")
+        join_command = [
+            sys.executable, str(HERE / "dispatch_completion_join.py"),
+            "--jobs", str(self.jobs), "--parent-attempt-id", "att-parent",
+            "--interval", "0.02", "--timeout", "60",
+        ]
+        parent_script = (
+            "import subprocess,sys,time\n"
+            "child=subprocess.Popen(%r,stdin=subprocess.DEVNULL,"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+            "print(child.pid,flush=True)\n"
+            "time.sleep(.4)\n"
+        ) % join_command
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        child_pid = None
+        try:
+            line = parent.stdout.readline()
+            self.assertTrue(line.strip(), "parent did not publish the join pid")
+            child_pid = int(line.strip())
+            parent_status = parent.wait(timeout=3)
+            self.assertEqual(parent_status, 0, parent.stderr.read())
+            parent.stdout.close()
+            parent.stderr.close()
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    stat_line = Path(f"/proc/{child_pid}/stat").read_text()
+                    state = stat_line.rsplit(") ", 1)[1][0]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                time.sleep(.02)
+            else:
+                self.fail("join remained live after its direct parent exited")
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=3)
+            if child_pid is not None:
+                try:
+                    stat_line = Path(f"/proc/{child_pid}/stat").read_text()
+                    if stat_line.rsplit(") ", 1)[1][0] != "Z":
+                        os.kill(child_pid, signal.SIGKILL)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
 
     def test_a_finished_owner_closes_only_the_chain_successors_it_never_started(self):
         # BC rt-96bab699: a correction stopped a serial chain, the owner reported BLOCKED, and the

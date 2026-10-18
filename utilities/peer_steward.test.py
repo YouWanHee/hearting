@@ -3765,6 +3765,85 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                             {"harness": "codex", "session_id": "sid-fixture"}, {})
         return store, duty
 
+    def test_concurrent_recovery_entry_is_single_and_holder_exit_releases_lock(self):
+        release = self.tmp_root / "release-reconcile"
+        first_marker = self.tmp_root / "first-entered"
+        second_marker = self.tmp_root / "second-entered"
+        third_marker = self.tmp_root / "third-entered"
+        child_pid_file = self.tmp_root / "inherited-child.pid"
+        script = (
+            "import importlib.util,os,subprocess,sys,time\n"
+            "from pathlib import Path\n"
+            "spec=importlib.util.spec_from_file_location('peer_steward_test',%r)\n"
+            "m=importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name]=m\n"
+            "spec.loader.exec_module(m)\n"
+            "def reconcile(_store, **_kwargs):\n"
+            "    Path(os.environ['RECONCILE_MARKER']).write_text('entered')\n"
+            "    child_file=os.environ.get('RECONCILE_CHILD_PID')\n"
+            "    if child_file:\n"
+            "        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "close_fds=False,start_new_session=True)\n"
+            "        Path(child_file).write_text(str(child.pid))\n"
+            "    release=os.environ.get('RECONCILE_RELEASE')\n"
+            "    deadline=time.monotonic()+5\n"
+            "    while release and not Path(release).exists() and time.monotonic()<deadline:\n"
+            "        time.sleep(.01)\n"
+            "m._reconcile_external_obligations=reconcile\n"
+            "m._runner_duties=lambda _store: []\n"
+            "raise SystemExit(m.main(['__ensure-obligations']))\n"
+        ) % str(_HERE / "peer-steward.py")
+
+        def env_for(marker, *, held=False, child=False):
+            env = dict(os.environ)
+            env["RECONCILE_MARKER"] = str(marker)
+            env["RECONCILE_RELEASE"] = str(release) if held else ""
+            env["RECONCILE_CHILD_PID"] = str(child_pid_file) if child else ""
+            return env
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c", script], env=env_for(first_marker, held=True, child=True),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not first_marker.exists():
+                time.sleep(.01)
+            self.assertTrue(first_marker.exists(), "first recovery call never entered")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not child_pid_file.exists():
+                time.sleep(.01)
+            child_pid = int(child_pid_file.read_text())
+
+            second = subprocess.run(
+                [sys.executable, "-c", script], env=env_for(second_marker),
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertFalse(second_marker.exists(), "contending caller ran recovery body")
+
+            holder.terminate()
+            holder.wait(timeout=3)
+            third = subprocess.run(
+                [sys.executable, "-c", script], env=env_for(third_marker),
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
+            )
+            self.assertEqual(third.returncode, 0, third.stderr)
+            self.assertTrue(third_marker.exists(), "recovery lock stayed held after owner exit")
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=3)
+            if child_pid is None and child_pid_file.exists():
+                child_pid = int(child_pid_file.read_text())
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
     def test_existing_lifecycle_callback_reconnects_through_one_runner(self):
         self.pending_message()
         with mock.patch.object(peer_steward, "_watch_reconciliation_needed", return_value=False), \

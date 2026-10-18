@@ -30,6 +30,7 @@ from dispatch_session_sweep import (  # noqa: E402
     activate,
     ack_delivered,
     delivery_context,
+    request_obligation_reconciliation,
     sweep_deliver,
 )
 
@@ -91,18 +92,8 @@ def main() -> int:
     # The same activation also reconnects retained registered-batch observers:
     # lock-guarded, completed duties are never replayed and the original
     # assignment is never relaunched. Fail-open like every other path here.
-    try:
-        from dispatch_batch_obligations import ensure_observers
-    except Exception:
-        ensure_observers = None
-    if ensure_observers is not None and _event_name(payload) != "SessionStart":
-        for root in seen:
-            try:
-                jobs_log = Path(root) / "jobs.log"
-                if jobs_log.is_file():
-                    ensure_observers(jobs_log)
-            except Exception:  # noqa: BLE001
-                continue
+    if _event_name(payload) != "SessionStart":
+        request_obligation_reconciliation()
     context = delivery_context(batches)
     if not context:
         return 0

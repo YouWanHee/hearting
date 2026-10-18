@@ -8,20 +8,27 @@ typed harvest, and emits one bounded JSON receipt for the session supervisor.
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Capture before importing the join machinery so an early parent exit is
+# detectable after PR_SET_PDEATHSIG is installed at the CLI entry point.
+_CLI_PARENT_PID = os.getppid() if __name__ == "__main__" else None
+
 import argparse
 import base64
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 import time
-import sys
 from typing import Callable
 
 
@@ -144,6 +151,22 @@ class JoinContractError(RuntimeError):
 
 class CompletionDeferred(JoinContractError):
     """Cancellation cleanup is retained by the existing execution observer."""
+
+
+def _bind_cli_to_direct_parent(expected_parent: int | None = None) -> None:
+    """Make only this result-consuming CLI die with its direct OS parent."""
+    if sys.platform != "linux":
+        raise OSError("direct-parent-death-guard-unsupported")
+    if expected_parent is None:
+        expected_parent = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Linux PR_SET_PDEATHSIG. Set it before opening the registry, then recheck
+    # PPID to close the parent-exits-between-check-and-prctl race.
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    if os.getppid() != expected_parent:
+        raise SystemExit(0)
 
 
 def canonical_delivery_receipt(receipt: dict[str, object]) -> dict[str, object]:
@@ -4600,4 +4623,10 @@ def reconcile_finished_children(
 
 
 if __name__ == "__main__":
+    try:
+        _bind_cli_to_direct_parent(_CLI_PARENT_PID)
+    except OSError:
+        # Running without the parent lifetime fence would leave an unowned
+        # result waiter. Fail before opening jobs.log instead.
+        raise SystemExit(70)
     raise SystemExit(main())

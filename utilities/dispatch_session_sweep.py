@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -31,6 +32,22 @@ import dispatch_pending_delivery as pending_delivery  # noqa: E402
 
 SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
+
+
+def request_obligation_reconciliation() -> None:
+    """Ask the shared recovery entry to reconnect observers without holding a hook."""
+    try:
+        script = Path(__file__).resolve().with_name("peer-steward.py")
+        subprocess.Popen(
+            [sys.executable, str(script), "__ensure-obligations"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def _append_self_instrumentation(
@@ -193,11 +210,7 @@ def _reconcile_canonical_dispatch_state(root: Path) -> None:
         reconcile_pending_delivery(jobs)
     except Exception:
         pass
-    try:
-        from dispatch_batch_obligations import ensure_observers
-        ensure_observers()
-    except Exception:
-        pass
+    request_obligation_reconciliation()
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:
