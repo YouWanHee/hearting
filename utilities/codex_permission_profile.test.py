@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -125,8 +126,14 @@ class PermissionProfileTest(unittest.TestCase):
         self.assertEqual(config["default_permissions"], profiles.PROFILE_NAME)
         body = config["permissions"][profiles.PROFILE_NAME]
         self.assertEqual(body["extends"], ":workspace")
-        self.assertEqual({path for path, access in body["filesystem"].items() if access == "write"}, set(map(str, self.roots)))
-        self.assertEqual(body["filesystem"][str(self.repo / ".git")], "read")
+        fs = body["filesystem"]
+        self.assertEqual({path for path, access in fs.items() if access == "write"},
+                         {str(self.repo / ".git"), *map(str, self.roots)})
+        for name in ("config", "hooks", "info", "HEAD", "index", "worktrees"):
+            self.assertEqual(fs[str(self.repo / ".git" / name)], "read")
+        for name in ("config.worktree", "modules", "MERGE_HEAD", "sequencer"):
+            self.assertNotIn(str(self.repo / ".git" / name), fs)
+        self.assertEqual(fs[str(self.repo / ".git/worktrees/worktree")], "write")
         with mock.patch.object(profiles, "named_profiles_available", return_value=True):
             self.assertIsNone(profiles.commit_profile_config(str(self.wt), [], "workspace-write", False))
             self.assertIsNone(profiles.commit_profile_config(str(self.wt), list(map(str, self.roots)), "danger-full-access", False))
@@ -142,6 +149,16 @@ class PermissionProfileTest(unittest.TestCase):
             self.assertEqual(flag, "-c")
             restored.update(tomllib.loads(value))
         self.assertEqual(restored, config)
+
+    def test_existing_optional_metadata_is_carved_out_without_legacy_root_grant(self):
+        common = self.repo / ".git"
+        (common / "config.worktree").write_text("[core]\n")
+        (common / "modules").mkdir()
+        fs = self.profile()["permissions"][profiles.PROFILE_NAME]["filesystem"]
+        self.assertEqual(fs[str(common / "config.worktree")], "read")
+        self.assertEqual(fs[str(common / "modules")], "read")
+        self.assertNotIn(str(common / "MERGE_HEAD"), fs)
+        self.assertNotIn(str(common), set(map(str, self.roots)))
 
     def test_native_commit_and_protected_paths(self):
         require_native_runtime(self)
@@ -173,6 +190,122 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
         self.assertEqual((self.repo / "source.txt").read_text(), "base\n")
         self.assertEqual((self.wt / ".codex/config.toml").read_text(), "# protected\n")
         self.assertFalse((self.wt / ".dispatch").exists())
+
+    def test_native_packed_refs_and_sequencer_cleanup(self):
+        require_native_runtime(self)
+        self.assertEqual(self.repo.parent, self.wt.parent)
+        self.assert_outside_native_temp_roots(self.repo / ".git")
+        common = self.repo / ".git"
+        start = self.git("symbolic-ref", "--short", "HEAD")
+        for branch in ("victim", "victim2"):
+            self.git("branch", branch)
+        self.git("tag", "victim-tag")
+        self.git("switch", "-qc", "pickme")
+        (self.repo / "picked.txt").write_text("picked\n")
+        self.git("add", "picked.txt")
+        subprocess.run(["git", "commit", "-qm", "picked"], cwd=self.repo,
+                       env={**self.env, "GIT_AUTHOR_DATE": "2001-01-01T00:00:00Z"}, check=True)
+        self.git("switch", "-q", start)
+        self.git("switch", "-qc", "conflictme")
+        (self.repo / "source.txt").write_text("conflict\n")
+        self.git("add", "source.txt")
+        self.git("commit", "-qm", "conflict")
+        self.git("switch", "-q", start)
+        self.git("worktree", "add", "-qb", "sibling", str(self.base / "sibling"))
+        self.git("pack-refs", "--all")
+        (self.wt / ".codex").mkdir()
+        (self.wt / ".codex/config.toml").write_text("# protected\n")
+        before = {name: (common / name).read_bytes() for name in ("config", "HEAD", "index")}
+        before["sibling_HEAD"] = (common / "worktrees/sibling/HEAD").read_bytes()
+        probe = self.base / "packed_probe.py"
+        probe.write_text('''import os, subprocess, sys, time
+from pathlib import Path
+wt, repo = map(Path, sys.argv[1:3])
+common = repo / '.git'
+def git(*args, code=0):
+    p = subprocess.run(['git', *args], cwd=wt, capture_output=True, text=True)
+    assert p.returncode == code, (args, p.returncode, p.stdout, p.stderr)
+    assert 'packed-refs.lock' not in p.stderr, (args, p.stderr)
+    return p.stdout.strip()
+def marker(name):
+    p = Path(git('rev-parse', '--git-path', name))
+    return (p if p.is_absolute() else wt / p).exists()
+def blocked(fn):
+    try: fn()
+    except OSError: return
+    raise AssertionError('protected mutation succeeded')
+git('pack-refs', '--all')
+git('branch', '-D', 'victim')
+git('tag', '-d', 'victim-tag')
+git('update-ref', '-d', 'refs/heads/victim2')
+git('cherry-pick', 'pickme')
+assert not marker('CHERRY_PICK_HEAD')
+(wt/'after.txt').write_text('after pick\\n')
+git('add', 'after.txt')
+git('commit', '-qm', 'after pick')
+assert not git('log', '-1', '--format=%aI').startswith('2001-')
+git('revert', '--no-edit', 'HEAD~1')
+assert not marker('REVERT_HEAD')
+(wt/'source.txt').write_text('worker side\\n')
+git('add', 'source.txt')
+git('commit', '-qm', 'worker side')
+git('cherry-pick', 'conflictme', code=1)
+assert marker('CHERRY_PICK_HEAD')
+(wt/'source.txt').write_text('resolved\\n')
+git('add', 'source.txt')
+git('-c', 'core.editor=true', 'cherry-pick', '--continue')
+assert not marker('CHERRY_PICK_HEAD')
+(wt/'final.txt').write_text('final\\n')
+git('add', 'final.txt')
+git('commit', '-qm', 'later ordinary commit')
+assert not git('log', '-1', '--format=%aI').startswith('2001-')
+blocked(lambda: (common/'config').write_text('unsafe'))
+blocked(lambda: (common/'config').unlink())
+(common/'config.new').write_text('unsafe')
+blocked(lambda: os.replace(common/'config.new', common/'config'))
+(common/'config.new').unlink()
+blocked(lambda: (common/'hooks/pre-commit').write_text('unsafe'))
+blocked(lambda: os.rename(common/'hooks', common/'hooks.moved'))
+blocked(lambda: (common/'info/exclude').write_text('unsafe'))
+blocked(lambda: (common/'HEAD').write_text('unsafe'))
+blocked(lambda: (common/'index').write_bytes(b'unsafe'))
+blocked(lambda: (common/'worktrees/sibling/HEAD').write_text('unsafe'))
+blocked(lambda: (common/'worktrees/sibling/config.worktree').write_text('unsafe'))
+blocked(lambda: (common/'worktrees/evil').mkdir())
+blocked(lambda: (repo/'source.txt').write_text('unsafe'))
+blocked(lambda: (wt/'.codex/config.toml').write_text('unsafe'))
+(wt/'probe-ready').write_text('ready')
+time.sleep(4)
+''')
+        proc = subprocess.Popen(["codex", "sandbox", "-P", profiles.PROFILE_NAME,
+            "-C", str(self.wt), *profiles.config_arguments(self.profile()), "--",
+            "python3", str(probe), str(self.wt), str(self.repo)], env=self.env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 45
+            while not (self.wt / "probe-ready").exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((self.wt / "probe-ready").exists(), "sandbox exited before probe-ready")
+            self.assertEqual(self.git("status", "--porcelain"), "")
+            self.assertEqual(self.git("status", "--porcelain", cwd=self.base / "sibling"), "")
+            self.assertIsNone(proc.poll(), "sandbox exited before concurrent status checks completed")
+            stdout, stderr = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0, stdout + stderr)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        for name, original in before.items():
+            path = common / ("worktrees/sibling/HEAD" if name == "sibling_HEAD" else name)
+            self.assertEqual(path.read_bytes(), original, name)
+        for ref in ("refs/heads/victim", "refs/heads/victim2", "refs/tags/victim-tag"):
+            self.assertNotIn(ref, self.git("for-each-ref", "--format=%(refname)"))
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=self.wt), "later ordinary commit")
+        self.assertEqual((self.repo / "source.txt").read_text(), "base\n")
+        self.assertEqual((self.wt / ".codex/config.toml").read_text(), "# protected\n")
+        for path in (common, *(common / name for name in ("refs", "objects", "logs", "worktrees/worktree"))):
+            self.assertFalse({".agents", ".aws", ".codex", ".git"} & {p.name for p in path.iterdir()})
+        self.assertFalse((common / "packed-refs.lock").exists())
 
     def test_native_app_server_uses_same_profile_without_provider(self):
         require_native_runtime(self)

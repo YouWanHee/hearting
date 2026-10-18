@@ -497,7 +497,12 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         self.assertTrue(profile["permissions"][codex_permission_profile.PROFILE_NAME]
                         ["network"]["enabled"])
         profile_filesystem = profile["permissions"][codex_permission_profile.PROFILE_NAME]["filesystem"]
-        self.assertEqual(profile_filesystem[str((primary_repo / ".git").resolve())], "read")
+        # A linked worktree may write the common Git dir so ref cleanup can take
+        # packed-refs.lock; shared config, hooks and primary metadata stay read-only.
+        primary_git = (primary_repo / ".git").resolve()
+        self.assertEqual(profile_filesystem[str(primary_git)], "write")
+        for name in ("config", "hooks", "HEAD", "index"):
+            self.assertEqual(profile_filesystem[str(primary_git / name)], "read")
         self.assertTrue(all(profile_filesystem[path] == "write"
                             for path in owner_args.writable_root))
 

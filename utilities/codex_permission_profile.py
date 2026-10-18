@@ -1,6 +1,6 @@
 """Project existing Git commit grants into native Codex permissions.
 
-Linked worktrees project their existing narrow grant; a primary checkout gets
+Linked worktrees project their named-profile common Git grant; a primary checkout gets
 a commit-only `.git` grant for the same callers (`primary_commit`). No user
 config is written. Runtimes without named profiles keep their existing
 legacy sandbox projection; discovery never becomes a new launch gate.
@@ -30,6 +30,9 @@ def named_profiles_available() -> bool:
 # and a placeholder `config.worktree` or `info` breaks git.
 _PRIMARY_GIT_PROTECTED = ("config", "hooks")
 _PRIMARY_GIT_PROTECTED_IF_PRESENT = ("config.worktree", "info")
+_LINKED_GIT_PROTECTED_IF_PRESENT = (
+    "info", "config.worktree", "modules", "HEAD", "index", "worktrees",
+)
 
 
 def commit_profile_config(worktree: str, writable_roots: list[str],
@@ -66,7 +69,13 @@ def commit_profile_config(worktree: str, writable_roots: list[str],
             return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return _profile({str(common): "read", **{root: "write" for root in sorted(roots)}}, network)
+    return _profile({
+        str(common): "write",
+        **{str(common / name): "read" for name in _PRIMARY_GIT_PROTECTED},
+        **{str(common / name): "read" for name in _LINKED_GIT_PROTECTED_IF_PRESENT
+           if (common / name).exists()},
+        **{root: "write" for root in sorted(roots)},
+    }, network)
 
 
 def _profile(filesystem: dict, network: bool) -> dict:
