@@ -34,6 +34,7 @@ import os
 import re
 import stat
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -815,6 +816,7 @@ class _Context:
         self.delivery_records: dict[str, dict[str, tuple]] = {}
         self.delivery_unknown_global = False
         self.delivery_groups: set[str] = set()
+        self.candidate_delivery_baseline: _CandidateDeliveryBaseline | None = None
         self.by_key: dict[str, set[str]] = {}
         self.legacy: dict[tuple, dict[str, set[str]]] = {}
 
@@ -965,7 +967,7 @@ def _parse_metadata(value: str) -> dict[str, str]:
     return parse_registry_metadata(value)
 
 
-def _delivery_record_relation(path: Path, related: set[str]) -> str:
+def _delivery_record_relation(path: Path, related: set[str] | frozenset[str]) -> str:
     """related | unrelated | unknown for a changed delivery record."""
     from dispatch_pending_delivery import PendingDeliveryError, _validate_record
     for attempt in range(2):
@@ -1119,25 +1121,83 @@ def _late_delivery_change(ctx: _Context, attempt: str, deadline: float) -> str |
     return None
 
 
-def _late_candidate_delivery_change(ctx: _Context, attempt: str,
-                                   deadline: float) -> str | None:
-    """Check candidate relation for changed files and memberships before final admission."""
+@dataclass(frozen=True)
+class _CandidateDeliveryBaseline:
+    attempt: str
+    related: frozenset[str]
+    related_file_stamps: tuple[tuple[Path, object], ...]
+    baseline_files: tuple[tuple[Path, object], ...]
+    baseline_file_paths: frozenset[Path]
+    group_stamps: tuple[tuple[Path, object], ...]
+    group_names: frozenset[str]
+    base: Path
+    base_stamp: object
+
+
+def _prepare_candidate_delivery_baseline(ctx: _Context, attempt: str,
+                                         deadline: float) -> _CandidateDeliveryBaseline | None:
+    """Prepare immutable lookup sets outside jobs.log.lock for final freshness."""
     related = _candidate_related_attempts(ctx.root, ctx.snapshot, attempt)
-    baseline_files = {path for path in ctx.discovery_stamps
-                      if isinstance(path, Path) and path.suffix == ".json"}
+    if time.monotonic() >= deadline:
+        return None
+    related_file_stamps = []
     for identity in related:
         for raw_path, fact in ctx.delivery_records.get(identity, {}).items():
             if time.monotonic() >= deadline:
-                return "unknown"
-            if _stamp(Path(raw_path)) != fact[-1]:
-                return "changed"
+                return None
+            related_file_stamps.append((Path(raw_path), fact[-1]))
+    baseline_files = []
+    for path, stamp in ctx.discovery_stamps.items():
+        if time.monotonic() >= deadline:
+            return None
+        if isinstance(path, Path) and path.suffix == ".json":
+            baseline_files.append((path, stamp))
+    group_stamps = tuple(ctx.group_stamps.items())
+    if time.monotonic() >= deadline:
+        return None
+    base = ctx.root / "pending-delivery"
+    return _CandidateDeliveryBaseline(
+        attempt=attempt,
+        related=frozenset(related),
+        related_file_stamps=tuple(related_file_stamps),
+        baseline_files=tuple(baseline_files),
+        baseline_file_paths=frozenset(path for path, _stamp_value in baseline_files),
+        group_stamps=group_stamps,
+        group_names=frozenset(ctx.delivery_groups),
+        base=base,
+        base_stamp=ctx.discovery_stamps.get(base),
+    )
 
-    # Reuse discovery's bounded file set for metadata checks. Only changed
-    # payloads are parsed, and this pass stays outside jobs.log.lock.
-    for path in baseline_files:
+
+def _late_candidate_delivery_change(ctx: _Context, attempt: str,
+                                   deadline: float) -> str | None:
+    """Compare prepared delivery metadata, parsing only changed/new records.
+
+    _detach calls this once outside the registry lock to reject known changes,
+    then again inside final admission immediately before journal/rename. The
+    immutable baseline is prepared by the first call and reused by the second.
+    """
+    baseline = ctx.candidate_delivery_baseline
+    if baseline is None or baseline.attempt != attempt:
+        baseline = _prepare_candidate_delivery_baseline(ctx, attempt, deadline)
+        if baseline is None:
+            return "unknown"
+        ctx.candidate_delivery_baseline = baseline
+    related = baseline.related
+    baseline_files = baseline.baseline_file_paths
+
+    # Candidate-related records have already been indexed. A changed record
+    # stays fail-closed even if a rewrite would remove its previous relation.
+    for path, before in baseline.related_file_stamps:
         if time.monotonic() >= deadline:
             return "unknown"
-        before = ctx.discovery_stamps.get(path)
+        if _stamp(path) != before:
+            return "changed"
+
+    # Stat the bounded discovery set and parse only changed payloads.
+    for path, before in baseline.baseline_files:
+        if time.monotonic() >= deadline:
+            return "unknown"
         after = _stamp(path)
         if after == before:
             continue
@@ -1152,7 +1212,7 @@ def _late_candidate_delivery_change(ctx: _Context, attempt: str,
     # A new record in any known group changes that group's membership stamp.
     # Read only additions, so ongoing unrelated writers do not require a quiet
     # global generation and existing large payloads stay outside this lock.
-    for group, before in ctx.group_stamps.items():
+    for group, before in baseline.group_stamps:
         if time.monotonic() >= deadline:
             return "unknown"
         after = _stamp(group)
@@ -1177,24 +1237,25 @@ def _late_candidate_delivery_change(ctx: _Context, attempt: str,
             if relation == "unknown":
                 return "unknown"
 
-    base = ctx.root / "pending-delivery"
-    if _stamp(base) != ctx.discovery_stamps.get(base):
-        groups = _bounded_directory_entries(base, deadline)
+    if _stamp(baseline.base) != baseline.base_stamp:
+        groups = _bounded_directory_entries(baseline.base, deadline)
         if groups is None:
-            if _stamp(base) is None:
+            if _stamp(baseline.base) is None:
                 groups = []
             else:
                 return "unknown"
-        elif _stamp(base) is None:
+        elif _stamp(baseline.base) is None:
             groups = []
         for group in groups:
-            if group.name in ctx.delivery_groups:
+            if group.name in baseline.group_names:
                 continue
             if time.monotonic() >= deadline:
                 return "unknown"
             if group.is_symlink() or not group.is_dir(follow_symlinks=False):
                 return "unknown"
-            entries = _bounded_directory_entries(Path(group.path), deadline)
+            group_path = Path(group.path)
+            group_stamp = _stamp(group_path)
+            entries = _bounded_directory_entries(group_path, deadline)
             if entries is None:
                 return "unknown"
             for entry in entries:
@@ -1207,6 +1268,8 @@ def _late_candidate_delivery_change(ctx: _Context, attempt: str,
                     return "changed"
                 if relation == "unknown":
                     return "unknown"
+            if _stamp(group_path) != group_stamp:
+                return "unknown"
     return None
 
 
@@ -1599,7 +1662,6 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
         return "late-evidence-unreadable"
     if not _fresh(watched):
         return "late-evidence-changed"
-    final_deadline = min(deadline, time.monotonic() + 0.15)
     # First validate the registry delta and release jobs.log.lock before the
     # broad delivery generation pass. That pass can inspect changed unrelated
     # records without extending the writers' critical section.
@@ -1607,11 +1669,12 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
     with _registry_lock_until(ctx.jobs, deadline) as admitted:
         if admitted is False:
             return "registry-lock-busy"
+        initial_deadline = min(deadline, time.monotonic() + 0.15)
         if not _fresh(watched):
             return "late-evidence-changed"
         delta = _registry_delta_is_candidate_change(
             fresh, ctx.jobs, key, attempt, current.workers_real,
-            current.by_key, final_deadline)
+            current.by_key, initial_deadline)
         if delta is True:
             return "late-evidence-changed"
         if delta is None:
@@ -1634,10 +1697,12 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
                 else "late-evidence-changed")
 
     # Reacquire after both outside-lock delivery checks and revalidate registry
-    # appends before touching the pinned home.
+    # appends before touching the pinned home. Start the short critical window
+    # at admission so outside preparation cannot consume it.
     with _registry_lock_until(ctx.jobs, deadline) as admitted:
         if admitted is False:
             return "registry-lock-busy"
+        final_deadline = min(deadline, time.monotonic() + 0.15)
         if not _fresh(watched):
             return "late-evidence-changed"
         delta = _registry_delta_is_candidate_change(
@@ -1688,6 +1753,10 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
                 os.close(leaf)
             if not _fresh(watched):
                 return "late-evidence-changed"
+            late_delivery = _late_candidate_delivery_change(current, attempt, final_deadline)
+            if late_delivery is not None:
+                return ("late-evidence-unreadable" if late_delivery == "unknown"
+                        else "late-evidence-changed")
             name = f"{key}.{ctx.now_ns}"
             journal = json.dumps({"schema": SCHEMA, "key": key, "name": name, "identity": ident},
                                  sort_keys=True).encode()

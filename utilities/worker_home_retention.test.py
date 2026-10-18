@@ -977,6 +977,49 @@ class Liveness(Fixture):
 
 
 class Races(Fixture):
+    def _assert_final_admission_write_keeps_home(self, home, write_record):
+        admitted, written = threading.Event(), threading.Event()
+        errors = []
+
+        def writer():
+            if not admitted.wait(5):
+                errors.append("second registry admission barrier timed out")
+                written.set()
+                return
+            try:
+                write_record()
+            except Exception as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                written.set()
+
+        real_admission = R._registry_lock_until
+        admission_count = []
+
+        @contextlib.contextmanager
+        def final_admission(jobs, deadline):
+            admission_count.append(None)
+            with real_admission(jobs, deadline) as acquired:
+                if len(admission_count) == 2 and acquired is not False:
+                    admitted.set()
+                    if not written.wait(5):
+                        raise AssertionError("delivery writer did not finish before final body")
+                yield acquired
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            with mock.patch.object(R, "_registry_lock_until", final_admission):
+                result = self.sweep(8)
+        finally:
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(admission_count), 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
+        self.assertTrue(home.is_dir())
+
     def two(self):
         return self.add("att-x1"), self.add("att-x2")
 
@@ -1494,6 +1537,35 @@ class Races(Fixture):
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
+
+    def test_second_registry_admission_catches_new_candidate_file_in_known_group(self):
+        home = self.add("att-final-admission-new-file")
+        group = self.root / "pending-delivery" / ("c" * 64)
+        self.delivery_record(group / ("delivery-" + "4" * 32 + ".json"),
+                             "att-unrelated", "att-parent", state="acked")
+        self.sweep(0)
+        self._assert_final_admission_write_keeps_home(
+            home, lambda: self.delivery_record(
+                group / ("delivery-" + "5" * 32 + ".json"),
+                "att-final-admission-new-file", "att-parent", state="pending"))
+
+    def test_second_registry_admission_catches_rewritten_candidate_parent_reference(self):
+        home = self.add("att-final-admission-parent-rewrite")
+        record = self.root / "pending-delivery" / ("d" * 64) / ("delivery-" + "6" * 32 + ".json")
+        value = self.delivery_record(record, "att-unrelated", "att-parent", state="acked")
+        self.sweep(0)
+        self._assert_final_admission_write_keeps_home(home, lambda: record.write_text(json.dumps({
+            **value, "parent_attempt_id": "att-final-admission-parent-rewrite", "state": "pending",
+        }), encoding="utf-8"))
+
+    def test_second_registry_admission_catches_rewritten_candidate_attempt_reference(self):
+        home = self.add("att-final-admission-attempt-rewrite")
+        record = self.root / "pending-delivery" / ("e" * 64) / ("delivery-" + "7" * 32 + ".json")
+        value = self.delivery_record(record, "att-unrelated", "att-parent", state="acked")
+        self.sweep(0)
+        self._assert_final_admission_write_keeps_home(home, lambda: record.write_text(json.dumps({
+            **value, "attempt_ids": ["att-final-admission-attempt-rewrite"], "state": "pending",
+        }), encoding="utf-8"))
 
     def test_resolver_upgrade_preserves_the_first_identity(self):
         for through_child in (False, True):
