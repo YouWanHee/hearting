@@ -523,16 +523,21 @@ final mismatch keeps the affected release for a normal retry.
 
 Release pruning is evidence-bound. `harness update` retains every superseded
 release whose migration quiescence/final-delta proof is incomplete. The
-existing `harness update --force-prune-unproven` path applies only to an
-unproven registry-containment proof: before that deletion, the updater appends
-its non-recoverable gap to canonical `inventory/gaps.jsonl` with
-`discovered_by=forced-prune`; a failed gap commit deletes nothing. It cannot
-override current/activation retention, `_release_in_use`,
-`_succeed_dispatch_state`, or the SD-112 writer boundary/final-delta check.
-Open rows and routes whose resolved `launch_home` names the release, and live
-processes whose pinned state names it, still keep it. The flag is never
-selected automatically. Re-running the command when the requested release is
-already current still performs this checked prune pass.
+The existing `harness update --force-prune-unproven` path applies only to two
+typed proof gaps after successful carry operations: a promoted migration's
+regular-file final digest mismatch, or containment that specifically identifies
+missing candidate attempt IDs. The final proof check and deletion remain in the
+same SD-112 writer boundary. Before either permitted deletion, the updater
+appends its non-recoverable gap to canonical `inventory/gaps.jsonl` with
+`discovered_by=forced-prune`; a failed gap commit deletes nothing. The flag
+cannot override current/activation retention, `_release_in_use`, live or
+uncertain writers, unsafe or unreadable state, failed copy/archive/registry
+merge/re-anchor work, an unresolved containment root, a missing migration
+destination, or changed discovery inputs. Open rows and routes whose resolved
+`launch_home` names the release, and live processes whose pinned state names
+it, still keep it. The flag is never selected automatically. Re-running the
+command when the requested release is already current still performs this
+checked prune pass.
 
 The legacy/current collision exception covers only these observations:
 `logs/dispatch-session-sweep.log`, `logs/<slug>.heartbeat`, and
@@ -545,10 +550,12 @@ observation files differs during carry-forward, the existing canonical file
 stays in place and the legacy bytes are copied and digest-verified under
 `<state-root>/dispatch-observation-archive/`, keyed by the resolved source
 root, relative path, and content digest. The archive is outside dispatch reader
-roots. Every other conflicting file, including completion proofs, sidecars,
-registry rows, delivery records, and ACKs, keeps the release until the existing
-verification succeeds. No `logs/**` or extension-wide exception is made. Raw
-logs and their observation archives have no new time-based deletion policy.
+roots. By default, every other conflicting file, including completion proofs,
+sidecars, registry rows, delivery records, and ACKs, keeps the release. The
+explicit migration digest exception above still requires successful copy and
+re-anchor operations plus its committed gap record. No `logs/**` or
+extension-wide exception is made. Raw logs and their observation archives have
+no new time-based deletion policy.
 
 After a release directory has actually been removed, pruning also removes only
 the matching release subtree beneath the default

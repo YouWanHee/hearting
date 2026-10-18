@@ -2476,10 +2476,12 @@ def _migration_deletion_precondition(candidate: Path, environ: dict[str, str]) -
     legacy-bound writers are quiescent/reconciled -- the caller's
     `_succeed_dispatch_state(candidate)` carry-forward already did that sweep
     (M6) -- and (3) the final delta digest verifies clean here. Any
-    undecidable or failed state is a typed refusal
-    (`dispatch-state-migration-blocked-live-attempt`), never a
-    warn-and-continue; the retention floor in `_cleanup_releases` is a time
-    delay, not evidence, and plays no part in this decision."""
+    undecidable, unsafe, or unreconciled state is a typed refusal
+    (`dispatch-state-migration-blocked-live-attempt`). A regular-file digest
+    mismatch remains a distinct proof-gap result; the prune caller may proceed
+    only through the existing explicit forced-prune gap commit. The retention
+    floor in `_cleanup_releases` is a time delay, not evidence, and plays no
+    part in this decision."""
 
     if not _dispatch_migration_promoted(environ):
         return True, ""
@@ -2588,7 +2590,9 @@ def _surviving_dispatch_root(candidate: Path, environ: dict[str, str]) -> Path |
     return live_release / ".dispatch"
 
 
-def _succeed_dispatch_state(candidate: Path) -> bool:
+def _succeed_dispatch_state(
+    candidate: Path, *, return_detail: bool = False
+) -> bool | tuple[bool, bool]:
     """Carry a pruned release's `.dispatch` tree forward into the live
     release before the candidate is deleted.
 
@@ -2605,16 +2609,24 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
     merged row-wise with terminal precedence so a carried snapshot can
     never revert a live terminal row to open.
 
-    Returns False if any file failed to copy, so the caller can leave the
-    candidate release in place instead of rmtree-ing state that was never
-    fully carried forward (review Q-6/P-3).
+    The normal result stays a conservative boolean: any failed carry step or
+    regular-file content mismatch returns False. The prune boundary requests
+    `return_detail=True` to distinguish those cases as
+    `(carry_operations_succeeded, content_matches)`. Only the separate final
+    migration-delta check can authorize a mismatch, and only through its
+    existing explicit forced-prune gap record.
     """
+
+    def result(carry_ok: bool, content_matches: bool = True) -> bool | tuple[bool, bool]:
+        if return_detail:
+            return carry_ok, content_matches
+        return carry_ok and content_matches
 
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
-        return True
+        return result(True)
     if _dispatch_tree_has_unsafe_entries(stale_dispatch):
-        return False
+        return result(False)
     live_dispatch = _surviving_dispatch_root(candidate, os.environ)
     if live_dispatch is None:
         # base parity (C47-9): when `candidate` is itself the current live
@@ -2626,32 +2638,43 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
         if not _dispatch_migration_promoted(os.environ):
             try:
                 if current_path().resolve(strict=True) == candidate:
-                    return True
+                    return result(True)
             except OSError:
                 pass
-        return False
+        return result(False)
     touched_dirs: set[Path] = set()
     ok = True
+    content_matches = True
     for source in stale_dispatch.rglob("*"):
         if not source.is_file():
             continue
         relative = source.relative_to(stale_dispatch)
         if relative.as_posix() in _REGISTRY_CARRY_NAMES:
             continue
+        if (source.is_symlink() or _path_has_symlink_from(source, stale_dispatch)
+                or not source.is_file()):
+            ok = False
+            continue
         destination = live_dispatch / relative
         if destination.exists():
-            if source.name.endswith(".attempt.json"):
-                if (_path_has_symlink_from(destination, live_dispatch)
-                        or destination.is_symlink() or not destination.is_file()):
-                    ok = False
-                else:
-                    touched_dirs.add(destination.parent)
+            if (_path_has_symlink_from(destination, live_dispatch)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            elif source.name.endswith(".attempt.json"):
+                touched_dirs.add(destination.parent)
             else:
                 try:
                     if not _dispatch_file_matches(
                         source, destination, stale_dispatch, live_dispatch, relative
                     ):
-                        ok = False
+                        # A failed observation archive is an actual carry
+                        # failure. Other regular-file mismatches are kept
+                        # separate for the final migration proof and its
+                        # existing explicit gap exception.
+                        if _dispatch_observation_file(relative):
+                            ok = False
+                        else:
+                            content_matches = False
                 except OSError:
                     ok = False
             continue
@@ -2696,14 +2719,26 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
         relative = source.relative_to(stale_dispatch)
         if relative.as_posix() in _REGISTRY_CARRY_NAMES:
             continue
+        destination = live_dispatch / relative
+        if (source.is_symlink() or _path_has_symlink_from(source, stale_dispatch)
+                or not source.is_file()
+                or _path_has_symlink_from(destination, live_dispatch)
+                or destination.is_symlink() or not destination.is_file()):
+            ok = False
+            continue
         try:
             if not _dispatch_file_matches(
-                source, live_dispatch / relative, stale_dispatch, live_dispatch, relative
+                source, destination, stale_dispatch, live_dispatch, relative
             ):
-                ok = False
+                if _dispatch_observation_file(relative):
+                    ok = False
+                else:
+                    content_matches = False
         except OSError:
             ok = False
-    return ok
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        ok = False
+    return result(ok, content_matches)
 
 
 def _stable_registry_snapshot(environ: dict[str, str]) -> list[dict]:
@@ -3842,22 +3877,49 @@ def _prune_release_under_writer_boundary(
         # Merge helpers take `_registry_lock()` internally. Its same-thread
         # reentrancy reuses this boundary's exact descriptors; every other
         # normal admission waits on the underlying flock.
-        if not _succeed_dispatch_state(candidate):
+        carry_result = _succeed_dispatch_state(candidate, return_detail=True)
+        if isinstance(carry_result, tuple) and len(carry_result) == 2:
+            carry_ok, content_matches = carry_result
+        else:
+            # Keep test seams and compatible wrappers that return the normal
+            # boolean conservative result working as before.
+            carry_ok, content_matches = bool(carry_result), True
+        if not carry_ok:
+            return False, "dispatch-state-carry-forward-incomplete"
+        if not content_matches and not force_prune_unproven:
             return False, "dispatch-state-carry-forward-incomplete"
 
-        # SD-112 source quiescence and final delta are not force-prunable: an
-        # unknown or late source byte stays in its release for retry.
+        # SD-112 source quiescence and final delta stay inside this same writer
+        # boundary. Only the exact regular-file digest proof gap can use the
+        # existing forced-prune record; unsafe, missing, unreadable, copy,
+        # registry, and re-anchor failures have already refused above or
+        # remain typed refusals here.
         migration_ok, migration_reason = _migration_deletion_precondition(candidate, environ)
+        unproven_reasons = []
         if not migration_ok:
-            return False, migration_reason
+            if (not force_prune_unproven
+                    or migration_reason
+                    != "dispatch-state-migration-blocked-live-attempt:delta-digest-mismatch"):
+                return False, migration_reason
+            unproven_reasons.append(migration_reason)
+        elif not content_matches:
+            # A mismatch outside the promoted migration delta proof is not
+            # force-overridable, even when another retention proof is missing.
+            return False, "dispatch-state-carry-forward-incomplete"
 
         containment_ok, containment_reason = _retention_containment_precondition(
             candidate, environ
         )
         if not containment_ok:
-            if not force_prune_unproven:
+            if (not force_prune_unproven
+                    or not containment_reason.startswith(
+                        "dispatch-registry-retention-unproven:missing:"
+                    )):
                 return False, containment_reason
-            if not _commit_forced_prune_gap_record(candidate, environ, containment_reason):
+            unproven_reasons.append(containment_reason)
+
+        for reason in unproven_reasons:
+            if not _commit_forced_prune_gap_record(candidate, environ, reason):
                 return False, "dispatch-registry-gap-record-commit-failed"
 
         # A route or reference may be published while the candidate's source

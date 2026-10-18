@@ -2465,6 +2465,10 @@ class RetentionContainmentGateTest(unittest.TestCase):
 
     def test_forced_prune_commits_gap_record_before_delete_and_refuses_when_commit_fails(self):
         v1, v2, v3 = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
         real = DISTRIBUTION._release_attempt_ids
 
         def broken(dispatch_root):
@@ -2478,15 +2482,63 @@ class RetentionContainmentGateTest(unittest.TestCase):
                 DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
             self.assertTrue(commit.called)
             self.assertTrue(v1.exists(), "a failed gap-record commit must refuse the delete")
+            self.assertTrue(cache.exists(), "a failed gap-record commit must keep derived cache")
 
             DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
         self.assertFalse(v1.exists(), "a successful gap-record commit must allow the forced delete")
+        self.assertFalse(cache.exists(), "derived cache follows successful source removal")
         stable_root = DISTRIBUTION.stable_state_root(os.environ)
         gaps = (stable_root / "inventory" / "gaps.jsonl").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(gaps), 1)
         row = json.loads(gaps[0])
         self.assertEqual(row["discovered_by"], "forced-prune")
         self.assertFalse(row["recoverable"])
+
+    def test_forced_prune_does_not_override_failed_sidecar_reanchor(self):
+        v1, _, _ = self._three_release_chain()
+        sidecar = (
+            v1 / ".dispatch" / "completion" / "rt-force-reanchor"
+            / "execute.att-force-reanchor.attempt.json"
+        )
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("{malformed sidecar\n", encoding="utf-8")
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+
+        with mock.patch.object(
+            DISTRIBUTION, "_commit_forced_prune_gap_record"
+        ) as commit:
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        commit.assert_not_called()
+        self.assertTrue(v1.exists(), "failed sidecar re-anchor must refuse forced deletion")
+        self.assertTrue(cache.exists(), "retained source must keep its derived cache")
+
+    def test_forced_prune_does_not_override_unreadable_containment_registry(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        real_attempt_ids = DISTRIBUTION._release_attempt_ids
+
+        def unreadable(dispatch_root):
+            if dispatch_root == v1 / ".dispatch":
+                return None
+            return real_attempt_ids(dispatch_root)
+
+        with mock.patch.object(
+            DISTRIBUTION, "_release_attempt_ids", side_effect=unreadable
+        ), mock.patch.object(
+            DISTRIBUTION, "_commit_forced_prune_gap_record"
+        ) as commit:
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        commit.assert_not_called()
+        self.assertTrue(v1.exists(), "unreadable containment proof must refuse forced deletion")
+        self.assertTrue(cache.exists(), "retained source must keep its derived cache")
 
     def test_existing_three_preconditions_are_unchanged_and_ordered_before_containment(self):
         v1, v2, v3 = self._three_release_chain()
