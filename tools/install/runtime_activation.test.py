@@ -1166,7 +1166,9 @@ class CodexIdentityConfigTest(unittest.TestCase):
                  mock.patch.object(native_context, "project_context_window", return_value=projection):
                 changes = activation._prepare_runtime_config("codex", release, None)
             self.assertTrue(changes[0]["tui_status_line_changed"])
-            parsed = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+            parsed_root = tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertIs(parsed_root["check_for_update_on_startup"], False)
+            parsed = parsed_root["tui"]
             self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
@@ -1180,6 +1182,63 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertNotIn(self.BEGIN, remaining)
+
+    def test_runtime_activation_startup_absent_true_false_dry_run_and_receipt_carry(self):
+        import native_context
+        import stat
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            tui = ('[tui]\nstatus_line = ["thread-title", "git-branch", "context-used", '
+                   '"model-with-reasoning", "five-hour-limit", "weekly-limit", "thread-id"]\n'
+                   'status_line_use_colors = true\n')
+            for label, explicit, expected in (("absent", "", False),
+                                              ("true", "check_for_update_on_startup = true\n", True),
+                                              ("false", "check_for_update_on_startup = false\n", False)):
+                with self.subTest(label=label):
+                    config = root / label / "config.toml"
+                    config.parent.mkdir()
+                    original = explicit + tui
+                    config.write_text(original, encoding="utf-8")
+                    projection = {"native_context": {"codex": {}}, "report_lines": [],
+                                  "pre_projection_exists": True,
+                                  "pre_projection_bytes": original.encode("utf-8")}
+                    with mock.patch.object(activation, "_config_path", return_value=config), \
+                         mock.patch.object(native_context, "project_context_window", return_value=projection):
+                        first = activation._prepare_runtime_config("codex", release, None)
+                    first_state = {"managed_config": {
+                        "codex_identity": first[0].get("managed_config"),
+                        "codex_tui": first[0].get("tui_record")}}
+                    parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+                    self.assertIs(parsed["check_for_update_on_startup"], expected)
+                    first_receipt = (first[0].get("managed_config") or {}).get("startup_default")
+                    self.assertEqual(bool(first_receipt), label == "absent")
+                    once = config.read_bytes()
+
+                    with mock.patch.object(activation, "_config_path", return_value=config), \
+                         mock.patch.object(native_context, "project_context_window", return_value=projection):
+                        second = activation._prepare_runtime_config("codex", release, first_state)
+                    second_receipt = (second[0].get("managed_config") or {}).get("startup_default")
+                    self.assertEqual(bool(second_receipt), label == "absent")
+                    self.assertEqual(config.read_bytes(), once)
+
+                    state = {"managed_config": {
+                        "codex_identity": second[0].get("managed_config"),
+                        "codex_tui": second[0].get("tui_record")}}
+                    before_dry_run = (config.read_bytes(), stat.S_IMODE(config.stat().st_mode),
+                                      config.stat().st_mtime_ns)
+                    with mock.patch.object(activation, "_config_path", return_value=config):
+                        activation._unmerge_codex_identity_config(state, "global", dry_run=True)
+                    self.assertEqual((config.read_bytes(), stat.S_IMODE(config.stat().st_mode),
+                                      config.stat().st_mtime_ns), before_dry_run)
+
+                    with mock.patch.object(activation, "_config_path", return_value=config):
+                        activation._unmerge_codex_identity_config(state, "global")
+                    restored = config.read_text(encoding="utf-8")
+                    self.assertEqual(restored, original)
+                    self.assertEqual((config.parent / activation.CODEX_IDENTITY_BACKUP).read_bytes(),
+                                     original.encode("utf-8"))
 
     def test_runtime_config_preparation_and_deactivation_preserve_symlink(self):
         import native_context
@@ -1206,7 +1265,9 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertTrue(config.is_symlink())
             self.assertEqual(os.readlink(config), link_target)
             applied = target.read_text(encoding="utf-8")
-            parsed = tomllib.loads(applied)["tui"]
+            parsed_root = tomllib.loads(applied)
+            self.assertIs(parsed_root["check_for_update_on_startup"], False)
+            parsed = parsed_root["tui"]
             self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, applied)
