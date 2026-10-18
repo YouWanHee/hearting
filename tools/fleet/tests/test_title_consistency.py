@@ -9,9 +9,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import config, refresh_title as rt, render, titles
+from fleet import config, herdr_projection, refresh_title as rt, render, titles
 from fleet.collectors import codex, opencode
 from fleet.model import Session
+from fleet.session_handle import current_session_subject
 from fleet.tests.test_f17_title_refresh import _ConfigHomeMixin
 
 
@@ -312,6 +313,27 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
                 self.assertEqual(render._session_name(sess), sess.title)
                 sess.runtime_name = "사용자가 정한 이름"
                 self.assertEqual(render._session_name(sess), sess.runtime_name)
+
+    def test_shared_subject_selection_reaches_fleet_and_herdr(self):
+        self.assertEqual(current_session_subject("  사용자 이름  ", "성공 제목"),
+                         "사용자 이름")
+        self.assertEqual(current_session_subject(None, "  마지막 성공 제목  "),
+                         "마지막 성공 제목")
+        self.assertEqual(current_session_subject(None, None), "")
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                session = Session(harness=harness, pid=1, session_id="subject",
+                                  runtime_name=None, title="마지막 성공 제목")
+                self.assertEqual(render._session_name(session), "마지막 성공 제목")
+                with mock.patch.object(herdr_projection, "resolve_display_inputs",
+                                       return_value={"runtime_name": "사용자 이름"}), \
+                     mock.patch.object(titles, "last_title", return_value="마지막 성공 제목"):
+                    self.assertEqual(herdr_projection.session_title(harness, "subject"),
+                                     "사용자 이름")
+                with mock.patch.object(herdr_projection, "resolve_display_inputs",
+                                       return_value={"runtime_name": None}), \
+                     mock.patch.object(titles, "last_title", return_value=None):
+                    self.assertEqual(herdr_projection.session_title(harness, "subject"), "")
 
     def test_codex_first_message_name_cannot_override_title_or_fill_gap(self):
         path = self._transcript("codex")

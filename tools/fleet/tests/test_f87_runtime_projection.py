@@ -12,7 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tools.fleet.herdr_projection import compose
-from tools.fleet.session_handle import display_name, minted_tag
+from tools.fleet import render
+from tools.fleet.session_handle import current_session_subject, minted_tag
 
 CODEX_SID = "01a0c233-96b3-7cf3-871b-7beb1fc71679"   # a rollout name must end in a uuid
 
@@ -25,7 +26,6 @@ def codex_sid(path):
 ROOT = next(parent for parent in Path(__file__).resolve().parents
             if (parent / "adapters/codex").is_dir())
 STATUSLINE = ROOT / "adapters/claude/statusline.sh"
-HELPER = ROOT / "adapters/claude/tools/fleet/session_handle.py"
 
 
 class RuntimeProjectionTest(unittest.TestCase):
@@ -102,14 +102,22 @@ class RuntimeProjectionTest(unittest.TestCase):
             os.symlink(sys.executable, interpreter)
         return str(interpreter), "_held=open(%r);" % str(rollout)
 
-    def statusline(self, root, sid, title, helper=True):
-        path = Path(self.env(root)["AGENT_HOME"]) / "tools/fleet/session_handle.py"
+    def statusline(self, root, sid, native_session_name, helper=True):
+        package = Path(self.env(root)["AGENT_HOME"]) / "tools/fleet"
+        package.mkdir(parents=True, exist_ok=True)
+        for module in ("__init__.py", "titles.py"):
+            shutil.copyfile(ROOT / "tools/fleet" / module, package / module)
+        path = package / "session_handle.py"
         if helper:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(HELPER, path)
+            shutil.copyfile(ROOT / "tools/fleet/session_handle.py", path)
         else:
             path.unlink(missing_ok=True)
-        return subprocess.run([str(STATUSLINE)], input=json.dumps({"cwd": str(root), "session_id": sid, "session_name": title}), text=True, capture_output=True, env=self.env(root))
+        return subprocess.run([str(STATUSLINE)], input=json.dumps({"cwd": str(root), "session_id": sid, "session_name": native_session_name}), text=True, capture_output=True, env=self.env(root))
+
+    def successful_title(self, root, sid, title):
+        path = root / "titles" / "claude" / (sid + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"title": title}), encoding="utf-8")
 
     def stub(self, root):
         bindir, log = root / "bin", root / "herdr.jsonl"
@@ -182,14 +190,22 @@ class RuntimeProjectionTest(unittest.TestCase):
         """F-99 — statusline shows the canonical name with zero sid8 (`CL/<sid8>`)."""
         with tempfile.TemporaryDirectory() as td:
             root, sid = Path(td), "abcdefgh-claude"
-            self.assertIn("My Task", self.statusline(root, sid, "My Task").stdout)
-            missing = self.statusline(root, sid, "My Task", helper=False)
+            self.successful_title(root, sid, "My Task")
+            native_title = "Automatic stdin title"
+            output = self.statusline(root, sid, native_title).stdout
+            self.assertIn("My Task", output)
+            self.assertNotIn(native_title, output)
+            missing = self.statusline(root, sid, native_title, helper=False)
             self.assertEqual(missing.returncode, 0)
             self.assertNotIn("My Task", missing.stdout)
+            self.assertNotIn(native_title, missing.stdout)
             self.assertNotIn("CL/abcdefgh", missing.stdout)
-            self.assertIn("A B", self.statusline(root, sid, "A\nB\x00").stdout)
-            long = self.statusline(root, sid, "가" * 100).stdout
+            self.successful_title(root, sid, "A\nB\x00")
+            self.assertIn("A B", self.statusline(root, sid, native_title).stdout)
+            self.successful_title(root, sid, "가" * 100)
+            long = self.statusline(root, sid, native_title).stdout
             self.assertNotIn("CL/abcdefgh", long)
+            self.assertNotIn(native_title, long)
             display = next(x for x in long.split(" │ ") if "가" in x)
             self.assertLess(display.count("가"), 100)
             self.assertIn("…", display)
@@ -289,15 +305,20 @@ class RuntimeProjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             for harness, sid, title in (("claude","abcdefgh-claude","Task"),("codex",CODEX_SID,"Task")):
-                expected = display_name(harness, sid, runtime_name=None, registry_name=None,
-                                        title=title, slug=None, cwd=None)
+                expected = current_session_subject(None, title)
                 self.assertEqual(expected, title)
                 if harness == "claude":
-                    self.assertIn(expected, self.statusline(root, sid, title).stdout)
+                    self.successful_title(root, sid, expected)
+                    native_title = "Automatic stdin title"
+                    statusline_output = self.statusline(root, sid, native_title).stdout
+                    self.assertIn(expected, statusline_output)
+                    self.assertNotIn(native_title, statusline_output)
                 else:
                     _, rows = self.project(root, sid, title=title)
                     metadata = next(row for row in rows if row[1] == "report-metadata")
                     self.assertEqual(metadata[-1], "[%s] codex %s" % (minted_tag(sid), title))
+                self.assertEqual(render._session_name(SimpleNamespace(
+                    runtime_name=None, title=title)), expected)
 
     def test_pane_header_order_is_number_then_steward_then_harness(self):
         """User-fixed format `[번호] (⚑) 하네스 요약` (2026-09-09; ⚑ moved before the harness
@@ -314,6 +335,16 @@ class RuntimeProjectionTest(unittest.TestCase):
         agent, title = compose("codex", "s", tag="3a", steward=True, title="가" * 80)
         self.assertEqual(agent, "[3a] ⚑ codex")
         self.assertLess(len(title), 80)
+
+    def test_marker_free_steward_lookup_skips_live_session_snapshot(self):
+        from fleet.collectors import steward
+        from tools.fleet.herdr_projection import is_steward
+
+        with unittest.mock.patch.object(steward, "read_markers", return_value={}) as read_markers, \
+             unittest.mock.patch.object(steward, "_projection_sessions") as projection_sessions:
+            self.assertFalse(is_steward("claude", "session-without-role-evidence"))
+        read_markers.assert_called_once_with()
+        projection_sessions.assert_not_called()
 
     def test_claude_display_hook_publishes_metadata_without_duplicate_session_lifecycle(self):
         """The native SessionStart integration owns lifecycle; Hearting paints metadata."""
@@ -630,11 +661,13 @@ class RuntimeProjectionTest(unittest.TestCase):
             root, sid = Path(td), "abcdefgh-claude"
             import re
             strip = lambda s: re.sub(r"\x1b\[[0-9;]*m", "", s)
-            out = strip(self.statusline(root, sid, "Real title").stdout)
+            self.successful_title(root, sid, "Real title")
+            out = strip(self.statusline(root, sid, "Automatic stdin title").stdout)
             segment = next(s for s in out.split("│") if "Real title" in s)
             self.assertEqual(segment.strip(), "Real title")   # title only, no `[46]` badge
             # A name that is only the folder is not a title: `📁 <dir>` already says it.
-            bare = strip(self.statusline(root, sid, root.name).stdout)
+            self.successful_title(root, sid, root.name)
+            bare = strip(self.statusline(root, sid, "Automatic stdin title").stdout)
             self.assertEqual(bare.count(root.name), 1)
 
     def test_sessionstart_worker_gating_and_json_contract(self):

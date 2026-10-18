@@ -620,7 +620,8 @@ class SameRepositoryRoleTest(unittest.TestCase):
                              mock.patch.object(steward, "_projection_sessions", return_value=rows), \
                              mock.patch.object(steward, "read_markers", return_value=markers), \
                              mock.patch.object(herdr, "_clear_gpu_session_aliases", side_effect=
-                                               lambda h, sid, pane: ["old-" + sid] if named else []), \
+                                              lambda h, sid, pane, cwd=None:
+                                              ["old-" + sid] if named else []), \
                              mock.patch.object(herdr_projection.os, "getcwd", return_value=str(self.repo)):
                             steward.enrich(rows)
                             self.assertTrue(parent.steward)

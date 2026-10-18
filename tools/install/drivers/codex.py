@@ -97,10 +97,15 @@ def install(scope="global", plugin=False, dry_run=False):
     try:
         tui_result = codex_tui_config.apply_status_line(
             runtime_home / "config.toml", fragment, dry_run=dry_run)
+        detail = "thread-id is last; other items and explicit colors are preserved"
+        if tui_result.get("startup_changed"):
+            detail += "; absent startup-update setting defaults to false"
+        if tui_result.get("startup_error"):
+            detail += f"; startup-update default skipped: {tui_result['startup_error']}"
         tui_action = {"action": "codex-tui-statusline", "dest": tui_result["path"],
                       "status": ("planned" if dry_run and tui_result["changed"] else
                                  "updated" if tui_result["changed"] else "unchanged"),
-                      "detail": "thread-id is last; other items and explicit colors are preserved"}
+                      "detail": detail}
     except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
         tui_action = {"action": "codex-tui-statusline", "dest": str(runtime_home / "config.toml"),
                       "status": "skipped", "detail": str(exc)}

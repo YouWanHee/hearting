@@ -749,6 +749,7 @@ Keep each value to one line. `결과` names the honest outcome status —
 completed, partial, failed, or blocked, localized for the audience — and must
 not present partial, failed, or blocked work as completed. Use `없음` (or its
 audience-language equivalent) when there is no artifact or remaining item.
+In `작업` and `남은 사항`, retain the source description and any comparison condition needed to identify the target; append its original number as a reference. Report a completion condition using its existing `text`, with its internal ID only where traceability helps. For example: “2명 고정·다중 참조·드롭아웃 없는 모델(E2 best48) 검증 완료; 0~3명 가변·참조 드롭아웃 FT 모델(var03 FT LAST3)은 평가 중단, checkpoint 재개 확인 필요.”
 
 If any review gate of the work closed without an independent reviewer's PASS —
 the route outcome's `review_independence_degraded`, or a

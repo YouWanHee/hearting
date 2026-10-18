@@ -2050,6 +2050,12 @@ def _merge_codex_identity_config(
                 result["conflicts"] = ["shell_environment_policy"]
                 return result
             identity_inserted = separator + block
+    elif existing == block:
+        recorded = previous_record.get("inserted")
+        if isinstance(recorded, str) and recorded and original.count(recorded) == 1 and block in recorded:
+            # Retain uninstall ownership when the user's policy now independently
+            # satisfies the fragment but the exact activation block is unchanged.
+            identity_inserted = recorded
     final_text, feature_record, feature_conflict = _codex_feature_insert(
         identity_text, previous_record.get("feature")
     )
@@ -2107,7 +2113,9 @@ def _unmerge_codex_identity_config(
         text = original_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    remaining = _codex_feature_remove(text, feature)
+    remaining = codex_tui_config.restore_startup_update_default_text(
+        text, record.get("startup_default") if isinstance(record, dict) else None)
+    remaining = _codex_feature_remove(remaining, feature)
     try:
         remaining = codex_tui_config.restore_status_line_text(remaining, managed.get("codex_tui"))
     except codex_tui_config.CodexTuiConfigError:
@@ -2390,15 +2398,45 @@ def _prepare_runtime_config(
         fragment = active_root / "adapters" / "codex" / "config" / "tui-statusline.toml"
         try:
             original = config.read_text(encoding="utf-8") if config.exists() else ""
-            updated = codex_tui_config.merge_status_line_from_fragment(original, fragment)
-            prior_tui = (previous.get("managed_config") or {}).get("codex_tui") if previous else None
-            result["tui_record"] = codex_tui_config.status_line_record(original, updated, prior_tui)
+        except (OSError, UnicodeError) as exc:
+            result.setdefault("conflicts", []).extend(("tui.status_line", "check_for_update_on_startup"))
+            result["tui_status_line_detail"] = str(exc)
+            result["startup_default_detail"] = str(exc)
+        else:
+            updated = original
+            prior_managed = (previous or {}).get("managed_config", {})
+            prior_managed = prior_managed if isinstance(prior_managed, dict) else {}
+            prior_identity = prior_managed.get("codex_identity")
+            prior_identity = prior_identity if isinstance(prior_identity, dict) else {}
+            try:
+                statusline_updated = codex_tui_config.merge_status_line_from_fragment(updated, fragment)
+                result["tui_record"] = codex_tui_config.status_line_record(
+                    updated, statusline_updated, prior_managed.get("codex_tui"))
+                updated = statusline_updated
+                result["tui_status_line_changed"] = updated != original
+            except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+                result.setdefault("conflicts", []).append("tui.status_line")
+                result["tui_status_line_detail"] = str(exc)
+
+            before_startup = updated
+            startup_record = None
+            try:
+                startup_updated = codex_tui_config.merge_startup_update_default_text(before_startup)
+                startup_record = codex_tui_config.startup_update_default_record(
+                    before_startup, startup_updated, prior_identity.get("startup_default"))
+                updated = startup_updated
+                result["startup_default_changed"] = updated != before_startup
+            except (UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+                result.setdefault("conflicts", []).append("check_for_update_on_startup")
+                result["startup_default_detail"] = str(exc)
+
+            if startup_record:
+                managed_config = result.get("managed_config")
+                managed_config = dict(managed_config) if isinstance(managed_config, dict) else {}
+                managed_config["startup_default"] = startup_record
+                result["managed_config"] = managed_config
             if updated != original:
                 _atomic_codex_config_text(config, updated)
-            result["tui_status_line_changed"] = updated != original
-        except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
-            result.setdefault("conflicts", []).append("tui.status_line")
-            result["tui_status_line_detail"] = str(exc)
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
         result["native_context"] = native

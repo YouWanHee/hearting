@@ -202,9 +202,16 @@ from a callback session id, an SDK-first root, timing, pane labels, or daemon
 environment.
 
 Pane identity follows native session-start/resume events: publishers carry the
-actual start source with the current ID. Fleet joins predecessor/current IDs from
-that pane's existing same-harness, same-repository seat history for display only;
-another live session keeps its own ID. These aliases grant no report, wake or write
+actual start source with the current ID. Fleet keeps two display joins separate.
+The compatibility join includes at most the eight most recently observed IDs in
+the exact pane seat for the same harness and repository. A confirmed predecessor
+chain follows only recorded same-harness clear or handover edges whose two session
+records resolve to that repository. An endpoint-free legacy ledger is considered
+only when the exact current SID and repository also occur in the current endpoint's
+ledger; explicit endpoint conflicts, ambiguous predecessors, missing repository
+evidence, and cycles stop the chain. Same-SID compact/resume/prompt rows are not
+edges, and a different-SID startup/resume/select/fork does not imply a clear.
+Another live session keeps its own ID. These aliases grant no report, wake or write
 authority and add no state ledger, user confirmation or caller flag.
 
 For an OpenCode TUI whose own native invocation has one explicit `-s` or

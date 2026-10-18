@@ -49,6 +49,13 @@ Research plan-review: on or off
 Proceed? (continue / revise / stop)
 ```
 
+Keep a reference tied to the source document or revision, model description,
+checkpoint and comparison condition in the existing Reference, Motivation, This
+attempt, Dataset and Ablation grid values. For example, distinguish a fixed
+two-speaker, multi-reference run without dropout (E2 best48) from a
+0–3-speaker variable run with reference dropout and fine-tuning (var03 FT LAST3);
+retain the original labels as references and leave an unexplained label unresolved.
+
 **S1-4. Invoke research plan-review only at standard+.** Dispatch the `research/plan-review` unit and provide the latest five RUNLOG rows, the draft `experiment_spec.md`, and any research directory. Ask it to check:
 
 - whether a completed or pending row already represents the same ablation;

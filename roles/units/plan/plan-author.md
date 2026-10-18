@@ -96,7 +96,7 @@ created: {YYYY-MM-DD}
 Body structure (in the selected artifact language; the labels below describe section
 semantics and are not mandatory literal headings):
 
-1. **Goal**: one-line summary.
+1. **Goal**: one-line summary that carries the source description and the comparison condition needed to recognize the subject; retain its original identifier as a reference. Do not infer the meaning of an unexplained key.
 2. **Current State Analysis**: current state of relevant files/functions (include
    file paths and key line numbers).
 3. **Change Plan**: step-by-step task list grouped by phase.
