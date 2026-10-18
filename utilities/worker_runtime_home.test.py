@@ -28,9 +28,18 @@ class WorkerHomes(unittest.TestCase):
         self.source = self.base / 'user'
         self.source.mkdir()
         self.env = {'AGENT_DISPATCH_JOBS': str(self.base / 'dispatch/jobs.log')}
+        self._module_snapshot = {
+            name: sys.modules.get(name)
+            for name in ('dispatch_allocation', 'claude_credential_recovery')
+        }
 
     def tearDown(self):
         self.tmp.cleanup()
+        for name, module in self._module_snapshot.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
     def _account_defaults(self, accounts):
         path = self.base / 'dispatch-defaults.yaml'
@@ -46,6 +55,7 @@ class WorkerHomes(unittest.TestCase):
         files = (
             'tools/profile/build-home.py',
             'utilities/dispatch-defaults.py',
+            'utilities/dispatch_allocation.py',
             'utilities/claude_credential_recovery.py',
             'capabilities/topologies.json',
             'profiles/templates/bootstrap-codex.md',
@@ -60,6 +70,21 @@ class WorkerHomes(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         self.assertFalse((root / 'profiles/dispatch-defaults.yaml').exists())
+        # The copied resolver imports this sibling by its top-level module
+        # name. Load the fixture copy so it cannot accidentally resolve the
+        # implementation from the real checkout's utilities directory.
+        allocation_path = root / 'utilities/dispatch_allocation.py'
+        allocation_spec = importlib.util.spec_from_file_location(
+            'dispatch_allocation', allocation_path)
+        allocation = importlib.util.module_from_spec(allocation_spec)
+        sys.modules[allocation_spec.name] = allocation
+        allocation_spec.loader.exec_module(allocation)
+        recovery_path = root / 'utilities/claude_credential_recovery.py'
+        recovery_spec = importlib.util.spec_from_file_location(
+            'claude_credential_recovery', recovery_path)
+        recovery = importlib.util.module_from_spec(recovery_spec)
+        sys.modules[recovery_spec.name] = recovery
+        recovery_spec.loader.exec_module(recovery)
         path = root / 'tools/profile/build-home.py'
         spec = importlib.util.spec_from_file_location(
             f'worker_home_builder_{id(self)}', path)
@@ -67,6 +92,118 @@ class WorkerHomes(unittest.TestCase):
         sys.modules[spec.name] = builder
         spec.loader.exec_module(builder)
         return root, builder
+
+    def test_minimal_packaged_root_honors_user_defaults_for_all_harnesses(self):
+        root, builder = self._minimal_packaged_builder()
+        home = self.base / 'minimal-user-home'
+        xdg = self.base / 'minimal-user-xdg'
+        codex_parent = self.base / 'minimal-parent-codex'
+        codex_account = self.base / 'minimal-account-codex'
+        claude_parent = self.base / 'minimal-parent-claude'
+        claude_account = self.base / 'minimal-account-claude'
+        opencode_parent = self.base / 'minimal-parent-opencode'
+        opencode_account = self.base / 'minimal-account-opencode'
+        xdg_data = self.base / 'minimal-parent-xdg-data'
+        for path in (home, xdg, codex_parent, codex_account, claude_parent,
+                     claude_account, opencode_parent, opencode_account):
+            path.mkdir(parents=True)
+        (codex_parent / 'auth.json').write_text('{"account":"parent"}')
+        (codex_account / 'auth.json').write_text('{"account":"selected"}')
+        for directory, account in ((claude_parent, 'parent'), (claude_account, 'selected')):
+            (directory / '.claude.json').write_text(json.dumps({
+                'oauthAccount': {'accountUuid': account, 'organizationUuid': account},
+            }))
+        (opencode_parent / 'opencode.json').write_text('{}')
+        (opencode_account / 'opencode').mkdir()
+        (opencode_account / 'opencode/auth.json').write_text('{"account":"selected"}')
+        (xdg_data / 'opencode').mkdir(parents=True)
+        (xdg_data / 'opencode/auth.json').write_text('{"account":"parent"}')
+        defaults_dir = xdg / 'hearting'
+        defaults_dir.mkdir()
+        defaults = defaults_dir / 'dispatch-defaults.yaml'
+        defaults.write_text(self._account_defaults({
+            'codex': str(codex_account), 'claude': str(claude_account),
+            'opencode': str(opencode_account),
+        }).read_text(encoding='utf-8'), encoding='utf-8')
+        env = {**self.env, 'HOME': str(home), 'XDG_CONFIG_HOME': str(xdg),
+               'CODEX_HOME': str(codex_parent), 'CLAUDE_CONFIG_DIR': str(claude_parent),
+               'OPENCODE_CONFIG_DIR': str(opencode_parent), 'XDG_DATA_HOME': str(xdg_data)}
+        self.assertNotIn('DISPATCH_DEFAULTS_CONFIG', env)
+        self.assertFalse((root / 'profiles/dispatch-defaults.yaml').exists())
+
+        codex = builder.build_worker_home(root, 'codex', 'stage', 'user-file-codex',
+                                           env=env, destination=self.base / 'user-codex-home')
+        self.assertEqual((Path(codex['CODEX_HOME']) / 'auth.json').resolve(),
+                         (codex_account / 'auth.json').resolve())
+        claude = builder.build_worker_home(root, 'claude', 'stage', 'user-file-claude',
+                                            env=env, destination=self.base / 'user-claude-home')
+        self.assertEqual(json.loads((Path(claude['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text())[
+            'oauthAccount']['accountUuid'], 'selected')
+        opencode = builder.build_worker_home(root, 'opencode', 'stage', 'user-file-opencode',
+                                              env=env, destination=self.base / 'user-opencode-home')
+        self.assertEqual((Path(opencode['XDG_DATA_HOME']) / 'opencode/auth.json').resolve(),
+                         (opencode_account / 'opencode/auth.json').resolve())
+
+        defaults.write_text('schema_version: [\n', encoding='utf-8')
+        with self.assertRaises(builder._dispatch_defaults_module().DefaultsConfigError):
+            builder._worker_account_selection('codex', env)
+
+    def test_reused_homes_remove_only_stale_explicit_auth_links(self):
+        root, builder = self._minimal_packaged_builder()
+        parent = self.base / 'reuse-parent-codex'
+        parent.mkdir()
+        (parent / 'auth.json').write_text('{"account":"parent"}', encoding='utf-8')
+        opencode_parent = self.base / 'reuse-parent-xdg-data'
+        (opencode_parent / 'opencode').mkdir(parents=True)
+        (opencode_parent / 'opencode/auth.json').write_text(
+            '{"account":"parent"}', encoding='utf-8')
+        selected_codex = self.base / 'reuse-selected-codex'
+        selected_opencode = self.base / 'reuse-selected-opencode'
+        selected_codex.mkdir()
+        selected_opencode.mkdir()
+        defaults = self._account_defaults({
+            'codex': str(selected_codex), 'opencode': str(selected_opencode),
+        })
+        codex_dest = self.base / 'reuse-codex-home'
+        codex_env = {**self.env, 'HOME': str(self.base / 'reuse-home'),
+                     'CODEX_HOME': str(parent)}
+        first = builder.build_worker_home(root, 'codex', 'stage', 'reuse-codex',
+                                          env=codex_env, destination=codex_dest)
+        codex_auth = Path(first['CODEX_HOME']) / 'auth.json'
+        self.assertEqual(codex_auth.resolve(), (parent / 'auth.json').resolve())
+        builder.build_worker_home(root, 'codex', 'stage', 'reuse-codex',
+                                  env={**codex_env, 'DISPATCH_DEFAULTS_CONFIG': str(defaults)},
+                                  destination=codex_dest)
+        self.assertFalse(codex_auth.exists())
+
+        opencode_config = self.base / 'reuse-opencode-config'
+        opencode_config.mkdir()
+        (opencode_config / 'opencode.json').write_text('{}', encoding='utf-8')
+        opencode_dest = self.base / 'reuse-opencode-home'
+        opencode_env = {**self.env, 'HOME': str(self.base / 'reuse-home'),
+                        'OPENCODE_CONFIG_DIR': str(opencode_config),
+                        'XDG_DATA_HOME': str(opencode_parent)}
+        first = builder.build_worker_home(root, 'opencode', 'stage', 'reuse-opencode',
+                                          env=opencode_env, destination=opencode_dest)
+        opencode_auth = Path(first['XDG_DATA_HOME']) / 'opencode/auth.json'
+        self.assertEqual(opencode_auth.resolve(),
+                         (opencode_parent / 'opencode/auth.json').resolve())
+        builder.build_worker_home(root, 'opencode', 'stage', 'reuse-opencode',
+                                  env={**opencode_env, 'DISPATCH_DEFAULTS_CONFIG': str(defaults)},
+                                  destination=opencode_dest)
+        self.assertFalse(opencode_auth.exists())
+
+        for harness, auth_path, env, dest in (
+                ('codex', self.base / 'regular-codex-home/auth.json', codex_env,
+                 self.base / 'regular-codex-home'),
+                ('opencode', self.base / 'regular-opencode-home/runtime/data/opencode/auth.json',
+                 opencode_env, self.base / 'regular-opencode-home')):
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text('preserve regular file', encoding='utf-8')
+            builder.build_worker_home(
+                root, harness, 'stage', 'regular-auth-' + harness,
+                env={**env, 'DISPATCH_DEFAULTS_CONFIG': str(defaults)}, destination=dest)
+            self.assertEqual(auth_path.read_text(encoding='utf-8'), 'preserve regular file')
 
     def test_missing_implicit_defaults_keeps_all_harness_auth_and_settings(self):
         root, builder = self._minimal_packaged_builder()

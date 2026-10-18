@@ -583,6 +583,11 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         for name in ('auth.json', 'config.toml'):
             auth_source = account_source if account_source is not None else source
             target = (auth_source if name == 'auth.json' else source) / name
+            if (name == 'auth.json' and account_source is not None
+                    and not target.is_file()):
+                old_link = home / name
+                if old_link.is_symlink():
+                    old_link.unlink()
             if (name == 'auth.json' and account_source is None
                     and not target.is_file()):
                 target = Path.home() / '.codex/auth.json'
@@ -758,7 +763,12 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
             values['XDG_' + kind.upper() + '_HOME'] = str(target)
         data = (account_source if account_source is not None else
                 Path(env.get('XDG_DATA_HOME') or Path.home() / '.local/share'))
-        symlink(data / 'opencode/auth.json', runtime / 'data/opencode/auth.json')
+        auth_source = data / 'opencode/auth.json'
+        if account_source is not None and not auth_source.is_file():
+            old_link = runtime / 'data/opencode/auth.json'
+            if old_link.is_symlink():
+                old_link.unlink()
+        symlink(auth_source, runtime / 'data/opencode/auth.json')
         symlink(home, runtime / 'config/opencode')
         values.update(OPENCODE_CONFIG_DIR=str(home), OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
                       OPENCODE_DISABLE_CLAUDE_CODE_SKILLS='1')
