@@ -1125,7 +1125,11 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                         module._native_queue_delivery_once(args, receipt, {attempt})
                 pending = read(root, SESSION, delivery_id)
                 self.assertEqual(pending["state"], "pending")
-                retry = pending["courier_retry"]
+                self.assertNotIn("courier_retry", pending)
+                retry_path = module.pending_delivery.courier_retry_path(
+                    module.pending_delivery.record_path(root, SESSION, delivery_id)
+                )
+                retry = json.loads(retry_path.read_text(encoding="utf-8"))["retry"]
                 self.assertEqual(retry["failure_count"], 1)
 
                 with mock.patch.object(module.pending_delivery.time, "time_ns",

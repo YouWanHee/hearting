@@ -288,6 +288,14 @@ def _read_unlocked(path: Path) -> dict | None:
     return _validate_record(value)
 
 
+def _public_record(value: dict) -> dict:
+    """Return the persisted record shape without internal courier state."""
+
+    if COURIER_RETRY_FIELD not in value:
+        return value
+    return {key: item for key, item in value.items() if key != COURIER_RETRY_FIELD}
+
+
 @contextmanager
 def _record_reference_lock(path: Path, *, candidate: dict | None = None):
     """Acquire attempt references before the record CAS lock.
@@ -471,10 +479,7 @@ def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
     value = _read_unlocked(path)
     if value is None:
         return None
-    if value.get("state") not in OPEN_STATES:
-        return value
-    retry = _read_courier_retry_unlocked(path, value)
-    return dict(value, **{COURIER_RETRY_FIELD: retry}) if retry is not None else value
+    return _public_record(value)
 
 
 def create(
@@ -565,11 +570,11 @@ def create(
         existing = _read_unlocked(path)
         if existing is not None:
             _verify_identity(existing, candidate)
-            return existing
+            return _public_record(existing)
         if tombstone_path(path).exists():
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-pruned")
         _write_unlocked(path, candidate)
-        return candidate
+        return _public_record(candidate)
 
 
 def _verify_identity(existing: dict, candidate: dict) -> None:
@@ -804,7 +809,7 @@ def claim(
         updated["attempts"] = value["attempts"] + 1
         updated["last_attempt_at_ns"] = now
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def mark_sent_ambiguous(
@@ -825,7 +830,7 @@ def mark_sent_ambiguous(
         updated = dict(value)
         updated["state"] = "sent-ambiguous"
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def ack(
@@ -854,7 +859,7 @@ def ack(
         updated["acked_by"] = acked_by
         updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def received_ack_identity(record: dict, recipient_key: str, delivery_id: str) -> dict:
@@ -903,7 +908,7 @@ def ack_received(
         if actual_identity != expected_identity:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "received-identity-changed")
         if value["state"] in TERMINAL_STATES:
-            return value
+            return _public_record(value)
         if value["state"] not in OPEN_STATES:
             raise PendingDeliveryError("pending-delivery-claim-refused", f"state={value['state']}")
         updated = dict(value)
@@ -912,7 +917,7 @@ def ack_received(
         updated["acked_by"] = acked_by
         updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) -> dict:
@@ -940,7 +945,7 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         updated["claim_owner"] = None
         updated["claim_deadline_ns"] = None
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
@@ -958,7 +963,7 @@ def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_own
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
         if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
-            return value
+            return _public_record(value)
         updated = dict(value)
         retry = (_read_courier_retry_unlocked(path, value)
                  or _new_courier_retry())
@@ -970,7 +975,7 @@ def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_own
             retry, failure, time.time_ns(), base_delay_ns)
         updated.update(state="pending", claim_owner=None, claim_deadline_ns=None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def reject_claimed(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
@@ -985,7 +990,7 @@ def reject_claimed(root: Path, recipient_key: str, delivery_id: str, *, claim_ow
         updated["state"] = "rejected"
         updated["expiry_reason"] = str(reason)[:1024] or "gateway-rejected"
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def expire_if_due(
@@ -1011,12 +1016,12 @@ def expire_if_due(
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
         if liveness == "unknown" or value["state"] not in OPEN_STATES:
-            return value
+            return _public_record(value)
         updated = dict(value)
         updated["state"] = "expired"
         updated["expiry_reason"] = reason
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def expire_recovery(
@@ -1055,19 +1060,19 @@ def expire_recovery(
                 )
         if value.get("state") == "expired":
             if (value.get("expiry_actor"), value.get("expiry_detail")) == (actor, reason):
-                return {**value, "idempotent": True}
+                return _public_record({**value, "idempotent": True})
             raise PendingDeliveryError("pending-delivery-recovery-refused", "already-expired")
         if value.get("state") not in {"pending", "sent-ambiguous"}:
             raise PendingDeliveryError("pending-delivery-recovery-refused", f"state={value.get('state')}")
         preview = {**value, "eligible": True, "idempotent": False}
         if not apply:
-            return preview
+            return _public_record(preview)
         updated = dict(value)
         updated.update({"state": "expired", "expiry_reason": "operator-recovery",
                         "expiry_actor": actor, "expiry_detail": reason,
                         "expired_at_ns": time.time_ns()})
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def tombstone_path(record_file: Path) -> Path:
