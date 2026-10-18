@@ -468,6 +468,13 @@ def _worker_account_selection(harness, env):
     """Read the existing validated dispatch-defaults config from this env."""
     defaults = _dispatch_defaults_module()
     config_path = defaults.default_config_path(environ=env)
+    if not env.get('DISPATCH_DEFAULTS_CONFIG') and not os.path.lexists(config_path):
+        # Account selection is optional. A minimal packaged root may omit the
+        # shipped defaults file entirely; keep the pre-account worker-home
+        # behavior in that case. Explicit paths and present configs still pass
+        # through the validated loader below, so requested-input and content
+        # errors remain visible.
+        return None, None
     config, _warnings = defaults.load_validated(
         config_path, defaults.default_topology_path())
     account = defaults.query_worker_account(config, harness)

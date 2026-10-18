@@ -2,6 +2,7 @@
 import json
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,123 @@ class WorkerHomes(unittest.TestCase):
         lines.extend(f'  {harness}: {value}' for harness, value in accounts.items())
         path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
         return path
+
+    def _minimal_packaged_builder(self):
+        """Load the real builder and resolver from a package root without profiles/."""
+        root = self.base / 'packaged-root'
+        files = (
+            'tools/profile/build-home.py',
+            'utilities/dispatch-defaults.py',
+            'utilities/claude_credential_recovery.py',
+            'capabilities/topologies.json',
+            'profiles/templates/bootstrap-codex.md',
+            'profiles/templates/bootstrap-claude.md',
+            'profiles/templates/bootstrap-opencode.md',
+            'adapters/codex/hooks/hooks.json',
+            'adapters/codex/config/models.conf',
+        )
+        for relative in files:
+            source = ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        self.assertFalse((root / 'profiles/dispatch-defaults.yaml').exists())
+        path = root / 'tools/profile/build-home.py'
+        spec = importlib.util.spec_from_file_location(
+            f'worker_home_builder_{id(self)}', path)
+        builder = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = builder
+        spec.loader.exec_module(builder)
+        return root, builder
+
+    def test_missing_implicit_defaults_keeps_all_harness_auth_and_settings(self):
+        root, builder = self._minimal_packaged_builder()
+        parent_home = self.base / 'packaged-parent-home'
+        parent_home.mkdir()
+
+        codex_source = self.base / 'packaged-parent-codex'
+        codex_source.mkdir()
+        (codex_source / 'auth.json').write_text('{"account":"parent"}', encoding='utf-8')
+        (codex_source / 'config.toml').write_text('[user]\nvalue="parent"\n', encoding='utf-8')
+        (codex_source / 'hooks.json').write_text('{"user_guard":true}', encoding='utf-8')
+        codex = builder.build_worker_home(
+            root, 'codex', 'stage', 'implicit-config-codex',
+            env={**self.env, 'HOME': str(parent_home), 'CODEX_HOME': str(codex_source)},
+            destination=self.base / 'packaged-codex-worker')
+        codex_home = Path(codex['CODEX_HOME'])
+        self.assertEqual((codex_home / 'auth.json').resolve(),
+                         (codex_source / 'auth.json').resolve())
+        self.assertEqual((codex_home / 'config.toml').resolve(),
+                         (codex_source / 'config.toml').resolve())
+        self.assertEqual((codex_home / 'hooks.json').resolve(),
+                         (codex_source / 'hooks.json').resolve())
+        self.assertEqual(codex['HEARTING_MODEL_CONFIG_HOME'], str(codex_source))
+
+        claude_source = self.base / 'packaged-parent-claude'
+        claude_source.mkdir()
+        claude_account = {'accountUuid': 'parent-account', 'organizationUuid': 'parent-org'}
+        (claude_source / '.claude.json').write_text(
+            json.dumps({'oauthAccount': claude_account}), encoding='utf-8')
+        claude_settings = {
+            'env': {'PARENT_SETTING': 'kept'},
+            'hooks': {'PreToolUse': [{'hooks': [{'command': 'parent-guard'}]}]},
+            'permissions': {'deny': ['Read(secret)']},
+        }
+        (claude_source / 'settings.json').write_text(
+            json.dumps(claude_settings), encoding='utf-8')
+        claude = builder.build_worker_home(
+            root, 'claude', 'stage', 'implicit-config-claude',
+            env={**self.env, 'HOME': str(parent_home),
+                 'CLAUDE_CONFIG_DIR': str(claude_source)},
+            destination=self.base / 'packaged-claude-worker')
+        claude_home = Path(claude['CLAUDE_CONFIG_DIR'])
+        self.assertEqual(json.loads((claude_home / '.claude.json').read_text()),
+                         {'oauthAccount': claude_account})
+        projected_settings = json.loads((claude_home / 'settings.json').read_text())
+        for key in ('env', 'hooks', 'permissions'):
+            self.assertEqual(projected_settings[key], claude_settings[key])
+        self.assertEqual(claude['HEARTING_MODEL_CONFIG_HOME'], str(claude_source))
+
+        opencode_source = self.base / 'packaged-parent-opencode'
+        opencode_source.mkdir()
+        (opencode_source / 'opencode.json').write_text(json.dumps({
+            'model': 'provider/parent-model',
+            'permission': {'bash': {'danger *': 'deny'}},
+        }), encoding='utf-8')
+        xdg_data = self.base / 'packaged-parent-xdg-data'
+        (xdg_data / 'opencode').mkdir(parents=True)
+        (xdg_data / 'opencode/auth.json').write_text(
+            '{"account":"parent"}', encoding='utf-8')
+        opencode = builder.build_worker_home(
+            root, 'opencode', 'stage', 'implicit-config-opencode',
+            env={**self.env, 'HOME': str(parent_home),
+                 'OPENCODE_CONFIG_DIR': str(opencode_source),
+                 'XDG_DATA_HOME': str(xdg_data)},
+            destination=self.base / 'packaged-opencode-worker')
+        opencode_home = Path(opencode['OPENCODE_CONFIG_DIR'])
+        projected_opencode = json.loads((opencode_home / 'opencode.json').read_text())
+        self.assertEqual(projected_opencode['model'], 'provider/parent-model')
+        self.assertEqual(projected_opencode['permission']['bash'],
+                         {'danger *': 'deny'})
+        self.assertEqual(projected_opencode['permission']['skill'], {'*': 'deny'})
+        self.assertFalse(projected_opencode['snapshot'])
+        self.assertEqual((opencode_home / 'runtime/data/opencode/auth.json').resolve(),
+                         (xdg_data / 'opencode/auth.json').resolve())
+        self.assertEqual(opencode['HEARTING_MODEL_CONFIG_HOME'], str(opencode_source))
+
+    def test_explicit_defaults_override_errors_are_not_ignored(self):
+        root, builder = self._minimal_packaged_builder()
+        missing = self.base / 'requested-dispatch-defaults.yaml'
+        with self.assertRaises(FileNotFoundError):
+            builder._worker_account_selection(
+                'codex', {**self.env, 'DISPATCH_DEFAULTS_CONFIG': str(missing)})
+
+        malformed = self.base / 'malformed-dispatch-defaults.yaml'
+        malformed.write_text('schema_version: [\n', encoding='utf-8')
+        defaults = builder._dispatch_defaults_module()
+        with self.assertRaises(defaults.DefaultsConfigError):
+            builder._worker_account_selection(
+                'codex', {**self.env, 'DISPATCH_DEFAULTS_CONFIG': str(malformed)})
 
     def test_codex_every_type_isolates_global_input_keeps_auth_config_and_hooks(self):
         (self.source / 'agent-config').mkdir()
