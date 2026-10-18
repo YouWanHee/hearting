@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_attempt_policy import (
     decide_attempt, required_action, deferred_completion, success_note,
-    DEFERRED_COMPLETION_NOTE, DEFERRED_COMPLETION_SOURCE,
+    DEFERRED_COMPLETION_NOTE, DEFERRED_COMPLETION_SOURCE, terminal_conflict_pending,
 )
 from dispatch_receipt_identity import (
     CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, canonical_receipt, receipt_digest, unseal_receipt,
@@ -3822,6 +3822,9 @@ def route_completion_evidence(
     used to collapse into one bare `None`, which lost the distinction a
     reader debugging a stuck row needs (round_1 review advisory 4).
     """
+
+    if terminal_conflict_pending(metadata):
+        return None, "terminal-evidence-conflict"
 
     if terminal is None:
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,

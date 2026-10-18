@@ -85,6 +85,47 @@ def _registry_with_parent_and_leg(
 
 
 class DispatchReapWatchTest(unittest.TestCase):
+    def setUp(self):
+        self.fixture = tempfile.TemporaryDirectory(prefix="dispatch-reap-watch-")
+        self.addCleanup(self.fixture.cleanup)
+        root = Path(self.fixture.name)
+        home = root / "home"
+        for path in (home, root / "state", root / "config", root / "data",
+                     root / "harness-state", root / "artifacts", root / "peer-ledger"):
+            path.mkdir(parents=True, exist_ok=True)
+        jobs = root / "jobs.log"
+        jobs.touch()
+        fixture_env = dict(os.environ)
+        for key in tuple(fixture_env):
+            if (key.startswith("AGENT_DISPATCH_")
+                    or key.startswith("AGENT_ARTIFACT_")
+                    or key in {"AGENT_HOME", "CLAUDE_HOME", "AGENT_RUNTIME_ROOT",
+                               "AGENT_SESSION_ROLE", "HERDR_SOCKET_PATH",
+                               "AGENT_HERDR_SESSION", "HERDR_SESSION",
+                               "SERVICE_CURRENT", "HEARTING_SERVICE_CURRENT",
+                               "AGENT_SERVICE_CURRENT", "AGENT_INSTALL_CURRENT",
+                               "AGENT_INSTALL_ROOT"}):
+                fixture_env.pop(key, None)
+        fixture_env.update({
+            "HOME": str(home), "XDG_STATE_HOME": str(root / "state"),
+            "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
+            "HARNESS_STATE_ROOT": str(root / "harness-state"),
+            "HARNESS_DATA_ROOT": str(root / "data"),
+            "AGENT_HOME": str(root / "agent-home"),
+            "CLAUDE_HOME": str(root / "claude-home"),
+            "AGENT_RUNTIME_ROOT": str(root / "runtime"),
+            "AGENT_ARTIFACT_ROOT": str(root / "artifacts"),
+            "AGENT_ARTIFACT_OUTPUT_DIR": str(root / "artifacts" / "output"),
+            "AGENT_PEER_LEDGER_ROOT": str(root / "peer-ledger"),
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "CODEX_HOME": str(home / ".codex"),
+            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+            "OPENCODE_CONFIG_DIR": str(home / ".config" / "opencode"),
+        })
+        patcher = mock.patch.dict(os.environ, fixture_env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_launcher_strips_attempt_tag_from_observer_environment(self):
         fake = mock.Mock(pid=37)
         with mock.patch.dict(
@@ -381,13 +422,17 @@ class DispatchReapWatchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             attempt = "att-residue-later-exits"
-            jobs = self._open_residue_row(base, attempt, "1.5")
+            # Leave a wide observation window after the watcher starts. A
+            # short-lived survivor can exit during procfs scanning and turn
+            # the intended residue fixture into a first-observation-empty
+            # fixture before the residue receipt is sealed.
+            jobs = self._open_residue_row(base, attempt, "5")
             meta = self._row_metadata(jobs)
             self.assertEqual(
                 meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
             )
             self.assertEqual(meta["attempt_descendant_residue_basis"], "terminal-envelope")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 12
             while D.attempt_tagged_descendants(meta).state != "empty":
                 self.assertLess(time.monotonic(), deadline, "residue never exited")
                 time.sleep(0.05)

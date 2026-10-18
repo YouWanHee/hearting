@@ -1008,11 +1008,13 @@ console.log(JSON.stringify(calls[0]));
 
         base_commit = "414a76bec4963e3e22d6f89766282cdf5f6b739b"
         old_batch_source = subprocess.run(
-            ["git", "show", f"{base_commit}:utilities/dispatch_batch_obligations.py"],
+            ["git", "-c", f"safe.directory={ROOT}", "show",
+             f"{base_commit}:utilities/dispatch_batch_obligations.py"],
             cwd=ROOT, capture_output=True, text=True, check=True,
         ).stdout
         old_completion_source = subprocess.run(
-            ["git", "show", f"{base_commit}:utilities/codex-managed-completion.py"],
+            ["git", "-c", f"safe.directory={ROOT}", "show",
+             f"{base_commit}:utilities/codex-managed-completion.py"],
             cwd=ROOT, capture_output=True, text=True, check=True,
         ).stdout
 

@@ -695,8 +695,11 @@ bulk mutation.
 When a child already has a committed PASS, join and reap inspect only its exact
 terminal log before cleanup. A valid late FAIL/BLOCKED is recorded through the
 existing `reconcile_attempt_terminal` conflict transition. The original PASS
-and receipt remain intact, and the attempt consumer holds the conflict for
-review. Unreadable or mismatched terminal evidence adds no conflict.
+and receipt remain intact, and join, stage advance, and owner settlement hold
+the conflict for review. Shared `route_completion_evidence` refuses a pending
+conflict before returning a PASS artifact, so stage advance cannot close the
+gate or start a successor from the preserved marker alone. Unreadable or
+mismatched terminal evidence adds no conflict.
 
 A registered headless owner yields after registering a batch; its runtime supervisor joins the exact `parent_attempt_id` batch outside the model and resumes the same owned session once with a bounded typed receipt. A registered Claude owner keeps one realtime stream-input process for the route and submits the next receipt immediately after each non-terminal join; when a freshly verified terminal marker closes every declared terminal gate, the supervisor skips the redundant final owner turn and closes the stream before terminal row reconciliation. An explicit custom-command fallback retains per-turn `--resume`. A Claude interactive parent may instead arm one native `asyncRewake` PostToolUse hook from a successful exact owner-start receipt, or from a successful exact steward watch armed in the same session (`utilities/peer-steward.py watch`, SD-122 §13.37.2-(10)); either way the hook owns exactly one arming event, verifies it against the session that produced it, and never widens to another attempt or watch. It re-reads the exact current row and sealed completion evidence before rendering: every terminal receipt — success or attention — exits two, because Claude Code wakes an idle session for an `asyncRewake` hook only on exit code 2 and delivers exit-0 output no earlier than the next user interaction (corrected 2026-08-29; success additionally carries its structured notification on stdout). A launcher-managed interactive Codex session places one owner-only gateway between remote TUI and App Server. The harness installer may make this checked entry transparent for interactive commands, but plugin or hook loading after process entry is not equivalent. That gateway atomically serializes manual input with an exact completion receipt, uses `turn/start` only while idle and `turn/steer` only for a steerable active turn, and durably suppresses duplicate sealed-batch delivery. The sidecar is prelaunched before the child spawn claim, connects only to the private control socket, never subscribes upstream, never sees or answers approvals, and submits no raw child output. A send followed by an unclassified disconnect is `sent-ambiguous` and is not retried. Outside those checked entries, hooks must not simulate wake by blocking Stop, parking every tool, or injecting a synthetic user turn; the parent remains conversational and uses a disclosed finite fallback. Legacy receipts may be consumed only by exact terminal typed harvest. Runtime-native subagents are a separate surface.
 
@@ -834,14 +837,19 @@ empty. Busy, blocked, unknown, form-open, nonempty-draft, or unreadable targets
 stay on the existing callback path and receive no PTY input. Prompt submission
 is only `queued`; the exact receiver ref remains the only peer-delivery receipt.
 
-For Claude's peer-message context path, a successful stdout flush records
-`queued`/`hook-context-emitted`; the flush and a later callback for the same SID
-are not receipt evidence. Keep the row queued until an exact native consumption
-record supplies the session, ref, and body evidence. The native consumption
-record format has not been established for this path, so no callback may infer
-receipt from output alone. A future `schema_version` is unsupported, not
-corrupt: readers skip it in place without rewriting or quarantining its bytes.
-The current schema's verified malformed or unsafe rows keep the existing
+For Claude's peer-message context path, SD-113 §13.34.1 recognizes successful
+synchronous `additionalContext` injection from the native
+`UserPromptSubmit`/`PostToolUse` boundary as recipient consumption. After the
+flush, the hook settles the exact sealed ref, body, and recipient through the
+shared receive/ACK writer, including its registered obligation. A failed or
+partial flush remains unreceived. CLI context rendering, a same-SID callback
+alone, helper output, and ambiguous sends remain unreceived. A retained queued
+row marked `hook-context-emitted` is recovered only by claiming its exact ref
+and delivering it again through that trusted native boundary; arbitrary queued
+pane/native transfers are not resent. The no-trailer session-tidy continue
+keeps its separate receipt authority. A future `schema_version` is unsupported,
+not corrupt: readers skip it in place without rewriting or quarantining its
+bytes. The current schema's verified malformed or unsafe rows keep the existing
 quarantine behavior.
 
 For Herdr observation, the endpoint is part of identity and cache keys. A

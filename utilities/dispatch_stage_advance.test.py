@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
 import dispatch_stage_advance as SA  # noqa: E402
+import dispatch_contract as DC  # noqa: E402
 
 
 def _route_hash(payload):
@@ -671,7 +673,11 @@ class TamperedRouteHashTest(unittest.TestCase):
             route_file = sandbox.write_route(route)
             request = make_request(sandbox, route_file, predecessor_node="a")
             services = FakeServices()
-            result = SA.coordinate_stage_advance(request, services)
+            # This test exercises the typed integrity refusal. With the
+            # opt-in gate off, the production compatibility helper reports
+            # diagnostically and lets structural classification continue.
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
+                result = SA.coordinate_stage_advance(request, services)
             self.assertEqual(result.reason, "stage-advance-launch-compatibility-mismatch")
             self.assertFalse(result.gate_closed)
             self.assertEqual(result.registered, False)
@@ -708,6 +714,75 @@ class EvidenceUnreadableTest(unittest.TestCase):
                 result = SA.coordinate_stage_advance(request, services)
             self.assertEqual(result.reason, "stage-advance-gate-unproven")
             self.assertFalse(result.gate_closed)
+        finally:
+            sandbox.close()
+
+
+class TerminalConflictConsumerTest(unittest.TestCase):
+    def test_conflicted_pass_blocks_actual_stage_advance_before_gate_close(self):
+        route = make_route([node("a"), node("b", depends_on=("a",))])
+        sandbox = Sandbox()
+        try:
+            route_file = sandbox.write_route(route)
+            attempt_id = "att-pred-conflict"
+            artifact_root = sandbox.root / ".agent_reports"
+            artifact_root.mkdir()
+            artifact = artifact_root / "report.md"
+            artifact.write_text("valid stage evidence\n", encoding="utf-8")
+            log = sandbox.root / "attempt.jsonl"
+            log.write_text("\n".join(json.dumps(row) for row in [
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {"type": "agent_message",
+                 "text": f"artifact: {artifact}\nverdict: PASS\nblocker: none"}},
+                {"type": "turn.completed"},
+            ]) + "\n", encoding="utf-8")
+            metadata = {
+                "attempt_schema_version": "2", "dispatch_depth": "2",
+                "transport": "headless", "execution_surface": "registered-headless",
+                "registered_worker": "1", "fallback_hop": "same-harness-headless",
+                "worker_type": "stage", "attempt_id": attempt_id,
+                "note": "completed-marker", "failure_class": "pass",
+                "classifier_source": "fixture-terminal-v1", "route_id": route["route_id"],
+                "route_node": "a", "route_hash": route["route_hash"],
+                "log_file": str(log), "artifact_root": str(artifact_root),
+            }
+            sandbox.add_registry_row(metadata, status="done")
+            request = make_request(sandbox, route_file, predecessor_node="a",
+                                   predecessor_terminal_attempt_id=attempt_id)
+            fixture_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(sandbox.root / "home"),
+                "XDG_STATE_HOME": str(sandbox.root / "state"),
+                "XDG_CONFIG_HOME": str(sandbox.root / "config"),
+                "XDG_DATA_HOME": str(sandbox.root / "data"),
+                "HARNESS_STATE_ROOT": str(sandbox.root / "harness-state"),
+                "HARNESS_DATA_ROOT": str(sandbox.root / "data"),
+                "AGENT_HOME": str(sandbox.root / "agent-home"),
+                "CLAUDE_HOME": str(sandbox.root / "claude-home"),
+                "AGENT_RUNTIME_ROOT": str(sandbox.root / "runtime"),
+                "AGENT_ARTIFACT_ROOT": str(artifact_root),
+                "AGENT_PEER_LEDGER_ROOT": str(sandbox.root / "peer-ledger"),
+                "AGENT_DISPATCH_JOBS": str(sandbox.jobs),
+                "CODEX_HOME": str(sandbox.root / "home" / ".codex"),
+                "CLAUDE_CONFIG_DIR": str(sandbox.root / "home" / ".claude"),
+                "OPENCODE_CONFIG_DIR": str(sandbox.root / "home" / ".config" / "opencode"),
+            }
+            with mock.patch.dict(os.environ, fixture_env, clear=True):
+                self.assertEqual(SA.gate_evidence(request), (str(artifact), ""))
+                self.assertEqual(DC.reconcile_attempt_terminal(
+                    sandbox.jobs, attempt_id, "dead-worker-fail",
+                    evidence={"failure_class": "fail", "classifier_source": "late-fixture"}),
+                    "terminal-conflict")
+                self.assertEqual(SA.gate_evidence(request),
+                                 (None, "terminal-evidence-conflict"))
+                services = FakeServices()
+                with mock.patch.object(SA, "completed_nodes", return_value=frozenset({"a"})), \
+                        mock.patch.object(SA, "started_nodes", return_value=frozenset()):
+                    result = SA.coordinate_stage_advance(request, services)
+            self.assertEqual(result.reason, "stage-advance-gate-unproven")
+            self.assertFalse(result.gate_closed)
+            self.assertEqual(services.close_gate_calls, 0)
+            self.assertEqual(services.start_calls, 0)
         finally:
             sandbox.close()
 
