@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for utilities/peer-steward.py (SD-122 (9) steward wait/start)."""
 import concurrent.futures
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -1000,15 +1001,24 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         cmd = _agent_start_cmd(run_mock)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
-    def test_codex_start_skips_its_startup_update_dialog(self):
+    def test_codex_start_keeps_shared_daemon_and_caller_args_without_update_override(self):
+        user_args = ["--remote", "unix:///tmp/caller-codex.sock"]
         for mode in ("bypass", "inherit"):
             with self.subTest(mode=mode), \
                     mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                     mock.patch.object(peer_steward.subprocess, "run",
                                       return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
-                self._start(kind="codex", permission_mode=mode)
+                self._start(kind="codex", permission_mode=mode, agent_args=user_args)
                 cmd = _agent_start_cmd(run_mock)
-                self.assertEqual(cmd[cmd.index("--") + 1:][:2], ["-c", "check_for_update_on_startup=false"])
+                passed = cmd[cmd.index("--") + 1:]
+                self.assertNotIn("check_for_update_on_startup=false", passed)
+                self.assertIn(user_args, [passed[i:i + len(user_args)]
+                                          for i in range(len(passed) - len(user_args) + 1)])
+                self.assertEqual(passed.count("--no-daemon"), 0)
+                if mode == "bypass":
+                    self.assertIn("--dangerously-bypass-approvals-and-sandbox", passed)
+                else:
+                    self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", passed)
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                 mock.patch.object(peer_steward.subprocess, "run",
                                   return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
@@ -1396,15 +1406,21 @@ class _WatchMixin(_TmpRootMixin):
         return {}
 
     def _release(self):
-        # A held reader can close between our open() and write() (a watcher that just
-        # got EOF from the previous release): EPIPE means "no reader took it", retry.
+        # A held reader can close between retries. Nonblocking open turns "no
+        # reader" into ENXIO so this bounded recovery loop cannot hang at open().
         for _ in range(100):
+            fd = None
             try:
-                with open(self.fifo, "w") as fh:
-                    fh.write("go")
+                fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(fd, b"go")
                 return
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {errno.ENXIO, errno.EPIPE}:
+                    raise
                 time.sleep(0.01)
+            finally:
+                if fd is not None:
+                    os.close(fd)
         self.fail("no reader took the FIFO release")
 
     def _wait_for_lock(self, watch_id, seconds=30):
@@ -2640,6 +2656,28 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
 class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
     """A56-2."""
 
+    def test_idle_watch_keeps_one_native_wait_and_resumes_on_its_event(self):
+        env = self._env("held")
+        armed = self._fields(self._run("watch", "peer-a", env=env).stdout)
+        watch_id = armed["watch_id"]
+        wait_record = self._wait_for_native_wait_started(watch_id)
+        self._wait_for_wait_calls(1)
+        before = self.calllog.read_bytes()
+
+        # The production watcher has already entered its select-based event wait.
+        # A short bounded fixture window measures repeated transport calls without
+        # turning the product wait into a timer loop.
+        time.sleep(0.2)
+        self.assertEqual(self.calllog.read_bytes(), before)
+        self.assertEqual(len(self._wait_calls()), 1)
+        self.assertTrue(peer_steward._pid_identity_ok(
+            wait_record["pid"], wait_record["pid_start"]))
+
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["state"], "idle")
+        self.assertEqual(len(self._wait_calls()), 1)
+
     def test_receipt_is_atomic_complete_and_text_free(self):
         proc = self._run("watch", "peer-a", env=self._env("held"))
         watch_id = self._fields(proc.stdout)["watch_id"]
@@ -2834,6 +2872,41 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                                  ("pane-exited", "pane-closed"))
                 peer_steward._ensure_watch_observers()
                 spawn.assert_not_called()
+
+    def test_update_replaces_only_the_exact_live_watch_and_rearms_same_duty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            watch_id = "legacy-watch"
+            arm = {"schema_version": 1, "watch_id": watch_id, "target": "fixture-target",
+                   "server": "named", "armed_ts": "then", "until": ["idle"],
+                   "agent": {"harness": "codex", "session_id": "sid-watch", "pane": "w1:p9"},
+                   "steward": {"harness": "claude", "session_id": "sid-steward"},
+                   "watcher": {"pid": 321, "pid_start": "654"}, "refs": ["attempt-one"],
+                   "rearm_count": 0, "observer_generation": 1}
+            paths = peer_steward._watch_paths(watch_id, root)
+            paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+            binding = "/fixture/managed/current"
+            required = peer_steward._watch_observer_duty_argv(
+                watch_id, arm, rearm_generation=0, timeout_before_refs=True)
+            with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+                 mock.patch.object(peer_steward, "_watch_entries", return_value=[(watch_id, arm)]), \
+                 mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_watcher_present", side_effect=[True, False]), \
+                 mock.patch.object(peer_steward.peer_obligations, "validate_service_binding",
+                                   return_value=binding), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "replace_managed_observer", return_value="replaced") as replace, \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(peer_steward, "_spawn_watch_observer") as spawn:
+                peer_steward._ensure_watch_observers(service_current=binding)
+            replace.assert_called_once_with(
+                321, "654", paths.lock, "utilities/peer-steward.py", required,
+                binding, lock_fd_option="--lock-fd", exact_arguments=True,
+                argument_variants=[])
+            spawn.assert_called_once_with(watch_id, arm, service_current=binding)
 
 
 class JoinTest(_WatchMixin, unittest.TestCase):
@@ -3749,11 +3822,90 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         batches.assert_called_once()
         runner.assert_not_called()
 
+    def test_managed_lifecycle_keeps_the_existing_runner_for_external_duties(self):
+        lifecycle_root = self.tmp_root / "managed-release"
+        signature = (("watch-fixture",),), ()
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "managed_service_binding", return_value="/fixture/current"), \
+             mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+             mock.patch.object(peer_steward, "_external_obligation_signature",
+                               return_value=signature), \
+             mock.patch.object(peer_steward, "_runner_duties", return_value=[]), \
+             mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner", return_value=True) as ensure:
+            self.assertEqual(peer_steward.cmd_ensure_obligations(
+                SimpleNamespace(lifecycle_root=lifecycle_root)), 0)
+        ensure.assert_called_once_with(lifecycle_root=lifecycle_root,
+                                       reconciliation_required=True)
+
+    def test_managed_runner_bounds_external_idle_scans_and_resets_for_new_batch(self):
+        import dispatch_batch_obligations as batch
+
+        def create_batch(suffix):
+            args = SimpleNamespace(
+                jobs=self.jobs_path, sealed_batch_id="sealed-" + suffix,
+                parent_attempt_id="att-parent", parent_session_id=None,
+                attempt_id=["att-child-" + suffix], control_socket=None,
+                queue_socket=None, thread_id=None, interval=1.0, timeout=2.0,
+            )
+            duty_id, _ = batch.create(args)
+            batch.update(self.jobs_path, duty_id, state="delivery-pending",
+                         reason="awaiting-recipient", outcome={"state": "done"})
+            return duty_id
+
+        first = create_batch("first")
+        watch_root = peer_steward._watch_root()
+        watch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        watch_id = "watch-idle-fixture"
+        watch_paths = peer_steward._watch_paths(watch_id, watch_root)
+        peer_steward._write_json_atomic(watch_paths.arm, {
+            "schema_version": peer_steward._WATCH_SCHEMA, "watch_id": watch_id,
+            "target": "fixture-target", "agent": {"harness": "codex",
+                "session_id": "sid-fixture", "pane": "w1:p1"},
+            "watcher": {"pid": 123, "pid_start": "456"},
+        })
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        delays = []
+        second = []
+
+        def observed_delay(delay):
+            delays.append(delay)
+            if len(delays) == 2:
+                second.append(create_batch("resumed"))
+            elif len(delays) == 3:
+                batch.update(self.jobs_path, first, state="complete", reason="fixture-settled")
+                batch.update(self.jobs_path, second[0], state="complete", reason="fixture-settled")
+                peer_steward._write_json_atomic(watch_paths.receipt, {"watch_id": watch_id})
+
+        try:
+            with mock.patch.object(peer_steward, "_reconcile_obligations"), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations") as reconcile, \
+                 mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]), \
+                 mock.patch.object(peer_steward.peer_obligations, "exec_service_runner"), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=observed_delay):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock_fd,
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        self.assertEqual(delays, [1.0, 1.7, 1.0])
+        self.assertEqual(reconcile.call_count, 4)
+        self.assertEqual(len(second), 1, "a batch arriving during idle resumes the bounded scan")
+
     def test_pending_peer_ticks_do_not_scan_external_families(self):
         store, duty = self.pending_message()
         ticks = []
 
-        def resume(row, current):
+        def resume(row, current, *, read_context=None):
             ticks.append(row["id"])
             if len(ticks) == 3:
                 current.update(row["id"], state="complete")
@@ -3775,6 +3927,28 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         for operation in (watches, watch_probe, batches, batch_probe):
             operation.assert_not_called()
 
+    def test_runner_idle_backoff_ignores_repeated_observation_writes_and_resets_on_change(self):
+        store, duty = self.pending_message()
+        ticks = []
+
+        def resume(row, current, *, read_context=None):
+            ticks.append(row["id"])
+            if len(ticks) <= 2:
+                current.update(row["id"], observer_error="same-unavailable")
+            elif len(ticks) == 3:
+                current.update(row["id"], observation={"reason": "recipient-returned"})
+            else:
+                current.update(row["id"], state="complete")
+
+        with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock, \
+             mock.patch.object(peer_steward, "_resume_message_obligation", side_effect=resume), \
+             mock.patch.object(peer_steward.time, "sleep") as sleep:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(peer_steward.cmd_obligation_runner(
+                SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+        self.assertEqual(ticks, [duty["id"]] * 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 1.7, 1.0])
+
     def test_work_accepted_at_unlock_is_reclaimed_before_runner_exit(self):
         store = peer_steward.peer_obligations.ObligationStore()
         store.root.mkdir(parents=True, exist_ok=True)
@@ -3788,7 +3962,7 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                     {"harness": "codex", "session_id": "sid-exit"}, {}))
             return result
 
-        def resume(row, current):
+        def resume(row, current, *, read_context=None):
             current.update(row["id"], state="complete")
 
         with (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock, \
@@ -3801,6 +3975,317 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len(accepted), 1)
         self.assertEqual(resumed.call_count, 1)
         self.assertEqual(store.get(accepted[0]["id"])["state"], "complete")
+
+    def test_external_batch_created_at_unlock_invalidates_the_runner_snapshot(self):
+        import dispatch_batch_obligations as batch
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock = lock_path.open("w")
+        watch_root = self.tmp_root / "stable-watch-root"
+        watch_root.mkdir()
+        real_flock = fcntl.flock
+        created = []
+        inside_create = False
+        delays = []
+
+        def unlock_and_accept(fd, operation):
+            nonlocal inside_create
+            result = real_flock(fd, operation)
+            if operation == fcntl.LOCK_UN and not inside_create and not created:
+                inside_create = True
+                args = SimpleNamespace(
+                    jobs=self.jobs_path, sealed_batch_id="accepted-at-unlock",
+                    parent_attempt_id="att-parent", parent_session_id=None,
+                    attempt_id=["att-child-unlock"], control_socket=None,
+                    queue_socket=None, thread_id=None, interval=1.0, timeout=2.0,
+                )
+                created.append(batch.create(args)[0])
+                inside_create = False
+            return result
+
+        def settle_before_next_pass(delay):
+            delays.append(delay)
+            batch.update(self.jobs_path, created[0], state="complete",
+                         reason="fixture-settled")
+
+        original_snapshot = peer_steward._external_obligation_snapshot
+        snapshots = []
+
+        def count_snapshot():
+            value = original_snapshot()
+            snapshots.append(value)
+            return value
+
+        try:
+            real_flock(lock.fileno(), fcntl.LOCK_EX)
+            with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+                 mock.patch.object(batch, "_jobs_paths", side_effect=lambda jobs=None, strict=True: [
+                    Path(jobs).resolve(strict=False) if jobs else self.jobs_path.resolve()
+                 ]), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   side_effect=count_snapshot), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "exec_service_runner", return_value=False), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=settle_before_next_pass), \
+                 mock.patch.object(peer_steward.fcntl, "flock", side_effect=unlock_and_accept):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno(),
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                real_flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock.close()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(delays, [1.0])
+        self.assertEqual(len(snapshots), 3,
+                         "the new batch is reread after unlock and the completed row on the next pass")
+        self.assertEqual(batch.read(self.jobs_path, created[0])["state"], "complete")
+
+    def test_watch_snapshot_brackets_scan_and_reuses_stable_pair(self):
+        import dispatch_batch_obligations as batch
+
+        root = self.tmp_root / "watch-snapshot-race"
+        root.mkdir()
+        batch_root = batch._root(self.jobs_path)
+        batch_root.mkdir(parents=True)
+        with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+             mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]):
+            stable = peer_steward._external_obligation_snapshot()
+            self.assertTrue(stable["watch_cacheable"])
+            self.assertTrue(stable["batches"]["cacheable"])
+            self.assertTrue(peer_steward._external_obligation_snapshot_unchanged(stable))
+
+            original = peer_steward._watch_entries
+            created = []
+
+            def scan_then_create(scan_root):
+                entries = original(scan_root)
+                if not created:
+                    watch_id = "watch-created-inside-scan"
+                    peer_steward._write_json_atomic(
+                        peer_steward._watch_paths(watch_id, root).arm,
+                        {"schema_version": peer_steward._WATCH_SCHEMA,
+                         "watch_id": watch_id, "target": "synthetic-target",
+                         "agent": {"harness": "codex", "session_id": "synthetic-session",
+                                   "pane": "w1:p1"},
+                         "watcher": {"pid": 1, "pid_start": "1"}},
+                    )
+                    created.append(watch_id)
+                return entries
+
+            with mock.patch.object(peer_steward, "_watch_entries", side_effect=scan_then_create):
+                stale = peer_steward._external_obligation_snapshot()
+                self.assertFalse(stale["watch_cacheable"])
+                self.assertEqual(stale["watches"], ())
+                self.assertFalse(peer_steward._external_obligation_snapshot_unchanged(stale))
+                refreshed = peer_steward._external_obligation_snapshot()
+
+        self.assertIn(created[0], [watch_id for watch_id, _arm in refreshed["watches"]])
+
+    def test_batch_created_between_scan_and_stamp_is_reclaimed_by_runner(self):
+        import dispatch_batch_obligations as batch
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock = (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        watch_root = self.tmp_root / "empty-watch-root"
+        watch_root.mkdir()
+        batch_root = batch._root(self.jobs_path)
+        batch_root.mkdir(parents=True)
+        args = SimpleNamespace(
+            jobs=self.jobs_path, sealed_batch_id="accepted-during-read",
+            parent_attempt_id="att-parent", parent_session_id=None,
+            attempt_id=["att-child-scan-race"], delivery_parent_id="att-parent",
+            control_socket=None, queue_socket=None, thread_id=None,
+            interval=1.0, timeout=2.0,
+        )
+        created = []
+        watch_created = []
+        producer_results = []
+        snapshots = []
+        launches = []
+        original_watch_entries = peer_steward._watch_entries
+        original_records = batch._read_only_records
+        original_snapshot = peer_steward._external_obligation_snapshot
+
+        def scan_watch_then_accept(root):
+            entries = original_watch_entries(root)
+            if not watch_created:
+                watch_id = "watch-accepted-during-read"
+                peer_steward._write_json_atomic(
+                    peer_steward._watch_paths(watch_id, watch_root).arm,
+                    {"schema_version": peer_steward._WATCH_SCHEMA,
+                     "watch_id": watch_id, "target": "synthetic-watch-target",
+                     "agent": {"harness": "codex", "session_id": "synthetic-watch-session",
+                               "pane": "w1:p1"},
+                     "watcher": {}},
+                )
+                watch_created.append(watch_id)
+            return entries
+
+        def scan_then_accept(jobs):
+            records = original_records(jobs)
+            if not created:
+                duty_id, _record = batch.create(args)
+                batch.update(jobs, duty_id, state="delivery-pending",
+                             outcome={"state": "settled", "attempts": args.attempt_id})
+                created.append(duty_id)
+                producer_results.append(peer_steward.peer_obligations._ensure_runner(
+                    store.root.parent.parent, use_remembered=True,
+                    reconciliation_required=True))
+            return records
+
+        def count_snapshot():
+            snapshot = original_snapshot()
+            snapshots.append(snapshot)
+            return snapshot
+
+        class Launched:
+            pid = 901234
+
+        def launch(command, **kwargs):
+            if "--resume-obligation" in command:
+                launches.append(("batch", command, batch.read(self.jobs_path, created[0]), kwargs))
+            else:
+                launches.append(("watch", command, None, kwargs))
+            return Launched()
+
+        sleeps = []
+
+        def settle_after_reclaim(_delay):
+            sleeps.append(_delay)
+            if len(sleeps) == 2:
+                batch.update(self.jobs_path, created[0], state="complete",
+                             reason="synthetic-owner-progress")
+                peer_steward._write_json_atomic(
+                    peer_steward._watch_paths(watch_created[0], watch_root).receipt,
+                    {"watch_id": watch_created[0], "state": "synthetic-complete"})
+
+        try:
+            with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+                 mock.patch.object(peer_steward, "_watch_entries",
+                                   side_effect=scan_watch_then_accept), \
+                 mock.patch.object(batch, "_jobs_paths", return_value=[self.jobs_path.resolve()]), \
+                 mock.patch.object(batch, "_read_only_records", side_effect=scan_then_accept), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   side_effect=count_snapshot), \
+                 mock.patch.object(peer_steward.peer_obligations, "exec_service_runner",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_settle_terminal_watch_if_unobserved",
+                                   return_value=False), \
+                 mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+                 mock.patch.object(peer_steward, "_watch_terminal_from_view", return_value=None), \
+                 mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=None), \
+                 mock.patch.object(batch.subprocess, "Popen", side_effect=launch), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=settle_after_reclaim):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno(),
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock.close()
+
+        self.assertEqual(producer_results, [False],
+                         "the producer saw the held runner lock and left responsibility with it")
+        self.assertEqual(len(launches), 2,
+                         "the real runner must reclaim both accepted external obligations")
+        self.assertFalse(snapshots[0]["watch_cacheable"])
+        self.assertEqual(snapshots[0]["watches"], ())
+        self.assertFalse(snapshots[0]["batches"]["cacheable"])
+        self.assertEqual(snapshots[0]["batches"]["signature"], ())
+        self.assertTrue(any(created[0] in [item[1] for item in snapshot["batches"]["signature"]]
+                            for snapshot in snapshots[1:]))
+        self.assertTrue(any(watch_created[0] in [watch_id for watch_id, _arm in snapshot["watches"]]
+                            for snapshot in snapshots[1:]))
+        self.assertEqual([kind for kind, _command, _record, _kwargs in launches], ["watch", "batch"])
+        _kind, command, accepted, _kwargs = launches[1]
+        self.assertIn("--resume-obligation", command)
+        self.assertIn(created[0], command)
+        self.assertEqual(accepted["state"], "delivery-pending")
+        recovered = batch.read(self.jobs_path, created[0])
+        self.assertEqual(recovered["state"], "complete")
+        self.assertEqual(recovered["reason"], "synthetic-owner-progress")
+        self.assertEqual(recovered["observer"]["pid"], Launched.pid)
+        self.assertTrue(peer_steward._watch_paths(watch_created[0], watch_root).receipt.is_file())
+
+    def test_scan_then_stamp_legacy_order_is_caught_at_real_runner_boundary(self):
+        import dispatch_batch_obligations as batch
+
+        def legacy_batch_snapshot(jobs=None):
+            signature, paths_by_jobs, roots_by_jobs, root_stamps = [], {}, {}, {}
+            cacheable = True
+            for jobs_path in batch._jobs_paths(jobs, strict=False):
+                key = str(jobs_path.resolve(strict=False))
+                root = jobs_path.resolve(strict=False).parent / "supervisor-state" / "obligations"
+                roots_by_jobs[key] = root
+                try:
+                    records = batch._read_only_records(jobs_path)
+                except (OSError, batch.BatchObligationError):
+                    signature.append((str(jobs_path), "unavailable"))
+                    paths_by_jobs[key] = None
+                    root_stamps[key] = batch._directory_stamp(root)
+                    cacheable = False
+                    continue
+                root_stamps[key] = batch._directory_stamp(root)
+                pending_paths = []
+                for path, record, error in records:
+                    if error is not None:
+                        signature.append((str(jobs_path), path.name, "unreadable"))
+                        pending_paths.append(path)
+                    elif record and record.get("state") in batch._PENDING:
+                        pending_paths.append(path)
+                        observer = record.get("observer") or {}
+                        signature.append((
+                            str(jobs_path), record.get("id", path.stem), record.get("state"),
+                            record.get("delivery"), observer.get("pid"), observer.get("pid_start"),
+                        ))
+                paths_by_jobs[key] = tuple(pending_paths)
+            return {"signature": tuple(sorted(signature)), "paths_by_jobs": paths_by_jobs,
+                    "roots_by_jobs": roots_by_jobs, "root_stamps": root_stamps,
+                    "cacheable": cacheable}
+
+        def legacy_external_snapshot():
+            try:
+                root = peer_steward._watch_root()
+                watches = tuple(peer_steward._watch_entries(root))
+                stamp = batch._directory_stamp(root)
+                cacheable = True
+            except Exception:
+                root, watches, stamp, cacheable = None, None, None, False
+            try:
+                batches = batch.pending_observer_snapshot()
+            except Exception:
+                batches = {"signature": (("batch-state-unavailable",),),
+                           "paths_by_jobs": {}}
+            return {"watch_root": root, "watches": watches, "watch_stamp": stamp,
+                    "watch_cacheable": cacheable, "batches": batches}
+
+        result = unittest.TestResult()
+        regression = ObligationStartupTest(
+            "test_batch_created_between_scan_and_stamp_is_reclaimed_by_runner")
+        with mock.patch.object(batch, "pending_observer_snapshot",
+                               side_effect=legacy_batch_snapshot), \
+             mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                               side_effect=legacy_external_snapshot):
+            regression.run(result)
+
+        # The focused boundary regression must fail with the old scan→stamp
+        # order; the current-source test in this class passes and proves both
+        # obligations were reclaimed by the coordinator.
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("0 != 2", result.failures[0][1])
 
 
 class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):

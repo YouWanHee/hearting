@@ -15,6 +15,8 @@ DEFAULT_STATUS_LINE = (
 )
 DEFAULT_STATUS_LINE_USE_COLORS = True
 BACKUP_NAME = "config.toml.pre-harness-tui"
+STARTUP_UPDATE_KEY = "check_for_update_on_startup"
+STARTUP_UPDATE_DEFAULT = False
 _MISSING = object()
 _TABLE_RE = re.compile(r"^\s*(\[\[?[^\]]+\]\]?)\s*(?:#.*)?$")
 _TUI_TABLE_RE = re.compile(r"^\s*\[tui\]\s*(?:#.*)?$")
@@ -216,6 +218,130 @@ def merge_status_line_from_fragment(text: str, fragment_path) -> str:
     return merge_status_line_text(text, defaults, colors)
 
 
+def _root_table_index(lines):
+    """Find the first real TOML table header, ignoring quoted multiline content."""
+    multiline = None
+    for line_index, line in enumerate(lines):
+        if multiline is None and _TABLE_RE.match(line.rstrip("\r\n")):
+            return line_index
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if multiline is not None:
+                if multiline == '"' and char == "\\":
+                    index += 2
+                elif line.startswith(multiline * 3, index):
+                    multiline = None
+                    index += 3
+                else:
+                    index += 1
+                continue
+            if char == "#":
+                break
+            if char in ('"', "'"):
+                if line.startswith(char * 3, index):
+                    multiline = char
+                    index += 3
+                    continue
+                index += 1
+                while index < len(line):
+                    if char == '"' and line[index] == "\\":
+                        index += 2
+                    elif line[index] == char:
+                        index += 1
+                        break
+                    else:
+                        index += 1
+                continue
+            index += 1
+    return None
+
+
+def _merge_startup_update_default(text: str) -> tuple[str, str]:
+    parsed = _parse(text)
+    current = parsed.get(STARTUP_UPDATE_KEY, _MISSING)
+    if current is not _MISSING:
+        if type(current) is not bool:
+            raise CodexTuiConfigError(f"{STARTUP_UPDATE_KEY} must be a boolean")
+        return text, ""
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    assignment = f"{STARTUP_UPDATE_KEY} = false{newline}"
+    # Put the root setting before all user tables and managed blocks. Inserting
+    # directly before a table can split a comment-delimited block such as the
+    # runtime-activation identity table that precedes its own header.
+    inserted = assignment
+    updated = inserted + text
+    _parse(updated, "merged Codex startup config")
+    return updated, inserted
+
+
+def merge_startup_update_default_text(text: str) -> str:
+    """Insert the startup-update default at TOML root, preserving explicit booleans."""
+    return _merge_startup_update_default(text)[0]
+
+
+def _valid_startup_update_record(record) -> bool:
+    if not isinstance(record, dict) or record.get("schema") != 1 \
+            or record.get("baseline") != {"present": False} \
+            or type(record.get("projected")) is not bool or record["projected"] is not False:
+        return False
+    inserted = record.get("inserted")
+    if not isinstance(inserted, str) or not re.fullmatch(
+            r"(?:\r?\n)?check_for_update_on_startup = false(?:\r?\n)", inserted):
+        return False
+    try:
+        return _parse(inserted, "startup default receipt") == {STARTUP_UPDATE_KEY: False}
+    except CodexTuiConfigError:
+        return False
+
+
+def _startup_update_record_matches(text: str, record) -> bool:
+    if not _valid_startup_update_record(record):
+        return False
+    try:
+        parsed = _parse(text)
+    except CodexTuiConfigError:
+        return False
+    inserted = record["inserted"]
+    if parsed.get(STARTUP_UPDATE_KEY, _MISSING) is not False or text.count(inserted) != 1:
+        return False
+    lines = text.splitlines(keepends=True)
+    table_index = _root_table_index(lines)
+    root_end = sum(len(line) for line in lines[:table_index]) if table_index is not None else len(text)
+    start = text.find(inserted)
+    key_start = start + (1 if inserted.startswith(("\n", "\r\n")) else 0)
+    return start >= 0 and key_start < root_end
+
+
+def startup_update_default_record(before: str, after: str, previous=None) -> dict | None:
+    """Record only our exact root insertion, retaining its ownership across refresh."""
+    parsed_before = _parse(before)
+    current = parsed_before.get(STARTUP_UPDATE_KEY, _MISSING)
+    if current is not _MISSING:
+        if type(current) is not bool:
+            raise CodexTuiConfigError(f"{STARTUP_UPDATE_KEY} must be a boolean")
+        return previous if current is False and _startup_update_record_matches(before, previous) else None
+    expected, inserted = _merge_startup_update_default(before)
+    if not inserted or expected != after:
+        return None
+    record = {"schema": 1, "baseline": {"present": False},
+              "projected": STARTUP_UPDATE_DEFAULT, "inserted": inserted}
+    return record if _valid_startup_update_record(record) else None
+
+
+def restore_startup_update_default_text(text: str, record) -> str:
+    """Remove only the exact inserted root line while it still has the projected value."""
+    if not _startup_update_record_matches(text, record):
+        return text
+    updated = text.replace(record["inserted"], "", 1)
+    try:
+        parsed = _parse(updated, "restored Codex startup config")
+    except CodexTuiConfigError:
+        return text
+    return text if STARTUP_UPDATE_KEY in parsed else updated
+
+
 def _tui_bounds(lines):
     start = next((i for i, line in enumerate(lines) if _TUI_TABLE_RE.match(line)), None)
     if start is None:
@@ -337,10 +463,17 @@ def restore_status_line_text(text: str, record) -> str:
 
 
 def apply_status_line(config_path, fragment_path, *, dry_run=False) -> dict:
-    """Apply the shared transformation with the shell installer backup contract."""
+    """Apply shared Codex defaults with the shell installer's backup contract."""
     config_path, fragment_path = Path(config_path), Path(fragment_path)
     original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     updated = merge_status_line_from_fragment(original, fragment_path)
+    statusline_updated = updated
+    startup_error = None
+    try:
+        updated = merge_startup_update_default_text(updated)
+    except CodexTuiConfigError as exc:
+        # A malformed startup key must not discard the independent status-line merge.
+        startup_error = str(exc)
     changed = updated != original
     if changed and not dry_run:
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,4 +500,6 @@ def apply_status_line(config_path, fragment_path, *, dry_run=False) -> dict:
             except FileNotFoundError:
                 pass
     return {"path": str(config_path), "fragment": str(fragment_path),
-            "changed": changed, "status": "planned" if dry_run and changed else "ok"}
+            "changed": changed, "startup_changed": updated != statusline_updated,
+            "startup_error": startup_error,
+            "status": "planned" if dry_run and changed else "ok"}

@@ -28,6 +28,12 @@ class LeasesTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state = self.root / "dispatch" / "gpu-leases.json"
+        self.no_tmux_bin = self.root / "no-tmux-bin"
+        self.no_tmux_bin.mkdir()
+        for name, target in (("python3", sys.executable), ("bash", "/bin/bash"),
+                             ("id", "/usr/bin/id"), ("sh", "/bin/sh"),
+                             ("tr", "/usr/bin/tr")):
+            (self.no_tmux_bin / name).symlink_to(target)
 
     def acquire(self, **kwargs):
         return G.acquire(self.state, OBS, **kwargs)
@@ -110,12 +116,129 @@ class LeasesTest(unittest.TestCase):
                 "owner": {"label": name}, "task": "CPU fixture", "run_id": "gpu-lease-test-" + name,
                 "run_dir": str(run_dir), "inner": inner}
 
-    def launch(self, options):
+    def launch(self, options, env=None):
         payload_source = G.serialized_payload_source()
         code = SOURCE + '\nprint(json.dumps(launch_compute(%r, %r)))' % (options, payload_source)
-        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+        launch_env = {**os.environ, "PATH": str(self.no_tmux_bin)}
+        if env:
+            launch_env.update(env)
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                                text=True, timeout=10, env=launch_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_tmux_launch_uses_private_server_and_exact_session_environment(self):
+        fakebin = self.root / "tmux-bin"
+        fakebin.mkdir()
+        records = self.root / "tmux-records"
+        fake = fakebin / "tmux"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, subprocess, sys\n"
+            "args = sys.argv[1:]\n"
+            "server = args[args.index('-L') + 1]\n"
+            "records = pathlib.Path(os.environ['HEARTING_FAKE_TMUX_RECORDS'])\n"
+            "def record(row):\n"
+            "    path = records / (row['event'] + '.jsonl')\n"
+            "    path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    with path.open('a') as handle: handle.write(json.dumps(row) + '\\n')\n"
+            "if 'start-server' in args:\n"
+            "    record({'event':'start', 'server':server, 'cwd':os.getcwd(), "
+            "'pins':{k:os.environ.get(k) for k in ('AGENT_HOME','AGENT_DISPATCH_ATTEMPT_ID',"
+            "'CODEX_THREAD_ID','CLAUDE_CODE_SESSION_ID','TMUX','TMUX_PANE',"
+            "'HEARTING_COMPUTE_RUN_ID','HEARTING_COMPUTE_HOST','HEARTING_RESOURCE_RUN_ID',"
+            "'HEARTING_GPU_LEASE_RELEASE')}})\n"
+            "else:\n"
+            "    tail = args[args.index('new-session') + 1:]\n"
+            "    session_env = {}; cwd = '/'; command = None; index = 0\n"
+            "    while index < len(tail):\n"
+            "        item = tail[index]\n"
+            "        if item in ('-d',): index += 1\n"
+            "        elif item in ('-s','-c','-e'):\n"
+            "            value = tail[index + 1]; index += 2\n"
+            "            if item == '-s': run_id = value\n"
+            "            elif item == '-c': cwd = value\n"
+            "            else:\n"
+            "                key, _, value = value.partition('='); session_env[key] = value\n"
+            "        else: command = item; break\n"
+            "    record({'event':'session', 'server':server, 'cwd':cwd, "
+            "'session_env':session_env, 'run_id':run_id})\n"
+            "    child = dict(os.environ)\n"
+            "    child.update({'AGENT_HOME':'/stale/server-release', "
+            "'AGENT_DISPATCH_ATTEMPT_ID':'att-stale-server', 'CODEX_THREAD_ID':'stale-thread'})\n"
+            "    child.update(session_env)\n"
+            "    raise SystemExit(subprocess.run(['bash','-lc',command], cwd=cwd, env=child).returncode)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        options = self.options("isolated-tmux", requested="")
+        output = Path(options["run_dir"]) / "transport-result"
+        options["inner"] = (
+            "__HEARTING_GPU_SETUP__ && printf '%s|%s|%s' \"$AGENT_HOME\" "
+            "\"$AGENT_DISPATCH_ATTEMPT_ID\" \"$CODEX_THREAD_ID\" > " + str(output)
+        )
+        options["cwd"] = str(self.root)
+        options["tmux_environment"] = {
+            **{key: "" for key in G.session_environment_keys()},
+            "AGENT_HOME": "/fixture/pinned-release",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-current-launch",
+            "CODEX_THREAD_ID": "current-thread",
+            "HEARTING_COMPUTE_RUN_ID": options["run_id"],
+            "HEARTING_COMPUTE_HOST": "fixture-host",
+            "HEARTING_RESOURCE_RUN_ID": "",
+            "HEARTING_GPU_LEASE_RELEASE": "",
+        }
+        server_env = {
+            "PATH": str(fakebin) + os.pathsep + str(self.no_tmux_bin),
+            "HEARTING_FAKE_TMUX_RECORDS": str(records),
+            "AGENT_HOME": "/launcher/stale-release",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-launcher-stale",
+            "CODEX_THREAD_ID": "launcher-stale-thread",
+            "TMUX": "/tmp/default-tmux,123,0",
+            "TMUX_PANE": "%9",
+            "HEARTING_COMPUTE_RUN_ID": "stale-compute-run",
+            "HEARTING_COMPUTE_HOST": "stale-host",
+            "HEARTING_RESOURCE_RUN_ID": "stale-resource-run",
+            "HEARTING_GPU_LEASE_RELEASE": "echo stale-lease",
+        }
+        receipt = self.launch(options, env=server_env)
+        self.assertEqual(output.read_text(),
+                         "/fixture/pinned-release|att-current-launch|current-thread")
+        transport = receipt["tmux_transport"]
+        self.assertEqual(transport["kind"], "hearting-tmux-v1")
+        self.assertRegex(transport["server"], r"^hearting-[0-9a-f]{20}$")
+        start = json.loads((records / "start.jsonl").read_text().splitlines()[0])
+        session = json.loads((records / "session.jsonl").read_text().splitlines()[0])
+        self.assertEqual(start["server"], transport["server"])
+        self.assertEqual(start["cwd"], "/")
+        self.assertEqual(set(start["pins"].values()), {None})
+        self.assertEqual(session["cwd"], str(self.root))
+        self.assertEqual(session["session_env"], options["tmux_environment"])
+
+    def test_tmux_launch_failure_releases_lease_for_a_retry(self):
+        fakebin = self.root / "failing-tmux-bin"
+        fakebin.mkdir()
+        tmux = fakebin / "tmux"
+        tmux.write_text(
+            "#!/bin/sh\n"
+            'if [ "$3" = "start-server" ]; then exit 0; fi\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        tmux.chmod(0o755)
+        options = self.options("tmux-failure", requested="0")
+        payload_source = G.serialized_payload_source()
+        code = SOURCE + "\nlaunch_compute(%r, %r)\n" % (options, payload_source)
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            timeout=10,
+            env={**os.environ, "PATH": str(fakebin) + os.pathsep + str(self.no_tmux_bin)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(G.snapshot(self.state), [])
+        retry = G.acquire(self.state, OBS, requested="0", run_id="tmux-retry")
+        self.assertEqual(retry["gpus"], ["0"])
+        G.release(self.state, retry)
 
     def test_two_concurrent_sessions_choose_distinct_gpus_and_release_on_exit(self):
         options = [self.options("one"), self.options("two")]

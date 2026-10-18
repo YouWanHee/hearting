@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: design-components
 description: "Use only when autopilot-design dispatches component, mockup, or preview construction. Not for top-level user requests or primary capability routing."
 argument-hint: "<design path or app path>"
 metadata:

@@ -782,6 +782,10 @@ def _pending_target_matches(row, recipient):
     return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
 
 
+class UnsupportedPendingSchema(ValueError):
+    """A valid pending row written by a newer reader; preserve it for takeover."""
+
+
 def _read_pending(ref, *, roots=None):
     path = _pending_path(ref)
     try:
@@ -796,6 +800,9 @@ def _read_pending(ref, *, roots=None):
     if len(raw) > 65536:
         raise ValueError("peer-pending-oversized")
     row = json.loads(raw)
+    if (isinstance(row, dict) and type(row.get("schema_version")) is int
+            and row["schema_version"] > 1):
+        raise UnsupportedPendingSchema("peer-pending-schema-unsupported")
     transfer = _read_transfer_record(ref, roots=roots)
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
@@ -949,6 +956,10 @@ def _pending_rows(*, recipient=None, sender=None, read_context=None):
         try:
             expected = path.lstat()
             row = _read_pending(path.stem, roots=roots)
+        except UnsupportedPendingSchema:
+            # A newer schema is not evidence of corruption. Leave its bytes
+            # and inode in place for a compatible managed reader to consume.
+            continue
         except (OSError, ValueError) as exc:
             if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
                 # A lock or temporary I/O failure proves no damage; the next
@@ -1130,7 +1141,8 @@ def schedule_acceptance_reply(handoff_ref, sender, recipient):
     return ref
 
 
-def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
+def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
+                        allow_hook_context_recovery=False):
     """Reserve one exact deferred row before any pane input, using the existing claim state.
 
     Other senders and native callbacks cannot submit it again once it is
@@ -1142,7 +1154,16 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
     from dispatch_contract import process_start_ticks
     with pending_lock(ref):
         row = _read_pending(ref)
-        if (not row or row["state"] != "pending" or row.get("rpc_claim")
+        recover_hook_context = bool(
+            allow_hook_context_recovery
+            and row
+            and recipient.get("harness") == "claude"
+            and row.get("state") == "queued"
+            and row.get("receipt") == "hook-context-emitted"
+            and not row.get("no_trailer")
+        )
+        if (not row or (row["state"] != "pending" and not recover_hook_context)
+                or row.get("rpc_claim")
                 or not _pending_target_matches(row, recipient)):
             return None
         if _registered_delivery_settled(row):
@@ -1695,12 +1716,16 @@ def retry_pending_codex(recipient):
         deliver_pending_codex(row["ref"], timeout=0.25)
 
 
-def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
-    """Use an existing native context boundary, preserving emission vs receipt.
+def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
+                      native_delivery=False):
+    """Use an existing native context boundary, settling only exact Claude delivery.
 
     Only Claude needs body delivery here; the other runtimes retain their native
-    queues. Claims serialize this with pane/native sends. A failed output remains
-    ambiguous, while a successful flush records queued, never received.
+    queues. Claims serialize this with pane/native sends. The Claude hook passes
+    native_delivery only from its UserPromptSubmit/PostToolUse boundary; after a
+    successful flush that boundary is recipient consumption under SD-113. Exact
+    receive validation and its existing writer still own the receipt/obligation
+    transition. CLI rendering and failed flushes remain unreceived.
     """
     if not _valid_transfer_endpoint(recipient):
         return
@@ -1724,8 +1749,11 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
                 parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
                 if not parsed or parsed.get("transfer_ref") != row["ref"]:
                     continue
+            native_boundary = bool(native_delivery and event in {"UserPromptSubmit", "PostToolUse"})
             try:
-                claimed = claim_pending_herdr(row["ref"], recipient, receipt="hook-context-inflight")
+                claimed = claim_pending_herdr(
+                    row["ref"], recipient, receipt="hook-context-inflight",
+                    allow_hook_context_recovery=native_boundary)
             except BlockingIOError:
                 continue
             if claimed:
@@ -1768,11 +1796,21 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
     print(json.dumps(output, ensure_ascii=False), file=stream)
     stream.flush()
     for row in claims:
+        native_boundary = bool(native_delivery and event in {"UserPromptSubmit", "PostToolUse"})
+        if native_boundary and not row.get("no_trailer"):
+            try:
+                receive_peer_message(row["text"], recipient, summary_text="Claude native context received")
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            # Exact validation or durable receipt failure leaves the same
+            # in-flight claim and original body for its normal recovery owner.
+            continue
         with pending_lock(row["ref"]):
             current = _read_pending(row["ref"])
             if (current and current["state"] == "unverified"
                     and current.get("rpc_claim") == row["rpc_claim"]):
-                _save_pending(dict(current, state="queued", rpc_claim=None, receipt="hook-context-emitted"))
+                receipt = "hook-context-emitted" if native_boundary else "context-emitted"
+                _save_pending(dict(current, state="queued", rpc_claim=None, receipt=receipt))
     for ref in warnings:
         with pending_lock(ref):
             current = _read_pending(ref)

@@ -48,20 +48,13 @@ def _append_self_instrumentation(
             # `<release>/.dispatch/logs/` on every prompt made every
             # superseded release un-prunable (delta-digest-mismatch).
             return
-        log_dir = root_path / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(
-            {
-                "ts_ns": time.time_ns(),
-                "elapsed_ns": elapsed_ns,
-                "entries": entry_count,
-                "claimed": 1 if claimed_count else 0,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with open(log_dir / LOG_FILENAME, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        from dispatch_observation_log import append_record
+        append_record(root_path, LOG_FILENAME, {
+            "ts_ns": time.time_ns(),
+            "elapsed_ns": elapsed_ns,
+            "entries": entry_count,
+            "claimed": 1 if claimed_count else 0,
+        })
     except OSError:
         pass
 
@@ -164,7 +157,7 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
 
 
 def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
-    """Reconnect existing courier duties on startup/resume; context alone is not receipt."""
+    """Reconnect activation duties and run canonical bounded maintenance once per session start."""
     records, _ = addressed_records(root, recipient_kind, session_id)
     from peer_obligations import retain_registered_completion
     for record in records:
@@ -176,7 +169,35 @@ def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
                 retain_registered_completion(jobs, attempt, session_id, recipient_kind)
             except (OSError, ValueError):
                 continue
+    _reconcile_canonical_dispatch_state(root)
     return records
+
+
+def _reconcile_canonical_dispatch_state(root: Path) -> None:
+    """Use the existing activation event to reach shared settlement and expiry owners."""
+    try:
+        from dispatch_contract import dispatch_state_roots, resolve_agent_home
+        roots = dispatch_state_roots(resolve_agent_home())
+        if not roots or Path(root).resolve(strict=False) != Path(roots[0]).resolve(strict=False):
+            return
+        jobs = Path(roots[0]) / "jobs.log"
+        if not jobs.is_file():
+            return
+    except Exception:
+        return
+    # This remains the single dispatch-reconcile actor for materialize,
+    # known-dead expiry, and retention pruning. A failure here does not prevent
+    # the independent owner-settlement reconnect below.
+    try:
+        from dispatch_completion_join import reconcile_pending_delivery
+        reconcile_pending_delivery(jobs)
+    except Exception:
+        pass
+    try:
+        from dispatch_batch_obligations import ensure_observers
+        ensure_observers()
+    except Exception:
+        pass
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:

@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: code-plan
 description: "Use only when autopilot-code dispatches the planning and plan-check stage. Not for top-level user requests or primary capability routing."
 argument-hint: "<task description> [--intensity direct|quick|standard|strong|thorough|adversarial]"
 metadata:

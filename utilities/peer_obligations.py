@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -206,6 +208,242 @@ def _service_exec_environment(source_root: Path, target_root: Path, environ=None
                 rewritten.append(str(target_root / relative))
         child_env["PYTHONPATH"] = os.pathsep.join(rewritten)
     return child_env
+
+
+def service_script(relative_script: str | Path, service_current: str | Path | None = None,
+                   *, root=None, environ=None):
+    """Resolve a service script only through an explicitly validated binding.
+
+    Fixed callers receive a script beneath their current code root. Lifecycle
+    callers may pass the verified managed-current binding to select the active
+    release and rebuild its service environment.
+    """
+    code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+    relative = Path(relative_script)
+    if relative.is_absolute():
+        relative = relative.resolve(strict=True).relative_to(code_root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("service-script-path-invalid")
+    binding = validate_service_binding(service_current, root=code_root)
+    target_root = active_service_root(binding, root=code_root) if binding else None
+    target_root = target_root or code_root
+    script = target_root / relative
+    if not script.is_file():
+        raise FileNotFoundError(script)
+    environment = (_service_exec_environment(code_root, target_root, environ=environ)
+                   if binding and target_root != code_root else None)
+    return script, environment, binding
+
+
+def _proc_start_identity(pid: int):
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2:].split()
+        if not fields or fields[0] in {"Z", "X"}:
+            return None
+        return fields[19]
+    except (OSError, ValueError, TypeError, IndexError):
+        return None
+
+
+def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
+    """Require the exact duty lock to be attached to this process's open fd."""
+    try:
+        info = lock_path.stat()
+        device = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}"
+        inode = str(info.st_ino)
+        fdinfo = Path(f"/proc/{pid}/fdinfo/{fd_number}").read_text(encoding="ascii")
+        for line in fdinfo.splitlines():
+            fields = line.split()
+            if (len(fields) >= 7 and fields[0] == "lock:" and fields[2] == "FLOCK"
+                    and fields[6] == device + ":" + inode):
+                return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return False
+
+
+def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | Path,
+                             relative_script: str | Path, required_arguments: Iterable[str],
+                             service_current: str | Path, *, lock_fd_option: str,
+                             root=None, timeout: float = 2.0,
+                             exact_arguments: bool = False,
+                             argument_variants: Iterable[Iterable[str]] = (),
+                             service_current_option: str = "--service-current"):
+    """Stop one exact old observer after proving its same-install duty lock.
+
+    Returns ``current`` for an already-current observer, ``replaced`` after
+    that exact process exits, and ``False`` when any part of the proof is
+    unavailable. No duty data is changed here.
+    """
+    if pid_start is not None and (
+            not isinstance(pid_start, str) or not pid_start.isdecimal()):
+        return False
+    if (isinstance(pid, bool) or not isinstance(pid, (int, str))
+            or (isinstance(pid, str) and not pid.isdecimal())):
+        return False
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            return False
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        expected_start = pid_start
+        lock = Path(lock_path).resolve(strict=True)
+        relative = Path(relative_script)
+        expected_args = list(map(str, required_arguments))
+        expected_variants = [expected_args]
+        if exact_arguments:
+            expected_variants.extend(list(map(str, variant)) for variant in argument_variants)
+        pidfd = os.pidfd_open(pid)
+        try:
+            def inspect():
+                nonlocal expected_start
+                # Resolve the managed target for every inspection. Activation
+                # may change the current release between the initial check and
+                # the pidfd signal boundary.
+                binding = validate_service_binding(service_current, root=code_root)
+                target_root = active_service_root(binding, root=code_root) if binding else None
+                if target_root is None:
+                    return None
+                observed_start = _proc_start_identity(pid)
+                if not observed_start:
+                    return None
+                if expected_start is None:
+                    # PID-only historical rows may bind only to the process
+                    # behind this newly opened pidfd. Subsequent inspections
+                    # must retain that exact birth identity.
+                    expected_start = observed_start
+                elif observed_start != expected_start:
+                    return None
+                namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
+                if namespace != os.stat("/proc/self/ns/pid").st_ino:
+                    return None
+                proc = Path("/proc") / str(pid)
+                argv = proc.joinpath("cmdline").read_bytes().decode().rstrip("\0").split("\0")
+                if len(argv) < 3:
+                    return None
+                script = Path(argv[1]).resolve(strict=True)
+                source_root = script.parent.parent
+                if (script != source_root / relative or _release_root(
+                        source_root, _service_layout(code_root)[2]) is None):
+                    return None
+                source_layout = _service_layout(source_root)
+                target_layout = _service_layout(code_root)
+                if (source_layout is None or target_layout is None
+                        or source_layout[1] != target_layout[1]
+                        or source_layout[2] != target_layout[2]
+                        or source_layout[3] != target_layout[3]):
+                    return None
+                lock_fd_number = None
+                if exact_arguments:
+                    duty_arguments = []
+                    control_values = {}
+                    control_options = {lock_fd_option, service_current_option}
+                    index = 2
+                    while index < len(argv):
+                        option = argv[index]
+                        if option in control_options:
+                            if option in control_values or index + 1 >= len(argv):
+                                return None
+                            value = argv[index + 1]
+                            if not value or value.startswith("--"):
+                                return None
+                            control_values[option] = value
+                            index += 2
+                            continue
+                        duty_arguments.append(option)
+                        index += 1
+                    if duty_arguments not in expected_variants:
+                        return None
+                    lock_fd_number = control_values.get(lock_fd_option)
+                    if lock_fd_number is None or not lock_fd_number.isdecimal():
+                        return None
+                    observed_binding = control_values.get(service_current_option)
+                    if observed_binding is not None and (
+                            validate_service_binding(observed_binding, root=code_root) != binding):
+                        return None
+                elif not any(argv[i:i + len(expected_args)] == expected_args
+                             for i in range(2, len(argv) - len(expected_args) + 1)):
+                    return None
+                try:
+                    env = {}
+                    for item in proc.joinpath("environ").read_bytes().split(b"\0"):
+                        if b"=" in item:
+                            key, value = item.split(b"=", 1)
+                            env[key.decode()] = value.decode(errors="replace")
+                    # The launcher can inherit a different release path from
+                    # the script's source root. Accept that provenance only
+                    # when it resolves to this same managed installation.
+                    for name in ("AGENT_HOME", "CLAUDE_HOME"):
+                        if name not in env:
+                            continue
+                        raw = env.get(name)
+                        if not raw:
+                            return None
+                        env_root = Path(raw).expanduser().resolve(strict=True)
+                        env_layout = _service_layout(env_root)
+                        if env_layout is None or env_layout[1:] != source_layout[1:]:
+                            return None
+                    if "HARNESS_DATA_ROOT" in env:
+                        raw = env["HARNESS_DATA_ROOT"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser()
+                    elif "XDG_DATA_HOME" in env:
+                        raw = env["XDG_DATA_HOME"]
+                        if not raw:
+                            return None
+                        observed_data_root = Path(raw).expanduser() / "hearting"
+                    else:
+                        home = env.get("HOME")
+                        if not home:
+                            return None
+                        observed_data_root = (
+                            Path(home).expanduser() / ".local" / "share" / "hearting")
+                    if (not observed_data_root.is_absolute()
+                            or Path(os.path.abspath(os.fspath(observed_data_root)))
+                            != source_layout[1]):
+                        return None
+                except (OSError, RuntimeError, ValueError):
+                    return None
+                try:
+                    if lock_fd_number is None:
+                        fd_index = argv.index(lock_fd_option)
+                        lock_fd_number = argv[fd_index + 1]
+                    held_path = Path(os.path.realpath(proc / "fd" / lock_fd_number))
+                except (ValueError, IndexError, OSError):
+                    return None
+                if held_path != lock or not _process_holds_flock(pid, lock, lock_fd_number):
+                    return None
+                if source_root == target_root:
+                    return ("current", None)
+                return ("legacy", None)
+
+            status = inspect()
+            if status is None:
+                return False
+            if status[0] == "current":
+                return "current"
+            # Recheck all evidence immediately before signaling the pidfd-bound
+            # process. A stale PID or changed duty lock cannot authorize this.
+            status = inspect()
+            if status is None:
+                return False
+            if status[0] == "current":
+                return "current"
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            deadline = time.monotonic() + max(0.0, timeout)
+            while time.monotonic() < deadline:
+                if _proc_start_identity(pid) != expected_start:
+                    return "replaced"
+                time.sleep(0.02)
+            return False
+        finally:
+            os.close(pidfd)
+    except (OSError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
 
 
 def exec_service_runner(lock_fd: int, state_root: str | Path, service_current: str | Path,
@@ -509,6 +747,17 @@ class ObligationStore:
 
     def __init__(self, root: str | Path | None = None):
         self.root = obligations_root(root)
+        self._list_cache: dict[str, tuple[tuple[int, int, int, int, int], dict | None]] = {}
+        self._discovery_metrics = {"stat_calls": 0, "json_reads": 0, "json_parses": 0}
+        self._active_list_context = None
+
+    def begin_read_pass(self) -> None:
+        """Share one discovery snapshot among lists made during a runner pass."""
+        self._active_list_context = {"paths": None, "records": {}}
+
+    def end_read_pass(self) -> None:
+        """Drop the pass snapshot so the next list observes external changes."""
+        self._active_list_context = None
 
     def _record_path(self, duty_id: str) -> Path:
         return self.root / (_safe_id(duty_id) + ".json")
@@ -525,16 +774,94 @@ class ObligationStore:
     def get(self, duty_id: str) -> dict | None:
         return _read_record(self._record_path(duty_id))
 
-    def list(self, *, states: Iterable[str] = _PENDING_STATES) -> list[dict]:
+    @staticmethod
+    def _list_signature(path: Path):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ObligationError("peer-obligation-record-invalid")
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+    def _read_list_record(self, path: Path):
+        key = str(path)
+        for _attempt in range(3):
+            try:
+                before = self._list_signature(path)
+            except FileNotFoundError:
+                self._list_cache.pop(key, None)
+                return None
+            self._discovery_metrics["stat_calls"] += 1
+            if before is None:
+                self._list_cache.pop(key, None)
+                return None
+            cached = self._list_cache.get(key)
+            if cached is not None and cached[0] == before:
+                return cached[1]
+
+            self._list_cache.pop(key, None)
+            self._discovery_metrics["json_reads"] += 1
+            self._discovery_metrics["json_parses"] += 1
+            record = _read_record(path)
+            try:
+                after = self._list_signature(path)
+            except FileNotFoundError:
+                self._list_cache.pop(key, None)
+                return None
+            self._discovery_metrics["stat_calls"] += 1
+            if before == after:
+                self._list_cache[key] = (after, copy.deepcopy(record))
+                return record
+        self._list_cache.pop(key, None)
+        raise ObligationError("peer-obligation-list-unstable")
+
+    def discovery_metrics(self) -> dict[str, int]:
+        return dict(self._discovery_metrics)
+
+    def reset_discovery_metrics(self) -> None:
+        for key in self._discovery_metrics:
+            self._discovery_metrics[key] = 0
+
+    def list(self, *, states: Iterable[str] = _PENDING_STATES,
+             kinds: Iterable[str] | None = None) -> list[dict]:
         if not self.root.is_dir():
+            self._list_cache.clear()
             return []
         wanted = set(states)
+        wanted_kinds = None if kinds is None else set(kinds)
         output = []
-        for path in sorted(self.root.glob("*.json")):
-            record = _read_record(path)
-            if record is not None and record.get("state") in wanted:
-                output.append(record)
+        context = self._active_list_context
+        if context is None:
+            context = {"paths": None, "records": {}}
+        if context["paths"] is None:
+            paths = sorted(self.root.glob("*.json"))
+            context["paths"] = paths
+            present = {str(path) for path in paths}
+            for stale in set(self._list_cache).difference(present):
+                self._list_cache.pop(stale, None)
+        paths = context["paths"]
+        for path in paths:
+            key = str(path)
+            if key not in context["records"]:
+                context["records"][key] = self._read_list_record(path)
+            record = context["records"][key]
+            if (record is not None and record.get("state") in wanted
+                    and (wanted_kinds is None
+                         or (record.get("intent") or {}).get("kind") in wanted_kinds)):
+                output.append(copy.deepcopy(record))
         return output
+
+    def _invalidate_list_record(self, duty_id: str) -> None:
+        path = self._record_path(duty_id)
+        key = str(path)
+        self._list_cache.pop(key, None)
+        context = self._active_list_context
+        if context is None:
+            return
+        context["records"].pop(key, None)
+        if context["paths"] is not None and path.exists() and key not in {
+                str(candidate) for candidate in context["paths"]}:
+            context["paths"] = sorted([*context["paths"], path])
 
     def create(self, duty_id: str, kind: str, identity: dict, intent: dict) -> dict:
         duty_id = _safe_id(duty_id)
@@ -558,12 +885,14 @@ class ObligationStore:
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
     def update(self, duty_id: str, *, state: str | None = None,
                observation: dict | None = None, result: str | None = None,
                delivery: str | None = None, cleanup: str | None = None,
                observer_error: str | None = None,
-               expected_phases: set[str] | None = None) -> dict:
+               expected_phases: set[str] | None = None,
+               skip_unchanged: bool = False) -> dict:
         if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
             raise ObligationError("peer-obligation-state-invalid")
         path = self._record_path(duty_id)
@@ -587,22 +916,31 @@ class ObligationStore:
                                "reason": observer_error}
             if result is not None and record.get("result") not in {None, result}:
                 raise ObligationError("peer-obligation-result-conflict")
-            if state is not None:
+            changed = False
+            if state is not None and record.get("state") != state:
                 record["state"] = state
-            if observation is not None:
+                changed = True
+            if observation is not None and record.get("observation") != observation:
                 record["observation"] = observation
-            if result is not None:
+                changed = True
+            if result is not None and record.get("result") != result:
                 record["result"] = result
-            if delivery is not None:
+                changed = True
+            if delivery is not None and record.get("delivery") != delivery:
                 record["delivery"] = delivery
-            if cleanup is not None:
+                changed = True
+            if cleanup is not None and record.get("cleanup") != cleanup:
                 record["cleanup"] = cleanup
+                changed = True
+            if skip_unchanged and not changed:
+                return record
             record["revision"] = int(record.get("revision", 0)) + 1
             record["updated_at"] = time.time()
             _write_atomic(path, record)
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
     def claim_phase(self, duty_id: str, expected: set[str], new_phase: str,
                     *, state: str = "pending", extra: dict | None = None) -> dict | None:
@@ -629,6 +967,7 @@ class ObligationStore:
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
 
 def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
@@ -640,7 +979,7 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
 
 
 def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
-                          reconciliation_required=False):
+                          reconciliation_required=False, service_current=None):
     """Replace only an exact observer whose old code cannot process this duty.
 
     Accepted work stays in the existing store; the same flock fences its next
@@ -649,7 +988,7 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
     has_batch = any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list())
     if not has_batch and not reconciliation_required:
         return False
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    if not service_current:
         return False
     state_root = str(store.root.parents[1])
     for proc in Path("/proc").iterdir():
@@ -666,15 +1005,15 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
             lock_fd = argv[argv.index("--lock-fd") + 1]
             if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
                 continue
-            source = Path(argv[1]).read_text()
-            if "def _reconcile_obligations(" in source:
-                return "current"
-            if (not reconciliation_required
-                    and "def _resume_registered_obligation(" in source
-                    and "from dispatch_session_sweep import addressed_records" in source):
-                return "current"
-            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-            return "replaced"
+            result = replace_managed_observer(
+                int(proc.name), _proc_start_identity(int(proc.name)) or "", lock_path,
+                "utilities/peer-steward.py",
+                ("__obligation-runner", "--lock-fd", lock_fd,
+                 "--state-root", state_root),
+                service_current, lock_fd_option="--lock-fd",
+            )
+            if result in {"current", "replaced"}:
+                return result
         except (OSError, ValueError, IndexError, UnicodeError):
             continue
         finally:
@@ -700,7 +1039,8 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             handoff = _handoff_legacy_runner(
-                store, lock_path, reconciliation_required=reconciliation_required)
+                store, lock_path, reconciliation_required=reconciliation_required,
+                service_current=service_current)
             if handoff == "current":
                 return True
             if handoff != "replaced":

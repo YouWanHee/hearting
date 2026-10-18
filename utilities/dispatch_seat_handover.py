@@ -96,19 +96,11 @@ def eligible_row(meta: dict) -> bool:
 
 def latest_rows(jobs) -> dict:
     """``attempt_id -> (status, metadata)`` from a registry file (last line of an attempt wins)."""
-    rows: dict = {}
     try:
-        text = Path(jobs).read_text(encoding="utf-8", errors="replace")
+        from dispatch_registry_cache import registry_view
+        return registry_view(Path(jobs)).handover_latest()
     except OSError:
-        return rows
-    for line in text.splitlines():
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = _meta(fields[5])
-        if meta.get("attempt_id"):
-            rows[meta["attempt_id"]] = (fields[1], meta)
-    return rows
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -405,12 +397,52 @@ def _select_binding_rows(rows: Iterable[tuple[dict, Optional[str]]]) -> list[dic
     return [binding for binding, _status in unique if _logical_key(binding) in selected]
 
 
-def _handover_candidates(harness: str, sid: str, jobs, rows=None) -> list[tuple[dict, str]]:
+def _handover_binding_keys_for_session(jobs, sid: str, *, read_context=None) -> tuple[tuple[str, str, str], ...]:
+    """Current exact jobs/route/node bindings handed along to this session."""
+    jobs_key = _jobs_key(jobs)
+    keys = set()
+    for snapshot in _all_snapshots(read_context):
+        seat_data = snapshot.get("seat")
+        if not isinstance(seat_data, dict):
+            continue
+        try:
+            seat = _seat_of(str(seat_data.get("key") or ""), snapshot)
+            chain = _chain_to(handover_rows(seat, read_context=read_context), sid)
+        except Exception:  # noqa: BLE001 - discovery failure leaves no inherited candidates
+            continue
+        for row in chain:
+            for binding in row.get("bindings") or ():
+                if not isinstance(binding, dict) or binding.get("jobs") != jobs_key:
+                    continue
+                route = str(binding.get("route") or "")
+                digest = str(binding.get("hash") or "")
+                node = str(binding.get("node") or "")
+                if route and digest and node:
+                    keys.add((route, digest, node))
+    return tuple(keys)
+
+
+def _handover_candidate_rows(jobs, sid: str, *, read_context=None):
+    from dispatch_registry_cache import registry_view
+    view = registry_view(Path(jobs))
+    keys = _handover_binding_keys_for_session(jobs, sid, read_context=read_context)
+    return view.handover_candidates(sid, keys)
+
+
+def _handover_candidates(harness: str, sid: str, jobs, rows=None, *, read_context=None) -> list[tuple[dict, str]]:
     """Collect every candidate still allowed by the existing route authority."""
-    rows = latest_rows(jobs) if rows is None else rows
+    if rows is None:
+        try:
+            candidate_rows = ((status, record.handover_metadata())
+                              for status, record in _handover_candidate_rows(
+                                  jobs, sid, read_context=read_context))
+        except OSError:
+            candidate_rows = ()
+    else:
+        candidate_rows = rows.values()
     found = []
     import route_authority
-    for status, meta in rows.values():
+    for status, meta in candidate_rows:
         choice = route_authority.decide_continuation(action="handover", status=status, metadata=meta, jobs=jobs,
             facts={"actor": sid, "eligible": eligible_row(meta)})
         if choice.allowed:
@@ -420,15 +452,20 @@ def _handover_candidates(harness: str, sid: str, jobs, rows=None) -> list[tuple[
 
 def _bindings_with_current_status(bindings: Iterable[dict]) -> list[tuple[dict, Optional[str]]]:
     """Attach status only when the current registry row exactly matches a kept binding."""
-    cache: dict[str, dict] = {}
+    cache: dict[str, object] = {}
     result = []
     for binding in bindings:
         if not isinstance(binding, dict):
             continue
         jobs = str(binding.get("jobs") or "")
         if jobs not in cache:
-            cache[jobs] = latest_rows(jobs) if jobs else {}
-        current = cache[jobs].get(str(binding.get("attempt") or ""))
+            try:
+                from dispatch_registry_cache import registry_view
+                cache[jobs] = registry_view(Path(jobs)) if jobs else None
+            except OSError:
+                cache[jobs] = None
+        view = cache[jobs]
+        current = view.handover_attempt(str(binding.get("attempt") or "")) if view else None
         status = None
         if current:
             current_status, meta = current
@@ -441,7 +478,7 @@ def _bindings_with_current_status(bindings: Iterable[dict]) -> list[tuple[dict, 
     return result
 
 
-def current_bindings(harness: str, sid: str, jobs=None) -> list:
+def current_bindings(harness: str, sid: str, jobs=None, *, read_context=None) -> list:
     """The selected depth-1 attempts ``sid`` answers for, whatever harness registered them.
     The cap is on distinct logical jobs; each selected job keeps all eligible flat bindings.
     A finished attempt counts while its route or completion record is still open.
@@ -449,7 +486,7 @@ def current_bindings(harness: str, sid: str, jobs=None) -> list:
     jobs = jobs or _default_jobs()
     if jobs is None or not Path(jobs).is_file():
         return []
-    return _select_binding_rows(_handover_candidates(harness, sid, jobs))
+    return _select_binding_rows(_handover_candidates(harness, sid, jobs, read_context=read_context))
 
 
 def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
@@ -533,8 +570,17 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
             jobs_key = _jobs_key(jobs_path)
             bound = {str(b.get("attempt") or "") for b in snapshot_bindings
                      if _jobs_key(b.get("jobs") or "") == jobs_key}
-            fresh = {aid: row for aid, row in latest_rows(jobs_path).items()
-                     if aid not in bound and (jobs_key, *route_identity(row[1])) in selected_keys}
+            from dispatch_registry_cache import registry_view
+            view = registry_view(Path(jobs_path))
+            route_keys = {(route, digest, node) for selected_jobs, route, digest, node in selected_keys
+                          if selected_jobs == jobs_key}
+            fresh = {}
+            for status, record in view.handover_candidates(old, route_keys):
+                meta = record.handover_metadata()
+                aid = meta.get("attempt_id", "")
+                if (aid and aid not in bound
+                        and (jobs_key, *route_identity(meta)) in selected_keys):
+                    fresh[aid] = (status, meta)
             refreshed.extend(binding for binding, _status in _handover_candidates(harness, old, jobs_path, rows=fresh))
         except Exception:  # noqa: BLE001 - the original snapshot remains a safe fallback
             continue
@@ -589,12 +635,24 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
             return existing
         # Only what the predecessor answers for now: a registered parent that already handed an
         # attempt on keeps its name but no longer answers for it (never A -> B and A -> C).
-        rows = latest_rows(jobs) if jobs else {}
+        view = None
+        rows = {}
+        if jobs:
+            try:
+                from dispatch_registry_cache import registry_view
+                view = registry_view(Path(jobs))
+                rows = {record.handover_metadata().get("attempt_id", ""): (status,
+                         record.handover_metadata())
+                        for status, record in _handover_candidate_rows(jobs, predecessor_sid)
+                        if record.handover_metadata().get("attempt_id")}
+            except OSError:
+                view = None
+                rows = {}
         predecessor_rows = [
             (binding, status) for binding, status in _handover_candidates(
                 predecessor_harness, predecessor_sid, jobs, rows=rows)
-            if binding["attempt"] in rows
-            and effective_parent(rows[binding["attempt"]][1], jobs) == predecessor_sid
+            if binding["attempt"] in rows and effective_parent(
+                rows[binding["attempt"]][1], jobs) == predecessor_sid
         ]
         if not predecessor_rows:
             return None

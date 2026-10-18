@@ -67,6 +67,9 @@ class TextProviderContextTest(unittest.TestCase):
             self.assertEqual(config["instructions"], [])
             self.assertNotIn("plugin", config)
             self.assertIn("runtime-default", command[0])
+            self.assertEqual(command[0][command[0].index("--title") + 1], "fleet-titler")
+            self.assertEqual(command[0][command[0].index("--log-level") + 1], "WARN")
+            self.assertEqual(command[1], "prompt")
             self.assertEqual((source / "opencode.jsonc").read_text(), original)
 
     def test_cascade_passes_each_child_context_without_mutating_caller(self):

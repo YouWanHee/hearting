@@ -47,6 +47,7 @@ from .work_titles import readable as _readable_name, resource_name as _resource_
 from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
+from .session_handle import current_session_subject as _current_session_subject
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
 from .session_handle import resolve_tag as _resolve_session_tag
@@ -1561,11 +1562,7 @@ def _session_name(s):
     Native titles, derived names, slugs and cwd basenames cannot replace a failed
     title refresh. Tags still identify sessions whose title has never succeeded.
     """
-    for candidate in (getattr(s, "runtime_name", None), s.title):
-        cleaned = _sanitize_session_title(candidate) if isinstance(candidate, str) else ""
-        if cleaned:
-            return cleaned
-    return ""
+    return _current_session_subject(getattr(s, "runtime_name", None), s.title)
 
 
 def _display_session_subject(s):

@@ -202,9 +202,16 @@ from a callback session id, an SDK-first root, timing, pane labels, or daemon
 environment.
 
 Pane identity follows native session-start/resume events: publishers carry the
-actual start source with the current ID. Fleet joins predecessor/current IDs from
-that pane's existing same-harness, same-repository seat history for display only;
-another live session keeps its own ID. These aliases grant no report, wake or write
+actual start source with the current ID. Fleet keeps two display joins separate.
+The compatibility join includes at most the eight most recently observed IDs in
+the exact pane seat for the same harness and repository. A confirmed predecessor
+chain follows only recorded same-harness clear or handover edges whose two session
+records resolve to that repository. An endpoint-free legacy ledger is considered
+only when the exact current SID and repository also occur in the current endpoint's
+ledger; explicit endpoint conflicts, ambiguous predecessors, missing repository
+evidence, and cycles stop the chain. Same-SID compact/resume/prompt rows are not
+edges, and a different-SID startup/resume/select/fork does not imply a clear.
+Another live session keeps its own ID. These aliases grant no report, wake or write
 authority and add no state ledger, user confirmation or caller flag.
 
 For an OpenCode TUI whose own native invocation has one explicit `-s` or
@@ -264,10 +271,17 @@ A runtime skill/slash command/native instruction describes:
 - how hook events are attached;
 - runtime-specific file formats and frontmatter.
 
-Current `skills/*/SKILL.md` files are compatibility references. Claude Code
-consumes adapter-owned concrete files under
-`adapters/claude/skills/*/SKILL.md`. Portable capability meaning belongs in
-`capabilities/`.
+Current `skills/*/SKILL.md` files are Claude-format compatibility references.
+Claude Code consumes adapter-owned concrete files under
+`adapters/claude/skills/*/SKILL.md`. Portable capability meaning and canonical
+identifiers belong in `capabilities/` and the manifest; a native skill's
+frontmatter is only the runtime representation of that identifier. Claude
+resolves a skill's invocation name from its directory, so Claude projections
+omit an explicit `name` field. Codex and OpenCode require an explicit native
+`name`, which their projections retain. The compatibility tree follows Claude's
+directory-name convention and may remain byte-identical to Claude's native
+tree. Duplicate discovery across runtime homes is prevented by projecting only
+the selected adapter's native tree, not by changing the shared identifier.
 
 ## 5. Hook Model
 
@@ -683,6 +697,27 @@ can take a turn; OpenCode waits through busy, question and permission states. Th
 courier never reads a composer, relaunches a missing parent or types into a shell
 pane. Unreceived refs stay visible in Fleet until the recipient processes them.
 
+At canonical session activation, Claude, Codex, and OpenCode use the shared
+`dispatch_session_sweep.activate` entry. The reconnect helper limits exact
+owner-settlement writes to the explicitly selected authoritative registry or,
+when it discovers configured roots, the canonical registry at index 0; discovery
+of a compatibility root never grants registry-write authority. Its independent
+sidecar-recovery pass still visits every configured discovery root. Activation
+invokes the existing `reconcile_pending_delivery` actor once for the canonical
+registry. That actor retains sole authority for pending materialization,
+known-dead expiry, and terminal retention pruning. Missing or inaccessible PID
+evidence stays unknown; no prompt callback, Fleet reader, or exact-attempt
+request runs an unrelated bulk mutation.
+
+When a child already has a committed PASS, join and reap inspect only its exact
+terminal log before cleanup. A valid late FAIL/BLOCKED is recorded through the
+existing `reconcile_attempt_terminal` conflict transition. The original PASS
+and receipt remain intact, and join, stage advance, and owner settlement hold
+the conflict for review. Shared `route_completion_evidence` refuses a pending
+conflict before returning a PASS artifact, so stage advance cannot close the
+gate or start a successor from the preserved marker alone. Unreadable or
+mismatched terminal evidence adds no conflict.
+
 A registered headless owner yields after registering a batch; its runtime supervisor joins the exact `parent_attempt_id` batch outside the model and resumes the same owned session once with a bounded typed receipt. A registered Claude owner keeps one realtime stream-input process for the route and submits the next receipt immediately after each non-terminal join; when a freshly verified terminal marker closes every declared terminal gate, the supervisor skips the redundant final owner turn and closes the stream before terminal row reconciliation. An explicit custom-command fallback retains per-turn `--resume`. A Claude interactive parent may instead arm one native `asyncRewake` PostToolUse hook from a successful exact owner-start receipt, or from a successful exact steward watch armed in the same session (`utilities/peer-steward.py watch`, SD-122 §13.37.2-(10)); either way the hook owns exactly one arming event, verifies it against the session that produced it, and never widens to another attempt or watch. It re-reads the exact current row and sealed completion evidence before rendering: every terminal receipt — success or attention — exits two, because Claude Code wakes an idle session for an `asyncRewake` hook only on exit code 2 and delivers exit-0 output no earlier than the next user interaction (corrected 2026-08-29; success additionally carries its structured notification on stdout). A launcher-managed interactive Codex session places one owner-only gateway between remote TUI and App Server. The harness installer may make this checked entry transparent for interactive commands, but plugin or hook loading after process entry is not equivalent. That gateway atomically serializes manual input with an exact completion receipt, uses `turn/start` only while idle and `turn/steer` only for a steerable active turn, and durably suppresses duplicate sealed-batch delivery. The sidecar is prelaunched before the child spawn claim, connects only to the private control socket, never subscribes upstream, never sees or answers approvals, and submits no raw child output. A send followed by an unclassified disconnect is `sent-ambiguous` and is not retried. Outside those checked entries, hooks must not simulate wake by blocking Stop, parking every tool, or injecting a synthetic user turn; the parent remains conversational and uses a disclosed finite fallback. Legacy receipts may be consumed only by exact terminal typed harvest. Runtime-native subagents are a separate surface.
 
 Shared parent-delivery selection, immutable registration checks, and pre-spawn sidecar arming belong to `utilities/dispatch_parent_completion.py` across all three adapters. A child adapter never infers the parent runtime from its own name. What a parent runtime carries is data its adapter declares in `adapters/<harness>/config/harness-capabilities.json` (`parent_completion`: the carrier, what proves it reaches the parent, and the fallback when it cannot); the shared selection reads that declaration instead of branching on a harness name. Select delivery by parent runtime: Codex managed parent → Codex gateway; Claude interactive parent → exact owner or exact steward-watch `asyncRewake` with an exit-2 wake for every terminal receipt, plus the SessionStart/UserPromptSubmit sweep that re-delivers any SD-111 pending record or un-acked watch receipt at the next prompt; OpenCode interactive parent → its plugin's turn carrier (`opencode-turn`), which, while the session is idle, hands the records owed to it to the session's next turn through `promptAsync` and acks them once OpenCode takes the turn — its tool commands name that carrier in `AGENT_PARENT_COMPLETION_CARRIER`, so a server that predates the carrier keeps `poll-fallback`; all three render the delivered records with the one shared `dispatch_session_sweep.delivery_context`; registered Claude owner → persistent realtime stream with a sealed-terminal fast path (checked per-turn `--resume` fallback); registered Codex headless owner → its private App Server supervisor. Keep TUI client A as the only approval owner and sidecar client B control-only. Require private socket/state paths, exact terminal+quiescent membership, durable idempotency, bounded typed context, and fail-closed ambiguity. A transparent launcher must preserve and validate the real CLI, route only interactive surfaces, repair on update, and restore exactly on uninstall. If those checks are unavailable, report fallback and the missing atomic `continueIfIdle(threadId, idempotencyKey, typedContext)`/native async-rewake primitive rather than widening Stop or PreToolUse.
@@ -818,6 +853,21 @@ form or question, and an empty visible composer. A dim prompt suggestion is
 empty. Busy, blocked, unknown, form-open, nonempty-draft, or unreadable targets
 stay on the existing callback path and receive no PTY input. Prompt submission
 is only `queued`; the exact receiver ref remains the only peer-delivery receipt.
+
+For Claude's peer-message context path, SD-113 §13.34.1 recognizes successful
+synchronous `additionalContext` injection from the native
+`UserPromptSubmit`/`PostToolUse` boundary as recipient consumption. After the
+flush, the hook settles the exact sealed ref, body, and recipient through the
+shared receive/ACK writer, including its registered obligation. A failed or
+partial flush remains unreceived. CLI context rendering, a same-SID callback
+alone, helper output, and ambiguous sends remain unreceived. A retained queued
+row marked `hook-context-emitted` is recovered only by claiming its exact ref
+and delivering it again through that trusted native boundary; arbitrary queued
+pane/native transfers are not resent. The no-trailer session-tidy continue
+keeps its separate receipt authority. A future `schema_version` is unsupported,
+not corrupt: readers skip it in place without rewriting or quarantining its
+bytes. The current schema's verified malformed or unsafe rows keep the existing
+quarantine behavior.
 
 For Herdr observation, the endpoint is part of identity and cache keys. A
 subscription is established before its snapshot is applied. A successful,

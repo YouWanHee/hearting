@@ -73,7 +73,16 @@ are resumed before new preparation, so resuming an existing task does not
 require another network fetch. Occupied worktree names are skipped with an
 automatically chosen suffix; preparation failure prevents route publication
 and launch and can be retried through the same start with its existing
-decision and approval.
+decision and approval. Candidate allocation checks the full Git ref namespace,
+including pseudo-refs, packed and symbolic refs, remote/tag names, branch
+prefix conflicts, and occupied paths before asking Git to resolve a short
+revision. If worktree creation fails after this invocation created its new
+branch, it removes that branch only when the ref still has the expected commit
+and is not attached to a worktree; a moved, existing, reserved, or uncertain
+ref is preserved. A successfully created worktree keeps its reserved identity
+when later publication fails, so retry resumes the same work. This applies to
+SHA-1 and SHA-256 repositories and does not alter approved dirty work or the
+primary checkout.
 
 Preparation does not run for preview, explain, a non-start compose, or the
 low-level `compile` interface. These paths remain read-only, and a sealed route
@@ -374,6 +383,31 @@ wall-clock cleanup deadline on a machine with no later normal work. Older
 cross-namespace owner evidence without a host-visible death receipt remains
 unknown and keeps its home.
 
+**Dispatch log retention.** Only regular Hearting attempt logs bound by an
+exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are
+eligible for automatic retirement. A log becomes eligible only after its
+attempt is terminal and its route, delivery/ACK, review/replay, replacement,
+summary, lease, and process obligations are settled and the writer is proven
+quiescent. Missing, conflicting, malformed, shared-with-protected, linked,
+replaced, or otherwise uncertain evidence keeps the bytes. Eligible logs age
+from the latest verified terminal/settlement time: retain at least 14 days,
+then retire the oldest eligible logs as needed to approach 2 GiB. Protected
+and unknown bytes take precedence, so totals above 2 GiB are expected when
+needed. The bounded pass reuses one evidence snapshot, rechecks identity
+immediately before unlink, and resumes on the next normal cadence after
+interruption. It runs beside the existing post-exit reaper and selector-free
+`reconcile --apply`; exact-attempt transactions remain scoped to their attempt.
+The append-only session-sweep and pending-delivery observation logs rotate at
+complete record boundaries under their writer lock, retaining a bounded set of
+closed segments. Their active inode and authoritative receipts/ACK records are
+not removed by this policy.
+
+Preflight doctors share the same failure presentation: preserve the check's
+exit status, report a bounded cause excerpt when available (favoring explicit
+reason/error lines and otherwise the final lines), and identify empty output.
+The adapter supplies only its runtime label and invokes its normal checks once;
+diagnosis does not retry the failed check or alter its result.
+
 **Inline exceptions.** Main or a dispatch-depth-1 owner may run such work inline only when at least one holds: the work is `direct` scale or a micro-stage inside the checked `quick` one-shot owner; file or state boundaries make it genuinely non-separable; every route-sealed registered-headless candidate has a typed hard-unavailable result and the compiled fallback policy reaches inline; the work is tightly coupled to external GPU or process state a worker cannot reach; the user explicitly requires main-session execution; or the stage is so small that dispatch overhead clearly exceeds it. A native-subagent restriction is surface-local and is never evidence that registered headless is unavailable. A failed hook-trust or worktree-safety check is a stop/re-isolate condition, not inline authority; `failure_scope=exact-worktree,retry_on_isolated_worktree=1` retains the stricter fail-close rule below. Running `standard+` separable work inline without recording the concrete reason — in `plans/<slug>/_internal/metrics.md` for code cycles, or the experiment `_RUNLOG`/`_internal` for lab cycles — is a contract violation; this generalizes SD-17 beyond code stages.
 
 **Durable capability participation.** A capability route is required before the first durable write under a capability-owned artifact bucket, including `direct`; direct means an inline node in a compiled route, not route absence. A route card, Skill/capability grounding marker, `pipeline_state.yaml` field such as `execution: inline`, or a failed native-subagent probe is not participation proof. Main sessions bind the checked route to the exact session/cwd; registered workers use their immutable route environment. Standard+ artifact writes therefore fail closed when route compilation fails, before public or `_internal` output can be used as retroactive authority.
@@ -474,26 +508,96 @@ primary resolution chain. That carry is still row-wise and monotonic: it never
 reverts a terminal attempt row to open, and a merge that cannot prove that
 invariant writes nothing and keeps the candidate release. Succession is not a
 sufficient condition for deletion: before pruning a release, `_cleanup_releases`
-also checks both the candidate release's own registry and the live release's
-registry for an open row whose `launch_home=` names that candidate, and keeps
-the release if either check finds one or the evidence cannot be read — a
-release a live attempt still references is never pruned. Explicit or
+also checks release-local and stable registries for an open row whose
+`launch_home=` names that candidate, and keeps the release if any check finds
+one or the evidence cannot be read — a release a live attempt still references
+is never pruned. Explicit or
 inherited registries inside a bundle's versioned `source` tree are rejected
 with `versioned-source-registry-fallback`. Completion, logs, watchdog,
 heartbeat, and supervisor state continue to derive only from the accepted
 registry's parent.
 
+The final source-deletion boundary combines admission locks with fresh use
+evidence. While the installer transaction lock is held, bounded global
+route/artifact discovery runs outside admission locks and builds an ephemeral
+index. If a scan declares its inventory unstable, cleanup retries that scan
+within its existing bound; exhaustion keeps releases for a normal update
+retry. For each eligible release, the updater checks route-directory
+generations and known registry fingerprints, then takes the relevant stable,
+release-local, and route-registry `jobs.log.lock` files in deterministic,
+deduplicated order. It rechecks those generations while the locks are held,
+then checks source use, carries that candidate's dispatch state, verifies its
+final source inventory/delta and registry containment, and removes that one
+release before releasing the locks. A changed input releases the locks and
+refreshes the index before that candidate is retried. Unchanged global route
+records are not reparsed for each candidate. Canonical route files are
+write-once; closure sidecars and owner bindings publish atomically, so their
+directory generations detect new or replaced references. Registry fingerprints
+also detect accepted in-place writers while their existing locks are held.
+
+Derived cache removal follows source removal after the admission locks have
+been released. The orphan cache pass also runs outside those locks and retains
+its live process, activation, route, and unknown-state checks. It stops if a
+reference generation changes during traversal, leaving remaining caches for a
+normal update retry. Unrelated admission can proceed during discovery,
+refresh, and cache removal.
+
+The jobs locks stop new normal admissions on those stable and legacy paths
+for the candidate being removed. A writer admitted before the boundary is
+caught by the changed registry or route index, or by the process scan of its
+pinned environment, argv, cwd, executable, or open files. This includes a
+legacy `AGENT_DISPATCH_JOBS` path whose writer's `AGENT_HOME`/`launch_home`
+names a different release. The process scan excludes only the exact
+descriptor owned by its current process and thread; forked children discard
+inherited ownership before acquiring a lock, and another descriptor for the
+same path remains evidence of use. Installer locking alone does not freeze
+arbitrary state files; the process and reference checks are part of the same
+candidate deletion decision. Unreadable evidence, an unavailable lock, or any
+final mismatch keeps the affected release for a normal retry.
+
 Release pruning is evidence-bound. `harness update` retains every superseded
-release whose migration or retention-containment proof is incomplete. An
-operator may run `harness update --force-prune-unproven` only after reviewing
-the proposed loss: before deleting each unproven candidate, the updater
-appends its non-recoverable gap to the canonical `inventory/gaps.jsonl` with
+release whose migration quiescence/final-delta proof is incomplete. The
+The existing `harness update --force-prune-unproven` path applies only to two
+typed proof gaps after successful carry operations: a promoted migration's
+regular-file final digest mismatch, or containment that specifically identifies
+missing candidate attempt IDs. The final proof check and deletion remain in the
+same SD-112 writer boundary. Before either permitted deletion, the updater
+appends its non-recoverable gap to canonical `inventory/gaps.jsonl` with
 `discovered_by=forced-prune`; a failed gap commit deletes nothing. The flag
-does not override current/activation retention, `_release_in_use` or
-`_succeed_dispatch_state`: open rows and routes whose resolved `launch_home`
-names the release, and live processes whose `AGENT_HOME` names it, still keep
-it. It is never selected automatically. Re-running the command when the
-requested release is already current still performs this checked prune pass.
+cannot override current/activation retention, `_release_in_use`, live or
+uncertain writers, unsafe or unreadable state, failed copy/archive/registry
+merge/re-anchor work, an unresolved containment root, a missing migration
+destination, or changed discovery inputs. Open rows and routes whose resolved
+`launch_home` names the release, and live processes whose pinned state names
+it, still keep it. The flag is never selected automatically. Re-running the
+command when the requested release is already current still performs this
+checked prune pass.
+
+The legacy/current collision exception covers only these observations:
+`logs/dispatch-session-sweep.log`, `logs/<slug>.heartbeat`, and
+`plugin-load.<slug>.mark`, with a single safe slug as the name component. The
+heartbeat and plugin-load marker are OpenCode best-effort liveness side
+channels: the liveness reader uses heartbeat mtime and marker existence. They
+are not dispatch authority. Exact attempt evidence under
+`heartbeats/<attempt>.json` remains strict. When one of the recognized
+observation files differs during carry-forward, the existing canonical file
+stays in place and the legacy bytes are copied and digest-verified under
+`<state-root>/dispatch-observation-archive/`, keyed by the resolved source
+root, relative path, and content digest. The archive is outside dispatch reader
+roots. By default, every other conflicting file, including completion proofs,
+sidecars, registry rows, delivery records, and ACKs, keeps the release. The
+explicit migration digest exception above still requires successful copy and
+re-anchor operations plus its committed gap record. No `logs/**` or
+extension-wide exception is made. Raw logs and their observation archives have
+no new time-based deletion policy.
+
+After a release directory has actually been removed, pruning also removes only
+the matching release subtree beneath the default
+`<state-root>/pycache/<absolute-data-root>/releases/<id>` prefix used by
+`PYTHONPYCACHEPREFIX`. Retained or unresolved releases keep their cache. A
+failed cache removal is retried as an orphan on a later normal update, and the
+scan stays within that exact release mapping; custom prefixes and neighboring
+cache trees are not inferred or traversed.
 
 Before delivery, the supervisor atomically commits the bounded receipt payload,
 deterministic receipt id and digest, exact attempt set, and row revisions. A
@@ -592,6 +696,15 @@ route, recipient, or other operation authority. Changing service code preserves
 the accepted duty, transfer identity, recipient, and session authority.
 Release following uses self-exec and preserves the narrow legacy compatibility
 handoff.
+
+The same managed lifecycle binding may select current code for the shared
+completion, batch, watch, and runner observers. A lifecycle callback may replace
+a live legacy observer only after its release, namespace, PID/start identity,
+exact duty arguments, and held duty lock all match the same installation.
+Replacement transfers the existing duty under that lock; it does not settle,
+acknowledge, retarget, or reseal the work. Fixed invocations, checkouts,
+interactive sessions, and observers without verifiable provenance keep their
+existing runtime and pending state.
 
 The completion duty belongs to the outer controller and durable pending record,
 not to the lifetime of one model turn, watcher process, or tab location. A
@@ -1716,6 +1829,17 @@ may end long before it finishes and any later session on any host that mounts
 that root can follow it by id through `runs`, `tail`, and `stop`. A run id
 doubles as the remote `tmux` session name, and a second launch within the same
 second takes a fresh directory rather than overwriting the first one's log.
+Hearting runs use a private tmux server namespace derived from the host-local
+GPU lease state root. Its first start has release, attempt, route, and session
+pins cleared and runs from `/`; each new session receives only the launcher's
+validated session/release/attempt provenance plus its exact compute run id and
+host with tmux `-e`; stale resource-run and lease-release markers are empty.
+The selected working directory is passed with `-c`. The namespace is recorded
+in run metadata, and `runs`/`stop` address that same server. Older run metadata
+without a transport keeps its legacy default
+tmux lookup; an unknown or malformed new transport is left untouched rather
+than falling back to another server. This does not stop or rewrite an existing
+general tmux server or its sessions.
 Before the payload starts, the launcher removes the four allowlisted runtime
 session variables and restores only one unique, validated launcher identity.
 The payload's exact `HEARTING_COMPUTE_RUN_ID` is then an attribution boundary:
@@ -1825,6 +1949,15 @@ A steward is informally depth −1; not a dispatch depth. This role carries no l
 gate, write, or approval authority over the session it addresses — its peer messages are
 advisory context between two already-running sessions, and the append-only ledger below
 is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the role:
+
+Fleet and herdr may join pane-session IDs for display through the shared read-only
+session-tidy reader. Its bounded compatibility join uses the exact pane, harness,
+and repository. Confirmed predecessor expansion follows only same-harness clear
+or handover evidence with matching repository evidence at both ends. A legacy
+ledger without endpoint metadata is eligible only after the exact current SID and
+repository bridge into the current endpoint ledger. Missing or conflicting
+evidence stops expansion. These aliases are outside receipt, wake, ACK, report,
+and peer-message authority.
 
 Starting a peer honors the requested project in the launched runtime: Codex receives
 `--cd`, interactive OpenCode receives its positional project, and Claude changes the
@@ -1941,7 +2074,12 @@ back to the steward's own user, never to the peer.
 **S2** no baton — canonical state is the artifact root, the dispatch state root, and
 memory. Receiving a message never changes route, gate, registry, or workflow state; the
 receiver treats it as data, not an instruction, and judges it against its own card, gate,
-and evidence.
+and evidence. When writing a body, identify the work in ordinary words and retain the
+condition that distinguishes it before adding an internal number: “the fixed
+two-speaker, multi-reference model without dropout (E2 best48).”
+Include the sender's role at the time and state whether the message is queued, received,
+or the work itself is complete; those are
+different facts, and the bound recipient remains the exact (harness, session_id).
 
 **S3** no polling — watching is a checked steward watch (`utilities/peer-steward.py watch`
 → a detached watcher, separate from the session's lifetime, that waits on `herdr agent

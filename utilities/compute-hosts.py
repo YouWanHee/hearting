@@ -55,6 +55,7 @@ OWNER_CLAIMS_SCHEMA = 1
 STOP_EXIT_CODE = 143
 STOP_REASON_DEFAULT = "stopped"
 STOP_REASON_FILENAME = "stop_reason"
+_LEGACY_TMUX_TRANSPORT = object()
 SSH_BRIDGE_MAX_PROCESSES = 8192
 SSH_BRIDGE_MAX_SOCKET_ROWS = 32768
 SSH_BRIDGE_MAX_FDS = 256
@@ -1983,9 +1984,23 @@ def cmd_run(args):
         command, os.environ.get("CUDA_VISIBLE_DEVICES"))
     share = getattr(args, "share", False)
     lease_owner = owner
+    resolved_session_env = gpu_leases.launcher_session_environment({}, owner=owner)
+    tmux_environment = {
+        key: resolved_session_env.get(key, "")
+        for key in gpu_leases.session_environment_keys()
+    }
+    tmux_environment.update({key: provenance.get(key, "")
+                             for key in PROVENANCE_CLEAR_KEYS})
+    tmux_environment.update({
+        "HEARTING_COMPUTE_RUN_ID": run_id,
+        "HEARTING_COMPUTE_HOST": name,
+        "HEARTING_RESOURCE_RUN_ID": "",
+        "HEARTING_GPU_LEASE_RELEASE": "",
+    })
     options = {"state_path": str(gpu_leases.state_path()), "observation": gpu_observation,
                "requested": requested, "share": share, "owner": lease_owner,
-               "task": args.name or rendered, "run_id": run_id, "run_dir": str(run_dir), "inner": inner}
+               "task": args.name or rendered, "run_id": run_id, "run_dir": str(run_dir),
+               "inner": inner, "cwd": workdir, "tmux_environment": tmux_environment}
     if args.dry_run:
         leases = {lease["token"]: lease for gpu in gpu_observation.get("gpus", [])
                   for lease in gpu.get("reservations") or []}
@@ -2017,6 +2032,7 @@ def cmd_run(args):
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": admission["gpus"],
             "gpu_lease": admission.get("gpu_lease"), "share": share,
+            "tmux_transport": admission.get("tmux_transport"),
             "gpu_observation": gpu_observation,
             "provenance": run_provenance,
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
@@ -2192,15 +2208,37 @@ def _record_stop(run_dir, exit_code=STOP_EXIT_CODE, reason=STOP_REASON_DEFAULT):
     return wrote_exit
 
 
-def _tmux_session_alive(host, run_id, timeout=CONNECT_TIMEOUT):
+def _tmux_command_prefix(transport=_LEGACY_TMUX_TRANSPORT):
+    """Select only the recorded Hearting server; missing metadata is legacy."""
+    if transport is _LEGACY_TMUX_TRANSPORT:
+        return ["tmux"]
+    if not isinstance(transport, dict):
+        return None
+    kind = transport.get("kind")
+    if kind == "nohup-v1":
+        return None
+    server = transport.get("server")
+    if (kind == "hearting-tmux-v1" and isinstance(server, str)
+            and re.fullmatch(r"hearting-[0-9a-f]{20}", server)):
+        return ["tmux", "-L", server]
+    return None
+
+
+def _tmux_session_alive(
+    host, run_id, timeout=CONNECT_TIMEOUT, transport=_LEGACY_TMUX_TRANSPORT
+):
     """Best-effort tmux liveness: True/False, or None when unknown.
 
     Unknown covers a missing tmux binary (e.g. nohup-backed runs), an
     unreachable host, or any probe failure: the caller must keep showing
     "running" rather than declaring the run gone.
     """
+    prefix = _tmux_command_prefix(transport)
+    if prefix is None:
+        return None
+    command = " ".join(shlex.quote(part) for part in prefix)
     script = (f"command -v tmux >/dev/null 2>&1 || exit 2; "
-              f"tmux has-session -t {shlex.quote(run_id)} 2>/dev/null")
+              f"{command} has-session -t {shlex.quote(run_id)} 2>/dev/null")
     try:
         result = remote(host, script, timeout=timeout)
     except Exception:
@@ -2238,7 +2276,12 @@ def cmd_runs(args):
                 except ConfigError:
                     alive = None
                 else:
-                    alive = _tmux_session_alive(host, row["run_id"])
+                    transport = row["meta"].get(
+                        "tmux_transport", _LEGACY_TMUX_TRANSPORT
+                    )
+                    alive = _tmux_session_alive(
+                        host, row["run_id"], transport=transport
+                    )
             row["stale"] = (alive is False)
             row["state"] = "stopped" if alive is False else "running"
         else:
@@ -2294,7 +2337,14 @@ def cmd_stop(args):
         print(f"unknown host for {args.run_id}", file=sys.stderr)
         return 1
     (name, host), = _select(config, [host_name])
-    result = remote(host, f"tmux kill-session -t {shlex.quote(args.run_id)} "
+    transport = state["meta"].get("tmux_transport", _LEGACY_TMUX_TRANSPORT)
+    prefix = _tmux_command_prefix(transport)
+    if prefix is None:
+        print(f"unknown tmux transport for {args.run_id}; leaving the run untouched",
+              file=sys.stderr)
+        return 1
+    command = " ".join(shlex.quote(part) for part in prefix)
+    result = remote(host, f"{command} kill-session -t {shlex.quote(args.run_id)} "
                           f"2>/dev/null && echo stopped || echo 'not running'")
     output = (result.stdout or result.stderr).strip()
     print(output)
@@ -2308,7 +2358,9 @@ def cmd_stop(args):
         # tmux is present and confirms the session is gone, never for
         # unknown hosts (missing tmux, unreachable) where a nohup-backed
         # run may still be alive.
-        should_record = (_tmux_session_alive(host, args.run_id) is False)
+        should_record = (_tmux_session_alive(
+            host, args.run_id, transport=transport
+        ) is False)
     if should_record:
         fresh = _run_state(config, args.run_id)
         if fresh["exit_code"] is None and not fresh.get("stop_reason"):

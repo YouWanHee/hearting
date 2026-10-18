@@ -92,6 +92,52 @@ class CodexTuiConfigTest(unittest.TestCase):
                 items = tomllib.loads(merged)["tui"]["status_line"]
                 self.assertEqual(items, (["x", "thread-id"] if '"x"' in source else ["thread-id"]))
 
+    def test_startup_default_preserves_explicit_values_and_inserts_at_toml_root(self):
+        for value in (True, False):
+            source = f'"check_for_update_on_startup" = {str(value).lower()} # user choice\r\n[tui]\r\n'
+            with self.subTest(value=value):
+                self.assertEqual(config.merge_startup_update_default_text(source), source)
+        for source in (
+                "",
+                '# check_for_update_on_startup = true\n[tui]\n',
+                '[tui]\nstatus_line = []\n',
+                'description = """\n[not_a_table]\n"""\r\n[tui]\r\n'):
+            with self.subTest(source=source):
+                merged = config.merge_startup_update_default_text(source)
+                parsed = tomllib.loads(merged)
+                self.assertIs(parsed["check_for_update_on_startup"], False)
+                self.assertIn("check_for_update_on_startup = false", merged)
+                self.assertEqual(config.merge_startup_update_default_text(merged), merged)
+                if "[tui]" in source:
+                    self.assertLess(merged.index("check_for_update_on_startup = false"),
+                                    merged.index("[tui]"))
+        self.assertIn("check_for_update_on_startup = false\r\n[tui]\r\n",
+                      config.merge_startup_update_default_text("[tui]\r\n"))
+
+    def test_startup_default_receipt_restores_only_our_unedited_root_insertion(self):
+        for source in ("", 'model = "keep"\n[tui]\n', '[tui]\r\n'):
+            with self.subTest(source=source):
+                merged = config.merge_startup_update_default_text(source)
+                record = config.startup_update_default_record(source, merged)
+                self.assertTrue(record)
+                carried = config.startup_update_default_record(merged, merged, record)
+                self.assertEqual(carried, record)
+                self.assertEqual(config.restore_startup_update_default_text(merged, carried), source)
+
+        merged = config.merge_startup_update_default_text('[tui]\n')
+        record = config.startup_update_default_record('[tui]\n', merged)
+        changed_value = merged.replace("check_for_update_on_startup = false",
+                                       "check_for_update_on_startup = true")
+        changed_line = merged.replace("check_for_update_on_startup = false",
+                                      "check_for_update_on_startup = false # owner comment")
+        self.assertEqual(config.restore_startup_update_default_text(changed_value, record), changed_value)
+        self.assertEqual(config.restore_startup_update_default_text(changed_line, record), changed_line)
+
+    def test_startup_default_rejects_malformed_toml_and_non_boolean_values(self):
+        for source in ('not = [valid', 'check_for_update_on_startup = "false"\n'):
+            with self.subTest(source=source), self.assertRaises(config.CodexTuiConfigError):
+                config.merge_startup_update_default_text(source)
+
     def test_invalid_input_is_not_written_or_backed_up(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -116,8 +162,10 @@ class CodexTuiConfigTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             first = config.apply_status_line(path, fragment)
             self.assertTrue(first["changed"])
+            self.assertTrue(first["startup_changed"])
             self.assertEqual(path.with_name(config.BACKUP_NAME).read_bytes(), original)
             after = path.read_bytes()
+            self.assertIs(tomllib.loads(after.decode("utf-8"))["check_for_update_on_startup"], False)
             second = config.apply_status_line(path, fragment)
             self.assertFalse(second["changed"])
             self.assertEqual(path.read_bytes(), after)
@@ -144,6 +192,7 @@ class CodexTuiConfigTest(unittest.TestCase):
             self.assertEqual(path.with_name(config.BACKUP_NAME).read_bytes(), original)
             merged_bytes = target.read_bytes()
             merged = tomllib.loads(merged_bytes.decode("utf-8"))
+            self.assertIs(merged["check_for_update_on_startup"], False)
             self.assertEqual(merged["model"], "keep")
             self.assertEqual(merged["tui"]["status_line"],
                              ["project-name", "custom-item", "thread-id"])
@@ -155,6 +204,19 @@ class CodexTuiConfigTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), merged_bytes)
             self.assertTrue(path.is_symlink())
             self.assertEqual(os.readlink(path), link_target)
+
+    def test_startup_type_conflict_does_not_discard_status_line_merge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fragment = Path(__file__).resolve().parents[1] / "adapters/codex/config/tui-statusline.toml"
+            path = root / "config.toml"
+            path.write_text('check_for_update_on_startup = "mine"\n[tui]\nstatus_line = []\n',
+                            encoding="utf-8")
+            result = config.apply_status_line(path, fragment)
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["check_for_update_on_startup"], "mine")
+            self.assertEqual(parsed["tui"]["status_line"][-1], "thread-id")
+            self.assertIn("must be a boolean", result["startup_error"])
 
     def test_invalid_symlink_target_is_unchanged_and_not_backed_up(self):
         with tempfile.TemporaryDirectory() as temp:
