@@ -41,6 +41,7 @@ from dispatch_completion_join import (  # noqa: E402
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import dispatch_batch_obligations as batch_obligations  # noqa: E402
+from dispatch_supervision import StopWaiting
 import codex_queue_delivery
 from codex_queue_dispatch import resolve_queue_socket
 import human_gate_receipt
@@ -56,8 +57,30 @@ class CompletionError(RuntimeError):
     """The exact batch or gateway control contract is invalid."""
 
 
+class ObserverOwnershipLost(StopWaiting):
+    """This observer no longer owns the exact duty lease and durable row."""
+
+
 PARENT_SESSION_ENDED = "parent-session-ended"
 JOIN_CHECKPOINT_SECONDS = 5.0
+
+
+def _observer_ownership_lost(args) -> bool:
+    duty_id = getattr(args, "_obligation_id", None)
+    fd = getattr(args, "obligation_lock_fd", None)
+    return bool(duty_id and fd is not None
+                and not batch_obligations.observer_owns_current(args.jobs, duty_id, fd))
+
+
+def _update_duty(args, duty_id, **changes):
+    fd = getattr(args, "obligation_lock_fd", None)
+    if fd is None:
+        return batch_obligations.update(args.jobs, duty_id, **changes)
+    updated = batch_obligations.update_for_observer(
+        args.jobs, duty_id, fd, **changes)
+    if updated is None:
+        raise ObserverOwnershipLost("completion-observer-ownership-lost")
+    return updated
 
 
 def _parent_proc_state(pid):
@@ -168,14 +191,16 @@ def parent_session_stop_reason(args, attempts):
 
 def _join_checkpoint(args, attempts):
     """Run the existing exact join with a short bounded checkpoint for supervision."""
-    if not getattr(args, "parent_lifetime", None):
+    has_parent_lifetime = bool(getattr(args, "parent_lifetime", None))
+    is_resumed_observer = bool(getattr(args, "_resume_execution", False))
+    if not has_parent_lifetime and not is_resumed_observer:
         return run_join(args, attempts)
     bounded = copy.copy(args)
-    bounded.timeout = min(
-        max(float(args.interval), 0.05), JOIN_CHECKPOINT_SECONDS,
-        max(float(args.timeout), 0.05),
-    )
-    bounded.interval = min(max(float(args.interval), 0.05), 2.0)
+    interval = float(getattr(args, "interval", 2.0))
+    checkpoint = (min(max(float(args.interval), 0.05), JOIN_CHECKPOINT_SECONDS)
+                  if has_parent_lifetime else JOIN_CHECKPOINT_SECONDS)
+    bounded.timeout = min(checkpoint, max(float(args.timeout), 0.05))
+    bounded.interval = min(max(interval, 0.05), 2.0)
     return run_join(bounded, attempts)
 
 
@@ -511,13 +536,63 @@ def wait_for_session_launch_claims(
 
 
 def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
+    if not args.join_command:
+        # The normal path stays in this observer process so its immutable file
+        # views and bounded settlement/recovery backoff survive each short
+        # supervision checkpoint. Explicit external join commands retain their
+        # existing argv, timeout, output-size, JSON, and error boundary below.
+        import dispatch_completion_join as completion_join
+        from runtime_observation import ObservationContext
+
+        observation_context = getattr(args, "_join_observation_context", None)
+        if observation_context is None:
+            observation_context = ObservationContext(max_entries=8)
+            args._join_observation_context = observation_context
+        try:
+            if args.parent_session_id:
+                receipt = completion_join.join_session_batch(
+                    jobs=args.jobs,
+                    parent_session_id=args.parent_session_id,
+                    expected_attempts=set(attempts),
+                    parent_completion_delivery=(
+                        CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                        else MANAGED_SESSION_PARENT_DELIVERY
+                    ),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                    recover_receiptless=True,
+                    observation_context=observation_context,
+                    registry_append_only=True,
+                )
+            else:
+                receipt = completion_join.join_batch(
+                    jobs=args.jobs,
+                    parent_attempt_id=args.parent_attempt_id,
+                    expected_attempts=set(attempts),
+                    interval=args.interval,
+                    timeout=args.timeout,
+                    recover_receiptless=True,
+                    observation_context=observation_context,
+                    registry_append_only=True,
+                )
+        except completion_join.JoinContractError as exc:
+            raise CompletionError("join-contract-failed") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CompletionError("join-process-failed") from exc
+        if not isinstance(receipt, dict):
+            raise CompletionError("join-response-shape-invalid")
+        try:
+            encoded_size = len(json.dumps(receipt, separators=(",", ":"),
+                                          sort_keys=True).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise CompletionError("join-response-json-invalid") from exc
+        if encoded_size > 65536:
+            raise CompletionError("join-response-oversized")
+        return receipt
+
     command = (
         shlex.split(args.join_command)
-        if args.join_command
-        else [
-            sys.executable,
-            str(ROOT / "utilities" / "dispatch_completion_join.py"),
-        ]
+        if args.join_command else []
     )
     command += ["--jobs", str(args.jobs)]
     if args.parent_session_id:
@@ -1042,6 +1117,8 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
 
 def _record_parent_session_ended(args, attempts, duty_id, outcome=None):
     from dispatch_supervision import materialize
+    if _observer_ownership_lost(args):
+        raise ObserverOwnershipLost("completion-observer-ownership-lost")
     try:
         materialize(args.jobs, attempts, reason=PARENT_SESSION_ENDED)
     except (OSError, ValueError, pending_delivery.PendingDeliveryError):
@@ -1056,7 +1133,7 @@ def _record_parent_session_ended(args, attempts, duty_id, outcome=None):
     }
     if current.get("outcome") is None and outcome is not None:
         changes["outcome"] = outcome
-    batch_obligations.update(args.jobs, duty_id, **changes)
+    _update_duty(args, duty_id, **changes)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1239,6 +1316,8 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             def replacement_checkpoint(selected):
                 from dispatch_replacement import advance_batch
                 nonlocal monitored
+                if _observer_ownership_lost(args):
+                    raise ObserverOwnershipLost("completion-observer-ownership-lost")
                 advanced = advance_batch(args.jobs, selected,
                     authority_check=(lambda jobs, aid, metadata: replacement_authority(args, jobs, aid, metadata))
                         if args.parent_session_id else None)
@@ -1246,8 +1325,8 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if watcher is not None:
                     watcher.attempts = set(monitored)
                 if duty_id:
-                    batch_obligations.update(
-                        args.jobs, duty_id, effective_attempts=sorted(monitored),
+                    _update_duty(
+                        args, duty_id, effective_attempts=sorted(monitored),
                         replacement_lineage=advanced[1], reason="replacement-checkpoint",
                     )
                 return advanced
@@ -1259,13 +1338,14 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
             def supervision_stop_check():
                 nonlocal previous_parent_lifetime
+                if _observer_ownership_lost(args):
+                    raise ObserverOwnershipLost("completion-observer-ownership-lost")
                 reason = parent_session_stop_reason(args, monitored)
                 if reason:
                     return reason
                 current_lifetime = getattr(args, "parent_lifetime", None)
                 if duty_id and current_lifetime != previous_parent_lifetime:
-                    batch_obligations.update(
-                        args.jobs, duty_id, parent_lifetime=current_lifetime)
+                    _update_duty(args, duty_id, parent_lifetime=current_lifetime)
                     previous_parent_lifetime = current_lifetime
                 if resume:
                     return ""
@@ -1289,8 +1369,8 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         receipt.get("delivery_records") or [], timeout=130.0,
                     )
                 if duty_id:
-                    batch_obligations.update(
-                        args.jobs, duty_id,
+                    _update_duty(
+                        args, duty_id,
                         state="unknown", reason=reason,
                         effective_attempts=sorted(monitored),
                         replacement_lineage=receipt.get("replacement_lineage") or [],
@@ -1321,10 +1401,17 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 normalization_error[:] = [exc]
                 return receipt
             return projected
+        def projection_stop_check():
+            if _observer_ownership_lost(args):
+                raise ObserverOwnershipLost("completion-observer-ownership-lost")
+            reason = parent_session_stop_reason(args, attempts)
+            if reason:
+                return reason
+            return "" if resume else _receiver_unavailable_reason(args, attempts)
+
         normalized = wait_for_batch(join=project, attempts=attempts, jobs=args.jobs,
             parent_attempt_id=delivery_parent, deadline=deadline,
-            stop_check=lambda: (parent_session_stop_reason(args, attempts)
-                                or ("" if resume else _receiver_unavailable_reason(args, attempts))))
+            stop_check=projection_stop_check)
         if normalization_error:
             raise normalization_error[0]
         if normalized.get("state") == "watch-expired":
@@ -1332,14 +1419,14 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if reason == "watch-deadline":
                 reason = "termination-pending"
             if duty_id:
-                batch_obligations.update(args.jobs, duty_id, state="unknown", reason=reason,
+                _update_duty(args, duty_id, state="unknown", reason=reason,
                     outcome=None, delivery="pending", effective_attempts=sorted(attempts))
             return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
         if duty_id:
             current = batch_obligations.read(args.jobs, duty_id) or {}
             lineage = normalized.get("replacement_lineage") or current.get("replacement_lineage") or []
-            batch_obligations.update(
-                args.jobs, duty_id, state="delivery-pending", reason="result-settled",
+            _update_duty(
+                args, duty_id, state="delivery-pending", reason="result-settled",
                 outcome=normalized, effective_attempts=sorted(attempts),
                 replacement_lineage=lineage,
             )
@@ -1347,11 +1434,15 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         attempts = set(obligation.get("effective_attempts") or attempts)
         delivery_parent = delivery_parent_id(args)
     parent_reason = parent_session_stop_reason(args, attempts)
+    if _observer_ownership_lost(args):
+        raise ObserverOwnershipLost("completion-observer-ownership-lost")
     if parent_reason:
         _record_parent_session_ended(args, attempts, duty_id, normalized)
         return {"schema_version": 1, "status": "retryable", "reason": parent_reason}, 75
 
     def delivery_stop_check():
+        if _observer_ownership_lost(args):
+            raise ObserverOwnershipLost("completion-observer-ownership-lost")
         reason = parent_session_stop_reason(args, attempts)
         if reason:
             _record_parent_session_ended(args, attempts, duty_id, normalized)
@@ -1438,6 +1529,9 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         return {"schema_version": 1, "status": "accepted", "resumed": launched}, 0
 
     inherited_fd = getattr(args, "obligation_lock_fd", None)
+    expected_observer = None
+    if inherited_fd is not None and getattr(args, "resume_obligation", None):
+        expected_observer = {"pid": os.getpid(), "pid_start": batch_obligations._pid_start(os.getpid())}
     if getattr(args, "resume_obligation", None):
         duty_id = args.resume_obligation
         record = batch_obligations.read(args.jobs, duty_id)
@@ -1481,40 +1575,57 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if lease is None:
         return {"schema_version": 1, "status": "retryable",
                 "reason": "completion-observer-already-running"}, 75
-    batch_obligations.update(args.jobs, args._obligation_id,
-                             observer={"pid": os.getpid(),
-                                       "pid_start": batch_obligations._pid_start(os.getpid())},
-                             reason="observing")
+    args.obligation_lock_fd = lease
+    ownership_lost = False
     result = None
     code = 75
     try:
+        claimed = batch_obligations.update_for_observer(
+            args.jobs, args._obligation_id, lease, claim=True,
+            expected_observer=expected_observer, reason="observing")
+        if claimed is None:
+            return {"schema_version": 1, "status": "retryable",
+                    "reason": "completion-observer-ownership-lost"}, 75
         result, code = _execute_once(args)
+        if _observer_ownership_lost(args):
+            raise ObserverOwnershipLost("completion-observer-ownership-lost")
         status = result.get("status") if isinstance(result, dict) else None
         current = batch_obligations.read(args.jobs, args._obligation_id) or {}
         if current.get("outcome") is not None:
             if status == "accepted":
-                batch_obligations.update(args.jobs, args._obligation_id,
+                _update_duty(args, args._obligation_id,
                     state="complete", delivery="accepted", reason="delivered")
             elif status == "retryable" and isinstance(result, dict) \
                     and result.get("reason") == PARENT_SESSION_ENDED:
-                batch_obligations.update(args.jobs, args._obligation_id,
+                _update_duty(args, args._obligation_id,
                     state="unknown", delivery="pending", reason=PARENT_SESSION_ENDED,
                     parent_lifetime=getattr(args, "parent_lifetime", None))
             else:
-                batch_obligations.update(args.jobs, args._obligation_id,
+                _update_duty(args, args._obligation_id,
                     state="delivery-pending", delivery=status or "unknown",
                     reason=(result.get("reason") if isinstance(result, dict) else None)
                            or "delivery-unconfirmed")
         elif status == "retryable":
             reason = str(result.get("reason") or "observation-unavailable")
-            batch_obligations.update(args.jobs, args._obligation_id,
+            _update_duty(args, args._obligation_id,
                 state="unknown", reason=reason, delivery="pending")
         return result, code
+    except ObserverOwnershipLost:
+        ownership_lost = True
+        return {"schema_version": 1, "status": "retryable",
+                "reason": "completion-observer-ownership-lost"}, 75
     finally:
-        batch_obligations.release(lease)
-        current = batch_obligations.read(args.jobs, args._obligation_id) or {}
-        if current.get("state") in batch_obligations._PENDING:
-            batch_obligations.ensure_observers(args.jobs, service_current=service_current)
+        still_owner = (not ownership_lost and batch_obligations.observer_owns_current(
+            args.jobs, args._obligation_id, lease))
+        if still_owner:
+            current = batch_obligations.read(args.jobs, args._obligation_id) or {}
+            if current.get("state") in batch_obligations._PENDING:
+                batch_obligations.handoff_observer(
+                    args.jobs, args._obligation_id, lease,
+                    service_current=service_current)
+        # Keep this descriptor open until the command exits. The successor,
+        # when launched, shares the same open file description and therefore
+        # retains the flock as this process returns its receipt.
 
 
 def main() -> int:

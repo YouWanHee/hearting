@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import fcntl
+import functools
 import importlib.util
 import json
 import os
@@ -880,7 +881,14 @@ def cycle_identity_matches(record, expected_digest, *, campaign_id=None) -> bool
     return False
 
 
+@functools.lru_cache(maxsize=1)
 def _route_module():
+    """Load code once; its functions still read current route/claim/state inputs.
+
+    Re-executing this large module for every historical owner also recreated
+    its topology/default modules and repeatedly grew sys.path. Installed
+    service upgrades exec the new release, just like other imported code.
+    """
     path = Path(__file__).with_name("capability-route.py")
     spec = importlib.util.spec_from_file_location("terminal_capability_route", path)
     module = importlib.util.module_from_spec(spec)
@@ -980,11 +988,12 @@ def _prove_route_children(request, route, gates):
     from route_authority import decide_continuation
     related = []
     seen_attempts = set()
-    for row_index, line in enumerate(Path(request.jobs).read_text(encoding="utf-8").splitlines()):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = dispatch_contract.parse_registry_metadata(fields[5])
+    from dispatch_registry_cache import registry_view
+    candidates = registry_view(request.jobs).completion_related(
+        request.owner_attempt_id, route.get("route_id", ""), route.get("route_hash", ""))
+    for record in candidates:
+        row_index, fields = record.order, list(record.fields)
+        meta = record.completion_metadata()
         try:
             same_route = _related_route_identity(meta, route)
         except (TypeError, ValueError):

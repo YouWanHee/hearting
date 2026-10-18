@@ -166,8 +166,9 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
     return records, count
 
 
-def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
-    """Reconnect activation duties and run canonical bounded maintenance once per session start."""
+def activate(root: Path, recipient_kind: str, session_id: str, *,
+             request_recovery: bool = True) -> list[dict]:
+    """Retain this session's duties and request maintenance from its existing runner."""
     records, _ = addressed_records(root, recipient_kind, session_id)
     from peer_obligations import retain_registered_completion
     for record in records:
@@ -179,31 +180,18 @@ def activate(root: Path, recipient_kind: str, session_id: str) -> list[dict]:
                 retain_registered_completion(jobs, attempt, session_id, recipient_kind)
             except (OSError, ValueError):
                 continue
-    _reconcile_canonical_dispatch_state(root)
+    if request_recovery:
+        _reconcile_canonical_dispatch_state(root)
     return records
 
 
 def _reconcile_canonical_dispatch_state(root: Path) -> None:
-    """Use the existing activation event to reach shared settlement and expiry owners."""
+    """Request recovery without putting global settlement ahead of delivery."""
     try:
-        from dispatch_contract import dispatch_state_roots, resolve_agent_home
-        roots = dispatch_state_roots(resolve_agent_home())
-        if not roots or Path(root).resolve(strict=False) != Path(roots[0]).resolve(strict=False):
-            return
-        jobs = Path(roots[0]) / "jobs.log"
-        if not jobs.is_file():
-            return
-    except Exception:
-        return
-    # This remains the single dispatch-reconcile actor for materialize,
-    # known-dead expiry, and retention pruning. A failure here does not prevent
-    # the independent owner-settlement reconnect below.
-    try:
-        from dispatch_completion_join import reconcile_pending_delivery
-        reconcile_pending_delivery(jobs)
+        from peer_obligations import request_dispatch_reconciliation
+        request_dispatch_reconciliation(root)
     except Exception:
         pass
-    request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
 
 
 def record_jobs(root: Path, record: dict) -> Path | None:

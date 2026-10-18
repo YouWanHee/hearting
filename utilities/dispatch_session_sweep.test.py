@@ -84,7 +84,7 @@ class IsolatedRootMixin:
             "dispatch_session_sweep.test.py", str(home), str(xdg), str(harness)
         )
         self.root = harness / "dispatch"
-        self.enterContext(mock.patch.object(SWEEP, "request_obligation_reconciliation"))
+        self.enterContext(mock.patch.object(peer_obligations, "ensure_normal_runner"))
 
     def tearDown(self):
         for key, value in self._saved_env.items():
@@ -120,6 +120,49 @@ def _receipt(**overrides):
 
 
 class SweepTest(IsolatedRootMixin, unittest.TestCase):
+    def test_worker_hook_flushes_and_acks_before_requesting_global_recovery(self):
+        self._seed()
+        hook = _load("worker_sweep_latency_fixture", ROOT / "hooks/dispatch-session-sweep.py")
+        class Output(io.StringIO):
+            flushed = False
+            def flush(self):
+                self.flushed = True
+        output = Output()
+        delivery_id = "delivery-" + "a" * 32
+        observed = []
+        def recovery(*, lifecycle_root=None):
+            observed.append((output.flushed, delivery_id in output.getvalue(),
+                             PD.read(self.root, "sess-owner", delivery_id)["state"]))
+        with mock.patch.object(hook, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(hook, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch("peer_obligations.request_obligation_recovery", side_effect=recovery) as request, \
+             mock.patch("dispatch_batch_obligations.ensure_observers") as expensive, \
+             mock.patch.dict(os.environ, {"AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_DEPTH": "2"}), \
+             mock.patch.object(sys, "stdin", io.StringIO('{"session_id":"sess-owner","hook_event_name":"UserPromptSubmit"}')), \
+             mock.patch.object(sys, "stdout", output):
+            self.assertEqual(hook.main(), 0)
+        expensive.assert_not_called()
+        request.assert_called_once_with(lifecycle_root=ROOT)
+        self.assertEqual(observed, [(True, True, "acked")])
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["attempts"], 1)
+        again, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        self.assertEqual(again, [])
+
+    def test_sessionstart_activation_leaves_one_recovery_request_to_hook_finally(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(HOOK, "activate", return_value=[]) as activate, \
+             mock.patch.object(HOOK, "request_obligation_reconciliation") as request, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "sess-owner", "hook_event_name": "SessionStart",
+             }))), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(HOOK.main(), 0)
+        activate.assert_called_once_with(self.root, HOOK.RECIPIENT_KIND, "sess-owner",
+                                         request_recovery=False)
+        request.assert_called_once_with(lifecycle_root=ROOT)
+        self.assertEqual(output.getvalue(), "")
+
     def _seed(self, session_id="sess-owner", **overrides):
         receipt = overrides.pop("receipt", _receipt())
         self.root.mkdir(parents=True, exist_ok=True)
@@ -462,6 +505,10 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             self.assertEqual(PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"],
                              "claimed", "ACK state changed before the pipe reader received output")
             gate.touch()
+            deadline = time.monotonic() + 5
+            while not child_pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(child_pid_file.exists(), "recovery request did not follow the ACK")
             child_pid = int(child_pid_file.read_text())
             tail, err = hook_process.communicate(timeout=8)
             hook_exit_at = time.monotonic()
@@ -1079,13 +1126,13 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
-             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
-             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure:
+             mock.patch("dispatch_batch_obligations.ensure_observers") as ensure, \
+             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner:
             SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
-        reconcile.assert_called_once_with(jobs)
-        request.assert_called_once_with(lifecycle_root=ROOT)
+        reconcile.assert_not_called()
         ensure.assert_not_called()
+        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
 
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1127,14 +1174,16 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
-             mock.patch.object(SWEEP, "request_obligation_reconciliation") as request, \
+             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner, \
              mock.patch.object(OBLIGATIONS.subprocess, "Popen") as launch:
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
-        reconcile.assert_called_once_with(jobs)
-        request.assert_called_once_with(lifecycle_root=ROOT)
+        reconcile.assert_not_called()
+        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
         settle.assert_not_called()
         launch.assert_not_called()
+        self.assertEqual(OBLIGATIONS.read(jobs, duty_id)["state"], "observing")
+        self.assertEqual(OBLIGATIONS.read(other_jobs, other_duty_id)["state"], "observing")
         self.assertEqual(jobs.read_bytes(), unreadable)
         self.assertEqual(other_jobs.read_bytes(), other_before)
 
@@ -1231,6 +1280,48 @@ hooks.dispose();
             self.assertIn("__ensure-obligations", command)
             self.assertIn("--lifecycle-root", command)
             self.assertIn(str(ROOT.resolve()), command)
+
+    def test_opencode_main_session_activation_owns_recovery_when_carrier_is_available(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        capture = self.root.parent / "opencode-main-recovery-calls.tsv"
+        bin_dir = self.root.parent / "main-fixture-bin"
+        bin_dir.mkdir()
+        fake_python = bin_dir / "python3"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$arg\" = '__ensure-obligations' ]; then printf 'ensure\\n' >> \"$RECOVERY_CAPTURE\"; exit 0; fi\n"
+            "  if [ \"$arg\" = 'activate' ]; then printf 'activate\\n' >> \"$RECOVERY_CAPTURE\"; printf '{\"text\":\"\",\"records\":[]}\\n'; exit 0; fi\n"
+            "done\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "AGENT_SESSION_ROLE": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "",
+            "OPENCODE_DISPATCH_SLUG": "",
+            "RECOVERY_CAPTURE": str(capture),
+            "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        })
+        script = f'''import {{ pathToFileURL }} from "node:url";
+const {{ AgentHarnessGuards }} = await import(pathToFileURL({json.dumps(str(ROOT / "adapters/opencode/plugins/hearting-guards.js"))}));
+const hooks = await AgentHarnessGuards({{client: {{app: {{log: async () => {{}}}}, session: {{promptAsync: async () => ({{response: {{ok: true}}}})}}}}, directory: process.cwd()}});
+await hooks.event({{event: {{type: "session.created", properties: {{info: {{id: "main-session"}}}}}}}});
+hooks.dispose();
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", script], env=env,
+                             cwd=str(self.root), capture_output=True, text=True, timeout=20)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (not capture.exists()
+              or len(capture.read_text().splitlines()) < 2):
+            time.sleep(0.02)
+        calls = capture.read_text().splitlines()
+        self.assertEqual(calls.count("ensure"), 1, calls)
+        self.assertEqual(calls.count("activate"), 1, calls)
 
 
 class DetachedCommonRecoveryTest(IsolatedRootMixin, unittest.TestCase):

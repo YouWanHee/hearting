@@ -17,6 +17,8 @@ import tempfile
 import time
 from typing import Any
 
+from dispatch_registry_cache import RegistryView, registry_view
+
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
@@ -178,8 +180,17 @@ def _registry_snapshot(jobs: Path) -> list[tuple[list[str], dict[str, str]]]:
 def _owner_snapshot(jobs: Path, attempt: str, *,
                     rows: list[tuple[list[str], dict[str, str]]] | None = None
                     ) -> tuple[list[str], dict[str, str]]:
+    if rows is None:
+        try:
+            candidates = registry_view(jobs).completion_attempt_records(attempt)
+        except OSError as exc:
+            raise OwnerRouteBindingError("owner-route-jobs-unreadable") from exc
+        if len(candidates) != 1:
+            raise OwnerRouteBindingError("owner-route-owner-row-not-unique")
+        record = candidates[0]
+        return list(record.fields), record.completion_metadata()
     matches = [
-        row for row in (rows if rows is not None else _registry_snapshot(jobs))
+        row for row in rows
         if row[1].get("attempt_id") == attempt
     ]
     if len(matches) != 1:
@@ -648,10 +659,8 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
     # side of a concurrent transition.
     if observer is not None:
         observer("file", canonical_jobs)
-    rows = _registry_snapshot(canonical_jobs)
-    fields, meta = _owner_snapshot(
-        canonical_jobs, owner_attempt_id, rows=rows
-    )
+    rows = registry_view(canonical_jobs)
+    fields, meta = _owner_snapshot(canonical_jobs, owner_attempt_id)
     row_binding = _row_binding(meta)
     if sealed_binding is not None and row_binding != sealed_binding:
         if gates_on():
@@ -704,7 +713,7 @@ def default_owner_route_file(jobs: str | Path | None = None, environ=None) -> st
 
 
 def _candidate_started_by_owner(
-    rows: list[tuple[list[str], dict[str, str]]], *, owner_attempt_id: str,
+    rows: list[tuple[list[str], dict[str, str]]] | RegistryView, *, owner_attempt_id: str,
     candidate: OwnerRouteAdvance, source_route: dict,
 ) -> bool:
     """Return whether an exact registered child adopted this candidate.
@@ -713,11 +722,18 @@ def _candidate_started_by_owner(
     be abandoned before any child starts.  Current-contract child rows survive
     process exit, so the adoption proof remains available after restart.
     """
-    relevant = [
-        (fields, meta) for fields, meta in rows
-        if meta.get("parent_attempt_id") == owner_attempt_id
-        and meta.get("route_id") == candidate.to_route_id
-    ]
+    if isinstance(rows, RegistryView):
+        relevant = []
+        for record in rows.completion_children(owner_attempt_id):
+            meta = record.completion_metadata()
+            if meta.get("route_id") == candidate.to_route_id:
+                relevant.append((list(record.fields), meta))
+    else:
+        relevant = [
+            (fields, meta) for fields, meta in rows
+            if meta.get("parent_attempt_id") == owner_attempt_id
+            and meta.get("route_id") == candidate.to_route_id
+        ]
     if not relevant:
         return False
     expected_file = str(Path(candidate.to_route_file).resolve(strict=False))
@@ -759,7 +775,7 @@ def _candidate_started_by_owner(
 def resolve_owner_route_advance(
     jobs: str | Path, *, owner_attempt_id: str, anchor: OwnerRouteBinding,
     anchor_generation: int | None = None,
-    registry_rows: list[tuple[list[str], dict[str, str]]] | None = None,
+    registry_rows: list[tuple[list[str], dict[str, str]]] | RegistryView | None = None,
     observer=None,
 ) -> tuple[OwnerRouteBinding, str]:
     """Follow only verified, child-adopted predecessor candidates.
@@ -778,7 +794,7 @@ def resolve_owner_route_advance(
         jobs_path = Path(jobs).expanduser()
         if observer is not None:
             observer("file", jobs_path)
-        registry_rows = _registry_snapshot(jobs_path) if jobs_path.is_file() else []
+        registry_rows = registry_view(jobs_path) if jobs_path.is_file() else []
     if observer is not None:
         observer("members", first_path)
     first_candidates = list(first_path.glob("*.json")) if first_path.is_dir() else []

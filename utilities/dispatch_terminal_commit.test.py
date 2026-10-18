@@ -1649,6 +1649,36 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     self.assertEqual(ledger.journal(), before)
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
 
+    def test_settled_history_reuses_its_producer_proof_until_an_input_changes(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            artifact_producer._HISTORICAL_OBSERVATIONS.clear()
+            artifact_producer._HISTORICAL_PROJECTIONS.clear()
+            terminal._route_module.cache_clear()
+            code_imports = []
+            loader = importlib.util.spec_from_file_location
+            def load_code(name, path, *args, **kwargs):
+                if name == "terminal_capability_route":
+                    code_imports.append(str(path))
+                return loader(name, path, *args, **kwargs)
+            verify = artifact_producer._verify_sealed_cycle_locked
+            with mock.patch.object(artifact_producer, "_verify_sealed_cycle_locked", wraps=verify) as checked, \
+                 mock.patch.object(importlib.util, "spec_from_file_location", side_effect=load_code):
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                first_count = checked.call_count
+                self.assertGreater(first_count, 0)
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                self.assertEqual(checked.call_count, first_count)
+                index_path = artifact_admission._index_path(fixture.root)
+                original = index_path.read_bytes()
+                index_path.write_bytes(b"{}")
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "unknown")
+                self.assertGreater(checked.call_count, first_count)
+                index_path.write_bytes(original)
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            self.assertEqual(len(code_imports), 1, "code reuse must not suppress fresh data rejection/recovery")
+
     def test_historical_observer_protects_corruption_missing_duty_and_unsettled_child(self):
         fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
