@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -187,6 +191,161 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 )
                 self.assertEqual(self.source.read_bytes(), self._serialize(self.link))
 
+    def test_observation_collision_is_archived_without_replacing_current_bytes(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        content_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                    / "dispatch-observation-archive" / root_digest
+                    / relative / content_digest)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            self.assertEqual(
+                distribution._migration_deletion_precondition(
+                    self.candidate, self.environment
+                ),
+                (True, ""),
+            )
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+        self.assertEqual(archived.read_bytes(), b"legacy observation\n")
+
+    def test_observation_written_after_carry_is_archived_by_final_delta_check(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        archive_root = (Path(self.environment["HARNESS_STATE_ROOT"])
+                        / "dispatch-observation-archive" / root_digest
+                        / relative)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            source.write_bytes(b"legacy observation plus late write\n")
+            self.assertEqual(
+                distribution._migration_deletion_precondition(
+                    self.candidate, self.environment
+                ),
+                (True, ""),
+            )
+        digests = {hashlib.sha256(path.read_bytes()).hexdigest()
+                   for path in archive_root.iterdir()}
+        self.assertEqual(
+            digests,
+            {
+                hashlib.sha256(b"legacy observation\n").hexdigest(),
+                hashlib.sha256(b"legacy observation plus late write\n").hexdigest(),
+            },
+        )
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+
+    def test_completion_proof_collision_still_blocks_release_deletion(self) -> None:
+        relative = Path("completion/proof.json")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b'{"proof":"legacy"}\n')
+        target.write_bytes(b'{"proof":"current"}\n')
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            allowed, reason = distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )
+        self.assertFalse(allowed)
+        self.assertIn("delta-digest-mismatch", reason)
+        self.assertEqual(source.read_bytes(), b'{"proof":"legacy"}\n')
+        self.assertEqual(target.read_bytes(), b'{"proof":"current"}\n')
+        self.assertFalse(
+            (Path(self.environment["HARNESS_STATE_ROOT"])
+             / "dispatch-observation-archive").exists()
+        )
+
+    def test_corrupt_archive_and_archive_write_failure_keep_the_release(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"legacy observation\n")
+        target.write_bytes(b"current observation\n")
+        root_digest = hashlib.sha256(
+            os.fsencode(str(self.source_root.resolve()))
+        ).hexdigest()
+        content_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        archived = (Path(self.environment["HARNESS_STATE_ROOT"])
+                    / "dispatch-observation-archive" / root_digest
+                    / relative / content_digest)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertTrue(distribution._succeed_dispatch_state(self.candidate))
+            archived.write_bytes(b"corrupt archive")
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            self.assertFalse(distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )[0])
+            archived.write_bytes(b"legacy observation\n")
+            # destructive-ok: reason=inject a missing archive object before the copy-failure case; boundary=one object below this test's temporary state root
+            archived.unlink()
+            with mock.patch.object(distribution, "_atomic_migrate_copy", return_value=False):
+                self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+        self.assertEqual(source.read_bytes(), b"legacy observation\n")
+        self.assertEqual(target.read_bytes(), b"current observation\n")
+
+    def test_symlink_in_dispatch_tree_keeps_source_and_refuses_carry(self) -> None:
+        relative = Path("logs/dispatch-session-sweep.log")
+        source = self.source_root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        outside = self.candidate.parent / "outside-observation.log"
+        outside.write_bytes(b"outside bytes\n")
+        source.symlink_to(outside)
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+            allowed, reason = distribution._migration_deletion_precondition(
+                self.candidate, self.environment
+            )
+        self.assertFalse(allowed)
+        self.assertIn("delta-unreadable", reason)
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside bytes\n")
+
+    def test_symlinked_live_sidecar_is_never_reanchored_outside_target_root(self) -> None:
+        relative = Path("completion/rt-test/plan.att-test.attempt.json")
+        source = self.source_root / relative
+        target = self.target_root / relative
+        outside = self.candidate.parent / "outside-sidecar.json"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            json.dumps({"completion_marker": str(source.parent / "plan.json")}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        outside.write_text('{"completion_marker":"outside"}\n', encoding="utf-8")
+        # destructive-ok: reason=replace the migrated fixture destination with a symlink attack; boundary=one destination below this test's temporary state root
+        target.unlink()
+        target.symlink_to(outside)
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.assertFalse(distribution._succeed_dispatch_state(self.candidate))
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"),
+                         '{"completion_marker":"outside"}\n')
+
     def test_other_sidecar_changes_still_block_deletion(self) -> None:
         original = self.target.read_bytes()
         mutations = {
@@ -238,6 +397,157 @@ class DispatchMigrationReanchorTest(unittest.TestCase):
                 self.assertFalse(distribution._migration_deletion_precondition(
                     self.candidate, self.environment
                 )[0])
+
+
+class ReleasePycachePruneTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.share = self.root / "share" / "hearting"
+        self.releases = self.share / "releases"
+        self.releases.mkdir(parents=True)
+        self.state = self.root / "state" / "hearting"
+        self.pycache = self.state / "pycache"
+
+    def _cache_for(self, release: Path) -> Path:
+        return self.pycache.joinpath(*self.releases.parts[1:], release.name)
+
+    def _patch_cleanup(self, stack: ExitStack, *, in_use=(False, ""), route=([], "")) -> None:
+        for name, value in {
+            "data_root": self.share,
+            "state_root": self.state,
+            "_stable_registry_snapshot": [],
+            "_open_route_launch_homes": route,
+            "_release_in_use": in_use,
+            "_release_held_by_live_process": (False, ""),
+            "_release_projection_referenced": False,
+            "_succeed_dispatch_state": True,
+            "_migration_deletion_precondition": (True, ""),
+            "_retention_containment_precondition": (True, ""),
+        }.items():
+            if callable(value):
+                stack.enter_context(mock.patch.object(
+                    distribution, name, side_effect=value
+                ))
+            else:
+                stack.enter_context(mock.patch.object(
+                    distribution, name, return_value=value
+                ))
+
+    def _create_release(self, name: str, timestamp: int) -> Path:
+        release = self.releases / name
+        release.mkdir()
+        (release / "cache_probe.py").write_text("VALUE = 42\n", encoding="utf-8")
+        os.utime(release, (timestamp, timestamp))
+        return release
+
+    def test_prune_removes_only_corresponding_default_pycache(self) -> None:
+        old = self._create_release("v-old", 1)
+        middle = self._create_release("v-middle", 2)
+        newest = self._create_release("v-newest", 3)
+        import_env = os.environ.copy()
+        import_env["PYTHONPYCACHEPREFIX"] = str(self.pycache)
+        import_env.pop("PYTHONDONTWRITEBYTECODE", None)
+        imported = subprocess.run(
+            [sys.executable, "-S", "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import cache_probe",
+             str(old)],
+            capture_output=True, text=True, env=import_env, check=False,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        old_cache = self._cache_for(old)
+        self.assertTrue(list(old_cache.rglob("*.pyc")))
+        for release in (middle, newest):
+            cache = self._cache_for(release)
+            cache.mkdir(parents=True)
+            (cache / "retained.pyc").write_bytes(b"retained")
+        sibling = self.pycache.joinpath(*self.releases.parts[1:-1])
+        sibling = sibling / "releases-neighbor" / "v-unrelated"
+        sibling.mkdir(parents=True)
+        (sibling / "unrelated.pyc").write_bytes(b"unrelated")
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+
+        self.assertFalse(old.exists())
+        self.assertFalse(old_cache.exists())
+        self.assertTrue(middle.exists() and self._cache_for(middle).exists())
+        self.assertTrue(newest.exists() and self._cache_for(newest).exists())
+        self.assertTrue((sibling / "unrelated.pyc").is_file())
+
+    def test_orphan_cache_waits_for_live_or_unresolved_release_evidence(self) -> None:
+        cache = self._cache_for(self.releases / "gone")
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"orphan")
+
+        def prove_use(_release, _stable, route_snapshot):
+            if route_snapshot[1]:
+                return True, route_snapshot[1]
+            return True, "open-attempt:att-live"
+
+        for route in (([], ""), ([], "route-discovery-unreliable:/fixture")):
+            with self.subTest(route=route):
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack, in_use=prove_use, route=route)
+                    distribution._cleanup_releases(set())
+                self.assertTrue((cache / "old.pyc").is_file())
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+        self.assertFalse(cache.exists())
+
+    def test_failed_cache_removal_is_retried_on_the_next_cleanup(self) -> None:
+        old = self._create_release("v-old", 1)
+        self._create_release("v-middle", 2)
+        self._create_release("v-newest", 3)
+        cache = self._cache_for(old)
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"old")
+        real_rmtree = distribution.shutil.rmtree
+
+        def fail_cache(path, *args, **kwargs):
+            if Path(path) == cache:
+                raise PermissionError("fixture cache failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution.shutil, "rmtree", side_effect=fail_cache
+            ))
+            distribution._cleanup_releases(set())
+        self.assertFalse(old.exists())
+        self.assertTrue((cache / "old.pyc").is_file())
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            distribution._cleanup_releases(set())
+        self.assertFalse(cache.exists())
+
+    def test_release_removal_failure_keeps_its_derived_cache(self) -> None:
+        old = self._create_release("v-old", 1)
+        self._create_release("v-middle", 2)
+        self._create_release("v-newest", 3)
+        cache = self._cache_for(old)
+        cache.mkdir(parents=True)
+        (cache / "old.pyc").write_bytes(b"old")
+
+        def fail_release(path, *_args, **_kwargs):
+            if Path(path) == old:
+                raise PermissionError("fixture release failure")
+            return None
+
+        with ExitStack() as stack:
+            self._patch_cleanup(stack)
+            stack.enter_context(mock.patch.object(
+                distribution.shutil, "rmtree", side_effect=fail_release
+            ))
+            distribution._cleanup_releases(set())
+        self.assertTrue(old.is_dir())
+        self.assertTrue((cache / "old.pyc").is_file())
 
 
 class ActivationFailureDiagnosticTest(unittest.TestCase):

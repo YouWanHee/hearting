@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,35 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def install_fake_tmux(fakebin, *, stale_environment=None):
+    fakebin.mkdir(parents=True, exist_ok=True)
+    tmux = fakebin / "tmux"
+    lines = ["#!/bin/sh"]
+    for key, value in (stale_environment or {}).items():
+        lines.append(f"export {key}={shlex.quote(value)}")
+    lines.extend([
+        'if [ "$1" = "-L" ]; then shift 2; fi',
+        'if [ "$1" = "start-server" ]; then exit 0; fi',
+        '[ "$1" = "new-session" ] || exit 1',
+        "shift",
+        "cwd=/",
+        'while [ "$#" -gt 0 ]; do',
+        '  case "$1" in',
+        '    -d) shift ;;',
+        '    -s) run_id=$2; shift 2 ;;',
+        '    -c) cwd=$2; shift 2 ;;',
+        '    -e) export "$2"; shift 2 ;;',
+        '    *) command=$1; break ;;',
+        "  esac",
+        "done",
+        'cd "$cwd" || exit 1',
+        'exec /bin/bash -lc "$command"',
+    ])
+    tmux.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmux.chmod(0o755)
+    return tmux
 
 
 class ComputeRunLauncherIdentityTest(unittest.TestCase):
@@ -412,11 +442,11 @@ class ComputeHostsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_tool(self, *args):
+    def run_tool(self, *args, env=None):
         if args[:1] == ("run",) and "--gpus" not in args:
             args = (*args[:2], "--gpus", "", *args[2:])
         return subprocess.run([sys.executable, str(TOOL), *args],
-                              text=True, capture_output=True, env=self.env)
+                              text=True, capture_output=True, env=env or self.env)
 
     def test_missing_inventory_is_a_typed_failure(self):
         env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.root / "absent.yaml")}
@@ -723,16 +753,11 @@ class ComputeHostsTest(unittest.TestCase):
 
     def test_tmux_run_pins_launcher_session_over_stale_server_environment(self):
         fakebin = self.root / "tmux-bin"
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "CODEX_THREAD_ID=stale-thread CODEX_SESSION_ID=other-stale "
-            "CLAUDE_CODE_SESSION_ID=stale-claude /bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
+        install_fake_tmux(fakebin, stale_environment={
+            "CODEX_THREAD_ID": "stale-thread",
+            "CODEX_SESSION_ID": "other-stale",
+            "CLAUDE_CODE_SESSION_ID": "stale-claude",
+        })
         clean = {key: value for key, value in self.env.items()
                  if key not in dict(load_module().SESSION_ENV_KEYS)}
         env = {**clean, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
@@ -748,11 +773,13 @@ class ComputeHostsTest(unittest.TestCase):
         run_id = result.stdout.split()[1]
         log = (self.run_root / run_id / "log").read_text(encoding="utf-8")
         self.assertEqual(log, "launch-thread||")
+        meta = json.loads((self.run_root / run_id / "meta.json").read_text())
+        self.assertEqual(meta["tmux_transport"]["kind"], "hearting-tmux-v1")
 
     def test_conflicting_launcher_sessions_fail_closed_in_nohup_payload(self):
         fakebin = self.root / "nohup-bin"
         fakebin.mkdir()
-        for command in ("bash", "mkdir", "nohup", "setsid", "python3", "sh"):
+        for command in ("bash", "id", "mkdir", "nohup", "setsid", "python3", "sh", "tr"):
             target = Path("/usr/bin") / command
             if not target.exists():
                 target = Path("/bin") / command
@@ -1226,14 +1253,20 @@ class ComputeHostsTest(unittest.TestCase):
     def test_stop_records_sigterm_exit_and_reason(self):
         # `stop` kills the tmux session before the run shell can write its
         # own exit code; the stop itself must leave 143 + a reason behind.
+        if shutil.which("tmux") is None:
+            self.skipTest("tmux is not installed")
         result = self.run_tool("run", "here", "--name", "stopme", "--",
                                "bash", "-c", "sleep 30")
         self.assertEqual(result.returncode, 0, result.stderr)
         run_id = result.stdout.split()[1]
+        meta = json.loads((self.run_root / run_id / "meta.json").read_text())
+        transport = meta["tmux_transport"]
+        self.assertEqual(transport["kind"], "hearting-tmux-v1")
+        server = transport["server"]
         try:
             for _ in range(50):
                 check = subprocess.run(
-                    ["tmux", "has-session", "-t", run_id],
+                    ["tmux", "-L", server, "has-session", "-t", run_id],
                     capture_output=True, timeout=5)
                 if check.returncode == 0:
                     break
@@ -1262,17 +1295,54 @@ class ComputeHostsTest(unittest.TestCase):
             tail = self.run_tool("tail", run_id)
             self.assertIn("exit 143 (stopped)", tail.stdout)
         finally:
-            subprocess.run(["tmux", "kill-session", "-t", run_id],
+            subprocess.run(["tmux", "-L", server, "kill-session", "-t", run_id],
                            capture_output=True, timeout=5)
+            subprocess.run(["tmux", "-L", server, "kill-server"],
+                           capture_output=True, timeout=5)
+
+    def test_tmux_transport_probes_only_the_recorded_managed_server(self):
+        module = load_module()
+        server = "hearting-0123456789abcdefabcd"
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(module, "remote", return_value=completed) as remote:
+            self.assertIs(
+                module._tmux_session_alive(
+                    {"ssh_host": "unused"}, "run-1",
+                    transport={"kind": "hearting-tmux-v1", "server": server},
+                ),
+                False,
+            )
+            self.assertIn(
+                f"tmux -L {server} has-session -t run-1",
+                remote.call_args.args[1],
+            )
+            self.assertIsNone(module._tmux_session_alive(
+                {"ssh_host": "unused"}, "run-1",
+                transport={"kind": "hearting-tmux-v1", "server": "default"},
+            ))
+            self.assertIsNone(module._tmux_session_alive(
+                {"ssh_host": "unused"}, "run-1",
+                transport={"kind": "nohup-v1"},
+            ))
+        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(module._tmux_command_prefix(), ["tmux"])
 
     def test_stop_never_overwrites_a_natural_finish(self):
         run_dir = self.run_root / "natural-20261002-000001-done"
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["true"]}), encoding="utf-8")
+                        "command": ["true"],
+                        "tmux_transport": {"kind": "hearting-tmux-v1",
+                                           "server": "hearting-00000000000000000000"}}),
+            encoding="utf-8")
         (run_dir / "exit_code").write_text("0\n", encoding="utf-8")
-        stopped = self.run_tool("stop", run_dir.name)
+        fakebin = self.root / "natural-fake-tmux"
+        install_fake_tmux(fakebin)
+        stopped = self.run_tool(
+            "stop", run_dir.name,
+            env={**self.env, "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", "")},
+        )
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(
             (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "0")
@@ -1285,19 +1355,25 @@ class ComputeHostsTest(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["bash", "-c", "sleep 30"]}),
+                        "command": ["bash", "-c", "sleep 30"],
+                        "tmux_transport": {"kind": "hearting-tmux-v1",
+                                           "server": "hearting-00000000000000000000"}}),
             encoding="utf-8")
-        listed = self.run_tool("runs")
+        fakebin = self.root / "stale-fake-tmux"
+        install_fake_tmux(fakebin)
+        fixture_env = {**self.env,
+                       "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", "")}
+        listed = self.run_tool("runs", env=fixture_env)
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn("stopped (gone)", listed.stdout)
         self.assertFalse((run_dir / "exit_code").exists())
-        payload = json.loads(self.run_tool("runs", "--json").stdout)
+        payload = json.loads(self.run_tool("runs", "--json", env=fixture_env).stdout)
         row = next(item for item in payload if item["run_id"] == run_dir.name)
         self.assertIsNone(row["exit_code"])
         self.assertEqual(row["state"], "stopped")
         self.assertTrue(row["stale"])
         # An explicit stop then seals the legacy run the same way as new ones.
-        stopped = self.run_tool("stop", run_dir.name)
+        stopped = self.run_tool("stop", run_dir.name, env=fixture_env)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(
             (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "143")
@@ -1311,7 +1387,8 @@ class ComputeHostsTest(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "meta.json").write_text(
             json.dumps({"run_id": run_dir.name, "host": "here",
-                        "command": ["bash", "-c", "sleep 30"]}),
+                        "command": ["bash", "-c", "sleep 30"],
+                        "tmux_transport": {"kind": "nohup-v1"}}),
             encoding="utf-8")
         with mock.patch.object(module, "_tmux_session_alive", return_value=None):
             config = module.load_config(str(self.config))
@@ -1319,8 +1396,8 @@ class ComputeHostsTest(unittest.TestCase):
             self.assertEqual(state["state"], "running")
             self.assertIsNone(module._tmux_session_alive(object(), "x"))
         listed = self.run_tool("runs", "--host", "here")
-        # With real tmux present and no such session this row shows stale;
-        # the unit point above is that unknown (None) never declares gone.
+        # An explicitly non-tmux transport stays unknown and never probes the
+        # host's default tmux server.
         self.assertEqual(listed.returncode, 0, listed.stderr)
 
     def test_record_stop_writes_once_and_keeps_a_natural_exit(self):
@@ -1540,16 +1617,10 @@ class LauncherProvenanceTest(unittest.TestCase):
         home = self.make_home()
         attempt = "att-9f2c4b1ad34e"
         fakebin = self.root / "tmux-bin"
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "env -u AGENT_HOME -u AGENT_DISPATCH_ATTEMPT_ID "
-            "/bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
+        install_fake_tmux(fakebin, stale_environment={
+            "AGENT_HOME": "/foreign/old-release",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-stale-owner",
+        })
         env = self.scrubbed_env(
             AGENT_HOME=str(home), AGENT_DISPATCH_ATTEMPT_ID=attempt,
             PATH=str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
@@ -1617,24 +1688,12 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", unknown.stdout.split("setup: ", 1)[1])
 
     def run_with_foreign_transport(self, name, env):
-        """Launch through a tmux server that retains unrelated old values.
-
-        A long-lived tmux server keeps the environment of whichever client
-        created it; the fixture pins exactly that: foreign provenance the
-        launcher never issued.
-        """
+        """Exercise a stale server environment against the per-run tmux -e pins."""
         fakebin = self.root / name
-        fakebin.mkdir()
-        tmux = fakebin / "tmux"
-        tmux.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 1 ]; do shift; done\n"
-            "AGENT_HOME=/foreign/stale-home "
-            "AGENT_DISPATCH_ATTEMPT_ID=att-unrelated-old-owner "
-            "/bin/bash -lc \"$1\"\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
+        install_fake_tmux(fakebin, stale_environment={
+            "AGENT_HOME": "/foreign/stale-home",
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-unrelated-old-owner",
+        })
         env = {**env, "PATH": str(fakebin) + os.pathsep
                + os.environ.get("PATH", "")}
         result = self.run_tool(

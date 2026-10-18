@@ -7,9 +7,11 @@ by an adapter. Only the host running the GPU reads its process identities.
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import socket
 import subprocess
@@ -21,6 +23,31 @@ import uuid
 
 class GPUUnavailable(ValueError):
     pass
+
+
+_TMUX_SESSION_ENV_KEYS = (
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+    "CODEX_THREAD_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID",
+)
+_TMUX_SERVER_PIN_KEYS = {
+    "AGENT_HOME", "CLAUDE_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
+    "AGENT_DISPATCH_DEPTH", "AGENT_DISPATCH_JOBS",
+    "AGENT_OWNER_ROUTE_FILE", "AGENT_ROUTE_FILE",
+    "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
+    "TMUX", "TMUX_PANE",
+    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+    "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE",
+} | set(_TMUX_SESSION_ENV_KEYS)
+
+
+def tmux_server_name(state_file):
+    """Stable private tmux namespace for this host-local Hearting state root."""
+    state = Path(state_file).expanduser()
+    if not state.is_absolute():
+        raise GPUUnavailable("GPU state path must be absolute for managed tmux")
+    root = state.parent.resolve(strict=False)
+    digest = hashlib.sha256(os.fsencode(str(root))).hexdigest()[:20]
+    return "hearting-" + digest
 
 
 def state_path(environ=None):
@@ -486,14 +513,58 @@ def launch_compute(options, payload_source):
     script = payload_source + "\nraise SystemExit(payload(%r, %r, %r))\n" % (path, lease, inner)
     command = "python3 -c " + shlex.quote(script)
     run_dir = Path(options["run_dir"])
+    launch_cwd = options.get("cwd") or os.getcwd()
+    if not isinstance(launch_cwd, str) or not os.path.isabs(launch_cwd):
+        release(path, lease)
+        raise GPUUnavailable("compute launch directory must be absolute")
+    tmux_environment = options.get("tmux_environment") or {}
+    if not isinstance(tmux_environment, dict):
+        release(path, lease)
+        raise GPUUnavailable("invalid tmux launch environment")
+    tmux_environment = dict(tmux_environment)
+    for key in (
+        *_TMUX_SESSION_ENV_KEYS,
+        "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
+        "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+        "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE",
+    ):
+        tmux_environment.setdefault(key, "")
+    for key, value in tmux_environment.items():
+        if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or not isinstance(value, str) or "\0" in value):
+            release(path, lease)
+            raise GPUUnavailable("invalid tmux launch environment")
+    server_env = dict(os.environ)
+    for key in _TMUX_SERVER_PIN_KEYS | set(tmux_environment):
+        server_env.pop(key, None)
+    server_name = tmux_server_name(path)
     try:
         run_dir.mkdir(parents=True, exist_ok=False)
-        if subprocess.call(["sh", "-c", "command -v tmux >/dev/null 2>&1"]) == 0:
-            subprocess.check_call(["tmux", "new-session", "-d", "-s", options["run_id"], command])
+        if subprocess.call(
+            ["sh", "-c", "command -v tmux >/dev/null 2>&1"],
+            env=server_env,
+            cwd="/",
+        ) == 0:
+            # The first client owns server creation. Keep that long-lived
+            # process outside the invoking release/session, then provide only
+            # this launch's validated identity and cwd to its new session.
+            subprocess.check_call(
+                ["tmux", "-L", server_name, "start-server"],
+                env=server_env,
+                cwd="/",
+            )
+            tmux_command = ["tmux", "-L", server_name, "new-session", "-d",
+                            "-s", options["run_id"]]
+            for key, value in sorted(tmux_environment.items()):
+                tmux_command.extend(["-e", f"{key}={value}"])
+            tmux_command.extend(["-c", launch_cwd, command])
+            subprocess.check_call(tmux_command, env=server_env, cwd="/")
+            tmux_transport = {"kind": "hearting-tmux-v1", "server": server_name}
         else:
             with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as output:
                 subprocess.Popen(["python3", "-c", script], stdin=stdin, stdout=output,
-                                 stderr=output, start_new_session=True)
+                                 stderr=output, start_new_session=True, cwd=launch_cwd)
+            tmux_transport = {"kind": "nohup-v1"}
         # The launcher remains the pending holder until its wrapper is bound.
         # A dead launcher can never let an unbound wrapper start a payload.
         deadline = time.monotonic() + 5
@@ -509,7 +580,8 @@ def launch_compute(options, payload_source):
     except Exception:
         release(path, lease)
         raise
-    return {"gpus": devices, "gpu_lease": lease}
+    return {"gpus": devices, "gpu_lease": lease,
+            "tmux_transport": tmux_transport}
 
 
 def requested_devices(command, default=None):

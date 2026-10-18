@@ -1695,6 +1695,37 @@ def _alias_digest(hex_digest: str) -> str:
     return "sha256:" + hex_digest
 
 
+def _dispatch_tree_has_unsafe_entries(root: Path) -> bool:
+    """Treat unreadable, symlinked, or special dispatch entries as unknown."""
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return False if directory == root else True
+        except OSError:
+            return True
+        if not stat.S_ISDIR(info.st_mode):
+            return True
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                    except OSError:
+                        return True
+                    if stat.S_ISLNK(mode):
+                        return True
+                    if stat.S_ISDIR(mode):
+                        pending.append(Path(entry.path))
+                    elif not stat.S_ISREG(mode):
+                        return True
+        except OSError:
+            return True
+    return False
+
+
 def _migration_relative_files(root: Path) -> list[str]:
     """Every regular file under `root`, relative-posix, excluding the
     registry (merged separately with terminal precedence, not byte-compared)."""
@@ -1856,12 +1887,15 @@ def _migration_m0_preflight(source_dispatch: Path, stable_root: Path) -> dict:
 
 
 # destructive-ok: reason=commit a verified migration copy; boundary=one destination and its mkstemp sibling under stable state
-def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
+def _atomic_migrate_copy(
+    source: Path, destination: Path, *, replace: bool = True
+) -> bool:
     """M2 per-file atomic copy for the new migration path only (decision 8):
     copy to a same-directory `.tmp`, verify the digest, fsync the file,
     `os.replace`, fsync the parent directory. Cross-device safe -- this never
-    relies on `os.rename` across filesystems, always a real copy. Returns
-    False (leaving no partial destination) on any verification failure."""
+    relies on `os.rename` across filesystems, always a real copy. `replace=False`
+    links the verified temporary file without replacing an existing destination.
+    Returns False (leaving no partial destination) on any verification failure."""
 
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1879,7 +1913,12 @@ def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
             os.fsync(tmp_handle.fileno())
         if _sha256_file(Path(tmp_name)) != source_digest:
             return False
-        os.replace(tmp_name, destination)
+        if replace:
+            os.replace(tmp_name, destination)
+        else:
+            # The observation archive is content-addressed. Never repair or
+            # replace an existing object: the caller must verify its bytes.
+            os.link(tmp_name, destination)
         ok = True
     except OSError:
         return False
@@ -1897,14 +1936,116 @@ def _atomic_migrate_copy(source: Path, destination: Path) -> bool:
     return True
 
 
-def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
-    """M2 additive copy + the copy-side half of M3 verification, mirroring
-    `_succeed_dispatch_state`'s additive discipline (destination existing
-    wins, nothing already there is ever clobbered) but per-file atomic
-    (`_atomic_migrate_copy`) instead of `shutil.copy2` -- this is the new
-    migration copy path only; `_succeed_dispatch_state`'s own `copy2`
-    semantics are unchanged (decision 8)."""
+_DISPATCH_OBSERVATION_FILES = {"logs/dispatch-session-sweep.log"}
 
+
+def _dispatch_observation_file(relative: Path) -> bool:
+    return relative.as_posix() in _DISPATCH_OBSERVATION_FILES
+
+
+def _path_has_symlink_from(path: Path, boundary: Path) -> bool:
+    """Refuse a symlink anywhere below a trusted root, including dangling leaves."""
+    try:
+        relative = path.relative_to(boundary)
+    except ValueError:
+        return True
+    current = boundary
+    if current.is_symlink():
+        return True
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _archive_dispatch_observation(
+    source_root: Path, source: Path, relative: Path, source_digest: str
+) -> bool:
+    """Keep one classified legacy observation without making it dispatch authority."""
+    if not _dispatch_observation_file(relative):
+        return False
+    try:
+        if source.is_symlink() or not stat.S_ISREG(source.lstat().st_mode):
+            return False
+        source_root_real = source_root.resolve(strict=True)
+        source_real = source.resolve(strict=True)
+        expected_source = source_root_real / relative
+        if source_real != expected_source or _path_has_symlink_from(source, source_root):
+            return False
+        if _sha256_file(source) != source_digest:
+            return False
+        state = state_root()
+        archive_root = state / "dispatch-observation-archive"
+        root_digest = hashlib.sha256(os.fsencode(str(source_root_real))).hexdigest()
+        destination = archive_root / root_digest / relative / source_digest
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if state.is_symlink() or not state.is_dir():
+            return False
+        # Build private path components one at a time and never traverse an
+        # existing symlink or replace a corrupt content-addressed object.
+        parent = state
+        for component in destination.parent.relative_to(state).parts:
+            parent /= component
+            if parent.is_symlink():
+                return False
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                if parent.is_symlink() or not parent.is_dir():
+                    return False
+            if stat.S_IMODE(parent.lstat().st_mode) & 0o077:
+                return False
+        if _path_has_symlink_from(destination, state):
+            return False
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            if not _atomic_migrate_copy(source, destination, replace=False):
+                return False
+            info = destination.lstat()
+        if (not stat.S_ISREG(info.st_mode) or destination.is_symlink()
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            return False
+        return _sha256_file(destination) == source_digest
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _dispatch_file_matches(
+    source: Path,
+    destination: Path,
+    source_root: Path,
+    target_root: Path,
+    relative: Path,
+) -> bool:
+    """Verify carry-forward bytes, with one explicit observation exception."""
+    if (source.is_symlink() or destination.is_symlink()
+            or _path_has_symlink_from(source, source_root)
+            or _path_has_symlink_from(destination, target_root)):
+        return False
+    if not stat.S_ISREG(source.lstat().st_mode) or not stat.S_ISREG(destination.lstat().st_mode):
+        return False
+    source_digest = _sha256_file(source)
+    if source_digest == _sha256_file(destination):
+        return True
+    if _dispatch_observation_file(relative):
+        return _archive_dispatch_observation(
+            source_root, source, relative, source_digest
+        )
+    return _semantic_reanchor_equal(source, destination, source_root, target_root)
+
+
+def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
+    """M2 additive copy + the copy-side half of M3 verification.
+
+    Existing destinations are never clobbered. Ordinary collisions must be
+    byte-equal (or exact sidecar re-anchors); the classified observation
+    collision is archived before it can count as reconciled. New files use
+    the per-file atomic copy used by this migration path."""
+
+    if _dispatch_tree_has_unsafe_entries(source_root):
+        return False
     ok = True
     touched_dirs: set[Path] = set()
     for source in source_root.rglob("*"):
@@ -1917,6 +2058,23 @@ def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
             continue
         destination = target_root / relative
         if destination.exists():
+            if source.name.endswith(".attempt.json"):
+                if (_path_has_symlink_from(destination, target_root)
+                        or destination.is_symlink() or not destination.is_file()):
+                    ok = False
+                else:
+                    touched_dirs.add(destination.parent)
+            else:
+                try:
+                    if not _dispatch_file_matches(
+                        source, destination, source_root, target_root, relative
+                    ):
+                        ok = False
+                except OSError:
+                    ok = False
+            continue
+        if _path_has_symlink_from(destination, target_root):
+            ok = False
             continue
         if not _atomic_migrate_copy(source, destination):
             ok = False
@@ -1929,20 +2087,38 @@ def _migrate_tree_additive(source_root: Path, target_root: Path) -> bool:
             continue
         destination = target_root / source.relative_to(source_root)
         if destination.exists():
-            touched_dirs.add(destination.parent)
+            if (_path_has_symlink_from(destination, target_root)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            else:
+                touched_dirs.add(destination.parent)
     for directory in touched_dirs:
         if not _reanchor_succeeded_attempt_links(directory, source_root, target_root):
+            ok = False
+    for source in source_root.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(source_root)
+        if relative.as_posix() in _REGISTRY_CARRY_NAMES or relative.as_posix() == MIGRATION_JOURNAL_FILENAME:
+            continue
+        try:
+            if not _dispatch_file_matches(
+                source, target_root / relative, source_root, target_root, relative
+            ):
+                ok = False
+        except OSError:
             ok = False
     return ok
 
 
 def _migration_verify(source_root: Path, target_root: Path) -> bool:
-    """M3: every source file (outside the registry-carry set) exists at its
-    destination -- a retry-safe re-check independent of what the copy pass's
-    own return value claimed (mirrors `_succeed_dispatch_state`'s review V-1
-    guard: a no-op retry pass must not read as success unless the files are
-    actually all there)."""
+    """M3: verify carried bytes and the one archived observation exception.
 
+    This retry-safe re-check is independent of what the copy pass returned;
+    a no-op retry cannot succeed unless every source file is reconciled."""
+
+    if _dispatch_tree_has_unsafe_entries(source_root):
+        return False
     for source in source_root.rglob("*"):
         if not source.is_file() or source.is_symlink():
             continue
@@ -1951,7 +2127,12 @@ def _migration_verify(source_root: Path, target_root: Path) -> bool:
             continue
         if relative.as_posix() == MIGRATION_JOURNAL_FILENAME:
             continue
-        if not (target_root / relative).is_file():
+        try:
+            if not _dispatch_file_matches(
+                source, target_root / relative, source_root, target_root, relative
+            ):
+                return False
+        except OSError:
             return False
     return True
 
@@ -2119,17 +2300,21 @@ def _migration_deletion_precondition(candidate: Path, environ: dict[str, str]) -
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
         return True, ""
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        return False, "dispatch-state-migration-blocked-live-attempt:delta-unreadable"
     stable_root = stable_state_root(environ)
     for relative in _migration_relative_files(stale_dispatch):
         target = stable_root / relative
         if not target.is_file():
             return False, "dispatch-state-migration-blocked-live-attempt:delta-unreconciled"
         try:
-            if _sha256_file(stale_dispatch / relative) != _sha256_file(target):
-                if _semantic_reanchor_equal(
-                    stale_dispatch / relative, target, stale_dispatch, stable_root
-                ):
-                    continue
+            if not _dispatch_file_matches(
+                stale_dispatch / relative,
+                target,
+                stale_dispatch,
+                stable_root,
+                Path(relative),
+            ):
                 return False, "dispatch-state-migration-blocked-live-attempt:delta-digest-mismatch"
         except OSError:
             return False, "dispatch-state-migration-blocked-live-attempt:delta-unreadable"
@@ -2242,6 +2427,8 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
         return True
+    if _dispatch_tree_has_unsafe_entries(stale_dispatch):
+        return False
     live_dispatch = _surviving_dispatch_root(candidate, os.environ)
     if live_dispatch is None:
         # base parity (C47-9): when `candidate` is itself the current live
@@ -2267,6 +2454,23 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
             continue
         destination = live_dispatch / relative
         if destination.exists():
+            if source.name.endswith(".attempt.json"):
+                if (_path_has_symlink_from(destination, live_dispatch)
+                        or destination.is_symlink() or not destination.is_file()):
+                    ok = False
+                else:
+                    touched_dirs.add(destination.parent)
+            else:
+                try:
+                    if not _dispatch_file_matches(
+                        source, destination, stale_dispatch, live_dispatch, relative
+                    ):
+                        ok = False
+                except OSError:
+                    ok = False
+            continue
+        if _path_has_symlink_from(destination, live_dispatch):
+            ok = False
             continue
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2292,9 +2496,26 @@ def _succeed_dispatch_state(candidate: Path) -> bool:
             continue
         destination = live_dispatch / source.relative_to(stale_dispatch)
         if destination.exists():
-            touched_dirs.add(destination.parent)
+            if (_path_has_symlink_from(destination, live_dispatch)
+                    or destination.is_symlink() or not destination.is_file()):
+                ok = False
+            else:
+                touched_dirs.add(destination.parent)
     for directory in touched_dirs:
         if not _reanchor_succeeded_attempt_links(directory, stale_dispatch, live_dispatch):
+            ok = False
+    for source in stale_dispatch.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(stale_dispatch)
+        if relative.as_posix() in _REGISTRY_CARRY_NAMES:
+            continue
+        try:
+            if not _dispatch_file_matches(
+                source, live_dispatch / relative, stale_dispatch, live_dispatch, relative
+            ):
+                ok = False
+        except OSError:
             ok = False
     return ok
 
@@ -3185,6 +3406,118 @@ def _release_keep_message(candidate: Path, why: str) -> str:
             "deleting it")
 
 
+def _release_pycache_base() -> Path | None:
+    """Return the default PYTHONPYCACHEPREFIX subtree for managed releases."""
+    try:
+        releases = Path(os.path.abspath(data_root() / "releases"))
+        state = state_root()
+        if not releases.is_absolute() or not state.is_absolute():
+            return None
+        return (state / "pycache").joinpath(*releases.parts[1:])
+    except (OSError, DistributionError, ValueError):
+        return None
+
+
+def _release_pycache_path(release: Path) -> Path | None:
+    releases = Path(os.path.abspath(data_root() / "releases"))
+    candidate = Path(os.path.abspath(release))
+    if (candidate.parent != releases or candidate.name in {"", ".", ".."}
+            or releases.is_symlink()):
+        return None
+    base = _release_pycache_base()
+    return base / candidate.name if base is not None else None
+
+
+def _safe_pycache_path(path: Path) -> bool:
+    state = state_root()
+    return not state.is_symlink() and not _path_has_symlink_from(path, state)
+
+
+# destructive-ok: reason=remove only bytecode derived from one release that was actually pruned; boundary=canonical release-specific subtree under state_root/pycache
+def _remove_release_pycache(release: Path) -> bool:
+    cache = _release_pycache_path(release)
+    if cache is None or not _safe_pycache_path(cache):
+        return False
+    if cache.is_symlink():
+        return False
+    if not cache.exists():
+        return True
+    if not cache.is_dir():
+        return False
+    try:
+        shutil.rmtree(cache)
+    except OSError:
+        return False
+    return not cache.exists() and not cache.is_symlink()
+
+
+def _cleanup_orphan_release_pycache(
+    releases: Path,
+    keep: set[Path],
+    stable_snapshot: list[dict],
+    route_snapshot: tuple[list[tuple[str, str]], str],
+    skip_names: set[str] | None = None,
+) -> None:
+    """Retry release-specific cache cleanup without scanning outside its exact prefix."""
+    base = _release_pycache_base()
+    if (base is None or not _safe_pycache_path(base) or base.is_symlink()
+            or not base.is_dir()):
+        return
+    # A non-symlink current entry is malformed/unknown. Do not infer that any
+    # missing release is unused while the active pointer cannot be resolved.
+    current = current_path()
+    if current.exists() and not current.is_symlink():
+        print(
+            f"harness release: current pointer {current} is not a symlink; "
+            "keeping orphan release caches",
+            file=sys.stderr,
+        )
+        return
+    try:
+        entries = sorted(base.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        print(f"harness release: cannot inspect release pycache {base}: {exc}", file=sys.stderr)
+        return
+    for cache in entries:
+        if skip_names and cache.name in skip_names:
+            continue
+        release = releases / cache.name
+        if (cache.is_symlink() or not cache.is_dir() or release.exists()
+                or release.is_symlink()):
+            continue
+        if Path(os.path.abspath(release)) in {Path(os.path.abspath(item)) for item in keep}:
+            continue
+        in_use, why = _release_in_use(release, stable_snapshot, route_snapshot)
+        if in_use:
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                f"because release use is unresolved ({why})",
+                file=sys.stderr,
+            )
+            continue
+        held, why_held = _release_held_by_live_process(release)
+        if held:
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                f"because a live process refers to it ({why_held})",
+                file=sys.stderr,
+            )
+            continue
+        if _release_projection_referenced(release):
+            print(
+                f"harness release: orphan pycache for {release} is retained "
+                "because a runtime activation still refers to it",
+                file=sys.stderr,
+            )
+            continue
+        if not _remove_release_pycache(release):
+            print(
+                f"harness release: could not remove orphan pycache for {release}; "
+                "it will be retried on a later update",
+                file=sys.stderr,
+            )
+
+
 # destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root
 def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) -> None:
     releases = data_root() / "releases"
@@ -3204,6 +3537,7 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         reverse=True,
     )
     retained = 0
+    cache_failures: set[str] = set()
     for candidate in candidates:
         if candidate in keep or retained < 2:
             retained += 1
@@ -3276,7 +3610,32 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
                     file=sys.stderr,
                 )
                 continue
-        shutil.rmtree(candidate, ignore_errors=True)
+        try:
+            shutil.rmtree(candidate)
+        except OSError as exc:
+            print(
+                f"harness release: could not remove {candidate}: {exc}; "
+                "keeping its pycache",
+                file=sys.stderr,
+            )
+            continue
+        if candidate.exists() or candidate.is_symlink():
+            print(
+                f"harness release: {candidate} remains after prune; keeping its pycache",
+                file=sys.stderr,
+            )
+            continue
+        if not _remove_release_pycache(candidate):
+            cache_failures.add(candidate.name)
+            print(
+                f"harness release: could not remove pycache derived from {candidate}; "
+                "it will be retried on a later update",
+                file=sys.stderr,
+            )
+
+    _cleanup_orphan_release_pycache(
+        releases, keep, stable_snapshot, route_snapshot, cache_failures
+    )
 
 
 # destructive-ok: reason=rollback or discard one managed release staging transaction; boundary=version target staging root and state leaf selected by this invocation

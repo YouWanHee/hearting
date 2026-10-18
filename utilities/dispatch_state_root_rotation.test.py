@@ -10,6 +10,7 @@ $AGENT_HOME/.dispatch/completion, which _cleanup_releases deletes wholesale
 every second rotation.
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -613,8 +614,22 @@ class RetryAfterFailedSuccessionStaysFailedTest(unittest.TestCase):
         self.assertFalse(DISTRIBUTION._succeed_dispatch_state(self.release_a))
 
         # Repair the live copy with a valid sidecar still recording the old
-        # release; the next retry must now succeed AND re-anchor it.
+        # release. The malformed legacy source still blocks deletion.
         live.write_text(
+            json.dumps(
+                {
+                    "completion_marker": str(stale_dir / "plan.json"),
+                    "completion_marker_history": str(stale_dir / "plan.1.json"),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(DISTRIBUTION._succeed_dispatch_state(self.release_a))
+        source_sidecar = stale_dir / "plan.att-bad.attempt.json"
+        source_sidecar.write_text(
             json.dumps(
                 {
                     "completion_marker": str(stale_dir / "plan.json"),
@@ -2106,6 +2121,21 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
             "route_id=rt-b3b14,harness=claude\n",
             encoding="utf-8",
         )
+        legacy_observation = v1 / ".dispatch" / "logs" / "dispatch-session-sweep.log"
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        stable_root.parent.mkdir(parents=True, exist_ok=True)
+        DISTRIBUTION._ensure_new_directory_mode(stable_root, 0o700)
+        current_observation = stable_root / "logs" / "dispatch-session-sweep.log"
+        legacy_observation.parent.mkdir(parents=True)
+        current_observation.parent.mkdir(parents=True, exist_ok=True)
+        legacy_observation.write_bytes(b"legacy sweep bytes\n")
+        current_observation.write_bytes(b"current sweep bytes\n")
+        observation_archive = (
+            stable_root.parent / "dispatch-observation-archive"
+            / hashlib.sha256(os.fsencode(str((v1 / ".dispatch").resolve()))).hexdigest()
+            / "logs" / "dispatch-session-sweep.log"
+            / hashlib.sha256(legacy_observation.read_bytes()).hexdigest()
+        )
         completion_dir = v1 / ".dispatch" / "completion" / "rt-b3b14"
         completion_dir.mkdir(parents=True)
         (completion_dir / "plan.json").write_text(
@@ -2118,8 +2148,9 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
 
         result = DISTRIBUTION.run_dispatch_state_migration(v1 / ".dispatch", environ=os.environ)
         self.assertEqual(result["status"], "completed")
-        stable_root = DISTRIBUTION.stable_state_root(os.environ)
         self.assertTrue((stable_root / "completion" / "rt-b3b14" / "plan.json").is_file())
+        self.assertEqual(current_observation.read_bytes(), b"current sweep bytes\n")
+        self.assertEqual(observation_archive.read_bytes(), b"legacy sweep bytes\n")
 
         v2 = DISTRIBUTION.data_root() / "releases" / "v-b3b14-2"
         (v2 / "core").mkdir(parents=True)
@@ -2133,6 +2164,8 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
         DISTRIBUTION.current_path().symlink_to(v3)
         DISTRIBUTION._cleanup_releases(keep=set())
         self.assertFalse(v1.exists(), "v1 must actually be pruned for this to be a real B-3/B-14 test")
+        self.assertEqual(current_observation.read_bytes(), b"current sweep bytes\n")
+        self.assertEqual(observation_archive.read_bytes(), b"legacy sweep bytes\n")
 
         # B-3: capability-route's continuation resolver reaches the stable
         # row through the alias, not the now-deleted release path.
