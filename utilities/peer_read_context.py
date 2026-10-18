@@ -12,7 +12,8 @@ from pathlib import Path
 
 
 class PeerReadContext:
-    def __init__(self):
+    def __init__(self, *, registry_append_only: bool = False):
+        self.registry_append_only = registry_append_only
         self._registry_views = {}
         self._handover_snapshots = None
         self._handover_ledgers = {}
@@ -37,7 +38,7 @@ class PeerReadContext:
             self._recipient_censuses[key] = loader()
         return self._recipient_censuses[key]
 
-    def current_attempt_row(self, jobs: Path, attempt_id: str):
+    def current_attempt_row(self, jobs: Path, attempt_id: str, *, append_only=None):
         """Return the latest exact attempt row from this scan's registry view."""
         from dispatch_completion_join import ChildRow, JoinContractError
         from dispatch_registry_cache import registry_view
@@ -46,7 +47,8 @@ class PeerReadContext:
         key = str(jobs.resolve(strict=False))
         if key not in self._registry_views:
             try:
-                self._registry_views[key] = registry_view(jobs)
+                self._registry_views[key] = registry_view(
+                    jobs, append_only=(self.registry_append_only if append_only is None else append_only))
             except FileNotFoundError:
                 self._registry_views[key] = None
             except OSError as exc:

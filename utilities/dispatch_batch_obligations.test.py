@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 import sys
@@ -14,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_batch_obligations as obligations  # noqa: E402
+import dispatch_registry_cache as registry_cache  # noqa: E402
 
 
 class BatchObligationTest(unittest.TestCase):
@@ -53,31 +55,44 @@ class BatchObligationTest(unittest.TestCase):
             obligations._resume_owner_settlements(self.jobs)
         settle.assert_called_once_with(self.jobs, "att-owner")
 
+    def test_owner_settlement_keeps_partial_registry_retryable_until_complete(self):
+        self.jobs.write_text(self._runtime_owner_row(), encoding="utf-8")
+        before = self.jobs.read_bytes()
+        context = obligations.OwnerSettlementReadContext()
+        with mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
+            self.assertTrue(obligations.has_unowned_work(self.jobs))
+            self.assertIn((str(self.jobs), "unavailable"),
+                          obligations.pending_observer_signature(self.jobs))
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_not_called()
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+            with self.jobs.open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_called_once_with(self.jobs, "att-owner")
+
     def test_pending_done_owner_stays_visible_across_cached_passes(self):
         self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        registry_cache.clear_cache()
+        registry_cache.reset_metrics()
         context = obligations.OwnerSettlementReadContext()
-        original_read_text = Path.read_text
-        reads = []
-
-        def count_registry_read(path, *args, **kwargs):
-            if path == self.jobs:
-                reads.append(path)
-            return original_read_text(path, *args, **kwargs)
 
         service_script = self.base / "release" / "utilities" / "codex-managed-completion.py"
         with mock.patch("peer_obligations.service_script",
                         return_value=(service_script, {}, None)), \
              mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True) as lease, \
              mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
-             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
-             mock.patch.object(Path, "read_text", count_registry_read):
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
             first = {"signature": ()}
             self.assertEqual(obligations.ensure_observers(
                 self.jobs, observer_snapshot=first, settlement_context=context), 0)
             second = {"signature": ()}
             self.assertEqual(obligations.ensure_observers(
                 self.jobs, observer_snapshot=second, settlement_context=context), 0)
-            self.assertEqual(len(reads), 1)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
             self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                                 for item in first["signature"]))
             self.assertEqual(first["signature"], second["signature"])
@@ -90,7 +105,7 @@ class BatchObligationTest(unittest.TestCase):
             obligations.ensure_observers(
                 self.jobs, observer_snapshot=fourth, settlement_context=context)
 
-        self.assertEqual(len(reads), 3)
+        self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
         self.assertEqual(settle.call_count, 2)
         self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                             for item in third["signature"]))
@@ -313,6 +328,7 @@ class BatchObligationTest(unittest.TestCase):
                            observer={"pid": 321, "pid_start": "654"})
         root = obligations._root(self.jobs)
         lock_fd = os.open(root / (duty_id + ".lease"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         binding = "/fixture/managed/current"
         target = Path("/fixture/releases/B/utilities/codex-managed-completion.py")
         environment = {"AGENT_HOME": "/fixture/releases/B"}
@@ -497,21 +513,15 @@ class BatchObligationTest(unittest.TestCase):
             "supervisor_lease_file=attempt.lock,log_file=attempt.log,attempt_id=att-owner\n"
         )
         self.jobs.write_text(row, encoding="utf-8")
+        registry_cache.clear_cache()
+        registry_cache.reset_metrics()
         context = obligations.OwnerSettlementReadContext()
-        original_read_text = Path.read_text
-        reads = []
 
-        def count_registry_read(path, *args, **kwargs):
-            if path == self.jobs:
-                reads.append(path)
-            return original_read_text(path, *args, **kwargs)
-
-        with mock.patch.object(Path, "read_text", count_registry_read), \
-             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True) as lease, \
+        with mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True) as lease, \
              mock.patch("dispatch_completion_join.settle_finished_attempt") as settle:
             obligations._resume_owner_settlements(self.jobs, context=context)
             obligations._resume_owner_settlements(self.jobs, context=context)
-            self.assertEqual(len(reads), 1)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
             self.assertEqual(lease.call_count, 2)
             settle.assert_not_called()
 
@@ -519,14 +529,31 @@ class BatchObligationTest(unittest.TestCase):
             with self.jobs.open("a", encoding="utf-8") as handle:
                 handle.write("t\tdone\t/repo\t/wt\tchild\tattempt_id=att-child\n")
             obligations._resume_owner_settlements(self.jobs, context=context)
-            self.assertEqual(len(reads), 2)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2)
 
             # Lease release is checked even while the registry stamp is stable.
             lease.return_value = False
             obligations._resume_owner_settlements(self.jobs, context=context)
             settle.assert_called_once()
             obligations._resume_owner_settlements(self.jobs, context=context)
-            self.assertEqual(len(reads), 4, "an unresolved unowned row stays retryable")
+            self.assertEqual(settle.call_count, 2, "an unresolved unowned row stays retryable")
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2,
+                             "retryable settlement reuses unchanged registry content")
+
+    def test_owner_settlement_accepts_valid_literal_replacement_character(self):
+        row = self._runtime_owner_row().replace(
+            "completed-supervisor", "completed-supervisor\ufffd")
+        self.jobs.write_text(row + "\n", encoding="utf-8")
+        registry_cache.clear_cache()
+        registry_cache.reset_metrics()
+        with mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True):
+            signatures = obligations._resume_owner_settlements(self.jobs)
+
+        self.assertIn((str(self.jobs), "owner-settlement", "att-owner", "done",
+                       "runtime-v1", "completed-supervisor\ufffd"), signatures)
+        self.assertFalse(any(item[:2] == (str(self.jobs), "owner-settlement-unavailable")
+                             for item in signatures))
 
     def test_parent_ended_duty_waits_dormant_until_recipient_returns(self):
         args = Namespace(**vars(self.args))

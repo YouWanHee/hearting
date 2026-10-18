@@ -1829,7 +1829,7 @@ class OneTurnStageTransportTest(unittest.TestCase):
                 else:
                     self.assertNotEqual(inspected["state"], "valid")
 
-    def test_named_permission_profile_is_applied_without_turn_sandbox_override(self):
+    def test_named_permission_profile_preserves_ordinary_turn_profile_authority(self):
         profile = {"default_permissions": "profile-test",
                    "permissions": {"profile-test": {
                        "filesystem": {str(self.root): "write"},
@@ -1898,6 +1898,7 @@ class OneTurnStageTransportTest(unittest.TestCase):
         self.assertEqual(turn["model"], "model-pinned")
         self.assertEqual(turn["effort"], "xhigh")
         self.assertNotIn("sandboxPolicy", turn)
+        self.assertNotIn("approvalPolicy", turn)
         self.assertTrue(captured["closed"])
         self.assertIn('"type":"turn.completed"', output.getvalue())
 

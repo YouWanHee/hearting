@@ -9,14 +9,13 @@ to the user one topic at a time, records the answers with
 renders `shards/frame/intent.md` from interview + answers before the owner is
 launched. `plan` reads the intent document as its brief.
 
-The acceptance bar is the user's own sentence (2026-09-06): "핵심은 이해하기
-쉽게 사용자에게 조사를 하고 물어봐야 해". So the validator refuses, before
-the gate is raised, an interview a tired reader could not answer without
-reading the plan: harness vocabulary, long questions, more than one topic per
-question, a question with no recommended answer, or more questions than the
-intensity allows. Facts a tool can establish are not questions -- the owner
-investigates them (grill-me rule) -- so every question carries `why`: the
-reason only the user can decide it.
+The interview asks only for decisions the person owns. Validation checks the
+schema, route and answer bindings, choice structure, approval meaning, actor
+provenance, question cap, and a finite serialized-input limit. Writing
+guidance recommends clear wording and one decision per question without
+rejecting a valid answer for style. Facts a tool can establish are not
+questions -- the owner investigates them -- so every question carries `why`:
+the reason only the person can decide it.
 
     frame_interview.py validate      --interview F --intensity I
     frame_interview.py answers-template --interview F
@@ -66,8 +65,8 @@ MIN_OPTIONS, MAX_OPTIONS = 2, 4
 KINDS = ("yes-no", "choice")
 BRIEF_FIELDS = ("problem", "outcome", "affected", "constraints", "open")
 
-# Harness vocabulary a user should never have to decode. Matched as whole
-# words, case-insensitively, in question/option/understanding/brief text.
+# Terms that writing guidance can flag for an author. They are not validation
+# errors; technical names may help a person understand a particular choice.
 JARGON = (
     "route", "routes", "dispatch", "dispatched", "owner", "attempt", "attempts",
     "worker", "workers", "gate", "gates", "ledger", "supervisor", "node", "nodes",
@@ -127,6 +126,7 @@ MAX_ANSWERS_BYTES = (
     max(QUESTION_CAP.values()) * (MAX_OFFMENU_NOTE_CHARS * 4 + 256)
     + MAX_CORRECTION_CHARS * 4 + 1024
 )
+MAX_INTERVIEW_BYTES = 64 * 1024
 # `choice` value meaning "answered, but none of the printed options apply".
 # Kept strictly distinct from `None` (the template default, "unanswered"):
 # collapsing the two would rebuild the very defect this sentinel closes.
@@ -290,6 +290,22 @@ class InterviewError(ValueError):
         self.detail = detail
 
 
+def load_json_file(path, *, max_bytes=MAX_INTERVIEW_BYTES, kind="interview", return_bytes=False):
+    """Read one bounded interview/answer JSON document before parsing it."""
+    try:
+        with Path(path).open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+    except OSError as exc:
+        raise InterviewError(f"{kind}-unreadable", f"{path}: {exc}") from exc
+    if len(raw) > max_bytes:
+        raise InterviewError(f"{kind}-too-large", f"{len(raw)} bytes > {max_bytes}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise InterviewError(f"{kind}-unreadable", f"{path}: {exc}") from exc
+    return (value, raw) if return_bytes else value
+
+
 def _text(value) -> str:
     return value if isinstance(value, str) else ""
 
@@ -299,6 +315,16 @@ def jargon_hits(text: str) -> list[str]:
     hits = [term for term, pattern in zip(JARGON, _JARGON_PATTERNS) if pattern.search(words)]
     hits += [m.group(0) for m in JARGON_IDS.finditer(text)]
     return hits
+
+
+def writing_guidance() -> tuple[str, ...]:
+    """Optional drafting advice; none of these style preferences gate an answer."""
+    return (
+        "Use clear wording that fits the reader and the decision.",
+        "Keep each question centered on one decision when practical.",
+        "Use technical names when they make the choice clearer, and explain them when useful.",
+        "Prefer concise wording while giving the reader enough context to answer.",
+    )
 
 
 def _sentences(text: str) -> int:
@@ -334,20 +360,19 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
     errors: list[str] = []
     if not is_interview(interview):
         return [f"schema: expected {SCHEMA!r}"]
+    try:
+        size = len(json.dumps(interview, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError, RecursionError):
+        return ["interview: not JSON-serializable"]
+    if size > MAX_INTERVIEW_BYTES:
+        return [f"interview: {size} bytes > {MAX_INTERVIEW_BYTES}"]
     if not _text(interview.get("route_id")):
         errors.append("route_id: missing")
     if not _text(interview.get("summary")):
         errors.append("summary: path to frame-summary.json missing")
     understanding = _text(interview.get("understanding")).strip()
     if not understanding:
-        errors.append("understanding: the owner's one-sentence restatement is missing")
-    else:
-        if len(understanding) > MAX_UNDERSTANDING_CHARS:
-            errors.append(f"understanding: {len(understanding)} chars > {MAX_UNDERSTANDING_CHARS}")
-        if _sentences(understanding) > 1:
-            errors.append("understanding: must be one sentence")
-        for hit in jargon_hits(understanding):
-            errors.append(f"understanding: harness word {hit!r}")
+        errors.append("understanding: the owner's restatement is missing")
     brief = interview.get("brief")
     if not isinstance(brief, dict):
         errors.append("brief: missing (problem/outcome/affected/constraints/open)")
@@ -356,10 +381,6 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
             text = _text(brief.get(field)).strip()
             if not text and field != "open":
                 errors.append(f"brief.{field}: missing")
-            if len(text) > MAX_BRIEF_FIELD_CHARS:
-                errors.append(f"brief.{field}: {len(text)} chars > {MAX_BRIEF_FIELD_CHARS}")
-            for hit in jargon_hits(text):
-                errors.append(f"brief.{field}: harness word {hit!r}")
     questions = interview.get("questions")
     if not isinstance(questions, list):
         errors.append("questions: must be a list (empty is allowed)")
@@ -383,24 +404,12 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
         topic = _text(question.get("topic")).strip()
         if not topic:
             errors.append(f"{where}.topic: missing")
-        elif len(topic) > MAX_TOPIC_CHARS:
-            errors.append(f"{where}.topic: {len(topic)} chars > {MAX_TOPIC_CHARS}")
         elif topic.lower() in topics:
             errors.append(f"{where}.topic: {topic!r} already asked -- one topic, one question")
         topics.add(topic.lower())
         text = _text(question.get("question")).strip()
         if not text:
             errors.append(f"{where}.question: missing")
-        else:
-            if len(text) > MAX_QUESTION_CHARS:
-                errors.append(f"{where}.question: {len(text)} chars > {MAX_QUESTION_CHARS}")
-            if _sentences(text) > MAX_SENTENCES:
-                errors.append(f"{where}.question: more than {MAX_SENTENCES} sentences")
-            lowered = f" {text.lower()} "
-            if text.count("?") + text.count("？") > 1 or " and also " in lowered or ", and " in lowered:
-                errors.append(f"{where}.question: asks two things at once")
-            for hit in jargon_hits(text):
-                errors.append(f"{where}.question: harness word {hit!r}")
         kind = _text(question.get("kind"))
         if kind not in KINDS:
             errors.append(f"{where}.kind: {kind!r} not in {KINDS}")
@@ -419,14 +428,8 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
             means = _text(option.get("means")).strip()
             if not label:
                 errors.append(f"{owhere}.label: missing")
-            elif len(label) > MAX_OPTION_LABEL_CHARS:
-                errors.append(f"{owhere}.label: {len(label)} chars > {MAX_OPTION_LABEL_CHARS}")
             if not means:
                 errors.append(f"{owhere}.means: say in one line what choosing it does")
-            elif len(means) > MAX_OPTION_MEANS_CHARS:
-                errors.append(f"{owhere}.means: {len(means)} chars > {MAX_OPTION_MEANS_CHARS}")
-            for hit in jargon_hits(label + " " + means):
-                errors.append(f"{owhere}: harness word {hit!r}")
         recommended = question.get("recommended")
         if not isinstance(recommended, int) or isinstance(recommended, bool) \
                 or not (0 <= recommended < max(len(options), 1)):
@@ -434,10 +437,6 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
         why = _text(question.get("why")).strip()
         if not why:
             errors.append(f"{where}.why: say why only the user can decide this (a fact a tool can find is not a question)")
-        elif len(why) > MAX_WHY_CHARS:
-            errors.append(f"{where}.why: {len(why)} chars > {MAX_WHY_CHARS}")
-        for hit in jargon_hits(why):
-            errors.append(f"{where}.why: harness word {hit!r}")
     if "route_proposals" in interview:
         errors += _route_proposal_errors(interview, questions)
     round_no = interview.get("round", 1)
@@ -894,11 +893,11 @@ def _route_lines(interview: dict, answers: dict, scope: dict) -> list[str]:
     return lines
 
 
-def _load(path: str) -> dict:
+def _load(path: str, *, max_bytes=MAX_INTERVIEW_BYTES, kind="interview") -> dict:
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise InterviewError("interview-unreadable", f"{path}: {exc}") from exc
+        value = load_json_file(path, max_bytes=max_bytes, kind=kind)
+    except InterviewError:
+        raise
     if not isinstance(value, dict):
         raise InterviewError("interview-unreadable", f"{path}: not an object")
     return value
@@ -929,7 +928,7 @@ def main(argv=None) -> int:
     if args.command == "answers-template":
         print(json.dumps(answers_template(interview), ensure_ascii=False, indent=2))
         return 0
-    answers = _load(args.answers)
+    answers = _load(args.answers, max_bytes=MAX_ANSWERS_BYTES, kind="answers")
     errors = validate_answers(interview, answers)
     if args.command == "validate-answers":
         print(json.dumps({"valid": not errors, "errors": errors}, ensure_ascii=False))

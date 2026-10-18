@@ -471,6 +471,34 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
         proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
         self.assertEqual((proof.status, proof.reason), ("proved", None))
 
+    def test_terminal_proof_keeps_damaged_or_uncommitted_registry_unknown(self):
+        latest = self.row("done", "att-latest", owner_route_id=self.route["route_id"],
+                          owner_route_hash=self.route["route_hash"],
+                          note="completed-marker", failure_class="pass",
+                          launch_outcome="never-launched")
+        child = self.row("open", "att-hidden", dispatch_depth="2",
+                         worker_type="stage", parent_attempt_id="att-latest")
+        for suffix in (b"\xff\n", child.encode("utf-8")):
+            with self.subTest(suffix=suffix[:20]):
+                self.jobs.write_bytes((latest + "\n").encode("utf-8") + suffix)
+                before = self.jobs.read_bytes()
+                proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+                self.assertEqual((proof.status, proof.reason),
+                                 ("rejected", "route-identity-unverified"))
+                self.assertEqual(self.jobs.read_bytes(), before)
+
+        # Committing the newline reveals the real open child; it still cannot
+        # be hidden by the cache's earlier prefix or by an exact owner gate.
+        self.jobs.write_text(latest + "\n" + child + "\n", encoding="utf-8")
+        self.assertEqual(T._prove_route_children(
+            self.request(), self.route, self.owner_gate()).status, "rejected")
+
+        # Valid malformed history and a literal replacement character keep
+        # the prior tolerant semantics once the current text is complete.
+        self.jobs.write_text(latest + "\nmalformed \ufffd\n", encoding="utf-8")
+        self.assertEqual(T._prove_route_children(
+            self.request(), self.route, self.owner_gate()).status, "proved")
+
     def test_a_registered_row_closed_without_ever_launching_does_not_block_settlement(self):
         # OpenCode r4 leg1: a `test` row was registered, never claimed, then closed by a marker;
         # it has no process identity because nothing was ever spawned.
@@ -1648,6 +1676,36 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                     self.assertEqual(ledger.journal(), before)
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+
+    def test_settled_history_reuses_its_producer_proof_until_an_input_changes(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            artifact_producer._HISTORICAL_OBSERVATIONS.clear()
+            artifact_producer._HISTORICAL_PROJECTIONS.clear()
+            terminal._route_module.cache_clear()
+            code_imports = []
+            loader = importlib.util.spec_from_file_location
+            def load_code(name, path, *args, **kwargs):
+                if name == "terminal_capability_route":
+                    code_imports.append(str(path))
+                return loader(name, path, *args, **kwargs)
+            verify = artifact_producer._verify_sealed_cycle_locked
+            with mock.patch.object(artifact_producer, "_verify_sealed_cycle_locked", wraps=verify) as checked, \
+                 mock.patch.object(importlib.util, "spec_from_file_location", side_effect=load_code):
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                first_count = checked.call_count
+                self.assertGreater(first_count, 0)
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                self.assertEqual(checked.call_count, first_count)
+                index_path = artifact_admission._index_path(fixture.root)
+                original = index_path.read_bytes()
+                index_path.write_bytes(b"{}")
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "unknown")
+                self.assertGreater(checked.call_count, first_count)
+                index_path.write_bytes(original)
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            self.assertEqual(len(code_imports), 1, "code reuse must not suppress fresh data rejection/recovery")
 
     def test_historical_observer_protects_corruption_missing_duty_and_unsettled_child(self):
         fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")

@@ -907,6 +907,9 @@ class ReviewRoundCapTest(unittest.TestCase):
         note = "dead-worker-fail,failure_class=fail" if node == "test" else "completed-review-blocking"
         pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
                 "route_id=rt-fixture,route_node=" + node + ",note=" + note)
+        if node == "test":
+            pipe += (",review_subject_digest=sha256:test-source"
+                     ",review_subject_binding_digest=sha256:fixture-binding")
         return "".join(
             f"2026-08-24T00:00:0{i}Z\tdone\t/repo\t/wt\tslug-r{i}\t{pipe},attempt_id=att-{node}-{i}\n"
             for i in range(1, n + 1)
@@ -926,8 +929,13 @@ class ReviewRoundCapTest(unittest.TestCase):
         printed = []
         code = None
         launched = []
+        real_run = subprocess.run
 
         def fake_run(cmd, **kwargs):
+            if cmd and str(cmd[0]) == "git":
+                # Source-bound code-test admission snapshots this isolated Git
+                # fixture while wrapper launches remain mocked below.
+                return real_run(cmd, **kwargs)
             launched.append(cmd)
             return mock.Mock(returncode=0)
 
@@ -945,7 +953,14 @@ class ReviewRoundCapTest(unittest.TestCase):
                  mock.patch.object(N.subprocess, "run", side_effect=fake_run), \
                  mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
                 try:
-                    N.main()
+                    if node_id == "test":
+                        with mock.patch("review_source_subject.observe",
+                                        return_value={"digest": "sha256:test-source"}), \
+                             mock.patch("review_source_subject.read_binding",
+                                        return_value={"subject_digest": "sha256:test-source"}):
+                            N.main()
+                    else:
+                        N.main()
                 except SystemExit as exc:
                     code = exc.code
         # A capped rejection must stop before the wrapper launch (only the

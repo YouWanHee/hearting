@@ -29,7 +29,12 @@ You are a bounded worker, not the user-facing main session.
   the arbiter's `auxiliary_findings_considered` merge. A peer leg, by contrast,
   carries gate authority and must land on a quality-peer harness.
 - Do not perform main-only entry confirmation, memory lifecycle, integration,
-  merge, push, cleanup, UI/status publication, or user-facing explanation.
+  merge, release, installation, cleanup, UI/status publication, or user-facing explanation.
+- Stage, review, support, and frame workers do not publish task branches or PRs.
+  The owner fragment defines task-branch publication capacity from the existing
+  sealed complete scope; the owner performs publication only within the actual
+  requested task. Integration pushes, main merges, releases,
+  installations, and worktree cleanup remain supervisor responsibilities.
 
 Your terminal final output consists of exactly these three newline-delimited
 fields, with only their values replaced, nothing before them and nothing after them:

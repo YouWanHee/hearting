@@ -2971,21 +2971,58 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         os.environ["AGENT_WORKFLOW_ROOT"] = str(Path(jobs).parent / "workflow")
         return code, json.loads(buf.getvalue())
 
-    def test_a_hard_to_read_interview_never_reaches_a_person(self):
+    def test_style_only_interview_is_registered_on_its_first_submission(self):
         route, path = self.two_stage_route(
             human_gate="frame-review",
             continuation={"kind": "human-gate", "gate": "frame-review"})
         jobs, session, _attempt = self.owner_registry()
         interview, value = self._interview()
-        value["questions"][0]["question"] = "Should the owner re-dispatch the plan node on this route?"
+        value["questions"][0]["question"] = (
+            "Should the owner re-dispatch the plan node on this route? "
+            "The stage-dispatch wrapper records the exact registered attempt."
+        )
         interview.write_text(json.dumps(value), encoding="utf-8")
-        with self.assertRaisesRegex(SUP.SupervisorError, "interview-invalid: .*harness word"):
-            self._block_with(path, jobs, interview)
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["interview"])
+        self.assertEqual(payload["questions"], 1)
         ledger = SUP.ledger_for(route)
-        self.assertEqual(ledger.read_only_state()["workflow_state"], "CREATED")
+        self.assertEqual(ledger.read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
         root = Path(jobs).resolve(strict=False).parent
-        self.assertFalse(list(PENDING.record_directory(root, session).glob("delivery-*.json"))
-                         if PENDING.record_directory(root, session).is_dir() else [])
+        self.assertTrue(list(PENDING.record_directory(root, session).glob("delivery-*.json")))
+
+    def test_style_rich_questions_accept_user_and_supervisor_answers_once(self):
+        for index, actor in enumerate(("user", "supervisor")):
+            with self.subTest(actor=actor):
+                route_id = f"rt-style-{index}"
+                route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"},
+                    route_id=route_id,
+                )
+                route["human_gate_bindings"][0]["release_authority"] = "any"
+                path.write_text(json.dumps(route), encoding="utf-8")
+                jobs, _session, _attempt = self.owner_registry(route_id=route_id)
+                interview_path, interview = self._interview(route_id=route_id)
+                interview["understanding"] = (
+                    "We need to preserve the registered source subject. The owner should "
+                    "explain the API path and CI contract before the plan is written."
+                )
+                interview["questions"][0]["question"] = (
+                    "Should the owner re-dispatch the plan node on this route? "
+                    "The stage-dispatch wrapper records the exact registered attempt."
+                )
+                interview_path.write_text(json.dumps(interview), encoding="utf-8")
+                code, raised = self._block_with(path, jobs, interview_path)
+                self.assertEqual(code, 0)
+                self.assertTrue(raised["interview"])
+                answer_path, answers = self._answers(interview, actor_kind=actor)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    released = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                        "--decision", "proceed", "--answers", str(answer_path), "--jobs", str(jobs)])
+                self.assertEqual(released, 0)
+                result = WS.human_gate_resolution(SUP.ledger_for(route, jobs).journal(), "frame-review")
+                self.assertEqual((result["status"], result["actor_kind"]), ("proceed", actor))
 
     def test_a_valid_interview_is_recorded_on_the_raise(self):
         route, path = self.two_stage_route(

@@ -87,8 +87,7 @@ def _write(path: Path, record: dict) -> None:
 def _plain_arguments(args) -> dict:
     output = {}
     for key, value in vars(args).items():
-        if key in {"resume_obligation", "ensure_obligations", "obligation_lock_fd",
-                   "service_current"}:
+        if key in {"resume_obligation", "ensure_obligations", "obligation_lock_fd", "service_current"}:
             continue
         output[key] = str(value) if isinstance(value, Path) else value
     return output
@@ -172,11 +171,7 @@ def acquire(jobs: str | Path, duty_id: str, inherited_fd: int | None = None) -> 
     lock_path = root / (duty_id + ".lease")
     if inherited_fd is not None:
         try:
-            target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{inherited_fd}")))
-            if target != lock_path.resolve() or not os.path.isfile(target):
-                return None
-            os.fstat(inherited_fd)
-            return inherited_fd
+            return inherited_fd if _fd_holds_lease(inherited_fd, lock_path) else None
         except (OSError, ValueError, TypeError):
             return None
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -185,19 +180,126 @@ def acquire(jobs: str | Path, duty_id: str, inherited_fd: int | None = None) -> 
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not _fd_holds_lease(fd, lock_path):
+            release(fd)
+            return None
         return fd
     except BlockingIOError:
         os.close(fd)
         return None
 
 
-def release(fd: int | None) -> None:
+def _fd_holds_lease(fd: int, lock_path: str | Path) -> bool:
+    """Prove this descriptor names the current lease inode and carries its flock."""
+    path = Path(lock_path)
+    try:
+        if path.is_symlink():
+            return False
+        expected = path.resolve(strict=True)
+        target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")))
+        descriptor = os.fstat(fd)
+        current = os.stat(expected, follow_symlinks=False)
+        if (target != expected or not stat.S_ISREG(descriptor.st_mode)
+                or (descriptor.st_dev, descriptor.st_ino)
+                != (current.st_dev, current.st_ino)):
+            return False
+        device = f"{os.major(current.st_dev):02x}:{os.minor(current.st_dev):02x}"
+        inode = str(current.st_ino)
+        fdinfo = Path(f"/proc/self/fdinfo/{fd}").read_text(encoding="ascii")
+        return any(
+            len(fields := line.split()) >= 7
+            and fields[0] == "lock:"
+            and fields[2] == "FLOCK"
+            and fields[3] == "ADVISORY"
+            and fields[4] == "WRITE"
+            and fields[6] == f"{device}:{inode}"
+            for line in fdinfo.splitlines()
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def observer_owns_current(jobs: str | Path, duty_id: str, fd: int | None) -> bool:
+    """Check the live lease and exact durable PID/start owner for this process."""
+    if fd is None:
+        return False
+    lock_path = _root(jobs) / (duty_id + ".lease")
+    if not _fd_holds_lease(fd, lock_path):
+        return False
+    try:
+        record = read(jobs, duty_id)
+        observer = record.get("observer") if record else None
+        start = _pid_start(os.getpid())
+        return (isinstance(observer, dict)
+                and observer.get("pid") == os.getpid()
+                and isinstance(start, str) and start.isdecimal()
+                and observer.get("pid_start") == start)
+    except (OSError, ValueError, TypeError, BatchObligationError):
+        return False
+
+
+def update_for_observer(jobs: str | Path, duty_id: str, fd: int,
+                        *, claim: bool = False,
+                        expected_observer: dict | None = None, **changes) -> dict | None:
+    """Update one duty only while this process still owns its exact lease row."""
+    path = _record_path(jobs, duty_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    update_lock = path.with_suffix(".update.lock")
+    if update_lock.is_symlink():
+        raise BatchObligationError("batch-obligation-update-lock-symlink")
+    lock_fd = os.open(update_lock, os.O_RDWR | os.O_CREAT
+                      | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if not _fd_holds_lease(fd, _root(jobs) / (duty_id + ".lease")):
+            return None
+        record = _read(path)
+        if record is None or record.get("state") not in _PENDING:
+            return None
+        owner = {"pid": os.getpid(), "pid_start": _pid_start(os.getpid())}
+        if not owner["pid_start"].isdecimal():
+            return None
+        if not claim and record.get("observer") != owner:
+            return None
+        if (claim and expected_observer is not None
+                and record.get("observer") not in (expected_observer, owner)):
+            return None
+        record.update(changes)
+        if claim:
+            record["observer"] = owner
+        record["updated_at"] = time.time()
+        _write(path, record)
+        return record
+    finally:
+        os.close(lock_fd)
+
+
+def release(fd: int | None, expected_path: str | Path | None = None) -> None:
     if fd is None:
         return
+    if expected_path is not None and not _fd_references_path(fd, expected_path):
+        return
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if expected_path is None or _fd_holds_lease(fd, expected_path):
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def _fd_references_path(fd: int, expected_path: str | Path) -> bool:
+    try:
+        path = Path(expected_path)
+        if path.is_symlink():
+            return False
+        expected = path.resolve(strict=True)
+        target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")))
+        descriptor = os.fstat(fd)
+        current = os.stat(expected, follow_symlinks=False)
+        return (target == expected and stat.S_ISREG(descriptor.st_mode)
+                and (descriptor.st_dev, descriptor.st_ino)
+                == (current.st_dev, current.st_ino))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _jobs_paths(jobs: str | Path | None, *, strict: bool = True) -> list[Path]:
@@ -354,6 +456,47 @@ def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     return False
 
 
+def _spawn_observer(jobs: Path, duty_id: str, fd: int, launch, *, expected_observer=None):
+    """Publish the PID before a resumed child can claim its inherited lease.
+
+    The child uses this same update lock. Holding it across fork/exec and the
+    small record write closes the spawn/publication race with no extra wire
+    arguments. Closing a parent's descriptor copy never unlocks the child's
+    shared open file description.
+    """
+    path = _record_path(jobs, duty_id)
+    lock_path = path.with_suffix(".update.lock")
+    if lock_path.is_symlink():
+        raise BatchObligationError("batch-obligation-update-lock-symlink")
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lease_path = _root(jobs) / (duty_id + ".lease")
+        if not _fd_holds_lease(fd, lease_path):
+            return None
+        record = _read(path)
+        if not record or record.get("state") not in _PENDING:
+            return None
+        if expected_observer is not None and record.get("observer") != expected_observer:
+            return None
+        script, child_env, binding = launch
+        command = [sys.executable, str(script), "--jobs", str(jobs), "--resume-obligation", duty_id,
+                   "--obligation-lock-fd", str(fd)]
+        if binding:
+            command.extend(("--service-current", binding))
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,), start_new_session=True,
+            cwd=str(jobs.parent), env=child_env)
+        if not _fd_holds_lease(fd, lease_path):
+            return None
+        record["observer"] = {"pid": process.pid, "pid_start": _pid_start(process.pid)}
+        record["updated_at"] = time.time()
+        _write(path, record)
+        return process
+    finally:
+        os.close(lock_fd)
+
+
 def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
                      observer_snapshot=None, settlement_context=None) -> int:
     """Resume unfinished exact batches through the existing completion sidecar."""
@@ -379,15 +522,6 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
     if observer_snapshot is not None and settlement_signatures:
         observer_snapshot["signature"] = tuple(sorted(
             (*observer_snapshot.get("signature", ()), *settlement_signatures)))
-    from dispatch_contract import ATTEMPT_DESCENDANT_ENV
-    # The observer is governance machinery, not part of whichever attempt's
-    # session resumed it. A retained tag would follow every generation and
-    # keep that unrelated attempt's descendant scan live forever.
-    observer_env = {
-        key: value
-        for key, value in (os.environ if child_env is None else child_env).items()
-        if key != ATTEMPT_DESCENDANT_ENV
-    }
     for jobs_path in jobs_paths:
         try:
             root = _root(jobs_path)
@@ -439,32 +573,34 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
                     fd = acquire(jobs_path, duty_id)
                     if fd is None:
                         continue
-                os.set_inheritable(fd, True)
-                command = [
-                    sys.executable, str(script), "--jobs", str(jobs_path),
-                    "--resume-obligation", duty_id,
-                    "--obligation-lock-fd", str(fd),
-                ]
-                if binding:
-                    command.extend(("--service-current", binding))
                 try:
-                    process = subprocess.Popen(
-                        command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,),
-                        start_new_session=True, cwd=str(jobs_path.parent), env=observer_env,
-                    )
-                    update(jobs_path, duty_id, observer={
-                        "pid": process.pid,
-                        "pid_start": _pid_start(process.pid),
-                    })
-                    launched += 1
-                except (OSError, subprocess.SubprocessError):
-                    release(fd)
-                else:
+                    if _spawn_observer(jobs_path, duty_id, fd, (script, child_env, binding)) is not None:
+                        launched += 1
+                finally:
+                    # This also safely releases a failed pre-spawn acquisition;
+                    # after a spawn it preserves the child's inherited flock.
                     os.close(fd)
-            except (OSError, ValueError, BatchObligationError):
+            except (OSError, ValueError, subprocess.SubprocessError, BatchObligationError):
                 continue
     return launched
+
+
+def handoff_observer(jobs: str | Path, duty_id: str, fd: int, *, service_current=None) -> bool:
+    """Pass a pending duty to one successor while this process still holds its lease."""
+    if not observer_owns_current(jobs, duty_id, fd):
+        return False
+    parent = {"pid": os.getpid(), "pid_start": _pid_start(os.getpid())}
+    if not parent["pid_start"].isdecimal():
+        return False
+    try:
+        import peer_obligations
+        script, child_env, binding = peer_obligations.service_script(
+            "utilities/codex-managed-completion.py", service_current)
+        jobs_path = Path(jobs).resolve(strict=True)
+        return _spawn_observer(jobs_path, duty_id, fd, (script, child_env, binding),
+                               expected_observer=parent) is not None
+    except (OSError, subprocess.SubprocessError, BatchObligationError):
+        return False
 
 
 def _registry_stamp(path: Path):
@@ -529,15 +665,18 @@ def _pending_owner_settlements(jobs: Path):
     from dispatch_terminal_commit import owner_completion_pending
 
     try:
-        lines = jobs.read_text(encoding="utf-8").splitlines()
+        from dispatch_registry_cache import registry_view
+        view = registry_view(jobs)
+        view.require_complete_text()
+        candidates = view.settlement_owner_candidates()
     except FileNotFoundError:
         return ()
     pending = []
-    for order, raw in enumerate(lines):
-        fields = raw.split("\t")
-        if len(fields) != 6 or fields[1] not in {"open", "running", "done"}:
+    for candidate in candidates:
+        order, raw, fields = candidate.order, candidate.raw, candidate.fields
+        if fields[1] not in {"open", "running", "done"}:
             continue
-        meta = parse_registry_metadata(fields[5])
+        meta = candidate.completion_metadata()
         if (meta.get("worker_type") != "owner" or meta.get("launch_started") != "1"
                 or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
                 or not meta.get("supervisor_lease_file") or not meta.get("log_file")

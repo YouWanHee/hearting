@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_contract as D
+import review_source_subject as SUBJECT
 spec = importlib.util.spec_from_file_location("route", ROOT / "utilities/capability-route.py")
 ROUTE = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ROUTE)
@@ -169,6 +170,7 @@ class CompletionMarkerTest(unittest.TestCase):
     def write_route(self, route, name="route.json"):
         path = self.base / name
         path.write_text(json.dumps(route), encoding="utf-8")
+        self.current_route_file = path
         return path
 
     def base_env(self):
@@ -1236,22 +1238,13 @@ class CompletionMarkerTest(unittest.TestCase):
             "registered_worker": "0",
             "fallback_hop": "native-subagent",
         }
-        codex = self.complete(
-            route_path, "test", evidence,
-            attempt_id="att-codex-native",
-            attempt_axes={
-                **axes, "execution_surface": "codex-native-subagent"
-            },
-        )
-        self.assertEqual(codex.returncode, 0, codex.stdout + codex.stderr)
-        claude = self.complete(
-            route_path, "test", evidence,
-            attempt_id="att-claude-native",
-            attempt_axes={
-                **axes, "execution_surface": "claude-subagent"
-            },
-        )
-        self.assertEqual(claude.returncode, 0, claude.stdout + claude.stderr)
+        # These are unregistered native surfaces. Seal each subject with the
+        # existing binding writer and exercise the canonical marker writer
+        # without inventing a registered attempt or PASS registry row.
+        self.complete_source_bound_native(
+            route, evidence, "att-codex-native", "codex-native-subagent", axes)
+        self.complete_source_bound_native(
+            route, evidence, "att-claude-native", "claude-subagent", axes)
         directory = self.stable_dispatch / "completion" / route["route_id"]
         first = json.loads((directory / "test.1.json").read_text())
         second = json.loads((directory / "test.2.json").read_text())
@@ -1277,6 +1270,38 @@ class CompletionMarkerTest(unittest.TestCase):
         if extra: line += "," + extra
         with self.jobs.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+
+    def write_source_bound_row(self, status, slug, attempt_id, extra="", node_id="test"):
+        node = next(item for item in self.current_route["nodes"] if item["id"] == node_id)
+        binding = SUBJECT.seal_attempt(
+            self.jobs, self.current_route, node, attempt_id, worktree=self.repo)
+        binding_fields = ",".join(f"{key}={value}" for key, value in binding.items())
+        route_file = f"route_file={self.current_route_file}"
+        combined = ",".join(value for value in (extra, binding_fields, route_file) if value)
+        self.write_row(status, slug, attempt_id, combined, node_id)
+
+    def complete_source_bound_native(self, route, evidence, attempt_id, surface, axes):
+        node = next(item for item in route["nodes"] if item["id"] == "test")
+        self.jobs.touch(exist_ok=True)
+        metadata = {
+            "attempt_schema_version": 2,
+            **axes,
+            "execution_surface": surface,
+            "registered_worker": False,
+            "worker_type": "test",
+            "route_id": route["route_id"],
+            "route_hash": route["route_hash"],
+            "route_node": "test",
+            "route_file": str(self.current_route_file),
+            "completion_gate": node.get("completion_gate", ""),
+            "attempt_id": attempt_id,
+        }
+        metadata.update(SUBJECT.seal_attempt(
+            self.jobs, route, node, attempt_id, worktree=self.repo))
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            return ROUTE._publish_completion_locked(
+                route, node, "test", evidence, jobs=self.jobs,
+                attempt_id=attempt_id, attempt_metadata=metadata)
 
     def read_row(self, attempt_id):
         for line in self.jobs.read_text(encoding="utf-8").splitlines():
@@ -1913,7 +1938,8 @@ class CompletionMarkerTest(unittest.TestCase):
         by_id = {n["id"]: n for n in route["nodes"]}
         node = by_id["test"]
         self.assertEqual(node["kind"], "pipeline-stage")
-        self.write_row("open", "test-r1", "att-census-test-r1", "worker_type=test", node_id="test")
+        self.write_source_bound_row("open", "test-r1", "att-census-test-r1",
+                                    "worker_type=test", node_id="test")
         evidence = self.base / "test.md"
         evidence.write_text("tests pass\n", encoding="utf-8")
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
@@ -1961,8 +1987,10 @@ class CompletionMarkerTest(unittest.TestCase):
         by_id = {n["id"]: n for n in route["nodes"]}
         node = by_id["test"]
         for round_no in (1, 2):
-            self.write_row("done", f"test-r{round_no}", f"att-test-r{round_no}",
-                           "worker_type=test,note=dead-invalid-envelope", node_id="test")
+            self.write_source_bound_row(
+                "done", f"test-r{round_no}", f"att-test-r{round_no}",
+                "worker_type=test,note=dead-invalid-envelope,failure_class=contract",
+                node_id="test")
         evidence = self.base / "test-owner-run.md"
         evidence.write_text(
             "owner ran the tests directly.\ncommand: python3 -m pytest\noutput: 42 passed\n",

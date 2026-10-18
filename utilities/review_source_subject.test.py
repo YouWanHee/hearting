@@ -54,9 +54,13 @@ class SourceSubjectTest(unittest.TestCase):
                 {"id": "impl-review", "kind": "review-worker", "unit": "qa/code-review",
                  "completion_gate": "code-impl-review", "write_scope": ["_internal/dev_reviews/**"],
                  "depends_on": ["execute"]},
+                {"id": "smoke", "kind": "pipeline-stage", "unit": "qa/test",
+                 "completion_gate": "code-test", "write_scope": ["test_logs/**"],
+                 "depends_on": ["impl-review"]},
             ],
         }
         self.node = self.route["nodes"][1]
+        self.test_node = self.route["nodes"][2]
 
     def git(self, *args):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True).strip()
@@ -133,6 +137,66 @@ class SourceSubjectTest(unittest.TestCase):
             self.route, planning_node, completion_dir=self.temp,
         ))
         self.assertTrue(SUBJECT.has_source_subject(self.route, self.route["nodes"][0]))
+
+    def test_custom_code_test_gate_binds_source_and_uses_ancestor_source_scope(self):
+        self.assertTrue(SUBJECT.has_review_subject(self.route, self.test_node))
+        self.assertTrue(SUBJECT.has_source_subject(self.route, self.test_node))
+        self.assertIn("source/**", SUBJECT.source_scopes(self.route, self.test_node))
+        jobs = Path(self.temp.name) / "state" / "jobs.log"
+        jobs.parent.mkdir()
+        route_file = Path(self.temp.name) / "route.json"
+        route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        values = SUBJECT.seal_attempt(jobs, self.route, self.test_node,
+                                      "att-test-source-A", worktree=self.repo)
+        metadata = {"route_file": str(route_file), "route_id": self.route["route_id"],
+                    "route_hash": self.route["route_hash"], "route_node": self.test_node["id"],
+                    "completion_gate": "code-test", "unit": "qa/test",
+                    "attempt_id": "att-test-source-A", **values}
+        fields = ["now", "open", str(self.repo), str(self.repo), "test-source-A", ""]
+        self.assertEqual(SUBJECT.validate_attempt(jobs, fields, metadata, require_new=True)["subject_digest"],
+                         values["review_subject_digest"])
+        marker_subject = SUBJECT.marker_subject(
+            self.route, self.test_node, attempt_id=metadata["attempt_id"],
+            attempt_metadata=metadata, jobs=jobs, worktree=self.repo,
+            completion_dir=Path(self.temp.name) / "completion" / self.route["route_id"],
+        )
+        self.assertEqual(marker_subject["digest"], values["review_subject_digest"])
+        (self.repo / "engine.py").write_text("value = 'B'\n", encoding="utf-8")
+        with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+            SUBJECT.validate_attempt(jobs, fields, metadata)
+        self.assertEqual(refused.exception.reason, "review-source-subject-changed-before-launch")
+        with self.assertRaises(SUBJECT.SourceSubjectError) as completion_refused:
+            SUBJECT.marker_subject(
+                self.route, self.test_node, attempt_id=metadata["attempt_id"],
+                attempt_metadata=metadata, jobs=jobs, worktree=self.repo,
+                completion_dir=Path(self.temp.name) / "completion" / self.route["route_id"],
+            )
+        self.assertEqual(completion_refused.exception.reason,
+                         "review-source-subject-changed-before-completion")
+
+    def test_inline_code_test_marker_carries_current_source_without_a_registered_binding(self):
+        completion = Path(self.temp.name) / "completion" / self.route["route_id"]
+        attempt = "att-inline-code-test"
+        metadata = {"attempt_id": attempt, "registered_worker": False,
+                    "execution_surface": "inline"}
+        subject = SUBJECT.marker_subject(
+            self.route, self.test_node, attempt_id=attempt, attempt_metadata=metadata,
+            worktree=self.repo, completion_dir=completion,
+        )
+        self.assertEqual(subject["digest"], self.observe_test()["digest"])
+        marker = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                  "node_id": self.test_node["id"], "completion_gate": "code-test",
+                  "attempt_id": attempt, "registered_worker": False,
+                  "execution_surface": "inline", "source_subject": subject}
+        self.assertIsNone(SUBJECT.marker_currency(
+            self.route, self.test_node, marker, completion,
+        ))
+        legacy = {key: value for key, value in marker.items() if key != "source_subject"}
+        self.assertEqual(SUBJECT.marker_currency(self.route, self.test_node, legacy, completion),
+                         ("superseded", "completion-source-subject-unknown"))
+
+    def observe_test(self):
+        return SUBJECT.observe(self.route, self.test_node, worktree=self.repo)
 
     def test_binding_is_attempt_exact_and_launch_rechecks_effective_source(self):
         jobs = Path(self.temp.name) / "state" / "jobs.log"

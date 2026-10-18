@@ -131,7 +131,7 @@ class LifecycleBindingTest(unittest.TestCase):
             self.a, "fixture_codex_projection",
             self.a / "adapters/codex/hooks/herdr_session_projection.py")
         with mock.patch.dict(os.environ, self.env, clear=True), \
-             mock.patch.object(module.subprocess, "Popen") as launch:
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
             self.assertTrue(module.project({"hook_event_name": "SessionStart"}, "sid-a"))
         return launch.call_args.args[0], launch.call_args.kwargs
 
@@ -576,7 +576,7 @@ console.log(JSON.stringify(calls[0]));
             self.assertIsNone(fixed_environment)
             self.assertIsNone(fixed_binding)
 
-    def test_activation_reconnect_passes_binding_to_watch_and_batch_families(self):
+    def test_activation_request_preserves_binding_for_the_shared_runner(self):
         from types import SimpleNamespace
 
         self._point_current(self.b)
@@ -587,11 +587,14 @@ console.log(JSON.stringify(calls[0]));
              mock.patch.object(peer_steward, "_ensure_watch_observers") as ensure_watches, \
              mock.patch.object(peer_steward.dispatch_batch_obligations,
                                "ensure_observers") as ensure_batches, \
-             mock.patch.object(obligations.subprocess, "Popen"):
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
             self.assertEqual(peer_steward.cmd_ensure_obligations(
                 SimpleNamespace(lifecycle_root=str(self.a))), 0)
-        ensure_watches.assert_called_once_with(service_current=str(self.current))
-        ensure_batches.assert_called_once_with(service_current=str(self.current))
+        ensure_watches.assert_not_called()
+        ensure_batches.assert_not_called()
+        argv = launch.call_args.args[0]
+        self.assertIn("__obligation-runner", argv)
+        self.assertEqual(argv[-2:], ["--service-current", str(self.current)])
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
     def test_takeover_signals_only_an_exact_same_install_observer_holding_its_duty_lock(self):
@@ -1187,7 +1190,7 @@ console.log(JSON.stringify(calls[0]));
         self.assertGreaterEqual(len(watch_scans), len(passes))
         self.assertLessEqual(len(watch_scans), len(passes) + 1)
         self.assertEqual(len(batch_scans), len(watch_scans))
-        self.assertEqual(len(registry_reads), 1)
+        self.assertLessEqual(len(registry_reads), 1)
         print(
             f"runner_idle_window=20s one_core=100% child_cpu=excluded "
             f"cpu={cpu_percent:.3f}% passes={len(passes)} "

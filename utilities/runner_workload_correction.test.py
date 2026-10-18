@@ -53,8 +53,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.saved_env = dict(os.environ)
         for key in tuple(os.environ):
             if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_",
-                               "AGENT_THREAD_", "AGENT_HERDR_", "HERDR_", "CLAUDE_",
-                               "CODEX_", "OPENCODE_")):
+                               "AGENT_THREAD_", "AGENT_HERDR_", "HERDR_", "HARNESS_",
+                               "CLAUDE_", "CODEX_", "OPENCODE_")):
                 os.environ.pop(key, None)
         os.environ.update({
             "HOME": str(self.home),
@@ -557,20 +557,21 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["attempt_row_lookups"] += 1
             return original_attempt_lookup(jobs, attempt_id, read_context=read_context)
 
-        def checked_context_lookup(context, jobs, attempt_id):
+        def checked_context_lookup(context, jobs, attempt_id, *, append_only=None):
             assert_fixture_path(jobs, "cached attempt-row lookup")
             if monitoring[0] and phase[0] == "runner":
                 counts["context_attempt_row_lookups"] += 1
-            return original_context_lookup(context, jobs, attempt_id)
+            return original_context_lookup(context, jobs, attempt_id,
+                                           append_only=append_only)
 
-        def checked_retire_handover(duty):
+        def checked_retire_handover(duty, *, wait=None):
             if monitoring[0] and phase[0] == "runner":
                 counts["completed_retire_recoveries"] += 1
                 retire_recovery_events.append({
                     "duty_id": duty["id"], "pass": counts["passes"],
                     "window": window_phase[0],
                 })
-            return original_retire_handover(duty)
+            return original_retire_handover(duty, wait=wait)
 
         def checked_authority(*args, **kwargs):
             choice = original_decide_continuation(*args, **kwargs)

@@ -189,6 +189,84 @@ def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]
     return code
 
 
+def report_forwarding_cleanup_incomplete(
+    result, attempt_id: str, attempts: list[str], *, args, route, node,
+    output: str = "", interrupted: bool = False,
+) -> int:
+    """Preserve unresolved pipe cleanup plus exact route-bound launch evidence.
+
+    The wrapper text is diagnostic input, not authority for its own attempt
+    tuple or verdict. Those come only from one registry row bound to this
+    route, node, and attempt. Cleanup remains incomplete even when that row
+    already proves a launch or terminal result.
+    """
+    rows = [
+        row for row in registry_rows(args.jobs, route["route_id"], node["id"])
+        if row.get("attempt_id") == attempt_id
+        and row.get("route_id") == route["route_id"]
+        and row.get("route_node") == node["id"]
+    ]
+    exact_row = rows[0] if len(rows) == 1 else None
+    if exact_row is None:
+        registered = started = child_spawned = "unknown"
+        terminal_row = None
+    else:
+        registered = "1"
+        claimed = exact_row.get("launch_claimed")
+        started = "1" if claimed == "1" else "0" if claimed == "0" else "unknown"
+        if claimed == "1" and exact_row.get("launch_started") == "1":
+            child_spawned = "1"
+        elif exact_row.get("launch_outcome") == "never-launched":
+            child_spawned = "0"
+        else:
+            child_spawned = "unknown"
+        terminal_row = finished_verdict_row(
+            args.jobs, route["route_id"], node["id"], attempt_id,
+        )
+
+    terminal_verdict = "unknown"
+    terminal_note = "-"
+    if terminal_row is not None:
+        terminal_note = terminal_row.get("note", "-") or "-"
+        terminal_verdict = (
+            readable_result(terminal_row)
+            or ("FAIL" if terminal_note == REVIEW_BLOCKING_NOTE else "PASS")
+        )
+
+    if interrupted:
+        signum = getattr(result, "received_signal", None)
+        reason = "interrupted"
+        code = 128 + int(signum) if signum else 130
+        interrupted_fields = {
+            "interrupted": "1",
+            "detail": "the call was stopped, so the worker was stopped with it",
+        }
+    else:
+        reason = "foreground-output-incomplete"
+        code = 76
+        interrupted_fields = {}
+    exit_code = fail(
+        reason, code,
+        **interrupted_fields,
+        attempt_id=attempt_id,
+        route_id=route["route_id"],
+        route_node=node["id"],
+        registered=registered,
+        started=started,
+        child_spawned=child_spawned,
+        terminal_verdict=terminal_verdict,
+        terminal_note=terminal_note,
+        cleanup="incomplete",
+        wrapper_returncode=str(result.returncode),
+        wrapper_stdout_json=json.dumps(result.stdout or "", ensure_ascii=False),
+        wrapper_stderr_json=json.dumps(result.stderr or "", ensure_ascii=False),
+        attempt_trace="|".join(attempts),
+    )
+    if interrupted and output:
+        print(output)
+    return exit_code
+
+
 def fail(reason: str, code: int, **fields: str) -> int:
     print("check=failed")
     print(f"reason={reason}")
@@ -2118,7 +2196,13 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     early = fields.get("early_death", "-")
                     worker_failure = fields.get("worker_failure", "-")
                     attempts.append(f"{ordinal}:{key}:direct:exit-{result.returncode}:attempt-{attempt_id}")
-                    if wrapper_interrupted(result, fields):
+                    interrupted = wrapper_interrupted(result, fields)
+                    if getattr(result, "cleanup_incomplete", False):
+                        return report_forwarding_cleanup_incomplete(
+                            result, attempt_id, attempts, args=args, route=route,
+                            node=node, output=output, interrupted=interrupted,
+                        )
+                    if interrupted:
                         return report_interrupted(result, output, attempt_id, attempts)
                     verdict_row = (finished_verdict_row(args.jobs, route["route_id"], node["id"], attempt_id)
                                    if worker_failure != "-" else None)
