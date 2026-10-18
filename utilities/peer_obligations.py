@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -745,6 +747,17 @@ class ObligationStore:
 
     def __init__(self, root: str | Path | None = None):
         self.root = obligations_root(root)
+        self._list_cache: dict[str, tuple[tuple[int, int, int, int, int], dict | None]] = {}
+        self._discovery_metrics = {"stat_calls": 0, "json_reads": 0, "json_parses": 0}
+        self._active_list_context = None
+
+    def begin_read_pass(self) -> None:
+        """Share one discovery snapshot among lists made during a runner pass."""
+        self._active_list_context = {"paths": None, "records": {}}
+
+    def end_read_pass(self) -> None:
+        """Drop the pass snapshot so the next list observes external changes."""
+        self._active_list_context = None
 
     def _record_path(self, duty_id: str) -> Path:
         return self.root / (_safe_id(duty_id) + ".json")
@@ -761,16 +774,94 @@ class ObligationStore:
     def get(self, duty_id: str) -> dict | None:
         return _read_record(self._record_path(duty_id))
 
-    def list(self, *, states: Iterable[str] = _PENDING_STATES) -> list[dict]:
+    @staticmethod
+    def _list_signature(path: Path):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ObligationError("peer-obligation-record-invalid")
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+    def _read_list_record(self, path: Path):
+        key = str(path)
+        for _attempt in range(3):
+            try:
+                before = self._list_signature(path)
+            except FileNotFoundError:
+                self._list_cache.pop(key, None)
+                return None
+            self._discovery_metrics["stat_calls"] += 1
+            if before is None:
+                self._list_cache.pop(key, None)
+                return None
+            cached = self._list_cache.get(key)
+            if cached is not None and cached[0] == before:
+                return cached[1]
+
+            self._list_cache.pop(key, None)
+            self._discovery_metrics["json_reads"] += 1
+            self._discovery_metrics["json_parses"] += 1
+            record = _read_record(path)
+            try:
+                after = self._list_signature(path)
+            except FileNotFoundError:
+                self._list_cache.pop(key, None)
+                return None
+            self._discovery_metrics["stat_calls"] += 1
+            if before == after:
+                self._list_cache[key] = (after, copy.deepcopy(record))
+                return record
+        self._list_cache.pop(key, None)
+        raise ObligationError("peer-obligation-list-unstable")
+
+    def discovery_metrics(self) -> dict[str, int]:
+        return dict(self._discovery_metrics)
+
+    def reset_discovery_metrics(self) -> None:
+        for key in self._discovery_metrics:
+            self._discovery_metrics[key] = 0
+
+    def list(self, *, states: Iterable[str] = _PENDING_STATES,
+             kinds: Iterable[str] | None = None) -> list[dict]:
         if not self.root.is_dir():
+            self._list_cache.clear()
             return []
         wanted = set(states)
+        wanted_kinds = None if kinds is None else set(kinds)
         output = []
-        for path in sorted(self.root.glob("*.json")):
-            record = _read_record(path)
-            if record is not None and record.get("state") in wanted:
-                output.append(record)
+        context = self._active_list_context
+        if context is None:
+            context = {"paths": None, "records": {}}
+        if context["paths"] is None:
+            paths = sorted(self.root.glob("*.json"))
+            context["paths"] = paths
+            present = {str(path) for path in paths}
+            for stale in set(self._list_cache).difference(present):
+                self._list_cache.pop(stale, None)
+        paths = context["paths"]
+        for path in paths:
+            key = str(path)
+            if key not in context["records"]:
+                context["records"][key] = self._read_list_record(path)
+            record = context["records"][key]
+            if (record is not None and record.get("state") in wanted
+                    and (wanted_kinds is None
+                         or (record.get("intent") or {}).get("kind") in wanted_kinds)):
+                output.append(copy.deepcopy(record))
         return output
+
+    def _invalidate_list_record(self, duty_id: str) -> None:
+        path = self._record_path(duty_id)
+        key = str(path)
+        self._list_cache.pop(key, None)
+        context = self._active_list_context
+        if context is None:
+            return
+        context["records"].pop(key, None)
+        if context["paths"] is not None and path.exists() and key not in {
+                str(candidate) for candidate in context["paths"]}:
+            context["paths"] = sorted([*context["paths"], path])
 
     def create(self, duty_id: str, kind: str, identity: dict, intent: dict) -> dict:
         duty_id = _safe_id(duty_id)
@@ -794,6 +885,7 @@ class ObligationStore:
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
     def update(self, duty_id: str, *, state: str | None = None,
                observation: dict | None = None, result: str | None = None,
@@ -848,6 +940,7 @@ class ObligationStore:
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
     def claim_phase(self, duty_id: str, expected: set[str], new_phase: str,
                     *, state: str = "pending", extra: dict | None = None) -> dict | None:
@@ -874,6 +967,7 @@ class ObligationStore:
             return record
         finally:
             os.close(fd)
+            self._invalidate_list_record(duty_id)
 
 
 def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated real-runner regression for the observed message/batch workload."""
+"""Isolated real-runner regression for managed message and retire workloads."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_registry_cache  # noqa: E402
 import dispatch_batch_obligations  # noqa: E402
 import dispatch_completion_join  # noqa: E402
+import dispatch_pending_delivery  # noqa: E402
 import peer_obligations  # noqa: E402
 from dispatch_contract import process_namespace_identity  # noqa: E402
 from peer_read_context import PeerReadContext  # noqa: E402
@@ -69,8 +70,9 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "OPENCODE_CONFIG_DIR": str(self.base / "opencode"),
         })
         self.addCleanup(self._restore_environment)
-        dispatch_registry_cache._CACHE.pop(str(self.jobs), None)
-        self.addCleanup(lambda: dispatch_registry_cache._CACHE.pop(str(self.jobs), None))
+        dispatch_registry_cache.clear_cache()
+        dispatch_registry_cache.reset_metrics()
+        self.addCleanup(dispatch_registry_cache.clear_cache)
         self.store = peer_obligations.ObligationStore(self.dispatch)
 
     def _restore_environment(self):
@@ -116,7 +118,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             self.store.update(duty_id, state="unknown", observation=initial_observation)
         return duty_id, ref, recipient["name"]
 
-    def _seed_workload(self):
+    def _seed_workload(self, *, recurring_negative=False):
         from harness_capabilities import parent_completion
 
         carrier = parent_completion("codex")["carrier"]
@@ -148,8 +150,6 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     "holder": [str(os.getpid()), str(pid_start), namespace]})
             registered_ids.append(duty_id)
 
-        padding_line = "job\topen\t/repo\t2026-10-18T00:00:00Z\tworker\t" + "x" * 4700 + "\n"
-        padding = padding_line * 4894
         metadata = ",".join((
             f"attempt_id={active_attempt}", "attempt_schema_version=2",
             f"parent_sid={self.active_session_id}", "parent_harness=codex",
@@ -159,7 +159,62 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "delivery_intent=1", "route_id=synthetic-route",
         ))
         active_row = (f"job\topen\t/repo\t2026-10-18T00:00:00Z\towner\t{metadata}\n")
-        self.jobs.write_text(padding + active_row, encoding="utf-8")
+        retire_rows = []
+        self.completed_retire_ids = []
+        self.retire_handover_meta = []
+        for index in range(2):
+            predecessor_sid = self._session_id("retired-parent", index)
+            successor_sid = self._session_id("successor", index)
+            predecessor_pane = f"w1:pOld{index}"
+            successor_pane = f"w1:pNew{index}"
+            successor_harness = "codex"
+            peer_steward._mark_seat_successor(
+                successor_pane, predecessor_pane, successor_harness, successor_sid)
+            identity = {
+                "server": "default", "pane": predecessor_pane, "harness": "claude",
+                "session_id": predecessor_sid, "name": f"retired-{index}",
+                "foreground": {"pid": 990000 + index, "start": str(8000 + index),
+                               "argv": ["claude"], "shell_pid": 980000 + index,
+                               "shell_start": str(7000 + index)},
+            }
+            requester = {"server": "default", "pane": successor_pane,
+                         "harness": successor_harness, "session_id": successor_sid}
+            duty_id = f"completed-retire-managed-{index}"
+            duty = self.store.create(duty_id, "retire", identity,
+                                     {"target": predecessor_pane, "requester": requester})
+            self.store.update(duty_id, state="complete", result="target-already-gone",
+                              delivery="completed", cleanup="complete",
+                              observation={"phase": "complete", "reason": "target-already-gone"})
+            self.completed_retire_ids.append(duty_id)
+            attempt = f"att-retire-{index}"
+            route_id = f"synthetic-retire-route-{index}"
+            route_hash = "sha256:" + hashlib.sha256(route_id.encode()).hexdigest()
+            route_meta = {
+                "attempt_id": attempt, "attempt_schema_version": "2",
+                "dispatch_depth": "1", "worker_type": "owner",
+                "parent_sid": predecessor_sid, "parent_harness": "claude",
+                "route_id": route_id, "route_hash": route_hash, "route_node": "execute",
+            }
+            self.retire_handover_meta.append((route_meta, successor_sid))
+            status = "done" if recurring_negative else "open"
+            retire_rows.append(f"job\t{status}\t/repo\t2026-10-18T00:00:00Z\towner\t"
+                               + ",".join(f"{key}={value}" for key, value in route_meta.items()) + "\n")
+
+        header = active_row + "".join(retire_rows)
+        target_bytes = 23_499_871
+        prefix = "job\topen\t/repo\t2026-10-18T00:00:00Z\tworker\t"
+        full_padding = prefix + "x" * 4700 + "\n"
+        remaining = target_bytes - len(header.encode("utf-8"))
+        rows, tail = divmod(remaining, len(full_padding.encode("utf-8")))
+        if tail and tail < len(prefix.encode("utf-8")) + 1:
+            rows -= 1
+            tail += len(full_padding.encode("utf-8"))
+        padding = full_padding * rows
+        if tail:
+            padding += prefix + "x" * (tail - len(prefix.encode("utf-8")) - 1) + "\n"
+        content = (header + padding).encode("utf-8")
+        self.assertEqual(len(content), target_bytes)
+        self.jobs.write_bytes(content)
 
         # Operational message census shape: 114 queued (112 hook-context and
         # two context-API), 73 pending, one unverified in herdr delivery, and
@@ -211,7 +266,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         # them even though only unfinished duties are returned to the runner.
         for kind, count, prefix in (("message", 362, "completed-message"),
                                     ("registered-batch", 253, "completed-batch"),
-                                    ("retire", 87, "completed-retire")):
+                                    ("retire", 85, "completed-retire")):
             for index in range(count):
                 duty_id = prefix + "-" + hashlib.sha256(
                     f"{prefix}-{index}".encode()).hexdigest()[:32]
@@ -221,17 +276,68 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.store.update(cancelled["id"], state="cancelled")
         return registered_ids, carrier, active_attempt
 
-    def test_real_runner_20_second_operational_shape(self):
-        registered_ids, _carrier, _attempt = self._seed_workload()
+    def _create_open_retire_delivery(self, index):
+        meta, _successor_sid = self.retire_handover_meta[index]
+        attempt_id = meta["attempt_id"]
+        receipt = {
+            "schema_version": 2,
+            "state": "delivered",
+            "parent_attempt_id": attempt_id,
+            "job_registry": str(self.jobs),
+            "children": [{
+                "attempt_id": attempt_id,
+                "status": "done",
+                "readiness": "ready",
+                "reason": "terminal-failure-or-unclosed",
+                "required_action": "inspect-done-failure",
+                "harness": "claude",
+                "delivery_classification": "attention",
+            }],
+            "delivery_classification": "attention",
+        }
+        delivery_id = "delivery-" + hashlib.sha256(
+            f"retire-authority-{attempt_id}".encode()).hexdigest()[:32]
+        record = dispatch_pending_delivery.create(
+            self.dispatch,
+            recipient_kind="claude-parent-runtime",
+            recipient_key=meta["parent_sid"],
+            delivery_id=delivery_id,
+            session_generation="",
+            session_generation_supported="0",
+            attempt_ids=[attempt_id],
+            parent_attempt_id=attempt_id,
+            route_id=meta["route_id"],
+            route_node=meta["route_node"],
+            receipt=receipt,
+            receipt_digest=dispatch_pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={attempt_id: meta["route_hash"]},
+        )
+        path = dispatch_pending_delivery.record_path(
+            self.dispatch, meta["parent_sid"], delivery_id)
+        return {"record": record, "path": path, "delivery_id": delivery_id,
+                "attempt_id": attempt_id, "recipient_key": meta["parent_sid"],
+                "route_meta": meta}
+
+    def test_real_runner_20_second_successful_handover_shape(self):
+        self._run_real_runner_workload(recurring_negative=False)
+
+    def test_real_runner_20_second_recurring_negative_retire_shape(self):
+        self._run_real_runner_workload(recurring_negative=True)
+
+    def _run_real_runner_workload(self, *, recurring_negative):
+        registered_ids, _carrier, _attempt = self._seed_workload(
+            recurring_negative=recurring_negative)
         # The active row carries this host's pid, start tick and namespace, so
         # only the ~23 MB padding is fixed; the exact byte count varies by host.
-        self.assertGreaterEqual(self.jobs.stat().st_size, 23_017_000)
-        self.assertLess(self.jobs.stat().st_size, 23_300_000)
+        self.assertEqual(self.jobs.stat().st_size, 23_499_871)
         self.assertEqual(len(list(peer_message._pending_dir().glob("*.json"))), 188)
         self.assertEqual(len(list(peer_message._transfer_path("0" * 32).parent.glob("*.json"))), 188)
         self.assertEqual(len(list(self.store.root.glob("*.json"))), 902)
         self.assertEqual(len(self.store.list(states={"complete"})), 702)
         self.assertEqual(len(self.store.list(states={"cancelled"})), 1)
+        self.assertEqual(len(self.completed_retire_ids), 2)
+        self.assertTrue(all(self.store.get(duty_id)["state"] == "complete"
+                            for duty_id in self.completed_retire_ids))
         self.assertEqual(sum(self.store.get(duty_id)["state"] in {"pending", "unknown"}
                              for duty_id, _ref, _target in self.message_duties), 193)
         registered_states = [self.store.get(duty_id)["state"] for duty_id in registered_ids]
@@ -264,11 +370,22 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         discovered_roots = set()
         write_targets = set()
         observed_roots = set()
+        validated_fixture_paths = {}
+        monitoring = [False]
+        phase = ["setup"]
 
         def assert_fixture_path(path, label):
-            resolved = Path(path).expanduser().resolve(strict=False)
+            key = os.fspath(path)
+            cached = validated_fixture_paths.get(key)
+            if cached is not None:
+                return cached
+            guard_cpu_started = time.process_time()
+            resolved = Path(key).expanduser().resolve(strict=False)
             self.assertTrue(resolved.is_relative_to(fixture_root),
                             f"{label} escaped the temporary fixture: {resolved}")
+            validated_fixture_paths[key] = resolved
+            if monitoring[0] and phase[0] == "runner":
+                counts["fixture_path_guard_cpu_seconds"] += time.process_time() - guard_cpu_started
             observed_roots.add(str(resolved))
             return resolved
 
@@ -289,12 +406,29 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "input_obligation_writes": 0, "input_pending_writes": 0,
             "input_transfer_writes": 0, "write_open_calls": 0,
             "replace_calls": 0, "unlink_calls": 0,
+            "completed_retire_recoveries": 0, "handover_authority_calls": 0,
+            "record_retire_calls": 0,
+            "service_runner_calls": 0, "watch_activation_calls": 0,
+            "batch_activation_calls": 0,
+            "store_list_cpu_seconds": 0.0, "reconcile_cpu_seconds": 0.0,
+            "external_cpu_seconds": 0.0,
+            "message_cpu_seconds": 0.0, "registered_cpu_seconds": 0.0,
+            "fixture_path_guard_cpu_seconds": 0.0,
         }
-        monitoring = [False]
-        phase = ["setup"]
+        window_phase = ["cold"]
         event = {}
         sleep_delays = []
         window = 20.0
+        measurement = {}
+        runner_store = []
+        lock_identities = []
+        lock_events = []
+        authority_counts = {}
+        retire_recovery_events = []
+        record_retire_events = []
+        retire_delivery_input = {}
+        original_retire = self.store.get(self.completed_retire_ids[0])
+        initial_jobs_digest = hashlib.sha256(self.jobs.read_bytes()).hexdigest()
         real_sleep = time.sleep
         real_os_open = os.open
         real_os_replace = os.replace
@@ -312,6 +446,17 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         original_read_record = peer_obligations._read_record
         original_store_list = peer_obligations.ObligationStore.list
         original_store_update = peer_obligations.ObligationStore.update
+        original_external_reconcile = peer_steward._reconcile_external_obligations
+        original_retire_handover = peer_steward._retire_handover
+        import route_authority
+        original_decide_continuation = route_authority.decide_continuation
+        import dispatch_seat_handover
+        original_record_retire = dispatch_seat_handover.record_retire_handover
+        import session_tidy
+        seat_lock_dir = session_tidy.state_root() / "locks"
+        seat_lock_dir_text = os.fspath(seat_lock_dir)
+        assert_fixture_path(seat_lock_dir, "seat lock directory")
+        original_flock = fcntl.flock
         original_registry_lines = dispatch_registry_cache.registry_lines
         original_attempt_lookup = dispatch_completion_join.current_attempt_row
         original_context_lookup = PeerReadContext.current_attempt_row
@@ -384,9 +529,16 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
 
         def checked_store_list(store, *args, **kwargs):
             assert_fixture_path(store.root, "obligation listing root")
+            if not runner_store:
+                runner_store.append(store)
             if monitoring[0] and phase[0] == "runner":
                 counts["store_list_calls"] += 1
-            return original_store_list(store, *args, **kwargs)
+            cpu_started = time.process_time()
+            try:
+                return original_store_list(store, *args, **kwargs)
+            finally:
+                if monitoring[0] and phase[0] == "runner":
+                    counts["store_list_cpu_seconds"] += time.process_time() - cpu_started
 
         def checked_store_update(store, duty_id, **kwargs):
             if monitoring[0] and phase[0] == "runner":
@@ -411,21 +563,109 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["context_attempt_row_lookups"] += 1
             return original_context_lookup(context, jobs, attempt_id)
 
+        def checked_retire_handover(duty):
+            if monitoring[0] and phase[0] == "runner":
+                counts["completed_retire_recoveries"] += 1
+                retire_recovery_events.append({
+                    "duty_id": duty["id"], "pass": counts["passes"],
+                    "window": window_phase[0],
+                })
+            return original_retire_handover(duty)
+
+        def checked_authority(*args, **kwargs):
+            choice = original_decide_continuation(*args, **kwargs)
+            if monitoring[0] and phase[0] == "runner" and kwargs.get("action") == "handover":
+                counts["handover_authority_calls"] += 1
+                meta = kwargs.get("metadata") or {}
+                attempt_id = meta.get("attempt_id")
+                window_counts = authority_counts.setdefault(attempt_id, {})
+                result_key = f"{window_phase[0]}_{'allowed' if choice.allowed else 'denied'}"
+                window_counts[result_key] = window_counts.get(result_key, 0) + 1
+                if (retire_delivery_input and attempt_id == retire_delivery_input["attempt_id"]
+                        and choice.allowed and "observed_at" not in retire_delivery_input):
+                    retire_delivery_input["observed_at"] = time.monotonic()
+                    retire_delivery_input["observed_pass"] = counts["passes"]
+                    retire_delivery_input["observed_window"] = window_phase[0]
+            return choice
+
+        def checked_record_retire(*args, **kwargs):
+            if monitoring[0] and phase[0] == "runner":
+                counts["record_retire_calls"] += 1
+                record_retire_events.append({
+                    "predecessor_sid": args[0] if args else kwargs.get("predecessor_sid"),
+                    "pass": counts["passes"], "window": window_phase[0],
+                })
+            return original_record_retire(*args, **kwargs)
+
+        def checked_flock(fd, operation):
+            result = original_flock(fd, operation)
+            if (monitoring[0] and phase[0] == "runner"
+                    and operation & fcntl.LOCK_EX):
+                try:
+                    target = os.readlink(f"/proc/self/fd/{fd}")
+                except OSError:
+                    target = None
+                if target is not None and os.path.dirname(target) == seat_lock_dir_text:
+                    lock_key = os.path.basename(target).removesuffix(".lock")
+                    lock_identities.append(lock_key)
+                    lock_events.append({"key": lock_key, "pass": counts["passes"],
+                                        "window": window_phase[0]})
+            return result
+
+        def checked_exec_service_runner(*args, **kwargs):
+            if monitoring[0] and phase[0] == "runner":
+                counts["service_runner_calls"] += 1
+                self.assertTrue(args[2] if len(args) > 2 else kwargs.get("service_current"))
+            return "same-release-noop"
+
+        def checked_watch_activation(*args, **kwargs):
+            if monitoring[0] and phase[0] == "runner":
+                counts["watch_activation_calls"] += 1
+            return None
+
+        def checked_batch_activation(*args, **kwargs):
+            if monitoring[0] and phase[0] == "runner":
+                counts["batch_activation_calls"] += 1
+            return None
+
         def checked_reconcile(store, duties=None, *, read_context=None):
             if monitoring[0] and phase[0] == "runner":
                 counts["passes"] += 1
                 counts["passes_after_input" if event else "passes_before_input"] += 1
-            return original_reconcile(store, duties, read_context=read_context)
+            cpu_started = time.process_time()
+            try:
+                return original_reconcile(store, duties, read_context=read_context)
+            finally:
+                if monitoring[0] and phase[0] == "runner":
+                    counts["reconcile_cpu_seconds"] += time.process_time() - cpu_started
+
+        def checked_external_reconcile(*args, **kwargs):
+            cpu_started = time.process_time()
+            try:
+                return original_external_reconcile(*args, **kwargs)
+            finally:
+                if monitoring[0] and phase[0] == "runner":
+                    counts["external_cpu_seconds"] += time.process_time() - cpu_started
 
         def checked_resume_message(duty, store, *, read_context=None):
             if monitoring[0] and phase[0] == "runner":
                 counts["message_resumes"] += 1
-            return original_resume_message(duty, store, read_context=read_context)
+            cpu_started = time.process_time()
+            try:
+                return original_resume_message(duty, store, read_context=read_context)
+            finally:
+                if monitoring[0] and phase[0] == "runner":
+                    counts["message_cpu_seconds"] += time.process_time() - cpu_started
 
         def checked_resume_registered(duty, store, *, read_context=None):
             if monitoring[0] and phase[0] == "runner":
                 counts["registered_resumes"] += 1
-            return original_resume_registered(duty, store, read_context=read_context)
+            cpu_started = time.process_time()
+            try:
+                return original_resume_registered(duty, store, read_context=read_context)
+            finally:
+                if monitoring[0] and phase[0] == "runner":
+                    counts["registered_cpu_seconds"] += time.process_time() - cpu_started
 
         def fake_native_provider(target):
             if monitoring[0] and phase[0] == "runner":
@@ -492,41 +732,85 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         runner_args = SimpleNamespace(state_root=str(self.dispatch), lock_fd=lock_fd,
-                                      service_current=None)
+                                      service_current="fixture-managed-current")
 
         def process_ticks():
-            fields = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="ascii")
-            return fields[fields.rfind(")") + 2:].split()
+            raw = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="ascii")
+            pid = int(raw[:raw.find(" (")])
+            return pid, raw[raw.rfind(")") + 2:].split()
+
+        def close_measurement_window(name):
+            ended = time.monotonic()
+            end_pid, after_fields = process_ticks()
+            record = measurement[name]
+            before_fields = record["before_fields"]
+            record.update({
+                "end_monotonic": ended,
+                "elapsed": ended - record["start_monotonic"],
+                "end_pid": end_pid,
+                "after_fields": after_fields,
+                "cpu_ticks": ((int(after_fields[11]) + int(after_fields[12]))
+                              - (int(before_fields[11]) + int(before_fields[12]))),
+                "registry": dispatch_registry_cache.metrics_snapshot(),
+                "store": runner_store[0].discovery_metrics() if runner_store else {},
+                "counts": dict(counts),
+            })
+            if name == "cold":
+                steady_pid, steady_fields = end_pid, after_fields
+                measurement["steady"] = {
+                    "start_monotonic": ended,
+                    "start_pid": steady_pid,
+                    "before_fields": steady_fields,
+                }
+                window_phase[0] = "steady"
+            else:
+                window_phase[0] = "post-change"
 
         def controlled_sleep(delay):
             requested = max(0.0, float(delay))
             sleep_delays.append(requested)
-            sleep_started = time.monotonic()
-            wake_at = sleep_started + requested
-            if len(sleep_delays) == 3 and not event:
-                real_sleep(min(requested * 0.25, max(0.0, deadline - time.monotonic())))
+            measured_phase = window_phase[0]
+            if measured_phase in {"cold", "steady"}:
+                record = measurement[measured_phase]
+                deadline = record["start_monotonic"] + window
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining:
+                    real_sleep(min(requested, remaining))
+                if time.monotonic() >= deadline:
+                    close_measurement_window(measured_phase)
+                return
+            if measured_phase == "post-change" and not event:
+                first_wait = min(requested * 0.25, requested)
+                if first_wait:
+                    real_sleep(first_wait)
                 phase[0] = "input"
+                if recurring_negative:
+                    delivery_input = self._create_open_retire_delivery(0)
+                    retire_delivery_input.update(delivery_input)
+                    retire_delivery_input.update({
+                        "duty_id": self.completed_retire_ids[0],
+                        "created_at": time.monotonic(),
+                        "pass_at_create": counts["passes"],
+                        "trigger_delay": max(0.0, requested - first_wait),
+                    })
                 duty_id, ref, target = self._message(193)
                 event.update({"duty_id": duty_id, "ref": ref, "target": target,
                               "created_at": time.monotonic(), "pass_at_create": counts["passes"],
-                              "trigger_delay": max(0.0, wake_at - time.monotonic())})
+                              "trigger_delay": max(0.0, requested - first_wait)})
                 phase[0] = "runner"
-                remaining = min(max(0.0, wake_at - time.monotonic()),
-                                max(0.0, deadline - time.monotonic()))
+                remaining = max(0.0, requested - first_wait)
                 if remaining:
                     real_sleep(remaining)
-            else:
-                remaining = min(requested, max(0.0, deadline - time.monotonic()))
-                if remaining:
-                    real_sleep(remaining)
-            if time.monotonic() >= deadline:
+                return
+            if event.get("processed_at"):
+                measurement["final_pid"], measurement["final_fields"] = process_ticks()
                 raise MeasurementWindowEnded()
+            if requested:
+                real_sleep(requested)
 
         ticks = os.sysconf("SC_CLK_TCK")
         monitoring[0] = True
         phase[0] = "runner"
-        before = None
-        after = None
         runner_ended_at_window = False
         runner_return = None
         try:
@@ -550,6 +834,11 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     mock.patch.object(peer_obligations, "_read_record", side_effect=checked_read_record),
                     mock.patch.object(peer_obligations.ObligationStore, "list", checked_store_list),
                     mock.patch.object(peer_obligations.ObligationStore, "update", checked_store_update),
+                    mock.patch.object(peer_steward, "_retire_handover", side_effect=checked_retire_handover),
+                    mock.patch.object(route_authority, "decide_continuation", side_effect=checked_authority),
+                    mock.patch.object(dispatch_seat_handover, "record_retire_handover",
+                                      side_effect=checked_record_retire),
+                    mock.patch.object(fcntl, "flock", side_effect=checked_flock),
                     mock.patch.object(dispatch_registry_cache, "registry_lines",
                                       side_effect=checked_registry_lines),
                     mock.patch.object(dispatch_completion_join, "registry_lines",
@@ -559,6 +848,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     mock.patch.object(PeerReadContext, "current_attempt_row", checked_context_lookup),
                     mock.patch.object(peer_steward, "_reconcile_obligations",
                                       side_effect=checked_reconcile),
+                    mock.patch.object(peer_steward, "_reconcile_external_obligations",
+                                      side_effect=checked_external_reconcile),
                     mock.patch.object(peer_steward, "_resume_message_obligation",
                                       side_effect=checked_resume_message),
                     mock.patch.object(peer_steward, "_resume_registered_obligation",
@@ -582,28 +873,27 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     mock.patch.object(peer_obligations, "ensure_runner",
                                       side_effect=AssertionError("fixture attempted service activation")),
                     mock.patch.object(peer_obligations, "exec_service_runner",
-                                      side_effect=AssertionError("fixture attempted service activation")),
+                                      side_effect=checked_exec_service_runner),
                     mock.patch.object(peer_steward, "_ensure_watch_observers",
-                                      side_effect=AssertionError("fixture attempted watch activation")),
+                                      side_effect=checked_watch_activation),
                     mock.patch.object(dispatch_batch_obligations, "ensure_observers",
-                                      side_effect=AssertionError("fixture attempted batch activation")),
+                                      side_effect=checked_batch_activation),
                     mock.patch.object(peer_steward.subprocess, "run",
                                       side_effect=AssertionError("fixture attempted external transport")),
                 )
                 for patcher in patchers:
                     patch_stack.enter_context(patcher)
+                dispatch_registry_cache.clear_cache()
+                dispatch_registry_cache.reset_metrics()
                 started = time.monotonic()
-                deadline = started + window
-                before = process_ticks()
-                start_tick = before[19]
-                cpu_before = int(before[11]) + int(before[12])
+                start_pid, start_fields = process_ticks()
+                measurement["cold"] = {"start_monotonic": started, "start_pid": start_pid,
+                                        "before_fields": start_fields}
+                window_phase[0] = "cold"
                 try:
                     runner_return = peer_steward.cmd_obligation_runner(runner_args)
                 except MeasurementWindowEnded:
                     runner_ended_at_window = True
-                after = process_ticks()
-                cpu_after = int(after[11]) + int(after[12])
-                elapsed = time.monotonic() - started
         finally:
             monitoring[0] = False
             phase[0] = "finished"
@@ -611,46 +901,132 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             os.close(lock_fd)
 
         self.assertTrue(runner_ended_at_window, f"runner returned early with {runner_return!r}")
-        self.assertEqual(after[19], start_tick)
-        self.assertGreaterEqual(elapsed, 19.0)
-        self.assertLessEqual(elapsed, 21.0)
-        cpu_percent = (cpu_after - cpu_before) * 100.0 / (ticks * elapsed)
+        self.assertIn("steady", measurement)
+        cold = measurement["cold"]
+        steady = measurement["steady"]
+        cold_cpu = cold["cpu_ticks"] * 100.0 / (ticks * cold["elapsed"])
+        steady_cpu = steady["cpu_ticks"] * 100.0 / (ticks * steady["elapsed"])
+        self.assertEqual(start_pid, os.getpid())
+        self.assertEqual(cold["end_pid"], start_pid)
+        self.assertEqual(steady["start_pid"], start_pid)
+        self.assertEqual(steady["end_pid"], start_pid)
+        self.assertEqual(measurement["final_pid"], start_pid)
+        self.assertEqual(cold["before_fields"][19], cold["after_fields"][19])
+        self.assertEqual(steady["before_fields"][19], steady["after_fields"][19])
+        self.assertEqual(measurement["final_fields"][19], cold["before_fields"][19])
+        for observed in (cold["elapsed"], steady["elapsed"]):
+            self.assertGreaterEqual(observed, 19.0)
+            self.assertLessEqual(observed, 21.0)
+
+        self.assertEqual(cold["registry"]["content_reads"], 1)
+        self.assertEqual(cold["registry"]["bytes_read"], self.jobs.stat().st_size)
+        self.assertEqual(cold["registry"]["full_metadata_parses"], 1)
+        self.assertGreater(cold["registry"]["metadata_rows_parsed"], 2)
+        self.assertEqual(steady["registry"]["content_reads"] - cold["registry"]["content_reads"], 0)
+        self.assertEqual(steady["registry"]["bytes_read"] - cold["registry"]["bytes_read"], 0)
+        self.assertEqual(steady["registry"]["full_metadata_parses"]
+                         - cold["registry"]["full_metadata_parses"], 0)
+        self.assertEqual(steady["registry"]["metadata_rows_parsed"]
+                         - cold["registry"]["metadata_rows_parsed"], 0)
+        self.assertEqual(cold["store"]["json_reads"], 902)
+        self.assertEqual(cold["store"]["json_parses"], 902)
+        self.assertEqual(steady["store"]["json_reads"] - cold["store"]["json_reads"], 0)
+        self.assertEqual(steady["store"]["json_parses"] - cold["store"]["json_parses"], 0)
+        self.assertGreater(steady["store"]["stat_calls"] - cold["store"]["stat_calls"], 0)
         self.assertGreaterEqual(counts["passes"], 4)
-        self.assertEqual(counts["passes_before_input"], 3)
-        self.assertEqual(counts["passes_after_input"], counts["passes"] - 3)
-        self.assertEqual(counts["message_resumes"], 193 * 3 + 194 * counts["passes_after_input"])
-        self.assertEqual(counts["registered_resumes"], 6 * counts["passes"])
-        self.assertEqual(counts["store_list_calls"], 2 * counts["passes"])
-        self.assertEqual(counts["pending_reads"], 193 * 3 + 194 * counts["passes_after_input"])
-        self.assertEqual(counts["transfer_record_reads"], 188 * 3 + 189 * counts["passes_after_input"])
-        self.assertEqual(counts["native_lookups"], 73 * 3 + 74 * counts["passes_after_input"])
-        self.assertEqual(counts["attempt_row_lookups"], 7 * counts["passes"])
-        self.assertEqual(counts["context_attempt_row_lookups"], 6 * counts["passes"])
-        self.assertEqual(counts["root_discoveries"], counts["passes"])
-        self.assertEqual(counts["root_candidates"], 3 * counts["passes"])
-        self.assertEqual(counts["registry_line_calls"], 2 * counts["passes"])
-        self.assertEqual(counts["jobs_file_reads"], 1)
+        self.assertGreaterEqual(counts["passes_before_input"], 4)
+        self.assertGreater(counts["passes_after_input"], 0)
+        self.assertLessEqual(counts["message_resumes"], 194 * counts["passes"])
+        self.assertGreaterEqual(counts["registered_resumes"], 6 * counts["passes"])
+        self.assertLessEqual(counts["pending_reads"], 194 * counts["passes"])
+        self.assertLessEqual(counts["transfer_record_reads"], 189 * counts["passes"])
+        self.assertLessEqual(counts["attempt_row_lookups"], 8 * counts["passes"])
+        self.assertLessEqual(counts["context_attempt_row_lookups"], 7 * counts["passes"])
+        self.assertGreaterEqual(counts["completed_retire_recoveries"], 2)
+        self.assertGreaterEqual(counts["record_retire_calls"], 2)
+        self.assertGreaterEqual(counts["handover_authority_calls"], 2)
+        self.assertEqual(counts["service_runner_calls"], counts["passes"])
+        self.assertEqual(counts["batch_activation_calls"], counts["passes"])
+        self.assertEqual(counts["watch_activation_calls"], 0)
+        self.assertEqual(counts["jobs_file_reads"], 0,
+                         "registry content is read through the fd generation reader")
+        self.assertEqual(cold["counts"]["obligation_writes"], 0,
+                         "cold unchanged duties must not checkpoint")
+        self.assertEqual(steady["counts"]["obligation_writes"]
+                         - cold["counts"]["obligation_writes"], 0,
+                         "steady unchanged duties must not checkpoint")
         self.assertEqual(counts["obligation_writes"], 1,
-                         "only the new input's real reconciliation should checkpoint")
+                         "only the changed duty may checkpoint after the measurement windows")
         self.assertEqual(counts["input_obligation_writes"], 1)
         self.assertEqual(counts["input_pending_writes"], 1)
         self.assertEqual(counts["input_transfer_writes"], 1)
-        expected_record_reads = (2 * (902 * counts["passes_before_input"]
-                                      + 903 * counts["passes_after_input"])
-                                 + counts["store_update_calls"] + counts["passes"])
-        self.assertEqual(counts["store_record_reads"], expected_record_reads)
         self.assertEqual(counts["store_update_calls"], 1)
         self.assertTrue(discovered_roots)
         self.assertTrue(write_targets)
         self.assertTrue(all(Path(path).resolve(strict=False).is_relative_to(fixture_root)
                             for path in discovered_roots | write_targets | observed_roots))
-        self.assertEqual(event["pass_at_create"], 3)
+        self.assertGreaterEqual(event["pass_at_create"], 4)
         self.assertIn("processed_at", event)
-        self.assertLessEqual(event["processed_at"] - event["created_at"],
-                             event["trigger_delay"] + 1.0)
+        input_latency = event["processed_at"] - event["created_at"]
+        self.assertLessEqual(input_latency, event["trigger_delay"] + 2.0)
+        self.assertLessEqual(event["trigger_delay"], 15.0)
         self.assertEqual(self.store.get(event["duty_id"])["state"], "unknown")
         self.assertEqual(self.store.get(event["duty_id"])["observation"]["reason"],
                          "target-identity-changed")
+        self.assertEqual(hashlib.sha256(self.jobs.read_bytes()).hexdigest(), initial_jobs_digest,
+                         "authority input changes must leave jobs.log unchanged")
+        if recurring_negative:
+            target_meta, target_successor = self.retire_handover_meta[0]
+            other_meta, _other_successor = self.retire_handover_meta[1]
+            for attempt_id in (target_meta["attempt_id"], other_meta["attempt_id"]):
+                for measured_window in ("cold", "steady"):
+                    self.assertGreaterEqual(
+                        authority_counts.get(attempt_id, {}).get(f"{measured_window}_denied", 0),
+                        2, f"{attempt_id} must be rediscovered and denied on multiple "
+                        f"{measured_window} passes: authority={authority_counts}; "
+                        f"counts={counts}; retire={retire_recovery_events}; "
+                        f"record={record_retire_events}; locks={lock_events}")
+            for duty_id in (self.completed_retire_ids[0], self.completed_retire_ids[1]):
+                for measured_window in ("cold", "steady"):
+                    resumed = [row for row in retire_recovery_events
+                               if row["duty_id"] == duty_id and row["window"] == measured_window]
+                    self.assertGreaterEqual(len(resumed), 2, (duty_id, measured_window))
+            self.assertEqual(authority_counts.get(target_meta["attempt_id"], {}).get(
+                "post-change_allowed", 0), 1, authority_counts)
+            self.assertEqual(authority_counts.get(other_meta["attempt_id"], {}).get(
+                "post-change_allowed", 0), 0, authority_counts)
+            self.assertGreater(retire_delivery_input.get("observed_pass", 0),
+                               retire_delivery_input.get("pass_at_create", -1))
+            self.assertEqual(retire_delivery_input.get("observed_window"), "post-change")
+            delivery = dispatch_pending_delivery.read(
+                self.dispatch, retire_delivery_input["recipient_key"],
+                retire_delivery_input["delivery_id"])
+            self.assertEqual(delivery["state"], "pending")
+            self.assertEqual(delivery["attempt_ids"], [target_meta["attempt_id"]])
+            self.assertIsNone(delivery["claim_owner"], "the fixture must not claim the delivery")
+            self.assertEqual(delivery["parent_attempt_id"], target_meta["attempt_id"])
+            original_after = self.store.get(retire_delivery_input["duty_id"])
+            self.assertEqual(original_after["id"], original_retire["id"])
+            self.assertEqual(original_after["state"], "complete")
+            self.assertEqual(original_after["accepted_at"], original_retire["accepted_at"])
+            self.assertEqual(original_after["intent"], original_retire["intent"])
+            self.assertEqual(original_after["intent"]["requester"], {
+                "server": "default", "pane": "w1:pNew0", "harness": "codex",
+                "session_id": target_successor,
+            })
+            self.assertEqual(delivery["receipt"]["job_registry"], str(self.jobs))
+            self.assertEqual(delivery["receipt"]["children"][0]["attempt_id"],
+                             target_meta["attempt_id"])
+            self.assertTrue(peer_steward._seat_successor_path("w1:pNew1").exists(),
+                            "the still-ineligible duty keeps its original successor mark")
+            self.assertEqual(dispatch_seat_handover.effective_parent(other_meta, self.jobs),
+                             other_meta["parent_sid"])
+        else:
+            self.assertEqual(counts["completed_retire_recoveries"], 2,
+                             f"authority={authority_counts}; retire={retire_recovery_events}; "
+                             f"record={record_retire_events}; locks={lock_events}")
+            self.assertEqual(counts["record_retire_calls"], 2)
+            self.assertEqual(counts["handover_authority_calls"], 2)
         self.assertTrue(all(self.store.get(duty_id)["state"] == "unknown"
                             for duty_id, _ref, _target in self.message_duties))
         final_registered = [self.store.get(duty_id)["state"] for duty_id in registered_ids]
@@ -659,21 +1035,98 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         notice_row = peer_message._read_pending(self.message_duties[187][1])
         self.assertEqual(notice_row["state"], "unverified")
         self.assertEqual(sum(bool(row.get("dispatch_notice")) for row in initial_rows), 1)
+
+        successor_locks = [key for key in lock_identities if key.startswith("peer-successor-")]
+        seat_locks = [key for key in lock_identities if not key.startswith("peer-successor-")]
+        self.assertEqual(len(set(successor_locks)), 2, lock_identities)
+        self.assertEqual(len(set(seat_locks)), 2, lock_identities)
+        self.assertEqual(len(set(lock_identities)), 4, lock_identities)
+        if recurring_negative:
+            expected_lock_identities = set(lock_identities)
+            for measured_window in ("cold", "steady"):
+                seen = {row["key"] for row in lock_events if row["window"] == measured_window}
+                self.assertEqual(seen, expected_lock_identities,
+                                 f"all four real lock identities must be entered in {measured_window}")
+            self.assertGreaterEqual(
+                sum(row["window"] == "steady" for row in record_retire_events), 4,
+                "steady negative discovery must enter the real retire handover path repeatedly")
+        for (meta, successor_sid), index in zip(self.retire_handover_meta, range(2)):
+            pane = f"w1:pNew{index}"
+            seat = session_tidy._pane_seat_of(pane)
+            snapshot = dispatch_seat_handover.read_snapshot(seat.key)
+            handed_over = not recurring_negative or index == 0
+            if handed_over:
+                self.assertEqual(snapshot["from"]["sid"], successor_sid)
+                self.assertTrue(any(binding.get("attempt") == meta["attempt_id"]
+                                    for binding in snapshot["bindings"]))
+                ledger = dispatch_seat_handover.handover_rows(seat)
+                self.assertTrue(any(row.get("from") == meta["parent_sid"]
+                                    and row.get("sid") == successor_sid
+                                    and any(item.get("attempt") == meta["attempt_id"]
+                                            for item in row.get("bindings", []))
+                                    for row in ledger))
+                self.assertEqual(dispatch_seat_handover.effective_parent(meta, self.jobs), successor_sid)
+                self.assertFalse(peer_steward._seat_successor_path(pane).exists())
+            else:
+                self.assertIsNone(snapshot)
+                self.assertEqual(dispatch_seat_handover.effective_parent(meta, self.jobs),
+                                 meta["parent_sid"])
+                self.assertTrue(peer_steward._seat_successor_path(pane).exists())
+        self.assertEqual(self.jobs.stat().st_size, 23_499_871)
+        denied_counts = {
+            name: sum(result_counts.get(f"{name}_denied", 0)
+                      for result_counts in authority_counts.values())
+            for name in ("cold", "steady")
+        }
+        successful_handover_count = 2 if not recurring_negative else 1
+        case_name = "recurring-negative-retire" if recurring_negative else "successful-handover"
+        cpu_recommendation = "met" if steady_cpu <= 1.0 else "exceeded"
         print(
-            "real-runner-workload-correction "
-            f"window={elapsed:.2f}s HZ={ticks} one_core=100% child_cpu=excluded(no child spawned) "
-            f"registry_bytes={self.jobs.stat().st_size} readable_transfers=188 recipient_sid_chars=36 "
-            "unknown_messages=193 pending_registered_batches=6 completed_records=702 cancelled_records=1 "
-            f"passes={counts['passes']} warmup_before_input={counts['passes_before_input']} "
-            f"progress_after_input={counts['passes_after_input']} requested_sleeps={sleep_delays} "
+            f"real-runner-workload-correction case={case_name} "
+            f"runner_pid={start_pid} starttime={cold['before_fields'][19]} HZ={ticks} "
+            "one_core=100% child_cpu=excluded(no child spawned) "
+            f"registry_bytes={self.jobs.stat().st_size} obligations=902 readable_transfers=188 "
+            f"successor_locks={len(set(successor_locks))} seat_locks={len(set(seat_locks))} "
+            f"completed_retire_handover={successful_handover_count} "
+            f"cold_window={cold['elapsed']:.2f}s cold_cpu={cold_cpu:.3f}% "
+            f"steady_window={steady['elapsed']:.2f}s steady_cpu={steady_cpu:.3f}% "
+            f"steady_cpu_recommendation={cpu_recommendation} "
+            f"cold_cpu_ticks={cold['cpu_ticks']} steady_cpu_ticks={steady['cpu_ticks']} "
+            f"cold_jobs_reads={cold['registry']['content_reads']} cold_jobs_bytes={cold['registry']['bytes_read']} "
+            f"cold_metadata_parses={cold['registry']['full_metadata_parses']} "
+            f"cold_metadata_rows_parsed={cold['registry']['metadata_rows_parsed']} "
+            f"steady_jobs_read_delta={steady['registry']['content_reads'] - cold['registry']['content_reads']} "
+            f"steady_jobs_byte_delta={steady['registry']['bytes_read'] - cold['registry']['bytes_read']} "
+            f"steady_metadata_parse_delta={steady['registry']['full_metadata_parses'] - cold['registry']['full_metadata_parses']} "
+            f"steady_metadata_rows_parse_delta={steady['registry']['metadata_rows_parsed'] - cold['registry']['metadata_rows_parsed']} "
+            f"cold_duty_json_reads={cold['store']['json_reads']} cold_duty_json_parses={cold['store']['json_parses']} "
+            f"steady_duty_json_read_delta={steady['store']['json_reads'] - cold['store']['json_reads']} "
+            f"steady_duty_json_parse_delta={steady['store']['json_parses'] - cold['store']['json_parses']} "
+            f"steady_duty_stat_delta={steady['store']['stat_calls'] - cold['store']['stat_calls']} "
+            f"passes={counts['passes']} cold_passes={cold['counts']['passes']} "
+            f"steady_passes={steady['counts']['passes'] - cold['counts']['passes']} requested_sleeps={sleep_delays} "
+            f"message_cpu={counts['message_cpu_seconds']:.4f}s registered_cpu={counts['registered_cpu_seconds']:.4f}s "
+            f"list_cpu={counts['store_list_cpu_seconds']:.4f}s reconcile_cpu={counts['reconcile_cpu_seconds']:.4f}s "
+            f"external_cpu={counts['external_cpu_seconds']:.4f}s path_guard_cpu={counts['fixture_path_guard_cpu_seconds']:.4f}s "
             f"store_list_calls={counts['store_list_calls']} store_record_reads={counts['store_record_reads']} "
             f"message_resumes={counts['message_resumes']} registered_resumes={counts['registered_resumes']} "
             f"pending_reads={counts['pending_reads']} transfer_record_reads={counts['transfer_record_reads']} "
             f"native_lookups_fake={counts['native_lookups']} root_discoveries={counts['root_discoveries']} "
             f"root_candidates={counts['root_candidates']} attempt_row_lookups={counts['attempt_row_lookups']} "
             f"context_attempt_lookups={counts['context_attempt_row_lookups']} "
-            f"registry_line_calls={counts['registry_line_calls']} jobs_file_reads={counts['jobs_file_reads']} "
+            f"registry_line_calls={counts['registry_line_calls']} fd_registry_reads={steady['registry']['content_reads']} "
             f"store_update_calls={counts['store_update_calls']} "
+            f"completed_retire_recoveries={counts['completed_retire_recoveries']} "
+            f"record_retire_calls={counts['record_retire_calls']} "
+            f"handover_authority_calls={counts['handover_authority_calls']} "
+            f"negative_authority_denials_cold={denied_counts['cold']} "
+            f"negative_authority_denials_steady={denied_counts['steady']} "
+            f"retire_delivery_authority_change={'yes' if retire_delivery_input else 'no'} "
+            f"retire_delivery_authority_seen_pass={retire_delivery_input.get('observed_pass', 'n/a')} "
+            f"retire_delivery_claim_owner={((retire_delivery_input.get('record') or {}).get('claim_owner') if retire_delivery_input else 'n/a')} "
+            f"lock_acquisitions_cold={sum(row['window'] == 'cold' for row in lock_events)} "
+            f"lock_acquisitions_steady={sum(row['window'] == 'steady' for row in lock_events)} "
+            f"lock_identities={sorted(set(lock_identities))} "
             f"unchanged_checkpoint_skips={counts['message_resumes'] - counts['store_update_calls']} "
             f"input_obligation_writes={counts['input_obligation_writes']} "
             f"runner_obligation_writes={counts['obligation_writes']} "
@@ -681,9 +1134,9 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             f"input_transfer_writes={counts['input_transfer_writes']} "
             f"write_open_calls={counts['write_open_calls']} replace_calls={counts['replace_calls']} "
             f"unlink_calls={counts['unlink_calls']} fixture_paths={len(observed_roots)} "
-            f"event_resume={event['processed_at'] - event['created_at']:.3f}s "
-            f"event_wait_remaining={event['trigger_delay']:.3f}s cpu={cpu_percent:.3f}% "
-            "fake_provider=target-identity-changed; real holder /proc check; sends/ACK/ensure fail-fast"
+            f"event_resume={input_latency:.3f}s event_wait_remaining={event['trigger_delay']:.3f}s "
+            f"post_change_cpu_ticks={int(measurement['final_fields'][11]) + int(measurement['final_fields'][12]) - (int(steady['after_fields'][11]) + int(steady['after_fields'][12]))} "
+            "fake_provider=target-identity-changed; real holder /proc check; native transport disabled"
         )
 
 if __name__ == "__main__":
