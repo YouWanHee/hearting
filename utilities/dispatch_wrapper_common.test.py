@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,17 @@ def load(harness: str):
 
 
 class WrapperCommonTest(unittest.TestCase):
+    def make_release(self, root: Path):
+        root.mkdir(parents=True)
+        (root / ".hearting-release.json").write_text(
+            '{"schema":1,"version":"fixture"}\n', encoding="utf-8"
+        )
+        for harness in ("claude", "codex", "opencode"):
+            target = root / "adapters" / harness / "bin" / "dispatch-headless.py"
+            target.parent.mkdir(parents=True)
+            source = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
     def test_every_wrapper_keeps_the_old_names_as_the_shared_functions(self):
         for harness in ("claude", "codex", "opencode"):
             wrapper = load(harness)
@@ -74,6 +86,120 @@ class WrapperCommonTest(unittest.TestCase):
                 with mock.patch.object(C, "bind_internal_eligibility_probe") as probe:
                     wrapper.bind_internal_eligibility_probe(args)
                 probe.assert_called_once_with(args, harness)
+
+    def test_reexecs_between_sibling_releases_in_both_directions_for_each_harness(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            releases = Path(tmp) / "releases"
+            releases.mkdir()
+            release_a = releases / "vA"
+            release_b = releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            argv = ["--start", "--slug", "space preserving value"]
+            with mock.patch.dict(os.environ, {"AGENT_HOME": "/ambient/home"}, clear=False), \
+                 mock.patch.object(C.os, "execv") as execv:
+                for harness in ("claude", "codex", "opencode"):
+                    for source, sealed in ((release_a, release_b), (release_b, release_a)):
+                        with self.subTest(harness=harness, source=source.name, sealed=sealed.name):
+                            self.assertTrue(C.reexec_for_sealed_release(
+                                source, sealed, harness, argv
+                            ))
+                            self.assertEqual(os.environ["AGENT_HOME"], str(sealed.resolve()))
+                            self.assertEqual(
+                                execv.call_args,
+                                mock.call(sys.executable, [
+                                    sys.executable,
+                                    str(sealed / "adapters" / harness / "bin" / "dispatch-headless.py"),
+                                    *argv,
+                                ]),
+                            )
+                self.assertEqual(execv.call_count, 6)
+
+    def test_reexec_skips_same_root_checkouts_other_installs_missing_markers_and_targets(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases = root / "managed" / "releases"
+            releases.mkdir(parents=True)
+            release_a = releases / "vA"
+            release_b = releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            other_releases = root / "other" / "releases"
+            other_releases.mkdir(parents=True)
+            other = other_releases / "vC"
+            self.make_release(other)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            with mock.patch.object(C.os, "execv") as execv:
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_a, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(checkout, release_b, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(release_a, other, "codex", []))
+                marker = release_a / ".hearting-release.json"
+                marker.unlink()
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "codex", []))
+                marker.write_text('{"schema":1}\n', encoding="utf-8")
+                (release_b / "adapters" / "codex" / "bin" / "dispatch-headless.py").unlink()
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "codex", []))
+                self.assertFalse(C.reexec_for_sealed_release(release_a, release_b, "invalid", []))
+                execv.assert_not_called()
+
+    def test_real_execv_reaches_the_sealed_sibling_release_for_each_harness(self):
+        import subprocess
+
+        wrapper_template = """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+from dispatch_wrapper_common import reexec_for_sealed_release
+root = Path(__file__).resolve().parents[3]
+sealed = Path(os.environ["SEALED_LAUNCH_HOME"])
+reexec_for_sealed_release(root, sealed, "{harness}", sys.argv[1:])
+Path(os.environ["REEXEC_RECEIPT"]).write_text(json.dumps({{
+    "root": str(root), "agent_home": os.environ.get("AGENT_HOME"),
+    "argv": sys.argv[1:], "pid": os.getpid(),
+}}), encoding="utf-8")
+"""
+        argv = ["--slug", "argument with spaces", "--start"]
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            releases = temp_root / "managed" / "releases"
+            releases.mkdir(parents=True)
+            release_a, release_b = releases / "vA", releases / "vB"
+            self.make_release(release_a)
+            self.make_release(release_b)
+            for harness in ("claude", "codex", "opencode"):
+                for release in (release_a, release_b):
+                    wrapper = release / "adapters" / harness / "bin" / "dispatch-headless.py"
+                    wrapper.write_text(wrapper_template.format(harness=harness), encoding="utf-8")
+                for source, sealed in ((release_a, release_b), (release_b, release_a)):
+                    with self.subTest(harness=harness, source=source.name, sealed=sealed.name):
+                        receipt = temp_root / f"receipt-{harness}-{source.name}-{sealed.name}.json"
+                        env = {
+                            "PATH": os.environ.get("PATH", ""),
+                            "HOME": str(temp_root / "home"),
+                            "PYTHONPATH": str(ROOT / "utilities"),
+                            "AGENT_HOME": str(source),
+                            "SEALED_LAUNCH_HOME": str(sealed),
+                            "REEXEC_RECEIPT": str(receipt),
+                        }
+                        process = subprocess.Popen(
+                            [sys.executable, str(source / "adapters" / harness / "bin" /
+                                               "dispatch-headless.py"), *argv],
+                            cwd=str(ROOT), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                        )
+                        stdout, stderr = process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 0, stdout + stderr)
+                        payload = json.loads(receipt.read_text(encoding="utf-8"))
+                        self.assertEqual(payload["root"], str(sealed.resolve()))
+                        self.assertEqual(payload["agent_home"], str(sealed.resolve()))
+                        self.assertEqual(payload["argv"], argv)
+                        self.assertEqual(payload["pid"], process.pid)
 
     def test_owner_input_opens_only_for_a_supervised_owner(self):
         from unittest import mock

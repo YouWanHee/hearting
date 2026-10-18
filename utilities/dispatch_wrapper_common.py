@@ -50,6 +50,43 @@ from route_authority import scan_anchored_death
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def reexec_for_sealed_release(wrapper_root: Path, sealed_home: Path, harness: str,
+                              argv: list[str]) -> bool:
+    """Re-run this wrapper from a sibling managed release matching its sealed home."""
+    if harness not in {"claude", "codex", "opencode"}:
+        return False
+    try:
+        wrapper_root = Path(wrapper_root).resolve(strict=True)
+        sealed_root = Path(sealed_home).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    if wrapper_root == sealed_root or wrapper_root.parent != sealed_root.parent:
+        return False
+    releases_root = wrapper_root.parent
+    if releases_root.name != "releases" or not releases_root.is_dir():
+        return False
+
+    for release in (wrapper_root, sealed_root):
+        marker = release / ".hearting-release.json"
+        if marker.is_symlink() or not marker.is_file():
+            return False
+
+    target = sealed_root / "adapters" / harness / "bin" / "dispatch-headless.py"
+    try:
+        target = target.resolve(strict=True)
+        if not target.is_relative_to(sealed_root) or not target.is_file():
+            return False
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+    # The next wrapper resolves AGENT_HOME to this same real root and therefore
+    # passes the sibling check once. Keep argv as tokens and preserve the
+    # interpreter's normal descriptor, signal, and exit behavior through exec.
+    os.environ["AGENT_HOME"] = str(sealed_root)
+    os.execv(sys.executable, [sys.executable, str(target), *argv])
+    return True
+
+
 def fail(reason: str, code: int, **fields: str) -> int:
     print("check=failed")
     print(f"reason={reason}")
