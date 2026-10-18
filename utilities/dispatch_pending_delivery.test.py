@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -419,6 +420,75 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
                                  lease_seconds=30, retry_context="target-b",
                                  retry_base_delay_seconds=0.05)
         self.assertEqual(recovered["courier_retry"]["failure_count"], 0)
+
+    def test_sealed_base_reader_accepts_new_writer_failed_obligation_and_consumes_it(self):
+        sealed = "48c08f3231f35c9ef24731ccda5070b6d744c48e"
+        source = subprocess.run(
+            ["git", "show", f"{sealed}:utilities/dispatch_pending_delivery.py"],
+            cwd=HERE.parent, check=True, capture_output=True, text=True,
+        ).stdout
+        old_path = Path(self._tmp.name) / "sealed_base_dispatch_pending_delivery.py"
+        old_path.write_text(source, encoding="utf-8")
+        name = "sealed_base_dispatch_pending_delivery_fixture"
+        spec = importlib.util.spec_from_file_location(name, old_path)
+        old = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[name] = old
+        self.addCleanup(lambda: sys.modules.pop(name, None))
+        spec.loader.exec_module(old)
+
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="new-writer",
+                     lease_seconds=30, retry_context="recipient:generation:target")
+            released = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="new-writer",
+                failure_reason="transport-timeout", retry_base_delay_seconds=2,
+            )
+        self.assertEqual(released["state"], "pending")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("courier_retry", raw)
+        self.assertTrue(PD.courier_retry_path(path).is_file())
+        self.assertEqual(old._validate_record(raw)["state"], "pending")
+
+        # Exercise the actual sealed-base read/claim/consume implementation.
+        self.assertEqual(old.read(self.root, "sess-claim", did)["state"], "pending")
+        old.claim(self.root, "sess-claim", did, claim_owner="old-reader", lease_seconds=30)
+        consumed = old.ack(self.root, "sess-claim", did, acked_by="old-recipient-consumed")
+        self.assertEqual(consumed["state"], "acked")
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], "acked")
+
+    def test_retry_sidecar_survives_record_write_failure_without_acknowledging(self):
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="carrier", lease_seconds=30,
+                     retry_context="stable-target")
+
+        real_replace = PD.os.replace
+
+        def fail_record_replace(source, destination):
+            if Path(destination) == path:
+                raise OSError("simulated record CAS write failure")
+            return real_replace(source, destination)
+
+        with unittest.mock.patch.object(PD.os, "replace", side_effect=fail_record_replace):
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.release_claim(
+                    self.root, "sess-claim", did, claim_owner="carrier",
+                    failure_reason="transport-timeout", retry_base_delay_seconds=2,
+                )
+
+        record = PD.read(self.root, "sess-claim", did)
+        self.assertEqual(record["state"], "claimed")
+        self.assertEqual(record["claim_owner"], "carrier")
+        metadata = json.loads(PD.courier_retry_path(path).read_text(encoding="utf-8"))
+        self.assertEqual(metadata["retry"]["failure_count"], 1)
+        self.assertGreater(metadata["retry"]["next_attempt_at_ns"], now)
+        self.assertNotEqual(record["state"], "acked")
 
 
     def test_first_claim_succeeds_second_is_refused(self):

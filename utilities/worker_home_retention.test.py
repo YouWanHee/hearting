@@ -1412,6 +1412,89 @@ class Races(Fixture):
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
 
+    def test_final_boundary_catches_candidate_file_added_to_existing_unrelated_group(self):
+        home = self.add("att-final-existing-group")
+        group = self.root / "pending-delivery" / ("a" * 64)
+        self.delivery_record(group / ("delivery-" + "1" * 32 + ".json"),
+                             "att-unrelated", "att-parent", state="acked")
+        self.sweep(0)
+
+        broad_done, written = threading.Event(), threading.Event()
+        errors = []
+        def writer():
+            if not broad_done.wait(5):
+                errors.append("broad comparison barrier timed out")
+                written.set()
+                return
+            try:
+                self.delivery_record(group / ("delivery-" + "2" * 32 + ".json"),
+                                     "att-final-existing-group", "att-parent", state="pending")
+            except Exception as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                written.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        broad = R._late_delivery_change
+        def broad_then_barrier(ctx, attempt, deadline):
+            result = broad(ctx, attempt, deadline)
+            broad_done.set()
+            if not written.wait(5):
+                raise AssertionError("late delivery writer did not reach the pre-admission barrier")
+            return result
+        try:
+            with mock.patch.object(R, "_late_delivery_change", broad_then_barrier):
+                result = self.sweep(8)
+        finally:
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
+        self.assertTrue(home.is_dir())
+
+    def test_final_rename_boundary_catches_parent_reference_rewrite_in_known_group(self):
+        home = self.add("att-final-parent-rewrite")
+        record = self.root / "pending-delivery" / ("b" * 64) / ("delivery-" + "3" * 32 + ".json")
+        value = self.delivery_record(record, "att-unrelated", "att-parent", state="acked")
+        self.sweep(0)
+
+        admitted, written = threading.Event(), threading.Event()
+        errors = []
+        def writer():
+            if not admitted.wait(5):
+                errors.append("final admission barrier timed out")
+                written.set()
+                return
+            try:
+                record.write_text(json.dumps({
+                    **value, "parent_attempt_id": "att-final-parent-rewrite", "state": "pending",
+                }), encoding="utf-8")
+            except Exception as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                written.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        final_check = R._late_candidate_delivery_change
+        def final_barrier(ctx, attempt, deadline):
+            admitted.set()
+            if not written.wait(5):
+                raise AssertionError("parent-reference writer did not reach the pre-rename barrier")
+            return final_check(ctx, attempt, deadline)
+        try:
+            with mock.patch.object(R, "_late_candidate_delivery_change", final_barrier):
+                result = self.sweep(8)
+        finally:
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
+        self.assertTrue(home.is_dir())
+
     def test_resolver_upgrade_preserves_the_first_identity(self):
         for through_child in (False, True):
             with self.subTest(through_child=through_child):

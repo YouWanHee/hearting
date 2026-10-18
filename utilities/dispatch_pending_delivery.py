@@ -32,7 +32,7 @@ carrier wiring withholds it for token-less recipients. The separate
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -119,6 +119,7 @@ COURIER_RETRY_FIELDS = frozenset({
 })
 COURIER_RETRY_SCHEMA = 1
 COURIER_RETRY_MAX_SECONDS = 15.0
+COURIER_RETRY_SUFFIX = ".courier-retry"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
@@ -144,6 +145,40 @@ def record_path(root: Path, recipient_key: str, delivery_id: str) -> Path:
     if not delivery_id or not delivery_id.startswith("delivery-"):
         raise PendingDeliveryError("pending-delivery-identity-conflict", "delivery_id")
     return record_directory(root, recipient_key) / f"{delivery_id}.json"
+
+
+def courier_retry_path(path: Path) -> Path:
+    """The retry metadata is invisible to readers scanning ``delivery-*.json``."""
+
+    return Path(path).with_name(Path(path).name + COURIER_RETRY_SUFFIX)
+
+
+def _validate_courier_retry(retry: object) -> dict:
+    if (not isinstance(retry, dict) or set(retry) != COURIER_RETRY_FIELDS
+            or retry.get("schema_version") != COURIER_RETRY_SCHEMA
+            or not isinstance(retry.get("context_digest"), str)
+            or (retry["context_digest"] and not _SHA256_RE.fullmatch(retry["context_digest"]))
+            or not isinstance(retry.get("failure_digest"), str)
+            or (retry["failure_digest"] and not _SHA256_RE.fullmatch(retry["failure_digest"]))
+            or any(type(retry.get(name)) is not int for name in (
+                "failure_count", "last_failure_at_ns", "next_attempt_at_ns",
+                "delay_ns", "base_delay_ns"))
+            or retry["failure_count"] < 0
+            or retry["last_failure_at_ns"] < 0
+            or retry["next_attempt_at_ns"] < 0
+            or retry["delay_ns"] < 0
+            or not (1 <= retry["base_delay_ns"] <= int(COURIER_RETRY_MAX_SECONDS * 1e9))
+            or (retry["failure_count"] == 0 and any((
+                retry["failure_digest"], retry["last_failure_at_ns"],
+                retry["next_attempt_at_ns"], retry["delay_ns"])))
+            or (retry["failure_count"] > 0 and (
+                not retry["failure_digest"] or retry["last_failure_at_ns"] < 1
+                or retry["next_attempt_at_ns"] < retry["last_failure_at_ns"]
+                or retry["delay_ns"] < 1
+                or retry["next_attempt_at_ns"] - retry["last_failure_at_ns"]
+                != retry["delay_ns"]))):
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-invalid")
+    return retry
 
 
 def _validate_record(value: object) -> dict:
@@ -173,31 +208,7 @@ def _validate_record(value: object) -> dict:
     if not isinstance(value.get("attempts"), int):
         raise PendingDeliveryError("delivery-persistence-refused", "attempts-invalid")
     if COURIER_RETRY_FIELD in value:
-        retry = value[COURIER_RETRY_FIELD]
-        if (not isinstance(retry, dict) or set(retry) != COURIER_RETRY_FIELDS
-                or retry.get("schema_version") != COURIER_RETRY_SCHEMA
-                or not isinstance(retry.get("context_digest"), str)
-                or (retry["context_digest"] and not _SHA256_RE.fullmatch(retry["context_digest"]))
-                or not isinstance(retry.get("failure_digest"), str)
-                or (retry["failure_digest"] and not _SHA256_RE.fullmatch(retry["failure_digest"]))
-                or any(type(retry.get(name)) is not int for name in (
-                    "failure_count", "last_failure_at_ns", "next_attempt_at_ns",
-                    "delay_ns", "base_delay_ns"))
-                or retry["failure_count"] < 0
-                or retry["last_failure_at_ns"] < 0
-                or retry["next_attempt_at_ns"] < 0
-                or retry["delay_ns"] < 0
-                or not (1 <= retry["base_delay_ns"] <= int(COURIER_RETRY_MAX_SECONDS * 1e9))
-                or (retry["failure_count"] == 0 and any((
-                    retry["failure_digest"], retry["last_failure_at_ns"],
-                    retry["next_attempt_at_ns"], retry["delay_ns"])))
-                or (retry["failure_count"] > 0 and (
-                    not retry["failure_digest"] or retry["last_failure_at_ns"] < 1
-                    or retry["next_attempt_at_ns"] < retry["last_failure_at_ns"]
-                    or retry["delay_ns"] < 1
-                    or retry["next_attempt_at_ns"] - retry["last_failure_at_ns"]
-                    != retry["delay_ns"]))):
-            raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-invalid")
+        _validate_courier_retry(value[COURIER_RETRY_FIELD])
     if (
         value.get("state") in {"claimed", "sent-ambiguous", "acked"}
         and value.get("claim_authority") not in CLAIM_AUTHORITIES
@@ -269,9 +280,41 @@ def _read_unlocked(path: Path) -> dict | None:
     return _validate_record(value)
 
 
-def _write_unlocked(path: Path, record: dict) -> None:
-    _validate_record(record)
-    encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode("utf-8")
+def _courier_retry_identity_digest(record: dict) -> str:
+    identity = {key: record.get(key) for key in IMMUTABLE_FIELDS}
+    encoded = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
+    """Read retry state bound to this record; legacy inline state is migrated on write."""
+
+    metadata_path = courier_retry_path(path)
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        legacy = record.get(COURIER_RETRY_FIELD)
+        return _validate_courier_retry(legacy) if legacy is not None else None
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    try:
+        metadata = json.loads(raw)
+    except ValueError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-corrupt") from exc
+    if (not isinstance(metadata, dict)
+            or set(metadata) != {
+                "schema_version", "delivery_id", "recipient_digest", "identity_digest", "retry",
+            }
+            or metadata.get("schema_version") != COURIER_RETRY_SCHEMA
+            or metadata.get("delivery_id") != record.get("delivery_id")
+            or metadata.get("recipient_digest") != record.get("recipient_digest")
+            or metadata.get("identity_digest") != _courier_retry_identity_digest(record)):
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-identity-invalid")
+    return _validate_courier_retry(metadata["retry"])
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -287,6 +330,32 @@ def _write_unlocked(path: Path, record: dict) -> None:
         except OSError:
             pass
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+
+
+def _write_courier_retry_unlocked(path: Path, record: dict, retry: dict) -> None:
+    _validate_courier_retry(retry)
+    _atomic_write_json(courier_retry_path(path), {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "delivery_id": record["delivery_id"],
+        "recipient_digest": record["recipient_digest"],
+        "identity_digest": _courier_retry_identity_digest(record),
+        "retry": retry,
+    })
+
+
+def _write_unlocked(path: Path, record: dict) -> None:
+    """Persist retry metadata first, then write the legacy-compatible record CAS."""
+
+    _validate_record(record)
+    persisted = dict(record)
+    retry = persisted.pop(COURIER_RETRY_FIELD, None)
+    if retry is not None:
+        _write_courier_retry_unlocked(path, record, retry)
+    _validate_record(persisted)
+    _atomic_write_json(path, persisted)
+    if persisted.get("state") in TERMINAL_STATES:
+        with suppress(OSError):
+            courier_retry_path(path).unlink()
 
 
 def _retry_context_digest(context: str | None) -> str | None:
@@ -349,7 +418,14 @@ def _advance_courier_retry(retry: dict, failure_reason: str, now_ns: int,
 def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
     """Unlocked observer read -- fleet/P6 visibility, never a transition."""
 
-    return _read_unlocked(record_path(root, recipient_key, delivery_id))
+    path = record_path(root, recipient_key, delivery_id)
+    value = _read_unlocked(path)
+    if value is None:
+        return None
+    if value.get("state") not in OPEN_STATES:
+        return value
+    retry = _read_courier_retry_unlocked(path, value)
+    return dict(value, **{COURIER_RETRY_FIELD: retry}) if retry is not None else value
 
 
 def create(
@@ -629,7 +705,7 @@ def claim(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
-        retry = value.get(COURIER_RETRY_FIELD)
+        retry = _read_courier_retry_unlocked(path, value)
         now_wall_ns = time.time_ns()
         if retry is None:
             retry = _new_courier_retry(retry_context_digest or "", retry_base_ns)
@@ -833,7 +909,8 @@ def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_own
         if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
             return value
         updated = dict(value)
-        retry = value.get(COURIER_RETRY_FIELD) or _new_courier_retry()
+        retry = (_read_courier_retry_unlocked(path, value)
+                 or _new_courier_retry())
         base_delay_ns = (retry["base_delay_ns"] if retry_base_delay_seconds is None
                          else _delay_ns(retry_base_delay_seconds))
         failure = failure_reason or ("sent-ambiguous" if value.get("state") == "sent-ambiguous"
@@ -1082,6 +1159,10 @@ def prune(
                     # process just created must not become a new orphan
                     # (review round 1, minor 2).
                     try:
+                        courier_retry_path(path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    try:
                         lock_path.unlink()
                     except FileNotFoundError:
                         pass
@@ -1095,6 +1176,10 @@ def prune(
                     continue
                 _write_prune_tombstone(path, value)
                 path.unlink()
+                try:
+                    courier_retry_path(path).unlink()
+                except FileNotFoundError:
+                    pass
                 try:
                     lock_path.unlink()
                 except FileNotFoundError:

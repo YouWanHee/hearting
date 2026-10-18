@@ -249,6 +249,21 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         kwargs.update(overrides)
         return PD.create(**kwargs)
 
+    def _release_via_cli(self, record, *, session_id="sess-owner"):
+        item = {
+            "root": str(self.root),
+            "storage_key": record.get(SWEEP.STORAGE_KEY) or session_id,
+            "delivery_id": record["delivery_id"],
+            "claim_owner": record["claim_owner"],
+        }
+        output = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"records": [item]}))), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SWEEP.main([
+                "release", "--recipient-kind", "claude-parent-runtime", "--session", session_id,
+            ]), 0)
+        return json.loads(output.getvalue())
+
     def test_empty_terminal_registry_uses_only_the_resolved_carrier_jobs_path(self):
         self.root.mkdir(parents=True, exist_ok=True)
         jobs=self.root/'jobs.log';jobs.touch()
@@ -282,6 +297,68 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(again, [])
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
+
+    def test_deliver_retry_wait_survives_normal_release_and_new_recipient_progresses(self):
+        self._seed(session_generation_supported="1")
+        delivery_id = "delivery-" + "a" * 32
+        now = time.time_ns()
+        with mock.patch.object(PD.time, "time_ns", return_value=now):
+            first, _ = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-owner")
+            self.assertEqual(len(first), 1)
+            self.assertEqual(self._release_via_cli(first[0])["count"], 1)
+        retry_path = PD.courier_retry_path(
+            PD.record_path(self.root, "sess-owner", delivery_id))
+        retry = json.loads(retry_path.read_text(encoding="utf-8"))["retry"]
+
+        # Recalling the same recipient before its stored deadline cannot claim or emit again.
+        with mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] - 1):
+            repeated, _ = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-owner")
+        self.assertEqual(repeated, [])
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["attempts"], 1)
+
+        # A verified seat handover changes the actual recipient while keeping the same stored obligation.
+        import dispatch_seat_handover as handover
+        bound = frozenset({"att-0000000000000000000000000000bbbb"})
+        with mock.patch.object(handover, "storage_recipients",
+                               return_value=[("sess-owner", bound)]), \
+                mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] - 1):
+            handed, _ = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-new")
+        self.assertEqual(len(handed), 1)
+        self.assertEqual(SWEEP.ack_delivered(
+            self.root, "sess-new", handed, acked_by="new-recipient-consumed"), 1)
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["state"], "acked")
+
+    def test_probe_retry_wait_survives_normal_release_recall_and_ack(self):
+        self._seed(session_generation_supported="1")
+        delivery_id = "delivery-" + "a" * 32
+        now = time.time_ns()
+        with mock.patch.object(PD.time, "time_ns", return_value=now):
+            outcome, count = SWEEP.sweep(
+                self.root, "claude-parent-runtime", "sess-owner", "generation-proof")
+            self.assertEqual((outcome, count), ("claimed", 1))
+            first = PD.read(self.root, "sess-owner", delivery_id)
+            self.assertEqual(self._release_via_cli(first)["count"], 1)
+        retry = json.loads(PD.courier_retry_path(
+            PD.record_path(self.root, "sess-owner", delivery_id)
+        ).read_text(encoding="utf-8"))["retry"]
+
+        with mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] - 1):
+            outcome, count = SWEEP.sweep(
+                self.root, "claude-parent-runtime", "sess-owner", "generation-proof")
+        self.assertEqual((outcome, count), ("refused", 1))
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["attempts"], 1)
+
+        with mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] + 1):
+            outcome, count = SWEEP.sweep(
+                self.root, "claude-parent-runtime", "sess-owner", "generation-proof")
+        self.assertEqual((outcome, count), ("claimed", 1))
+        claimed = PD.read(self.root, "sess-owner", delivery_id)
+        self.assertEqual(SWEEP.ack_delivered(
+            self.root, "sess-owner", [claimed], acked_by="probe-recipient-consumed"), 1)
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["state"], "acked")
 
     def test_deliver_reclaims_sent_ambiguous_record_only_after_lease_expiry(self):
         # The async rewake carrier leaves a record sent-ambiguous; a lost wake
