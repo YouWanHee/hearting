@@ -37,6 +37,7 @@ def _load(name: str, path: Path):
 
 PD = _load("dispatch_pending_delivery", HERE / "dispatch_pending_delivery.py")
 SWEEP = _load("dispatch_session_sweep", HERE / "dispatch_session_sweep.py")
+import dispatch_batch_obligations as OBLIGATIONS  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -908,6 +909,57 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
         reconcile.assert_called_once_with(jobs)
         ensure.assert_called_once_with()
+
+    def test_canonical_activation_continues_past_unreadable_registry(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        args = SimpleNamespace(
+            jobs=jobs, sealed_batch_id="batch-activation", parent_attempt_id="att-parent",
+            parent_session_id=None, attempt_id=["att-sidecar"],
+            delivery_parent_id="att-parent", control_socket=self.root / "control.sock",
+            queue_socket=None, thread_id=None, interval=0.1, timeout=1.0,
+        )
+        duty_id, _record = OBLIGATIONS.create(args)
+        unreadable = b"\xffactivation-registry\n"
+        jobs.write_bytes(unreadable)
+
+        secondary = self.root.parent / "secondary-dispatch"
+        secondary.mkdir()
+        other_jobs = secondary / "jobs.log"
+        metadata = ",".join((
+            "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
+            "launch_started=1", "supervisor_lease=flock-v1",
+            "supervisor_lease_file=/fixture/owner.lease", "log_file=/fixture/owner.log",
+            "attempt_id=att-activation-owner", "workflow_completion=runtime-v1",
+            "note=completed-supervisor",
+        ))
+        other_jobs.write_text(
+            f"2026-10-18T00:00:00Z\tdone\t/repo\t/wt\towner\t{metadata}\n",
+            encoding="utf-8")
+
+        class Launched:
+            pid = 902343
+
+        service_script = self.root.parent / "release" / "utilities" / "codex-managed-completion.py"
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root, secondary)), \
+             mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
+             mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
+             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch.object(OBLIGATIONS.subprocess, "Popen", return_value=Launched()) as launch:
+            self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
+
+        reconcile.assert_called_once_with(jobs)
+        settle.assert_called_once_with(other_jobs, "att-activation-owner")
+        self.assertEqual(launch.call_count, 1)
+        argv = launch.call_args.args[0]
+        self.assertEqual(argv[argv.index("--jobs") + 1], str(jobs))
+        self.assertIn(duty_id, argv)
+        self.assertEqual(jobs.read_bytes(), unreadable)
 
 
 if __name__ == "__main__":

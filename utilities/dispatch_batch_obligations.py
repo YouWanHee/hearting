@@ -362,7 +362,11 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None) ->
         "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
     for jobs_path in jobs_paths:
-        _resume_owner_settlements(jobs_path)
+        try:
+            _resume_owner_settlements(jobs_path)
+        except (OSError, UnicodeError):
+            # Keep this root's sidecar scan and later independent roots reachable.
+            continue
     for jobs_path in jobs_paths:
         try:
             root = _root(jobs_path)
@@ -523,12 +527,19 @@ def pending_observer_signature(jobs: str | Path | None = None) -> tuple[tuple, .
     """
     signature = []
     for jobs_path in _jobs_paths(jobs, strict=False):
+        unavailable = False
         try:
             owner_settlements = _pending_owner_settlements(jobs_path)
-            records = _read_only_records(jobs_path)
-        except (OSError, BatchObligationError):
+        except (OSError, UnicodeError):
             signature.append((str(jobs_path), "unavailable"))
-            continue
+            unavailable = True
+            owner_settlements = ()
+        try:
+            records = _read_only_records(jobs_path)
+        except (OSError, UnicodeError, BatchObligationError):
+            if not unavailable:
+                signature.append((str(jobs_path), "unavailable"))
+            records = ()
         for _order, status, _raw, meta, lease_held in owner_settlements:
             if not lease_held:
                 signature.append((str(jobs_path), "owner-settlement",

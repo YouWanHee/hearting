@@ -57,14 +57,107 @@ class BatchObligationTest(unittest.TestCase):
         other_jobs = self.base / "other-jobs.log"
         other_jobs.write_text(self._runtime_owner_row("att-second") + "\n", encoding="utf-8")
         self.jobs.write_text(self._runtime_owner_row("att-first") + "\n", encoding="utf-8")
+        service_script = self.base / "release" / "utilities" / "codex-managed-completion.py"
         with mock.patch.object(obligations, "_jobs_paths", return_value=[self.jobs, other_jobs]), \
-             mock.patch("peer_obligations.service_script", return_value=(Path("/unused"), {}, None)), \
+             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
              mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
              mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle:
             self.assertEqual(obligations.ensure_observers(), 0)
         self.assertEqual([call.args for call in settle.call_args_list],
                          [(self.jobs, "att-first"), (other_jobs, "att-second")])
+
+    def test_invalid_registry_does_not_starve_later_settlement_or_sidecars(self):
+        other_root = self.base / "other-registry"
+        other_root.mkdir()
+        other_jobs = other_root / "jobs.log"
+        other_jobs.write_text(
+            self._runtime_owner_row("att-second") + "\n"
+            + self._runtime_owner_row("att-live") + "\n", encoding="utf-8")
+        duty_id, _record = obligations.create(self.args)
+        unknown_args = Namespace(**vars(self.args))
+        unknown_args.sealed_batch_id = "batch-unknown"
+        unknown_args.attempt_id = ["att-unknown"]
+        unknown_id, _unknown = obligations.create(unknown_args)
+        obligations.update(self.jobs, unknown_id, state="unknown",
+                           reason="parent-session-ended")
+        unknown_path = obligations._record_path(self.jobs, unknown_id)
+        unknown_before = unknown_path.read_bytes()
+        unreadable = b"\xffunreadable-registry\n"
+        self.jobs.write_bytes(unreadable)
+
+        class Launched:
+            pid = 902341
+
+        def lease_held(_jobs, metadata):
+            return metadata.get("attempt_id") == "att-live"
+
+        service_script = self.base / "release" / "utilities" / "codex-managed-completion.py"
+        with mock.patch.object(obligations, "_jobs_paths", return_value=[self.jobs, other_jobs]), \
+             mock.patch("peer_obligations.service_script", return_value=(service_script, {}, None)), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", side_effect=lease_held), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch.object(obligations, "_parent_duty_has_recipient", return_value=False), \
+             mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()) as launch:
+            self.assertEqual(obligations.ensure_observers(), 1)
+            signature = obligations.pending_observer_signature()
+            self.assertTrue(obligations.has_unowned_work())
+
+        settle.assert_called_once_with(other_jobs, "att-second")
+        self.assertEqual(launch.call_count, 1)
+        argv = launch.call_args.args[0]
+        self.assertEqual(argv[argv.index("--jobs") + 1], str(self.jobs))
+        self.assertIn(duty_id, argv)
+        self.assertEqual(self.jobs.read_bytes(), unreadable)
+        self.assertEqual(unknown_path.read_bytes(), unknown_before)
+        self.assertIn((str(self.jobs), "unavailable"), signature)
+        self.assertTrue(any(item[:3] == (str(self.jobs), duty_id, "observing")
+                            for item in signature))
+        self.assertTrue(any(item[:3] == (str(self.jobs), unknown_id, "unknown")
+                            for item in signature))
+        self.assertTrue(any(item[:3] == (str(other_jobs), "owner-settlement", "att-second")
+                            for item in signature))
+        self.assertFalse(any(item[:3] == (str(other_jobs), "owner-settlement", "att-live")
+                             for item in signature))
+
+    def test_registry_read_oserror_keeps_liveness_signature_and_later_work(self):
+        other_root = self.base / "other-registry"
+        other_root.mkdir()
+        other_jobs = other_root / "jobs.log"
+        other_jobs.write_text(self._runtime_owner_row("att-readable") + "\n", encoding="utf-8")
+        duty_id, _record = obligations.create(self.args)
+        first_registry_before = self.jobs.read_bytes()
+        read_owner_rows = obligations._pending_owner_settlements
+
+        def fail_first_registry(path):
+            if Path(path) == self.jobs:
+                raise PermissionError("fixture registry read denied")
+            return read_owner_rows(path)
+
+        class Launched:
+            pid = 902342
+
+        with mock.patch.object(obligations, "_jobs_paths", return_value=[self.jobs, other_jobs]), \
+             mock.patch("peer_obligations.service_script", return_value=(Path("/unused"), {}, None)), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch.object(obligations, "_pending_owner_settlements",
+                               side_effect=fail_first_registry), \
+             mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()) as launch:
+            self.assertEqual(obligations.ensure_observers(), 1)
+            signature = obligations.pending_observer_signature()
+            self.assertTrue(obligations.has_unowned_work())
+
+        settle.assert_called_once_with(other_jobs, "att-readable")
+        self.assertEqual(launch.call_count, 1)
+        self.assertIn((str(self.jobs), "unavailable"), signature)
+        self.assertTrue(any(item[:3] == (str(self.jobs), duty_id, "observing")
+                            for item in signature))
+        self.assertTrue(any(item[:3] == (str(other_jobs), "owner-settlement", "att-readable")
+                            for item in signature))
+        self.assertEqual(self.jobs.read_bytes(), first_registry_before)
 
     def test_exact_identity_and_settled_result_are_immutable(self):
         duty_id, record = obligations.create(self.args)
