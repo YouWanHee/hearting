@@ -2882,6 +2882,10 @@ def _release_registry_snapshot(registry_paths: Iterable[Path]) -> list[dict]:
 # docstring).
 _ROUTE_SCAN_MAX_FILES = 20000  # measured 1909 route files across 10 artifact roots
 _ROUTE_RECORD_MAX_BYTES = 1_048_576  # same cap as claude-session-supervisor.py:107
+_ROUTE_CHAIN_MAX_FILES = 4096
+_ROUTE_CHAIN_MAX_BYTES = 1_048_576
+_ROUTE_CHAIN_MAX_TOTAL_BYTES = 16 * 1_048_576
+_ROUTE_CHAIN_HARNESSES = ("claude", "codex", "opencode")
 
 
 class _Undecidable:
@@ -3126,9 +3130,10 @@ def _route_attempts_finished(
     conservative, never release something the sealed registry would have held.
 
     `None` -- no sealed jobs path, unreadable, a malformed row, or **no rows at
-    all** -- keeps the release pinned. Absence of evidence is the one direction
-    that deletes data: a route compiled but not yet launched has no rows, and so
-    does a route whose rows were pruned out from under it.
+    all** -- is not completion evidence. The caller has one separate narrow
+    no-row path for the current direct-inline shape; it also checks all known
+    registries, the session route-chain ledger, and inline-finish state. Every
+    other no-row shape remains pinned.
     """
 
     body_id = raw.get("route_id")
@@ -3155,6 +3160,242 @@ def _route_attempts_finished(
     return True if route_id in index["seen"] else None
 
 
+def _historical_inline_route_shape(route_id: str, raw: dict) -> bool:
+    """Whether this is the one supported no-attempt route shape.
+
+    A missing registry row is ambiguous for every staged or older route. The
+    only shape eligible for a separate no-row check is the current schema's
+    direct one-shot owner: one depth-zero inline terminal node with no worker
+    owner. Its route-chain and finish continuation evidence are checked
+    separately. Keep this mirror exact; a new route shape stays protected until
+    its continuation semantics are represented here.
+    """
+
+    nodes = raw.get("nodes")
+    if not (
+        raw.get("schema_version") == 2
+        and raw.get("route_id") == route_id
+        and raw.get("effective_intensity") == "direct"
+        and raw.get("execution_topology") == "inline"
+        and raw.get("owner_dispatch_depth") == 0
+        and raw.get("max_dispatch_depth") == 0
+        and isinstance(nodes, list)
+        and len(nodes) == 1
+    ):
+        return False
+    node = nodes[0]
+    return bool(
+        isinstance(node, dict)
+        and node.get("id") == "inline"
+        and node.get("kind") == "capability-owner"
+        and node.get("dispatch_depth") == 0
+        and node.get("execution_surface") == "inline"
+        and node.get("registered_worker") is False
+        and node.get("terminal") is True
+        and node.get("completion_gate") == "inline-complete"
+        and node.get("terminal_gate") == "inline-complete"
+    )
+
+
+def _inline_finish_absent(
+    route_file: Path, route_id: str, inventory: dict | None = None,
+) -> bool:
+    """Prove no inline finish slot exists, watching its publication path.
+
+    Any existing slot, including a finished or malformed one, is conservative:
+    without the route's close outcome it may represent a continuation or an
+    interrupted finish transaction. Directory fingerprints catch creation of
+    the slot after discovery.
+    """
+
+    runtime_dir = route_file.parent.parent
+    finish_root = runtime_dir / "inline-finish" / "v1"
+    route_dir = finish_root / route_id
+    finish_file = route_dir / "finish.json"
+    for directory in (runtime_dir, finish_root, route_dir):
+        _watch_discovery_path(inventory, directory, directory=True)
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+    _watch_discovery_path(inventory, finish_file)
+    try:
+        finish_file.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _route_chain_absent(
+    route_id: str, environ: dict[str, str], inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
+) -> bool:
+    """Prove no session route-chain entry can resume this open route.
+
+    Depth-zero compose/start writes an existing per-session route-chain ledger,
+    even when a direct inline route has no dispatch attempt row. Any matching
+    entry therefore keeps the sealed launch home. This reader mirrors only the
+    ledger's stable envelope and remains stdlib-only for the embedded installer.
+    """
+
+    try:
+        explicit = environ.get("FLEET_ROUTE_CHAIN_DIR")
+        if explicit:
+            root = Path(os.path.abspath(os.path.expanduser(explicit)))
+        else:
+            state_home = environ.get("XDG_STATE_HOME")
+            if state_home:
+                root = _env_absolute(state_home, "XDG_STATE_HOME") / "agent-fleet" / "route-chains"
+            else:
+                home = environ.get("HOME")
+                if not home:
+                    return False
+                root = _env_absolute(home, "HOME") / ".local" / "state" / "agent-fleet" / "route-chains"
+    except (DistributionError, OSError, ValueError):
+        return False
+    cache_key = os.path.normcase(os.path.abspath(os.fspath(root)))
+    if route_chain_cache is not None and cache_key in route_chain_cache:
+        route_ids = route_chain_cache[cache_key]
+        return route_ids is not None and route_id not in route_ids
+    _watch_discovery_path(inventory, root, directory=True)
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        if route_chain_cache is not None:
+            route_chain_cache[cache_key] = set()
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(root_info.st_mode):
+        return False
+
+    try:
+        with os.scandir(root) as stream:
+            root_entries = list(stream)
+    except OSError:
+        return False
+    for entry in root_entries:
+        try:
+            unexpected_directory = entry.is_dir(follow_symlinks=False) or entry.is_symlink()
+        except OSError:
+            return False
+        if entry.name not in _ROUTE_CHAIN_HARNESSES and unexpected_directory:
+            return False
+
+    scanned = 0
+    scanned_bytes = 0
+    route_ids: set[str] = set()
+    for harness in _ROUTE_CHAIN_HARNESSES:
+        directory = root / harness
+        _watch_discovery_path(inventory, directory, directory=True)
+        try:
+            directory_info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if not stat.S_ISDIR(directory_info.st_mode):
+            return False
+        try:
+            with os.scandir(directory) as stream:
+                entries = [entry for entry in stream if entry.name.endswith(".jsonl")]
+        except OSError:
+            return False
+        for entry in entries:
+            scanned += 1
+            if scanned > _ROUTE_CHAIN_MAX_FILES or entry.is_symlink():
+                return False
+            path = Path(entry.path)
+            _watch_discovery_path(inventory, path)
+            try:
+                before = path.lstat()
+                if not stat.S_ISREG(before.st_mode) or before.st_size > _ROUTE_CHAIN_MAX_BYTES:
+                    return False
+                with path.open("rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        return False
+                    payload = source.read(_ROUTE_CHAIN_MAX_BYTES + 1)
+                if len(payload) > _ROUTE_CHAIN_MAX_BYTES:
+                    return False
+                payload.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+            scanned_bytes += len(payload)
+            if scanned_bytes > _ROUTE_CHAIN_MAX_TOTAL_BYTES:
+                return False
+            for line in payload.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return False
+                if not isinstance(row, dict):
+                    return False
+                value = row.get("route_id")
+                if isinstance(value, str) and value:
+                    route_ids.add(value)
+    if route_chain_cache is not None:
+        route_chain_cache[cache_key] = route_ids
+    return route_id not in route_ids
+
+
+def _historical_inline_route_unused(
+    path: Path, route_id: str, raw: dict, cache: dict, environ: dict,
+    watched_paths: set[Path] | None = None,
+    inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
+) -> bool:
+    """Is an exact direct route merely historical, with no continuation evidence?"""
+
+    if not _historical_inline_route_shape(route_id, raw):
+        return False
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = tuple_.get("jobs_path") if isinstance(tuple_, dict) else None
+    jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
+    if (
+        not isinstance(tuple_, dict)
+        or tuple_.get("contract_version") != 1
+        or not isinstance(jobs, dict)
+        or jobs.get("kind") != "jobs_path"
+        or not isinstance(jobs_path, str)
+        or not os.path.isabs(jobs_path)
+    ):
+        return False
+    sealed = _read_route_registry_index(jobs_path, cache, watched_paths, inventory)
+    if sealed is None or sealed["malformed"] or route_id in sealed["seen"]:
+        return False
+
+    # A different registry cannot certify completion, but any related row or
+    # unreadable registry can still be evidence of a lost owner binding.
+    veto_paths = _veto_registry_paths(environ)
+    if not veto_paths:
+        return False
+    seen_paths: set[str] = set()
+    for registry in veto_paths:
+        try:
+            identity = os.path.realpath(registry)
+        except OSError:
+            identity = registry
+        if identity in seen_paths:
+            continue
+        seen_paths.add(identity)
+        index = _read_route_registry_index(registry, cache, watched_paths, inventory)
+        if index is None or index["malformed"] or route_id in index["seen"]:
+            return False
+
+    if not _route_chain_absent(route_id, environ, inventory, route_chain_cache):
+        return False
+    return _inline_finish_absent(path, route_id, inventory)
+
+
 def _veto_registry_paths(environ: dict) -> list[str]:
     """Registries that may only ever KEEP a pin, never release one."""
 
@@ -3173,6 +3414,7 @@ def _route_record_launch_home(
     path: Path, registry_cache: dict | None = None, environ: dict | None = None,
     watched_paths: set[Path] | None = None,
     inventory: dict | None = None,
+    route_chain_cache: dict | None = None,
 ):
     """`launch_compatibility_tuple.launch_home.path` from one route record.
 
@@ -3186,9 +3428,10 @@ def _route_record_launch_home(
 
     Also `None` when the route is unclosed but every one of its registry
     attempts is terminal and its current owner has no readable result or launched
-    runtime continuation awaiting correction (`_route_attempts_finished`).
-    "Unclosed" and "still working" are not the same thing, and a route that died
-    at launch is never closed by anyone.
+    runtime continuation awaiting correction (`_route_attempts_finished`), or
+    when the exact direct-inline no-row shape has no route-chain or pending
+    finish continuation. "Unclosed" and "still working" are not the same thing,
+    and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the
@@ -3219,13 +3462,23 @@ def _route_record_launch_home(
     # Checked only after the record parses and names a launch_home: an
     # undecidable record must stay undecidable, never be released by a
     # terminality answer derived from a body we could not trust.
-    if _route_attempts_finished(
+    attempts_finished = _route_attempts_finished(
         path.stem, raw,
         registry_cache if registry_cache is not None else {},
         environ if environ is not None else os.environ,
         watched_paths,
         inventory,
-    ) is True:
+    )
+    if attempts_finished is True:
+        return None
+    if attempts_finished is None and _historical_inline_route_unused(
+        path, path.stem, raw,
+        registry_cache if registry_cache is not None else {},
+        environ if environ is not None else os.environ,
+        watched_paths,
+        inventory,
+        route_chain_cache,
+    ):
         return None
     return value
 
@@ -3380,6 +3633,7 @@ def _open_route_launch_homes(
 
     results: list[tuple[str, str]] = []
     registry_cache = registry_cache if registry_cache is not None else {}
+    route_chain_cache: dict = {}
     environ = environ or {}
     for path, scanned_file in candidates.values():
         if scanned_file is False or (scanned_file is None and not path.is_file()):
@@ -3388,6 +3642,7 @@ def _open_route_launch_homes(
             path, registry_cache, environ,
             inventory["registries"] if inventory is not None else None,
             inventory,
+            route_chain_cache,
         )
         if launch_home is None:
             continue
@@ -3854,10 +4109,9 @@ def _release_keep_message(candidate: Path, why: str) -> str:
         return (f"harness release: {candidate} is still referenced by a live dispatch attempt ({why}); "
                 "keeping it instead of deleting it")
     if kind == "open-route":
-        return (f"harness release: {candidate} is named by a route record that has no closing outcome "
-                f"({why}); no attempt row proves anything runs from it, but an unclosed route may still "
-                "resume there, so it is kept. Close the route once its work is settled "
-                "(capability-route.py close --route <route-file> --summary ...) and the next update prunes it")
+        return (f"harness release: {candidate} is still named by an unresolved route reference "
+                f"({why}); current evidence does not establish that execution or continuation no "
+                "longer needs it, so it is kept")
     return (f"harness release: {candidate} cannot be proved unused ({why}); keeping it instead of "
             "deleting it")
 

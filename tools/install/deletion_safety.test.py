@@ -547,17 +547,35 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
 
     def _routes_dir(self, base: Path) -> Path:
         routes = base / ".agent_reports" / ".runtime" / "routes"
-        routes.mkdir(parents=True)
+        routes.mkdir(parents=True, exist_ok=True)
         return routes
 
-    def _record(self, path: Path, launch_home: str, jobs: str | None) -> None:
+    def _record(
+        self, path: Path, launch_home: str, jobs: str | None, *, direct: bool = False,
+    ) -> None:
         tuple_: dict = {"launch_home": {"kind": "launch_home", "path": launch_home}}
         if jobs is not None:
             tuple_["jobs_path"] = {"kind": "jobs_path", "path": jobs}
-        path.write_text(json.dumps({
+        record = {
             "route_id": path.stem, "schema_version": 2,
             "launch_compatibility_tuple": tuple_,
-        }), encoding="utf-8")
+        }
+        if direct:
+            tuple_["contract_version"] = 1
+            record.update({
+                "effective_intensity": "direct",
+                "execution_topology": "inline",
+                "owner_dispatch_depth": 0,
+                "max_dispatch_depth": 0,
+                "nodes": [{
+                    "id": "inline", "kind": "capability-owner",
+                    "dispatch_depth": 0, "execution_surface": "inline",
+                    "registered_worker": False, "terminal": True,
+                    "completion_gate": "inline-complete",
+                    "terminal_gate": "inline-complete",
+                }],
+            })
+        path.write_text(json.dumps(record), encoding="utf-8")
 
     def _registry(self, path: Path, rows) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -567,7 +585,7 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
                 ["2026-09-06T00:00:00Z", status, "repo", "worktree", "slug", meta]))
         path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
-    def _scan(self, base: Path, environ: dict | None = None):
+    def _scan(self, base: Path, environ: dict | None = None, inventory: dict | None = None):
         with mock.patch.object(
             distribution, "_open_route_artifact_roots",
             return_value=([str(base / ".agent_reports")], [], ""),
@@ -575,7 +593,21 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
             # `{}` on purpose: `stable_state_root` reads only the passed
             # mapping, so an empty one resolves no veto registry and the suite
             # can never read the operator's live jobs.log.
-            return distribution._open_route_launch_homes(environ or {})
+            return distribution._open_route_launch_homes(environ or {}, inventory=inventory)
+
+    def _direct_no_rows(self, base: Path, *, inventory: dict | None = None):
+        routes = self._routes_dir(base)
+        jobs = base / "state" / "dispatch" / "jobs.log"
+        self._record(
+            routes / f"{self.ROUTE_ID}.json", str(base / "release"), str(jobs), direct=True,
+        )
+        self._registry(jobs, [])
+        environ = {
+            "HARNESS_STATE_ROOT": str(base / "state"),
+            "HOME": str(base / "home"),
+            "AGENT_DISPATCH_JOBS": str(jobs),
+        }
+        return self._scan(base, environ, inventory), environ, jobs
 
     def _pins(self, rows, *, jobs="present", write_registry=True):
         """Return whether the route still pins its launch_home."""
@@ -626,6 +658,128 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
         self.assertTrue(self._pins([
             ("done", "route_id=rt-someotherroute,attempt_id=att-x"),
         ]))
+
+    def test_exact_historical_direct_inline_route_without_registry_rows_releases(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        (results, reason), _environ, _jobs = self._direct_no_rows(Path(tmp.name))
+        self.assertEqual(reason, "")
+        self.assertEqual(results, [])
+
+    def test_direct_inline_no_row_result_does_not_depend_on_cwd_presence_or_project(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        roots = (base / "current-project", base / "other-project")
+        for cwd in (roots[0], roots[1], base / "missing-project"):
+            with self.subTest(cwd=cwd):
+                if cwd != base / "missing-project":
+                    cwd.mkdir(parents=True)
+                (results, reason), environ, _jobs = self._direct_no_rows(base)
+                route_file = base / ".agent_reports" / ".runtime" / "routes" / f"{self.ROUTE_ID}.json"
+                row = json.loads(route_file.read_text(encoding="utf-8"))
+                row["cwd"] = str(cwd)
+                route_file.write_text(json.dumps(row), encoding="utf-8")
+                results, reason = self._scan(base, environ)
+                self.assertEqual(reason, "")
+                self.assertEqual(results, [])
+
+    def test_direct_inline_no_row_exception_does_not_cover_staged_or_unknown_routes(self):
+        for mutate in (
+            lambda row: row.update(effective_intensity="standard", execution_topology="staged"),
+            lambda row: row.update(schema_version=99),
+            lambda row: row["nodes"][0].update(registered_worker=True),
+            lambda row: row["nodes"][0].update(terminal=False),
+        ):
+            with self.subTest(mutate=mutate):
+                tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+                base = Path(tmp.name)
+                routes = self._routes_dir(base)
+                jobs = base / "state" / "dispatch" / "jobs.log"
+                route_file = routes / f"{self.ROUTE_ID}.json"
+                self._record(route_file, str(base / "release"), str(jobs), direct=True)
+                row = json.loads(route_file.read_text(encoding="utf-8"))
+                mutate(row)
+                route_file.write_text(json.dumps(row), encoding="utf-8")
+                self._registry(jobs, [])
+                env = {"HARNESS_STATE_ROOT": str(base / "state"), "AGENT_DISPATCH_JOBS": str(jobs)}
+                results, reason = self._scan(base, env)
+                self.assertEqual(reason, "")
+                self.assertEqual([route for route, _home in results], [self.ROUTE_ID])
+
+    def test_direct_inline_no_rows_keeps_a_related_row_in_another_registry(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        (results, reason), environ, _sealed = self._direct_no_rows(base)
+        self.assertEqual((results, reason), ([], ""))
+        other = base / "other" / "jobs.log"
+        self._registry(other, [("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,attempt_id=lost")])
+        environ["AGENT_DISPATCH_JOBS"] = str(other)
+        results, reason = self._scan(base, environ)
+        self.assertEqual(reason, "")
+        self.assertEqual([route for route, _home in results], [self.ROUTE_ID])
+
+    def test_direct_inline_no_rows_keeps_when_a_veto_registry_is_unavailable(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        (_initial, _reason), environ, _sealed = self._direct_no_rows(base)
+        environ["AGENT_DISPATCH_JOBS"] = str(base / "missing" / "jobs.log")
+        results, reason = self._scan(base, environ)
+        self.assertEqual(reason, "")
+        self.assertEqual([route for route, _home in results], [self.ROUTE_ID])
+
+    def test_direct_inline_no_rows_keeps_for_any_inline_finish_state(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        (initial, _reason), _environ, _jobs = self._direct_no_rows(base)
+        self.assertEqual(initial, [])
+        finish = (base / ".agent_reports" / ".runtime" / "inline-finish" / "v1"
+                  / self.ROUTE_ID / "finish.json")
+        finish.parent.mkdir(parents=True)
+        finish.write_text("not-json\n", encoding="utf-8")
+        (results, reason), _env, _jobs = self._direct_no_rows(base)
+        self.assertEqual(reason, "")
+        self.assertEqual([route for route, _home in results], [self.ROUTE_ID])
+
+    def test_direct_inline_no_rows_keeps_when_session_route_chain_names_it(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        (_initial, _reason), environ, _jobs = self._direct_no_rows(base)
+        chain_root = base / "route-chains"
+        ledger = chain_root / "codex" / "session-fixture.jsonl"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(json.dumps({
+            "v": 1, "event": "start", "route_id": self.ROUTE_ID,
+        }) + "\n", encoding="utf-8")
+        environ["FLEET_ROUTE_CHAIN_DIR"] = str(chain_root)
+        results, reason = self._scan(base, environ)
+        self.assertEqual(reason, "")
+        self.assertEqual([route for route, _home in results], [self.ROUTE_ID])
+
+    def test_inline_finish_publication_changes_route_discovery_fingerprint(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        inventory: dict = {}
+        (_initial, _reason), _environ, _jobs = self._direct_no_rows(base, inventory=inventory)
+        snapshot = distribution._snapshot_discovery_inputs(inventory, [])
+        finish = (base / ".agent_reports" / ".runtime" / "inline-finish" / "v1"
+                  / self.ROUTE_ID / "finish.json")
+        finish.parent.mkdir(parents=True)
+        finish.write_text("pending\n", encoding="utf-8")
+        self.assertTrue(distribution._discovery_inputs_changed(snapshot))
+
+    def test_route_chain_publication_changes_route_discovery_fingerprint(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        inventory: dict = {}
+        (_initial, _reason), environ, _jobs = self._direct_no_rows(base)
+        chain_root = base / "route-chains"
+        environ["FLEET_ROUTE_CHAIN_DIR"] = str(chain_root)
+        self._scan(base, environ, inventory)
+        snapshot = distribution._snapshot_discovery_inputs(inventory, [])
+        ledger = chain_root / "codex" / "session-fixture.jsonl"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(json.dumps({"v": 1, "event": "start", "route_id": self.ROUTE_ID}) + "\n",
+                          encoding="utf-8")
+        self.assertTrue(distribution._discovery_inputs_changed(snapshot))
 
     def test_a_missing_or_unreadable_registry_keeps_the_pin(self):
         self.assertTrue(self._pins([], write_registry=False))
