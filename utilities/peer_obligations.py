@@ -1139,7 +1139,7 @@ def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None,
 
 
 def request_dispatch_reconciliation(state_root: str | Path) -> bool:
-    """Reconnect the existing runner without doing global work in a carrier.
+    """Request the existing runner through detached recovery for a carrier.
 
     Compatibility roots remain read-only. Worker and subsession carriers use
     this same entry even when they have no session-projection hook.
@@ -1153,8 +1153,9 @@ def request_dispatch_reconciliation(state_root: str | Path) -> bool:
     if not (root / "jobs.log").is_file():
         return False
     # Dispatch storage and peer storage may be separate roots. Preserve the
-    # same normal peer runner rather than creating another store under jobs.
-    return ensure_normal_runner(lifecycle_root=home, reconciliation_required=True)
+    # common detached request rather than creating another store under jobs or
+    # running runner setup on the carrier's activation path.
+    return request_obligation_recovery(lifecycle_root=home)
 
 
 @contextmanager

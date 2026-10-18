@@ -131,7 +131,7 @@ class LifecycleBindingTest(unittest.TestCase):
             self.a, "fixture_codex_projection",
             self.a / "adapters/codex/hooks/herdr_session_projection.py")
         with mock.patch.dict(os.environ, self.env, clear=True), \
-             mock.patch.object(module.subprocess, "Popen") as launch:
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
             self.assertTrue(module.project({"hook_event_name": "SessionStart"}, "sid-a"))
         return launch.call_args.args[0], launch.call_args.kwargs
 

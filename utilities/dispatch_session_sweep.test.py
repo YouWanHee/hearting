@@ -54,6 +54,62 @@ def _log_fixture_env(test_file: str, home: str, xdg: str, harness: str) -> None:
         handle.write(f"{test_file}\t{home}\t{xdg}\t{harness}\n")
 
 
+def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
+    """Instrument the common detached entry and hold only the existing ensure body."""
+    support = base / "slow-recovery-site"
+    support.mkdir(parents=True, exist_ok=True)
+    requests = base / "common-recovery-requests.jsonl"
+    bodies = base / "slow-recovery-bodies.jsonl"
+    (support / "sitecustomize.py").write_text(
+        "import json, os, subprocess, time\n"
+        "from pathlib import Path\n"
+        "import peer_obligations\n"
+        "_real_popen = subprocess.Popen\n"
+        "def _append(path, value):\n"
+        "    with open(path, 'a', encoding='utf-8') as handle:\n"
+        "        handle.write(json.dumps(value) + '\\n')\n"
+        "def _tracked_popen(args, *pos, **kwargs):\n"
+        "    argv = [str(item) for item in args] if not isinstance(args, str) else [args]\n"
+        "    if len(argv) >= 3 and Path(argv[1]).name == 'peer-steward.py' and argv[2] == '__ensure-obligations':\n"
+        "        _append(os.environ['R1_REQUEST_LOG'], {'pid': os.getpid(), 'argv': argv, 'cwd': kwargs.get('cwd'), 'start_new_session': kwargs.get('start_new_session')})\n"
+        "    return _real_popen(args, *pos, **kwargs)\n"
+        "subprocess.Popen = _tracked_popen\n"
+        "def _slow_ensure(*args, **kwargs):\n"
+        "    time.sleep(float(os.environ['R1_RECOVERY_DELAY']))\n"
+        "    try:\n"
+        "        state = json.loads(Path(os.environ['R1_RECORD_PATH']).read_text(encoding='utf-8')).get('state')\n"
+        "    except Exception as exc:\n"
+        "        state = 'unreadable:' + type(exc).__name__\n"
+        "    try:\n"
+        "        snapshot = Path(os.environ['R1_SNAPSHOT_PATH']).read_text(encoding='utf-8')\n"
+        "    except OSError:\n"
+        "        snapshot = None\n"
+        "    _append(os.environ['R1_BODY_LOG'], {'state': state, 'snapshot': snapshot, 'kwargs': {key: str(value) for key, value in kwargs.items()}})\n"
+        "    return True\n"
+        "peer_obligations.ensure_normal_runner = _slow_ensure\n",
+        encoding="utf-8",
+    )
+    return ({
+        "PYTHONPATH": str(support) + os.pathsep + str(Path(__file__).resolve().parent),
+        "R1_REQUEST_LOG": str(requests),
+        "R1_BODY_LOG": str(bodies),
+        "R1_RECORD_PATH": str(record_path),
+        "R1_SNAPSHOT_PATH": str(snapshot_path),
+        "R1_RECOVERY_DELAY": "0.8",
+    }, requests, bodies)
+
+
+def _read_jsonl_after(test_case, path: Path, count: int = 1):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if path.exists():
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            if len(rows) >= count:
+                return rows
+        time.sleep(0.02)
+    test_case.fail(f"timed out waiting for {count} rows in {path}")
+
+
 class IsolatedRootMixin:
     def setUp(self):
         super().setUp()
@@ -859,7 +915,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
                      ROOT / "adapters" / "codex" / "hooks" / "userprompt-lifecycle.py"):
             self.assertIn("delivery_context", hook.read_text(encoding="utf-8"))
 
-    def run_plugin(self, body, *, prompt_async="accept", restored_selector=False):
+    def run_plugin(self, body, *, prompt_async="accept", restored_selector=False, extra_env=None):
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         if restored_selector:
             fixture = self.root.parent / "restored-plugin/adapters/opencode/plugins/hearting-guards.js"
@@ -871,6 +927,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
             plugin = fixture
         js = r'''
 import { pathToFileURL } from "node:url";
+import { writeFileSync } from "node:fs";
 const { AgentHarnessGuards } = await import(pathToFileURL(PLUGIN));
 const prompts = [];
 const logs = [];
@@ -886,7 +943,10 @@ BODY
 hooks.dispose();
 console.log(JSON.stringify({prompts, logs}));
 '''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body).replace("PLUGIN", json.dumps(str(plugin)))
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
+        env = self.env()
+        if extra_env:
+            env.update(extra_env)
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env, cwd=str(self.root),
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout.strip().splitlines()[-1])
@@ -937,6 +997,27 @@ await new Promise(r => setTimeout(r, 1500));
         self.assertEqual(len(result["prompts"]), 1)
         self.assertEqual(result["prompts"][0]["path"], {"id": self.SID})
         self.assertEqual(self.state(), "acked")
+
+    def test_actual_open_code_activation_detaches_slow_recovery_until_delivery_ack(self):
+        self.seed_turn()
+        record_path = PD.record_path(self.root, self.SID, "delivery-" + "a" * 32)
+        snapshot = self.root.parent / "opencode-activation-complete.txt"
+        probe_env, requests, bodies = _slow_recovery_probe(self.root.parent, record_path, snapshot)
+        result = self.run_plugin(f'''writeFileSync(process.env.R1_SNAPSHOT_PATH, "activation-complete\\n");
+await hooks.event({{event: {{type: "session.idle", properties: {{sessionID: "{self.SID}"}}}}}});
+await new Promise(r => setTimeout(r, 1500));
+''', restored_selector=True, extra_env=probe_env)
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertIn("att-0000000000000000000000000000bbbb",
+                      result["prompts"][0]["body"]["parts"][0]["text"])
+        self.assertEqual(self.state(), "acked")
+        request_rows = _read_jsonl_after(self, requests)
+        self.assertEqual(len(request_rows), 1, request_rows)
+        self.assertTrue(request_rows[0]["start_new_session"])
+        self.assertEqual(Path(request_rows[0]["argv"][1]), ROOT / "utilities/peer-steward.py")
+        body_rows = _read_jsonl_after(self, bodies)
+        self.assertEqual(body_rows[0]["state"], "acked")
+        self.assertEqual(body_rows[0]["snapshot"], "activation-complete\n")
 
     def test_a_turn_opencode_did_not_take_is_released_for_the_next_pass(self):
         self.seed_turn()
@@ -1127,12 +1208,22 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
              mock.patch("dispatch_batch_obligations.ensure_observers") as ensure, \
-             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner:
+             mock.patch("peer_obligations.request_obligation_recovery", return_value=True) as request:
             SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation")
             SWEEP.activate(secondary, "claude-parent-runtime", "sid-activation")
         reconcile.assert_not_called()
         ensure.assert_not_called()
-        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
+        request.assert_called_once_with(lifecycle_root=self.root.parent)
+
+    def test_canonical_activation_without_jobs_does_not_request_recovery(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root.parent), \
+             mock.patch("dispatch_contract.dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
+             mock.patch("peer_obligations.request_obligation_recovery") as request:
+            SWEEP.activate(self.root, "claude-parent-runtime", "sid-no-jobs")
+        request.assert_not_called()
+        peer_obligations.ensure_normal_runner.assert_not_called()
 
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1174,14 +1265,12 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
              mock.patch.object(SWEEP, "addressed_records", return_value=([], 0)), \
              mock.patch("dispatch_completion_join.reconcile_pending_delivery") as reconcile, \
              mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
-             mock.patch("peer_obligations.ensure_normal_runner", return_value=True) as runner, \
-             mock.patch.object(OBLIGATIONS.subprocess, "Popen") as launch:
+             mock.patch("peer_obligations.request_obligation_recovery", return_value=True) as request:
             self.assertEqual(SWEEP.activate(self.root, "claude-parent-runtime", "sid-activation"), [])
 
         reconcile.assert_not_called()
-        runner.assert_called_once_with(lifecycle_root=self.root.parent, reconciliation_required=True)
+        request.assert_called_once_with(lifecycle_root=self.root.parent)
         settle.assert_not_called()
-        launch.assert_not_called()
         self.assertEqual(OBLIGATIONS.read(jobs, duty_id)["state"], "observing")
         self.assertEqual(OBLIGATIONS.read(other_jobs, other_duty_id)["state"], "observing")
         self.assertEqual(jobs.read_bytes(), unreadable)
@@ -1227,6 +1316,39 @@ class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
              }))):
             self.assertEqual(HOOK.main(), 0)
         request.assert_called_once_with(lifecycle_root=ROOT)
+
+    def test_actual_codex_sessionstart_outputs_context_before_detached_slow_recovery_without_ack(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        delivery_id = "delivery-" + "d" * 32
+        SweepTest._seed(self, recipient_kind="codex-native-queue", delivery_id=delivery_id)
+        record_path = PD.record_path(self.root, "sess-owner", delivery_id)
+        snapshot = self.root.parent / "codex-sessionstart-output.json"
+        probe_env, requests, bodies = _slow_recovery_probe(self.root.parent, record_path, snapshot)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AGENT_", "CLAUDE_", "CODEX_", "OPENCODE_", "HERDR_", "FLEET_"))}
+        env.update(self._env_patch)
+        env.update(probe_env)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py")],
+            input=json.dumps({"session_id": "sess-owner", "source": "startup"}),
+            capture_output=True, text=True, env=env, cwd=str(ROOT), timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("att-0000000000000000000000000000bbbb", context)
+        self.assertEqual(PD.read(self.root, "sess-owner", delivery_id)["state"], "pending")
+        snapshot.write_text(result.stdout, encoding="utf-8")
+        request_rows = _read_jsonl_after(self, requests)
+        self.assertEqual(len(request_rows), 1, request_rows)
+        self.assertTrue(request_rows[0]["start_new_session"])
+        self.assertIn("--lifecycle-root", request_rows[0]["argv"])
+        self.assertEqual(request_rows[0]["argv"][-1], str(ROOT.resolve()))
+        body_rows = _read_jsonl_after(self, bodies)
+        self.assertEqual(body_rows[0]["state"], "pending")
+        self.assertEqual(body_rows[0]["snapshot"], result.stdout)
 
     def test_opencode_worker_init_and_session_created_use_shared_recovery_entry(self):
         capture = self.root.parent / "opencode-recovery-calls.tsv"

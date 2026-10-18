@@ -165,6 +165,7 @@ def emit_context(event_name: str, parts: list[str]) -> None:
 def main() -> int:
     payload = load_payload()
     current_cwd = cwd(payload)
+    sid = session_id(payload)
     worker = is_worker_session()
     if worker:
         try:
@@ -176,7 +177,7 @@ def main() -> int:
     else:
         try:
             from herdr_session_projection import project
-            project(payload, session_id(payload), worker=False)
+            project(payload, sid, worker=False, request_recovery=False)
         except Exception:
             pass
 
@@ -189,7 +190,6 @@ def main() -> int:
             sys.path.insert(0, str(utilities))
             from dispatch_contract import dispatch_state_roots, resolve_agent_home
             from dispatch_session_sweep import activate, delivery_context
-            sid = session_id(payload)
             if sid:
                 batches = [(root, activate(root, "codex-native-queue", sid))
                            for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home()))
