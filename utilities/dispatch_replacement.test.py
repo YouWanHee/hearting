@@ -501,6 +501,10 @@ class ReplacementTest(unittest.TestCase):
         args=SimpleNamespace(**vars(self.args));args.attempt_id='att-g2'
         args.replacement_input_argv=['--start','--attempt-id','att-g2','--sandbox','workspace-write',
                                      '--prompt-text','phase g2']
+        args.dispatch_depth=1;args.sandbox='workspace-write'
+        args.parent_session_id='codex-owner-session';args.parent_harness='codex'
+        args.parent_transport='app-server';args.parent_sandbox='workspace-write'
+        args.launch_authority='parent-session'
         args.launch_lifecycle='foreground-scoped';args.nested_headless_network=False
         args.replacement_runtime_sandbox='danger-full-access'
         first=R.seal_launch_input(args,'codex','phase g2')
@@ -508,32 +512,41 @@ class ReplacementTest(unittest.TestCase):
                     **D.parse_registry_metadata(first)},'open',append=True)
         host=SimpleNamespace(**vars(args));host.launch_lifecycle='detached'
         host.replacement_runtime_sandbox='workspace-write'
-        with self.assertRaises(D.DispatchContractError) as sandbox_change:
-            R.seal_launch_input(host,'codex','phase g2')
-        self.assertEqual(sandbox_change.exception.reason,'replacement-input-tuple-mismatch')
-        self.assertIn('axis=file',sandbox_change.exception.detail)
-        self.assertIn("predecessor='danger-full-access'",sandbox_change.exception.detail)
-        self.assertIn("candidate='workspace-write'",sandbox_change.exception.detail)
-        host.replacement_runtime_sandbox='danger-full-access'
         second=R.seal_launch_input(host,'codex','phase g2')
         saved=json.loads((R._directory(self.jobs)/'inputs'/'att-g2.json').read_text())
         self.assertEqual((saved['applied_permissions']['launch_lifecycle'],saved['applied_permissions']['runtime_sandbox']),
-                         ('detached','danger-full-access'))
+                         ('detached','workspace-write'))
         self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
         # A granted permission, the work or the sandbox it asks for still conflicts.
         for changes in ({'nested_headless_network':True},
                         {'resolved_permission_posture':{'mode':'bypass','mode_flag':'bypassPermissions',
                                                         'allowed_tools':('Read',),'inherited_default_mode':'default'}},
-                        {'replacement_input_argv':['--start','--attempt-id','att-g2','--sandbox','danger-full-access',
+                        {'replacement_runtime_sandbox':'danger-full-access'},
+                        {'replacement_runtime_sandbox':'read-only'},
+                        {'sandbox':'danger-full-access',
+                         'replacement_input_argv':['--start','--attempt-id','att-g2','--sandbox','danger-full-access',
                                                    '--prompt-text','phase g2']}):
             with self.subTest(changed=sorted(changes)):
                 with self.assertRaises(D.DispatchContractError) as caught:
                     R.seal_launch_input(SimpleNamespace(**{**vars(host),**changes}),'codex','phase g2')
-                if 'replacement_input_argv' in changes:
+                if 'sandbox' in changes:
                     self.assertEqual(caught.exception.reason,'replacement-record-conflict')
                 else:
                     self.assertEqual(caught.exception.reason,'replacement-input-tuple-mismatch')
                     self.assertIn('child_spawned=0', caught.exception.detail)
+        for changed_parent in ({'parent_sandbox':'read-only'}, {'parent_sandbox':'unknown'},
+                               {'parent_session_id':'different-session'}, {'parent_transport':'unknown'}):
+            with self.subTest(changed_parent=changed_parent):
+                changed=SimpleNamespace(**{**vars(host),**changed_parent})
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.seal_launch_input(changed,'codex','phase g2')
+                self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        missing_parent=SimpleNamespace(**vars(host))
+        for field in ('parent_session_id','parent_harness','parent_transport','parent_sandbox','launch_authority'):
+            delattr(missing_parent,field)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.seal_launch_input(missing_parent,'codex','phase g2')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
         with self.assertRaises(D.DispatchContractError):R.seal_launch_input(host,'codex','another phase')
         # Once claimed, even the launcher's location may not reseal it.
         self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'1'},'open',append=True)

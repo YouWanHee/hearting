@@ -1186,10 +1186,7 @@ def recovery_task(record, source, history):
 
 def permission_mismatch_detail(previous, current):
     """Describe a historical permission difference with its exact evidence source."""
-    old = granted_permissions(previous.get("applied_permissions"),
-                              previous.get("launch_home"), previous.get("worktree"))
-    new = granted_permissions(current.get("applied_permissions"),
-                              current.get("launch_home"), current.get("worktree"))
+    old, new = _granted_permission_pair(previous, current)
     if old == new:
         return None
 
@@ -1399,8 +1396,7 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     for flag, expected in current.items():
         if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
             raise _contract_error("replacement-argv-mismatch", flag)
-    granted = granted_permissions(candidate.get("applied_permissions"), candidate.get("launch_home"), candidate.get("worktree"))
-    sealed = granted_permissions(history.get("applied_permissions"), history.get("launch_home"), history.get("worktree"))
+    sealed, granted = _granted_permission_pair(history, candidate)
     cross_owner = owner and candidate.get("harness") != history.get("harness")
     if cross_owner:
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
@@ -1663,6 +1659,62 @@ def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
     return json.loads(text)
 
 
+def _same_verified_workspace_write_parent(previous, current) -> bool:
+    """Whether both sealed launches name the same known Codex workspace-write parent.
+
+    The current launch's parent tuple is revalidated by the existing wrapper before
+    launch-input sealing. Requiring the complete tuple to match its predecessor keeps
+    this normalization tied to that exact boundary; absent, unknown, or changed parent
+    evidence leaves the launcher sandbox values distinct.
+    """
+    if previous.get("harness") != "codex" or current.get("harness") != "codex":
+        return False
+    old, new = previous.get("resolved") or {}, current.get("resolved") or {}
+    depth = str(old.get("dispatch_depth") or "")
+    if depth not in {"1", "2"} or str(new.get("dispatch_depth") or "") != depth:
+        return False
+    for key in ("parent_harness", "parent_transport", "parent_sandbox", "launch_authority"):
+        value = old.get(key)
+        if (not isinstance(value, str) or not value.strip() or value.lower() == "unknown"
+                or value != new.get(key)):
+            return False
+    if old.get("parent_harness") != "codex" or old.get("parent_sandbox") != "workspace-write":
+        return False
+    for key in ("parent_session_id", "parent_attempt_id"):
+        identity = old.get(key)
+        if identity != new.get(key):
+            return False
+        if (identity is not None and
+                (not isinstance(identity, str) or not identity.strip() or identity.lower() == "unknown")):
+            return False
+    identity_key = "parent_session_id" if depth == "1" else "parent_attempt_id"
+    identity = old.get(identity_key)
+    if (not isinstance(identity, str) or not identity.strip() or identity.lower() == "unknown"
+            or identity != new.get(identity_key)):
+        return False
+    return True
+
+
+def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
+    """Compare effective grants, collapsing only a proven nested Codex sandbox layer."""
+    old_applied = previous.get("applied_permissions") or {}
+    new_applied = current.get("applied_permissions") or {}
+    old = granted_permissions(old_applied, previous.get("launch_home"), previous.get("worktree"))
+    new = granted_permissions(new_applied, current.get("launch_home"), current.get("worktree"))
+    if _same_verified_workspace_write_parent(previous, current):
+        if (old_applied.get("launch_lifecycle") == "foreground-scoped"
+                and new_applied.get("launch_lifecycle") == "detached"
+                and old.get("runtime_sandbox") == "danger-full-access"):
+            old = dict(old)
+            old["runtime_sandbox"] = "workspace-write"
+        elif (new_applied.get("launch_lifecycle") == "foreground-scoped"
+                and old_applied.get("launch_lifecycle") == "detached"
+                and new.get("runtime_sandbox") == "danger-full-access"):
+            new = dict(new)
+            new["runtime_sandbox"] = "workspace-write"
+    return old, new
+
+
 # A sealed fact and the same value computed again now. The release a launch ran from is where it
 # ran, not what work it is: its row and sealed input keep the `launch_home` it ran from, a
 # continuation records its own, and a different current value on that axis is neither a refusal
@@ -1717,9 +1769,9 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
 
 def same_sealed_work(previous, current, *, recovery=None) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
+    old_grants, new_grants = _granted_permission_pair(previous, current)
     exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
-            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"), previous.get("worktree"))
-            == granted_permissions(current.get("applied_permissions"), current.get("launch_home"), current.get("worktree")))
+            and old_grants == new_grants)
     if exact or recovery is None:
         return exact
     record, source, history, route = recovery

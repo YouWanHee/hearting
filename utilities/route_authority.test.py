@@ -1255,5 +1255,84 @@ class ResourcePredecessorPidReuseTest(unittest.TestCase):
                 self.assertFalse(RA.resource_predecessor_finished(self.row(**change)))
 
 
+class NestedHostSandboxEqualityTest(unittest.TestCase):
+    """Only a matching, known workspace-write parent bounds nested Codex access."""
+
+    @staticmethod
+    def inputs():
+        resolved = {
+            "dispatch_depth": 1,
+            "sandbox": "workspace-write",
+            "parent_session_id": "codex-owner-session",
+            "parent_harness": "codex",
+            "parent_transport": "app-server",
+            "parent_sandbox": "workspace-write",
+            "launch_authority": "parent-session",
+        }
+        previous = {
+            "attempt_id": "att-replay",
+            "harness": "codex",
+            "jobs": "/isolated/state/jobs.log",
+            "worktree": "/isolated/worktree",
+            "argv": ["--start", "--sandbox", "workspace-write"],
+            "task": "same work",
+            "resolved": dict(resolved),
+            "applied_permissions": {
+                "launch_lifecycle": "foreground-scoped",
+                "runtime_sandbox": "danger-full-access",
+                "nested_headless_network": False,
+            },
+        }
+        current = {
+            **previous,
+            "resolved": dict(resolved),
+            "applied_permissions": {
+                "launch_lifecycle": "detached",
+                "runtime_sandbox": "workspace-write",
+                "nested_headless_network": False,
+            },
+        }
+        return previous, current
+
+    def test_exact_nested_parent_makes_host_replay_effectively_equal(self):
+        previous, current = self.inputs()
+        self.assertNotEqual(
+            RA.granted_permissions(previous["applied_permissions"]),
+            RA.granted_permissions(current["applied_permissions"]),
+        )  # The raw launcher settings still differ.
+        self.assertEqual(RA._granted_permission_pair(previous, current)[0],
+                         RA._granted_permission_pair(previous, current)[1])
+        self.assertIsNone(RA.permission_mismatch_detail(previous, current))
+        self.assertTrue(RA.same_sealed_work(previous, current))
+
+    def test_real_widening_narrowing_and_unproven_parent_boundaries_stay_distinct(self):
+        previous, current = self.inputs()
+        cases = {
+            "host-widening": ("runtime_sandbox", "danger-full-access", None),
+            "host-narrowing": ("runtime_sandbox", "read-only", None),
+            "parent-absent": (None, None, "absent"),
+            "parent-unknown": (None, None, "unknown"),
+            "parent-identity-changed": (None, None, "different"),
+            "parent-boundary-changed": (None, None, "read-only"),
+        }
+        for name, (permission_key, permission_value, parent_change) in cases.items():
+            with self.subTest(case=name):
+                candidate = json.loads(json.dumps(current))
+                if permission_key:
+                    candidate["applied_permissions"][permission_key] = permission_value
+                elif parent_change == "absent":
+                    candidate["resolved"] = {"dispatch_depth": 1, "sandbox": "workspace-write"}
+                elif parent_change == "unknown":
+                    candidate["resolved"]["parent_sandbox"] = "unknown"
+                elif parent_change == "different":
+                    candidate["resolved"]["parent_session_id"] = "other-session"
+                elif parent_change == "read-only":
+                    candidate["resolved"]["parent_sandbox"] = "read-only"
+                detail = RA.permission_mismatch_detail(previous, candidate)
+                self.assertIsNotNone(detail)
+                self.assertIn("axis=file", detail)
+                self.assertFalse(RA.same_sealed_work(previous, candidate))
+
+
 if __name__ == "__main__":
     unittest.main()
