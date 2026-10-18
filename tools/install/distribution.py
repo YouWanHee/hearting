@@ -3793,10 +3793,21 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
                 )
                 original_size = os.fstat(fd).st_size
                 try:
+                    append_payload = payload
+                    if original_size:
+                        if os.lseek(fd, original_size - 1, os.SEEK_SET) != original_size - 1:
+                            raise OSError("forced-prune gap tail position changed")
+                        tail = os.read(fd, 1)
+                        if len(tail) != 1:
+                            raise OSError("forced-prune gap tail could not be read")
+                        if tail != b"\n":
+                            # Keep any interrupted prior bytes verbatim, but
+                            # isolate them from this canonical JSONL row.
+                            append_payload = b"\n" + payload
                     offset = 0
-                    while offset < len(payload):
+                    while offset < len(append_payload):
                         try:
-                            written = os.write(fd, payload[offset:])
+                            written = os.write(fd, append_payload[offset:])
                         except InterruptedError:
                             continue
                         if written <= 0:

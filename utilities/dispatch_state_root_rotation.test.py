@@ -2461,7 +2461,9 @@ class RetentionContainmentGateTest(unittest.TestCase):
         except OSError:
             return None
 
-    def _cleanup_with_gap_before_delete(self, candidate, stable_root, minimum_rows):
+    def _cleanup_with_gap_before_delete(
+        self, candidate, stable_root, minimum_rows, expected_rows=None, expected_cache=None
+    ):
         import dispatch_registry_inventory as INV
 
         gap_path = stable_root / "inventory" / "gaps.jsonl"
@@ -2475,9 +2477,14 @@ class RetentionContainmentGateTest(unittest.TestCase):
                 line_count = len(data.splitlines())
                 self.assertGreaterEqual(line_count, minimum_rows)
                 rows = INV.read_gaps(stable_root)
-                self.assertEqual(len(rows), line_count)
+                if expected_rows is None:
+                    self.assertEqual(len(rows), line_count)
+                else:
+                    self.assertEqual(len(rows), expected_rows)
                 self.assertTrue(all(row["discovered_by"] == "forced-prune" for row in rows))
                 self.assertTrue(all(row["recoverable"] is False for row in rows))
+                if expected_cache is not None:
+                    self.assertTrue(expected_cache.exists(), "derived cache must remain until source removal")
                 deletion_evidence.append(data)
             return real_rmtree(path, *args, **kwargs)
 
@@ -2486,6 +2493,8 @@ class RetentionContainmentGateTest(unittest.TestCase):
         ):
             DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
         self.assertEqual(len(deletion_evidence), 1, "source removal must follow a readable gap")
+        if expected_cache is not None:
+            self.assertFalse(expected_cache.exists(), "derived cache must follow source removal")
         return deletion_evidence[0]
 
     def test_containment_holds_after_carry_forward_and_prune_proceeds(self):
@@ -2704,6 +2713,139 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertFalse(v1.exists())
         self.assertFalse(cache.exists())
 
+    def test_forced_prune_gap_rollback_truncate_failure_is_framed_on_retry(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        real_write = os.write
+        real_ftruncate = os.ftruncate
+        target_writes = 0
+        partial_suffix = bytearray()
+        rollback_failed = False
+
+        def interrupted_partial_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) != gap_path:
+                return real_write(fd, data)
+            target_writes += 1
+            if target_writes == 1:
+                partial = data[:17]
+                partial_suffix.extend(partial)
+                return real_write(fd, partial)
+            if target_writes == 2:
+                raise InterruptedError()
+            return 0
+
+        def fail_rollback_truncate_once(fd, length):
+            nonlocal rollback_failed
+            if self._descriptor_path(fd) == gap_path and not rollback_failed:
+                rollback_failed = True
+                raise OSError("injected forced-prune rollback truncation failure")
+            return real_ftruncate(fd, length)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=interrupted_partial_write
+        ), mock.patch.object(
+            DISTRIBUTION.os, "ftruncate", side_effect=fail_rollback_truncate_once
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertEqual(target_writes, 3)
+        self.assertTrue(rollback_failed, "the failure must leave the interrupted suffix for retry")
+        self.assertEqual(gap_path.read_bytes(), original_bytes + bytes(partial_suffix))
+        self.assertFalse(gap_path.read_bytes().endswith(b"\n"))
+        self.assertTrue(v1.exists(), "failed rollback must retain the source release")
+        self.assertTrue(cache.exists(), "failed rollback must retain the derived cache")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
+            )
+        self.assertTrue(retry_bytes.startswith(original_bytes + bytes(partial_suffix) + b"\n"))
+        self.assertFalse(v1.exists())
+
+    def test_forced_prune_gap_seeded_interrupted_tail_recovers_after_delimiter_write_failure(self):
+        v1, v2, v3 = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v3, os.environ, "seed-interrupted-row")
+        )
+        complete_bytes = gap_path.read_bytes()
+        interrupted_row = complete_bytes[len(original_bytes):]
+        self.assertTrue(interrupted_row.endswith(b"\n"))
+        seeded_tail = original_bytes + interrupted_row[:17]
+        gap_path.write_bytes(seeded_tail)
+
+        real_write = os.write
+        recovery_write_failed = False
+
+        def fail_delimiter_write_once(fd, data):
+            nonlocal recovery_write_failed
+            if self._descriptor_path(fd) == gap_path and not recovery_write_failed:
+                recovery_write_failed = True
+                self.assertTrue(data.startswith(b"\n"), "retry must first delimit the interrupted tail")
+                raise OSError("injected gap-tail delimiter write failure")
+            return real_write(fd, data)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=fail_delimiter_write_once
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(recovery_write_failed)
+        self.assertEqual(gap_path.read_bytes(), seeded_tail)
+        self.assertTrue(v1.exists(), "failed tail recovery must retain the source release")
+        self.assertTrue(cache.exists(), "failed tail recovery must retain the derived cache")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
+            )
+        self.assertTrue(retry_bytes.startswith(seeded_tail + b"\n"))
+        self.assertFalse(v1.exists())
+
+    def test_forced_prune_gap_valid_row_without_final_newline_stays_readable(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-readable-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        self.assertTrue(original_bytes.endswith(b"\n"))
+        unterminated_valid_row = original_bytes[:-1]
+        gap_path.write_bytes(unterminated_valid_row)
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_cache=cache
+            )
+
+        self.assertTrue(retry_bytes.startswith(unterminated_valid_row + b"\n"))
+        self.assertGreaterEqual(len(retry_bytes.splitlines()), 2)
+        self.assertFalse(v1.exists())
+
     def test_forced_prune_gap_file_sync_failure_retains_release_and_retries(self):
         v1, v2, _ = self._three_release_chain()
         cache = DISTRIBUTION._release_pycache_path(v1)
@@ -2716,6 +2858,8 @@ class RetentionContainmentGateTest(unittest.TestCase):
             DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
         )
         original_bytes = gap_path.read_bytes()
+        seeded_tail = original_bytes + b'{"schema_version":'
+        gap_path.write_bytes(seeded_tail)
         real_fsync = os.fsync
         failed = False
 
@@ -2734,13 +2878,13 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertTrue(failed, "the gap file must be synchronized before deletion")
         self.assertTrue(v1.exists())
         self.assertTrue(cache.exists())
-        self.assertEqual(gap_path.read_bytes(), original_bytes)
+        self.assertEqual(gap_path.read_bytes(), seeded_tail)
 
         with self._missing_attempt_proof(v1):
             retry_bytes = self._cleanup_with_gap_before_delete(
-                v1, stable_root, minimum_rows=2
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
             )
-        self.assertTrue(retry_bytes.startswith(original_bytes))
+        self.assertTrue(retry_bytes.startswith(seeded_tail + b"\n"))
         self.assertFalse(v1.exists())
         self.assertFalse(cache.exists())
 
