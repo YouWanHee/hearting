@@ -474,26 +474,45 @@ primary resolution chain. That carry is still row-wise and monotonic: it never
 reverts a terminal attempt row to open, and a merge that cannot prove that
 invariant writes nothing and keeps the candidate release. Succession is not a
 sufficient condition for deletion: before pruning a release, `_cleanup_releases`
-also checks both the candidate release's own registry and the live release's
-registry for an open row whose `launch_home=` names that candidate, and keeps
-the release if either check finds one or the evidence cannot be read — a
-release a live attempt still references is never pruned. Explicit or
+also checks release-local and stable registries for an open row whose
+`launch_home=` names that candidate, and keeps the release if any check finds
+one or the evidence cannot be read — a release a live attempt still references
+is never pruned. Explicit or
 inherited registries inside a bundle's versioned `source` tree are rejected
 with `versioned-source-registry-fallback`. Completion, logs, watchdog,
 heartbeat, and supervisor state continue to derive only from the accepted
 registry's parent.
 
+The final source-deletion boundary combines admission locks with fresh use
+evidence. While the installer transaction lock is held, pruning takes the
+stable `jobs.log.lock` and every extant managed release-local `jobs.log.lock`
+in deterministic, deduplicated order. It refreshes candidate-local and
+release-wide registry references, stable references, open route records,
+runtime activations, and the live-process scan inside that boundary; it then
+carries the final dispatch state, verifies the final source inventory/delta
+and registry containment, and removes the release before releasing those
+locks. The jobs locks stop new normal admissions on those stable and legacy
+paths. A writer admitted before the boundary is caught by its fresh registry
+or route record while admission is serialized, or by the process scan of its
+pinned environment, argv, cwd, executable, or open files. This includes a
+legacy `AGENT_DISPATCH_JOBS` path whose writer's `AGENT_HOME`/`launch_home`
+names a different release. Installer locking alone does not freeze arbitrary
+state files; the process and reference checks are part of the same deletion
+decision. Unreadable evidence, an unavailable lock, or any final mismatch
+keeps the release for a normal retry.
+
 Release pruning is evidence-bound. `harness update` retains every superseded
-release whose migration or retention-containment proof is incomplete. An
-operator may run `harness update --force-prune-unproven` only after reviewing
-the proposed loss: before deleting each unproven candidate, the updater
-appends its non-recoverable gap to the canonical `inventory/gaps.jsonl` with
-`discovered_by=forced-prune`; a failed gap commit deletes nothing. The flag
-does not override current/activation retention, `_release_in_use` or
-`_succeed_dispatch_state`: open rows and routes whose resolved `launch_home`
-names the release, and live processes whose `AGENT_HOME` names it, still keep
-it. It is never selected automatically. Re-running the command when the
-requested release is already current still performs this checked prune pass.
+release whose migration quiescence/final-delta proof is incomplete. The
+existing `harness update --force-prune-unproven` path applies only to an
+unproven registry-containment proof: before that deletion, the updater appends
+its non-recoverable gap to canonical `inventory/gaps.jsonl` with
+`discovered_by=forced-prune`; a failed gap commit deletes nothing. It cannot
+override current/activation retention, `_release_in_use`,
+`_succeed_dispatch_state`, or the SD-112 writer boundary/final-delta check.
+Open rows and routes whose resolved `launch_home` names the release, and live
+processes whose pinned state names it, still keep it. The flag is never
+selected automatically. Re-running the command when the requested release is
+already current still performs this checked prune pass.
 
 The legacy/current collision exception covers only these observations:
 `logs/dispatch-session-sweep.log`, `logs/<slug>.heartbeat`, and

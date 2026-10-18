@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -1474,13 +1475,44 @@ def _merge_registry_rows(
     return merged, ok
 
 
+_REGISTRY_LOCK_LOCAL = threading.local()
+
+
+def _registry_lock_identity(lock_path: Path) -> str:
+    """Canonical identity used only to deduplicate this process's lock holds."""
+    return os.path.normcase(os.path.realpath(lock_path))
+
+
 @contextlib.contextmanager
 def _registry_lock(jobs: Path):
-    """flock the registry's `<jobs>.lock`, mirroring `_distribution_lock()`."""
+    """flock `<jobs>.lock`, reentrant only for nested calls on this thread.
+
+    Cleanup takes a stable ordered set of registry admission locks while its
+    carry helpers also use `_registry_lock()` for individual merges. The
+    thread-local ownership table lets those nested calls reuse the already-held
+    OS lock. Other threads and processes open their own descriptor and remain
+    serialized by flock.
+    """
     jobs.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(f"{jobs}.lock")
     if lock_path.is_symlink():
         raise OSError(f"dispatch registry lock must not be a symlink: {lock_path}")
+    identity = _registry_lock_identity(lock_path)
+    owned = getattr(_REGISTRY_LOCK_LOCAL, "owned", None)
+    if owned is None:
+        owned = {}
+        _REGISTRY_LOCK_LOCAL.owned = owned
+    owned_paths = getattr(_REGISTRY_LOCK_LOCAL, "owned_paths", None)
+    if owned_paths is None:
+        owned_paths = {}
+        _REGISTRY_LOCK_LOCAL.owned_paths = owned_paths
+    if identity in owned:
+        owned[identity] += 1
+        try:
+            yield
+        finally:
+            owned[identity] -= 1
+        return
     handle = lock_path.open("a+b")
     try:
         try:
@@ -1491,13 +1523,73 @@ def _registry_lock(jobs: Path):
             import msvcrt
 
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        owned[identity] = 1
+        owned_paths[identity] = lock_path
         yield
     finally:
+        owned.pop(identity, None)
+        owned_paths.pop(identity, None)
         try:
             if "fcntl" in sys.modules:
                 sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
         finally:
             handle.close()
+
+
+def _installed_legacy_registry_paths(candidate: Path) -> list[Path]:
+    """Enumerate legacy release registries that can admit release-bound work.
+
+    Include every real managed release `.dispatch/jobs.log`, not only the
+    candidate's and current release's registries: a writer may use a pinned
+    legacy jobs path while its `launch_home` names a different release. The
+    stable registry is added separately by `_dispatch_writer_boundary()`.
+    """
+    jobs_paths = {candidate / ".dispatch" / "jobs.log"}
+    releases = data_root() / "releases"
+    if releases.is_dir() and not releases.is_symlink():
+        try:
+            with os.scandir(releases) as entries:
+                for entry in entries:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    dispatch = Path(entry.path) / ".dispatch"
+                    if dispatch.is_dir() and not dispatch.is_symlink():
+                        jobs_paths.add(dispatch / "jobs.log")
+        except OSError as exc:
+            raise OSError(f"could not enumerate legacy dispatch registries under {releases}") from exc
+    try:
+        live_release = current_path().resolve(strict=True)
+    except OSError:
+        live_release = None
+    if live_release is not None:
+        live_dispatch = live_release / ".dispatch"
+        if live_dispatch.is_dir() and not live_dispatch.is_symlink():
+            jobs_paths.add(live_dispatch / "jobs.log")
+    return sorted(jobs_paths, key=lambda jobs: _registry_lock_identity(Path(f"{jobs}.lock")))
+
+
+def _dispatch_writer_boundary_paths(candidate: Path, environ: dict[str, str]) -> list[Path]:
+    """Return the stable and extant legacy admission registries in lock order."""
+    jobs_paths = {stable_state_root(environ) / "jobs.log"}
+    for jobs in _installed_legacy_registry_paths(candidate):
+        if jobs.parent.is_dir() and not jobs.parent.is_symlink():
+            jobs_paths.add(jobs)
+    by_identity = {}
+    for jobs in jobs_paths:
+        lock_path = Path(f"{jobs}.lock")
+        if lock_path.is_symlink():
+            raise OSError(f"dispatch registry lock must not be a symlink: {lock_path}")
+        by_identity.setdefault(_registry_lock_identity(lock_path), jobs)
+    return [by_identity[key] for key in sorted(by_identity)]
+
+
+@contextlib.contextmanager
+def _dispatch_writer_boundary(candidate: Path, environ: dict[str, str]):
+    """Hold every known stable/legacy admission lock through release removal."""
+    with contextlib.ExitStack() as stack:
+        for jobs in _dispatch_writer_boundary_paths(candidate, environ):
+            stack.enter_context(_registry_lock(jobs))
+        yield
 
 
 # destructive-ok: reason=atomically replace one dispatch registry; boundary=one validated jobs registry and its mkstemp sibling
@@ -1527,10 +1619,10 @@ def _succeed_registry_rows(stale_jobs: Path, live_jobs: Path) -> bool:
     instead of the byte-copy `_succeed_dispatch_state` uses for every other
     file under `.dispatch`. A byte copy either skips the whole live registry
     (destination exists) or clobbers it outright; neither preserves rows the
-    live registry gained after the stale snapshot was taken. Never holds
-    both registries' locks at once: the stale file is read and released
-    before the live lock is acquired, so there is no lock-ordering deadlock
-    surface with any other reader/writer of these two files.
+    live registry gained after the stale snapshot was taken. This helper
+    acquires its stale and live locks one at a time. Cleanup may already hold
+    both through its deterministic outer admission boundary; the nested calls
+    then reuse those same-thread lock descriptors.
     """
     if not stale_jobs.is_file():
         return True
@@ -2604,21 +2696,13 @@ def _stable_registry_snapshot(environ: dict[str, str]) -> list[dict]:
 def _release_reference_registries(candidate: Path) -> list[Path]:
     """Registries that can name `candidate` as a launch home.
 
-    Two registries can hold an open row pointing at this release: the
-    release's own `.dispatch/jobs.log` (state-root chain (3) -- a session
-    that never had `AGENT_DISPATCH_JOBS` registers directly under whichever
-    release `current` pointed at when it ran), and the live release's
-    `.dispatch/jobs.log` (a row `_succeed_dispatch_state()` already carried
-    forward before this candidate is deleted).
+    Any installed release may still be the pinned `AGENT_DISPATCH_JOBS`
+    writer root while its open row's `launch_home` points elsewhere. Read all
+    extant release-local registries under the writer boundary, alongside the
+    stable registry snapshot, so launch-home and jobs-path identities are not
+    conflated.
     """
-
-    registries = [candidate / ".dispatch" / "jobs.log"]
-    try:
-        live_release = current_path().resolve(strict=True)
-    except OSError:
-        return registries
-    registries.append(live_release / ".dispatch" / "jobs.log")
-    return registries
+    return _installed_legacy_registry_paths(candidate)
 
 
 # SD-115 axis 4 (b): every registry loop above resolves `launch_home` at
@@ -3173,6 +3257,14 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
             except OSError:
                 continue
             readable = True
+            if (entry.name == str(os.getpid()) and link.parent == entry / "fd"
+                    and _registry_lock_identity(Path(value)) in
+                    getattr(_REGISTRY_LOCK_LOCAL, "owned_paths", {})):
+                # The deletion boundary itself owns these exact lock files.
+                # Ignore only those descriptors on this thread; the current
+                # process's environment/argv/cwd/exe and every other fd remain
+                # part of the live-use check.
+                continue
             if value == real or value.startswith(prefix):
                 return True, f"live-process:{entry.name}"
             if (link.parent == entry / "fd" and Path(value).parent == candidate.parent.resolve()
@@ -3210,13 +3302,11 @@ def _release_in_use(
     """Return (in_use, reason). Undecidable evidence returns (True, ...).
 
     `stable_snapshot` is `_stable_registry_snapshot()`'s pre-parsed result --
-    the third reference-registry source (decision 2): the stable per-user
-    registry's `launch_home`-bearing open rows. `launch_home`, `commonpath`,
-    and the two-registry `is_live_registry` branch below are byte-for-byte
-    unchanged; the stable source is purely additive and evaluated after them.
-    A stable-registry open row with no `launch_home` is never candidate-local
-    authority on its own (unlike a candidate-local legacy row) -- it is not
-    scoped to any one release.
+    the stable per-user registry's `launch_home`-bearing open rows. Release-
+    local references are read from every installed legacy registry by
+    `_release_reference_registries()`, so a pinned jobs path remains visible
+    even when its row's `launch_home` names another release. A stable-registry
+    open row with no `launch_home` is not candidate-local authority on its own.
 
     `route_snapshot` is `_open_route_launch_homes()`'s pre-parsed result
     (SD-115 axis 4 (b)) -- the fourth reference source, evaluated last and
@@ -3226,8 +3316,9 @@ def _release_in_use(
     (SD-115 axis 4 (a)) that a plain judgment-time `realpath()` on the
     registry row would otherwise re-resolve to whatever is current now.
     `route_snapshot=None` keeps the existing direct-call/test surface
-    working unchanged; the production caller, `_cleanup_releases`, always
-    passes a real snapshot computed once outside the per-candidate loop.
+    working unchanged. Production pruning takes a fresh route snapshot after
+    acquiring the writer boundary; the earlier snapshot in `_cleanup_releases`
+    is used only by the bounded orphan-cache pass.
     """
 
     try:
@@ -3418,6 +3509,69 @@ def _release_keep_message(candidate: Path, why: str) -> str:
             "deleting it")
 
 
+# destructive-ok: reason=remove only retention-proved version directories; boundary=canonical release child while stable and legacy admission locks remain held
+def _prune_release_under_writer_boundary(
+    candidate: Path, *, force_prune_unproven: bool = False
+) -> tuple[bool, str]:
+    """Carry, refresh deletion evidence, verify, and remove under admission locks.
+
+    `_distribution_lock()` serializes installer operations, while the stable
+    and release-local `<jobs>.lock` files serialize normal dispatch admission.
+    The process and reference scans are repeated after acquiring those locks:
+    an already-admitted legacy writer may write non-registry files without
+    holding the jobs lock, so its pinned environment / argv / cwd / executable
+    / descriptors and its fresh registry or route evidence must also be clear.
+    """
+    environ = os.environ
+    try:
+        with _dispatch_writer_boundary(candidate, environ):
+            stable_snapshot = _stable_registry_snapshot(environ)
+            route_snapshot = _open_route_launch_homes(environ)
+            in_use, why = _release_in_use(candidate, stable_snapshot, route_snapshot)
+            if in_use:
+                return False, why
+            held, why = _release_held_by_live_process(candidate)
+            if held:
+                return False, why
+            if _release_projection_referenced(candidate):
+                return False, "runtime-activation-reference"
+
+            # Merge helpers take `_registry_lock()` internally. Its
+            # same-thread reentrancy reuses this boundary's descriptors, while
+            # every other thread/process still waits on the underlying flock.
+            if not _succeed_dispatch_state(candidate):
+                return False, "dispatch-state-carry-forward-incomplete"
+
+            # SD-112 source quiescence and final delta are not force-prunable:
+            # an unknown or late source byte stays in its release for retry.
+            migration_ok, migration_reason = _migration_deletion_precondition(candidate, environ)
+            if not migration_ok:
+                return False, migration_reason
+
+            containment_ok, containment_reason = _retention_containment_precondition(
+                candidate, environ
+            )
+            if not containment_ok:
+                if not force_prune_unproven:
+                    return False, containment_reason
+                if not _commit_forced_prune_gap_record(candidate, environ, containment_reason):
+                    return False, "dispatch-registry-gap-record-commit-failed"
+
+            # Keep the exact same admission boundary through removal. A writer
+            # admitted before the locks was caught by the fresh process check;
+            # a new admission on any known stable/legacy registry cannot begin
+            # until after this removal attempt finishes.
+            try:
+                shutil.rmtree(candidate)
+            except OSError as exc:
+                return False, f"release-removal-failed:{exc}"
+            if candidate.exists() or candidate.is_symlink():
+                return False, "release-remains-after-prune"
+            return True, ""
+    except (OSError, DistributionError) as exc:
+        return False, f"dispatch-writer-boundary-unavailable:{exc}"
+
+
 def _release_pycache_base() -> Path | None:
     """Return the default PYTHONPYCACHEPREFIX subtree for managed releases."""
     try:
@@ -3530,18 +3684,14 @@ def _cleanup_orphan_release_pycache(
             )
 
 
-# destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root
 def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) -> None:
     releases = data_root() / "releases"
     if not releases.is_dir() or releases.is_symlink():
         return
-    # Parsed once, outside the per-candidate loop (decision 2) -- an
-    # unreadable/malformed stable registry raises here and aborts the whole
-    # cleanup pass rather than being silently re-attempted per candidate.
+    # These snapshots feed only the bounded orphan-cache pass below. Each
+    # candidate release gets fresh stable, route, local-registry, and process
+    # evidence inside `_prune_release_under_writer_boundary()`.
     stable_snapshot = _stable_registry_snapshot(os.environ)
-    # Also parsed once, outside the per-candidate loop -- SD-115 axis 4 (b)'s
-    # fourth reference source (route records; see `_release_in_use`'s
-    # docstring).
     route_snapshot = _open_route_launch_homes(os.environ)
     candidates = sorted(
         (path for path in releases.iterdir() if path.is_dir() and not path.is_symlink()),
@@ -3554,88 +3704,29 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         if candidate in keep or retained < 2:
             retained += 1
             continue
-        in_use, why = _release_in_use(candidate, stable_snapshot, route_snapshot)
-        if in_use:
-            print(_release_keep_message(candidate, why), file=sys.stderr)
-            continue
-        # A runtime activation is a reference this loop never consulted. That was
-        # survivable while a packaged bundle held its own copy; once a bundle
-        # addresses the release by symlink, deleting the release leaves the
-        # runtime pointing at nothing and `harness runtime status` reports
-        # `missing`. `_release_in_use` cannot see this: it reads dispatch rows and
-        # routes, so it covers a release pinned by an OPEN attempt (SD-115 axis 4)
-        # and not one pinned by an idle activation -- an update that skips a
-        # runtime as `foreign` leaves exactly that shape behind.
-        held, why_held = _release_held_by_live_process(candidate)
-        if held:
-            print(
-                f"harness release: {candidate} is still in use by a live process "
-                f"({why_held}); keeping it instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        if _release_projection_referenced(candidate):
-            print(
-                f"harness release: {candidate} is still the activation source of a "
-                "runtime; keeping it instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        if not _succeed_dispatch_state(candidate):
-            print(
-                f"harness release: dispatch state carry-forward incomplete for "
-                f"{candidate}; keeping the release instead of deleting it",
-                file=sys.stderr,
-            )
-            continue
-        # Both preconditions are "unproven-ness" checks -- a content mismatch
-        # (real corruption, e.g. B-7/B-8's out-of-band divergent copy) and a
-        # broken/missing dispatch-registry containment proof are the same
-        # kind of gap, and both route through the identical
-        # force_prune_unproven + gap-precommit gate (SD-115 §13.34.3-(2)).
-        # `_release_in_use`/`_succeed_dispatch_state` above are never
-        # force-overridable: those guard live/unmigrated state, not proof.
-        unproven_reasons = []
-        migration_ok, migration_reason = _migration_deletion_precondition(candidate, os.environ)
-        if not migration_ok:
-            unproven_reasons.append(migration_reason)
-        containment_ok, containment_reason = _retention_containment_precondition(candidate, os.environ)
-        if not containment_ok:
-            unproven_reasons.append(containment_reason)
-        if unproven_reasons:
-            if not force_prune_unproven:
-                for reason in unproven_reasons:
-                    print(
-                        f"harness release: {reason} for {candidate}; keeping it "
-                        "instead of deleting it",
-                        file=sys.stderr,
-                    )
-                continue
-            gap_committed = all(
-                _commit_forced_prune_gap_record(candidate, os.environ, reason)
-                for reason in unproven_reasons
-            )
-            if not gap_committed:
+        removed, why = _prune_release_under_writer_boundary(
+            candidate, force_prune_unproven=force_prune_unproven
+        )
+        if not removed:
+            if why.startswith("live-process:"):
                 print(
-                    f"harness release: registry-gap record commit failed for {candidate}; "
-                    "keeping it instead of deleting it",
+                    f"harness release: {candidate} is still in use by a live process "
+                    f"({why}); keeping it instead of deleting it",
                     file=sys.stderr,
                 )
-                continue
-        try:
-            shutil.rmtree(candidate)
-        except OSError as exc:
-            print(
-                f"harness release: could not remove {candidate}: {exc}; "
-                "keeping its pycache",
-                file=sys.stderr,
-            )
-            continue
-        if candidate.exists() or candidate.is_symlink():
-            print(
-                f"harness release: {candidate} remains after prune; keeping its pycache",
-                file=sys.stderr,
-            )
+            elif why.startswith("release-removal-failed:"):
+                print(
+                    f"harness release: could not remove {candidate}: {why.partition(':')[2]}; "
+                    "keeping its pycache",
+                    file=sys.stderr,
+                )
+            elif why in {"dispatch-state-carry-forward-incomplete", "release-remains-after-prune"}:
+                print(
+                    f"harness release: {candidate} {why}; keeping it and its pycache",
+                    file=sys.stderr,
+                )
+            else:
+                print(_release_keep_message(candidate, why), file=sys.stderr)
             continue
         if not _remove_release_pycache(candidate):
             cache_failures.add(candidate.name)

@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2348,6 +2349,164 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["discovered_by"], "forced-prune")
         self.assertFalse(gaps[0]["recoverable"])
+
+    def _promote_candidate(self, candidate):
+        result = DISTRIBUTION.run_dispatch_state_migration(
+            candidate / ".dispatch", environ=os.environ
+        )
+        self.assertEqual(result["status"], "completed", result)
+
+    def test_late_legacy_writer_is_carried_under_final_verification_removal_boundary(self):
+        import subprocess
+        import fcntl
+
+        v1, v2, v3 = self._three_release_chain()
+        (v2 / ".dispatch").mkdir()
+        (v2 / ".dispatch" / "jobs.log").write_text(
+            _row("2026-08-01T00:00:00Z", "done", "att-other-home",
+                 f",launch_home={v3}") + "\n",
+            encoding="utf-8",
+        )
+        source_jobs = v1 / ".dispatch" / "jobs.log"
+        source_jobs.write_text(source_jobs.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self._promote_candidate(v1)
+        candidate_jobs = source_jobs
+        stable_jobs = DISTRIBUTION.stable_state_root(os.environ) / "jobs.log"
+        other_legacy_jobs = v2 / ".dispatch" / "jobs.log"
+        late_evidence = v1 / ".dispatch" / "completion" / "late-evidence.json"
+        late_row = _row("2026-08-02T00:00:00Z", "done", "att-late-writer",
+                        f",launch_home={v2}")
+        writer_code = """
+import fcntl, pathlib, sys
+jobs, evidence, row = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+with open(str(jobs) + '.lock', 'a+b') as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with jobs.open('a', encoding='utf-8') as registry:
+        registry.write(row + '\\n')
+        registry.flush()
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_bytes(b'late non-registry evidence\\n')
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+"""
+        writer_env = dict(os.environ)
+        writer_env["AGENT_HOME"] = str(v2)
+        writer_env["AGENT_DISPATCH_JOBS"] = str(candidate_jobs)
+        real_routes = DISTRIBUTION._open_route_launch_homes
+        route_discoveries = 0
+
+        def discover_then_write(environ):
+            nonlocal route_discoveries
+            result = real_routes(environ)
+            route_discoveries += 1
+            if route_discoveries == 1:
+                subprocess.run(
+                    [sys.executable, "-c", writer_code, str(candidate_jobs),
+                     str(late_evidence), late_row],
+                    env=writer_env, check=True, capture_output=True, text=True,
+                )
+            return result
+
+        def assert_lock_is_held(jobs):
+            with open(str(jobs) + ".lock", "a+b") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                self.fail(f"writer admission lock was not held: {jobs}.lock")
+
+        competitor_result = {}
+
+        def competing_admission_probe():
+            with open(str(stable_jobs) + ".lock", "a+b") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    competitor_result["blocked"] = True
+                else:
+                    competitor_result["blocked"] = False
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+
+        real_precondition = DISTRIBUTION._migration_deletion_precondition
+        real_rmtree = DISTRIBUTION.shutil.rmtree
+
+        def verify_in_boundary(candidate, environ):
+            if candidate == v1:
+                for jobs in (candidate_jobs, stable_jobs, other_legacy_jobs):
+                    assert_lock_is_held(jobs)
+                competitor = threading.Thread(target=competing_admission_probe)
+                competitor.start()
+                competitor.join(timeout=5)
+                self.assertFalse(competitor.is_alive(), "admission probe must not wait for the boundary")
+                self.assertTrue(competitor_result.get("blocked"), "stable admission crossed the delete boundary")
+            return real_precondition(candidate, environ)
+
+        def remove_in_boundary(path, *args, **kwargs):
+            if Path(path) == v1:
+                for jobs in (candidate_jobs, stable_jobs, other_legacy_jobs):
+                    assert_lock_is_held(jobs)
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(DISTRIBUTION, "_open_route_launch_homes",
+                               side_effect=discover_then_write), \
+             mock.patch.object(DISTRIBUTION, "_migration_deletion_precondition",
+                               side_effect=verify_in_boundary), \
+             mock.patch.object(DISTRIBUTION.shutil, "rmtree", side_effect=remove_in_boundary):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(route_discoveries, 2, "cleanup must refresh route evidence inside the boundary")
+        self.assertFalse(v1.exists())
+        self.assertEqual(
+            (DISTRIBUTION.stable_state_root(os.environ) / "completion" / "late-evidence.json").read_bytes(),
+            b"late non-registry evidence\n",
+        )
+        carried_rows = stable_jobs.read_text(encoding="utf-8")
+        self.assertIn("att-late-writer", carried_rows)
+
+    def test_live_writer_on_legacy_jobs_path_with_other_launch_home_is_retained_then_retried(self):
+        import subprocess
+
+        v1, v2, v3 = self._three_release_chain()
+        self._promote_candidate(v1)
+        jobs = v1 / ".dispatch" / "jobs.log"
+        child_env = dict(os.environ)
+        child_env["AGENT_HOME"] = str(v2)
+        child_env["AGENT_DISPATCH_JOBS"] = str(jobs)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(30)"],
+            cwd=v2, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            DISTRIBUTION._cleanup_releases(keep=set())
+            self.assertTrue(v1.is_dir(), "the pinned legacy jobs path must keep the source release")
+        finally:
+            child.terminate()
+            child.communicate(timeout=5)
+
+        DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertFalse(v1.exists(), "unused source should prune on the normal retry after writer exit")
+
+    def test_unknown_source_evidence_and_unreadable_stable_registry_keep_release(self):
+        v1, v2, v3 = self._three_release_chain()
+        self._promote_candidate(v1)
+        outside = self.base / "outside-evidence.json"
+        outside.write_bytes(b"outside\n")
+        unknown = v1 / ".dispatch" / "completion" / "unknown.json"
+        unknown.parent.mkdir(parents=True, exist_ok=True)
+        unknown.symlink_to(outside)
+
+        DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertTrue(v1.is_dir())
+        self.assertEqual(outside.read_bytes(), b"outside\n")
+
+        unknown.unlink()
+        stable_jobs = DISTRIBUTION.stable_state_root(os.environ) / "jobs.log"
+        stable_jobs.write_text("malformed registry row\n", encoding="utf-8")
+        with self.assertRaises(DISTRIBUTION.DistributionError):
+            DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertTrue(v1.is_dir(), "unreadable global reference evidence must retain source")
 
 
 class ReviewSelfDispositionAliasTest(unittest.TestCase):

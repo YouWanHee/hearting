@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -33,6 +34,28 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.patch = mock.patch.dict(os.environ, self.environment, clear=True)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+
+    def test_registry_lock_reenters_on_owner_thread_but_blocks_other_threads(self) -> None:
+        jobs = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "registry-boundary" / "jobs.log"
+        started = threading.Event()
+        acquired = threading.Event()
+
+        def competing_admission() -> None:
+            started.set()
+            with distribution._registry_lock(jobs):
+                acquired.set()
+
+        worker = threading.Thread(target=competing_admission)
+        with distribution._registry_lock(jobs):
+            with distribution._registry_lock(jobs):
+                self.assertTrue(Path(f"{jobs}.lock").is_file())
+            worker.start()
+            self.assertTrue(started.wait(timeout=2))
+            self.assertFalse(acquired.wait(timeout=0.1), "another thread bypassed the owner lock")
+
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "competing admission did not resume after unlock")
+        self.assertTrue(acquired.is_set())
 
     # destructive-ok: reason=install a same-byte foreign successor for CAS verification; boundary=two exact symlink/file fixture leaves below HEARTING_FIXTURE_ROOT
     def test_rollback_preserves_exact_successors(self) -> None:
