@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: design-refs
 description: "Use only when autopilot-design dispatches visual-reference collection and brief creation. Not for top-level user requests or primary capability routing."
 argument-hint: "<design task> [--design <path>] [--refs <image paths>] [--no-web]"
 metadata:

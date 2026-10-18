@@ -1,6 +1,5 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
-name: autopilot-ship
 description: "Use when preparing deployment/release or a delivery archive (package mode). Owns release; default preset. Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
 argument-hint: "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]"
 metadata:

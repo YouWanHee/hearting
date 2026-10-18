@@ -33,6 +33,7 @@ sys.modules[SPEC.name] = JOIN
 SPEC.loader.exec_module(JOIN)
 sys.path.insert(0, str(HERE))
 import dispatch_contract as D  # noqa: E402
+import dispatch_observation_log as OBS  # noqa: E402
 import dispatch_terminal_commit as TERMINAL  # noqa: E402
 import dispatch_supervision  # noqa: E402
 
@@ -4517,7 +4518,7 @@ class RefusalWriterOwnFailureStaysSilentTest(unittest.TestCase):
             jobs.write_text("", encoding="utf-8")
             log_dir = Path(td) / "logs"
             with mock.patch.object(
-                Path, "mkdir", side_effect=OSError("simulated refusal-ledger mkdir failure")
+                OBS.os, "mkdir", side_effect=OSError("simulated refusal-ledger mkdir failure")
             ):
                 JOIN.log_delivery_refusal(jobs, "att-writer-failure", "some-reason")
             # No exception escaped (verified by reaching this line), and --

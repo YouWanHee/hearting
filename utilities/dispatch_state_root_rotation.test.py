@@ -10,6 +10,7 @@ $AGENT_HOME/.dispatch/completion, which _cleanup_releases deletes wholesale
 every second rotation.
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -17,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -613,8 +615,22 @@ class RetryAfterFailedSuccessionStaysFailedTest(unittest.TestCase):
         self.assertFalse(DISTRIBUTION._succeed_dispatch_state(self.release_a))
 
         # Repair the live copy with a valid sidecar still recording the old
-        # release; the next retry must now succeed AND re-anchor it.
+        # release. The malformed legacy source still blocks deletion.
         live.write_text(
+            json.dumps(
+                {
+                    "completion_marker": str(stale_dir / "plan.json"),
+                    "completion_marker_history": str(stale_dir / "plan.1.json"),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(DISTRIBUTION._succeed_dispatch_state(self.release_a))
+        source_sidecar = stale_dir / "plan.att-bad.attempt.json"
+        source_sidecar.write_text(
             json.dumps(
                 {
                     "completion_marker": str(stale_dir / "plan.json"),
@@ -1799,6 +1815,191 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         self.assertTrue(n1.is_dir())
         self.assertTrue(n2.is_dir())
 
+    def test_changed_stable_reference_after_global_discovery_keeps_release(self):
+        n = self._make_release("v-late-reference", 1000.0)
+        self._make_release("v-late-reference-next", 2000.0)
+        n2 = self._make_release("v-late-reference-current", 3000.0)
+        self._seal_current(n2)
+        real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
+        published = False
+
+        def publish_reference(environ, extra_jobs_paths=(), legacy_registry_paths=None):
+            nonlocal published
+            if not published:
+                self._write_registry_row("open", "att-late-reference", f"launch_home={n}")
+                published = True
+            return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            DISTRIBUTION, "_dispatch_cleanup_boundary_paths",
+            side_effect=publish_reference,
+        ), contextlib.redirect_stderr(stderr):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(n.is_dir())
+        self.assertIn("open-attempt:att-late-reference", stderr.getvalue())
+
+    def test_new_route_after_global_discovery_is_refreshed_before_prune(self):
+        n = self._make_release("v-late-route", 1000.0)
+        self._make_release("v-late-route-next", 2000.0)
+        n2 = self._make_release("v-late-route-current", 3000.0)
+        self._seal_current(n2)
+        real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        discoveries = 0
+        published = False
+
+        def publish_route(environ, extra_jobs_paths=(), legacy_registry_paths=None):
+            nonlocal published
+            if not published:
+                self._write_registry_row(
+                    "open", "att-late-route", f"artifact_root={self.artifact_root}"
+                )
+                self._write_route_record("rt-95e2db8fa2b8e5f5", n)
+                published = True
+            return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            DISTRIBUTION, "_dispatch_cleanup_boundary_paths",
+            side_effect=publish_route,
+        ), mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), contextlib.redirect_stderr(stderr):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(discoveries, 2, "new route input should trigger one bounded refresh")
+        self.assertTrue(n.is_dir())
+        self.assertIn("open-route:rt-95e2db8fa2b8e5f5", stderr.getvalue())
+
+    def test_exhausted_unstable_route_refresh_never_prunes_from_partial_inventory(self):
+        releases = [self._make_release(f"v-unstable-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "done", "att-unstable-index", f"artifact_root={self.artifact_root}"
+        )
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        published_targets = [releases[4], releases[3], releases[2], releases[0]]
+        discoveries = 0
+
+        def publish_after_partial_scan(environ, *, inventory=None, **kwargs):
+            nonlocal discoveries
+            observed = real_discovery(environ, inventory=inventory, **kwargs)
+            if discoveries < len(published_targets):
+                route_id = "rt-" + hashlib.sha256(
+                    f"unstable-{discoveries}".encode()
+                ).hexdigest()[:16]
+                self._write_route_record(route_id, published_targets[discoveries])
+            discoveries += 1
+            # Model the reader contract directly: it returns what it observed,
+            # while declaring that the inventory changed during discovery.
+            inventory["unstable"] = True
+            inventory["fingerprints"]["unstable"] = True
+            return observed
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes",
+            side_effect=publish_after_partial_scan,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(discoveries, 4, "initial discovery plus three bounded refreshes")
+        self.assertTrue(all(release.is_dir() for release in releases))
+        self.assertTrue(releases[0].is_dir(), "the last undiscovered route target was pruned")
+
+    def test_route_published_after_later_prune_protects_oldest_candidate(self):
+        releases = [self._make_release(f"v-later-route-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "done", "att-later-route-root", f"artifact_root={self.artifact_root}"
+        )
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        real_cache_removal = DISTRIBUTION._remove_release_pycache
+        discoveries = 0
+        published = False
+        route_id = "rt-" + hashlib.sha256(b"later-published-route").hexdigest()[:16]
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        def publish_after_prune(release):
+            nonlocal published
+            result = real_cache_removal(release)
+            if release == releases[2] and not published:
+                self._write_route_record(route_id, releases[0])
+                published = True
+            return result
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), mock.patch.object(
+            DISTRIBUTION, "_remove_release_pycache", side_effect=publish_after_prune,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(published)
+        self.assertEqual(discoveries, 2, "later publication should trigger one outside-epoch refresh")
+        self.assertFalse(releases[2].exists(), "the first eligible release should be reclaimed")
+        self.assertTrue(releases[0].is_dir(), "the later route reference was ignored")
+
+    def test_changed_existing_stable_reference_after_later_prune_is_refreshed(self):
+        releases = [self._make_release(f"v-later-change-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "open", "att-changed-reference",
+            f"artifact_root={self.artifact_root},launch_home={releases[-1]}",
+        )
+        stable_jobs = self.stable_root / "jobs.log"
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        real_cache_removal = DISTRIBUTION._remove_release_pycache
+        discoveries = 0
+        changed = False
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        def change_reference_after_prune(release):
+            nonlocal changed
+            result = real_cache_removal(release)
+            if release == releases[2] and not changed:
+                lines = stable_jobs.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 1)
+                fields = lines[0].split("\t")
+                pipe = [
+                    f"launch_home={releases[0]}" if item.startswith("launch_home=") else item
+                    for item in fields[5].split(",")
+                ]
+                fields[5] = ",".join(pipe)
+                with DISTRIBUTION._registry_lock(stable_jobs):
+                    DISTRIBUTION._atomic_registry_write(stable_jobs, ["\t".join(fields)])
+                changed = True
+            return result
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), mock.patch.object(
+            DISTRIBUTION, "_remove_release_pycache", side_effect=change_reference_after_prune,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(changed)
+        self.assertEqual(discoveries, 2, "atomic replacement of an existing reference must refresh")
+        self.assertFalse(releases[2].exists(), "the first eligible release should be reclaimed")
+        self.assertTrue(releases[0].is_dir(), "the changed existing reference was ignored")
+
     def test_forced_prune_never_overrides_an_open_sealed_release(self):
         n = self._make_release("vN", 1000.0)
         self._make_release("vN+1", 2000.0)
@@ -2106,6 +2307,36 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
             "route_id=rt-b3b14,harness=claude\n",
             encoding="utf-8",
         )
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        stable_root.parent.mkdir(parents=True, exist_ok=True)
+        DISTRIBUTION._ensure_new_directory_mode(stable_root, 0o700)
+        observation_values = (
+            ("logs/dispatch-session-sweep.log", b"legacy sweep bytes\n", b"current sweep bytes\n"),
+            ("logs/legacy-worker.heartbeat", b"legacy heartbeat bytes\n", b"current heartbeat bytes\n"),
+            ("plugin-load.legacy-worker.mark", b"legacy plugin marker\n", b"current plugin marker\n"),
+        )
+        source_dispatch = v1 / ".dispatch"
+        source_root_digest = hashlib.sha256(
+            os.fsencode(str(source_dispatch.resolve()))
+        ).hexdigest()
+        observation_paths = []
+        for relative_text, legacy_bytes, current_bytes in observation_values:
+            relative = Path(relative_text)
+            legacy_observation = source_dispatch / relative
+            current_observation = stable_root / relative
+            legacy_observation.parent.mkdir(parents=True, exist_ok=True)
+            current_observation.parent.mkdir(parents=True, exist_ok=True)
+            legacy_observation.write_bytes(legacy_bytes)
+            current_observation.write_bytes(current_bytes)
+            observation_archive = (
+                stable_root.parent / "dispatch-observation-archive"
+                / source_root_digest / relative
+                / hashlib.sha256(legacy_bytes).hexdigest()
+            )
+            observation_paths.append(
+                (legacy_observation, current_observation, observation_archive,
+                 legacy_bytes, current_bytes)
+            )
         completion_dir = v1 / ".dispatch" / "completion" / "rt-b3b14"
         completion_dir.mkdir(parents=True)
         (completion_dir / "plan.json").write_text(
@@ -2118,8 +2349,10 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
 
         result = DISTRIBUTION.run_dispatch_state_migration(v1 / ".dispatch", environ=os.environ)
         self.assertEqual(result["status"], "completed")
-        stable_root = DISTRIBUTION.stable_state_root(os.environ)
         self.assertTrue((stable_root / "completion" / "rt-b3b14" / "plan.json").is_file())
+        for _legacy, current_observation, observation_archive, legacy_bytes, current_bytes in observation_paths:
+            self.assertEqual(current_observation.read_bytes(), current_bytes)
+            self.assertEqual(observation_archive.read_bytes(), legacy_bytes)
 
         v2 = DISTRIBUTION.data_root() / "releases" / "v-b3b14-2"
         (v2 / "core").mkdir(parents=True)
@@ -2129,10 +2362,20 @@ class PostPromotionPruneAliasIntegrationTest(unittest.TestCase):
         (v3 / "core").mkdir(parents=True)
         (v3 / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         os.utime(v3, (future + 2, future + 2))
+        releases_root = Path(os.path.abspath(DISTRIBUTION.data_root() / "releases"))
+        v1_cache = (stable_root.parent / "pycache").joinpath(
+            *releases_root.parts[1:], v1.name
+        )
+        v1_cache.mkdir(parents=True)
+        (v1_cache / "legacy.pyc").write_bytes(b"derived cache")
         DISTRIBUTION.current_path().unlink()
         DISTRIBUTION.current_path().symlink_to(v3)
         DISTRIBUTION._cleanup_releases(keep=set())
         self.assertFalse(v1.exists(), "v1 must actually be pruned for this to be a real B-3/B-14 test")
+        self.assertFalse(v1_cache.exists(), "the pruned release's derived cache must also be removed")
+        for _legacy, current_observation, observation_archive, legacy_bytes, current_bytes in observation_paths:
+            self.assertEqual(current_observation.read_bytes(), current_bytes)
+            self.assertEqual(observation_archive.read_bytes(), legacy_bytes)
 
         # B-3: capability-route's continuation resolver reaches the stable
         # row through the alias, not the now-deleted release path.
@@ -2199,6 +2442,61 @@ class RetentionContainmentGateTest(unittest.TestCase):
         DISTRIBUTION.current_path().symlink_to(v3)
         return v1, v2, v3
 
+    def _missing_attempt_proof(self, candidate):
+        real_attempt_ids = DISTRIBUTION._release_attempt_ids
+
+        def missing(dispatch_root):
+            ids = real_attempt_ids(dispatch_root)
+            if dispatch_root == candidate / ".dispatch":
+                return ids | {"att-missing-from-surviving-root"}
+            return ids
+
+        return mock.patch.object(
+            DISTRIBUTION, "_release_attempt_ids", side_effect=missing
+        )
+
+    def _descriptor_path(self, fd):
+        try:
+            return Path(os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")))
+        except OSError:
+            return None
+
+    def _cleanup_with_gap_before_delete(
+        self, candidate, stable_root, minimum_rows, expected_rows=None, expected_cache=None
+    ):
+        import dispatch_registry_inventory as INV
+
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        real_rmtree = DISTRIBUTION.shutil.rmtree
+        deletion_evidence = []
+
+        def inspect_before_removal(path, *args, **kwargs):
+            if Path(path) == candidate:
+                data = gap_path.read_bytes()
+                self.assertTrue(data.endswith(b"\n"), "gap journal must end on a complete row")
+                line_count = len(data.splitlines())
+                self.assertGreaterEqual(line_count, minimum_rows)
+                rows = INV.read_gaps(stable_root)
+                if expected_rows is None:
+                    self.assertEqual(len(rows), line_count)
+                else:
+                    self.assertEqual(len(rows), expected_rows)
+                self.assertTrue(all(row["discovered_by"] == "forced-prune" for row in rows))
+                self.assertTrue(all(row["recoverable"] is False for row in rows))
+                if expected_cache is not None:
+                    self.assertTrue(expected_cache.exists(), "derived cache must remain until source removal")
+                deletion_evidence.append(data)
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(
+            DISTRIBUTION.shutil, "rmtree", side_effect=inspect_before_removal
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+        self.assertEqual(len(deletion_evidence), 1, "source removal must follow a readable gap")
+        if expected_cache is not None:
+            self.assertFalse(expected_cache.exists(), "derived cache must follow source removal")
+        return deletion_evidence[0]
+
     def test_containment_holds_after_carry_forward_and_prune_proceeds(self):
         v1, v2, v3 = self._three_release_chain()
         DISTRIBUTION._cleanup_releases(keep=set())
@@ -2222,6 +2520,10 @@ class RetentionContainmentGateTest(unittest.TestCase):
 
     def test_forced_prune_commits_gap_record_before_delete_and_refuses_when_commit_fails(self):
         v1, v2, v3 = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
         real = DISTRIBUTION._release_attempt_ids
 
         def broken(dispatch_root):
@@ -2235,15 +2537,63 @@ class RetentionContainmentGateTest(unittest.TestCase):
                 DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
             self.assertTrue(commit.called)
             self.assertTrue(v1.exists(), "a failed gap-record commit must refuse the delete")
+            self.assertTrue(cache.exists(), "a failed gap-record commit must keep derived cache")
 
             DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
         self.assertFalse(v1.exists(), "a successful gap-record commit must allow the forced delete")
+        self.assertFalse(cache.exists(), "derived cache follows successful source removal")
         stable_root = DISTRIBUTION.stable_state_root(os.environ)
         gaps = (stable_root / "inventory" / "gaps.jsonl").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(gaps), 1)
         row = json.loads(gaps[0])
         self.assertEqual(row["discovered_by"], "forced-prune")
         self.assertFalse(row["recoverable"])
+
+    def test_forced_prune_does_not_override_failed_sidecar_reanchor(self):
+        v1, _, _ = self._three_release_chain()
+        sidecar = (
+            v1 / ".dispatch" / "completion" / "rt-force-reanchor"
+            / "execute.att-force-reanchor.attempt.json"
+        )
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("{malformed sidecar\n", encoding="utf-8")
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+
+        with mock.patch.object(
+            DISTRIBUTION, "_commit_forced_prune_gap_record"
+        ) as commit:
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        commit.assert_not_called()
+        self.assertTrue(v1.exists(), "failed sidecar re-anchor must refuse forced deletion")
+        self.assertTrue(cache.exists(), "retained source must keep its derived cache")
+
+    def test_forced_prune_does_not_override_unreadable_containment_registry(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        real_attempt_ids = DISTRIBUTION._release_attempt_ids
+
+        def unreadable(dispatch_root):
+            if dispatch_root == v1 / ".dispatch":
+                return None
+            return real_attempt_ids(dispatch_root)
+
+        with mock.patch.object(
+            DISTRIBUTION, "_release_attempt_ids", side_effect=unreadable
+        ), mock.patch.object(
+            DISTRIBUTION, "_commit_forced_prune_gap_record"
+        ) as commit:
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        commit.assert_not_called()
+        self.assertTrue(v1.exists(), "unreadable containment proof must refuse forced deletion")
+        self.assertTrue(cache.exists(), "retained source must keep its derived cache")
 
     def test_existing_three_preconditions_are_unchanged_and_ordered_before_containment(self):
         v1, v2, v3 = self._three_release_chain()
@@ -2291,6 +2641,448 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["discovered_by"], "forced-prune")
         self.assertFalse(gaps[0]["recoverable"])
+
+    def test_forced_prune_gap_retries_positive_short_writes_before_removal(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        real_write = os.write
+        target_writes = 0
+
+        def short_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) == gap_path:
+                target_writes += 1
+                return real_write(fd, data[: min(13, len(data))])
+            return real_write(fd, data)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=short_write
+        ):
+            self._cleanup_with_gap_before_delete(v1, stable_root, minimum_rows=1)
+
+        self.assertGreater(target_writes, 1, "positive short writes must be completed in a loop")
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists(), "derived cache follows source removal")
+
+    def test_forced_prune_gap_partial_append_rolls_back_and_retry_preserves_prior_bytes(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        real_write = os.write
+        target_writes = 0
+
+        def interrupted_partial_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) != gap_path:
+                return real_write(fd, data)
+            target_writes += 1
+            if target_writes == 1:
+                return real_write(fd, data[:17])
+            if target_writes == 2:
+                raise InterruptedError()
+            return 0
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=interrupted_partial_write
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertEqual(target_writes, 3)
+        self.assertTrue(v1.exists(), "a partial append must not authorize source deletion")
+        self.assertTrue(cache.exists(), "failed gap append must retain derived cache")
+        self.assertEqual(gap_path.read_bytes(), original_bytes, "rollback must preserve prior journal bytes")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2
+            )
+        self.assertTrue(retry_bytes.startswith(original_bytes))
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
+
+    def test_forced_prune_gap_rollback_truncate_failure_is_framed_on_retry(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        real_write = os.write
+        real_ftruncate = os.ftruncate
+        target_writes = 0
+        partial_suffix = bytearray()
+        rollback_failed = False
+
+        def interrupted_partial_write(fd, data):
+            nonlocal target_writes
+            if self._descriptor_path(fd) != gap_path:
+                return real_write(fd, data)
+            target_writes += 1
+            if target_writes == 1:
+                partial = data[:17]
+                partial_suffix.extend(partial)
+                return real_write(fd, partial)
+            if target_writes == 2:
+                raise InterruptedError()
+            return 0
+
+        def fail_rollback_truncate_once(fd, length):
+            nonlocal rollback_failed
+            if self._descriptor_path(fd) == gap_path and not rollback_failed:
+                rollback_failed = True
+                raise OSError("injected forced-prune rollback truncation failure")
+            return real_ftruncate(fd, length)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=interrupted_partial_write
+        ), mock.patch.object(
+            DISTRIBUTION.os, "ftruncate", side_effect=fail_rollback_truncate_once
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertEqual(target_writes, 3)
+        self.assertTrue(rollback_failed, "the failure must leave the interrupted suffix for retry")
+        self.assertEqual(gap_path.read_bytes(), original_bytes + bytes(partial_suffix))
+        self.assertFalse(gap_path.read_bytes().endswith(b"\n"))
+        self.assertTrue(v1.exists(), "failed rollback must retain the source release")
+        self.assertTrue(cache.exists(), "failed rollback must retain the derived cache")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
+            )
+        self.assertTrue(retry_bytes.startswith(original_bytes + bytes(partial_suffix) + b"\n"))
+        self.assertFalse(v1.exists())
+
+    def test_forced_prune_gap_seeded_interrupted_tail_recovers_after_delimiter_write_failure(self):
+        v1, v2, v3 = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v3, os.environ, "seed-interrupted-row")
+        )
+        complete_bytes = gap_path.read_bytes()
+        interrupted_row = complete_bytes[len(original_bytes):]
+        self.assertTrue(interrupted_row.endswith(b"\n"))
+        seeded_tail = original_bytes + interrupted_row[:17]
+        gap_path.write_bytes(seeded_tail)
+
+        real_write = os.write
+        recovery_write_failed = False
+
+        def fail_delimiter_write_once(fd, data):
+            nonlocal recovery_write_failed
+            if self._descriptor_path(fd) == gap_path and not recovery_write_failed:
+                recovery_write_failed = True
+                self.assertTrue(data.startswith(b"\n"), "retry must first delimit the interrupted tail")
+                raise OSError("injected gap-tail delimiter write failure")
+            return real_write(fd, data)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "write", side_effect=fail_delimiter_write_once
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(recovery_write_failed)
+        self.assertEqual(gap_path.read_bytes(), seeded_tail)
+        self.assertTrue(v1.exists(), "failed tail recovery must retain the source release")
+        self.assertTrue(cache.exists(), "failed tail recovery must retain the derived cache")
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
+            )
+        self.assertTrue(retry_bytes.startswith(seeded_tail + b"\n"))
+        self.assertFalse(v1.exists())
+
+    def test_forced_prune_gap_valid_row_without_final_newline_stays_readable(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-readable-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        self.assertTrue(original_bytes.endswith(b"\n"))
+        unterminated_valid_row = original_bytes[:-1]
+        gap_path.write_bytes(unterminated_valid_row)
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_cache=cache
+            )
+
+        self.assertTrue(retry_bytes.startswith(unterminated_valid_row + b"\n"))
+        self.assertGreaterEqual(len(retry_bytes.splitlines()), 2)
+        self.assertFalse(v1.exists())
+
+    def test_forced_prune_gap_file_sync_failure_retains_release_and_retries(self):
+        v1, v2, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        gap_path = stable_root / "inventory" / "gaps.jsonl"
+        self.assertTrue(
+            DISTRIBUTION._commit_forced_prune_gap_record(v2, os.environ, "seed-existing-row")
+        )
+        original_bytes = gap_path.read_bytes()
+        seeded_tail = original_bytes + b'{"schema_version":'
+        gap_path.write_bytes(seeded_tail)
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_gap_file_sync(fd):
+            nonlocal failed
+            if self._descriptor_path(fd) == gap_path and not failed:
+                failed = True
+                raise OSError("injected forced-prune gap file sync failure")
+            return real_fsync(fd)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "fsync", side_effect=fail_gap_file_sync
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(failed, "the gap file must be synchronized before deletion")
+        self.assertTrue(v1.exists())
+        self.assertTrue(cache.exists())
+        self.assertEqual(gap_path.read_bytes(), seeded_tail)
+
+        with self._missing_attempt_proof(v1):
+            retry_bytes = self._cleanup_with_gap_before_delete(
+                v1, stable_root, minimum_rows=2, expected_rows=2, expected_cache=cache
+            )
+        self.assertTrue(retry_bytes.startswith(seeded_tail + b"\n"))
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
+
+    def test_forced_prune_gap_directory_sync_failure_retains_release_and_retries(self):
+        v1, _, _ = self._three_release_chain()
+        cache = DISTRIBUTION._release_pycache_path(v1)
+        self.assertIsNotNone(cache)
+        cache.mkdir(parents=True)
+        (cache / "derived.pyc").write_bytes(b"derived")
+        stable_root = DISTRIBUTION.stable_state_root(os.environ)
+        inventory_root = stable_root / "inventory"
+        gap_path = inventory_root / "gaps.jsonl"
+        self.assertFalse(inventory_root.exists(), "fixture must exercise first namespace creation")
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_inventory_directory_sync(fd):
+            nonlocal failed
+            if self._descriptor_path(fd) == inventory_root and not failed:
+                failed = True
+                raise OSError("injected forced-prune gap directory sync failure")
+            return real_fsync(fd)
+
+        with self._missing_attempt_proof(v1), mock.patch.object(
+            DISTRIBUTION.os, "fsync", side_effect=fail_inventory_directory_sync
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
+
+        self.assertTrue(failed, "the new inventory namespace must be synchronized")
+        self.assertTrue(v1.exists())
+        self.assertTrue(cache.exists())
+        self.assertEqual(gap_path.read_bytes(), b"", "failed directory sync must roll back the row")
+
+        with self._missing_attempt_proof(v1):
+            self._cleanup_with_gap_before_delete(v1, stable_root, minimum_rows=1)
+        self.assertFalse(v1.exists())
+        self.assertFalse(cache.exists())
+
+    def _promote_candidate(self, candidate):
+        result = DISTRIBUTION.run_dispatch_state_migration(
+            candidate / ".dispatch", environ=os.environ
+        )
+        self.assertEqual(result["status"], "completed", result)
+
+    def test_late_legacy_writer_is_carried_under_final_verification_removal_boundary(self):
+        import subprocess
+        import fcntl
+
+        v1, v2, v3 = self._three_release_chain()
+        (v2 / ".dispatch").mkdir()
+        (v2 / ".dispatch" / "jobs.log").write_text(
+            _row("2026-08-01T00:00:00Z", "done", "att-other-home",
+                 f",launch_home={v3}") + "\n",
+            encoding="utf-8",
+        )
+        source_jobs = v1 / ".dispatch" / "jobs.log"
+        source_jobs.write_text(source_jobs.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self._promote_candidate(v1)
+        candidate_jobs = source_jobs
+        stable_jobs = DISTRIBUTION.stable_state_root(os.environ) / "jobs.log"
+        other_legacy_jobs = v2 / ".dispatch" / "jobs.log"
+        late_evidence = v1 / ".dispatch" / "completion" / "late-evidence.json"
+        late_row = _row("2026-08-02T00:00:00Z", "done", "att-late-writer",
+                        f",launch_home={v2}")
+        writer_code = """
+import fcntl, pathlib, sys
+jobs, evidence, row = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+with open(str(jobs) + '.lock', 'a+b') as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with jobs.open('a', encoding='utf-8') as registry:
+        registry.write(row + '\\n')
+        registry.flush()
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_bytes(b'late non-registry evidence\\n')
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+"""
+        writer_env = dict(os.environ)
+        writer_env["AGENT_HOME"] = str(v2)
+        writer_env["AGENT_DISPATCH_JOBS"] = str(candidate_jobs)
+        real_routes = DISTRIBUTION._open_route_launch_homes
+        route_discoveries = 0
+
+        def discover_then_write(environ, **kwargs):
+            nonlocal route_discoveries
+            result = real_routes(environ, **kwargs)
+            route_discoveries += 1
+            if route_discoveries == 1:
+                subprocess.run(
+                    [sys.executable, "-c", writer_code, str(candidate_jobs),
+                     str(late_evidence), late_row],
+                    env=writer_env, check=True, capture_output=True, text=True,
+                )
+            return result
+
+        def assert_lock_is_held(jobs):
+            with open(str(jobs) + ".lock", "a+b") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                self.fail(f"writer admission lock was not held: {jobs}.lock")
+
+        competitor_result = {}
+
+        def competing_admission_probe():
+            with open(str(stable_jobs) + ".lock", "a+b") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    competitor_result["blocked"] = True
+                else:
+                    competitor_result["blocked"] = False
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+
+        real_precondition = DISTRIBUTION._migration_deletion_precondition
+        real_rmtree = DISTRIBUTION.shutil.rmtree
+
+        def verify_in_boundary(candidate, environ):
+            if candidate == v1:
+                for jobs in (candidate_jobs, stable_jobs, other_legacy_jobs):
+                    assert_lock_is_held(jobs)
+                competitor = threading.Thread(target=competing_admission_probe)
+                competitor.start()
+                competitor.join(timeout=5)
+                self.assertFalse(competitor.is_alive(), "admission probe must not wait for the boundary")
+                self.assertTrue(competitor_result.get("blocked"), "stable admission crossed the delete boundary")
+            return real_precondition(candidate, environ)
+
+        def remove_in_boundary(path, *args, **kwargs):
+            if Path(path) == v1:
+                for jobs in (candidate_jobs, stable_jobs, other_legacy_jobs):
+                    assert_lock_is_held(jobs)
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(DISTRIBUTION, "_open_route_launch_homes",
+                               side_effect=discover_then_write), \
+             mock.patch.object(DISTRIBUTION, "_migration_deletion_precondition",
+                               side_effect=verify_in_boundary), \
+             mock.patch.object(DISTRIBUTION.shutil, "rmtree", side_effect=remove_in_boundary):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(
+            route_discoveries, 3,
+            "cleanup must refresh external publication and the monotonic carry-forward",
+        )
+        self.assertFalse(v1.exists())
+        self.assertEqual(
+            (DISTRIBUTION.stable_state_root(os.environ) / "completion" / "late-evidence.json").read_bytes(),
+            b"late non-registry evidence\n",
+        )
+        carried_rows = stable_jobs.read_text(encoding="utf-8")
+        self.assertIn("att-late-writer", carried_rows)
+
+    def test_live_writer_on_legacy_jobs_path_with_other_launch_home_is_retained_then_retried(self):
+        import subprocess
+
+        v1, v2, v3 = self._three_release_chain()
+        self._promote_candidate(v1)
+        jobs = v1 / ".dispatch" / "jobs.log"
+        child_env = dict(os.environ)
+        child_env["AGENT_HOME"] = str(v2)
+        child_env["AGENT_DISPATCH_JOBS"] = str(jobs)
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(30)"],
+            cwd=v2, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            DISTRIBUTION._cleanup_releases(keep=set())
+            self.assertTrue(v1.is_dir(), "the pinned legacy jobs path must keep the source release")
+        finally:
+            child.terminate()
+            child.communicate(timeout=5)
+
+        DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertFalse(v1.exists(), "unused source should prune on the normal retry after writer exit")
+
+    def test_unknown_source_evidence_and_unreadable_stable_registry_keep_release(self):
+        v1, v2, v3 = self._three_release_chain()
+        self._promote_candidate(v1)
+        outside = self.base / "outside-evidence.json"
+        outside.write_bytes(b"outside\n")
+        unknown = v1 / ".dispatch" / "completion" / "unknown.json"
+        unknown.parent.mkdir(parents=True, exist_ok=True)
+        unknown.symlink_to(outside)
+
+        DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertTrue(v1.is_dir())
+        self.assertEqual(outside.read_bytes(), b"outside\n")
+
+        unknown.unlink()
+        stable_jobs = DISTRIBUTION.stable_state_root(os.environ) / "jobs.log"
+        stable_jobs.write_text("malformed registry row\n", encoding="utf-8")
+        with self.assertRaises(DISTRIBUTION.DistributionError):
+            DISTRIBUTION._cleanup_releases(keep=set())
+        self.assertTrue(v1.is_dir(), "unreadable global reference evidence must retain source")
 
 
 class ReviewSelfDispositionAliasTest(unittest.TestCase):

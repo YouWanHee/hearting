@@ -402,6 +402,13 @@ utilities/read_marker.test.py	0.18
 utilities/registered_parent_park.test.py	8.60
 utilities/resource_run_registry.test.py	0.16
 utilities/resource_runner.test.py	59.10
+# Local isolated revision-suite batch: cycle cyc_1ce7be6f1f9ef8ca8b5a90c6d1cf8425 dev_logs/revision-split-final.tsv (original execute, before retention correction; not GH run above).
+# Single measurement under concurrent host load (not CI or a repeated-run estimate); two suites exceeded advisory 300s, all below the existing 600s timeout.
+utilities/review_batch_revision.test.py	400.73
+utilities/review_batch_revision_collection.test.py	0.79
+utilities/review_batch_revision_mixed.test.py	188.95
+utilities/review_batch_revision_replacement.test.py	199.74
+utilities/review_batch_revision_resume.test.py	431.35
 utilities/review_completion_lifecycle.test.py	24.53
 utilities/review_input.test.py	5.82
 utilities/review_input_preview.test.py	3.62
