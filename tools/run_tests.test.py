@@ -1479,14 +1479,25 @@ class UserSiteYamlBridge(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_yaml_is_visible_without_parent_siblings_or_startup_hooks(self):
-        parent_site = self.root / "parent-site"
+    def _assert_isolated_child_import(self, companion_shape):
+        parent_site = self.root / f"parent-site-{companion_shape}"
         package = parent_site / "yaml"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(
             "SOURCE = 'parent-user-yaml'\n", encoding="utf-8"
         )
-        (parent_site / "_yaml.py").write_text("SOURCE = 'optional-extension'\n", encoding="utf-8")
+        companion_source = f"optional-{companion_shape}"
+        if companion_shape == "package":
+            companion = parent_site / "_yaml"
+            companion.mkdir()
+            (companion / "__init__.py").write_text(
+                f"SOURCE = {companion_source!r}\n", encoding="utf-8"
+            )
+        else:
+            companion = parent_site / "_yaml.py"
+            companion.write_text(
+                f"SOURCE = {companion_source!r}\n", encoding="utf-8"
+            )
         (parent_site / "sibling_only.py").write_text("VALUE = 1\n", encoding="utf-8")
         pth_marker = self.root / "pth-executed"
         (parent_site / "parent.pth").write_text(
@@ -1502,39 +1513,61 @@ class UserSiteYamlBridge(unittest.TestCase):
             encoding="utf-8",
         )
 
-        suite_tmp = self.root / "suite"
+        suite_tmp = self.root / f"suite-{companion_shape}"
+        parent_environment = os.environ.copy()
         with mock.patch.object(self.mod.site, "ENABLE_USER_SITE", True), \
              mock.patch.object(self.mod.site, "getusersitepackages", return_value=str(parent_site)):
             env = self.mod.build_isolated_env(suite_tmp)
+        self.assertEqual(os.environ, parent_environment)
 
         private_site = self.mod._child_user_site(suite_tmp / "home")
         self.assertTrue((private_site / "yaml").is_symlink())
         self.assertFalse((private_site / "sibling_only.py").exists())
         self.assertFalse((private_site / "sitecustomize.py").exists())
         self.assertFalse(any(private_site.glob("parent*.pth")))
-        self.assertTrue((private_site / "_yaml.py").is_symlink())
+        if companion_shape == "package":
+            self.assertTrue((private_site / "_yaml").is_symlink())
+            self.assertEqual((private_site / "_yaml").resolve(), companion.resolve())
+        else:
+            self.assertTrue((private_site / "_yaml.py").is_symlink())
+            self.assertEqual((private_site / "_yaml.py").resolve(), companion.resolve())
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent("""
                 import json
+                import sys
                 import yaml
+                import _yaml
                 try:
                     import sibling_only
                     sibling_visible = True
                 except ImportError:
                     sibling_visible = False
-                print(json.dumps({"source": yaml.SOURCE, "sibling": sibling_visible,
-                                  "yaml_file": yaml.__file__}))
-            """)],
+                print(json.dumps({"yaml_source": yaml.SOURCE,
+                                  "yaml_file": yaml.__file__,
+                                  "companion_source": _yaml.SOURCE,
+                                  "companion_file": _yaml.__file__,
+                                  "sibling": sibling_visible,
+                                  "parent_site_on_path": sys.path.count(%r) > 0}))
+            """ % str(parent_site))],
             env=env, capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         imported = json.loads(result.stdout)
-        self.assertEqual(imported["source"], "parent-user-yaml")
+        self.assertEqual(imported["yaml_source"], "parent-user-yaml")
+        self.assertEqual(imported["companion_source"], companion_source)
         self.assertFalse(imported["sibling"])
+        self.assertFalse(imported["parent_site_on_path"])
         self.assertTrue(imported["yaml_file"].startswith(str(private_site / "yaml")))
+        self.assertTrue(imported["companion_file"].startswith(str(private_site / "_yaml")))
         self.assertFalse(pth_marker.exists())
         self.assertFalse((self.root / "sitecustomize-ran").exists())
         self.assertFalse((self.root / "usercustomize-ran").exists())
+
+    def test_yaml_is_visible_without_parent_siblings_or_startup_hooks(self):
+        self._assert_isolated_child_import("module")
+
+    def test_package_shaped_yaml_companion_is_importable_in_isolated_child(self):
+        self._assert_isolated_child_import("package")
 
     def test_disabled_or_missing_user_yaml_is_not_linked(self):
         parent_site = self.root / "parent-site"

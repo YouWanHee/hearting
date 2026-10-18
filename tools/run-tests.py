@@ -282,9 +282,18 @@ def _install_user_yaml(private_site: Path) -> None:
             )
             if extension_origin is None or not extension_origin.is_relative_to(user_site):
                 continue
-            extension_destination = private_site / extension_origin.name
-            if not extension_destination.exists() and not extension_destination.is_symlink():
-                extension_destination.symlink_to(extension_origin)
+            if extension.submodule_search_locations is not None:
+                extension_package = extension_origin.parent.resolve(strict=True)
+                if (not extension_package.is_dir()
+                        or not extension_package.is_relative_to(user_site)):
+                    continue
+                extension_destination = private_site / "_yaml"
+                if not extension_destination.exists() and not extension_destination.is_symlink():
+                    extension_destination.symlink_to(extension_package, target_is_directory=True)
+            else:
+                extension_destination = private_site / extension_origin.name
+                if not extension_destination.exists() and not extension_destination.is_symlink():
+                    extension_destination.symlink_to(extension_origin)
         except (OSError, RuntimeError, TypeError, ValueError):
             pass
         return
