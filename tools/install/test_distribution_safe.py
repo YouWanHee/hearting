@@ -16,7 +16,6 @@ import threading
 import unittest
 from unittest import mock
 
-import distribution
 import fixture_env
 
 
@@ -1076,4 +1075,23 @@ class ActivationFailureDiagnosticTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    with tempfile.TemporaryDirectory(prefix="hearting-test-distribution-safe-") as root:
+        fixture_root = Path(root).resolve()
+        with fixture_env.patched_environment(
+            fixture_root / "runtime", Path(__file__).resolve().parents[2]
+        ) as env:
+            private_root = (fixture_root / "runtime").resolve()
+            for key in (
+                "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "HARNESS_STATE_ROOT",
+                "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+            ):
+                Path(env[key]).resolve().relative_to(private_root)
+            print("routine_fixture_roots=" + json.dumps({
+                key: env[key] for key in (
+                    "HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "HARNESS_STATE_ROOT",
+                    "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+                )
+            }, sort_keys=True), flush=True)
+            import distribution
+            unittest.main()

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -256,7 +257,8 @@ class RouteReleaseRetentionConsumerTest(unittest.TestCase):
 
     def test_one_update_reclaims_only_the_unneeded_route_and_its_pycache(self) -> None:
         names = ["v0.0.1-old", "v0.0.2-staged", "v0.0.3-live",
-                 "v0.0.4-correction", "v0.0.5-resumable", "v0.0.6-current"]
+                 "v0.0.4-correction", "v0.0.5-resumable",
+                 "v0.0.6-unknown", "v0.0.7-current"]
         for offset, name in enumerate(names[:-1]):
             self._minimal_release(name, 1_700_000_000 + offset)
         current, _digest = self._install_current_fixture(names[-1])
@@ -287,7 +289,14 @@ class RouteReleaseRetentionConsumerTest(unittest.TestCase):
                 "done\tfixture\t/tmp/wt\towner\towner_route_id=rt-4444444444444444,worker_type=owner,attempt_id=blocked,note=dead-worker-blocked,failure_class=blocked",
             ]),
             self._route("rt-6666666666666666", self._release_root(names[4])),
+            self._route("rt-7777777777777777", self._release_root(names[5]), rows=[
+                "future-state\tfixture\t/tmp/wt\tfuture\troute_id=rt-7777777777777777,attempt_id=future",
+            ]),
         ]
+        old_contract_bytes = (ROOT / "capabilities" / "code-execute.md").read_bytes()
+        old_contract_root = self._release_root(names[3]) / "capabilities"
+        old_contract_root.mkdir(parents=True)
+        (old_contract_root / "code-execute.md").write_bytes(old_contract_bytes)
         route_chain = (Path(self.env["XDG_STATE_HOME"]) / "agent-fleet" / "route-chains"
                        / "codex" / "fixture-session.jsonl")
         route_chain.parent.mkdir(parents=True)
@@ -328,10 +337,36 @@ class RouteReleaseRetentionConsumerTest(unittest.TestCase):
         self.assertEqual(update["release"]["version"], target)
         sys.path.insert(0, str(ROOT / "utilities"))
         import route_authority
+        import parent_next_directive
         correction_route = json.loads(routes[3][0].read_text(encoding="utf-8"))
         contract_roots = route_authority.contract_read_roots(target_root, correction_route)
-        self.assertIn(self._release_root(names[3]) / "capabilities", contract_roots)
+        sealed_contract_root = next(
+            root for root in contract_roots if root.resolve() == old_contract_root.resolve()
+        )
+        loaded_contract = (sealed_contract_root / "code-execute.md").read_bytes()
+        self.assertEqual(loaded_contract, old_contract_bytes)
         self.assertIn(target_root / "capabilities", contract_roots)
+        correction_row = next(
+            line.split("\t") for line in routes[3][1].read_text(encoding="utf-8").splitlines()
+            if "owner_route_id=rt-4444444444444444" in line
+        )
+        correction_metadata = dict(
+            item.split("=", 1) for item in correction_row[5].split(",") if "=" in item
+        )
+        self.assertEqual(
+            route_authority.answerable_owner_end(correction_row[1], correction_metadata), "BLOCKED"
+        )
+        continuation = parent_next_directive.correction_command(
+            correction_metadata["attempt_id"], routes[3][1], agent_home=target_root,
+        )
+        continuation_args = shlex.split(continuation)
+        self.assertEqual(continuation_args[1], str(
+            Path(self.env["XDG_DATA_HOME"]) / "hearting" / "current"
+            / "utilities" / "capability-route.py"
+        ))
+        self.assertEqual(continuation_args[2:], [
+            "correct", "--jobs", str(routes[3][1]), "--attempt-id", "blocked",
+        ])
 
         self.assertFalse(old.exists(), "the historical direct route alone must not pin its release")
         self.assertFalse(self._pycache_root(old).exists(), "deleted release pycache must be reclaimed")
@@ -341,6 +376,9 @@ class RouteReleaseRetentionConsumerTest(unittest.TestCase):
                             f"protected release cache {name} was removed")
         self.assertTrue(self._release_root(names[-1]).exists(), "previous release remains inside retention floor")
         self.assertTrue(self._pycache_root(self._release_root(names[-1])).exists())
+        self.assertTrue(self._release_root(names[5]).exists(), "unknown route state must retain its release")
+        self.assertTrue(self._pycache_root(self._release_root(names[5])).exists(),
+                        "unknown route state must retain its release cache")
         for path, before in immutable.items():
             self.assertEqual(path.read_bytes(), before, f"update changed protected state: {path}")
 
@@ -356,7 +394,10 @@ class RouteReleaseRetentionConsumerTest(unittest.TestCase):
             "module_file": record["module_file"], "module_version": record["module_version"],
             "module_sha256": record["module_sha256"], "installed_target": target,
             "current_after_update": str(target_root), "update_calls": 1,
-            "old_contract_read_root": str(self._release_root(names[3]) / "capabilities"),
+            "old_contract_read_root": str(sealed_contract_root),
+            "old_contract_sha256": hashlib.sha256(loaded_contract).hexdigest(),
+            "correction_continuation": continuation,
+            "unknown_route_release": str(self._release_root(names[5])),
         }, sort_keys=True))
 
     def test_v33552_updater_first_installs_patch_but_keeps_its_own_cleanup_identity(self) -> None:
