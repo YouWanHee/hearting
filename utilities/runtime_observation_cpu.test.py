@@ -1014,12 +1014,16 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "    profiler = cProfile.Profile()\n"
                     "    profiler.enable()\n"
                     "    saved = [False]\n"
+                    "    saving = [False]\n"
                     "    def save_profile():\n"
-                    "        if saved[0]: return\n"
-                    "        saved[0] = True\n"
+                    "        if saved[0] or saving[0]: return\n"
+                    "        saving[0] = True\n"
                     "        profiler.disable()\n"
-                    "        profiler.dump_stats(os.path.join(os.environ['FIXTURE_PROFILE_DIR'], "
-                    "str(os.getpid()) + '.prof'))\n"
+                    "        path = os.path.join(os.environ['FIXTURE_PROFILE_DIR'], str(os.getpid()) + '.prof')\n"
+                    "        profiler.dump_stats(path + '.tmp')\n"
+                    "        os.replace(path + '.tmp', path)\n"
+                    "        saved[0] = True\n"
+                    "        saving[0] = False\n"
                     "    atexit.register(save_profile)\n",
                     encoding="utf-8")
                 with (profile_hook / "sitecustomize.py").open("a", encoding="utf-8") as hook:
@@ -1030,6 +1034,7 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                         "        original_exit(code)\n"
                     "    os._exit = profiled_exit\n"
                     "    def profiled_signal(signum, frame):\n"
+                    "        if saving[0]: return\n"
                     "        save_profile()\n"
                     "        raise SystemExit(128 + signum)\n"
                     "    signal.signal(signal.SIGTERM, profiled_signal)\n")
