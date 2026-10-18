@@ -859,7 +859,7 @@ def _no_competing_successor(rows, aid, replacement=None):
         status='done', facts={'death_kind': 'claimed', 'competing_successor': competing}))
 
 
-def claim(jobs: Path, aid: str) -> dict:
+def claim(jobs: Path, aid: str, *, resume_capacity=False) -> dict:
     """Lock-held death, children and terminal-fence checks precede one claim."""
     aid = _id(aid)
     with _locked(jobs) as lines:
@@ -869,6 +869,11 @@ def claim(jobs: Path, aid: str) -> dict:
         fields, meta = rows[aid]
         DC.validate_attempt_metadata(meta)
         binding = source_binding(jobs, meta)
+        if not binding and not resume_capacity and meta.get('worker_type') == 'owner':
+            carried = _unstarted_replacement_claim(jobs, aid)
+            if carried and _settled_legacy_owner_resume(
+                    jobs, lines, carried['original_attempt_id'], carried):
+                raise DC.DispatchContractError('replacement-duty-settled')
         if binding:
             old_family, _, claim_digest = binding
             record = _check_record(_read(_record_path(jobs, old_family)), old_family,
@@ -1013,6 +1018,71 @@ def recovery_delivery_state(jobs, aid):
         return 'accepted'
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
         return 'unknown'
+
+
+def _settled_legacy_owner_resume(jobs, lines, aid, record=None):
+    """Whether an explicit owner resume may recheck one settled legacy edge.
+
+    The attention remains a completed failure delivery. This predicate only
+    preserves the exact B->C claim as lineage when C was claimed but never
+    started; the caller still performs the current parent and launch checks.
+    """
+    try:
+        rows = _rows(lines)
+        if aid not in rows or recovery_delivery_state(jobs, aid) != 'settled':
+            return False
+        fields, source = rows[aid]
+        binding = source_binding(jobs, source)
+        reservation = source_reservation(jobs, aid)
+        family = (reservation or {}).get('family_id') or (binding or ('',))[0]
+        if not family or not binding or (reservation or {}).get('family_id') != family:
+            return False
+        canonical = _read(_record_path(jobs, family))
+        if record is not None and record != canonical:
+            return False
+        record = _check_record(canonical, family)
+        digest = _digest(record)
+        if (record.get('original_attempt_id') != aid
+                or binding != (family, record.get('replacement_attempt_id'), digest)):
+            return False
+        target = rows.get(record.get('replacement_attempt_id'))
+        if target is None:
+            return False
+        target_fields, target_meta = target
+        exact_successor = (
+            target_meta.get('attempt_id') == record['replacement_attempt_id']
+            and target_meta.get('automatic_retry_of') == aid
+            and target_meta.get('replacement_original_attempt_id') == aid
+            and target_meta.get('replacement_family_id') == family
+            and target_meta.get('replacement_ordinal') == '1'
+            and target_meta.get('replacement_claim_digest') == digest
+        )
+        saved = _read(_directory(jobs) / 'attention/by-source' / (_id(aid) + '.json'))
+        attention = (saved or {}).get('attention') or {}
+        proof = (saved or {}).get('proof') or {}
+        exact_attention = (
+            set(saved or {}) == {'attention', 'proof'}
+            and set(proof) == {'family_id', 'claim_digest'}
+            and proof.get('family_id') == family
+            and proof.get('claim_digest') == digest
+            and set(attention) == {'source_attempt_id', 'state', 'reason', 'node', 'failure'}
+            and attention.get('source_attempt_id') == aid
+            and attention.get('state') == 'needs-attention'
+            and attention.get('reason') == 'replacement-parent-identity-unproven'
+            and attention.get('node') == '__owner__'
+            and isinstance(attention.get('failure'), str)
+        )
+        decision = route_authority.decide_continuation(action='settled-owner-resume',
+            status=fields[1], metadata=source, facts={
+                'record': record,
+                'attention_reason': attention.get('reason') if exact_attention else '',
+                'exact_successor': exact_successor,
+                'successor_never_started': never_started(target_fields[1], target_meta),
+                'retained_corrections': bool((record.get('proof') or {}).get('corrections')),
+            })
+        return decision.allowed
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
+        return False
 
 
 def _settle_recovery_attention(jobs, aid, result):
@@ -1369,7 +1439,8 @@ def validate_claim_source(jobs, lines, record):
     if canonical != record:
         raise DC.DispatchContractError('replacement-claim-drift')
     rows = _rows(lines); prior = record['original_attempt_id']
-    if recovery_delivery_state(jobs, prior) == 'settled':
+    if (recovery_delivery_state(jobs, prior) == 'settled'
+            and not _settled_legacy_owner_resume(jobs, lines, prior, record)):
         raise DC.DispatchContractError('replacement-duty-settled')
     if prior not in rows:
         raise DC.DispatchContractError('replacement-source-missing')
@@ -1756,10 +1827,12 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
     `resume_capacity` is set only by an explicit `start`: a usage-limit stop is replaced
     when the person resumes, never by a supervisor tick, so no loop of automatic launches exists.
     """
-    rows = _rows(Path(jobs).read_text().splitlines())
+    lines = Path(jobs).read_text().splitlines()
+    rows = _rows(lines)
     if aid not in rows:
         return {'state':'unavailable','reason':'replacement-source-missing'}
-    if recovery_delivery_state(jobs, aid) == 'settled':
+    if (recovery_delivery_state(jobs, aid) == 'settled'
+            and not (resume_capacity and _settled_legacy_owner_resume(jobs, lines, aid))):
         return {'state': 'not-applicable'}
     fields, source = rows[aid]
     kind = death_kind(fields, source, jobs=jobs)
@@ -1792,7 +1865,7 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
             if hold:
                 return _capacity_wait(jobs, aid, hold_source, hold)
             _settle_terminal_cleanup(jobs, rows, aid, source)
-        record = claim(Path(jobs), aid)
+        record = claim(Path(jobs), aid, resume_capacity=resume_capacity)
         rows = _rows(Path(jobs).read_text().splitlines())
         source = rows[aid][1]
         replacement = record['replacement_attempt_id']

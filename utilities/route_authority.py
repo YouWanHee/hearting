@@ -78,6 +78,13 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DR.DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
+    if (meta.get('worker_type') == 'owner'
+            and meta.get('note') == 'dead-governor-reservation-transfer'):
+        # This terminal disposition means the replacement never launched. If
+        # its exact cleanup proof is missing, it is unknown rather than a new
+        # silent-death edge; the branch above already returned `unlaunched`
+        # when the complete proof was available.
+        return None
     if meta.get('note') in DR.DEATH_NOTES and status not in {'cancelled', 'killed'}:
         return 'silent'
     if (meta.get('worker_type') == 'owner' and status == 'done'
@@ -391,6 +398,26 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
+    if action == "settled-owner-resume":
+        record = facts.get("record") or {}
+        logical = record.get("logical_node") or {}
+        proof = record.get("proof") or {}
+        aid = metadata.get("attempt_id")
+        eligible = (
+            status == "done" and metadata.get("worker_type") == "owner"
+            and bool(answerable_owner_end(status, metadata))
+            and record.get("original_attempt_id") == aid
+            and record.get("ordinal") == 1
+            and proof.get("death_kind") == "corrected"
+            and logical.get("node") == "__owner__"
+            and logical.get("after_capacity") == aid
+            and facts.get("attention_reason") == "replacement-parent-identity-unproven"
+            and facts.get("exact_successor") is True
+            and facts.get("successor_never_started") is True
+            and facts.get("retained_corrections") is True
+        )
+        return ContinuationDecision(eligible, "resume" if eligible else "settled",
+            "" if eligible else "replacement-duty-settled", "start" if eligible else "settle")
     if action == "replacement-progress":
         from dispatch_contract import verdict_pass
         from dispatch_replacement import _plain_retry_successor, _replacement_in_flight
