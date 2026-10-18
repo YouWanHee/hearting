@@ -58,6 +58,10 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
     if (meta.get('parent_close_requested') == '1' or
             jobs is not None and route_parent_close.row_requested(meta, jobs)):
         return None
+    if meta.get('worker_type') == 'owner' and DR.never_started(status, meta):
+        # The launch fence is the execution boundary. A reservation may carry a
+        # claim, but its absence of launch_started means it has no worker result.
+        return 'unlaunched'
     if jobs is not None and meta.get('note') == 'dead-worker-blocked':
         found = DR.owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
@@ -79,10 +83,6 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
     if (meta.get('worker_type') == 'owner' and status == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
-    if (meta.get('worker_type') == 'owner' and status == 'done'
-            and meta.get('launch_outcome') == 'never-launched' and meta.get('launch_claimed') == '0'
-            and meta.get('launch_started') != '1' and not meta.get('pid')):
-        return 'unlaunched'  # nothing ran: the log never existed and no process was ever bound
     if meta.get('worker_type') == 'owner' and status == 'done' and meta.get('note') in DR.RUNTIME_DEATH_NOTES:
         return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
     if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'

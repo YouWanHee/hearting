@@ -559,7 +559,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(caught.exception.reason,'replacement-reuse-evidence-drift')
 
     def test_quick_owner_uses_explicit_route_without_owner_environment(self):
-        self.write({**self.meta,'worker_type':'owner','route_file':str(self.path)})
+        self.write({**self.meta,'worker_type':'owner','launch_started':'1','route_file':str(self.path)})
         record=self.claim();source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
         cmd=R._command(self.jobs,record,source,R.launch_input(self.jobs,'att-source',source))
         self.assertEqual(cmd[cmd.index('--route-file')+1],str(self.path))
@@ -584,7 +584,8 @@ class ReplacementTest(unittest.TestCase):
         self.assertFalse((R._directory(self.jobs)/'claims').exists())
 
     def _launch_env(self,worker_type,prepare):
-        self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
+        self.write({**self.meta,'worker_type':worker_type,'launch_started':'1','route_file':str(self.path)}
+                   if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
         seen={}
         def run(command,**kw):
             seen.update(kw['env']);return SimpleNamespace(returncode=0)
@@ -1218,7 +1219,8 @@ class ReplacementTest(unittest.TestCase):
 
     def _parked_owner(self,*journal,raiser_type=None,**changes):
         self._parked_route(raiser_type)
-        self.owner={**self.meta,'worker_type':'owner','note':'dead-worker-blocked','failure_class':'blocked',**changes}
+        self.owner={**self.meta,'worker_type':'owner','launch_started':'1',
+                    'note':'dead-worker-blocked','failure_class':'blocked',**changes}
         self.write(self.owner,stamp=self.OWNER_STAMP)
         self._journal(*journal)
 
@@ -1315,7 +1317,8 @@ class ReplacementTest(unittest.TestCase):
         self._parked_route()
         if owner_executed:
             self.route['nodes'][1].update(kind='capability-owner',unit='_kernel/owner',dispatch_depth=1,terminal=True)
-        self.owner={**self.meta,'worker_type':'owner','note':'completed-supervisor','failure_class':'pass',
+        self.owner={**self.meta,'worker_type':'owner','launch_started':'1',
+                    'note':'completed-supervisor','failure_class':'pass',
                     'workflow_completion':'runtime-v1',**changes}
         self.write(self.owner,stamp=self.OWNER_STAMP)
         self._journal(*journal)
@@ -1377,7 +1380,7 @@ class ReplacementTest(unittest.TestCase):
 
     # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
     def _owner(self,**changes):
-        self.write({**self.meta,'worker_type':'owner',**changes})
+        self.write({**self.meta,'worker_type':'owner','launch_started':'1',**changes})
 
     def _capacity_owner(self):
         self._owner(note='dead-capacity',failure_class='capacity')
@@ -1412,7 +1415,8 @@ class ReplacementTest(unittest.TestCase):
         meta={**meta,**changes};self.write(meta,append=True);return meta
 
     def test_death_kind_names_why_a_row_may_be_replaced(self):
-        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner','note':note,**m})
+        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner',
+            'launch_started':'1','note':note,**m})
         self.assertEqual(R.death_kind(*row('dead-exact-pid')),'silent')
         self.assertEqual(R.death_kind(*row('dead-capacity',failure_class='capacity')),'capacity')
         self.assertEqual(R.death_kind(*row('dead-worker-fail',failure_class='capacity')),'capacity')
@@ -1428,7 +1432,8 @@ class ReplacementTest(unittest.TestCase):
         self.assertIsNone(R.death_kind(['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-runtime-error'}))
 
     def test_runtime_death_is_settled_by_its_own_error_envelope(self):
-        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime'}
+        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime',
+              'launch_started':'1'}
         fields=['now','done','',str(self.root)]
         def seen(state,failure_class):
             return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
@@ -1812,7 +1817,7 @@ class ReplacementTest(unittest.TestCase):
     # -- an owner its launcher closed before spawning: a pause the next `start` resumes ----------
     def _unlaunched_owner(self,**changes):
         self._owner(note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0',
-                    log_file=str(self.root/'never-written.log'),**changes)
+                    launch_started='0',log_file=str(self.root/'never-written.log'),**changes)
 
     def test_owner_closed_before_spawn_is_an_unlaunched_pause(self):
         self._unlaunched_owner()
@@ -1857,7 +1862,10 @@ class ReplacementTest(unittest.TestCase):
         base={**self.meta,'worker_type':'owner','note':'dead-producer-binding-failed',
               'launch_outcome':'never-launched','launch_claimed':'0'}
         self.assertEqual(R.death_kind(['now','done'],base),'unlaunched')
-        for changes in ({'launch_started':'1'},{'pid':'4242'},{'launch_claimed':'1'},
+        claimed_but_never_started={**base,'note':'dead-governor-reservation-transfer',
+                                   'launch_claimed':'1'}
+        self.assertEqual(R.death_kind(['now','done'],claimed_but_never_started),'unlaunched')
+        for changes in ({'launch_started':'1'},{'pid':'4242'},
                         {'worker_type':'stage','dispatch_depth':'2'},{'launch_outcome':''}):
             with self.subTest(changes=changes):
                 self.assertNotEqual(R.death_kind(['now','done'],{**base,**changes}),'unlaunched')
@@ -1914,7 +1922,8 @@ class ReplacementTest(unittest.TestCase):
     def _blocked_owner(self):
         """An owner that ended BLOCKED with its input channel opened at launch, as its supervisor leaves it."""
         import dispatch_owner_input as I
-        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1',
+                'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
         self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
@@ -2057,7 +2066,8 @@ class ReplacementTest(unittest.TestCase):
         import dispatch_owner_input as I
         self.route.update(effective_intensity='standard',
                           nodes=[{'id': 'test', 'kind': 'pipeline-stage', 'worker_type': 'test'}])
-        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-fail', 'failure_class': 'fail'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1',
+                'note': 'dead-worker-fail', 'failure_class': 'fail'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
         self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
@@ -2659,7 +2669,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
         import dispatch_owner_input as I
-        meta = {**self.meta, 'worker_type': 'owner'}
+        meta = {**self.meta, 'worker_type': 'owner', 'launch_started': '1'}
         self.write(meta, 'open')
         I.initialize_owner_input(self.jobs, 'att-source', 'claude-next-turn')
         self.assertFalse(I.submit(self.jobs, 'att-source', 'approved: go', 'early').get('retained'))

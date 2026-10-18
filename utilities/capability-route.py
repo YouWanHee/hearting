@@ -11139,13 +11139,8 @@ def _current_owner_attempt(jobs, attempt_id):
     An answer sent with an older owner's id still reaches the owner doing the work now."""
     try:
         from dispatch_replacement import effective_attempts
-        current = attempt_id
-        for _ in range(32):
-            effective, mapping = effective_attempts(jobs, {current})
-            if not mapping:
-                return current
-            current = next(iter(effective))
-        return current
+        effective, _mapping = effective_attempts(jobs, {attempt_id})
+        return next(iter(effective)) if len(effective) == 1 else attempt_id
     except (DispatchContractError, OSError, ValueError, StopIteration):
         return attempt_id
 

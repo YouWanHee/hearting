@@ -65,6 +65,12 @@ def _id(value):
     return value
 
 
+def never_started(status, metadata):
+    """A terminal row whose launch fence proves no payload ever began."""
+    return (status == 'done' and metadata.get('launch_outcome') == 'never-launched'
+            and metadata.get('launch_started') != '1' and not metadata.get('pid'))
+
+
 def _once(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _bytes(value)
@@ -325,6 +331,24 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
             result['source_result'] = 'EXITED'
         elif route_authority.owner_result_format_only_end(fields[1], meta):
             result['source_result'] = 'CONTRACT'
+    elif kind == 'unlaunched' and jobs is not None:
+        carried = _unstarted_replacement_claim(jobs, meta.get('attempt_id'))
+        carried_proof = (carried or {}).get('proof') or {}
+        if carried and (carried_proof.get('death_kind') == CORRECTED or carried_proof.get('parked_gate')):
+            source_lines = Path(jobs).read_text().splitlines() if lines is None else lines
+            validate_claim_source(jobs, source_lines, carried)
+        if carried and carried_proof.get('death_kind') == CORRECTED:
+            source_attempt = carried['original_attempt_id']
+            _correction_context(jobs, source_attempt, carried_proof)
+            result['carried_continuation'] = {
+                'attempt_id': source_attempt,
+                'family_id': carried['family_id'],
+                'claim_digest': _digest(carried),
+                'corrections': [
+                    {'id': item['id'], 'digest': item['digest']}
+                    for item in _retained_corrections(jobs, source_attempt)
+                ],
+            }
     return result
 
 
@@ -1934,9 +1958,11 @@ def effective_attempts(jobs, attempts):
         if aid not in rows:
             continue
         current = aid
+        last_launched = aid
         seen = {aid}
         chain = [aid]
         first = None
+        root_edge = None
         while current in rows:
             _, source = rows[current]
             binding = source_binding(jobs, source)
@@ -1960,20 +1986,26 @@ def effective_attempts(jobs, attempts):
                     or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
                     or any(target.get(k) != source.get(k) for k in ('worker_type', 'dispatch_depth'))):
                 raise DC.DispatchContractError('replacement-lineage-unproven', replacement)
-            if target.get('launch_started') != '1':
-                break  # Registration and launch claim do not prove execution.
             if replacement in seen:
                 raise DC.DispatchContractError('replacement-lineage-cycle', replacement)
+            if root_edge is None:
+                root_edge = {'original_attempt_id': aid, 'replacement_attempt_id': replacement,
+                             'family_id': family, 'claim_digest': _digest(record)}
             seen.add(replacement)
             chain.append(replacement)
-            if first is None:
-                first = {'original_attempt_id': aid, 'replacement_attempt_id': replacement,
-                         'family_id': family, 'claim_digest': _digest(record)}
             current = replacement
+            if target.get('launch_started') == '1':
+                last_launched = replacement
+                if first is None:
+                    first = dict(root_edge)
+            elif not never_started(rows[replacement][0][1], target):
+                # Open, legacy, and unobservable reservations remain the current
+                # owner. Only an exact terminal never-launched row can be skipped.
+                break
         if first is not None:
             effective.discard(aid)
-            effective.add(current)
-            projected.append((chain, {**first, 'replacement_attempt_id': current}))
+            effective.add(last_launched)
+            projected.append((chain, {**first, 'replacement_attempt_id': last_launched}))
     covered = {attempt for chain, _edge in projected for attempt in chain[1:]}
     mapping = [edge for chain, edge in projected if chain[0] not in covered]
     return effective, mapping
@@ -2164,11 +2196,21 @@ def recovery_instructions(args):
     carried_proof = (carried or {}).get('proof') or {}
     if not (carried_proof.get('parked_gate') or carried_proof.get('death_kind') == CORRECTED):
         carried = None
+    pinned_continuation = (record.get('proof') or {}).get('carried_continuation')
+    if pinned_continuation:
+        if (carried is None
+                or pinned_continuation.get('attempt_id') != carried.get('original_attempt_id')
+                or pinned_continuation.get('family_id') != carried.get('family_id')
+                or pinned_continuation.get('claim_digest') != _digest(carried)
+                or carried_proof.get('death_kind') != CORRECTED):
+            raise DC.DispatchContractError('replacement-lineage-unproven', prior)
+        _correction_context(jobs, carried['original_attempt_id'], carried_proof)
+        carried_proof = {**carried_proof, 'corrections': pinned_continuation.get('corrections') or []}
     if carried is not None:
         text += (f'{prior} was itself the continuation of {carried["original_attempt_id"]}; '
                  'what that continuation was given follows.\n')
     for claim, answered in ((record, prior), (carried, carried and carried['original_attempt_id'])):
-        proof = (claim or {}).get('proof') or {}
+        proof = carried_proof if claim is carried and pinned_continuation else (claim or {}).get('proof') or {}
         if proof.get('parked_gate'):
             text += _gate_context(jobs, claim)
         if proof.get('death_kind') == CORRECTED:
@@ -2201,15 +2243,26 @@ def _unstarted_replacement_claim(jobs, aid):
         rows = _rows(Path(jobs).read_text().splitlines())
     except (OSError, DC.DispatchContractError):
         return None
-    for _ in range(8):
-        meta = (rows.get(aid) or ((), {}))[1]
+    seen = set()
+    while aid not in seen:
+        seen.add(aid)
+        row = rows.get(aid)
+        if row is None:
+            return None
+        fields, meta = row
         family = meta.get('replacement_family_id', '')
-        if (not meta.get('replacement_original_attempt_id') or meta.get('pid')
-                or meta.get('launch_outcome') != 'never-launched' or meta.get('launch_claimed') != '0'
+        if (not meta.get('replacement_original_attempt_id')
+                or not never_started(fields[1], meta)
                 or not re.fullmatch(r'[0-9a-f]{64}', family)):
             return None
         claim = _check_record(_read(_record_path(jobs, family)), family)
-        if claim['replacement_attempt_id'] != aid:
+        original = rows.get(claim.get('original_attempt_id'))
+        if (claim['replacement_attempt_id'] != aid
+                or meta.get('automatic_retry_of') != claim.get('original_attempt_id')
+                or meta.get('replacement_claim_digest') != _digest(claim)
+                or original is None
+                or not route_authority.replacement_parent_matches(original[1], meta, jobs, lineage=True)
+                or any(meta.get(key) != original[1].get(key) for key in ('worker_type', 'dispatch_depth'))):
             return None
         if (claim.get('proof') or {}).get('death_kind') != 'unlaunched':
             return claim

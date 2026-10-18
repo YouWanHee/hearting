@@ -495,6 +495,19 @@ def _slot(route, node, rows, jobs=None):
         if not matches:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
         status, meta = rows[aid]
+        if (node == "owner" and jobs is not None and _never_started(status, meta)
+                and meta.get("replacement_original_attempt_id")):
+            # A registered replacement that never crossed launch_started is
+            # still its predecessor's continuation. Follow the existing exact
+            # claim; do not let the reservation become the semantic owner.
+            from dispatch_replacement import effective_attempts
+            effective, _lineage = effective_attempts(jobs, {meta["replacement_original_attempt_id"]})
+            if len(effective) != 1:
+                raise DispatchContractError("work-attempt-identity-conflict", aid)
+            aid = next(iter(effective))
+            if aid not in rows:
+                raise DispatchContractError("work-attempt-identity-conflict", aid)
+            status, meta = rows[aid]
         # A live attempt delivers to the session that launched it, so another
         # session cannot adopt it. A finished one only has a result to read:
         # the session a supervisor handed the route to may harvest it.
@@ -560,9 +573,8 @@ def _start(route, path, jobs, node, harness, run):
 
 def _never_started(status, meta):
     """An owner row its launcher closed before spawning: nothing ran and nothing failed."""
-    return (status == "done" and meta.get("launch_outcome") == "never-launched"
-            and meta.get("launch_claimed") == "0" and meta.get("launch_started") != "1"
-            and not meta.get("pid"))
+    from dispatch_replacement import never_started
+    return never_started(status, meta)
 
 
 def _launch_failure_reason(launch):

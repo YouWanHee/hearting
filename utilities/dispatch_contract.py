@@ -10175,7 +10175,7 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
-def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> None:
+def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jobs: Path | None = None) -> None:
     """The jobs lock arbitrates retries against the committed predecessor.
 
     Observers propose a predecessor, never permission. Distinct consumers of
@@ -10204,8 +10204,29 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
         raise DispatchContractError("retry-predecessor-missing", prior)
     status, source = predecessor
     if source.get("replacement_family_id"):
-        if (source.get("replacement_attempt_id") != metadata.get("attempt_id")
-                or metadata.get("replacement_family_id") != source["replacement_family_id"]):
+        if jobs is None:
+            family = source.get("replacement_family_id")
+            replacement = source.get("replacement_attempt_id")
+        else:
+            from dispatch_replacement import _check_record, _read, _record_path, source_binding
+            binding = source_binding(jobs, source)
+            family, replacement = (binding[0], binding[1]) if binding else (None, None)
+            if family and replacement:
+                record = _check_record(_read(_record_path(jobs, family)), family,
+                                       {"replacement_claim_digest": binding[2] or None})
+                if (record.get("original_attempt_id") != prior
+                        or record.get("replacement_attempt_id") != replacement):
+                    raise DispatchContractError("replacement-lineage-unproven", prior)
+            elif source.get("replacement_original_attempt_id"):
+                # The inbound family on a replacement row is not its outgoing
+                # claim. Without the exact by-source reservation there is no
+                # authorized successor to register.
+                raise DispatchContractError("automatic-replacement-exhausted", prior)
+            else:
+                family = source.get("replacement_family_id")
+                replacement = source.get("replacement_attempt_id")
+        if (not family or replacement != metadata.get("attempt_id")
+                or metadata.get("replacement_family_id") != family):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
     if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
@@ -10379,7 +10400,7 @@ def claim_attempt_row(
                         return False
                 if not launch or metadata.get("launch_claimed") == "1" or fields[1] != "open":
                     return False
-                _automatic_retry_admission(lines, row_metadata)
+                _automatic_retry_admission(lines, row_metadata, jobs=jobs)
                 if preclaim is not None:
                     preclaim(lines)
                 pipe = ",".join(part for part in fields[5].split(",") if not part.startswith("launch_claimed="))
@@ -10437,7 +10458,7 @@ def claim_attempt_row(
                     f"replacement_attempts={len(replacement_attempts)} limit={replacement_attempt_limit}",
                 )
         if launch:
-            _automatic_retry_admission(lines, row_metadata)
+            _automatic_retry_admission(lines, row_metadata, jobs=jobs)
         if launch and preclaim is not None:
             preclaim(lines)
         row_fields[5] += f",launch_claimed={1 if launch else 0}"
