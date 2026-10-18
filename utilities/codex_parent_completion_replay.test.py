@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -196,6 +198,145 @@ class EndpointSymlinkTests(unittest.TestCase):
             finally:
                 process._replay_stderr_file.close()
                 listener.close()
+
+
+class NativeAcceptanceFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="parent-replay-acceptance-test-")
+        self.root = Path(self.temporary.name)
+        self.worktree = self.root / "workspace"
+        self.worktree.mkdir(mode=0o700)
+        self.sentinel = "HEARTING_REPLAY_FIXTURE_ONCE"
+        self.fixture = replay._write_native_fixture(self.worktree, self.sentinel)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _valid_tool_trace(self):
+        paths = [self.fixture["facts_path"], *self.fixture["artifact_paths"]]
+        read_output = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+        read = {"command": "cat " + " ".join(map(str, paths)),
+                "aggregatedOutput": read_output, "status": "completed", "exitCode": 0}
+        verified = subprocess.run(
+            [sys.executable, "-B", str(self.fixture["verifier"])],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        verifier = {"command": f"python3 -B {self.fixture['verifier']}",
+                    "aggregatedOutput": verified.stdout, "status": "completed", "exitCode": 0}
+        applied = subprocess.run(
+            [sys.executable, "-B", str(self.fixture["action"]), self.sentinel],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        action = {"command": f"python3 -B {self.fixture['action']} {self.sentinel}",
+                  "aggregatedOutput": applied.stdout, "status": "completed", "exitCode": 0}
+        return [read, verifier, action]
+
+    def test_ordered_synthetic_facts_and_exact_native_report_are_required(self):
+        facts = self.fixture["facts"]
+        self.assertEqual([item["result"] for item in facts["events"]],
+                         ["FAIL", "FIXED", "PASS", "SUCCESS", "PASS", "COMPLETE"])
+        self.assertTrue(facts["synthetic_values"]["commit"].startswith("synthetic-only:"))
+        self.assertTrue(facts["synthetic_values"]["deployment"].startswith("synthetic-only:"))
+        self.assertIn("not probed", facts["synthetic_values"]["serving"])
+        self.assertEqual(facts["report"]["before"]["approved_action_count"], 0)
+        self.assertEqual(facts["report"]["after"]["approved_action_count"], 1)
+        self.assertTrue(facts["report"]["skipped"])
+        self.assertTrue(facts["report"]["limits"])
+
+        tools = self._valid_tool_trace()
+        text = ("The isolated fixture action was applied once after I read the exact evidence. "
+                "All external and deployment claims remain synthetic.\nFACTUAL_REPORT_JSON:\n"
+                + json.dumps(facts["report"], ensure_ascii=False))
+        checks = replay._first_report_checks(text, tools, self.fixture)
+        for key in ("report_matches_fixture_facts", "report_has_substantive_closing_prose",
+                    "every_exact_artifact_was_read", "fixture_verifier_passed_in_native_tool_trace",
+                    "one_approved_followthrough_tool_invocation",
+                    "followthrough_state_matches_one_time_fixture_action"):
+            self.assertTrue(checks[key], key)
+        self.assertTrue(all(checks["artifact_reads"].values()))
+
+    def test_keyword_presence_cannot_substitute_for_factual_values_or_action_trace(self):
+        tools = self._valid_tool_trace()
+        facts = self.fixture["facts"]
+        wrong = dict(facts["report"])
+        wrong["synthetic_values"] = dict(wrong["synthetic_values"], deployment="production deployment succeeded")
+        text = ("The fixture deployment passed verification and the synthetic service is serving.\n"
+                "FACTUAL_REPORT_JSON:\n" + json.dumps(wrong))
+        checks = replay._first_report_checks(text, tools, self.fixture)
+        self.assertFalse(checks["report_matches_fixture_facts"])
+
+        duplicate = {**tools[-1], "command": tools[-1]["command"]}
+        checks = replay._first_report_checks(
+            "Substantive fixture completion report.\nFACTUAL_REPORT_JSON:\n"
+            + json.dumps(facts["report"]), [*tools, duplicate], self.fixture)
+        self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
+
+        missing_read = [item for item in tools if self.fixture["artifact_paths"][0].as_posix()
+                        not in item["command"]]
+        checks = replay._first_report_checks(
+            "Substantive fixture completion report.\nFACTUAL_REPORT_JSON:\n"
+            + json.dumps(facts["report"]), missing_read, self.fixture)
+        self.assertFalse(checks["every_exact_artifact_was_read"])
+
+    def test_fixture_followthrough_script_rejects_a_second_action(self):
+        first = subprocess.run([sys.executable, "-B", str(self.fixture["action"]), self.sentinel],
+                               capture_output=True, text=True, check=False)
+        second = subprocess.run([sys.executable, "-B", str(self.fixture["action"]), self.sentinel],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        state = json.loads(self.fixture["followthrough"].read_text(encoding="utf-8"))
+        self.assertEqual(state["approved_action_count"], 1)
+        self.assertEqual(state["sentinel"], self.sentinel)
+
+    def test_old_ack_cleanup_repeat_and_new_conflict_revision_remain_distinct(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_supervision as supervision
+
+        jobs = self.root / "jobs.log"
+        attempt, route_id, receipt, completion, metadata = replay._fixture_registry(
+            jobs, "idle-parent", self.worktree, self.sentinel)
+        pending.claim(self.root, "idle-parent", completion["delivery_id"],
+                      claim_owner="fixture-consumer", lease_seconds=30,
+                      require_generation_proof=False, jobs=jobs)
+        acked = pending.ack(self.root, "idle-parent", completion["delivery_id"],
+                            acked_by="codex-native-prompt:idle-parent")
+        old_ack = pending.received_ack_identity(acked, "idle-parent", completion["delivery_id"])
+
+        cleanup = supervision.materialize(jobs, {attempt}, reason="join-deadline")[0]
+        self.assertFalse(supervision.notice_is_current(cleanup))
+        self.assertIn("retains cleanup observation only",
+                      supervision.render_text(cleanup["receipt"]))
+        duplicate = pending.create(
+            self.root, recipient_kind="codex-native-queue", recipient_key="idle-parent",
+            delivery_id=completion["delivery_id"], session_generation="",
+            session_generation_supported="0", attempt_ids=[attempt], parent_attempt_id="-",
+            route_id=route_id, route_node="_owner", receipt=receipt,
+            receipt_digest=completion["receipt_digest"],
+            row_revisions={attempt: metadata["delivery_row_revision"]})
+        self.assertEqual(duplicate["state"], "acked")
+        self.assertEqual(pending.received_ack_identity(
+            pending.read(self.root, "idle-parent", completion["delivery_id"]),
+            "idle-parent", completion["delivery_id"]), old_ack)
+
+        conflict_metadata = {
+            **metadata, "cleanup_state": "unknown", "terminal_conflict": "1",
+            "conflicting_terminal_note": "synthetic-late-failure",
+            "conflicting_failure_class": "fail",
+            "conflicting_classifier_source": "native-replay-late-fixture",
+        }
+        jobs.write_text(
+            "2026-10-19T00:00:00Z\tdone\t" + str(self.worktree) + "\t" + str(self.worktree)
+            + "\tisolated-parent-replay\t"
+            + ",".join(f"{key}={value}" for key, value in conflict_metadata.items()) + "\n",
+            encoding="utf-8")
+        late = supervision.materialize(jobs, {attempt}, reason="terminal-evidence-conflict")[0]
+        self.assertNotEqual(late["delivery_id"], cleanup["delivery_id"])
+        self.assertNotEqual(late["delivery_id"], completion["delivery_id"])
+        self.assertTrue(late["receipt"]["obligation_revision"])
+        self.assertTrue(supervision.notice_is_current(late))
+        self.assertTrue(pending.read(self.root, "idle-parent", completion["delivery_id"]))
+        self.assertEqual(pending.read(self.root, "idle-parent", cleanup["delivery_id"])["state"], "pending")
 
     def test_resolver_rejects_symlink_into_group_or_world_writable_directory(self):
         with tempfile.TemporaryDirectory(prefix="parent-replay-unsafe-endpoint-") as temporary:

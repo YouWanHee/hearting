@@ -29,6 +29,7 @@ import tempfile
 import tomllib
 import time
 import uuid
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -442,6 +443,157 @@ def _turn_items(turn: dict) -> tuple[list[str], list[dict]]:
     return messages, tools
 
 
+def _write_native_fixture(worktree: Path, sentinel: str) -> dict:
+    """Build the fully labelled, synthetic chronology consumed by the native turn."""
+    fixture = worktree / ".agent_reports" / "native-parent-fixture"
+    fixture.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fixture_id = "fixture-" + hashlib.sha256(sentinel.encode()).hexdigest()[:12]
+    events = [
+        {"sequence": 1, "event": "original-code-attempt", "result": "FAIL",
+         "evidence": "synthetic-request-boundary-assertion", "reason": "The original request boundary rejected the fixture input."},
+        {"sequence": 2, "event": "fix-applied", "result": "FIXED",
+         "evidence": "synthetic-parser-correction", "reason": "The fixture parser now accepts the documented input."},
+        {"sequence": 3, "event": "verification", "result": "PASS",
+         "evidence": "fixture-verifier-6-checks", "reason": "Six isolated fixture assertions passed."},
+        {"sequence": 4, "event": "deployment", "result": "SUCCESS",
+         "evidence": "synthetic-deployment", "reason": "A synthetic deployment record was marked successful."},
+        {"sequence": 5, "event": "independent-review", "result": "PASS",
+         "evidence": "synthetic-review-01", "reason": "The isolated fixture review record passed."},
+        {"sequence": 6, "event": "documentation", "result": "COMPLETE",
+         "evidence": "synthetic-docs-complete", "reason": "The isolated fixture documentation record is complete."},
+    ]
+    synthetic = {
+        "commit": f"synthetic-only:commit-id=fixture-commit-{fixture_id}",
+        "deployment": f"synthetic-only:status=success id=fixture-deploy-{fixture_id}",
+        "serving": f"synthetic-only:synthetic://serving/{fixture_id} (not probed)",
+    }
+    skipped = [
+        "Production deployment and serving checks were skipped; the displayed values are synthetic.",
+        "The historical direct dispatch_completion_join suite recorded 2 skips; this native replay did not rerun it.",
+    ]
+    limits = [
+        "All six chronology records and the deployment, review, commit, and serving values are synthetic fixture data.",
+        "No production endpoint, deployment, commit, CI run, PR, or operating state was changed or measured.",
+        "This isolated app-server replay tests Codex delivery and reporting only.",
+    ]
+    report = {
+        "fixture": "synthetic-isolated-codex-parent-replay",
+        "fixture_id": fixture_id,
+        "reason": "Complete the already approved isolated parent follow-through after reading the exact result.",
+        "before": {"followthrough_file": "absent", "approved_action_count": 0},
+        "after": {"followthrough_file": "present", "approved_action_count": 1,
+                    "sentinel": sentinel},
+        "chronology": events,
+        "verification": {"command": "python3 -B verify_fixture.py", "result": "PASS",
+                          "checks_passed": 6, "checks_failed": 0},
+        "skipped": skipped,
+        "synthetic_values": synthetic,
+        "limits": limits,
+    }
+    facts = {"fixture_id": fixture_id, "sentinel": sentinel, "events": events,
+             "report": report, "skipped": skipped, "limits": limits,
+             "synthetic_values": synthetic}
+    facts_path = fixture / "fixture-facts.json"
+    _write_json(facts_path, facts)
+    artifact_paths = []
+    for event in events:
+        path = fixture / f"{event['sequence']:02d}-{event['event']}.md"
+        path.write_text(
+            f"FIXTURE_ID={fixture_id}\nEVENT_ID={event['evidence']}\n"
+            f"SEQUENCE={event['sequence']}\nEVENT={event['event']}\nRESULT={event['result']}\n"
+            f"REASON={event['reason']}\nSYNTHETIC=true\n",
+            encoding="utf-8")
+        artifact_paths.append(path)
+    verifier = fixture / "verify_fixture.py"
+    verifier.write_text(
+        "import json\nfrom pathlib import Path\n"
+        "root = Path(__file__).resolve().parent\n"
+        "facts = json.loads((root / 'fixture-facts.json').read_text(encoding='utf-8'))\n"
+        "events = facts['events']\n"
+        "assert [item['sequence'] for item in events] == list(range(1, 7))\n"
+        "assert [item['result'] for item in events] == ['FAIL', 'FIXED', 'PASS', 'SUCCESS', 'PASS', 'COMPLETE']\n"
+        "for item in events:\n"
+        "    path = root / f\"{item['sequence']:02d}-{item['event']}.md\"\n"
+        "    text = path.read_text(encoding='utf-8')\n"
+        "    assert f\"EVENT_ID={item['evidence']}\" in text\n"
+        "    assert f\"RESULT={item['result']}\" in text\n"
+        "    assert 'SYNTHETIC=true' in text\n"
+        "print('FIXTURE_VERIFICATION=PASS checks=6 failed=0')\n",
+        encoding="utf-8")
+    followthrough = fixture / "follow-through.json"
+    action = fixture / "apply_fixture_followthrough.py"
+    action.write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "root = Path(__file__).resolve().parent\n"
+        "facts = json.loads((root / 'fixture-facts.json').read_text(encoding='utf-8'))\n"
+        "sentinel = sys.argv[1]\n"
+        "if sentinel != facts['sentinel']:\n    raise SystemExit('fixture-sentinel-mismatch')\n"
+        "target = root / 'follow-through.json'\n"
+        "try:\n"
+        "    with target.open('x', encoding='utf-8') as stream:\n"
+        "        json.dump({'fixture_id': facts['fixture_id'], 'sentinel': sentinel,\n"
+        "                   'approved_action_count': 1, 'synthetic': True}, stream, sort_keys=True)\n"
+        "        stream.write('\\n')\n"
+        "except FileExistsError:\n    raise SystemExit('fixture-followthrough-already-applied')\n"
+        "print('FOLLOWTHROUGH_APPLIED=' + facts['fixture_id'])\n",
+        encoding="utf-8")
+    return {"fixture": fixture, "facts": facts, "facts_path": facts_path,
+            "artifact_paths": artifact_paths, "verifier": verifier,
+            "action": action, "followthrough": followthrough}
+
+
+def _factual_report_object(text: str) -> dict | None:
+    marker = "FACTUAL_REPORT_JSON:"
+    offset = text.find(marker)
+    if offset < 0:
+        return None
+    raw = text[offset + len(marker):].lstrip()
+    try:
+        value, _end = json.JSONDecoder().raw_decode(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _first_report_checks(text: str, tools: list[dict], fixture: dict) -> dict:
+    expected = fixture["facts"]["report"]
+    report = _factual_report_object(text)
+    command_items = [item for item in tools if isinstance(item.get("command"), str)]
+    def successful(item):
+        return item.get("status") in {"completed", "success"} and item.get("exitCode") == 0
+
+    artifact_reads = {}
+    for path in [fixture["facts_path"], *fixture["artifact_paths"]]:
+        marker = ("FIXTURE_ID=" + fixture["facts"]["fixture_id"] if path != fixture["facts_path"]
+                  else '"fixture_id"')
+        artifact_reads[str(path)] = any(
+            str(path) in item["command"] and marker in str(item.get("aggregatedOutput", ""))
+            for item in command_items if successful(item))
+    verifier_runs = [item for item in command_items if str(fixture["verifier"]) in item["command"]]
+    action_runs = [item for item in command_items if str(fixture["action"]) in item["command"]]
+    followthrough = None
+    try:
+        followthrough = json.loads(fixture["followthrough"].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    prose = text.split("FACTUAL_REPORT_JSON:", 1)[0].strip()
+    return {
+        "report_matches_fixture_facts": report == expected,
+        "report_has_substantive_closing_prose": len(prose) >= 40,
+        "every_exact_artifact_was_read": bool(artifact_reads) and all(artifact_reads.values()),
+        "artifact_reads": artifact_reads,
+        "fixture_verifier_passed_in_native_tool_trace": any(
+            successful(item) and "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+            in str(item.get("aggregatedOutput", "")) for item in verifier_runs),
+        "one_approved_followthrough_tool_invocation": len(action_runs) == 1 and successful(action_runs[0]),
+        "followthrough_state_matches_one_time_fixture_action": followthrough == {
+            "fixture_id": fixture["facts"]["fixture_id"],
+            "sentinel": fixture["facts"]["sentinel"],
+            "approved_action_count": 1, "synthetic": True},
+        "report_object": report,
+    }
+
+
 def _fixture_registry(jobs: Path, thread_id: str, workspace: Path, sentinel: str):
     attempt = "att-parent-replay-" + uuid.uuid4().hex[:12]
     route_id = "rt-parent-replay-" + uuid.uuid4().hex[:8]
@@ -455,6 +607,7 @@ def _fixture_registry(jobs: Path, thread_id: str, workspace: Path, sentinel: str
             "reason": "registry-closed", "required_action": "advance-completed",
             "harness": "codex", "delivery_classification": "success"}]}
     digest = pending_delivery._canonical_receipt_digest(receipt)
+    sealed_batch_id = "batch-parent-replay-" + hashlib.sha256(attempt.encode()).hexdigest()[:12]
     metadata = {
         "attempt_schema_version": "2", "dispatch_depth": "1", "transport": "headless",
         "execution_surface": "registered-headless", "registered_worker": "1",
@@ -465,7 +618,8 @@ def _fixture_registry(jobs: Path, thread_id: str, workspace: Path, sentinel: str
         "delivery_recipient_kind": "codex-native-queue", "route_id": route_id,
         "owner_route_id": route_id, "owner_route_hash": route_hash,
         "route_hash": route_hash, "route_node": "_owner", "harness": "codex",
-        "workflow_completion": "runtime-v1", "note": "completed-marker", "failure_class": "pass",
+        "workflow_completion": "runtime-v1", "managed_sealed_batch_id": sealed_batch_id,
+        "note": "completed-marker", "failure_class": "pass", "cleanup_state": "unknown",
         "launch_outcome": "completed", "terminal_event": "worker-result",
     }
     jobs.write_text("2026-10-19T00:00:00Z\tdone\t" + str(workspace) + "\t" + str(workspace)
@@ -556,20 +710,15 @@ def _run_replay(output_dir: Path) -> dict:
         artifact_root = worktree / ".agent_reports"
         artifact_root.mkdir(mode=0o700)
         sentinel = "HEARTING_REPLAY_" + uuid.uuid4().hex.upper()
-        artifact = artifact_root / "exact-result.md"
-        artifact.write_text(
-            f"# Isolated fixture result\n\n"
-            "Chronology: original code attempt FAIL; corrected code attempt PASS; fixture deployment PASS; "
-            "fixture independent review PASS; documentation complete; cleanup state unknown; late join-deadline observed.\n"
-            f"What: created this isolated fixture result.\n"
-            f"Why: replay the approved parent follow-through.\n"
-            f"Before: follow-through file absent.\n"
-            f"After: follow-through file should contain this exact sentinel: {sentinel}\n"
-            f"Verification: read this file and write the sentinel once.\n"
-            f"Commit/PR/deployment/serving: none; this is an isolated fixture.\n"
-            f"Limits: no operating work was performed or measured.\n",
-            encoding="utf-8")
-        followthrough = worktree / "follow-through.txt"
+        fixture = _write_native_fixture(worktree, sentinel)
+        artifact_paths = [fixture["facts_path"], *fixture["artifact_paths"]]
+        for event in fixture["facts"]["events"]:
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "synthetic-fixture-stage", "sequence": event["sequence"],
+                "stage": event["event"], "result": event["result"],
+                "evidence": event["evidence"], "synthetic": True,
+            })
+        followthrough = fixture["followthrough"]
         endpoint = codex_home / "app-server-control" / "app-server-control.sock"
         # Do not inherit the supervised worker's CODEX_HOME, artifact output,
         # memory, Herd, or provider-key bindings into the isolated app server.
@@ -614,12 +763,21 @@ def _run_replay(output_dir: Path) -> dict:
                 attempt, route_id, receipt, completion_record, metadata = _fixture_registry(
                     jobs, thread_id, worktree, sentinel)
                 prompt = (
-                    "Continue the already approved isolated fixture task. Read the exact artifact at "
-                    f"{artifact}. Verify its sentinel, then write exactly that sentinel once to "
-                    f"{followthrough}, unless it already contains the exact sentinel once. Do not repeat a completed action. "
-                    "The earlier chronology is fixture history, not a production deployment or real independent review. "
-                    "This is only an isolated fixture: no real deployment, PR, "
-                    "commit, or operating change occurred."
+                    "Continue the already approved isolated fixture task. Read every exact path below, "
+                    "including fixture-facts.json, in the listed order. Run the exact verify_fixture.py "
+                    "with Python 3. Before any action, check whether follow-through.json already exists. "
+                    "If absent, run apply_fixture_followthrough.py with the exact sentinel from the facts "
+                    "once; if present and exact, do not run it again. Then give the first substantive "
+                    "completion report, including why, before/after, verification, skips, synthetic "
+                    "commit/deployment/serving values, and limits. After the prose, include a JSON object "
+                    "under the exact marker FACTUAL_REPORT_JSON: that matches the report object in "
+                    "fixture-facts.json. Label every fixture value synthetic and do not imply any real "
+                    "commit, deployment, independent review, production serving, CI, or operating change.\n"
+                    "Exact artifact paths (read all):\n- "
+                    + "\n- ".join(str(path) for path in artifact_paths)
+                    + f"\nVerifier: {fixture['verifier']}\nOne-time approved action: {fixture['action']} {sentinel}\n"
+                    + f"Expected action file: {followthrough}\n"
+                    "The earlier chronology is isolated fixture history; do not invent external results."
                 )
                 (output_dir / "input.txt").write_text(prompt + "\n", encoding="utf-8")
                 started = client.request("turn/start", {
@@ -743,34 +901,68 @@ def _run_replay(output_dir: Path) -> dict:
                                            if _turn_for_client_message([turn], continuation_id) is not None)
             if continuation_occurrences != 1:
                 raise ReplayFailed("stable-native-continuation-not-exactly-once")
+            settle_deadline = time.monotonic() + 30
+            settled_duty = obligations.get(duty_id)
+            while time.monotonic() < settle_deadline:
+                settled_duty = obligations.get(duty_id)
+                if isinstance(settled_duty, dict) and settled_duty.get("state") == "complete":
+                    break
+                time.sleep(0.1)
+            if not isinstance(settled_duty, dict) or settled_duty.get("state") != "complete":
+                raise ReplayBlocked("completed-native-receiving-duty-not-settled")
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "completed-native-receiving-duty-settled",
+                "duty_id": duty_id, "delivery_id": completion_record["delivery_id"],
+                "receiving_turn_id": continuation_turn.get("id"),
+                "duty_state": settled_duty.get("state"),
+                "attempt_row_status": "done",
+            })
             final_text = continuation_messages[-1]
             tool_trace = [*initial_tools, *continuation_tools]
             (output_dir / "turn-output.txt").write_text(final_text + "\n", encoding="utf-8")
             (output_dir / "tool-trace.jsonl").write_text("".join(
                 json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in tool_trace),
                 encoding="utf-8")
-            report_check = {
-                "artifact_sentinel_seen_in_tool_trace": any(
-                    sentinel in json.dumps(item, ensure_ascii=False) for item in tool_trace),
-                "followthrough_exactly_once": followthrough.read_text(encoding="utf-8") == sentinel + "\n",
-                "report_mentions_reason": any(token in final_text.lower() for token in ("why", "because", "reason")),
-                "report_mentions_before_after": "before" in final_text.lower() and "after" in final_text.lower(),
-                "report_mentions_verification": any(token in final_text.lower() for token in ("check", "verif")),
-                "report_mentions_delivery_state": any(token in final_text.lower() for token in
-                    ("deployment", "deploy", "serving", "served")),
-                "report_mentions_limit": any(token in final_text.lower() for token in ("limit", "remaining", "fixture")),
-            }
+            report_check = _first_report_checks(final_text, tool_trace, fixture)
+            if not all(value for key, value in report_check.items()
+                       if key not in {"artifact_reads", "report_object"}):
+                raise ReplayFailed("first-parent-report-does-not-match-exact-fixture-facts")
+            original_ack_identity = pending_delivery.received_ack_identity(
+                first_record, thread_id, completion_record["delivery_id"])
+            followthrough_after_first_report = followthrough.read_bytes()
+            followthrough_stat_after_first_report = followthrough.stat().st_mtime_ns
+            _write_json(output_dir / "first-report-facts.json", fixture["facts"]["report"])
+            _write_json(output_dir / "first-report-checks.json", report_check)
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "first-closing-report-validated", "turn_id": continuation_turn.get("id"),
+                "report_matches_exact_facts": report_check["report_matches_fixture_facts"],
+                "all_exact_artifacts_read": report_check["every_exact_artifact_was_read"],
+                "verifier_tool_trace_passed": report_check["fixture_verifier_passed_in_native_tool_trace"],
+                "one_time_followthrough_observed": report_check["followthrough_state_matches_one_time_fixture_action"],
+                "fixture_id": fixture["facts"]["fixture_id"],
+            })
 
             # Re-expose the late cleanup and same exact result only inside the
-            # isolated ledger. Observe history before the direct user question.
+            # isolated ledger. The completed result is ACKed; cleanup remains
+            # with its controller and must not become another model turn.
             history_before_cleanup = _all_turns(endpoint, thread_id)
             cleanup_notice = dispatch_supervision.materialize(
                 jobs, {attempt}, reason="join-deadline")[0]
             cleanup_text = dispatch_session_sweep._bounded_receipt_text(cleanup_notice)
+            cleanup_is_current = dispatch_supervision.notice_is_current(cleanup_notice)
+            if cleanup_is_current or "retains cleanup observation only" not in cleanup_text:
+                raise ReplayFailed("late-join-deadline-was-not-classified-as-cleanup-only")
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "late-cleanup-materialized", "delivery_id": cleanup_notice["delivery_id"],
+                "receipt_digest": cleanup_notice["receipt_digest"],
+                "obligation_revision": (cleanup_notice.get("receipt") or {}).get("obligation_revision"),
                 "timestamp_provenance": cleanup_notice.get("timestamp_provenance"),
                 "rendered_context": cleanup_text,
+            })
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "late-join-deadline-observed", "delivery_id": cleanup_notice["delivery_id"],
+                "reason": (cleanup_notice.get("receipt") or {}).get("reason"),
+                "cleanup_only": True, "synthetic_cleanup_state": "unknown",
             })
             duplicate = pending_delivery.create(runtime,
                 recipient_kind="codex-native-queue", recipient_key=thread_id,
@@ -779,8 +971,20 @@ def _run_replay(output_dir: Path) -> dict:
                 route_id=route_id, route_node="_owner", receipt=receipt,
                 receipt_digest=completion_record["receipt_digest"],
                 row_revisions={attempt: metadata["delivery_row_revision"]})
+            ack_after_duplicate = pending_delivery.read(
+                runtime, thread_id, completion_record["delivery_id"])
+            if (duplicate.get("state") != "acked" or ack_after_duplicate is None
+                    or pending_delivery.received_ack_identity(
+                        ack_after_duplicate, thread_id, completion_record["delivery_id"])
+                        != original_ack_identity):
+                raise ReplayFailed("same-result-redelivery-changed-the-exact-old-ack")
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "same-result-redelivery", "delivery_id": duplicate["delivery_id"],
+                "receipt_digest": duplicate["receipt_digest"], "state": duplicate["state"],
+                "ack_identity": original_ack_identity,
+            })
             # Admit these records to the candidate consumer before observing
-            # silence; an unsubmitted empty native queue is not evidence.
+            # suppression; an unsubmitted empty native queue is not evidence.
             deliveries, _ = dispatch_session_sweep.sweep_deliver(runtime, "codex-native-queue", thread_id)
             if deliveries:
                 raise ReplayFailed("late-cleanup-or-duplicate-still-eligible-for-native-delivery")
@@ -792,6 +996,137 @@ def _run_replay(output_dir: Path) -> dict:
                 for item in queue_after_cleanup)
             if not no_extra_turn or not no_queued_duplicate:
                 raise ReplayFailed("late-cleanup-created-an-unrequested-native-turn-or-queue-item")
+
+            # A genuinely new terminal conflict gets a new notice revision.
+            # It must reach the still-idle native parent through the existing
+            # Codex managed-completion NoticeWatcher and queue courier.
+            late_metadata = {
+                **metadata, "cleanup_state": "unknown", "terminal_conflict": "1",
+                "conflicting_terminal_note": "synthetic-late-failure",
+                "conflicting_failure_class": "fail",
+                "conflicting_classifier_source": "native-replay-late-fixture",
+            }
+            jobs.write_text(
+                "2026-10-19T00:00:00Z\tdone\t" + str(worktree) + "\t" + str(worktree)
+                + "\tisolated-parent-replay\t"
+                + ",".join(f"{key}={value}" for key, value in late_metadata.items()) + "\n",
+                encoding="utf-8")
+            from dispatch_attempt_policy import terminal_conflict_pending
+            from dispatch_supervision import _rows as supervision_rows
+            late_row = supervision_rows(jobs, {attempt})[attempt]
+            if not terminal_conflict_pending(late_row[1]) or late_row[0] != "done":
+                raise ReplayFailed("late-conflict-fixture-did-not-preserve-done-row-and-new-failure")
+            late_notice = dispatch_supervision.materialize(
+                jobs, {attempt}, reason="terminal-evidence-conflict")[0]
+            if (late_notice["delivery_id"] == completion_record["delivery_id"]
+                    or late_notice["delivery_id"] == cleanup_notice["delivery_id"]
+                    or not dispatch_supervision.notice_is_current(late_notice)):
+                raise ReplayFailed("new-terminal-conflict-did-not-create-a-current-distinct-notice")
+            _write_json(output_dir / "late-cleanup-notice.json", cleanup_notice)
+            _write_json(output_dir / "late-conflict-notice.json", late_notice)
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "new-conflict-notice-materialized-after-old-ack",
+                "old_ack_delivery_id": completion_record["delivery_id"],
+                "old_ack_identity": original_ack_identity,
+                "new_notice_delivery_id": late_notice["delivery_id"],
+                "new_notice_receipt_digest": late_notice["receipt_digest"],
+                "new_notice_reason": late_notice["receipt"]["reason"],
+                "new_notice_revision": late_notice["receipt"]["obligation_revision"],
+                "new_conflicting_terminal_note": late_metadata["conflicting_terminal_note"],
+                "old_goal_row_status": late_row[0],
+            })
+
+            spec = importlib.util.spec_from_file_location(
+                "codex_parent_replay_managed_completion", UTILITIES / "codex-managed-completion.py")
+            if spec is None or spec.loader is None:
+                raise ReplayBlocked("native-notice-courier-unavailable")
+            managed_completion = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(managed_completion)
+            watcher_args = SimpleNamespace(
+                jobs=jobs.resolve(), parent_session_id=thread_id,
+                sealed_batch_id=metadata["managed_sealed_batch_id"],
+                interval=0.05, queue_socket=endpoint,
+            )
+            watcher = managed_completion.NoticeWatcher(watcher_args, {attempt}, capability=None)
+            watcher.start()
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "idle-parent-native-notice-courier-started",
+                "thread_id": thread_id, "courier": "codex-managed-completion.NoticeWatcher",
+                "manual_prompt_or_wake": False,
+            })
+            late_notice_deadline = time.monotonic() + 180
+            late_notice_turn = None
+            late_notice_record = None
+            try:
+                while time.monotonic() < late_notice_deadline:
+                    late_notice_record = pending_delivery.read(
+                        runtime, thread_id, late_notice["delivery_id"])
+                    late_notice_turn = _turn_for_client_message(
+                        _all_turns(endpoint, thread_id), late_notice["delivery_id"])
+                    if (late_notice_record and late_notice_record.get("state") == "acked"
+                            and late_notice_turn and late_notice_turn.get("status")
+                            in {"completed", "interrupted"}):
+                        break
+                    time.sleep(0.05)
+            finally:
+                watcher.close()
+            if late_notice_turn is None:
+                raise ReplayBlocked("idle-parent-new-notice-not-queued-by-native-courier")
+            if late_notice_record is None or late_notice_record.get("state") != "acked":
+                raise ReplayBlocked("idle-parent-new-notice-exact-ack-not-observed")
+            if late_notice_turn.get("status") != "completed":
+                raise ReplayBlocked("idle-parent-new-notice-turn-unfinished")
+            late_notice_messages, late_notice_tools = _turn_items(late_notice_turn)
+            if not late_notice_messages:
+                raise ReplayFailed("idle-parent-new-notice-response-missing")
+            _write_json(output_dir / "idle-parent-notice-turn.json", late_notice_turn)
+            _write_json(output_dir / "idle-parent-notice-ack.json",
+                        pending_delivery.received_ack_identity(
+                            late_notice_record, thread_id, late_notice["delivery_id"]))
+            (output_dir / "idle-parent-notice-output.txt").write_text(
+                late_notice_messages[-1] + "\n", encoding="utf-8")
+            (output_dir / "idle-parent-notice-tool-trace.jsonl").write_text("".join(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                for item in late_notice_tools), encoding="utf-8")
+            idle_turns = _all_turns(endpoint, thread_id)
+            notice_occurrences = sum(
+                1 for turn in idle_turns
+                if _turn_for_client_message([turn], late_notice["delivery_id"]) is not None)
+            cleanup_turn_occurrences = sum(
+                1 for turn in idle_turns
+                if _turn_for_client_message([turn], cleanup_notice["delivery_id"]) is not None)
+            idle_response_count = len(idle_turns) - len(history_after_cleanup)
+            followthrough_after_idle_notice = followthrough.read_bytes()
+            followthrough_stat_after_idle_notice = followthrough.stat().st_mtime_ns
+            late_notice_action_invocations = sum(
+                1 for item in late_notice_tools
+                if str(fixture["action"]) in str(item.get("command", "")))
+            no_duplicate_idle_action_or_response = (
+                cleanup_turn_occurrences == 0 and idle_response_count == 1
+                and notice_occurrences == 1 and late_notice_action_invocations == 0
+                and followthrough_after_idle_notice == followthrough_after_first_report
+                and followthrough_stat_after_idle_notice == followthrough_stat_after_first_report)
+            old_after_notice = pending_delivery.read(
+                runtime, thread_id, completion_record["delivery_id"])
+            if (not no_duplicate_idle_action_or_response or old_after_notice is None
+                    or pending_delivery.received_ack_identity(
+                        old_after_notice, thread_id, completion_record["delivery_id"])
+                        != original_ack_identity):
+                raise ReplayFailed("idle-notice-identity-or-one-response-contract-failed")
+            _append_event(output_dir / "native-events.jsonl", {
+                "event": "idle-parent-new-notice-consumed",
+                "new_notice_delivery_id": late_notice["delivery_id"],
+                "new_notice_turn_id": late_notice_turn.get("id"),
+                "new_notice_ack_state": late_notice_record.get("state"),
+                "new_notice_turn_status": late_notice_turn.get("status"),
+                "new_notice_turn_occurrences": notice_occurrences,
+                "late_cleanup_turn_occurrences": cleanup_turn_occurrences,
+                "idle_parent_new_turn_count": idle_response_count,
+                "no_duplicate_action_or_response": no_duplicate_idle_action_or_response,
+                "old_ack_delivery_id": completion_record["delivery_id"],
+                "old_ack_identity_preserved": True,
+                "native_turn_count_after_notice": len(idle_turns),
+            })
 
             followthrough_before_question = followthrough.read_bytes()
             stat_before_question = followthrough.stat().st_mtime_ns
@@ -837,9 +1172,39 @@ def _run_replay(output_dir: Path) -> dict:
                 runtime, thread_id, cleanup_notice["delivery_id"])
             all_turns_after_question = _all_turns(endpoint, thread_id)
             queue_after_question = codex_queue_delivery.list_queue(endpoint, thread_id, timeout=10)
+            latest_ack = pending_delivery.read(runtime, thread_id, completion_record["delivery_id"])
+            latest_conflict_row = supervision_rows(jobs, {attempt})[attempt]
+            conflict_still_pending = terminal_conflict_pending(latest_conflict_row[1])
+            conflict_ack = pending_delivery.read(runtime, thread_id, late_notice["delivery_id"])
+            conflict_turn_occurrences = sum(
+                1 for turn in all_turns_after_question
+                if _turn_for_client_message([turn], late_notice["delivery_id"]) is not None)
+            report_checks_passed = all(
+                value for key, value in report_check.items()
+                if key not in {"artifact_reads", "report_object"})
+            acceptance_checks = {
+                "first_report_matches_fixture_and_real_tool_evidence": report_checks_passed,
+                "exact_original_ack_identity_preserved": bool(latest_ack)
+                    and pending_delivery.received_ack_identity(
+                        latest_ack, thread_id, completion_record["delivery_id"])
+                        == original_ack_identity,
+                "late_cleanup_and_deadline_suppressed_as_duplicate_work": (
+                    cleanup_record_after_question is not None
+                    and cleanup_record_after_question.get("state") == "rejected"
+                    and no_extra_turn and no_queued_duplicate),
+                "same_result_redelivery_did_not_reopen_completed_attempt": (
+                    duplicate.get("state") == "acked" and late_row[0] == "done"
+                    and isinstance(settled_duty, dict) and settled_duty.get("state") == "complete"),
+                "new_conflict_notice_delivered_and_consumed_once_while_parent_idle": (
+                    conflict_ack is not None and conflict_ack.get("state") == "acked"
+                    and conflict_turn_occurrences == 1 and late_notice_turn.get("status") == "completed"
+                    and no_duplicate_idle_action_or_response),
+                "new_failure_conflict_remains_visible_after_notice": conflict_still_pending,
+                "direct_status_answer_did_not_repeat_followthrough": direct_answer_ok and followthrough_unchanged,
+            }
             # The exact history/queue checks are native Codex evidence; receipt
-            # identity, cleanup rendering, and no-turn-before-question are
-            # deterministic evidence from the same isolated registry.
+            # identity, conflict state, and cleanup classification are also
+            # tied to the same isolated registry and private Codex queue.
             report.update({
                 "status": "observed", "thread_id": thread_id, "turn_id": turn_id,
                 "original_turn_status_after_crash": first_turn_before_crash.get("status"),
@@ -857,6 +1222,8 @@ def _run_replay(output_dir: Path) -> dict:
                 "continuation_tool_count": len(continuation_tools),
                 "continuation_report_count": len(continuation_messages),
                 "report_checks": report_check,
+                "first_report_matches_exact_facts": report_checks_passed,
+                "original_ack_identity": original_ack_identity,
                 "late_cleanup_rendered_cleanup_only": "retains cleanup observation only" in cleanup_text,
                 "late_cleanup_additional_native_turns_before_direct_question":
                     max(0, len(history_after_cleanup) - len(history_before_cleanup)),
@@ -866,30 +1233,36 @@ def _run_replay(output_dir: Path) -> dict:
                 "duplicate_record_kept_ack_state": duplicate.get("state") == "acked",
                 "native_history_count_unchanged_before_direct_question": no_extra_turn,
                 "native_queue_has_no_completion_duplicate": no_queued_duplicate,
-                "cleanup_notice_acknowledged_on_direct_question":
-                    bool(cleanup_record_after_question and cleanup_record_after_question.get("state") == "acked"),
+                "cleanup_notice_retired_as_resolved": bool(
+                    cleanup_record_after_question and cleanup_record_after_question.get("state") == "rejected"),
+                "late_conflict_delivery_id": late_notice["delivery_id"],
+                "late_conflict_receipt_digest": late_notice["receipt_digest"],
+                "late_conflict_obligation_revision": late_notice["receipt"]["obligation_revision"],
+                "late_conflict_turn_id": late_notice_turn.get("id"),
+                "late_conflict_turn_occurrences": conflict_turn_occurrences,
+                "late_conflict_still_pending": conflict_still_pending,
+                "attempt_remains_done_after_duplicate": late_row[0] == "done",
                 "direct_question_answered": direct_answer_ok,
                 "followthrough_unchanged_after_direct_question": followthrough_unchanged,
+                "acceptance_checks": acceptance_checks,
                 "crash_reconnect_replayed": True,
-                "limitations": ["Fixture result, deployment, serving, and operating performance were not real "
-                    "production events. The app-server replay used an isolated persisted thread and copied "
-                    "private auth material that was removed before model tools ran."],
+                "synthetic_fixture_facts": fixture["facts"],
+                "limitations": ["Chronology, commit, deployment, serving, independent review, late conflict, "
+                    "and follow-through are explicitly synthetic fixture data, not production events.",
+                    "The app-server replay used an isolated persisted thread and copied private auth material "
+                    "that was removed before model tools ran.",
+                    "This native Codex result does not establish Claude/OpenCode parity, PR readiness, CI, or "
+                    "the later report/test gates."],
             })
-            if not all(report_check.values()):
+            if not all(acceptance_checks.values()):
                 report["status"] = "failed"
                 report["verdict"] = "FAIL"
-                report["failure_reason"] = "first-parent-report-or-tool-trace-contract-failed"
-            elif initial_messages or initial_tools:
-                report["verdict"] = "BLOCKED"
-                report["blocker"] = "native-crash-window-after-ack-before-tool-or-response-not-captured"
-                report["d1"] = "observed-with-native-continuation"
-                report["d2"] = "late-cleanup-and-direct-question-observed"
+                report["failure_reason"] = "measured-native-parent-acceptance-check-failed"
             else:
-                report["verdict"] = "BLOCKED"
-                report["blocker"] = "full-parent-chronology-and-idle-handover-native-replay-not-yet-covered"
-                report["d1"] = "isolated-native-crash-slice-observed; full-parent-acceptance-unfinished"
-                report["d2"] = "shared-consumer-suppression-observed; full-native-notice-and-idle-handover-unfinished"
-                report["d3"] = "exact-ack-and-cleanup-unknown-preserved; adapter matrix is deterministic-only"
+                report.update(status="observed", verdict="PASS", blocker="none",
+                    d1="PASS: exact native ACK, crash interruption, stable continuation, factual first report, one-time follow-through",
+                    d2="PASS: late cleanup/deadline and exact same-result redelivery were suppressed without reopening the done attempt",
+                    d3="PASS: new post-ACK conflict revision reached and completed on the idle parent through NoticeWatcher/native queue")
             return report
         finally:
             _stop_server(server)

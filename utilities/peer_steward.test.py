@@ -8544,5 +8544,158 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotEqual(store.get(duty["id"])["state"], "complete")
 
 
+class NativeReceivingTurnSettlementTests(unittest.TestCase):
+    """A native turn settles only its delivery duty; it does not mutate route work."""
+
+    def _fixture(self, root: Path, *, binding=True):
+        import dispatch_pending_delivery as pending
+        jobs = root / "jobs.log"
+        jobs.write_text("fixture registry remains unchanged\n", encoding="utf-8")
+        metadata = {
+            "attempt_id": "att-native-receive", "route_id": "rt-native-receive",
+            "route_node": "execute", "parent_attempt_id": "-",
+            "delivery_id": "delivery-native-receive", "delivery_receipt_digest": "digest-native",
+            "delivery_row_revision": "revision-native", "harness": "codex",
+        }
+        row = SimpleNamespace(attempt_id="att-native-receive", status="done", metadata=metadata)
+        observation = {}
+        if binding:
+            observation["native_receiving_turn"] = {
+                "thread_id": "native-parent", "recipient_sid": "native-parent",
+                "storage_recipient": "native-parent", "delivery_id": metadata["delivery_id"],
+                "receipt_digest": metadata["delivery_receipt_digest"],
+                "row_revision": metadata["delivery_row_revision"], "turn_id": "turn-exact",
+            }
+        duty = {"id": "registered-batch-test", "intent": {"identity": {"jobs": str(jobs)}},
+                "observation": observation, "state": "pending"}
+        receipt = {"children": [{"attempt_id": row.attempt_id, "status": "done",
+                                 "required_action": "advance-completed"}]}
+        exact = {
+            "state": "acked", "receipt": receipt, "receipt_digest": "digest-native",
+            "row_revisions": {row.attempt_id: "revision-native"},
+            "acked_by": "codex-native-prompt:turn-exact",
+        }
+        workflow = {"state": "open", "declared_next_work": ["impl-review"]}
+        next_notice_receipt = {"kind": "supervision", "reason": "new-work-remains"}
+        next_notice = pending.create(
+            root, recipient_kind="codex-native-queue", recipient_key="native-parent",
+            delivery_id="delivery-next-work", session_generation="",
+            session_generation_supported="0", attempt_ids=["att-next-work"],
+            parent_attempt_id="att-owner", route_id="rt-next", route_node="impl-review",
+            receipt=next_notice_receipt,
+            receipt_digest=pending._canonical_receipt_digest(next_notice_receipt),
+            row_revisions={"att-next-work": "revision-next"})
+        before_registry = jobs.read_bytes()
+        return pending, jobs, row, duty, exact, workflow, next_notice, before_registry
+
+    def test_completed_live_ack_only_unknown_and_interrupted_turns_stay_separate_from_workflow(self):
+        import dispatch_completion_join as join
+        import codex_queue_delivery
+        import codex_queue_dispatch
+        import dispatch_pending_delivery as pending
+
+        for status, expected_state in (("completed", "complete"),
+                                       ("inProgress", "pending"),
+                                       ("future-status", "unknown")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                (fixture_pending, jobs, row, duty, exact, workflow, next_notice,
+                 before_registry) = self._fixture(Path(temporary))
+                store_updates = []
+
+                class Store:
+                    def update(_self, _duty_id, **changes):
+                        store_updates.append(changes)
+                        duty.update(changes)
+                        return duty
+
+                with mock.patch.object(fixture_pending, "read", return_value=exact), \
+                     mock.patch.object(join, "pending_record_identity",
+                                       return_value=("rt-native-receive", "execute", "-")), \
+                     mock.patch.object(fixture_pending, "received_ack_identity", return_value={
+                         "route_id": "rt-native-receive", "route_node": "execute",
+                         "parent_attempt_id": "-"}), \
+                     mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                       return_value=Path(temporary) / "queue.sock"), \
+                     mock.patch.object(codex_queue_delivery, "read_exact_turn",
+                                       return_value={"id": "turn-exact", "status": status}), \
+                     mock.patch.object(codex_queue_delivery, "send_at_least_once") as send:
+                    self.assertTrue(peer_steward._resume_native_receiving_turn(
+                        duty, Store(), row, exact, "native-parent", "native-parent"))
+
+                self.assertEqual(duty["state"], expected_state)
+                self.assertEqual(len(store_updates), 1)
+                send.assert_not_called()
+                self.assertEqual(jobs.read_bytes(), before_registry)
+                self.assertEqual(workflow, {"state": "open", "declared_next_work": ["impl-review"]})
+                next_after = fixture_pending.read(Path(temporary), "native-parent", "delivery-next-work")
+                self.assertEqual(next_after["state"], "pending")
+                self.assertEqual(next_after["receipt"], next_notice["receipt"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            (fixture_pending, _jobs, row, duty, exact, _workflow, _next_notice,
+             _before_registry) = self._fixture(Path(temporary), binding=False)
+
+            class Store:
+                def update(_self, _duty_id, **changes):
+                    duty.update(changes)
+                    return duty
+
+            with mock.patch.object(fixture_pending, "read") as read, \
+                 mock.patch.object(codex_queue_delivery, "send_at_least_once") as send:
+                self.assertTrue(peer_steward._resume_native_receiving_turn(
+                    duty, Store(), row, exact, "native-parent", "native-parent"))
+            self.assertEqual(duty["state"], "unknown")
+            self.assertEqual(duty["observation"]["reason"], "native-receiving-turn-binding-unknown")
+            read.assert_not_called()
+            send.assert_not_called()
+
+    def test_interrupted_turn_reuses_one_stable_continuation(self):
+        import dispatch_completion_join as join
+        import codex_queue_delivery
+        import codex_queue_dispatch
+        import dispatch_pending_delivery as pending
+
+        with tempfile.TemporaryDirectory() as temporary:
+            (fixture_pending, _jobs, row, duty, exact, _workflow, _next_notice,
+             _before_registry) = self._fixture(Path(temporary))
+
+            class Store:
+                def update(_self, _duty_id, **changes):
+                    duty.update(changes)
+                    return duty
+
+            send = mock.Mock(return_value={"status": "queued"})
+            with mock.patch.object(fixture_pending, "read", return_value=exact), \
+                 mock.patch.object(join, "pending_record_identity",
+                                   return_value=("rt-native-receive", "execute", "-")), \
+                 mock.patch.object(fixture_pending, "received_ack_identity", return_value={
+                     "route_id": "rt-native-receive", "route_node": "execute",
+                     "parent_attempt_id": "-"}), \
+                 mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                   return_value=Path(temporary) / "queue.sock"), \
+                 mock.patch.object(codex_queue_delivery, "read_exact_turn",
+                                   return_value={"id": "turn-exact", "status": "interrupted"}), \
+                 mock.patch.object(codex_queue_delivery, "_latest_turn",
+                                   return_value={"id": "turn-exact", "status": "interrupted"}), \
+                 mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id",
+                                   return_value=None), \
+                 mock.patch.object(codex_queue_delivery, "list_queue", return_value=[]), \
+                 mock.patch.object(codex_queue_delivery, "send_at_least_once", send), \
+                 mock.patch.object(join, "completion_followup_text", return_value="approved follow-through"):
+                self.assertTrue(peer_steward._resume_native_receiving_turn(
+                    duty, Store(), row, exact, "native-parent", "native-parent"))
+                continuation_id = duty["observation"]["continuation_id"]
+                self.assertTrue(continuation_id.startswith("delivery-"))
+                codex_queue_delivery.list_queue.return_value = [
+                    {"clientUserMessageId": continuation_id}]
+                self.assertTrue(peer_steward._resume_native_receiving_turn(
+                    duty, Store(), row, exact, "native-parent", "native-parent"))
+
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.kwargs["client_message_id"], continuation_id)
+            self.assertEqual(duty["state"], "pending")
+            self.assertEqual(duty["observation"]["continuation_source_turn"], "turn-exact")
+
+
 if __name__ == "__main__":
     unittest.main()
