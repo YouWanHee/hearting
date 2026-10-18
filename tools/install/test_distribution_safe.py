@@ -16,7 +16,6 @@ import threading
 import unittest
 from unittest import mock
 
-import distribution
 import fixture_env
 
 
@@ -154,9 +153,8 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
 
     def test_release_keep_message_names_the_actual_evidence(self) -> None:
         # Only an open attempt row is a "live dispatch attempt". A route record without a
-        # closing outcome, or evidence that could not be read, must be named as what it is,
-        # and the route line says what settles it (2026-10-06: four releases kept for weeks by
-        # route records with no attempt row anywhere, announced as live attempts).
+        # closing outcome, or evidence that could not be read, must be named as what it is;
+        # routine cleanup must not ask a person to close the record manually.
         release = Path("/releases/v9")
         attempt = distribution._release_keep_message(release, "open-attempt:att-123")
         self.assertIn("still referenced by a live dispatch attempt (open-attempt:att-123)", attempt)
@@ -164,8 +162,9 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.assertIn("live dispatch attempt", legacy)
         route = distribution._release_keep_message(release, "open-route:rt-abc")
         self.assertNotIn("live dispatch attempt", route)
-        self.assertIn("route record that has no closing outcome (open-route:rt-abc)", route)
-        self.assertIn("capability-route.py close", route)
+        self.assertIn("unresolved route reference (open-route:rt-abc)", route)
+        self.assertIn("execution or continuation", route)
+        self.assertNotIn("capability-route.py close", route)
         for why in ("registry-unreadable:/x/jobs.log", "registry-row-unparsable:/x/jobs.log",
                     "route-launch-home-unresolvable:rt-abc", "route-discovery-unreliable:/x/bindings"):
             with self.subTest(why=why):
@@ -1076,4 +1075,23 @@ class ActivationFailureDiagnosticTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    with tempfile.TemporaryDirectory(prefix="hearting-test-distribution-safe-") as root:
+        fixture_root = Path(root).resolve()
+        with fixture_env.patched_environment(
+            fixture_root / "runtime", Path(__file__).resolve().parents[2]
+        ) as env:
+            private_root = (fixture_root / "runtime").resolve()
+            for key in (
+                "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "HARNESS_STATE_ROOT",
+                "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+            ):
+                Path(env[key]).resolve().relative_to(private_root)
+            print("routine_fixture_roots=" + json.dumps({
+                key: env[key] for key in (
+                    "HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "HARNESS_STATE_ROOT",
+                    "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_ROOT",
+                )
+            }, sort_keys=True), flush=True)
+            import distribution
+            unittest.main()
