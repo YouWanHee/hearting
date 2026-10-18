@@ -4166,7 +4166,13 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
                 "keeping its pycache",
                 file=sys.stderr,
             )
-        elif why in {"dispatch-state-carry-forward-incomplete", "release-remains-after-prune"}:
+        elif why == "dispatch-state-carry-forward-incomplete":
+            print(
+                "harness release: dispatch state carry-forward incomplete for "
+                f"{candidate}; keeping it and its pycache",
+                file=sys.stderr,
+            )
+        elif why == "release-remains-after-prune":
             print(
                 f"harness release: {candidate} {why}; keeping it and its pycache",
                 file=sys.stderr,
