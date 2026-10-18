@@ -2861,7 +2861,8 @@ class GateCarrierTest(unittest.TestCase):
         self.assertNotIn("your decision", message)
 
     def test_an_answer_awaiting_this_parent_is_started_by_the_wake_that_carries_it(self):
-        # D1: the parent's rewake starts the route instead of asking the parent to.
+        # D1: the parent's wake schedules a start handoff; the existing start
+        # checks remain authoritative and the notice does not claim launch.
         import dispatch_supervision as supervision
         kept = [{"id": "input-1", "digest": "d1", "text": "use the smaller batch"}]
         armed = []
@@ -2874,7 +2875,10 @@ class GateCarrierTest(unittest.TestCase):
             rewake._RECIPIENT_KEY_CACHE.clear()
             notices = rewake._gate_notices(self._launch())
         self.assertEqual(len(notices), 1)
-        self.assertIn("started the route's continuation", notices[0])
+        self.assertIn("scheduled the route's start under the parent's identity", notices[0])
+        self.assertIn("existing launch checks still decide whether a new owner starts", notices[0])
+        self.assertIn("This is a handoff, not completion", notices[0])
+        self.assertNotIn("started the route's continuation", notices[0])
         self.assertEqual([env["AGENT_DISPATCH_CALLER_HARNESS"] for env in armed], ["claude"])
 
     def test_gate_notices_survives_an_expired_claim(self):
