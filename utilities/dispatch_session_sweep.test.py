@@ -582,7 +582,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             self.assertTrue(child_pid_file.exists(), "recovery request did not follow the ACK")
             child_pid = int(child_pid_file.read_text())
             tail, err = hook_process.communicate(
-                timeout=max(0.001, started + 10.0 - time.monotonic()))
+                timeout=min(8.0, max(0.001, started + 10.0 - time.monotonic())))
             hook_exit_at = time.monotonic()
             elapsed = hook_exit_at - started
             self.assertEqual(hook_process.returncode, 0, err.decode("utf-8", "replace"))
