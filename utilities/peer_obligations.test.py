@@ -488,6 +488,47 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual(duty["intent"]["identity"]["attempt_id"], "att-fixture")
         ensure.assert_called_once_with(jobs.parent)
 
+    def test_registered_completion_retains_exact_native_turn_before_ack(self):
+        from types import SimpleNamespace
+        import dispatch_completion_join as join
+        import dispatch_pending_delivery as pending
+        attempt, sid, carrier = "att-native-retained", "native-thread", "codex-native-queue"
+        receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": "parent-session-native",
+            "job_registry": str(self.jobs), "children": [{"attempt_id": attempt, "status": "done",
+                "readiness": "ready", "reason": "registry-closed", "required_action": "advance-completed",
+                "harness": "codex"}]}
+        revision, delivery_id = "revision-native", "delivery-native-retained"
+        metadata = {"attempt_id": attempt, "attempt_schema_version": "2", "dispatch_depth": "1",
+            "worker_type": "stage", "parent_sid": sid, "parent_completion_delivery": carrier,
+            "delivery_intent": "1", "delivery_id": delivery_id,
+            "delivery_receipt_digest": pending._canonical_receipt_digest(receipt),
+            "delivery_row_revision": revision, "route_id": "rt-native", "route_node": "execute",
+            "parent_attempt_id": "-", "harness": "codex"}
+        row = SimpleNamespace(status="done", metadata=metadata)
+        pending.create(self.root, recipient_kind=carrier, recipient_key=sid, delivery_id=delivery_id,
+            session_generation="", session_generation_supported="0", attempt_ids=[attempt],
+            parent_attempt_id="-", route_id="rt-native", route_node="execute", receipt=receipt,
+            receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={attempt: revision})
+        record = {**pending.read(self.root, sid, delivery_id), "_storage_key": sid}
+        turn = {"thread_id": sid, "turn_id": "turn-native", "status": "inProgress"}
+        with mock.patch.object(join, "current_attempt_row", return_value=row), \
+             mock.patch.object(join, "pending_record_identity",
+                               return_value=("rt-native", "execute", "-")), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch("harness_capabilities.parent_completion", return_value={"carrier": carrier}), \
+             mock.patch.object(obligations, "ensure_normal_runner"):
+            self.assertTrue(obligations.retain_registered_completion(
+                self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=turn))
+        duties = obligations.ObligationStore(self.jobs.parent).list(kinds={"registered-batch"})
+        self.assertEqual(len(duties), 1)
+        retained = duties[0]["observation"]["native_receiving_turn"]
+        self.assertEqual((retained["thread_id"], retained["turn_id"], retained["delivery_id"]),
+                         (sid, "turn-native", delivery_id))
+        self.assertEqual(pending.read(self.root, sid, delivery_id)["state"], "pending")
+        invalid_turn = {"thread_id": sid, "message_id": "not-a-turn", "status": "inProgress"}
+        self.assertFalse(obligations.retain_registered_completion(
+            self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=invalid_turn))
+
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
     def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
         self._check_observer_handoff(supported=False)

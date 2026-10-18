@@ -233,7 +233,8 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(record["schema_version"], 1)
         self.assertEqual(record["state"], "pending")
         self.assertEqual(record["receipt"], kwargs["receipt"])
-        self.assertEqual(set(record), set(PD.REQUIRED_FIELDS))
+        self.assertEqual(set(record), set(PD.REQUIRED_FIELDS) | {PD.TIMESTAMP_PROVENANCE_FIELD})
+        self.assertIsNotNone(record[PD.TIMESTAMP_PROVENANCE_FIELD]["record_materialized_at_utc"])
 
     def test_create_is_idempotent_o_excl_semantics(self):
         kwargs, first = self._create()
@@ -300,6 +301,7 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         path = PD.record_path(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
         legacy = dict(record)
         del legacy["claim_authority"]
+        legacy.pop(PD.TIMESTAMP_PROVENANCE_FIELD, None)
         legacy["state"] = "sent-ambiguous"
         legacy["claim_owner"] = "legacy-owner"
         legacy["claim_deadline_ns"] = 0
@@ -314,6 +316,7 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         path = PD.record_path(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
         legacy = dict(record)
         del legacy["claim_authority"]
+        legacy.pop(PD.TIMESTAMP_PROVENANCE_FIELD, None)
         legacy["state"] = "claimed"
         legacy["claim_owner"] = "legacy-owner"
         legacy["claim_deadline_ns"] = 0
@@ -413,6 +416,41 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         self.assertEqual(acked["state"], "acked")
         self.assertIsNotNone(acked["acked_at_ns"])
+        self.assertIsNotNone(acked[PD.TIMESTAMP_PROVENANCE_FIELD]["receive_at_utc"])
+
+    def test_timestamp_provenance_is_observational_idempotent_and_keeps_legacy_unknown(self):
+        kwargs = dict(self.kwargs)
+        did = kwargs["delivery_id"]
+        identity = PD.received_ack_identity(PD.read(self.root, "sess-claim", did), "sess-claim", did)
+        PD.claim(self.root, "sess-claim", did, claim_owner="time-test", lease_seconds=30)
+        first = PD.record_send(self.root, "sess-claim", did, source="native-queue-accepted",
+                               event_id="client-item-1")
+        again = PD.record_send(self.root, "sess-claim", did, source="native-queue-accepted",
+                               event_id="client-item-1")
+        second = PD.record_send(self.root, "sess-claim", did, source="native-queue-accepted",
+                                event_id="client-item-2")
+        timeline = second[PD.TIMESTAMP_PROVENANCE_FIELD]
+        self.assertEqual(first, again)
+        self.assertIsNotNone(timeline["first_send_at_utc"])
+        self.assertEqual(timeline["observed_send_count"], 2)
+        self.assertEqual(timeline["observed_redelivery_count"], 1)
+        self.assertEqual(PD.received_ack_identity(second, "sess-claim", did), identity)
+
+        legacy_kwargs = dict(self.kwargs, delivery_id="delivery-" + "c" * 32)
+        legacy_record = PD.create(**legacy_kwargs)
+        legacy_path = PD.record_path(self.root, "sess-claim", legacy_kwargs["delivery_id"])
+        legacy = dict(legacy_record)
+        legacy.pop(PD.TIMESTAMP_PROVENANCE_FIELD)
+        legacy.pop("claim_authority")
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        PD.claim(self.root, "sess-claim", legacy_kwargs["delivery_id"],
+                 claim_owner="legacy-time", lease_seconds=30)
+        observed = PD.record_send(self.root, "sess-claim", legacy_kwargs["delivery_id"],
+                                  source="native-queue-accepted", event_id="legacy-retry")
+        old_timeline = observed[PD.TIMESTAMP_PROVENANCE_FIELD]
+        self.assertIsNone(old_timeline["record_materialized_at_utc"])
+        self.assertIsNone(old_timeline["first_send_at_utc"])
+        self.assertIsNotNone(old_timeline["last_send_at_utc"])
 
     def test_generic_ack_does_not_gain_pending_state_authority(self):
         path = PD.record_path(self.root, "sess-claim", self.kwargs["delivery_id"])

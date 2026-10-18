@@ -268,6 +268,33 @@ def _legacy_gate_current(record: dict, jobs: Path, child: dict, metadata: dict) 
     return current
 
 
+def exact_completion_already_received(record: dict, metadata: dict, jobs: Path) -> bool:
+    """Recognize an already ACKed exact result without treating ACK as work."""
+    receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+    children = receipt.get("children")
+    if (receipt.get("state") != "ready" or not isinstance(children, list) or not children
+            or not metadata.get("parent_sid") or not metadata.get("parent_completion_delivery")):
+        return False
+    attempts = {child.get("attempt_id") for child in children if isinstance(child, dict)}
+    if len(attempts) != len(children) or not attempts:
+        return False
+    try:
+        from dispatch_completion_join import recover_acknowledged_batch_outcome
+        from dispatch_receipt_identity import canonical_receipt
+        from dispatch_seat_handover import effective_parent
+        recipient = effective_parent(metadata, jobs)
+        if not recipient:
+            return False
+        recovered = recover_acknowledged_batch_outcome(
+            jobs, attempts, recipient_sid=recipient,
+            parent_attempt_id=receipt.get("parent_attempt_id", ""),
+            parent_completion_delivery=metadata["parent_completion_delivery"])
+        return (recovered is not None
+                and canonical_receipt(recovered) == canonical_receipt(receipt))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
 def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
     receipt = record.get("receipt") or {}
     if receipt.get("kind") == "supervision":
@@ -321,6 +348,8 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
                 return False
         elif action == "advance-completed":
             if framed_decision_consumed(record, meta, jobs):
+                continue
+            if exact_completion_already_received(record, meta, jobs):
                 continue
             current = True
         elif route_obligation_closed(meta, jobs):

@@ -364,6 +364,93 @@ def _resume_text(receipt: dict) -> str:
         return ""
 
 
+def _acknowledged_completion_result(receipt: dict) -> dict | None:
+    """Return the exact all-child receipt when its current recipient ACKed it."""
+    try:
+        import dispatch_pending_delivery as pending
+        from dispatch_completion_join import current_attempt_row, recover_acknowledged_batch_outcome
+        from dispatch_seat_handover import effective_parent
+        jobs = Path(receipt["job_registry"])
+        monitored = set(receipt["monitored_attempt_ids"])
+        for attempt in sorted(monitored):
+            row = current_attempt_row(jobs, attempt)
+            if row is None:
+                return None
+            meta = row.metadata
+            if (not meta.get("parent_sid") or not meta.get("delivery_id")
+                    or effective_parent(meta, jobs) != receipt["recipient_thread_id"]):
+                return None
+            record = pending.read(jobs.resolve(strict=True).parent,
+                                  meta["parent_sid"], meta["delivery_id"])
+            body = (record or {}).get("receipt")
+            if not isinstance(body, dict):
+                continue
+            attempt_ids = {child.get("attempt_id") for child in body.get("children", [])
+                           if isinstance(child, dict)}
+            if not attempt_ids:
+                continue
+            recovered = recover_acknowledged_batch_outcome(
+                jobs, attempt_ids, recipient_sid=receipt["recipient_thread_id"],
+                parent_attempt_id=body.get("parent_attempt_id", ""),
+                parent_completion_delivery=meta.get("parent_completion_delivery", ""))
+            if recovered is None:
+                continue
+            children = recovered.get("children")
+            if (isinstance(children, list) and children
+                    and all(isinstance(child, dict) and child.get("status") == "done"
+                            and child.get("required_action") == "advance-completed"
+                            for child in children)):
+                return recovered
+        return None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
+def _cleanup_only_text(receipt: dict, completed: dict) -> str:
+    attempts = ", ".join(receipt["monitored_attempt_ids"])
+    text = (f"The exact settled completion for {attempts} was already received by the current parent. "
+            "This notice retains cleanup observation only; the process cleanup is still live or unknown "
+            "under the existing controller. Do not restart the goal, repeat completed follow-through, "
+            "or ask the user whether to wait or cancel. This notice grants no process signal, registry "
+            "rewrite, retry, or cancellation. Preserve any new failure, conflict, unfinished work, or "
+            "direct user question. The parent result remains the exact received result.")
+    try:
+        import dispatch_pending_delivery as pending
+        from dispatch_completion_join import current_attempt_row
+        completion_times = []
+        for child in completed.get("children", []):
+            if not isinstance(child, dict) or not isinstance(child.get("attempt_id"), str):
+                continue
+            row = current_attempt_row(Path(receipt["job_registry"]), child["attempt_id"])
+            if row is None or not row.metadata.get("parent_sid") or not row.metadata.get("delivery_id"):
+                continue
+            record = pending.read(Path(receipt["job_registry"]).resolve(strict=True).parent,
+                                  row.metadata["parent_sid"], row.metadata["delivery_id"])
+            timing = (record or {}).get("timestamp_provenance") or {}
+            first_send = timing.get("first_send_at_utc") or "unknown"
+            received = timing.get("receive_at_utc") or "unknown"
+            first_source = timing.get("first_send_source") or "unknown"
+            receive_source = timing.get("receive_source") or "unknown"
+            completion_times.append(f"{child['attempt_id']} first observed send={first_send} ({first_source}), "
+                                    f"exact receipt={received} ({receive_source})")
+        if completion_times:
+            text += " Original completion delivery timing (UTC wall clock): " + "; ".join(completion_times) + "."
+
+        rows = _rows(Path(receipt["job_registry"]), set(receipt["monitored_attempt_ids"]))
+        from dispatch_contract import residue_live_pids
+        residues = []
+        for attempt in receipt["monitored_attempt_ids"]:
+            row = rows.get(attempt)
+            pids = residue_live_pids(row[1]) if row else ()
+            if pids:
+                residues.append(f"{attempt} residue pid(s) {', '.join(map(str, pids[:4]))}")
+        if residues:
+            text += " Observed cleanup residue: " + "; ".join(residues) + "."
+    except (OSError, ValueError, SupervisionError):
+        pass
+    return text
+
+
 # Set on a delivered record (not its receipt) when its carrier started the continuation.
 CONTINUED_KEY = "parent_continuation"
 
@@ -401,6 +488,11 @@ def continue_for_parent(record: dict, *, session_id: str, recipient_kind: str,
 
 def render_text(receipt: dict, *, continued: dict | None = None) -> str:
     receipt = validate(receipt)
+    if receipt["reason"] in {"process-unverifiable", "join-deadline", "join-observer-failed",
+                              "supervisor-exited", "watch-deadline", "receiver-unavailable"}:
+        completed = _acknowledged_completion_result(receipt)
+        if completed is not None:
+            return _cleanup_only_text(receipt, completed)
     if receipt["reason"] == ANSWER_AWAITING_PARENT:
         if continued:
             return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "

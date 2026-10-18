@@ -21,6 +21,7 @@ session's records and never reads ``jobs.log``.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -108,7 +109,7 @@ def _bounded_receipt_text(record: dict) -> str:
     receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
     if receipt.get("kind") == "supervision":
         from dispatch_supervision import CONTINUED_KEY, render_text
-        return render_text(receipt, continued=record.get(CONTINUED_KEY))
+        return render_text(receipt, continued=record.get(CONTINUED_KEY)) + _timestamp_note(record)
     if receipt.get("kind") == "human-gate":
         return (f"delivery_id={record.get('delivery_id', '-')} route_id={receipt.get('route_id', '-')} "
                 f"route_file={receipt.get('route_file', '-')} attempt_id={receipt.get('owner_attempt_id', '-')} "
@@ -140,6 +141,24 @@ def _bounded_receipt_text(record: dict) -> str:
         f"route_node={record.get('route_node', '-')} attempts={record.get('attempts', 0)} "
         + " ".join(parts)
     )
+
+
+def _timestamp_note(record: dict) -> str:
+    timeline = record.get("timestamp_provenance")
+    if not isinstance(timeline, dict):
+        return " Timing provenance is unknown for this legacy notice; do not infer its original send time."
+    def value(key):
+        result = timeline.get(key)
+        return result if isinstance(result, str) and result else "unknown"
+    return (" Timing (UTC wall clock; monotonic lease values remain separate): notice record materialized "
+            + value("record_materialized_at_utc") + "; first observed send "
+            + value("first_send_at_utc") + "; latest observed send " + value("last_send_at_utc")
+            + "; exact receipt " + value("receive_at_utc") + "; observed sends="
+            + str(timeline.get("observed_send_count", "unknown")) + ", redeliveries="
+            + str(timeline.get("observed_redelivery_count", "unknown")) + "; materializer="
+            + value("record_materialized_source") + "; first-send source="
+            + value("first_send_source") + "; latest-send source=" + value("last_send_source")
+            + "; receipt source=" + value("receive_source") + ". Missing legacy values stay unknown.")
 
 
 def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple[list[dict], int]:
@@ -209,6 +228,51 @@ def record_jobs(root: Path, record: dict) -> Path | None:
         return jobs
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def retain_receiving_turn(batches: list[tuple[Path, list[dict]]], session_id: str,
+                          receiving_turn: dict | None) -> set[tuple[str, str]]:
+    """Persist exact completion/turn ownership before a Codex prompt is ACKed.
+
+    Returned keys identify records that the hook may ACK after successful
+    rendering. Non-completion notices need no follow-through duty.
+    """
+    ackable: set[tuple[str, str]] = set()
+    for root, records in batches:
+        for record in records:
+            delivery_id = record.get("delivery_id")
+            receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+            children = receipt.get("children")
+            if not isinstance(children, list):
+                if isinstance(delivery_id, str):
+                    ackable.add((str(root), delivery_id))
+                continue
+            attempt_ids = record.get("attempt_ids")
+            if (not isinstance(attempt_ids, list) or not attempt_ids
+                    or not isinstance(delivery_id, str) or receiving_turn is None):
+                continue
+            receipt_attempts = {child.get("attempt_id") for child in children
+                                if isinstance(child, dict)}
+            if any(attempt not in receipt_attempts for attempt in attempt_ids):
+                continue
+            jobs = record_jobs(root, record)
+            if jobs is None:
+                continue
+            from peer_obligations import retain_registered_completion
+            retained = True
+            for attempt in attempt_ids:
+                try:
+                    if not retain_registered_completion(
+                            jobs, attempt, session_id, record.get("recipient_kind", ""),
+                            delivery_record=record, receiving_turn=receiving_turn):
+                        retained = False
+                        break
+                except (OSError, ValueError, RuntimeError):
+                    retained = False
+                    break
+            if retained:
+                ackable.add((str(root), delivery_id))
+    return ackable
 
 
 def sweep_deliver(
@@ -304,12 +368,17 @@ COMPLETION_DELIVERY_HEADER = (
     "Hearting runtime delivery (SD-111 durable pending records for this session). "
     "Follow each receipt's required_action. advance-completed confirms that attempt's "
     "completion: read its exact result and perform already approved parent review/follow-through "
-    "this turn or its existing registered continuation. Receipt/ACK is not execution. Follow the owning "
+    "this turn or its existing registered continuation. Receipt, queue consumption and ACK are not execution. "
+    "On the first user-facing close of material work, explain what changed and why, observed before/after, "
+    "checks actually run (including reused, skipped, and unrun checks), applicable commit/PR/deployment/serving, "
+    "and limits or remaining work; do not invent deployment or operating results. Follow the owning "
     "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
     "runtime-owned close/finalize; a closed route needs no restart. "
     "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
     "For other unresolved actions use the exact checked recovery surface. "
-    "A receipt may repeat an earlier async notice; do not repeat an already handled action. "
+    "An automatic repeat of the same exact result or cleanup-only notice after follow-through was handled "
+    "does not repeat the action or request a new user ACK; preserve new failures, conflicts, unfinished work, "
+    "and direct user questions. "
     "Do not start Monitor, dispatch-wait, or a polling loop."
 )
 
@@ -374,9 +443,15 @@ def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by:
     acked = 0
     for record in records:
         try:
-            pending_delivery.ack(
-                root, record.get(STORAGE_KEY) or session_id, record["delivery_id"], acked_by=acked_by
-            )
+            storage = record.get(STORAGE_KEY) or session_id
+            delivery_id = record["delivery_id"]
+            try:
+                event_id = hashlib.sha256((delivery_id + "\0" + acked_by).encode("utf-8")).hexdigest()
+                pending_delivery.record_send(root, storage, delivery_id,
+                    source="codex-prompt-context-rendered", event_id=event_id)
+            except (pending_delivery.PendingDeliveryError, OSError):
+                pass  # Timestamp observation is advisory; it never withholds an exact ACK.
+            pending_delivery.ack(root, storage, delivery_id, acked_by=acked_by)
             acked += 1
         except (pending_delivery.PendingDeliveryError, KeyError, OSError):
             continue

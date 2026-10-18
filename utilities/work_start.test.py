@@ -2861,6 +2861,50 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertTrue(receipt["retained"])
         return receipt
 
+    def _native_blocked_owner(self):
+        original = self._metadata
+        def with_native_carrier(aid, *args, **kwargs):
+            metadata = original(aid, *args, **kwargs)
+            metadata["parent_completion_delivery"] = "codex-native-queue"
+            return metadata
+        self._metadata = with_native_carrier
+        aid = self._seed_initial_owner()
+        self._finish_blocked(aid)
+        return aid
+
+    def _ack_native_blocked_result(self, aid):
+        import dispatch_pending_delivery as pending
+        from dispatch_completion_join import (acknowledged_attempt_receipt, current_attempt_row,
+            pending_record_identity, unseal_delivery_receipt)
+        row = current_attempt_row(self.jobs, aid)
+        metadata = row.metadata
+        record = pending.read(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"])
+        if record is None:
+            receipt = unseal_delivery_receipt(metadata["delivery_receipt_b64"])
+            route_id, route_node, parent_attempt = pending_record_identity(metadata, self.jobs)
+            record = pending.create(self.jobs.parent,
+                recipient_kind=metadata["delivery_recipient_kind"], recipient_key=metadata["parent_sid"],
+                delivery_id=metadata["delivery_id"], session_generation=metadata.get("session_generation", ""),
+                session_generation_supported=metadata.get("session_generation_supported", "0"),
+                attempt_ids=[aid], parent_attempt_id=parent_attempt, route_id=route_id,
+                route_node=route_node, receipt=receipt,
+                receipt_digest=metadata["delivery_receipt_digest"],
+                row_revisions={aid: metadata["delivery_row_revision"]})
+        self.assertIsNotNone(record, {key: metadata.get(key) for key in
+            ("parent_completion_delivery", "parent_sid", "delivery_intent", "delivery_id",
+             "delivery_persistence_refused")})
+        if record["state"] == "pending":
+            record = pending.claim(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                claim_owner="fixture-parent", lease_seconds=30, jobs=self.jobs)
+        if record["state"] != "acked":
+            pending.record_send(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                source="fixture-native-prompt", event_id="fixture-parent-turn")
+            pending.ack(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                acked_by="codex-native-prompt:" + metadata["parent_sid"])
+        receipt = acknowledged_attempt_receipt(self.jobs, aid, recipient_sid=metadata["parent_sid"],
+            parent_completion_delivery=metadata["parent_completion_delivery"])
+        self.assertIsNotNone(receipt)
+
     def _controlled_runner(self, command, **_kwargs):
         aid = command[command.index("--attempt-id") + 1]
         prior = command[command.index("--automatic-retry-of") + 1] if "--automatic-retry-of" in command else ""
@@ -3081,6 +3125,54 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(c_meta.get("launch_outcome"), "never-launched")
         self.assertEqual(c_meta.get("note"), "dead-governor-reservation-transfer")
         return owner_a, owner_b, owner_c, receipt_c
+
+    def _ack_exact_blocked_result(self, attempt):
+        import dispatch_pending_delivery as pending
+        from dispatch_completion_join import current_attempt_row, materialize_after_terminal_close
+        row = current_attempt_row(self.jobs, attempt)
+        metadata = row.metadata
+        self.assertEqual(metadata.get("parent_completion_delivery"), "codex-native-queue")
+        materialize_after_terminal_close(self.jobs, attempt)
+        record = pending.read(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"])
+        self.assertIsNotNone(record)
+        if record["state"] == "pending":
+            record = pending.claim(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                                   claim_owner="fixture-parent", lease_seconds=30, jobs=self.jobs)
+        if record["state"] != "acked":
+            pending.record_send(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                                source="fixture-native-prompt", event_id="fixture-parent-turn")
+            record = pending.ack(self.jobs.parent, metadata["parent_sid"], metadata["delivery_id"],
+                                 acked_by="codex-native-prompt:" + metadata["parent_sid"])
+        self.assertEqual(record["state"], "acked")
+        return record
+
+    def test_normal_start_harvests_native_ack_then_starts_one_existing_answer(self):
+        owner = self._native_blocked_owner()
+        self._ack_native_blocked_result(owner)
+        self._store(owner, "use the smaller fixture", "input-native-start")
+        result = self._cli_start()
+        self.assertIn("owner_attempt_id", result, result)
+        replacement = result["owner_attempt_id"]
+        self.assertNotEqual(replacement, owner)
+        self.assertTrue(result["owner_started"], result)
+        self.assertEqual(result["blocked_result_harvest"]["status"], "exact-result-consumed")
+        self.assertIn("use the smaller fixture", self.delivered_prompts[replacement])
+        launches = len(self.launches)
+        replay = self._cli_start()
+        self.assertEqual(replay["owner_attempt_id"], replacement)
+        self.assertEqual(len(self.launches), launches)
+
+    def test_normal_start_harvests_native_ack_then_reports_real_blocker_without_answer(self):
+        owner = self._native_blocked_owner()
+        self._ack_native_blocked_result(owner)
+        launches = len(self.launches)
+        result = self._cli_start()
+        self.assertEqual((result["reason"], result["required_action"]),
+                         ("owner-blocked", "answer-blocked-owner"), result)
+        self.assertEqual(result["blocked_result_harvest"]["status"], "exact-result-consumed")
+        self.assertIn("correction_command", result)
+        self.assertEqual(len(self.launches), launches)
+        self.assertNotIn("dispatch-harvest.py", result.get("next_step", ""))
 
     def test_full_blocked_chain_normal_start_carries_late_correction_and_replays_once(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
@@ -4103,6 +4195,76 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
             print("fixture_preservation",json.dumps({"request_sha256":hashlib.sha256(self.request_bytes).hexdigest(),
                 "pins":len(self.request["command"]["inputs"]),"original_bytes_unchanged":True,
                 "round_census":marker["round_census"],"terminal":"BLOCKED","strict_reviews":list(proof)}))
+
+
+class BlockedOwnerAutoHarvestTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.jobs = self.root / "jobs.log"
+        self.attempt = "att-blocked-auto-harvest"
+        self.route = {"route_id": "rt-blocked-harvest", "route_hash": "sha256:blocked-harvest"}
+        self.metadata = {
+            "attempt_schema_version": "2", "dispatch_depth": "1", "worker_type": "owner",
+            "attempt_id": self.attempt, "harness": "codex", "owner_route_id": self.route["route_id"],
+            "owner_route_hash": self.route["route_hash"], "route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "parent_sid": "parent",
+            "parent_completion_delivery": "codex-stop-hook", "delivery_intent": "1",
+            "supervisor_lease_nonce": "lease-nonce",
+            "launch_started": "1", "launch_outcome": "started", "note": "dead-worker-blocked",
+            "failure_class": "blocked",
+        }
+        self.jobs.write_text("t\tdone\t/repo\t/wt\ttask\t" + ",".join(
+            f"{key}={value}" for key, value in self.metadata.items()) + "\n")
+
+    def _start(self, stored_answer=False):
+        import dispatch_contract
+        import dispatch_owner_input
+        if stored_answer:
+            # Model the retained user answer created before a normal start.
+            with mock.patch.object(dispatch_owner_input, "_answers_blocked_owner", return_value=True):
+                path = dispatch_owner_input._path(self.jobs, self.attempt)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"schema_version": 1, "attempt_id": self.attempt,
+                    "target": dispatch_owner_input._digest({key: self.metadata.get(key, "") for key in (
+                        "attempt_id", "harness", "owner_route_id", "owner_route_hash", "route_id",
+                        "route_hash", "parent_sid", "supervisor_lease_nonce")}),
+                    "requests": [{"id": "input-1", "digest": "answer-digest", "text": "use the smaller batch",
+                                  "state": "retained", "events": []}],
+                    "thread_id": dispatch_owner_input.PLACEHOLDER_THREAD,
+                    "transport": "codex-active-turn", "accepting": True}))
+        calls = []
+
+        def exact_harvest(command, **kwargs):
+            calls.append(command)
+            self.assertIn("--status", command)
+            self.assertEqual(command[command.index("--status") + 1], "all")
+            self.assertEqual(command[command.index("--attempt-id") + 1], self.attempt)
+            fields = self.jobs.read_text().splitlines()[-1].split("\t")
+            metadata = dict(item.split("=", 1) for item in fields[5].split(","))
+            metadata["parent_completion_harvested"] = "1"
+            fields[5] = ",".join(f"{key}={value}" for key, value in sorted(metadata.items()))
+            self.jobs.write_text("\t".join(fields) + "\n")
+            return subprocess.CompletedProcess(command, 0,
+                "parent_completion_receipt=consumed\n", "")
+
+        with mock.patch.object(W.route_authority, "answerable_owner_end", return_value="BLOCKED"):
+            result = W._harvest_unread_blocked_owner(self.route, self.jobs, exact_harvest)
+        self.assertEqual(result, {"ok": True, "attempt_id": self.attempt,
+                                  "status": "exact-result-consumed"})
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(W._harvest_unread_blocked_owner(self.route, self.jobs, exact_harvest))
+        self.assertEqual(len(calls), 1)
+        if stored_answer:
+            self.assertEqual(dispatch_owner_input.retained(self.jobs, self.attempt)[0]["id"], "input-1")
+        return result
+
+    def test_normal_start_harvests_terminal_blocked_result_without_answer(self):
+        self._start(stored_answer=False)
+
+    def test_normal_start_harvest_preserves_a_stored_answer(self):
+        self._start(stored_answer=True)
 
 
 if __name__ == "__main__":

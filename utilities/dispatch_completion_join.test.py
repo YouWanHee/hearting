@@ -5396,5 +5396,62 @@ class CompletionProjectionBoundaryTest(unittest.TestCase):
         self.assertEqual(receipt["children"][0]["required_action"], "inspect-recovery")
 
 
+class AcknowledgedCompletionRecoveryTest(unittest.TestCase):
+    def test_recovers_only_the_same_acked_receipt_and_current_child_binding(self):
+        import dispatch_pending_delivery as pending
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text("fixture\n")
+            attempt = "att-child"
+            revision = "row-revision-1"
+            receipt = {"schema_version": 2, "state": "ready",
+                "parent_attempt_id": "parent-session-digest", "job_registry": str(jobs),
+                "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                    "reason": "registry-closed", "required_action": "advance-completed",
+                    "harness": "codex"}]}
+            meta = {"delivery_intent": "1", "parent_sid": "thread-parent",
+                "parent_completion_delivery": "codex-native-queue",
+                "delivery_id": "delivery-exact", "delivery_receipt_digest": "sha256:exact",
+                "delivery_row_revision": revision, "delivery_recipient_kind": "codex-native-queue",
+                "attempt_id": attempt}
+            row = SimpleNamespace(status="done", metadata=meta)
+            record = {"state": "acked", "recipient_kind": "codex-native-queue",
+                "attempt_ids": [attempt], "receipt_digest": "sha256:exact",
+                "row_revisions": {attempt: revision}, "receipt": receipt, "acked_by":
+                "codex-native-prompt:thread-parent"}
+            identity = {"delivery_id": "delivery-exact", "route_id": "rt-exact",
+                "route_node": "execute", "parent_attempt_id": "parent-attempt",
+                "row_revisions": {attempt: revision}}
+            with mock.patch.object(JOIN, "current_attempt_row", return_value=row), \
+                 mock.patch.object(JOIN, "pending_record_identity",
+                                   return_value=("rt-exact", "execute", "parent-attempt")), \
+                 mock.patch("dispatch_seat_handover.effective_parent", return_value="thread-parent"), \
+                 mock.patch("dispatch_contract.terminal_conflict_pending", return_value=False), \
+                 mock.patch.object(pending, "read", return_value=record), \
+                 mock.patch.object(pending, "received_ack_identity", return_value=identity):
+                self.assertEqual(JOIN.recover_acknowledged_batch_outcome(
+                    jobs, {attempt}, recipient_sid="thread-parent",
+                    parent_attempt_id="parent-session-digest",
+                    parent_completion_delivery="codex-native-queue"), receipt)
+
+                record["state"] = "pending"
+                record["acked_by"] = None
+                self.assertEqual(JOIN.current_batch_receipt_projection(
+                    jobs, {attempt}, recipient_sid="thread-parent",
+                    parent_attempt_id="parent-session-digest",
+                    parent_completion_delivery="codex-native-queue"), receipt)
+                self.assertIsNone(JOIN.recover_acknowledged_batch_outcome(
+                    jobs, {attempt}, recipient_sid="thread-parent",
+                    parent_attempt_id="parent-session-digest",
+                    parent_completion_delivery="codex-native-queue"))
+
+                record["row_revisions"] = {attempt: "stale-revision"}
+                self.assertIsNone(JOIN.current_batch_receipt_projection(
+                    jobs, {attempt}, recipient_sid="thread-parent",
+                    parent_attempt_id="parent-session-digest",
+                    parent_completion_delivery="codex-native-queue"))
+
+
 if __name__ == "__main__":
     unittest.main()

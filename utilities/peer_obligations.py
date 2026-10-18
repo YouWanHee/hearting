@@ -630,8 +630,9 @@ def _write_atomic(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holder=None):
-    """Reconnect the existing exact-attempt courier; never start the work again."""
+def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holder=None,
+                                 delivery_record=None, receiving_turn=None):
+    """Retain an exact completion and, when supplied, its native receiving turn."""
     from dispatch_completion_join import JoinContractError, current_attempt_row
     from dispatch_seat_handover import effective_parent
     from harness_capabilities import HARNESSES, parent_completion
@@ -643,7 +644,54 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     if (not harness or row is None or row.status not in {"open", "running", "done"}
             or row.metadata.get("parent_completion_delivery") != carrier
             or effective_parent(row.metadata, Path(jobs)) != session_id):
-        return
+        return False
+    receiving_observation = None
+    if delivery_record is not None:
+        import dispatch_pending_delivery as pending
+        from dispatch_completion_join import pending_record_identity
+        turn_keys = {"thread_id", "turn_id", "status"}
+        if (not isinstance(receiving_turn, dict) or set(receiving_turn) != turn_keys
+                or receiving_turn.get("thread_id") != session_id
+                or not isinstance(receiving_turn.get("turn_id"), str)
+                or not receiving_turn["turn_id"]
+                or receiving_turn.get("status") not in {
+                    "inProgress", "in_progress", "running", "interrupted", "completed", "complete"
+                }):
+            return False
+        storage = delivery_record.get("_storage_key") or row.metadata.get("parent_sid")
+        delivery_id = row.metadata.get("delivery_id", "")
+        if (storage != row.metadata.get("parent_sid") or not delivery_id
+                or delivery_record.get("delivery_id") != delivery_id
+                or delivery_record.get("recipient_kind") != carrier
+                or attempt_id not in (delivery_record.get("attempt_ids") or [])):
+            return False
+        try:
+            root = Path(jobs).resolve(strict=True).parent
+            exact = pending.read(root, storage, delivery_id)
+            if (exact is None or exact.get("state") not in pending.OPEN_STATES
+                    or exact.get("recipient_kind") != carrier
+                    or exact.get("attempt_ids") != delivery_record.get("attempt_ids")
+                    or exact.get("receipt_digest") != row.metadata.get("delivery_receipt_digest")
+                    or exact.get("row_revisions", {}).get(attempt_id)
+                        != row.metadata.get("delivery_row_revision")):
+                return False
+            route_id, route_node, parent_attempt_id = pending_record_identity(row.metadata, Path(jobs))
+            exact_identity = pending.received_ack_identity(exact, storage, delivery_id)
+            if (exact_identity.get("route_id") != route_id
+                    or exact_identity.get("route_node") != route_node
+                    or exact_identity.get("parent_attempt_id") != parent_attempt_id
+                    or effective_parent(row.metadata, Path(jobs)) != session_id):
+                return False
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
+        receiving_observation = {
+            **receiving_turn, "delivery_id": delivery_id,
+            "receipt_digest": row.metadata.get("delivery_receipt_digest"),
+            "row_revision": row.metadata.get("delivery_row_revision"),
+            "storage_recipient": storage, "route_id": route_id,
+            "route_node": route_node, "parent_attempt_id": parent_attempt_id,
+            "recipient_sid": session_id,
+        }
     identity = {"jobs": str(Path(jobs).resolve()), "attempt_id": attempt_id,
                 "session_id": session_id, "harness": harness,
                 "server": os.environ.get("AGENT_HERDR_SESSION") or "default"}
@@ -651,9 +699,18 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     duty = store.create(stable_duty_id("registered-batch", identity),
                         "registered-batch", identity, {"carrier": carrier})
     if duty.get("state") not in {"complete", "cancelled"}:
+        observation = dict(duty.get("observation") or {})
+        if receiving_observation is not None:
+            existing = observation.get("native_receiving_turn")
+            if existing is not None and existing != receiving_observation:
+                return False
+            observation["native_receiving_turn"] = receiving_observation
         if holder:
-            store.update(duty["id"], observation={"holder": list(holder)})
+            observation["holder"] = list(holder)
+        if observation and observation != duty.get("observation"):
+            store.update(duty["id"], observation=observation)
         ensure_normal_runner(Path(jobs).parent)
+    return True
 
 
 def _registered_delivery_bindings(message, roots=None, *, received_only=False, read_context=None):

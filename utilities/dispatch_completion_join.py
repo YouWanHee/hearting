@@ -836,8 +836,13 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                  f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
         return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
                 "Read the exact result and perform the already approved parent review/follow-through in this turn, "
-                "or run its existing registered continuation. Then report what you actually did and when it started. "
-                "Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual finalization is required."
+                "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+                "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+                "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+                "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+                "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+                "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+                "conflict, unfinished work, or direct user question."
                 + ("".join("\n" + note for note in notes)
                    + ("\nIf this next leg is already approved, execute it in this turn or its existing registered continuation. "
                       "Nothing starts it from receipt alone; obtain approval only for work outside the existing scope." if notes else "")))
@@ -855,6 +860,178 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
               "it does not select or change the owner or child harness. "
               "Continue the authorized work within its existing human gates. "
               "This receipt creates no new approval step.")
+
+
+def _batch_receipt_projection(
+    jobs: Path, attempt_ids: set[str], *, recipient_sid: str,
+    parent_attempt_id: str, parent_completion_delivery: str,
+    require_ack: bool,
+) -> dict[str, object] | None:
+    """Read one batch receipt from every current, exact child delivery row.
+
+    This projection never grants execution or report authority.
+    ACK mode recovers a received result before joining; current mode
+    revalidates a cached result's receipt identity and generation.
+    """
+    if (not attempt_ids or len(attempt_ids) > MAX_BATCH_ATTEMPTS or not recipient_sid
+            or not parent_attempt_id):
+        return None
+    import dispatch_pending_delivery as pending
+    from dispatch_seat_handover import effective_parent
+
+    jobs = Path(jobs)
+    root = jobs.resolve(strict=True).parent
+    receipts: list[dict[str, object]] = []
+    originals = set(attempt_ids)
+    for attempt_id in sorted(attempt_ids):
+        try:
+            row = current_attempt_row(jobs, attempt_id)
+            if row is None or row.status != "done":
+                return None
+            meta = row.metadata
+            if (meta.get("delivery_intent") != "1"
+                    or meta.get("parent_completion_delivery") != parent_completion_delivery
+                    or not meta.get("parent_sid")
+                    or effective_parent(meta, jobs) != recipient_sid
+                    or not meta.get("delivery_id")
+                    or not meta.get("delivery_receipt_digest")
+                    or not meta.get("delivery_row_revision")):
+                return None
+            from dispatch_contract import terminal_conflict_pending
+            if terminal_conflict_pending(meta):
+                return None
+            storage_recipient = meta["parent_sid"]
+            record = pending.read(root, storage_recipient, meta["delivery_id"])
+            if (record is None
+                    or (require_ack and record.get("state") != "acked")
+                    or record.get("state") not in pending.OPEN_STATES | {"acked"}
+                    or record.get("recipient_kind") != parent_completion_delivery
+                    or record.get("attempt_ids") != [attempt_id]
+                    or record.get("receipt_digest") != meta["delivery_receipt_digest"]
+                    or record.get("row_revisions", {}).get(attempt_id)
+                        != meta["delivery_row_revision"]):
+                return None
+            route_id, route_node, row_parent = pending_record_identity(meta, jobs)
+            identity = pending.received_ack_identity(record, storage_recipient, meta["delivery_id"])
+            if (identity.get("delivery_id") != meta["delivery_id"]
+                    or identity.get("route_id") != route_id
+                    or identity.get("route_node") != route_node
+                    or identity.get("parent_attempt_id") != row_parent
+                    or identity.get("row_revisions", {}).get(attempt_id)
+                        != meta["delivery_row_revision"]):
+                return None
+            if (record.get("state") == "acked"
+                    and not _received_ack_actor_valid(record.get("acked_by"),
+                        parent_completion_delivery, recipient_sid)):
+                return None
+            receipt = record.get("receipt")
+            if (not isinstance(receipt, dict) or receipt.get("schema_version") != 2
+                    or receipt.get("state") != "ready"
+                    or receipt.get("parent_attempt_id") != parent_attempt_id
+                    or receipt.get("job_registry") != str(jobs.resolve(strict=True))):
+                return None
+            receipts.append(receipt)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, JoinContractError):
+            return None
+    from dispatch_receipt_identity import canonical_receipt
+    first = canonical_receipt(receipts[0])
+    if any(canonical_receipt(receipt) != first for receipt in receipts[1:]):
+        return None
+    children = first.get("children")
+    if not isinstance(children, list) or {
+            child.get("attempt_id") for child in children if isinstance(child, dict)
+    } != attempt_ids:
+        return None
+    for child in children:
+        if (not isinstance(child, dict) or child.get("status") != "done"
+                or child.get("readiness") != "ready"):
+            return None
+    if first.get("replacement_lineage"):
+        try:
+            from dispatch_replacement import adopt_receipt
+            for edge in first["replacement_lineage"]:
+                originals.discard(edge["replacement_attempt_id"])
+                originals.add(edge["original_attempt_id"])
+            adopt_receipt(jobs, originals, first)
+        except (OSError, ValueError, KeyError, TypeError, DispatchContractError):
+            return None
+    return first
+
+
+def _received_ack_actor_valid(acked_by: object, carrier: str, recipient_sid: str) -> bool:
+    if carrier == "codex-native-queue":
+        return (acked_by == "codex-native-prompt:" + recipient_sid
+                or isinstance(acked_by, str)
+                and acked_by.startswith("codex-native-queue:delivery-"))
+    if carrier == "codex-managed-gateway":
+        return isinstance(acked_by, str) and acked_by.startswith("codex-managed-gateway:")
+    return isinstance(acked_by, str) and bool(acked_by)
+
+
+def recover_acknowledged_batch_outcome(
+    jobs: Path, attempt_ids: set[str], *, recipient_sid: str,
+    parent_attempt_id: str, parent_completion_delivery: str,
+) -> dict[str, object] | None:
+    """Recover a batch result from every exact recipient ACK, without joining."""
+    return _batch_receipt_projection(jobs, attempt_ids, recipient_sid=recipient_sid,
+        parent_attempt_id=parent_attempt_id, parent_completion_delivery=parent_completion_delivery,
+        require_ack=True)
+
+
+def current_batch_receipt_projection(
+    jobs: Path, attempt_ids: set[str], *, recipient_sid: str,
+    parent_attempt_id: str, parent_completion_delivery: str,
+) -> dict[str, object] | None:
+    """Revalidate a cached outcome using current exact receipt identities."""
+    return _batch_receipt_projection(jobs, attempt_ids, recipient_sid=recipient_sid,
+        parent_attempt_id=parent_attempt_id, parent_completion_delivery=parent_completion_delivery,
+        require_ack=False)
+
+
+def acknowledged_attempt_receipt(
+    jobs: Path, attempt_id: str, *, recipient_sid: str,
+    parent_completion_delivery: str,
+) -> dict[str, object] | None:
+    """Read one exact ACKed terminal receipt, including BLOCKED/FAIL outcomes."""
+    if not attempt_id or not recipient_sid or not parent_completion_delivery:
+        return None
+    try:
+        import dispatch_pending_delivery as pending
+        from dispatch_seat_handover import effective_parent
+        from dispatch_contract import terminal_conflict_pending
+        jobs = Path(jobs)
+        row = current_attempt_row(jobs, attempt_id)
+        if row is None or row.status != "done":
+            return None
+        meta = row.metadata
+        if (meta.get("delivery_intent") != "1"
+                or meta.get("parent_completion_delivery") != parent_completion_delivery
+                or not meta.get("parent_sid")
+                or effective_parent(meta, jobs) != recipient_sid
+                or terminal_conflict_pending(meta)
+                or not meta.get("delivery_id") or not meta.get("delivery_receipt_digest")
+                or not meta.get("delivery_row_revision")):
+            return None
+        storage = meta["parent_sid"]
+        record = pending.read(jobs.resolve(strict=True).parent, storage, meta["delivery_id"])
+        if (record is None or record.get("state") != "acked"
+                or record.get("recipient_kind") != parent_completion_delivery
+                or record.get("attempt_ids") != [attempt_id]
+                or record.get("receipt_digest") != meta["delivery_receipt_digest"]
+                or record.get("row_revisions", {}).get(attempt_id) != meta["delivery_row_revision"]
+                or not _received_ack_actor_valid(record.get("acked_by"), carrier=parent_completion_delivery,
+                                                 recipient_sid=recipient_sid)):
+            return None
+        route_id, route_node, parent_attempt = pending_record_identity(meta, jobs)
+        identity = pending.received_ack_identity(record, storage, meta["delivery_id"])
+        if (identity.get("route_id") != route_id or identity.get("route_node") != route_node
+                or identity.get("parent_attempt_id") != parent_attempt
+                or identity.get("row_revisions", {}).get(attempt_id) != meta["delivery_row_revision"]):
+            return None
+        receipt = record.get("receipt")
+        return receipt if isinstance(receipt, dict) else None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, JoinContractError):
+        return None
 
 
 def delivery_timing_fields(**values: int | None) -> dict[str, int | None]:

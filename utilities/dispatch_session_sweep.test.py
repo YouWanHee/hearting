@@ -1778,5 +1778,28 @@ class DetachedCommonRecoveryTest(IsolatedRootMixin, unittest.TestCase):
                     time.sleep(0.02)
 
 
+class NativeReceivingTurnRetentionTest(unittest.TestCase):
+    def test_completion_receipt_is_ackable_only_after_exact_turn_retention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            record = {"delivery_id": "delivery-exact", "recipient_kind": "codex-native-queue",
+                "attempt_ids": ["att-exact"], "receipt": {"children": [{"attempt_id": "att-exact"}]}}
+            binding = {"thread_id": "sid-exact", "turn_id": "turn-exact", "status": "inProgress"}
+            with mock.patch.object(SWEEP, "record_jobs", return_value=jobs), \
+                 mock.patch("peer_obligations.retain_registered_completion", return_value=True) as retain:
+                ackable = SWEEP.retain_receiving_turn([(root, [record])], "sid-exact", binding)
+                self.assertEqual(ackable, {(str(root), "delivery-exact")})
+                self.assertEqual(retain.call_count, 1)
+                self.assertEqual(retain.call_args.kwargs["receiving_turn"], binding)
+                self.assertEqual(SWEEP.retain_receiving_turn([(root, [record])], "sid-exact", None), set())
+                self.assertEqual(retain.call_count, 1)
+
+            notice = {"delivery_id": "delivery-notice", "receipt": {"kind": "supervision"}}
+            self.assertEqual(SWEEP.retain_receiving_turn([(root, [notice])], "sid-exact", None),
+                             {(str(root), "delivery-notice")})
+
+
 if __name__ == "__main__":
     unittest.main()

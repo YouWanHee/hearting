@@ -416,6 +416,31 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertIn("att-child finished, but the worker left process pid 753216 running", named)
         self.assertIn("closes by itself once that process exits", named)
 
+    def test_cleanup_notice_after_exact_received_result_keeps_observation_without_reopening_work(self):
+        self._notice_rows()
+        record = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")[0]
+        completed = {"children": [{"attempt_id": "att-child", "status": "done",
+            "required_action": "advance-completed"}]}
+        with mock.patch.object(supervision, "_acknowledged_completion_result", return_value=completed), \
+             mock.patch.object(contract, "residue_live_pids", return_value=(753216,)):
+            text = supervision.render_text(record["receipt"])
+        self.assertIn("retains cleanup observation only", text)
+        self.assertIn("cleanup residue", text)
+        self.assertIn("753216", text)
+        self.assertIn("Do not restart the goal", text)
+        self.assertIn("or ask the user whether to wait or cancel", text)
+        self.assertNotIn("run the route's start command", text)
+        self.assertIn("grants no process signal", text)
+
+    def test_cleanup_notice_without_exact_completion_ack_keeps_existing_recovery_guidance(self):
+        self._notice_rows()
+        receipt = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")[0]["receipt"]
+        with mock.patch.object(supervision, "_acknowledged_completion_result", return_value=None):
+            text = supervision.render_text(receipt)
+        self.assertNotIn("retains cleanup observation only", text)
+        self.assertIn("inspect these exact attempts", text)
+        self.assertIn("ask the user whether to keep waiting or cancel", text)
+
     def test_claim_binds_live_generation_without_changing_the_obligation(self):
         self._notice_rows()
         record = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")[0]

@@ -372,6 +372,27 @@ def native_queue_prompt_receipts(sid: str):
     return batches, [context] if context else []
 
 
+def native_receiving_turn(payload: dict[str, Any], thread_id: str) -> dict[str, str] | None:
+    """Bind the hook to a turn ID that Codex itself exposes and confirms.
+
+    ``message_id`` aliases are deliberately excluded: they do not prove a
+    native turn binding.
+    """
+    turn_id = nested_string(payload, "turn_id", "turnID")
+    if not thread_id or not turn_id:
+        return None
+    try:
+        from codex_queue_dispatch import resolve_queue_socket
+        import codex_queue_delivery
+        turn = codex_queue_delivery.read_exact_turn(resolve_queue_socket(), thread_id, turn_id)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if (turn is None or turn.get("id") != turn_id
+            or turn.get("status") not in {"inProgress", "in_progress", "running"}):
+        return None
+    return {"thread_id": thread_id, "turn_id": turn_id, "status": turn["status"]}
+
+
 def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) -> None:
     """F-100c — the receive side of a herdr steer, harness-neutral: when the prompt
     carries the `(peer-from: <harness> <sid> <name>)` trailer a steward appended, write
@@ -465,8 +486,14 @@ def main() -> int:
     # receipts a predecessor left for it are swept only once that is known.
     card = card_context(payload, current_cwd)
     batches = []
+    ackable = set()
     try:
         batches, parts = native_queue_prompt_receipts(sid)
+        from dispatch_session_sweep import retain_receiving_turn
+        ackable = retain_receiving_turn(
+            batches, interaction_sid,
+            native_receiving_turn(payload, interaction_sid),
+        )
     except Exception:
         parts = []
     if "peer-from:" in current_prompt or "cross-session-message" in current_prompt:
@@ -488,7 +515,11 @@ def main() -> int:
     # Commit acknowledgement only after successful synchronous hook rendering.
     from dispatch_session_sweep import ack_delivered
     for root, records in batches:
-        ack_delivered(root, sid, records, acked_by="codex-native-prompt:" + sid)
+        retained = [record for record in records
+                    if (str(root), record.get("delivery_id")) in ackable]
+        if retained:
+            ack_delivered(root, interaction_sid, retained,
+                          acked_by="codex-native-prompt:" + interaction_sid)
     return 0
 
 

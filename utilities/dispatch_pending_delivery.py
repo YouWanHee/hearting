@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import datetime
 import fcntl
 import hashlib
 import json
@@ -111,6 +112,13 @@ REQUIRED_FIELDS = (
     "last_attempt_at_ns", "acked_at_ns", "acked_by", "expiry_reason", "lineage",
 )
 RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
+TIMESTAMP_PROVENANCE_FIELD = "timestamp_provenance"
+TIMESTAMP_PROVENANCE_KEYS = frozenset({
+    "record_materialized_at_utc", "record_materialized_source",
+    "first_send_at_utc", "first_send_source", "last_send_at_utc", "last_send_source",
+    "last_send_event_id",
+    "receive_at_utc", "receive_source", "observed_send_count", "observed_redelivery_count",
+})
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
 
@@ -150,7 +158,9 @@ def _validate_record(value: object) -> dict:
             value.get("recipient_kind"), _LEGACY_CLAIM_AUTHORITY_DEFAULT
         )
         keys = set(value)
-    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - RECOVERY_AUDIT_FIELDS:
+    if (not set(REQUIRED_FIELDS) <= keys
+            or keys - set(REQUIRED_FIELDS) - RECOVERY_AUDIT_FIELDS
+                - {TIMESTAMP_PROVENANCE_FIELD}):
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise PendingDeliveryError("delivery-persistence-refused", "schema-version-invalid")
@@ -179,6 +189,8 @@ def _validate_record(value: object) -> dict:
         or value["expired_at_ns"] < 1
     ):
         raise PendingDeliveryError("delivery-persistence-refused", "recovery-audit-invalid")
+    if TIMESTAMP_PROVENANCE_FIELD in value:
+        _validate_timestamp_provenance(value[TIMESTAMP_PROVENANCE_FIELD])
     return value
 
 
@@ -251,6 +263,63 @@ def _write_unlocked(path: Path, record: dict) -> None:
         except OSError:
             pass
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _timestamp_provenance(*, materialized: str | None = None,
+                          materialized_source: str | None = None) -> dict:
+    return {
+        "record_materialized_at_utc": materialized,
+        "record_materialized_source": materialized_source,
+        "first_send_at_utc": None, "first_send_source": None,
+        "last_send_at_utc": None, "last_send_source": None, "last_send_event_id": None,
+        "receive_at_utc": None, "receive_source": None,
+        "observed_send_count": 0, "observed_redelivery_count": 0,
+    }
+
+
+def _validate_timestamp_provenance(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != TIMESTAMP_PROVENANCE_KEYS:
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    for key in ("record_materialized_at_utc", "first_send_at_utc", "last_send_at_utc", "receive_at_utc"):
+        item = value[key]
+        if item is not None:
+            if not isinstance(item, str):
+                raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+            try:
+                normalized = item.removesuffix("Z") + ("+00:00" if item.endswith("Z") else "")
+                datetime.datetime.fromisoformat(normalized)
+            except ValueError as exc:
+                raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid") from exc
+    for key in ("record_materialized_source", "first_send_source", "last_send_source",
+                "receive_source", "last_send_event_id"):
+        item = value[key]
+        if item is not None and (not isinstance(item, str) or not item or len(item) > 128
+                                 or any(ord(char) < 32 for char in item)):
+            raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    for key in ("observed_send_count", "observed_redelivery_count"):
+        item = value[key]
+        if type(item) is not int or item < 0:
+            raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    if value["observed_redelivery_count"] > value["observed_send_count"]:
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+
+
+def _record_received(value: dict, source: str) -> dict:
+    timeline = value.get(TIMESTAMP_PROVENANCE_FIELD)
+    if timeline is None:
+        # A newly observed event never fills in a missing legacy timestamp.
+        timeline = _timestamp_provenance(materialized_source="legacy-unknown")
+    updated = dict(timeline)
+    updated["receive_at_utc"] = _utc_now()
+    updated["receive_source"] = source[:128]
+    result = dict(value)
+    result[TIMESTAMP_PROVENANCE_FIELD] = updated
+    return result
 
 
 def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
@@ -342,6 +411,8 @@ def create(
         "acked_by": None,
         "expiry_reason": None,
         "lineage": list(lineage or ()),
+        TIMESTAMP_PROVENANCE_FIELD: _timestamp_provenance(
+            materialized=_utc_now(), materialized_source="dispatch_pending_delivery.create"),
     }
     with _record_lock(path):
         existing = _read_unlocked(path)
@@ -604,6 +675,44 @@ def ack(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated = _record_received(updated, acked_by)
+        _write_unlocked(path, updated)
+        return updated
+
+
+def record_send(root: Path, recipient_key: str, delivery_id: str, *, source: str,
+                event_id: str, expected_identity: dict | None = None) -> dict:
+    """Record one confirmed send event, outside receipt identity and CAS state."""
+    if (not isinstance(source, str) or not source or len(source) > 128
+            or not isinstance(event_id, str) or not event_id or len(event_id) > 128):
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-source-invalid")
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") not in OPEN_STATES | {"acked"}:
+            raise PendingDeliveryError("pending-delivery-claim-refused", f"state={value['state']}")
+        if expected_identity is not None and received_ack_identity(
+                value, recipient_key, delivery_id) != expected_identity:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "send-identity-changed")
+        old = value.get(TIMESTAMP_PROVENANCE_FIELD)
+        timeline = dict(old) if old is not None else _timestamp_provenance(
+            materialized_source="legacy-unknown")
+        if timeline.get("last_send_event_id") == event_id:
+            return value
+        now = _utc_now()
+        count = timeline["observed_send_count"]
+        if count == 0 and timeline["record_materialized_at_utc"] is not None:
+            timeline["first_send_at_utc"] = now
+            timeline["first_send_source"] = source
+        timeline["last_send_at_utc"] = now
+        timeline["last_send_source"] = source
+        timeline["last_send_event_id"] = event_id
+        timeline["observed_send_count"] = count + 1
+        timeline["observed_redelivery_count"] += 1 if count else 0
+        updated = dict(value)
+        updated[TIMESTAMP_PROVENANCE_FIELD] = timeline
         _write_unlocked(path, updated)
         return updated
 
@@ -661,6 +770,7 @@ def ack_received(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated = _record_received(updated, acked_by)
         _write_unlocked(path, updated)
         return updated
 
