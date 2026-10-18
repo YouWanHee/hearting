@@ -74,6 +74,17 @@ DELIVER_LEASE_SECONDS = 120.0
 STORAGE_KEY = "_storage_key"     # added to a returned copy only: the directory a record is stored under
 
 
+def _retry_context(recipient_kind: str, session_id: str,
+                   storage_key: str, record: dict) -> str:
+    """Stable evidence for this recipient and durable delivery target."""
+
+    return ":".join(str(value or "") for value in (
+        recipient_kind, session_id, storage_key, record.get("recipient_digest"),
+        record.get("session_generation"), record.get("session_generation_supported"),
+        record.get("delivery_id"), record.get("receipt_digest"),
+    ))
+
+
 HUMAN_GATE_PREFIX = "human-gate:"
 
 
@@ -329,6 +340,7 @@ def sweep_deliver(
                 lease_seconds=DELIVER_LEASE_SECONDS,
                 require_generation_proof=False,
                 jobs=jobs,
+                retry_context=_retry_context(recipient_kind, session_id, storage_key, current),
             )
         except pending_delivery.PendingDeliveryError:
             continue
@@ -508,6 +520,7 @@ def sweep(
                     lease_seconds=SWEEP_LEASE_SECONDS,
                     require_generation_proof=True,
                     jobs=jobs,
+                    retry_context=_retry_context(recipient_kind, session_id, session_id, record),
                 )
             except pending_delivery.PendingDeliveryError:
                 continue

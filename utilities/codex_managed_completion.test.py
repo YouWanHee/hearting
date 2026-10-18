@@ -1117,6 +1117,93 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             self.assertEqual(send.call_args.kwargs["thread_id"], SESSION)
             self.assertIn(attempt, send.call_args.kwargs["message"])
 
+    def test_native_queue_same_transport_failure_survives_observer_recall(self):
+        module = load_completion_module()
+        from dispatch_pending_delivery import create, read
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            attempt = "att-native-retry"
+            delivery_id = "delivery-" + "a" * 32
+            receipt = {"schema_version": 2, "state": "ready", "job_registry": str(jobs),
+                       "parent_attempt_id": "att-parent", "children": []}
+            record = create(
+                root=root, recipient_kind="codex-native-queue", recipient_key=SESSION,
+                delivery_id=delivery_id, session_generation="",
+                session_generation_supported="0", attempt_ids=[attempt],
+                parent_attempt_id="att-parent", route_id="rt-native-retry",
+                route_node="execute", receipt=receipt,
+                receipt_digest=module.pending_delivery._canonical_receipt_digest(receipt),
+                row_revisions={attempt: "revision-one"},
+            )
+            row = SimpleNamespace(
+                attempt_id=attempt, raw="terminal-row",
+                metadata={"delivery_id": delivery_id,
+                          "delivery_recipient_kind": "codex-native-queue",
+                          "delivery_row_revision": "revision-one",
+                          "delivery_receipt_digest": record["receipt_digest"]},
+            )
+            args = SimpleNamespace(
+                queue_socket=root / "app-server.sock", thread_id=SESSION,
+                sealed_batch_id="batch-native-retry", jobs=jobs,
+                delivery_retry_interval=0.05,
+            )
+
+            class Session:
+                def __init__(self, path, *, timeout):
+                    self.path = path
+
+                def close(self):
+                    pass
+
+            fixed_now = time.time_ns()
+            with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                     "thread": {"id": SESSION, "cwd": str(root)}}), \
+                 mock.patch.object(module, "current_session_children", return_value=[row]), \
+                 mock.patch.object(module, "_queue_target_from_rows", return_value=SESSION), \
+                 mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=Session), \
+                 mock.patch("peer_obligations.retain_registered_completion",
+                            return_value=True) as retain, \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=[
+                     module.codex_queue_delivery.QueueDeliveryError("transport-timeout"),
+                     {"status": "consumed", "turn_id": "turn-after-retry",
+                      "turn_status": "completed"},
+                 ]) as send:
+                with mock.patch.object(module.pending_delivery.time, "time_ns", return_value=fixed_now):
+                    with self.assertRaisesRegex(
+                            module.codex_queue_delivery.QueueDeliveryError, "transport-timeout"):
+                        module._native_queue_delivery_once(args, receipt, {attempt})
+                pending = read(root, SESSION, delivery_id)
+                self.assertEqual(pending["state"], "pending")
+                self.assertNotIn("courier_retry", pending)
+                retry_path = module.pending_delivery.courier_retry_path(
+                    module.pending_delivery.record_path(root, SESSION, delivery_id)
+                )
+                retry = json.loads(retry_path.read_text(encoding="utf-8"))["retry"]
+                self.assertEqual(retry["failure_count"], 1)
+
+                with mock.patch.object(module.pending_delivery.time, "time_ns",
+                                       return_value=fixed_now + 1_000_000):
+                    with self.assertRaises(module.pending_delivery.PendingDeliveryError) as caught:
+                        module._native_queue_delivery_once(args, receipt, {attempt})
+                self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
+                self.assertEqual(send.call_count, 1)
+                self.assertEqual(read(root, SESSION, delivery_id)["attempts"], 1)
+
+                with mock.patch.object(module.pending_delivery.time, "time_ns",
+                                       return_value=retry["next_attempt_at_ns"] + 1):
+                    result = module._native_queue_delivery_once(args, receipt, {attempt})
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(send.call_count, 2)
+            retain.assert_called_once()
+            self.assertEqual(send.call_args_list[0].kwargs["client_message_id"],
+                             send.call_args_list[1].kwargs["client_message_id"])
+            delivered = read(root, SESSION, delivery_id)
+            self.assertEqual(delivered["state"], "acked")
+            self.assertNotIn("courier_retry", delivered)
+
     def test_queue_acceptance_uses_exact_id_and_restarts_only_while_pending(self) -> None:
         from types import SimpleNamespace
 

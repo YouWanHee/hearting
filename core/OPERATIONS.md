@@ -190,6 +190,16 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+When a dispatch wrapper's code root and sealed launch home are different
+releases in the same managed `releases/` directory, the wrapper replaces itself
+with the corresponding harness wrapper from the sealed release before registry,
+lock, or child-launch work. It keeps the original argument vector and sets
+`AGENT_HOME` to the sealed real path; the target then follows the existing
+validation and registration path once. Checkouts, different installations,
+same-root launches, and roots without both release markers keep their existing
+behavior. This aligns code with the launch already selected and does not create
+a new attempt or alter the route's sealed launch tuple.
+
 Release cleanup retains trees used by live processes, including their working
 directories and open files. Shared Python dispatch code holds its resolved code
 root open for the process lifetime, so a hook launched through a rotating runtime
@@ -345,6 +355,22 @@ runtime-native nesting, and registered-worker status:
 The portable role for a `standard+` dispatch-depth-1 owner is `deep orchestrator`. The retained `orchestrator` role is balanced mechanical coordination of already decided commands, paths, and states; they are not aliases.
 
 An optional `allocation.owner_order` in the selected dispatch defaults orders eligible owners within each quality band. Explicit choices and pins, runtime/account eligibility, the balanced usage gate, relief promotion and all-gated headroom recovery retain precedence. This order is sealed into new routes and applies only to `worker_type=owner`; frame, review and stage worker allocation retain their existing policies. Without it, owner allocation also retains its existing behavior. Harness eligibility comes from the selected user policy, so an explicitly configured OpenCode deep profile may participate in that policy's deep band.
+
+Schema v4 may also define an optional top-level `worker_account` mapping for
+`claude`, `codex`, and `opencode`. It selects only the worker's authentication
+source: a Claude config directory, a Codex home for `auth.json`, or an OpenCode
+`XDG_DATA_HOME` for `opencode/auth.json`. Relative paths resolve from the
+launch cwd and `~` resolves from that launch's `HOME`. An omitted harness key
+keeps the existing source. Model affinity and allocation remain independent.
+Worker settings, permissions, hooks, models, and plugins continue to come from
+the parent config source. Credential contents are not copied or edited; Codex
+and OpenCode `auth.json` are linked from the selected source. Claude account
+metadata and secure-storage path selection follow the selected config
+directory. OpenCode also accepts provider credentials from the inherited
+environment or a project `.env` ([CLI documentation](https://docs.opencode.ai/docs/cli/));
+the worker-account key does not rewrite those sources, so a file-based account
+split is not guaranteed when they provide credentials. Filesystem fixtures
+verify path selection; native macOS Keychain behavior remains unverified.
 
 **Main-session role contract.** The dispatch-depth-0 main session is the context owner, router, orchestrator, and final integrator — not the default executor of every stage. It directly owns: memory and existing artifact-root recovery (`.agent_reports/`, legacy `.claude_reports/`); user-intent and artifact-state reconstruction; compact-metadata primary/secondary capability selection under `WORKFLOW §0.2`; the completed route-confirmation card under `WORKFLOW §0.4`; spec, guard, worktree, and currentness checks; work decomposition and write-ownership decisions; worker dispatch with registration, liveness watching, and harvest; cross-stage conflict and semantic decisions; final consistency integration of metrics, documents, and notes; and the user-facing response. Before confirmation, main does not preload the full entry Skill or its references. At `standard+`, the dispatch-depth-1 capability owner reads that contract, and each dispatch-depth-2 worker reads only its assigned stage contract. When a stage is separable, main does not take on inline: long experiment or evaluation execution, repeated checkpoint inference, bulk figure/media generation, report HTML assembly, mechanical document synchronization, independent verification/QA, or implementation work with a clear file boundary against other stages.
 

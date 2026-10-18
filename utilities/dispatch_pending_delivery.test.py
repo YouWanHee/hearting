@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -29,6 +30,7 @@ PD = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = PD
 SPEC.loader.exec_module(PD)
+import dispatch_attempt_reference as AR  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -359,16 +361,225 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         PD.create(**self.kwargs)
 
-    def test_owner_release_makes_failed_send_immediately_reclaimable(self):
+    def _retry_state(self):
+        path = PD.record_path(self.root, "sess-claim", self.kwargs["delivery_id"])
+        metadata = json.loads(PD.courier_retry_path(path).read_text(encoding="utf-8"))
+        return metadata["retry"]
+
+    def test_public_records_match_legacy_json_while_retry_sidecar_defers_claim(self):
         did = self.kwargs["delivery_id"]
-        PD.claim(self.root, "sess-claim", did, claim_owner="queue", lease_seconds=86400)
-        result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
+        path = PD.record_path(self.root, "sess-claim", did)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(PD.read(self.root, "sess-claim", did), raw)
+        self.assertEqual(PD.create(**self.kwargs), raw)
+
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            claimed = PD.claim(
+                self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                retry_context="target-a", retry_base_delay_seconds=2,
+            )
+        raw_claimed = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(claimed, raw_claimed)
+        self.assertNotIn("courier_retry", claimed)
+        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_claimed)
+
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            released = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="first",
+                failure_reason="transport-timeout", retry_base_delay_seconds=2,
+            )
+        raw_released = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(released, raw_released)
+        self.assertNotIn("courier_retry", released)
+        self.assertEqual(PD.create(**self.kwargs), raw_released)
+        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_released)
+
+        retry = self._retry_state()
+        self.assertEqual(retry["failure_count"], 1)
+        self.assertEqual(retry["next_attempt_at_ns"], now + retry["delay_ns"])
+        self.assertLessEqual(retry["delay_ns"], 15_000_000_000)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 1_000_000):
+            with self.assertRaises(PD.PendingDeliveryError) as caught:
+                PD.claim(
+                    self.root, "sess-claim", did, claim_owner="duplicate", lease_seconds=30,
+                    retry_context="target-a", retry_base_delay_seconds=2,
+                )
+        self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
+        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_released)
+        self.assertEqual(self._retry_state(), retry)
+
+    def test_owner_release_persists_a_retry_deadline(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="queue", lease_seconds=86400)
+            result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
         self.assertEqual(result["state"], "pending")
-        PD.claim(self.root, "sess-claim", did, claim_owner="prompt", lease_seconds=30)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 1_000_000_001):
+            PD.claim(self.root, "sess-claim", did, claim_owner="prompt", lease_seconds=30)
         result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
         self.assertEqual(result["claim_owner"], "prompt")
         PD.ack(self.root, "sess-claim", did, acked_by="prompt")
         self.assertEqual(PD.release_claim(self.root, "sess-claim", did, claim_owner="prompt")["state"], "acked")
+
+    def test_same_failure_backoff_survives_recall_and_restart_until_due(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            first = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="first",
+                failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        self.assertNotIn("courier_retry", first)
+        retry = self._retry_state()
+        self.assertEqual(retry["failure_count"], 1)
+        self.assertEqual(retry["next_attempt_at_ns"], now + retry["delay_ns"])
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 10_000_000):
+            with self.assertRaises(PD.PendingDeliveryError) as caught:
+                PD.claim(self.root, "sess-claim", did, claim_owner="recalled", lease_seconds=30,
+                         retry_context="target-a", retry_base_delay_seconds=0.05)
+        self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["attempts"], 1)
+        due = retry["next_attempt_at_ns"] + 1
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=due):
+            PD.claim(self.root, "sess-claim", did, claim_owner="restarted", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            second = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="restarted",
+                failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        second_retry = self._retry_state()
+        self.assertEqual(second_retry["failure_count"], 2)
+        self.assertGreater(second_retry["delay_ns"], retry["delay_ns"])
+        self.assertNotIn("courier_retry", second)
+        self.assertEqual(second["attempts"], 2)
+
+    def test_send_timestamps_coexist_with_retry_sidecar_until_ack(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="first",
+                failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+
+        path = PD.record_path(self.root, "sess-claim", did)
+        retry_path = PD.courier_retry_path(path)
+        retry_before = json.loads(retry_path.read_text(encoding="utf-8"))["retry"]
+        due = retry_before["next_attempt_at_ns"] + 1
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=due):
+            PD.claim(self.root, "sess-claim", did, claim_owner="retry", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            sent = PD.record_send(
+                self.root, "sess-claim", did, source="native-queue-accepted",
+                event_id="client-item-after-retry")
+            self.assertEqual(sent[PD.TIMESTAMP_PROVENANCE_FIELD]["observed_send_count"], 1)
+            self.assertEqual(
+                json.loads(retry_path.read_text(encoding="utf-8"))["retry"], retry_before)
+            acked = PD.ack(self.root, "sess-claim", did, acked_by="native-queue-consumed")
+
+        self.assertEqual(acked["state"], "acked")
+        self.assertEqual(acked[PD.TIMESTAMP_PROVENANCE_FIELD]["observed_send_count"], 1)
+        self.assertEqual(acked[PD.TIMESTAMP_PROVENANCE_FIELD]["receive_source"],
+                         "native-queue-consumed")
+        self.assertFalse(retry_path.exists())
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("courier_retry", persisted)
+        self.assertIn(PD.TIMESTAMP_PROVENANCE_FIELD, persisted)
+
+    def test_changed_delivery_context_and_clock_rollback_clear_stale_wait(self):
+        did = self.kwargs["delivery_id"]
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30,
+                     retry_context="target-a", retry_base_delay_seconds=0.05)
+            PD.release_claim(self.root, "sess-claim", did, claim_owner="first",
+                             failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now + 1_000_000):
+            changed = PD.claim(self.root, "sess-claim", did, claim_owner="target-change",
+                               lease_seconds=30, retry_context="target-b",
+                               retry_base_delay_seconds=0.05)
+        self.assertNotIn("courier_retry", changed)
+        self.assertEqual(self._retry_state()["failure_count"], 0)
+        PD.release_claim(self.root, "sess-claim", did, claim_owner="target-change",
+                         failure_reason="transport-timeout", retry_base_delay_seconds=0.05)
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now - 1_000_000_000):
+            recovered = PD.claim(self.root, "sess-claim", did, claim_owner="clock-recovered",
+                                 lease_seconds=30, retry_context="target-b",
+                                 retry_base_delay_seconds=0.05)
+        self.assertNotIn("courier_retry", recovered)
+        self.assertEqual(self._retry_state()["failure_count"], 0)
+
+    def test_sealed_base_reader_accepts_new_writer_failed_obligation_and_consumes_it(self):
+        sealed = "48c08f3231f35c9ef24731ccda5070b6d744c48e"
+        source = subprocess.run(
+            ["git", "show", f"{sealed}:utilities/dispatch_pending_delivery.py"],
+            cwd=HERE.parent, check=True, capture_output=True, text=True,
+        ).stdout
+        old_path = Path(self._tmp.name) / "sealed_base_dispatch_pending_delivery.py"
+        old_path.write_text(source, encoding="utf-8")
+        name = "sealed_base_dispatch_pending_delivery_fixture"
+        spec = importlib.util.spec_from_file_location(name, old_path)
+        old = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[name] = old
+        self.addCleanup(lambda: sys.modules.pop(name, None))
+        spec.loader.exec_module(old)
+
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="new-writer",
+                     lease_seconds=30, retry_context="recipient:generation:target")
+            released = PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="new-writer",
+                failure_reason="transport-timeout", retry_base_delay_seconds=2,
+            )
+        self.assertEqual(released["state"], "pending")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("courier_retry", raw)
+        self.assertTrue(PD.courier_retry_path(path).is_file())
+        self.assertEqual(old._validate_record(raw)["state"], "pending")
+
+        # Exercise the actual sealed-base read/claim/consume implementation.
+        self.assertEqual(old.read(self.root, "sess-claim", did)["state"], "pending")
+        old.claim(self.root, "sess-claim", did, claim_owner="old-reader", lease_seconds=30)
+        consumed = old.ack(self.root, "sess-claim", did, acked_by="old-recipient-consumed")
+        self.assertEqual(consumed["state"], "acked")
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], "acked")
+
+    def test_retry_sidecar_survives_record_write_failure_without_acknowledging(self):
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        now = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
+            PD.claim(self.root, "sess-claim", did, claim_owner="carrier", lease_seconds=30,
+                     retry_context="stable-target")
+
+        real_replace = PD.os.replace
+
+        def fail_record_replace(source, destination):
+            if Path(destination) == path:
+                raise OSError("simulated record CAS write failure")
+            return real_replace(source, destination)
+
+        with unittest.mock.patch.object(PD.os, "replace", side_effect=fail_record_replace):
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.release_claim(
+                    self.root, "sess-claim", did, claim_owner="carrier",
+                    failure_reason="transport-timeout", retry_base_delay_seconds=2,
+                )
+
+        record = PD.read(self.root, "sess-claim", did)
+        self.assertEqual(record["state"], "claimed")
+        self.assertEqual(record["claim_owner"], "carrier")
+        metadata = json.loads(PD.courier_retry_path(path).read_text(encoding="utf-8"))
+        self.assertEqual(metadata["retry"]["failure_count"], 1)
+        self.assertGreater(metadata["retry"]["next_attempt_at_ns"], now)
+        self.assertNotEqual(record["state"], "acked")
 
 
     def test_first_claim_succeeds_second_is_refused(self):
@@ -769,6 +980,248 @@ class PruneTest(IsolatedRootMixin, unittest.TestCase):
             PD.main(["prune", "--root", str(self.root), "--apply", "--json"])
         self.assertEqual(json.loads(buf.getvalue())["pruned_records"], 1)
         self.assertFalse(old_acked.exists())
+
+
+class ReferenceAdmissionTests(IsolatedRootMixin, unittest.TestCase):
+    def _create(self, suffix, attempt):
+        receipt = _receipt()
+        delivery_id = "delivery-" + suffix * 32
+        recipient = "sess-reference-admission"
+        PD.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key=recipient,
+            delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+            attempt_ids=[attempt], parent_attempt_id="att-reference-parent",
+            route_id="rt-reference", route_node="execute", receipt=receipt,
+            receipt_digest=_digest(receipt), row_revisions={attempt: "fixture"},
+        )
+        return recipient, delivery_id, PD.record_path(self.root, recipient, delivery_id)
+
+    def test_ack_and_terminal_state_writes_wait_for_the_reference_admission(self):
+        import fcntl, threading
+
+        recipient, delivery_id, path = self._create("a", "att-reference-ack")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        attempted, errors = threading.Event(), []
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "reference-state-writer"
+                    and operation & fcntl.LOCK_EX):
+                attempted.set()
+            return real_flock(fd, operation)
+
+        with AR.admission(self.root, ["att-reference-ack"]):
+            def ack():
+                try:
+                    PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=ack, name="reference-state-writer")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "ACK writer did not reach its reference lock")
+                self.assertEqual(json.loads(path.read_text())["state"], "claimed")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+
+        recipient, delivery_id, path = self._create("b", "att-reference-expire")
+        attempted.clear()
+        with AR.admission(self.root, ["att-reference-expire"]):
+            def expire():
+                try:
+                    PD.expire_if_due(
+                        self.root, recipient, delivery_id, actor=PD.EXPIRY_ACTOR,
+                        reason="pending-delivery-ttl-exceeded")
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=expire, name="reference-state-writer")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "terminal writer did not reach its reference lock")
+                self.assertEqual(json.loads(path.read_text())["state"], "pending")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(json.loads(path.read_text())["state"], "expired")
+
+    def test_prune_transition_waits_for_reference_admission_and_keeps_tombstone(self):
+        import fcntl, threading
+
+        recipient, delivery_id, path = self._create("c", "att-reference-prune")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+        old = time.time() - 8 * 86400
+        os.utime(path, (old, old))
+        attempted, result, errors = threading.Event(), [], []
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "reference-pruner"
+                    and operation & fcntl.LOCK_EX):
+                attempted.set()
+            return real_flock(fd, operation)
+
+        with AR.admission(self.root, ["att-reference-prune"]):
+            def prune():
+                try:
+                    result.append(PD.prune(
+                        self.root, apply=True, retention_seconds=1,
+                        lock_retention_seconds=86400))
+                except Exception as exc:
+                    errors.append(repr(exc))
+
+            thread = threading.Thread(target=prune, name="reference-pruner")
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                thread.start()
+                self.assertTrue(attempted.wait(3), "pruner did not reach its reference lock")
+                self.assertTrue(path.is_file())
+                self.assertFalse(PD.tombstone_path(path).exists())
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["pruned_records"], 1)
+        self.assertFalse(path.exists())
+        self.assertEqual(json.loads(PD.tombstone_path(path).read_text())["terminal_state"], "acked")
+
+    def test_stale_reference_mutexes_are_removed_by_normal_prune(self):
+        recipient, delivery_id, _path = self._create("d", "att-reference-stale")
+        lock = AR.lock_path(self.root, "att-reference-stale")
+        old = time.time() - 2 * 86400
+        os.utime(lock, (old, old))
+
+        plan = PD.prune_plan(self.root, lock_retention_seconds=3600)
+        self.assertEqual([item["path"] for item in plan["reference_locks"]], [str(lock)])
+        result = PD.prune(self.root, apply=True, lock_retention_seconds=3600)
+        self.assertEqual(result["pruned_reference_locks"], 1)
+        self.assertFalse(lock.exists())
+        with AR.admission(self.root, ["att-reference-stale"]):
+            self.assertTrue(lock.exists(), "the ordinary writer recreates a pruned key safely")
+
+    def test_normal_create_does_not_resurrect_a_pruned_delivery_tombstone(self):
+        recipient, delivery_id, path = self._create("e", "att-reference-pruned")
+        PD.claim(self.root, recipient, delivery_id, claim_owner="carrier", lease_seconds=60)
+        PD.ack(self.root, recipient, delivery_id, acked_by="consumed")
+        old = time.time() - 8 * 86400
+        os.utime(path, (old, old))
+        result = PD.prune(self.root, apply=True, retention_seconds=1)
+        self.assertEqual(result["pruned_records"], 1)
+        tombstone = PD.tombstone_path(path)
+        self.assertTrue(tombstone.is_file())
+
+        with self.assertRaises(PD.PendingDeliveryError) as caught:
+            self._create("e", "att-reference-pruned")
+        self.assertEqual(caught.exception.detail, "record-pruned")
+        self.assertFalse(path.exists())
+        self.assertTrue(tombstone.is_file())
+
+    def test_reference_waiter_reopens_after_an_old_inode_is_unlinked(self):
+        import fcntl, threading
+
+        attempt = "att-reference-inode-race"
+        path = AR.lock_path(self.root, attempt)
+        with AR.admission(self.root, [attempt]):
+            pass
+        old_fd = os.open(path, os.O_RDWR)
+        fcntl.flock(old_fd, fcntl.LOCK_EX)
+        waiter_attempted, waiter_reopened = threading.Event(), threading.Event()
+        new_holder_entered, release_new_holder, waiter_entered = (
+            threading.Event(), threading.Event(), threading.Event())
+        errors, calls = [], {"waiter": 0}
+        real_flock = AR.fcntl.flock
+
+        def observed_flock(fd, operation):
+            if (threading.current_thread().name == "old-inode-waiter"
+                    and operation & fcntl.LOCK_EX):
+                calls["waiter"] += 1
+                if calls["waiter"] == 1:
+                    waiter_attempted.set()
+                elif calls["waiter"] == 2:
+                    waiter_reopened.set()
+            return real_flock(fd, operation)
+
+        def waiter():
+            try:
+                with AR.admission(self.root, [attempt]):
+                    waiter_entered.set()
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        def new_holder():
+            try:
+                with AR.admission(self.root, [attempt]):
+                    new_holder_entered.set()
+                    if not release_new_holder.wait(3):
+                        errors.append("new lock holder timed out")
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        first = threading.Thread(target=waiter, name="old-inode-waiter")
+        second = threading.Thread(target=new_holder, name="new-inode-holder")
+        try:
+            with unittest.mock.patch.object(AR.fcntl, "flock", observed_flock):
+                first.start()
+                self.assertTrue(waiter_attempted.wait(3))
+                old_identity = os.fstat(old_fd).st_ino
+                path.unlink()
+                second.start()
+                self.assertTrue(new_holder_entered.wait(3))
+                self.assertNotEqual(old_identity, path.stat().st_ino)
+                fcntl.flock(old_fd, fcntl.LOCK_UN)
+                os.close(old_fd)
+                old_fd = -1
+                self.assertTrue(waiter_reopened.wait(3), "waiter must reopen the current lock inode")
+                self.assertFalse(waiter_entered.is_set(), "waiter must respect the new inode holder")
+                release_new_holder.set()
+                self.assertTrue(waiter_entered.wait(3))
+        finally:
+            release_new_holder.set()
+            if old_fd >= 0:
+                fcntl.flock(old_fd, fcntl.LOCK_UN)
+                os.close(old_fd)
+            first.join(3)
+            second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_reference_admission_releases_after_exception(self):
+        import subprocess
+
+        attempt = "att-reference-exception"
+        with self.assertRaisesRegex(RuntimeError, "fixture interruption"):
+            with AR.admission(self.root, [attempt]):
+                raise RuntimeError("fixture interruption")
+        self.assertEqual(AR.held_attempts(), frozenset())
+        with AR.admission(self.root, [attempt]) as admitted:
+            self.assertTrue(admitted)
+
+        child = (
+            "import os,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+            "import dispatch_attempt_reference as a; "
+            "ctx=a.admission(Path(sys.argv[2]),[sys.argv[3]]); "
+            "ctx.__enter__(); print('held',flush=True); os._exit(0)"
+        )
+        crashed = subprocess.run(
+            [sys.executable, "-c", child, str(HERE), str(self.root), attempt],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        self.assertEqual(crashed.stdout.strip(), "held")
+        with AR.admission(self.root, [attempt]) as admitted:
+            self.assertTrue(admitted, "process interruption releases the advisory flock")
+
+    def test_writer_reference_extraction_matches_retention_attempt_relation(self):
+        record = {
+            "attempt_ids": ["att-reference-child", "notice-" + "a" * 32, "malformed"],
+            "parent_attempt_id": "att-reference-parent",
+        }
+        expected = frozenset({"att-reference-child", "att-reference-parent"})
+        self.assertEqual(AR.record_attempts(record), expected)
+        self.assertEqual(AR.lock_paths(self.root, record["attempt_ids"] + [record["parent_attempt_id"]]),
+                         tuple(sorted(AR.lock_path(self.root, item) for item in expected)))
 
 
 class ExpiryTest(IsolatedRootMixin, unittest.TestCase):

@@ -484,9 +484,11 @@ def _spawn_observer(jobs: Path, duty_id: str, fd: int, launch, *, expected_obser
                    "--obligation-lock-fd", str(fd)]
         if binding:
             command.extend(("--service-current", binding))
+        from dispatch_contract import governance_environment
+
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,), start_new_session=True,
-            cwd=str(jobs.parent), env=child_env)
+            cwd=str(jobs.parent), env=governance_environment(child_env))
         if not _fd_holds_lease(fd, lease_path):
             return None
         record["observer"] = {"pid": process.pid, "pid_start": _pid_start(process.pid)}
