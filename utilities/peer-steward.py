@@ -976,7 +976,16 @@ def _headless_session_bindings(session_id, jobs):
     import opencode_session_runtime as native
     from dispatch_completion_join import current_attempt_row
     matches = []
-    for aid, (_, meta) in handover.latest_rows(jobs).items() if jobs else ():
+    if not jobs:
+        return matches
+    try:
+        from dispatch_registry_cache import registry_view
+        candidate_rows = registry_view(Path(jobs)).headless_owner_candidates()
+    except OSError:
+        return matches
+    for _status, registry_record in candidate_rows:
+        meta = registry_record.handover_metadata()
+        aid = meta.get("attempt_id", "")
         if (not handover.eligible_row(meta) or meta.get("worker_type") != "owner"
                 or meta.get("harness") != "opencode" or meta.get("transport") != "headless"
                 or meta.get("registered_worker") != "1"
@@ -1789,9 +1798,9 @@ def _handoff_lifetime_valid(foreground):
 def reserve_handoff_retire(target, exact, requester):
     """Reserve in the existing store; never execute exit from acceptance."""
     store = peer_obligations.ObligationStore()
-    matches = [d for d in store.list(states=peer_obligations._PENDING_STATES | {"complete"})
-        if d.get("intent", {}).get("kind") == "retire"
-        and all((d["intent"].get("identity") or {}).get(k) == exact.get(k)
+    matches = [d for d in store.list(states=peer_obligations._PENDING_STATES | {"complete"},
+                                    kinds={"retire"})
+        if all((d["intent"].get("identity") or {}).get(k) == exact.get(k)
                 for k in ("server", "pane", "harness", "session_id"))]
     if matches:
         if len(matches) != 1 or matches[0]["intent"].get("requester") != requester:
@@ -2018,9 +2027,9 @@ def cmd_retire(args):
         # lifetime and its successor. Never borrow another requester's duty.
         own_sid, own_harness = _current_session_identity()
         own_pane = _caller_pane()
-        matches = [row for row in store.list(states=peer_obligations._PENDING_STATES | {"complete"})
-                   if row.get("intent", {}).get("kind") == "retire"
-                   and row["intent"].get("target") == target
+        matches = [row for row in store.list(states=peer_obligations._PENDING_STATES | {"complete"},
+                                             kinds={"retire"})
+                   if row["intent"].get("target") == target
                    and row["intent"].get("requester") == {
                        "session_id": own_sid, "harness": own_harness,
                        "pane": own_pane, "server": _HERDR_SESSION or "default"}]
@@ -5574,9 +5583,7 @@ def _reconcile_external_obligations(store, *, service_current=None, snapshot=Non
                 _ensure_watch_observers(service_current=service_current, entries=watches)
         except Exception:
             pass
-    for duty in store.list(states={"complete"}):
-        if duty.get("intent", {}).get("kind") != "retire":
-            continue
+    for duty in store.list(states={"complete"}, kinds={"retire"}):
         pane = (duty.get("intent", {}).get("requester") or {}).get("pane")
         if pane and _seat_successor_path(pane).is_file():
             try:
@@ -5637,6 +5644,7 @@ def cmd_obligation_runner(args):
     previous_signature = None
     settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     while True:
+        store.begin_read_pass()
         duties = store.list()
         from peer_read_context import PeerReadContext
         read_context = PeerReadContext()
@@ -5665,6 +5673,7 @@ def cmd_obligation_runner(args):
             # and work accepted before release is either reclaimed here or owned
             # by the new lock holder.
             fcntl.flock(args.lock_fd, fcntl.LOCK_UN)
+            store.end_read_pass()
             latest_duties = store.list()
             latest_snapshot = external_snapshot
             if (service_current and external_snapshot is not None

@@ -27,15 +27,17 @@ class PeerReadContextTest(unittest.TestCase):
     def test_attempt_rows_are_indexed_once_and_keep_latest_exact_row(self):
         self.jobs.write_text("\n".join((row("att-a", "queued"), row("att-b"),
                                           row("att-a", "running", slug="latest"))) + "\n")
+        CACHE.reset_metrics()
         context = PeerReadContext()
-        with mock.patch.object(CACHE, "registry_lines", wraps=CACHE.registry_lines) as read:
-            first = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
-            second = JOIN.current_attempt_row(self.jobs, "att-b", read_context=context)
-            again = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+        first = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
+        second = JOIN.current_attempt_row(self.jobs, "att-b", read_context=context)
+        again = JOIN.current_attempt_row(self.jobs, "att-a", read_context=context)
         self.assertEqual((first.status, first.slug, first.order), ("running", "latest", 2))
         self.assertEqual(second.attempt_id, "att-b")
         self.assertEqual(again.raw, first.raw)
-        read.assert_called_once_with(self.jobs)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
 
     def test_unrelated_invalid_schema_is_ignored_and_exact_invalid_schema_fails(self):
         self.jobs.write_text(row("att-good") + "\n" + row("att-bad", schema="1") + "\n")

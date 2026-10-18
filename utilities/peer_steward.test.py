@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for utilities/peer-steward.py (SD-122 (9) steward wait/start)."""
 import concurrent.futures
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -1396,15 +1397,21 @@ class _WatchMixin(_TmpRootMixin):
         return {}
 
     def _release(self):
-        # A held reader can close between our open() and write() (a watcher that just
-        # got EOF from the previous release): EPIPE means "no reader took it", retry.
+        # A held reader can close between retries. Nonblocking open turns "no
+        # reader" into ENXIO so this bounded recovery loop cannot hang at open().
         for _ in range(100):
+            fd = None
             try:
-                with open(self.fifo, "w") as fh:
-                    fh.write("go")
+                fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(fd, b"go")
                 return
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {errno.ENXIO, errno.EPIPE}:
+                    raise
                 time.sleep(0.01)
+            finally:
+                if fd is not None:
+                    os.close(fd)
         self.fail("no reader took the FIFO release")
 
     def _wait_for_lock(self, watch_id, seconds=30):

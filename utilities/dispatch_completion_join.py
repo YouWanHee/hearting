@@ -81,7 +81,7 @@ from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_supervisor_terminal import (  # noqa: E402
     classify_supervisor_log, missing_result_terminal,
 )
-from dispatch_registry_cache import registry_lines  # noqa: E402
+from dispatch_registry_cache import registry_lines, registry_view  # noqa: E402
 
 INVALID_ENVELOPE_CLASSIFIER_SOURCE = "completion-join-invalid-envelope-v1"
 OPEN_STATES = frozenset({"open", "running"})
@@ -2809,18 +2809,17 @@ def current_children(
     if bool(route_id) != bool(route_hash):
         raise JoinContractError("route-selection-identity-incomplete")
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except FileNotFoundError:
-        lines = []
+        view = None
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
 
     latest: dict[str, ChildRow] = {}
-    for order, line in enumerate(lines):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = _metadata(fields[5])
+    records = view.completion_children(parent_attempt_id) if view is not None else ()
+    for record in records:
+        fields = record.fields
+        meta = record.completion_metadata()
         if meta.get("parent_attempt_id") != parent_attempt_id:
             continue
         if meta.get("attempt_schema_version") != "2":
@@ -2829,11 +2828,11 @@ def current_children(
         if not attempt_id:
             raise JoinContractError("owned-row-attempt-id-missing")
         latest[attempt_id] = ChildRow(
-            order=order,
+            order=record.order,
             status=fields[1],
             slug=fields[4],
             attempt_id=attempt_id,
-            raw=line,
+            raw=record.raw,
             metadata=meta,
         )
 
@@ -2868,26 +2867,22 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     if not attempt_id:
         raise JoinContractError("attempt-id-missing")
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     matches: list[ChildRow] = []
-    for order, line in enumerate(lines):
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        metadata = _metadata(fields[5])
-        if metadata.get("attempt_id") != attempt_id:
-            continue
+    for record in view.completion_attempt_records(attempt_id):
+        fields = record.fields
+        metadata = record.completion_metadata()
         if metadata.get("attempt_schema_version") != "2":
             raise JoinContractError("attempt-row-schema-invalid")
         matches.append(
             ChildRow(
-                order=order,
+                order=record.order,
                 status=fields[1],
                 slug=fields[4],
                 attempt_id=attempt_id,
-                raw=line,
+                raw=record.raw,
                 metadata=metadata,
             )
         )
@@ -2904,28 +2899,18 @@ def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> Ch
     if read_context is not None:
         return read_context.current_attempt_row(jobs, attempt_id)
     try:
-        lines = registry_lines(jobs)
+        view = registry_view(jobs)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
-    found: ChildRow | None = None
-    # A row of this attempt always carries this text; skipping the others before
-    # parsing keeps a lookup cheap on a registry of thousands of rows.
-    needle = "attempt_id=" + attempt_id
-    for order, line in enumerate(lines):
-        if needle not in line:
-            continue
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        metadata = _metadata(fields[5])
-        if metadata.get("attempt_id") != attempt_id:
-            continue
-        if metadata.get("attempt_schema_version") != "2":
-            raise JoinContractError("attempt-row-schema-invalid")
-        found = ChildRow(order, fields[1], fields[4], attempt_id, line, metadata)
-    return found
+    record, error = view.completion_attempt(attempt_id)
+    if error:
+        raise JoinContractError(error)
+    if record is None:
+        return None
+    return ChildRow(record.order, record.status, record.slug, attempt_id,
+                    record.raw, record.completion_metadata())
 
 
 def current_delivery_state(
