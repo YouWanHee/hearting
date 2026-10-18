@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import time
 import uuid
 
@@ -97,13 +98,16 @@ def _copy_runtime_config(source_home: Path, codex_home: Path, env: dict[str, str
     # Only the two lifecycle paths under test are enabled in this private home.
     (codex_home / "hooks.json").write_text(
         json.dumps({"hooks": selected}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (codex_home / "hooks.json").chmod(0o600)
     copied["hooks.json"] = True
     # Personal MCP, plugin, provider, and shell configuration is deliberately
     # absent. Native integrations and multi-agent dispatch stay disabled.
     (codex_home / "config.toml").write_text(
         "[analytics]\nenabled = false\n\n[features]\napps = false\nmulti_agent = false\n",
         encoding="utf-8")
+    (codex_home / "config.toml").chmod(0o600)
     (codex_home / "installation_id").write_text(uuid.uuid4().hex + "\n", encoding="ascii")
+    (codex_home / "installation_id").chmod(0o600)
     copied["installation_id"] = True
     copied["auth.json"] = False
     auth_source = None
@@ -113,6 +117,151 @@ def _copy_runtime_config(source_home: Path, codex_home: Path, env: dict[str, str
             auth_source = source
             break
     return copied, auth_source
+
+
+def _event_key(value: str) -> str:
+    return "".join(character.lower() for character in value if character.isalnum())
+
+
+def _same_source(raw: object, expected: Path) -> bool:
+    if not isinstance(raw, str) or not raw:
+        return False
+    candidate = Path(raw).expanduser()
+    try:
+        return candidate.samefile(expected)
+    except OSError:
+        return candidate.absolute() == expected.absolute()
+
+
+def _listed_isolated_hooks(client, worktree: Path, hooks_path: Path) -> dict[str, dict]:
+    response = client.request("hooks/list", {"cwds": [str(worktree)]})
+    rows = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise ReplayBlocked("isolated-hook-list-shape-invalid")
+    hooks = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("cwd") != str(worktree):
+            continue
+        entries = row.get("hooks")
+        if not isinstance(entries, list):
+            raise ReplayBlocked("isolated-hook-list-entry-invalid")
+        hooks.extend(hook for hook in entries if isinstance(hook, dict)
+                     and _same_source(hook.get("sourcePath"), hooks_path))
+
+    try:
+        source = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReplayBlocked("isolated-hook-source-unreadable") from exc
+    definitions = source.get("hooks") if isinstance(source, dict) else None
+    expected_events: dict[str, int] = {}
+    if isinstance(definitions, dict):
+        for event, groups in definitions.items():
+            if not isinstance(event, str) or not isinstance(groups, list):
+                raise ReplayBlocked("isolated-hook-source-shape-invalid")
+            for group in groups:
+                if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                    raise ReplayBlocked("isolated-hook-source-entry-invalid")
+                count = sum(isinstance(item, dict) for item in group["hooks"])
+                if count:
+                    key = _event_key(event)
+                    expected_events[key] = expected_events.get(key, 0) + count
+    observed_events: dict[str, int] = {}
+    by_key = {}
+    for hook in hooks:
+        key = hook.get("key")
+        current_hash = hook.get("currentHash")
+        event = hook.get("eventName")
+        if (not isinstance(key, str) or not key or key in by_key
+                or not isinstance(current_hash, str) or not current_hash
+                or not isinstance(event, str) or not event):
+            raise ReplayBlocked("isolated-hook-trust-identity-invalid")
+        if hook.get("enabled") is False:
+            raise ReplayBlocked("isolated-hook-disabled:" + _event_key(event))
+        by_key[key] = hook
+        event_key = _event_key(event)
+        observed_events[event_key] = observed_events.get(event_key, 0) + 1
+    if not by_key or observed_events != expected_events:
+        raise ReplayBlocked("isolated-hook-source-set-mismatch")
+    return by_key
+
+
+def _trust_isolated_hooks(client, codex_home: Path, worktree: Path,
+                          hooks_path: Path) -> dict:
+    """Trust only the generated hooks through Codex's current-hash config API."""
+    config_path = codex_home / "config.toml"
+    home_info = codex_home.lstat()
+    if (not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != os.geteuid()
+            or stat.S_IMODE(home_info.st_mode) != 0o700):
+        raise ReplayBlocked("isolated-codex-home-ownership-unsafe")
+    for path in (config_path, hooks_path):
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or path.parent.resolve(strict=True) != codex_home.resolve(strict=True)):
+            raise ReplayBlocked("isolated-hook-config-ownership-unsafe")
+    hook_bytes = hooks_path.read_bytes()
+    hook_digest = hashlib.sha256(hook_bytes).hexdigest()
+    try:
+        config_data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ReplayBlocked("isolated-hook-config-invalid") from exc
+    existing_state = config_data.get("hooks", {}).get("state", {})
+    if existing_state:
+        raise ReplayBlocked("isolated-hook-state-not-private-empty")
+
+    listed = _listed_isolated_hooks(client, worktree, hooks_path)
+    expected_hashes = {key: hook["currentHash"] for key, hook in listed.items()}
+    edits = [{"keyPath": "hooks.state", "value": {key: {"trusted_hash": current_hash}},
+              "mergeStrategy": "upsert"}
+             for key, current_hash in expected_hashes.items()]
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    client.request("config/batchWrite", {
+        "edits": edits, "reloadUserConfig": True, "filePath": str(config_path),
+    })
+    os.chmod(config_path, mode)
+    if hooks_path.read_bytes() != hook_bytes:
+        raise ReplayBlocked("isolated-hook-source-changed-during-trust")
+    try:
+        trusted_state = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        trusted_state = trusted_state.get("hooks", {}).get("state", {})
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ReplayBlocked("isolated-hook-trust-config-invalid") from exc
+    if (not isinstance(trusted_state, dict) or set(trusted_state) != set(expected_hashes)
+            or any(not isinstance(trusted_state.get(key), dict)
+                   or trusted_state[key].get("trusted_hash") != digest
+                   for key, digest in expected_hashes.items())):
+        raise ReplayBlocked("isolated-hook-trust-hash-not-persisted")
+
+    verified = _listed_isolated_hooks(client, worktree, hooks_path)
+    if (set(verified) != set(expected_hashes)
+            or any(verified[key].get("currentHash") != digest
+                   or verified[key].get("trustStatus") not in {"trusted", "managed"}
+                   for key, digest in expected_hashes.items())):
+        raise ReplayBlocked("isolated-hook-current-hash-not-trusted")
+    if hooks_path.read_bytes() != hook_bytes:
+        raise ReplayBlocked("isolated-hook-source-changed-after-trust")
+    return {"hooks_json_sha256": hook_digest, "trusted_hook_count": len(expected_hashes),
+            "trusted_hook_keys": sorted(expected_hashes)}
+
+
+def _start_replay_thread(client, worktree: Path) -> str:
+    result = client.request("thread/start", {
+        "cwd": str(worktree), "ephemeral": False, "sandbox": "workspace-write",
+        "approvalPolicy": "never",
+    })
+    thread = result.get("thread") if isinstance(result, dict) else None
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ReplayBlocked("isolated-thread-start-unconfirmed")
+    return thread_id
+
+
+def _start_trusted_replay_thread(client, codex_home: Path, worktree: Path,
+                                 hooks_path: Path) -> tuple[str, str, dict]:
+    probe_thread_id = _start_replay_thread(client, worktree)
+    hook_trust = _trust_isolated_hooks(client, codex_home, worktree, hooks_path)
+    client.request("thread/unsubscribe", {"threadId": probe_thread_id})
+    thread_id = _start_replay_thread(client, worktree)
+    return thread_id, probe_thread_id, hook_trust
 
 
 def _fake_agent_home(temp_root: Path) -> Path:
@@ -177,10 +326,10 @@ def _start_server(command: list[str], endpoint: Path, worktree: Path, env: dict[
                                 + summary + f"; socket_dir_mode={oct(stat.S_IMODE(parent_info.st_mode))}"
                                 + f"; codex_home_mode={oct(stat.S_IMODE(home_info.st_mode))}")
         try:
-            info = endpoint.lstat()
+            info = codex_queue_delivery.resolve_endpoint(endpoint).lstat()
             if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid():
                 return process
-        except FileNotFoundError:
+        except (FileNotFoundError, codex_queue_delivery.QueueDeliveryError):
             pass
         time.sleep(0.05)
     summary = _stderr_summary(stderr_path)
@@ -452,14 +601,16 @@ def _run_replay(output_dir: Path) -> dict:
                 # Initialization has loaded the auth record into the isolated
                 # server. Remove the private copy before model tools can run.
                 (codex_home / "auth.json").unlink(missing_ok=True)
-                thread_result = client.request("thread/start", {
-                    "cwd": str(worktree), "ephemeral": False, "sandbox": "workspace-write",
-                    "approvalPolicy": "never",
+                # Codex exposes project hook hashes only after project trust is
+                # established by a thread. Probe without a model turn, persist
+                # exact current hashes through hooks.state, then start the
+                # measured thread with native hook trust already in place.
+                thread_id, probe_thread_id, hook_trust = _start_trusted_replay_thread(
+                    client, codex_home, worktree, hooks_path)
+                _append_event(output_dir / "native-events.jsonl", {
+                    "event": "isolated-hooks-trusted", "probe_thread_id": probe_thread_id,
+                    **hook_trust,
                 })
-                thread = thread_result.get("thread")
-                if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
-                    raise ReplayBlocked("isolated-thread-start-unconfirmed")
-                thread_id = thread["id"]
                 attempt, route_id, receipt, completion_record, metadata = _fixture_registry(
                     jobs, thread_id, worktree, sentinel)
                 prompt = (
