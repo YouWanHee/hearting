@@ -7368,6 +7368,9 @@ def write_completion_marker(
         source_subject = marker_subject(
             route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
             jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
+            owner_inline=(review_identity.get("reviewer_kind") == "owner-inline"
+                          and axes.get("registered_worker") is False
+                          and axes.get("execution_surface") == "inline"),
         )
     except SourceSubjectError as exc:
         # Only an implementation review consumes its source subject as evidence.
