@@ -723,6 +723,149 @@ class ReleasePycachePruneTest(unittest.TestCase):
         self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
         self.assertEqual(worker_errors, [])
 
+    def test_unrelated_admission_proceeds_during_delayed_refresh(self) -> None:
+        releases = [self._create_release(f"refresh-{index}", index) for index in range(3)]
+        boundary_jobs = releases[0] / ".dispatch" / "jobs.log"
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        boundary_jobs.parent.mkdir()
+        unrelated_jobs.parent.mkdir()
+        for index, release in enumerate(releases):
+            os.utime(release, (index, index))
+        generation_dir = self.root / "refresh-routes"
+        generation_dir.mkdir()
+        refresh_started = threading.Event()
+        allow_refresh = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+        discovery_calls = 0
+
+        def inventory_for_scan(inventory):
+            inventory.clear()
+            inventory.update({
+                "files": set(), "directories": {generation_dir}, "registries": set(),
+                "start_files": {},
+                "start_directories": {
+                    generation_dir: distribution._path_fingerprint(generation_dir)
+                },
+                "unstable": False,
+            })
+            inventory["fingerprints"] = distribution._snapshot_discovery_inputs(
+                inventory, ()
+            )
+
+        def delayed_refresh(_environ, *, inventory, **_kwargs):
+            nonlocal discovery_calls
+            discovery_calls += 1
+            inventory_for_scan(inventory)
+            if discovery_calls == 1:
+                (generation_dir / "published.json").write_text("{}\n", encoding="utf-8")
+            elif discovery_calls == 2:
+                refresh_started.set()
+                if not allow_refresh.wait(timeout=3):
+                    raise TimeoutError("fixture did not release the bounded refresh")
+            return [], ""
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_open_route_launch_homes",
+                        side_effect=delayed_refresh,
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_dispatch_cleanup_boundary_paths",
+                        return_value=[boundary_jobs],
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(refresh_started.wait(timeout=2))
+
+            def admit_unrelated() -> None:
+                with distribution._registry_lock(unrelated_jobs):
+                    admitted.set()
+
+            competitor = threading.Thread(target=admit_unrelated)
+            competitor.start()
+            self.assertTrue(
+                admitted.wait(timeout=1),
+                "delayed refresh held an unrelated dispatch admission lock",
+            )
+            competitor.join(timeout=2)
+            self.assertFalse(competitor.is_alive())
+        finally:
+            allow_refresh.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertEqual(discovery_calls, 2)
+        self.assertEqual(worker_errors, [])
+
+    def test_unrelated_admission_proceeds_during_delayed_cache_deletion(self) -> None:
+        releases = [self._create_release(f"cache-delay-{index}", index) for index in range(3)]
+        boundary_jobs = releases[0] / ".dispatch" / "jobs.log"
+        unrelated_jobs = releases[-1] / ".dispatch" / "jobs.log"
+        boundary_jobs.parent.mkdir()
+        unrelated_jobs.parent.mkdir()
+        for index, release in enumerate(releases):
+            os.utime(release, (index, index))
+        cache_started = threading.Event()
+        allow_cache = threading.Event()
+        admitted = threading.Event()
+        worker_errors = []
+        real_remove_cache = distribution._remove_release_pycache
+
+        def delayed_cache_removal(release):
+            if Path(release) == releases[0]:
+                cache_started.set()
+                if not allow_cache.wait(timeout=3):
+                    raise TimeoutError("fixture did not release cache deletion")
+            return real_remove_cache(release)
+
+        def cleanup() -> None:
+            try:
+                with ExitStack() as stack:
+                    self._patch_cleanup(stack)
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_remove_release_pycache",
+                        side_effect=delayed_cache_removal,
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        distribution, "_dispatch_cleanup_boundary_paths",
+                        return_value=[boundary_jobs],
+                    ))
+                    distribution._cleanup_releases(set())
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        try:
+            self.assertTrue(cache_started.wait(timeout=2))
+
+            def admit_unrelated() -> None:
+                with distribution._registry_lock(unrelated_jobs):
+                    admitted.set()
+
+            competitor = threading.Thread(target=admit_unrelated)
+            competitor.start()
+            self.assertTrue(
+                admitted.wait(timeout=1),
+                "delayed cache deletion held an unrelated dispatch admission lock",
+            )
+            competitor.join(timeout=2)
+            self.assertFalse(competitor.is_alive())
+        finally:
+            allow_cache.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "cleanup fixture did not finish within its bound")
+        self.assertFalse(releases[0].exists())
+        self.assertEqual(worker_errors, [])
+
     def test_known_observation_collisions_prune_but_completion_conflict_retains(self) -> None:
         real_succeed_dispatch_state = distribution._succeed_dispatch_state
         observations = {

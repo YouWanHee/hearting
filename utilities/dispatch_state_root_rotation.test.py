@@ -1821,9 +1821,13 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         n2 = self._make_release("v-late-reference-current", 3000.0)
         self._seal_current(n2)
         real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
+        published = False
 
         def publish_reference(environ, extra_jobs_paths=(), legacy_registry_paths=None):
-            self._write_registry_row("open", "att-late-reference", f"launch_home={n}")
+            nonlocal published
+            if not published:
+                self._write_registry_row("open", "att-late-reference", f"launch_home={n}")
+                published = True
             return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
 
         stderr = io.StringIO()
@@ -1844,12 +1848,16 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         real_boundary_paths = DISTRIBUTION._dispatch_cleanup_boundary_paths
         real_discovery = DISTRIBUTION._open_route_launch_homes
         discoveries = 0
+        published = False
 
         def publish_route(environ, extra_jobs_paths=(), legacy_registry_paths=None):
-            self._write_registry_row(
-                "open", "att-late-route", f"artifact_root={self.artifact_root}"
-            )
-            self._write_route_record("rt-95e2db8fa2b8e5f5", n)
+            nonlocal published
+            if not published:
+                self._write_registry_row(
+                    "open", "att-late-route", f"artifact_root={self.artifact_root}"
+                )
+                self._write_route_record("rt-95e2db8fa2b8e5f5", n)
+                published = True
             return real_boundary_paths(environ, extra_jobs_paths, legacy_registry_paths)
 
         def count_discovery(environ, **kwargs):
@@ -1869,6 +1877,128 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         self.assertEqual(discoveries, 2, "new route input should trigger one bounded refresh")
         self.assertTrue(n.is_dir())
         self.assertIn("open-route:rt-95e2db8fa2b8e5f5", stderr.getvalue())
+
+    def test_exhausted_unstable_route_refresh_never_prunes_from_partial_inventory(self):
+        releases = [self._make_release(f"v-unstable-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "done", "att-unstable-index", f"artifact_root={self.artifact_root}"
+        )
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        published_targets = [releases[4], releases[3], releases[2], releases[0]]
+        discoveries = 0
+
+        def publish_after_partial_scan(environ, *, inventory=None, **kwargs):
+            nonlocal discoveries
+            observed = real_discovery(environ, inventory=inventory, **kwargs)
+            if discoveries < len(published_targets):
+                route_id = "rt-" + hashlib.sha256(
+                    f"unstable-{discoveries}".encode()
+                ).hexdigest()[:16]
+                self._write_route_record(route_id, published_targets[discoveries])
+            discoveries += 1
+            # Model the reader contract directly: it returns what it observed,
+            # while declaring that the inventory changed during discovery.
+            inventory["unstable"] = True
+            inventory["fingerprints"]["unstable"] = True
+            return observed
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes",
+            side_effect=publish_after_partial_scan,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertEqual(discoveries, 4, "initial discovery plus three bounded refreshes")
+        self.assertTrue(all(release.is_dir() for release in releases))
+        self.assertTrue(releases[0].is_dir(), "the last undiscovered route target was pruned")
+
+    def test_route_published_after_later_prune_protects_oldest_candidate(self):
+        releases = [self._make_release(f"v-later-route-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "done", "att-later-route-root", f"artifact_root={self.artifact_root}"
+        )
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        real_cache_removal = DISTRIBUTION._remove_release_pycache
+        discoveries = 0
+        published = False
+        route_id = "rt-" + hashlib.sha256(b"later-published-route").hexdigest()[:16]
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        def publish_after_prune(release):
+            nonlocal published
+            result = real_cache_removal(release)
+            if release == releases[2] and not published:
+                self._write_route_record(route_id, releases[0])
+                published = True
+            return result
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), mock.patch.object(
+            DISTRIBUTION, "_remove_release_pycache", side_effect=publish_after_prune,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(published)
+        self.assertEqual(discoveries, 2, "later publication should trigger one outside-epoch refresh")
+        self.assertFalse(releases[2].exists(), "the first eligible release should be reclaimed")
+        self.assertTrue(releases[0].is_dir(), "the later route reference was ignored")
+
+    def test_changed_existing_stable_reference_after_later_prune_is_refreshed(self):
+        releases = [self._make_release(f"v-later-change-{index}", 1000 + index)
+                    for index in range(5)]
+        self._seal_current(releases[-1])
+        self._write_registry_row(
+            "open", "att-changed-reference",
+            f"artifact_root={self.artifact_root},launch_home={releases[-1]}",
+        )
+        stable_jobs = self.stable_root / "jobs.log"
+        real_discovery = DISTRIBUTION._open_route_launch_homes
+        real_cache_removal = DISTRIBUTION._remove_release_pycache
+        discoveries = 0
+        changed = False
+
+        def count_discovery(environ, **kwargs):
+            nonlocal discoveries
+            discoveries += 1
+            return real_discovery(environ, **kwargs)
+
+        def change_reference_after_prune(release):
+            nonlocal changed
+            result = real_cache_removal(release)
+            if release == releases[2] and not changed:
+                lines = stable_jobs.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 1)
+                fields = lines[0].split("\t")
+                pipe = [
+                    f"launch_home={releases[0]}" if item.startswith("launch_home=") else item
+                    for item in fields[5].split(",")
+                ]
+                fields[5] = ",".join(pipe)
+                with DISTRIBUTION._registry_lock(stable_jobs):
+                    DISTRIBUTION._atomic_registry_write(stable_jobs, ["\t".join(fields)])
+                changed = True
+            return result
+
+        with mock.patch.object(
+            DISTRIBUTION, "_open_route_launch_homes", side_effect=count_discovery,
+        ), mock.patch.object(
+            DISTRIBUTION, "_remove_release_pycache", side_effect=change_reference_after_prune,
+        ):
+            DISTRIBUTION._cleanup_releases(keep=set())
+
+        self.assertTrue(changed)
+        self.assertEqual(discoveries, 2, "atomic replacement of an existing reference must refresh")
+        self.assertFalse(releases[2].exists(), "the first eligible release should be reclaimed")
+        self.assertTrue(releases[0].is_dir(), "the changed existing reference was ignored")
 
     def test_forced_prune_never_overrides_an_open_sealed_release(self):
         n = self._make_release("vN", 1000.0)
@@ -2509,7 +2639,10 @@ with open(str(jobs) + '.lock', 'a+b') as lock:
              mock.patch.object(DISTRIBUTION.shutil, "rmtree", side_effect=remove_in_boundary):
             DISTRIBUTION._cleanup_releases(keep=set())
 
-        self.assertEqual(route_discoveries, 2, "cleanup must refresh route evidence inside the boundary")
+        self.assertEqual(
+            route_discoveries, 3,
+            "cleanup must refresh external publication and the monotonic carry-forward",
+        )
         self.assertFalse(v1.exists())
         self.assertEqual(
             (DISTRIBUTION.stable_state_root(os.environ) / "completion" / "late-evidence.json").read_bytes(),

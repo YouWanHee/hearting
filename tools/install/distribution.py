@@ -2911,6 +2911,8 @@ def _open_route_artifact_roots(
 
     jobs = state_root / "jobs.log"
     _watch_discovery_path(inventory, jobs)
+    if inventory is not None:
+        inventory["registries"].add(jobs)
     if jobs.is_file():
         try:
             text = jobs.read_text(encoding="utf-8")
@@ -3389,12 +3391,19 @@ def _path_fingerprint(path: Path) -> tuple | None:
 
 def _snapshot_discovery_inputs(inventory: dict, registry_paths: Iterable[Path]) -> dict:
     paths = set(inventory.get("files", ()))
-    watched_registries = set(inventory.get("registries", ()))
-    watched_registries.update(Path(path) for path in registry_paths)
-    paths.update(watched_registries)
+    route_registries = set(inventory.get("registries", ()))
+    admission_registries = {Path(path) for path in registry_paths}
+    paths.update(route_registries)
+    paths.update(admission_registries)
     directories = set(inventory.get("directories", ()))
     return {
         "files": {Path(path): _path_fingerprint(Path(path)) for path in paths},
+        "route_registries": {
+            Path(path): _path_fingerprint(Path(path)) for path in route_registries
+        },
+        "admission_registries": {
+            Path(path): _path_fingerprint(Path(path)) for path in admission_registries
+        },
         "directories": {
             Path(path): _path_fingerprint(Path(path)) for path in directories
         },
@@ -3406,6 +3415,29 @@ def _discovery_inputs_changed(snapshot: dict) -> bool:
     return bool(snapshot.get("unstable")) or any(
         _path_fingerprint(path) != fingerprint
         for collection in (snapshot.get("files", {}), snapshot.get("directories", {}))
+        for path, fingerprint in collection.items()
+    )
+
+
+def _discovery_generation_changed(snapshot: dict) -> bool:
+    """Check cheap publication generations between full global discoveries.
+
+    Route records are immutable write-once files; outcomes and owner bindings
+    publish by atomic rename. Their containing directory generations detect
+    creation, replacement, and removal without statting every route file under
+    each admission hold. Registry files are checked individually because
+    accepted writers may append in place while holding their existing jobs
+    lock. Those locks are held during the final generation check.
+    """
+    if snapshot.get("unstable"):
+        return True
+    return any(
+        _path_fingerprint(path) != fingerprint
+        for collection in (
+            snapshot.get("directories", {}),
+            snapshot.get("route_registries", {}),
+            snapshot.get("admission_registries", {}),
+        )
         for path, fingerprint in collection.items()
     )
 
@@ -3745,6 +3777,7 @@ def _prune_release_under_writer_boundary(
     stable_snapshot: list[dict] | None = None,
     route_snapshot: tuple[list[tuple[str, str]], str] | None = None,
     registry_snapshot: list[dict] | None = None,
+    discovery_inputs: dict | None = None,
 ) -> tuple[bool, str]:
     """Carry, refresh deletion evidence, verify, and remove under admission locks.
 
@@ -3758,12 +3791,30 @@ def _prune_release_under_writer_boundary(
     environ = os.environ
     if not writer_boundary_held:
         try:
-            with _dispatch_writer_boundary(candidate, environ):
-                fresh_stable = _stable_registry_snapshot(environ)
-                fresh_routes = _open_route_launch_homes(environ)
-                fresh_registries = _release_registry_snapshot(
-                    _release_reference_registries(candidate)
-                )
+            legacy_paths = _installed_legacy_registry_paths(None)
+            route_inventory: dict = {}
+            stable_jobs = stable_state_root(environ) / "jobs.log"
+            watch_paths = [*legacy_paths, stable_jobs]
+            if environ.get("AGENT_DISPATCH_JOBS"):
+                watch_paths.append(Path(environ["AGENT_DISPATCH_JOBS"]))
+            fresh_routes = _open_route_launch_homes(
+                environ, inventory=route_inventory, watch_paths=watch_paths
+            )
+            route_inventory["registries"].add(stable_jobs)
+            discovery_inputs = _snapshot_discovery_inputs(
+                route_inventory, [*legacy_paths, stable_jobs]
+            )
+            fresh_stable = _stable_registry_snapshot(environ)
+            fresh_registries = _release_registry_snapshot(legacy_paths)
+            if (_discovery_inputs_changed(discovery_inputs)
+                    or route_inventory.get("unstable")):
+                return False, "route-discovery-inputs-changed"
+            paths = _dispatch_cleanup_boundary_paths(
+                environ, route_inventory.get("registries", ()), legacy_paths
+            )
+            with _dispatch_writer_boundary(None, environ, jobs_paths=paths):
+                if _discovery_generation_changed(discovery_inputs):
+                    return False, "route-discovery-inputs-changed"
                 return _prune_release_under_writer_boundary(
                     candidate,
                     force_prune_unproven=force_prune_unproven,
@@ -3771,6 +3822,7 @@ def _prune_release_under_writer_boundary(
                     stable_snapshot=fresh_stable,
                     route_snapshot=fresh_routes,
                     registry_snapshot=fresh_registries,
+                    discovery_inputs=discovery_inputs,
                 )
         except (OSError, DistributionError) as exc:
             return False, f"dispatch-writer-boundary-unavailable:{exc}"
@@ -3807,6 +3859,14 @@ def _prune_release_under_writer_boundary(
                 return False, containment_reason
             if not _commit_forced_prune_gap_record(candidate, environ, containment_reason):
                 return False, "dispatch-registry-gap-record-commit-failed"
+
+        # A route or reference may be published while the candidate's source
+        # state is being carried and verified. Recheck only publication
+        # generations and known registry files here; full route parsing and
+        # refresh happen after this admission epoch is released.
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            return False, "route-discovery-inputs-changed"
 
         try:
             shutil.rmtree(candidate)
@@ -3871,6 +3931,7 @@ def _cleanup_orphan_release_pycache(
     route_snapshot: tuple[list[tuple[str, str]], str],
     skip_names: set[str] | None = None,
     registry_snapshot: list[dict] | None = None,
+    discovery_inputs: dict | None = None,
 ) -> None:
     """Retry release-specific cache cleanup without scanning outside its exact prefix."""
     base = _release_pycache_base()
@@ -3893,6 +3954,14 @@ def _cleanup_orphan_release_pycache(
         print(f"harness release: cannot inspect release pycache {base}: {exc}", file=sys.stderr)
         return
     for cache in entries:
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            print(
+                "harness release: orphan pycache scan stopped because reference "
+                "inputs changed; remaining caches will be retried on a later update",
+                file=sys.stderr,
+            )
+            return
         if skip_names and cache.name in skip_names:
             continue
         release = releases / cache.name
@@ -3926,6 +3995,14 @@ def _cleanup_orphan_release_pycache(
                 file=sys.stderr,
             )
             continue
+        if (discovery_inputs is not None
+                and _discovery_generation_changed(discovery_inputs)):
+            print(
+                f"harness release: orphan pycache for {release} was retained because "
+                "reference inputs changed during the check",
+                file=sys.stderr,
+            )
+            return
         if not _remove_release_pycache(release):
             print(
                 f"harness release: could not remove orphan pycache for {release}; "
@@ -3944,121 +4021,261 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         reverse=True,
     )
 
-    # Do the bounded global route/artifact discovery before taking any
-    # admission locks. The update-local inventory lets the final boundary
-    # detect changed registries, route files, outcomes, bindings, and directory
-    # membership; unchanged global records are not reparsed per release.
+    # Route and artifact discovery is global and may traverse NFS trees. Keep
+    # it outside admission locks, then use publication generations and locked
+    # registry fingerprints to decide whether the update-local index is still
+    # current for each candidate.
     environ = os.environ
     legacy_registry_paths = _installed_legacy_registry_paths(None)
-    route_inventory: dict = {}
-    route_snapshot = _open_route_launch_homes(
-        environ, inventory=route_inventory, watch_paths=legacy_registry_paths
-    )
-    discovery_inputs = route_inventory.get("fingerprints") or _snapshot_discovery_inputs(
-        route_inventory, legacy_registry_paths
-    )
     try:
-        writer_paths = _dispatch_cleanup_boundary_paths(
-            environ, route_inventory.get("registries", ()), legacy_registry_paths
-        )
-    except (OSError, DistributionError) as exc:
+        stable_jobs = stable_state_root(environ) / "jobs.log"
+    except DistributionError as exc:
         for candidate in candidates:
             if candidate not in keep:
                 print(_release_keep_message(
                     candidate, f"dispatch-writer-boundary-unavailable:{exc}"
                 ), file=sys.stderr)
         return
+    admission_registry_paths = [*legacy_registry_paths, stable_jobs]
+    ambient_jobs = environ.get("AGENT_DISPATCH_JOBS")
+    if ambient_jobs:
+        admission_registry_paths.append(Path(ambient_jobs))
+
+    def discover() -> dict:
+        inventory: dict = {}
+        watch_paths = [*legacy_registry_paths, stable_jobs]
+        if ambient_jobs:
+            watch_paths.append(Path(ambient_jobs))
+        route_snapshot = _open_route_launch_homes(
+            environ, inventory=inventory, watch_paths=watch_paths
+        )
+        inventory.setdefault("registries", set()).add(stable_jobs)
+        inputs = inventory.get("fingerprints") or _snapshot_discovery_inputs(
+            inventory, admission_registry_paths
+        )
+        indexed_files = dict(inputs.get("files", {}))
+        indexed_route_registries = dict(inputs.get("route_registries", {}))
+        admission_before = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in admission_registry_paths
+        }
+        route_registry_before = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in inventory.get("registries", ())
+        }
+        try:
+            stable_snapshot = _stable_registry_snapshot(environ)
+            registry_snapshot = _release_registry_snapshot(legacy_registry_paths)
+        except OSError as exc:
+            return {"error": f"dispatch-writer-boundary-unavailable:{exc}"}
+        admission_after = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in admission_registry_paths
+        }
+        route_registry_after = {
+            Path(path): _path_fingerprint(Path(path))
+            for path in inventory.get("registries", ())
+        }
+        inputs["files"] = indexed_files
+        inputs["admission_registries"] = {
+            Path(path): indexed_files.get(Path(path), admission_before[Path(path)])
+            for path in admission_registry_paths
+        }
+        inputs["route_registries"] = {
+            Path(path): indexed_route_registries.get(Path(path), value)
+            for path, value in route_registry_before.items()
+        }
+        if (admission_before != admission_after
+                or route_registry_before != route_registry_after
+                or any(inputs["route_registries"].get(path) != value
+                       for path, value in route_registry_after.items())
+                or any(inputs["admission_registries"].get(path) != value
+                       for path, value in admission_after.items())):
+            inputs["unstable"] = True
+        return {
+            "inventory": inventory,
+            "inputs": inputs,
+            "route_snapshot": route_snapshot,
+            "stable_snapshot": stable_snapshot,
+            "registry_snapshot": registry_snapshot,
+            "unstable": bool(inventory.get("unstable") or inputs.get("unstable")
+                              or _discovery_inputs_changed(inputs)),
+        }
+
+    evidence = discover()
+    if evidence.get("error"):
+        for candidate in candidates:
+            if candidate not in keep:
+                print(_release_keep_message(candidate, evidence["error"]), file=sys.stderr)
+        return
+
+    # The initial observation plus at most three refreshes preserves the
+    # existing bound. Exhaustion is uncertainty, never deletion authority.
+    refreshes = 0
+    while evidence["unstable"] and refreshes < 3:
+        refreshes += 1
+        evidence = discover()
+        if evidence.get("error"):
+            break
+    if evidence.get("error") or evidence.get("unstable"):
+        why = evidence.get("error") or "route-discovery-unstable"
+        for candidate in candidates:
+            if candidate not in keep:
+                print(_release_keep_message(candidate, why), file=sys.stderr)
+        return
 
     retained = 0
     cache_failures: set[str] = set()
-    try:
-        with _dispatch_writer_boundary(None, environ, jobs_paths=writer_paths) as boundary:
-            stable_snapshot = _stable_registry_snapshot(environ)
+    pass_uncertain = False
 
-            # A changed global input warrants one refreshed discovery. New
-            # route-bound registry paths discovered there are admitted to the
-            # same boundary before any candidate is judged.
-            for _attempt in range(3):
-                if _discovery_inputs_changed(discovery_inputs):
-                    route_inventory = {}
-                    route_snapshot = _open_route_launch_homes(
-                        environ, inventory=route_inventory,
-                        watch_paths=legacy_registry_paths,
-                    )
-                    discovery_inputs = route_inventory.get("fingerprints") or \
-                        _snapshot_discovery_inputs(route_inventory, legacy_registry_paths)
-                locked = {_registry_lock_identity(Path(f"{jobs}.lock"))
-                          for jobs in writer_paths}
-                known_registry_paths = (
-                    set(legacy_registry_paths)
-                    | set(route_inventory.get("registries", ()))
-                )
-                for jobs in known_registry_paths:
-                    lock_path = Path(f"{jobs}.lock")
-                    identity = _registry_lock_identity(lock_path)
-                    if (identity not in locked and jobs.parent.is_dir()
-                            and not jobs.parent.is_symlink()):
-                        if lock_path.is_symlink():
-                            route_snapshot = ([], f"route-discovery-unreliable:{lock_path}")
-                            continue
-                        boundary.enter_context(_registry_lock(jobs))
-                        writer_paths.append(jobs)
-                        locked.add(identity)
-                if not _discovery_inputs_changed(discovery_inputs):
-                    break
-
-            registry_snapshot = _release_registry_snapshot(legacy_registry_paths)
-            for candidate in candidates:
-                if candidate in keep or retained < 2:
-                    retained += 1
+    def note_removed(candidate: Path) -> None:
+        # The source's own legacy registry disappears with it. Incorporate
+        # that expected monotonic change so a quiet later candidate does not
+        # trigger another global route scan. A route that actually depended
+        # on a registry inside this source does require fresh route evidence.
+        inputs = evidence["inputs"]
+        candidate_real = Path(os.path.abspath(candidate))
+        route_registry_removed = False
+        for field in ("files", "directories", "route_registries", "admission_registries"):
+            mapping = inputs.get(field, {})
+            for path in list(mapping):
+                try:
+                    Path(os.path.abspath(path)).relative_to(candidate_real)
+                except ValueError:
                     continue
-                removed, why = _prune_release_under_writer_boundary(
-                    candidate,
-                    force_prune_unproven=force_prune_unproven,
-                    writer_boundary_held=True,
-                    stable_snapshot=stable_snapshot,
-                    route_snapshot=route_snapshot,
-                    registry_snapshot=registry_snapshot,
-                )
-                if not removed:
-                    if why.startswith("live-process:"):
-                        print(
-                            f"harness release: {candidate} is still in use by a live process "
-                            f"({why}); keeping it instead of deleting it",
-                            file=sys.stderr,
-                        )
-                    elif why.startswith("release-removal-failed:"):
-                        print(
-                            f"harness release: could not remove {candidate}: {why.partition(':')[2]}; "
-                            "keeping its pycache",
-                            file=sys.stderr,
-                        )
-                    elif why in {"dispatch-state-carry-forward-incomplete", "release-remains-after-prune"}:
-                        print(
-                            f"harness release: {candidate} {why}; keeping it and its pycache",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(_release_keep_message(candidate, why), file=sys.stderr)
-                    continue
-                if not _remove_release_pycache(candidate):
-                    cache_failures.add(candidate.name)
-                    print(
-                        f"harness release: could not remove pycache derived from {candidate}; "
-                        "it will be retried on a later update",
-                        file=sys.stderr,
-                    )
+                mapping[path] = None
+                if field == "route_registries":
+                    route_registry_removed = True
+        evidence["registry_snapshot"] = [
+            row for row in evidence["registry_snapshot"]
+            if not Path(os.path.abspath(row["registry"])).is_relative_to(candidate_real)
+        ]
+        if route_registry_removed:
+            evidence["refresh_required"] = True
 
-            _cleanup_orphan_release_pycache(
-                releases, keep, stable_snapshot, route_snapshot, cache_failures,
-                registry_snapshot,
+    def report_kept(candidate: Path, why: str) -> None:
+        if why.startswith("live-process:"):
+            print(
+                f"harness release: {candidate} is still in use by a live process "
+                f"({why}); keeping it instead of deleting it",
+                file=sys.stderr,
             )
-    except OSError as exc:
-        for candidate in candidates:
-            if candidate not in keep and candidate.exists():
-                print(_release_keep_message(
-                    candidate, f"dispatch-writer-boundary-unavailable:{exc}"
-                ), file=sys.stderr)
+        elif why.startswith("release-removal-failed:"):
+            print(
+                f"harness release: could not remove {candidate}: {why.partition(':')[2]}; "
+                "keeping its pycache",
+                file=sys.stderr,
+            )
+        elif why in {"dispatch-state-carry-forward-incomplete", "release-remains-after-prune"}:
+            print(
+                f"harness release: {candidate} {why}; keeping it and its pycache",
+                file=sys.stderr,
+            )
+        else:
+            print(_release_keep_message(candidate, why), file=sys.stderr)
+
+    for candidate in candidates:
+        if candidate in keep or retained < 2:
+            retained += 1
+            continue
+
+        removed = False
+        why = "route-discovery-inputs-changed"
+        refreshed_for_candidate = 0
+        while refreshed_for_candidate <= 3:
+            if evidence.get("error"):
+                why = evidence["error"]
+                pass_uncertain = True
+                break
+            if evidence.get("refresh_required") or _discovery_generation_changed(
+                evidence["inputs"]
+            ):
+                if refreshed_for_candidate == 3:
+                    pass_uncertain = True
+                    why = "route-discovery-refresh-exhausted"
+                    break
+                refreshed_for_candidate += 1
+                evidence = discover()
+                if evidence.get("error") or evidence.get("unstable"):
+                    why = evidence.get("error") or "route-discovery-unstable"
+                    continue
+                evidence.pop("refresh_required", None)
+                continue
+
+            try:
+                writer_paths = _dispatch_cleanup_boundary_paths(
+                    environ, evidence["inventory"].get("registries", ()),
+                    legacy_registry_paths,
+                )
+                with _dispatch_writer_boundary(None, environ, jobs_paths=writer_paths):
+                    if _discovery_generation_changed(evidence["inputs"]):
+                        why = "route-discovery-inputs-changed"
+                    else:
+                        removed, why = _prune_release_under_writer_boundary(
+                            candidate,
+                            force_prune_unproven=force_prune_unproven,
+                            writer_boundary_held=True,
+                            stable_snapshot=evidence["stable_snapshot"],
+                            route_snapshot=evidence["route_snapshot"],
+                            registry_snapshot=evidence["registry_snapshot"],
+                            discovery_inputs=evidence["inputs"],
+                        )
+            except (OSError, DistributionError) as exc:
+                why = f"dispatch-writer-boundary-unavailable:{exc}"
+                pass_uncertain = True
+
+            if why == "route-discovery-inputs-changed":
+                if refreshed_for_candidate == 3:
+                    pass_uncertain = True
+                    why = "route-discovery-refresh-exhausted"
+                    break
+                refreshed_for_candidate += 1
+                evidence = discover()
+                if evidence.get("error") or evidence.get("unstable"):
+                    why = evidence.get("error") or "route-discovery-unstable"
+                    if evidence.get("error"):
+                        pass_uncertain = True
+                    continue
+                evidence.pop("refresh_required", None)
+                continue
+            break
+
+        if removed:
+            note_removed(candidate)
+            # A derived cache is outside the source admission epoch. The
+            # release was removed while its full state boundary was held.
+            if not _remove_release_pycache(candidate):
+                cache_failures.add(candidate.name)
+                print(
+                    f"harness release: could not remove pycache derived from {candidate}; "
+                    "it will be retried on a later update",
+                    file=sys.stderr,
+                )
+        else:
+            report_kept(candidate, why)
+            if pass_uncertain:
+                break
+
+    if pass_uncertain:
+        return
+
+    # A carry-forward may have changed a registry while the source was held.
+    # Refresh outside the epoch before judging orphan caches; if the bounded
+    # refresh cannot establish a current view, leave the remaining caches.
+    refreshed_for_orphans = 0
+    while evidence.get("refresh_required") or _discovery_generation_changed(evidence["inputs"]):
+        if refreshed_for_orphans == 3:
+            return
+        refreshed_for_orphans += 1
+        evidence = discover()
+        if evidence.get("error") or evidence.get("unstable"):
+            return
+        evidence.pop("refresh_required", None)
+
+    _cleanup_orphan_release_pycache(
+        releases, keep, evidence["stable_snapshot"], evidence["route_snapshot"],
+        cache_failures, evidence["registry_snapshot"], evidence["inputs"],
+    )
 
 
 # destructive-ok: reason=rollback or discard one managed release staging transaction; boundary=version target staging root and state leaf selected by this invocation
