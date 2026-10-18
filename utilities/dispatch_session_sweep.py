@@ -475,7 +475,8 @@ def main(argv: list[str] | None = None) -> int:
         batches = []
         for root in _state_roots():
             if args.action == "activate":
-                records = activate(root, args.recipient_kind, args.session)
+                records = activate(root, args.recipient_kind, args.session,
+                                   request_recovery=False)
             else:
                 records, _entries = sweep_deliver(root, args.recipient_kind, args.session)
             if records:
@@ -485,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
             "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
                          "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner")}
                         for root, records in batches for record in records],
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), flush=True)
+        if args.action == "activate":
+            request_obligation_reconciliation(lifecycle_root=Path(__file__).resolve().parents[1])
         return 0
     try:
         handed = json.load(sys.stdin).get("records") or []

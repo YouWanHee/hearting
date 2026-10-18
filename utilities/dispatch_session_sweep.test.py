@@ -65,6 +65,7 @@ def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
         "from pathlib import Path\n"
         "import peer_obligations\n"
         "_real_popen = subprocess.Popen\n"
+        "_real_run = subprocess.run\n"
         "def _append(path, value):\n"
         "    with open(path, 'a', encoding='utf-8') as handle:\n"
         "        handle.write(json.dumps(value) + '\\n')\n"
@@ -74,6 +75,12 @@ def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
         "        _append(os.environ['R1_REQUEST_LOG'], {'pid': os.getpid(), 'argv': argv, 'cwd': kwargs.get('cwd'), 'start_new_session': kwargs.get('start_new_session')})\n"
         "    return _real_popen(args, *pos, **kwargs)\n"
         "subprocess.Popen = _tracked_popen\n"
+        "def _tracked_run(args, *pos, **kwargs):\n"
+        "    argv = [str(item) for item in args] if not isinstance(args, str) else [args]\n"
+        "    if os.environ.get('R1_CONTEXT_OUTPUT') and any(Path(item).name == 'local-evidence-inject.sh' for item in argv):\n"
+        "        return subprocess.CompletedProcess(args, 0, os.environ['R1_CONTEXT_OUTPUT'], '')\n"
+        "    return _real_run(args, *pos, **kwargs)\n"
+        "subprocess.run = _tracked_run\n"
         "def _slow_ensure(*args, **kwargs):\n"
         "    time.sleep(float(os.environ['R1_RECOVERY_DELAY']))\n"
         "    try:\n"
@@ -690,11 +697,13 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
                 mock.patch.object(dispatch_contract, "dispatch_state_roots", return_value=[self.root]), \
                 mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
                 mock.patch.object(peer_obligations, "retain_registered_completion") as retain, \
+                mock.patch.object(bridge, "request_lifecycle_recovery") as request, \
                 mock.patch.dict(sys.modules, {"herdr_session_projection": SimpleNamespace(project=lambda *a, **k: None)}), \
                 mock.patch.object(bridge.sys, "stdout", out):
             self.assertEqual(bridge.main(), 0)
         self.assertIn("att-0000000000000000000000000000bbbb", out.getvalue())
         retain.assert_called_once()
+        request.assert_called_once_with()
         self.assertEqual(PD.read(self.root, "sess-owner", before["delivery_id"]), before)
 
     # -- A-21: generation-unproven claim refused, state unchanged. ---------
@@ -919,7 +928,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         if restored_selector:
             fixture = self.root.parent / "restored-plugin/adapters/opencode/plugins/hearting-guards.js"
-            fixture.parent.mkdir(parents=True)
+            fixture.parent.mkdir(parents=True, exist_ok=True)
             source = plugin.read_text().replace("let paneNativeOrigin //", 'let paneNativeOrigin = '
                 + json.dumps({"pid": 123, "start": "456", "sid": self.SID,
                               "directory": str(self.root), "state": "pending"}) + ' //')
@@ -1018,6 +1027,53 @@ await new Promise(r => setTimeout(r, 1500));
         body_rows = _read_jsonl_after(self, bodies)
         self.assertEqual(body_rows[0]["state"], "acked")
         self.assertEqual(body_rows[0]["snapshot"], "activation-complete\n")
+
+    def test_actual_open_code_empty_activation_requests_recovery_without_roots_or_jobs(self):
+        for case, root_exists, seed_record in (
+            ("missing-root", False, False),
+            ("missing-jobs", True, True),
+        ):
+            with self.subTest(case=case):
+                case_base = self.root.parent / f"opencode-{case}"
+                dispatch_root = case_base / "dispatch"
+                if root_exists:
+                    dispatch_root.mkdir(parents=True)
+                delivery_id = "delivery-" + "a" * 32
+                if seed_record:
+                    previous_root = self.root
+                    self.root = dispatch_root
+                    try:
+                        self.seed_turn()
+                    finally:
+                        self.root = previous_root
+                    (dispatch_root / "jobs.log").unlink()
+
+                record_path = PD.record_path(dispatch_root, self.SID, delivery_id)
+                snapshot = case_base / "activation-complete.txt"
+                probe_env, requests, bodies = _slow_recovery_probe(case_base, record_path, snapshot)
+                extra_env = {
+                    **probe_env,
+                    "AGENT_HOME": str(ROOT),
+                    "AGENT_DISPATCH_JOBS": str(dispatch_root / "jobs.log"),
+                    "HARNESS_STATE_ROOT": str(case_base / "stable-state"),
+                    "AGENT_PEER_LEDGER_ROOT": str(case_base / "peer-ledger"),
+                }
+                result = self.run_plugin(
+                    'writeFileSync(process.env.R1_SNAPSHOT_PATH, "activation-complete\\n");',
+                    restored_selector=True, extra_env=extra_env,
+                )
+                self.assertEqual(result["prompts"], [])
+                carrier = [item["extra"] for item in result["logs"]
+                           if item.get("service") == "hearting-completion-carrier"]
+                self.assertFalse(any(item["stage"] in {"claim", "settle"} for item in carrier))
+                request_rows = _read_jsonl_after(self, requests)
+                self.assertEqual(len(request_rows), 1, request_rows)
+                self.assertTrue(request_rows[0]["start_new_session"])
+                self.assertEqual(Path(request_rows[0]["argv"][1]), ROOT / "utilities/peer-steward.py")
+                body_rows = _read_jsonl_after(self, bodies)
+                self.assertEqual(body_rows[0]["snapshot"], "activation-complete\n")
+                if seed_record:
+                    self.assertEqual(PD.read(dispatch_root, self.SID, delivery_id)["state"], "pending")
 
     def test_a_turn_opencode_did_not_take_is_released_for_the_next_pass(self):
         self.seed_turn()
@@ -1225,6 +1281,27 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
         request.assert_not_called()
         peer_obligations.ensure_normal_runner.assert_not_called()
 
+    def test_cli_activation_requests_once_after_flushed_empty_output_without_roots(self):
+        class FlushOutput(io.StringIO):
+            flushed = False
+
+            def flush(self):
+                self.flushed = True
+                super().flush()
+
+        output = FlushOutput()
+        observed = []
+        with mock.patch.object(SWEEP, "_state_roots", return_value=[]), \
+             mock.patch.object(SWEEP, "request_obligation_reconciliation",
+                               side_effect=lambda *, lifecycle_root=None:
+                               observed.append((output.flushed, lifecycle_root))), \
+             mock.patch.object(sys, "stdout", output):
+            self.assertEqual(SWEEP.main(["activate", "--recipient-kind", "opencode-turn",
+                                         "--session", "sid-empty"]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload, {"text": "", "records": []})
+        self.assertEqual(observed, [(True, ROOT)])
+
     def test_canonical_activation_continues_past_unreadable_registry(self):
         self.root.mkdir(parents=True, exist_ok=True)
         jobs = self.root / "jobs.log"
@@ -1278,6 +1355,28 @@ class ActivationDispatchReconcileTest(IsolatedRootMixin, unittest.TestCase):
 
 
 class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
+    def test_codex_sessionstart_keeps_recovery_owner_when_root_resolution_raises(self):
+        bridge = _load("codex_sessionstart_root_error_test",
+                       ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py")
+        import dispatch_contract
+
+        output = io.StringIO()
+        with mock.patch.object(bridge, "load_payload", return_value={"session_id": "codex-root-error"}), \
+             mock.patch.object(bridge, "is_worker_session", return_value=False), \
+             mock.patch.object(bridge, "card_context", return_value="fixture context"), \
+             mock.patch.object(bridge, "local_evidence_context", return_value=""), \
+             mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(dispatch_contract, "dispatch_state_roots",
+                               side_effect=RuntimeError("state roots unavailable")), \
+             mock.patch.object(bridge, "request_lifecycle_recovery") as request, \
+             mock.patch.dict(sys.modules, {
+                 "herdr_session_projection": SimpleNamespace(project=lambda *args, **kwargs: None),
+             }), contextlib.redirect_stdout(output):
+            self.assertEqual(bridge.main(), 0)
+        request.assert_called_once_with()
+        payload = json.loads(output.getvalue())
+        self.assertIn("fixture context", payload["hookSpecificOutput"]["additionalContext"])
+
     def test_codex_worker_prompt_and_sessionstart_request_recovery_without_main_context(self):
         prompt = _load("codex_userprompt_recovery_test",
                        ROOT / "adapters/codex/hooks/userprompt-lifecycle.py")
@@ -1349,6 +1448,66 @@ class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
         body_rows = _read_jsonl_after(self, bodies)
         self.assertEqual(body_rows[0]["state"], "pending")
         self.assertEqual(body_rows[0]["snapshot"], result.stdout)
+
+    def test_actual_codex_sessionstart_requests_once_after_context_without_root_jobs_or_sid(self):
+        for case, sid, root_exists, seed_record in (
+            ("missing-root", "codex-no-root", False, False),
+            ("missing-jobs", "codex-no-jobs", True, True),
+            ("missing-sid", "", False, False),
+        ):
+            with self.subTest(case=case):
+                case_base = self.root.parent / f"codex-{case}"
+                dispatch_root = case_base / "dispatch"
+                if root_exists:
+                    dispatch_root.mkdir(parents=True)
+                delivery_id = "delivery-" + "b" * 32
+                if seed_record:
+                    previous_root = self.root
+                    self.root = dispatch_root
+                    try:
+                        SweepTest._seed(self, session_id=sid, recipient_kind="codex-native-queue",
+                                        delivery_id=delivery_id)
+                    finally:
+                        self.root = previous_root
+                    (dispatch_root / "jobs.log").unlink()
+
+                record_path = PD.record_path(dispatch_root, sid or "missing-sid", delivery_id)
+                snapshot = case_base / "sessionstart-output.json"
+                probe_env, requests, bodies = _slow_recovery_probe(case_base, record_path, snapshot)
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("AGENT_", "CLAUDE_", "CODEX_", "OPENCODE_", "HERDR_", "FLEET_"))}
+                env.update(self._env_patch)
+                env.update(probe_env)
+                env.update({
+                    "AGENT_HOME": str(ROOT),
+                    "AGENT_DISPATCH_JOBS": str(dispatch_root / "jobs.log"),
+                    "HARNESS_STATE_ROOT": str(case_base / "stable-state"),
+                    "AGENT_PEER_LEDGER_ROOT": str(case_base / "peer-ledger"),
+                    "R1_CONTEXT_OUTPUT": "fixture SessionStart context",
+                })
+                payload = {"source": "startup", "cwd": str(self.root.parent)}
+                if sid:
+                    payload["session_id"] = sid
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py")],
+                    input=json.dumps(payload), capture_output=True, text=True,
+                    env=env, cwd=str(ROOT), timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                emitted = json.loads(result.stdout)
+                self.assertEqual(emitted["hookSpecificOutput"]["hookEventName"], "SessionStart")
+                context = emitted["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("fixture SessionStart context", context)
+                snapshot.write_text(result.stdout, encoding="utf-8")
+                request_rows = _read_jsonl_after(self, requests)
+                self.assertEqual(len(request_rows), 1, request_rows)
+                self.assertTrue(request_rows[0]["start_new_session"])
+                self.assertEqual(request_rows[0]["argv"][-1], str(ROOT.resolve()))
+                body_rows = _read_jsonl_after(self, bodies)
+                self.assertEqual(body_rows[0]["snapshot"], result.stdout)
+                if seed_record:
+                    self.assertIn("att-0000000000000000000000000000bbbb", context)
+                    self.assertEqual(PD.read(dispatch_root, sid, delivery_id)["state"], "pending")
 
     def test_opencode_worker_init_and_session_created_use_shared_recovery_entry(self):
         capture = self.root.parent / "opencode-recovery-calls.tsv"
