@@ -1020,6 +1020,95 @@ class Races(Fixture):
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
 
+    def _assert_late_discovered_record_rewrite_keeps_home(self, attempt_field):
+        attempt = "att-late-discovered-" + attempt_field
+        home = self.add(attempt)
+        self.sweep(0)
+        group = self.root / "pending-delivery" / ("f" * 64)
+        record = group / ("delivery-" + "9" * 32 + ".json")
+        initial = {}
+        late_reads = []
+        prepared = []
+        inserted = []
+        admitted, written = threading.Event(), threading.Event()
+        errors = []
+
+        def discover_after_initial_index(ctx, candidate, deadline):
+            self.assertNotIn(record, ctx.discovery_stamps)
+            self.assertNotIn(group, ctx.group_stamps)
+            self.assertNotIn(group.name, ctx.delivery_groups)
+            self.delivery_record(record, "att-late-other", "att-late-parent", state="acked")
+            inserted.append(True)
+            result = real_late(ctx, candidate, deadline)
+            initial["record"] = json.loads(record.read_text(encoding="utf-8"))
+            return result
+
+        real_late = R._late_delivery_change
+        real_relation = R._delivery_record_relation
+        real_prepare = R._prepare_candidate_delivery_baseline
+
+        def observed_relation(path, related):
+            result = real_relation(path, related)
+            if Path(path) == record:
+                late_reads.append(result)
+            return result
+
+        def observed_prepare(ctx, candidate, deadline):
+            baseline = real_prepare(ctx, candidate, deadline)
+            if baseline is not None:
+                prepared.append(baseline)
+            return baseline
+
+        def writer():
+            if not admitted.wait(5):
+                errors.append("second registry admission barrier timed out")
+                written.set()
+                return
+            try:
+                value = dict(initial["record"], state="pending")
+                if attempt_field == "parent_attempt_id":
+                    value[attempt_field] = attempt
+                else:
+                    value[attempt_field] = [attempt]
+                record.write_text(json.dumps(value), encoding="utf-8")
+            except Exception as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                written.set()
+
+        real_admission = R._registry_lock_until
+        admission_count = []
+
+        @contextlib.contextmanager
+        def final_admission(jobs, deadline):
+            admission_count.append(None)
+            with real_admission(jobs, deadline) as acquired:
+                if len(admission_count) == 2 and acquired is not False:
+                    if not inserted or "unrelated" not in late_reads or not prepared:
+                        raise AssertionError("late discovery or baseline preparation did not finish before admission")
+                    admitted.set()
+                    if not written.wait(5):
+                        raise AssertionError("late-discovered record writer missed final admission")
+                yield acquired
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            with mock.patch.object(R, "_late_delivery_change", discover_after_initial_index), \
+                    mock.patch.object(R, "_delivery_record_relation", observed_relation), \
+                    mock.patch.object(R, "_prepare_candidate_delivery_baseline", observed_prepare), \
+                    mock.patch.object(R, "_registry_lock_until", final_admission):
+                result = self.sweep(8)
+        finally:
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(admission_count), 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(late_reads[0], "unrelated")
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
+        self.assertTrue(home.is_dir())
+
     def two(self):
         return self.add("att-x1"), self.add("att-x2")
 
@@ -1566,6 +1655,12 @@ class Races(Fixture):
         self._assert_final_admission_write_keeps_home(home, lambda: record.write_text(json.dumps({
             **value, "attempt_ids": ["att-final-admission-attempt-rewrite"], "state": "pending",
         }), encoding="utf-8"))
+
+    def test_late_discovered_group_parent_reference_rewrite_keeps_home(self):
+        self._assert_late_discovered_record_rewrite_keeps_home("parent_attempt_id")
+
+    def test_late_discovered_group_attempt_reference_rewrite_keeps_home(self):
+        self._assert_late_discovered_record_rewrite_keeps_home("attempt_ids")
 
     def test_resolver_upgrade_preserves_the_first_identity(self):
         for through_child in (False, True):

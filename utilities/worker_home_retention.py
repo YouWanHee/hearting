@@ -1082,7 +1082,17 @@ def _late_delivery_change(ctx: _Context, attempt: str, deadline: float) -> str |
                     return "unknown"
                 if not entry.name.endswith(".json"):
                     continue
-                relation = _delivery_record_relation(Path(entry.path), related)
+                record_path = Path(entry.path)
+                record_before = _stamp(record_path)
+                relation = _delivery_record_relation(record_path, related)
+                record_after = _stamp(record_path)
+                if (time.monotonic() >= deadline or record_before is None
+                        or record_before != record_after):
+                    return "unknown"
+                # Keep the generation for the payload observation above. A
+                # later in-place rewrite must be visible even though the
+                # recipient directory's membership stamp stays unchanged.
+                ctx.discovery_stamps[record_path] = record_before
                 if relation == "related":
                     return "changed"
                 if relation == "unknown":
