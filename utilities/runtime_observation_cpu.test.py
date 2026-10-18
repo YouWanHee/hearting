@@ -724,6 +724,11 @@ try:
     result = {"registered": registered, "state": "returned"}
 except TimeoutError:
     result = {"registered": False, "state": "lock-timeout"}
+except AssertionError as exc:
+    # Older observations may turn the alarm's OSError into a false liveness
+    # result. Keep the exact lock evidence instead of losing it to a JSON
+    # decode error in the fixture driver. The after gate still rejects this.
+    result = {"registered": False, "state": "observation-failed", "error": str(exc)}
 finally:
     signal.alarm(0)
 end = time.monotonic()
