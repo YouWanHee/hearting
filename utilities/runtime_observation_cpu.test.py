@@ -64,13 +64,16 @@ target = argv[2] if len(argv) > 2 else "fixture-target"
 log = os.environ["FIXTURE_HERDR_LOG"]
 with open(log, "a", encoding="utf-8") as out:
     out.write(f"{os.getpid()} {verb} {target}\n")
-if verb == "wait":
-    with open(os.environ["FIXTURE_HERDR_FIFO"], "rb") as source:
-        source.read(1)
 payload = {"id": "fixture-herdr", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fixture"},
     "agent_status": "idle", "name": target, "pane_id": "w1:p9"
 }, "type": "agent_info"}}
+if verb == "process-info":
+    worker = int(os.environ["FIXTURE_WATCH_FOREGROUND_PID"])
+    payload["result"] = {"process_info": {
+        "pane_id": "w1:p9", "shell_pid": int(os.environ["FIXTURE_WATCH_SHELL_PID"]),
+        "foreground_process_group_id": worker,
+        "foreground_processes": [{"pid": worker, "argv": [sys.executable]}]}}
 print(json.dumps(payload))
 '''
 
@@ -838,6 +841,7 @@ def _row_text(index: int, jobs_path: Path, project_root: Path,
         f"attempt_id={attempt_id},parent_attempt_id={parent_id},harness=codex,",
     ]
     if index < OBSERVER_COUNT:
+        fields[-1] += "parent_sid=sid-fixture,parent_harness=claude,"
         fields[-1] += ",".join(f"{key}={value}" for key, value in worker_identities[index].items()) + ","
     fields[-1] += "note="
     prefix = "\t".join(fields)
@@ -1103,6 +1107,8 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     if not identity.get("pid_start"):
                         raise AssertionError("fixture worker has no exact PID/start identity")
                     worker_identities.append(identity)
+                os.environ["FIXTURE_WATCH_SHELL_PID"] = str(os.getpid())
+                os.environ["FIXTURE_WATCH_FOREGROUND_PID"] = str(worker_processes[0].pid)
                 _write_jobs(jobs_path, source, worker_identities)
                 jobs_size = jobs_path.stat().st_size
                 if jobs_size < JOBS_BYTES:
@@ -1285,6 +1291,21 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                         })
                     raise AssertionError(f"{exc}; watcher diagnostics={diagnostics}") from exc
                 watcher_pids = {process.pid for _watch_id, process in watch_processes}
+                def pending_watch_readiness():
+                    observations = []
+                    for watch_id, process in watch_processes:
+                        path = steward._watch_paths(watch_id, watch_root).observation
+                        if process.poll() is not None or not path.is_file():
+                            return None
+                        observation = json.loads(path.read_text())
+                        if (observation.get("state") != "pending"
+                                or observation.get("reason") != "bound-registered-work-pending"
+                                or (observation.get("native_wait") or {}).get("agent_state") != "idle"):
+                            return None
+                        observations.append(observation)
+                    return observations
+                watch_readiness = _wait_for(pending_watch_readiness, 60,
+                    "all watchers pending on actual registered work after native idle")
                 runner_pids = {runner_process.pid}
                 owner_pids = {int(owner["pid"]) for owner in owners}
                 worker_pids = {process.pid for process in worker_processes}
@@ -1320,9 +1341,21 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     after = observer_snapshot()
                     if not BASELINE_MODE and after != before:
                         raise AssertionError("an ensure pass duplicated or replaced a healthy observer")
-                observation_server.publish_unrelated()
-                burst = _sample_window(BURST_SECONDS, seed_pids,
-                                       seed_provider=current_seed_pids)
+                stop_events = threading.Event()
+                sent_events = []
+                def publish_events():
+                    while not stop_events.is_set():
+                        observation_server.publish_unrelated()
+                        sent_events.append(WATCHER_COUNT)
+                        stop_events.wait(1)
+                publisher = threading.Thread(target=publish_events, daemon=True)
+                publisher.start()
+                try:
+                    burst = _sample_window(BURST_SECONDS, seed_pids,
+                                           seed_provider=current_seed_pids)
+                finally:
+                    stop_events.set()
+                    publisher.join(timeout=2)
                 after_burst = observer_snapshot()
                 if not BASELINE_MODE and after_burst != stable_owners:
                     raise AssertionError("unrelated event changed managed observer ownership")
@@ -1487,6 +1520,10 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "completed_retire_retry_seconds": retire_retry_seconds,
                     "successor_lock_wait": successor_wait_window,
                     "observers": OBSERVER_COUNT, "watchers": WATCHER_COUNT,
+                    "watch_readiness_before_windows": [
+                        {"state": item["state"], "reason": item["reason"],
+                         "native_state": item["native_wait"]["agent_state"]}
+                        for item in watch_readiness],
                     "managed_runner": RUNNER_COUNT,
                     "observer_pid_start": [
                         {"pid": int(item["pid"]), "pid_start": item["pid_start"],
@@ -1518,7 +1555,7 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     "unrelated_event": burst,
                     "profile_summaries": profile_summaries,
                     "herdr_requests": dict(observation_server.requests),
-                    "unrelated_events_sent": WATCHER_COUNT,
+                    "unrelated_events_sent": sum(sent_events),
                     "historical_index_projection_metrics_delta": historical_metrics,
                     "observer_replacement_retry": replacement_result,
                     "limitations": [
