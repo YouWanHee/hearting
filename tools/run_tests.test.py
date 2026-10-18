@@ -7,6 +7,8 @@ tests exercise the actual CLI contract, not internals.
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 import signal
 import re
@@ -1466,6 +1468,162 @@ class FingerprintFixture(unittest.TestCase):
         self.assertEqual(baseline.read_text().count("fails.test.py"), 0)
 
 
+class UserSiteYamlBridge(unittest.TestCase):
+    """Only an enabled user-site PyYAML package crosses suite isolation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.mod = load_runner_module()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_yaml_is_visible_without_parent_siblings_or_startup_hooks(self):
+        parent_site = self.root / "parent-site"
+        package = parent_site / "yaml"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "SOURCE = 'parent-user-yaml'\n", encoding="utf-8"
+        )
+        (parent_site / "_yaml.py").write_text("SOURCE = 'optional-extension'\n", encoding="utf-8")
+        (parent_site / "sibling_only.py").write_text("VALUE = 1\n", encoding="utf-8")
+        pth_marker = self.root / "pth-executed"
+        (parent_site / "parent.pth").write_text(
+            f"import pathlib; pathlib.Path({str(pth_marker)!r}).write_text('ran')\n",
+            encoding="utf-8",
+        )
+        (parent_site / "sitecustomize.py").write_text(
+            f"from pathlib import Path; Path({str(self.root / 'sitecustomize-ran')!r}).touch()\n",
+            encoding="utf-8",
+        )
+        (parent_site / "usercustomize.py").write_text(
+            f"from pathlib import Path; Path({str(self.root / 'usercustomize-ran')!r}).touch()\n",
+            encoding="utf-8",
+        )
+
+        suite_tmp = self.root / "suite"
+        with mock.patch.object(self.mod.site, "ENABLE_USER_SITE", True), \
+             mock.patch.object(self.mod.site, "getusersitepackages", return_value=str(parent_site)):
+            env = self.mod.build_isolated_env(suite_tmp)
+
+        private_site = self.mod._child_user_site(suite_tmp / "home")
+        self.assertTrue((private_site / "yaml").is_symlink())
+        self.assertFalse((private_site / "sibling_only.py").exists())
+        self.assertFalse((private_site / "sitecustomize.py").exists())
+        self.assertFalse(any(private_site.glob("parent*.pth")))
+        self.assertTrue((private_site / "_yaml.py").is_symlink())
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent("""
+                import json
+                import yaml
+                try:
+                    import sibling_only
+                    sibling_visible = True
+                except ImportError:
+                    sibling_visible = False
+                print(json.dumps({"source": yaml.SOURCE, "sibling": sibling_visible,
+                                  "yaml_file": yaml.__file__}))
+            """)],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        imported = json.loads(result.stdout)
+        self.assertEqual(imported["source"], "parent-user-yaml")
+        self.assertFalse(imported["sibling"])
+        self.assertTrue(imported["yaml_file"].startswith(str(private_site / "yaml")))
+        self.assertFalse(pth_marker.exists())
+        self.assertFalse((self.root / "sitecustomize-ran").exists())
+        self.assertFalse((self.root / "usercustomize-ran").exists())
+
+    def test_disabled_or_missing_user_yaml_is_not_linked(self):
+        parent_site = self.root / "parent-site"
+        package = parent_site / "yaml"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("SOURCE = 'user'\n", encoding="utf-8")
+        with mock.patch.object(self.mod.site, "ENABLE_USER_SITE", False), \
+             mock.patch.object(self.mod.site, "getusersitepackages", return_value=str(parent_site)):
+            disabled = self.mod.build_isolated_env(self.root / "disabled")
+        disabled_site = self.mod._child_user_site(Path(disabled["HOME"]))
+        self.assertFalse((disabled_site / "yaml").exists())
+
+        missing_site = self.root / "missing-site"
+        missing_site.mkdir()
+        with mock.patch.object(self.mod.site, "ENABLE_USER_SITE", True), \
+             mock.patch.object(self.mod.site, "getusersitepackages", return_value=str(missing_site)):
+            missing = self.mod.build_isolated_env(self.root / "missing")
+        missing_private_site = self.mod._child_user_site(Path(missing["HOME"]))
+        self.assertFalse((missing_private_site / "yaml").exists())
+
+
+class PerSuiteProgressEvents(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.mod = load_runner_module()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pass_fail_and_timeout_events_include_suite_profile_result_and_duration(self):
+        cases = (
+            ("pass.test.py", "print('passed')\n", 5, "pass", "suite_end"),
+            ("fail.test.py", "raise SystemExit(3)\n", 5, "fail", "suite_end"),
+            ("timeout.test.py", "import time\ntime.sleep(30)\n", 1, "timeout", "suite_timeout"),
+        )
+        for relpath, body, timeout, expected, final_event in cases:
+            with self.subTest(suite=relpath):
+                suite = write_suite(self.root, relpath, body)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    results = self.mod.run_profile(
+                        [suite], self.root, "isolated", 1, timeout, None
+                    )
+                events = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual([event["event"] for event in events], [
+                    "suite_prepare_start", "suite_prepare_end", "suite_start", final_event,
+                ])
+                self.assertTrue(all(event["suite"] == relpath for event in events))
+                self.assertTrue(all(event["profile"] == "isolated" for event in events))
+                self.assertEqual(events[1]["result"], "ready")
+                self.assertEqual(events[-1]["result"], expected)
+                self.assertIsInstance(events[-1]["duration_s"], (int, float))
+                self.assertEqual(results[0].passed, expected == "pass")
+
+    def test_start_line_is_visible_while_suite_subprocess_is_still_running(self):
+        suite = write_suite(self.root, "slow.test.py", "import time\ntime.sleep(3)\n")
+        driver = textwrap.dedent("""
+            import runpy
+            import sys
+            from pathlib import Path
+            runner = runpy.run_path(sys.argv[1])
+            runner["run_profile"]([Path(sys.argv[2])], Path(sys.argv[3]),
+                                  "isolated", 1, 10, None)
+        """)
+        process = subprocess.Popen(
+            [sys.executable, "-c", driver, str(RUNNER), str(suite), str(self.root)],
+            cwd=str(ROOT), env=CLEAN_ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        observed = False
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                event = json.loads(line)
+                if event["event"] == "suite_start":
+                    observed = True
+                    self.assertEqual(event["suite"], "slow.test.py")
+                    self.assertIsNone(process.poll())
+                    break
+            _stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        self.assertTrue(observed)
+
+
 class TempParentProbeFixture(unittest.TestCase):
     """C-5: the Git containment probe must distinguish a real "not a
     repository" answer from any other probe failure."""
@@ -1508,6 +1666,16 @@ class TempParentProbeFixture(unittest.TestCase):
             with self.subTest(name=name):
                 git = self.fake_git(name, body)
                 self.assertEqual(self.mod.probe_git_containment(str(git), self.root), "uncertain")
+
+    def test_probe_timeout_is_uncertain_and_uses_ten_second_limit(self):
+        with mock.patch.object(
+            self.mod.subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd="git", timeout=10),
+        ) as probe:
+            self.assertEqual(
+                self.mod.probe_git_containment("git", self.root), "uncertain"
+            )
+        self.assertEqual(probe.call_args.kwargs["timeout"], 10)
 
     def test_missing_binary_is_uncertain(self):
         self.assertEqual(
@@ -2228,7 +2396,16 @@ class ShardCliFixture(RunTestsFixtureBase):
 
     def test_leak_sweep_stays_on_inside_a_shard(self):
         args = [a for a in self.base_args() if a != "--no-leak-sweep"]
-        result = run_runner(args + ["--shard", "1/2", "--strict-leak-sweep"])
+        isolated_home = self.root / "runner-home"
+        isolated_home.mkdir()
+        env = dict(CLEAN_ENV)
+        env["HOME"] = str(isolated_home)
+        result = subprocess.run(
+            [sys.executable, str(RUNNER)] + args + [
+                "--shard", "1/2", "--strict-leak-sweep",
+            ],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_help_says_shard_works_with_every_isolation_profile(self):

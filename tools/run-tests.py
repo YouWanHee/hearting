@@ -10,7 +10,9 @@ Isolation is owned by a single helper, build_isolated_env(), so the
 definition cannot drift. There is no code path that hands a suite subprocess
 the caller's real (ambient) environment — the runtime the caller invoked this
 script from is never propagated. See owner addendum A: an "ambient" execution
-profile does not exist here on purpose.
+profile does not exist here on purpose. The only dependency exception is a
+symlink to PyYAML when it is installed in the enabled parent user site; no
+other parent user-site package or startup customization is exposed.
 
 The post-run live-state leak sweep classifies each newly appeared path under
 the live-state root by *positive* evidence only, never by absence of it:
@@ -37,6 +39,7 @@ import py_compile
 import re
 import shutil
 import signal
+import site
 import stat
 import subprocess
 import sys
@@ -235,12 +238,61 @@ if _DIR and os.path.isdir(_DIR):
 """
 
 
-def _install_child_stderr_hook(home: Path, directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    site_packages = (
+def _child_user_site(home: Path) -> Path:
+    return (
         home / ".local" / "lib"
         / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     )
+
+
+def _install_user_yaml(private_site: Path) -> None:
+    """Expose only PyYAML found in an enabled parent user site."""
+    if site.ENABLE_USER_SITE is not True:
+        return
+    from importlib.machinery import PathFinder
+
+    configured = site.getusersitepackages()
+    candidates = configured if isinstance(configured, (list, tuple)) else [configured]
+    for candidate in candidates:
+        try:
+            user_site = Path(candidate).expanduser().resolve(strict=True)
+            package = user_site / "yaml"
+            package_real = package.resolve(strict=True)
+            spec = PathFinder.find_spec("yaml", [str(user_site)])
+            origin = Path(spec.origin).resolve(strict=True) if spec and spec.origin else None
+            if (not package.is_dir() or not package_real.is_relative_to(user_site)
+                    or origin is None
+                    or not origin.is_relative_to(package_real)):
+                continue
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+
+        private_site.mkdir(parents=True, exist_ok=True)
+        destination = private_site / "yaml"
+        if not destination.exists() and not destination.is_symlink():
+            destination.symlink_to(package_real, target_is_directory=True)
+
+        # Some installations also expose a top-level extension module. Link it
+        # only when it is actually present in this same user site.
+        try:
+            extension = PathFinder.find_spec("_yaml", [str(user_site)])
+            extension_origin = (
+                Path(extension.origin).resolve(strict=True)
+                if extension and extension.origin else None
+            )
+            if extension_origin is None or not extension_origin.is_relative_to(user_site):
+                continue
+            extension_destination = private_site / extension_origin.name
+            if not extension_destination.exists() and not extension_destination.is_symlink():
+                extension_destination.symlink_to(extension_origin)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+        return
+
+
+def _install_child_stderr_hook(home: Path, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    site_packages = _child_user_site(home)
     site_packages.mkdir(parents=True, exist_ok=True)
     hook = site_packages / "usercustomize.py"
     hook.write_text(_CHILD_STDERR_HOOK, encoding="utf-8")
@@ -340,6 +392,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
     child_stderr = tmpdir / "child-stderr"
     _install_child_stderr_hook(home, child_stderr)
+    # PyYAML is the sole dependency exposed from an enabled user site. The
+    # parent site itself, its .pth files, and customization modules stay private.
+    _install_user_yaml(_child_user_site(home))
     env[CHILD_STDERR_ENV] = str(child_stderr)
     # _EXPLICIT_UNSET_KEYS are simply omitted from `env` (env -i semantics: a
     # subprocess launched with this dict as its full environment never sees
@@ -473,9 +528,9 @@ def probe_git_containment(git_exe: str, candidate: Path) -> str:
     try:
         probe = subprocess.run(
             [git_exe, "-C", str(candidate), "rev-parse", "--show-toplevel"],
-            env={}, capture_output=True, text=True,
+            env={}, capture_output=True, text=True, timeout=10,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return "uncertain"
     if probe.returncode == 0:
         return "inside" if probe.stdout.strip() else "uncertain"
@@ -786,13 +841,20 @@ def _sample_pgid_live_state_writes(
         stop_event.wait(_LIVE_SAMPLER_INTERVAL)
 
 
+def _suite_progress(event: str, relpath: str, profile: str, **fields) -> None:
+    record = {"event": event, "profile": profile, "suite": relpath}
+    record.update(fields)
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+
+
 def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeout: int) -> SuiteResult:
     relpath = suite_relpath(root, suite)
     if suite.name.endswith(".sh"):
         cmd = ["bash", str(suite)]
     else:
         cmd = [sys.executable, str(suite)]
-    started = datetime.datetime.now()
+    started_monotonic = time.monotonic()
+    _suite_progress("suite_start", relpath, profile)
     timed_out = False
     # start_new_session=True makes the child the leader of its own process
     # group. That ordering matters: killpg() is only ever called after this
@@ -845,11 +907,18 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
         if snapshot:
             with _OWNED_LIVE_PATHS_LOCK:
                 _OWNED_LIVE_PATHS_BY_SUITE.setdefault(relpath, set()).update(snapshot)
-    duration = (datetime.datetime.now() - started).total_seconds()
+    duration = time.monotonic() - started_monotonic
     result = SuiteResult(relpath, rc, timed_out, out, err, duration, profile)
     child_stderr = collect_child_stderr(env)
     if not result.passed:
         result.child_stderr = child_stderr
+    _suite_progress(
+        "suite_timeout" if timed_out else "suite_end",
+        relpath,
+        profile,
+        result="timeout" if timed_out else "pass" if result.passed else "fail",
+        duration_s=round(duration, 3),
+    )
     return result
 
 
@@ -1820,6 +1889,25 @@ def run_profile(
             return build_ci_like_env(tmp, root)
         raise ValueError(profile)
 
+    def prepare_env(idx: int, suite: Path) -> dict[str, str]:
+        relpath = suite_relpath(root, suite)
+        started = time.monotonic()
+        _suite_progress("suite_prepare_start", relpath, profile)
+        try:
+            env = make_env(idx)
+        except BaseException as exc:
+            _suite_progress(
+                "suite_prepare_end", relpath, profile,
+                result="error", error_type=type(exc).__name__,
+                duration_s=round(time.monotonic() - started, 3),
+            )
+            raise
+        _suite_progress(
+            "suite_prepare_end", relpath, profile,
+            result="ready", duration_s=round(time.monotonic() - started, 3),
+        )
+        return env
+
     try:
         indexed = list(enumerate(suites))
         parallel = [
@@ -1835,7 +1923,7 @@ def run_profile(
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             futures = []
             for idx, suite in parallel:
-                env = make_env(idx)
+                env = prepare_env(idx, suite)
                 futures.append(
                     (idx, pool.submit(run_suite, suite, root, env, profile, timeout))
                 )
@@ -1846,7 +1934,7 @@ def run_profile(
         # suite starts. Preserve the original corpus order in the returned
         # report even though execution order is deliberately different.
         for idx, suite in serial:
-            env = make_env(idx)
+            env = prepare_env(idx, suite)
             results_by_index[idx] = run_suite(suite, root, env, profile, timeout)
     finally:
         for tmp in tmp_roots:
