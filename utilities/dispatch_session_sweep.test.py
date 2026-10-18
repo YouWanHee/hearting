@@ -492,8 +492,11 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         fixture.write_text(
             "import json,os,time\n"
             "open(os.environ['SLOW_RECOVERY_PID'],'w').write(str(os.getpid()))\n"
-            "open(os.environ['SLOW_RECOVERY_ENV'],'w').write(json.dumps({k:os.environ.get(k) for k in "
-            "('AGENT_DISPATCH_JOBS','HARNESS_STATE_ROOT','AGENT_PEER_LEDGER_ROOT','XDG_STATE_HOME','AGENT_HOME','FIXTURE_LIFECYCLE_ROOT')}))\n"
+            "time.sleep(.05)\n"
+            "env_path=os.environ['SLOW_RECOVERY_ENV']\n"
+            "with open(env_path+'.tmp','w') as stream: json.dump({k:os.environ.get(k) for k in "
+            "('AGENT_DISPATCH_JOBS','HARNESS_STATE_ROOT','AGENT_PEER_LEDGER_ROOT','XDG_STATE_HOME','AGENT_HOME','FIXTURE_LIFECYCLE_ROOT')},stream)\n"
+            "os.replace(env_path+'.tmp',env_path)\n"
             "time.sleep(15)\n",
             encoding="utf-8",
         )
@@ -515,6 +518,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             "hook.dispatch_state_roots=lambda _home:(Path(os.environ['FIXTURE_DISPATCH_ROOT']),)\n"
             "real_ack=hook.ack_delivered\n"
             "def ack(*args,**kwargs):\n"
+            " time.sleep(.05)\n"
             " Path(os.environ['ACK_ENTERED']).write_text(str(time.monotonic_ns()))\n"
             " deadline=time.monotonic()+5\n"
             " while not Path(os.environ['ACK_GATE']).exists() and time.monotonic()<deadline: time.sleep(.005)\n"
@@ -564,16 +568,21 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
                              "UserPromptSubmit")
             self.assertIn("att-0000000000000000000000000000bbbb",
                           output_payload["hookSpecificOutput"]["additionalContext"])
+            # Flush can wake this reader before the hook enters ACK.
+            # The fixture delay exercises that scheduler boundary explicitly.
+            while not ack_entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
             self.assertTrue(ack_entered.exists(), "hook did not reach its ACK call")
             self.assertEqual(PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"],
                              "claimed", "ACK state changed before the pipe reader received output")
             gate.touch()
-            deadline = time.monotonic() + 5
+            deadline = min(time.monotonic() + 5, started + 10.0)
             while not child_pid_file.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(child_pid_file.exists(), "recovery request did not follow the ACK")
             child_pid = int(child_pid_file.read_text())
-            tail, err = hook_process.communicate(timeout=8)
+            tail, err = hook_process.communicate(
+                timeout=max(0.001, started + 10.0 - time.monotonic()))
             hook_exit_at = time.monotonic()
             elapsed = hook_exit_at - started
             self.assertEqual(hook_process.returncode, 0, err.decode("utf-8", "replace"))
@@ -588,7 +597,14 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
                              "acked")
             self.assertTrue(tail == b"" or tail.endswith(b"\n"))
             self.assertTrue(self._pid_alive(child_pid), "slow recovery did not outlive hook exit")
-            child_env = json.loads((self.root.parent / "slow-recovery-env.json").read_text())
+            # Detached startup is independent of the completed hook's latency.
+            # Atomic publication makes existence a complete-payload signal.
+            child_env_path = self.root.parent / "slow-recovery-env.json"
+            deadline = time.monotonic() + 5
+            while not child_env_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(child_env_path.exists(), "slow recovery did not publish its environment")
+            child_env = json.loads(child_env_path.read_text())
             self.assertEqual(child_env, {
                 "AGENT_DISPATCH_JOBS": env["AGENT_DISPATCH_JOBS"],
                 "HARNESS_STATE_ROOT": env["HARNESS_STATE_ROOT"],
@@ -601,6 +617,8 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             if hook_process.poll() is None:
                 hook_process.kill()
                 hook_process.wait(timeout=3)
+            for stream in (hook_process.stdout, hook_process.stderr):
+                stream.close()
             if child_pid is None and child_pid_file.exists():
                 child_pid = int(child_pid_file.read_text())
             if child_pid is not None:
