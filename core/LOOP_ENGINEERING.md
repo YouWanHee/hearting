@@ -145,6 +145,11 @@ writer lock, and checks process-group cleanup only after its leader exits.
 Registry mutation keeps its fresh authority check inside the existing short
 writer section; observation must remain safe when its caller already holds
 that same registry lock.
+After native idle is confirmed, a watcher with positively pending registered
+work may keep waiting on a fresh observation of that work and the current
+exact pane census. It needs native readiness again when that work stops
+blocking or its identity becomes uncertain. An unrelated pane event alone
+must not restart the native readiness probes while completion is impossible.
 
 Long-lived observers may retain a bounded projection of an immutable result
 while every file generation it depended on remains current. The projection

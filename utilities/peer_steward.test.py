@@ -1501,6 +1501,52 @@ class WatchDeadlineTest(unittest.TestCase):
         self.assertEqual(state, "unknown")
 
 
+class WatchPendingRegisteredWorkTest(_TmpRootMixin, unittest.TestCase):
+    def _view(self, sid="sid-current"):
+        return SimpleNamespace(complete=True, endpoint="default", panes=[{
+            "pane_id": "w1:p9", "agent": "claude", "agent_session": {"value": sid}}])
+
+    def _expected(self):
+        return {"pane": "w1:p9", "harness": "claude", "session_id": "sid-current"}
+
+    def _row(self, status="running", sid="sid-current"):
+        import dispatch_contract
+        metadata = {
+            "attempt_schema_version": "2", "dispatch_depth": "2", "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "fallback_hop": "same-harness-headless", "attempt_id": "att-watch-live",
+            "harness": "codex", "parent_sid": sid, "parent_harness": "claude",
+            **dispatch_contract.process_launch_identity(os.getpid()),
+        }
+        pipe = ",".join(f"{key}={value}" for key, value in metadata.items())
+        self.jobs_path.write_text(f"now\t{status}\trepo\tworktree\twatch-live\t{pipe}\n")
+
+    def test_unchanged_registry_does_not_cache_liveness_or_terminal_status(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        self._row()
+        check = peer_steward._watch_registered_work_pending
+        self.assertTrue(check(self._view(), self._expected(), "default"))
+        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                        ObservedAttemptLiveness("unverifiable", "fixture", "unverifiable", "fixture")):
+            self.assertFalse(check(self._view(), self._expected(), "default"))
+        self._row(status="done")
+        self.assertFalse(check(self._view(), self._expected(), "default"))
+        self._row(sid="sid-foreign")
+        self.assertFalse(check(self._view(), self._expected(), "default"))
+
+    def test_replacement_incomplete_census_and_observation_errors_use_full_readiness(self):
+        self._row()
+        check = peer_steward._watch_registered_work_pending
+        self.assertFalse(check(self._view("sid-foreign"), self._expected(), "default"))
+        self.assertFalse(check(None, self._expected(), "default"))
+        view = self._view()
+        view.complete = False
+        self.assertFalse(check(view, self._expected(), "default"))
+        with mock.patch.object(peer_steward.peer_obligations, "bound_work_for_pane",
+                               side_effect=OSError("unreadable")):
+            self.assertFalse(check(self._view(), self._expected(), "default"))
+
+
 class WatchWakeTest(unittest.TestCase):
     def test_malformed_observer_protocol_does_not_interrupt_watch_sweep(self):
         with mock.patch.object(peer_steward.os, "kill") as kill:

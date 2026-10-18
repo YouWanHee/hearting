@@ -2502,6 +2502,35 @@ def _watch_terminal_from_view(view, expected, server, transport=None):
     return None
 
 
+def _watch_registered_work_pending(view, expected, server):
+    """A fresh blocking fact can defer readiness, never authorize completion."""
+    if (view is None or view.complete is not True
+            or herdr_observation.endpoint_name(view.endpoint) !=
+               herdr_observation.endpoint_name(server)):
+        return False
+    pane, harness, sid = (expected.get(key) for key in ("pane", "harness", "session_id"))
+    if not pane or harness not in {"claude", "codex", "opencode"} or not sid or sid == "-":
+        return False
+    matches = [row for row in view.panes if row.get("pane_id") == pane]
+    if len(matches) != 1:
+        return False
+    current_sid = matches[0].get("agent_session")
+    if isinstance(current_sid, dict):
+        current_sid = current_sid.get("value")
+    if matches[0].get("agent") != harness or current_sid != sid:
+        return False
+    try:
+        work, state = peer_obligations.bound_work_for_pane(
+            pane, harness, sid, registry_append_only=True)
+        if state != "observed" or not work:
+            return False
+        states = [peer_obligations.completion_readiness(item).state for item in work]
+    except (OSError, ValueError, TypeError):
+        # Uncertainty takes the ordinary complete readiness path below.
+        return False
+    return "unknown" not in states and "pending" in states
+
+
 def _settle_terminal_watch_if_unobserved(watch_id, arm, root=None,
                                         reason_override=None):
     paths = _watch_paths(watch_id, root)
@@ -4019,6 +4048,9 @@ def cmd_watch_run(args):
                     if (wait_record or {}).get("state") == "result":
                         result_state = wait_record.get("agent_state")
                         if result_state in {"idle", "done"}:
+                            if (observation.get("reason") == "bound-registered-work-pending"
+                                    and _watch_registered_work_pending(view, expected, server)):
+                                continue
                             readiness = _pane_readiness(
                                 args.target, result_state,
                                 expected_harness=expected["harness"],
