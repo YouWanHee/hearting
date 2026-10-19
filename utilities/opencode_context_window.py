@@ -2,18 +2,21 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
-import re
 import sys
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Mapping
 
 try:
     from model_config import parse_context_window, resolve_config, resolve_context_window
+    import opencode_runtime
 except ImportError:  # package import in focused unit tests
     from utilities.model_config import parse_context_window, resolve_config, resolve_context_window
+    from utilities import opencode_runtime
 
 
 class OpenCodeContextError(ValueError):
@@ -59,10 +62,12 @@ def _run(command: list[str], *, cwd: str, env: Mapping[str, str]) -> str:
     return result.stdout
 
 
-def _installed_command(command: str | None = None) -> str:
+def _installed_command(command: str | None = None,
+                       environ: Mapping[str, str] | None = None) -> str:
     if command:
         return command
-    return shutil.which("opencode") or "opencode"
+    path = None if environ is None else environ.get("PATH")
+    return shutil.which("opencode", path=path) or "opencode"
 
 
 def _installed_version(command: str, *, cwd: str, env: Mapping[str, str]) -> str | None:
@@ -73,8 +78,8 @@ def _installed_version(command: str, *, cwd: str, env: Mapping[str, str]) -> str
         return None
     if result.returncode != 0:
         return None
-    match = re.search(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)", result.stdout or "")
-    return match.group(1) if match else None
+    parsed = opencode_runtime.parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+    return ".".join(str(part) for part in parsed) if parsed else None
 
 
 def _resolved_config(*, cwd: str, env: Mapping[str, str], command: str) -> dict[str, object]:
@@ -90,6 +95,7 @@ def _resolved_config(*, cwd: str, env: Mapping[str, str], command: str) -> dict[
 
 def _model_limits(config: Mapping[str, object], model: str) -> dict[str, int | None]:
     provider, model_id = model.split("/", 1)
+    model_id = model_id.partition("#")[0]
     providers = config.get("provider")
     provider_config = providers.get(provider) if isinstance(providers, dict) else None
     models = provider_config.get("models") if isinstance(provider_config, dict) else None
@@ -114,6 +120,118 @@ def _minimum_limits(*sources: Mapping[str, int | None]) -> dict[str, int | None]
     if result["context"] is None:
         raise OpenCodeContextError("resolved OpenCode model has no native context limit")
     return result
+
+
+def _api_json(path: str, *, cwd: str, env: Mapping[str, str], command: str) -> object:
+    output = _run([command, "api", "GET", path], cwd=cwd, env=env)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise OpenCodeContextError(f"OpenCode V2 API {path} did not return JSON") from exc
+
+
+def _v2_location(payload: Mapping[str, object], *, cwd: str) -> str:
+    location = payload.get("location")
+    directory = location.get("directory") if isinstance(location, dict) else None
+    if not isinstance(directory, str) or not directory:
+        raise OpenCodeContextError("OpenCode V2 API response has no location directory")
+    try:
+        actual = str(Path(directory).resolve(strict=True))
+        expected = str(Path(cwd).resolve(strict=True))
+    except OSError as exc:
+        raise OpenCodeContextError(f"cannot verify OpenCode V2 location: {exc}") from exc
+    if actual != expected:
+        raise OpenCodeContextError(
+            f"OpenCode V2 API location {actual} differs from launch directory {expected}"
+        )
+    return actual
+
+
+def _v2_server_identity(*, cwd: str, env: Mapping[str, str], command: str) -> str:
+    info = _api_json("/api/info", cwd=cwd, env=env, command=command)
+    if not isinstance(info, dict):
+        raise OpenCodeContextError("OpenCode V2 server info is not an object")
+    version, pid, urls = info.get("version"), info.get("pid"), info.get("urls")
+    if (not isinstance(version, str) or type(pid) is not int or pid < 0
+            or not isinstance(urls, list) or not urls
+            or any(not isinstance(url, str) or not url for url in urls)):
+        raise OpenCodeContextError("OpenCode V2 server identity is incomplete")
+    # Do not put service URLs or other runtime details in receipts. The digest
+    # lets the before/after check prove it observed the same server process.
+    identity = json.dumps([version, pid, urls], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _v2_model_info(payload: object, *, cwd: str, model: str | None = None) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise OpenCodeContextError("OpenCode V2 model API response is not an object")
+    _v2_location(payload, cwd=cwd)
+    data = payload.get("data")
+    if model is None:
+        if data is None:
+            raise OpenCodeContextError("OpenCode V2 default model is unavailable")
+        if not isinstance(data, dict):
+            raise OpenCodeContextError("OpenCode V2 default model is malformed")
+        selected = data
+    else:
+        if not isinstance(data, list):
+            raise OpenCodeContextError("OpenCode V2 model list is malformed")
+        if not isinstance(model, str) or model.count("/") < 1:
+            raise OpenCodeContextError("selected OpenCode model must use provider/model syntax")
+        provider, model_id = model.split("/", 1)
+        model_id = model_id.partition("#")[0]
+        if not provider or not model_id:
+            raise OpenCodeContextError("selected OpenCode model must use provider/model syntax")
+        matches = [row for row in data if isinstance(row, dict)
+                   and row.get("providerID") == provider and row.get("id") == model_id]
+        if len(matches) != 1:
+            raise OpenCodeContextError(
+                f"OpenCode V2 model {provider}/{model_id} is missing or ambiguous"
+            )
+        selected = matches[0]
+    provider_id, model_id = selected.get("providerID"), selected.get("id")
+    if (not isinstance(provider_id, str) or not provider_id
+            or not isinstance(model_id, str) or not model_id
+            or not isinstance(selected.get("modelID"), str)
+            or selected.get("enabled") is not True
+            or selected.get("status") not in ("active", "alpha", "beta", "deprecated")):
+        raise OpenCodeContextError("OpenCode V2 selected model is disabled or malformed")
+    limits = selected.get("limit")
+    if not isinstance(limits, dict):
+        raise OpenCodeContextError("OpenCode V2 selected model has no limit object")
+    result = {
+        "providerID": provider_id,
+        "id": model_id,
+        "modelID": selected["modelID"],
+        "status": selected["status"],
+        "limits": {
+            "context": _integer_limit(limits, "context", required=True),
+            "input": _integer_limit(limits, "input", required=False),
+            "output": _integer_limit(limits, "output", required=True),
+        },
+    }
+    return result
+
+
+def _v2_snapshot(*, cwd: str, env: Mapping[str, str], command: str,
+                 model: str | None = None) -> tuple[dict[str, object], str]:
+    path = "/api/model/default" if model is None else "/api/model"
+    for attempt in range(2):
+        server = _v2_server_identity(cwd=cwd, env=env, command=command)
+        payload = _api_json(path, cwd=cwd, env=env, command=command)
+        try:
+            return _v2_model_info(payload, cwd=cwd, model=model), server
+        except OpenCodeContextError as exc:
+            first_snapshot = any(marker in str(exc) for marker in (
+                "default model is unavailable", "default model is malformed",
+                "model list is malformed", "missing or ambiguous",
+            ))
+            if attempt or not first_snapshot:
+                raise
+            # V2 documents that a model snapshot can precede initial plugin
+            # settlement. Re-read once; never poll indefinitely or invent a row.
+            time.sleep(0.05)
+    raise OpenCodeContextError("OpenCode V2 model snapshot remained unavailable")
 
 
 def _verify_final_limits(model: str, applied: Mapping[str, int | None],
@@ -179,7 +297,10 @@ def _native_limits(model: str, *, env: Mapping[str, str]) -> dict[str, int | Non
 
 
 def apply_context_override(config_content: str, model: str, context_window: str | int,
-                           native_limits: Mapping[str, int | None]) -> tuple[str, dict[str, int | None]]:
+                           native_limits: Mapping[str, int | None], *,
+                           provider_key: str = "provider",
+                           provider_keys: tuple[str, ...] | None = None
+                           ) -> tuple[str, dict[str, int | None]]:
     """Add only selected-model limit fields, preserving every other config value."""
     raw = config_content.strip()
     try:
@@ -196,10 +317,49 @@ def apply_context_override(config_content: str, model: str, context_window: str 
     native_input = _integer_limit(native_limits, "input", required=False)
     native_output = _integer_limit(native_limits, "output", required=False)
     provider, model_id = model.split("/", 1)
+    model_id = model_id.partition("#")[0]
 
-    providers = config.setdefault("provider", {})
+    configured_limits = []
+    source_keys = tuple(dict.fromkeys((*(provider_keys or ()), provider_key)))
+    for source_key in source_keys:
+        source_providers = config.get(source_key)
+        if source_providers is None:
+            continue
+        if not isinstance(source_providers, dict):
+            raise OpenCodeContextError(
+                f"OPENCODE_CONFIG_CONTENT {source_key} must be an object"
+            )
+        source_provider = source_providers.get(provider)
+        if source_provider is None:
+            continue
+        if not isinstance(source_provider, dict):
+            raise OpenCodeContextError(f"OpenCode provider {provider} in {source_key} must be an object")
+        source_models = source_provider.get("models")
+        if source_models is None:
+            continue
+        if not isinstance(source_models, dict):
+            raise OpenCodeContextError(f"OpenCode provider {provider} {source_key}.models must be an object")
+        source_model = source_models.get(model_id)
+        if source_model is None:
+            continue
+        if not isinstance(source_model, dict):
+            raise OpenCodeContextError(f"OpenCode model {model} config in {source_key} must be an object")
+        source_limit = source_model.get("limit")
+        if source_limit is None:
+            continue
+        if not isinstance(source_limit, dict):
+            raise OpenCodeContextError(
+                f"OpenCode model {model} config {source_key}.limit must be an object"
+            )
+        configured_limits.append({
+            "context": _integer_limit(source_limit, "context", required=False),
+            "input": _integer_limit(source_limit, "input", required=False),
+            "output": _integer_limit(source_limit, "output", required=False),
+        })
+
+    providers = config.setdefault(provider_key, {})
     if not isinstance(providers, dict):
-        raise OpenCodeContextError("OPENCODE_CONFIG_CONTENT provider must be an object")
+        raise OpenCodeContextError(f"OPENCODE_CONFIG_CONTENT {provider_key} must be an object")
     provider_config = providers.setdefault(provider, {})
     if not isinstance(provider_config, dict):
         raise OpenCodeContextError(f"OpenCode provider {provider} must be an object")
@@ -221,6 +381,8 @@ def apply_context_override(config_content: str, model: str, context_window: str 
     context_caps = [requested, native_context]
     if existing_context is not None:
         context_caps.append(existing_context)
+    context_caps.extend(source["context"] for source in configured_limits
+                        if source["context"] is not None)
     context = min(context_caps)
     limits["context"] = context
     input_cap = None
@@ -230,10 +392,14 @@ def apply_context_override(config_content: str, model: str, context_window: str 
             input_caps.append(native_input)
         if existing_input is not None:
             input_caps.append(existing_input)
+        input_caps.extend(source["input"] for source in configured_limits
+                          if source["input"] is not None)
         input_cap = min(input_caps)
         limits["input"] = input_cap
     existing_output = _integer_limit(limits, "output", required=False)
     output_caps = [value for value in (native_output, existing_output) if value is not None]
+    output_caps.extend(source["output"] for source in configured_limits
+                       if source["output"] is not None)
     output_cap = min(output_caps) if output_caps else None
     if output_cap is not None:
         limits["output"] = output_cap
@@ -367,12 +533,68 @@ def _hook_main() -> None:
 def prepare_launch_context(*, model: str, context_window: str | int,
                            config_content: str, cwd: str,
                            environ: Mapping[str, str] | None = None,
-                           command: str | None = None) -> dict[str, object]:
+                           command: str | None = None,
+                           variant: str | None = None) -> dict[str, object]:
     """Inspect the installed runtime's effective model limit and prepare its cap."""
-    native_command = _installed_command(command)
     env = dict(os.environ if environ is None else environ)
+    native_command = _installed_command(command, environ=env)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
     runtime_version = _installed_version(native_command, cwd=cwd, env=env)
+    version_parts = opencode_runtime.parse_version(runtime_version)
+    is_v2 = bool(version_parts and opencode_runtime.is_v2(version=version_parts))
+    if is_v2:
+        model_variant = model.partition("#")[2] if isinstance(model, str) else ""
+        effective_variant = (variant if variant not in (None, "", "runtime-default")
+                             else (model_variant or variant))
+        before_info, before_server = _v2_snapshot(
+            cwd=cwd, env=env, command=native_command,
+            model=None if model == "inherit" else model,
+        )
+        selected_model = (f"{before_info['providerID']}/{before_info['id']}"
+                          if model == "inherit" else model)
+        assert isinstance(selected_model, str)
+        native_limits = dict(before_info["limits"])
+        updated, applied = apply_context_override(
+            config_content, selected_model, context_window, native_limits,
+            provider_key="providers", provider_keys=("providers", "provider"),
+        )
+        final_env = {**env, "OPENCODE_CONFIG_CONTENT": updated}
+        after_info, after_server = _v2_snapshot(
+            cwd=cwd, env=final_env, command=native_command,
+            model=None if model == "inherit" else selected_model,
+        )
+        if before_server != after_server:
+            raise OpenCodeContextError("OpenCode V2 server changed during model-limit verification")
+        if ((before_info["providerID"], before_info["id"], before_info["modelID"])
+                != (after_info["providerID"], after_info["id"], after_info["modelID"])):
+            raise OpenCodeContextError("OpenCode V2 selected model changed during context override")
+        final_limits = dict(after_info["limits"])
+        _verify_final_limits(selected_model, applied, final_limits)
+        compaction = {
+            "state": "unknown", "enabled": None, "trigger_tokens": None,
+            "context_tokens": final_limits["context"],
+            "input_tokens": final_limits["input"],
+            "output_allowance_tokens": final_limits["output"],
+            "configured_reserve_tokens": None, "effective_reserve_tokens": None,
+            "source": "opencode-v2-model-api",
+            "reason": "native-v2-compaction-behavior-unverified",
+        }
+        return {
+            "config_content": updated,
+            "model": selected_model,
+            "variant": effective_variant,
+            "catalog_limits": {"context": None, "input": None, "output": None},
+            "configured_limits": {"context": None, "input": None, "output": None},
+            "native_limits": native_limits,
+            "applied_limits": applied,
+            "final_limits": final_limits,
+            "compaction_policy": compaction,
+            "runtime_version": runtime_version,
+            "native_application": "OPENCODE_CONFIG_CONTENT:providers-model-limit",
+            "server_identity": before_server,
+            "location_identity": str(Path(cwd).resolve(strict=True)),
+            "config_identity": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+        }
     before_config = _resolved_config(cwd=cwd, env=env, command=native_command)
     selected_model = before_config.get("model") if model == "inherit" else model
     if not isinstance(selected_model, str) or selected_model.count("/") < 1:
@@ -454,6 +676,11 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         "final_limits": final_limits,
         "compaction_policy": policy,
         "runtime_version": runtime_version,
+        "variant": variant,
+        "native_application": "OPENCODE_CONFIG_CONTENT:provider-model-limit",
+        "server_identity": None,
+        "location_identity": str(Path(cwd).resolve()),
+        "config_identity": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
     }
 
 

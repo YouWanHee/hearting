@@ -1691,54 +1691,6 @@ def main(argv: list[str]) -> int:
         except (DispatchContractError, OSError) as exc:
             return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
                         detail=str(exc), child_spawned="0")
-    if action == "start":
-        native_env = {**os.environ, **args.nested_runtime_env,
-                      "OPENCODE_CONFIG_CONTENT": args.opencode_config_content}
-        try:
-            context_capture = opencode_context.prepare_launch_context(
-                model=args.resolved_model_settings["model"],
-                context_window=args.resolved_model_settings["context_window"],
-                config_content=args.opencode_config_content,
-                cwd=args.worktree,
-                environ=native_env,
-            )
-        except opencode_context.OpenCodeContextError as exc:
-            return fail("opencode-context-limit-unavailable", 69,
-                        detail=str(exc), child_spawned="0")
-        args.opencode_config_content = str(context_capture["config_content"])
-        catalog_limits = context_capture["catalog_limits"]
-        configured_limits = context_capture["configured_limits"]
-        native_limits = context_capture["native_limits"]
-        applied_limits = context_capture["applied_limits"]
-        final_limits = context_capture["final_limits"]
-        args.resolved_model_settings.update({
-            "context_window_native_model": str(context_capture["model"]),
-            "context_window_catalog_limit_context": str(catalog_limits["context"]),
-            "context_window_configured_limit_context": "absent" if configured_limits["context"] is None else str(configured_limits["context"]),
-            "context_window_configured_limit_input": "absent" if configured_limits["input"] is None else str(configured_limits["input"]),
-            "context_window_configured_limit_output": "absent" if configured_limits["output"] is None else str(configured_limits["output"]),
-            "context_window_native_limit_context": str(native_limits["context"]),
-            "context_window_native_limit_input": "absent" if native_limits["input"] is None else str(native_limits["input"]),
-            "context_window_native_limit_output": "absent" if native_limits["output"] is None else str(native_limits["output"]),
-            "context_window_applied_limit_context": str(applied_limits["context"]),
-            "context_window_applied_limit_input": "absent" if applied_limits["input"] is None else str(applied_limits["input"]),
-            "context_window_final_limit_context": "absent" if final_limits["context"] is None else str(final_limits["context"]),
-            "context_window_final_limit_input": "absent" if final_limits["input"] is None else str(final_limits["input"]),
-            "context_window_final_limit_output": "absent" if final_limits["output"] is None else str(final_limits["output"]),
-            "context_policy_state": context_capture["compaction_policy"]["state"],
-            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
-                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
-            "context_policy_trigger": ("absent" if context_capture["compaction_policy"]["trigger_tokens"] is None
-                                       else str(context_capture["compaction_policy"]["trigger_tokens"])),
-            "context_policy_output_allowance": ("absent" if context_capture["compaction_policy"]["output_allowance_tokens"] is None
-                                                 else str(context_capture["compaction_policy"]["output_allowance_tokens"])),
-            "context_policy_configured_reserve": ("absent" if context_capture["compaction_policy"]["configured_reserve_tokens"] is None
-                                                  else str(context_capture["compaction_policy"]["configured_reserve_tokens"])),
-            "context_policy_effective_reserve": ("absent" if context_capture["compaction_policy"]["effective_reserve_tokens"] is None
-                                                 else str(context_capture["compaction_policy"]["effective_reserve_tokens"])),
-            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
-            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
-        })
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -1947,7 +1899,68 @@ def main(argv: list[str]) -> int:
         args.worker_runtime_env = prepare_worker_home(args.agent_home, 'opencode',
                                                      args.worker_type, args.attempt_id,
                                                      env=dispatch_env)
-        dispatch_env.update(args.worker_runtime_env)
+        for key, value in args.worker_runtime_env.items():
+            if value is None:
+                dispatch_env.pop(key, None)
+            else:
+                dispatch_env[key] = value
+        try:
+            context_capture = opencode_context.prepare_launch_context(
+                model=args.resolved_model_settings["model"],
+                variant=args.resolved_model_settings.get("variant"),
+                context_window=args.resolved_model_settings["context_window"],
+                config_content=str(dispatch_env.get("OPENCODE_CONFIG_CONTENT") or "{}"),
+                cwd=args.worktree,
+                environ=dispatch_env,
+            )
+        except opencode_context.OpenCodeContextError as exc:
+            annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": "never-launched"})
+            cancel_governor_reservation(governor, governor_root, reservation_token)
+            close_job_row(
+                jobs, args.slug, args.worktree,
+                "opencode-context-limit-unavailable", "", args.attempt_id,
+            )
+            return fail("opencode-context-limit-unavailable", 69,
+                        detail=str(exc), attempt_id=args.attempt_id, child_spawned="0")
+        args.opencode_config_content = str(context_capture["config_content"])
+        dispatch_env["OPENCODE_CONFIG_CONTENT"] = args.opencode_config_content
+        catalog_limits = context_capture["catalog_limits"]
+        configured_limits = context_capture["configured_limits"]
+        native_limits = context_capture["native_limits"]
+        applied_limits = context_capture["applied_limits"]
+        final_limits = context_capture["final_limits"]
+        def limit_receipt(value):
+            return "absent" if value is None else str(value)
+        args.resolved_model_settings.update({
+            "context_window_native_model": str(context_capture["model"]),
+            "context_window_native_variant": str(context_capture.get("variant") or "absent"),
+            "context_window_native_application": str(
+                context_capture.get("native_application") or "unavailable"),
+            "context_window_catalog_limit_context": limit_receipt(catalog_limits["context"]),
+            "context_window_configured_limit_context": limit_receipt(configured_limits["context"]),
+            "context_window_configured_limit_input": limit_receipt(configured_limits["input"]),
+            "context_window_configured_limit_output": limit_receipt(configured_limits["output"]),
+            "context_window_native_limit_context": limit_receipt(native_limits["context"]),
+            "context_window_native_limit_input": limit_receipt(native_limits["input"]),
+            "context_window_native_limit_output": limit_receipt(native_limits["output"]),
+            "context_window_applied_limit_context": limit_receipt(applied_limits["context"]),
+            "context_window_applied_limit_input": limit_receipt(applied_limits["input"]),
+            "context_window_final_limit_context": limit_receipt(final_limits["context"]),
+            "context_window_final_limit_input": limit_receipt(final_limits["input"]),
+            "context_window_final_limit_output": limit_receipt(final_limits["output"]),
+            "context_window_server_identity": str(context_capture.get("server_identity") or "unavailable"),
+            "context_window_location_identity": str(context_capture.get("location_identity") or "unavailable"),
+            "context_window_config_identity": str(context_capture.get("config_identity") or "unavailable"),
+            "context_policy_state": context_capture["compaction_policy"]["state"],
+            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
+                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
+            "context_policy_trigger": limit_receipt(context_capture["compaction_policy"]["trigger_tokens"]),
+            "context_policy_output_allowance": limit_receipt(context_capture["compaction_policy"]["output_allowance_tokens"]),
+            "context_policy_configured_reserve": limit_receipt(context_capture["compaction_policy"]["configured_reserve_tokens"]),
+            "context_policy_effective_reserve": limit_receipt(context_capture["compaction_policy"]["effective_reserve_tokens"]),
+            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
+            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
+        })
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
@@ -2057,7 +2070,9 @@ def main(argv: list[str]) -> int:
         launch_metadata["opencode_context_window_request"] = str(
             args.resolved_model_settings.get("context_window", ""))
         for key in (
-                "context_window_native_model",
+                "context_window_native_model", "context_window_native_variant",
+                "context_window_native_application", "context_window_server_identity",
+                "context_window_location_identity", "context_window_config_identity",
                 "context_window_final_limit_context", "context_window_final_limit_input",
                 "context_window_final_limit_output", "context_policy_state",
                 "context_policy_runtime_version",
@@ -2082,7 +2097,7 @@ def main(argv: list[str]) -> int:
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
         launch_metadata["opencode_runtime_dir"] = str(
             Path(dispatch_env["XDG_DATA_HOME"]).parent)
-        launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
+        launch_metadata["runtime_home"] = dispatch_env.get("OPENCODE_CONFIG_DIR") or "shared-service"
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         # Nested runtime and worker-home overlays are already applied above.
@@ -2432,8 +2447,10 @@ def main(argv: list[str]) -> int:
     print(f"variant={settings['variant']}")
     print(f"context_window_requested={settings['context_window']}")
     print(f"context_window_source={settings['context_window_source']}")
-    print(f"context_window_native_application=OPENCODE_CONFIG_CONTENT:provider-model-limit")
-    for key in ("context_window_native_model", "context_window_catalog_limit_context",
+    print(f"context_window_native_application={settings.get('context_window_native_application', 'not-launched')}")
+    for key in ("context_window_native_model", "context_window_native_variant",
+                "context_window_server_identity", "context_window_location_identity",
+                "context_window_config_identity", "context_window_catalog_limit_context",
                 "context_window_configured_limit_context", "context_window_configured_limit_input",
                 "context_window_configured_limit_output", "context_window_native_limit_context",
                 "context_window_native_limit_input", "context_window_native_limit_output",
