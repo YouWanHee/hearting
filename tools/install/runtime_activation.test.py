@@ -640,6 +640,48 @@ class LinkedReleaseBundleTest(unittest.TestCase):
             repaired, _ = self._build(release, root / "codex-home")
             self.assertTrue(activation._same_tree(repaired, release))
 
+    def test_rebuilding_retires_only_linked_bundles_whose_release_is_gone(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "codex-home"
+            old = self._release(root, "v1.0.0")
+            active = self._release(root, "v1.0.1")
+            live = self._release(root, "v1.0.2")
+            old_bundle, _ = self._build(old, home)
+            active_bundle, _ = self._build(active, home)
+            live_bundle, _ = self._build(live, home)
+            copy_bundle, _ = self._build(self._checkout(root), home)
+            (home / ".harness").mkdir(exist_ok=True)
+            (home / ".harness" / "activation.json").write_text(
+                json.dumps({"active_root": str(active_bundle)}), encoding="utf-8"
+            )
+            bundles = old_bundle.parent.parent
+            dangling = root / "gone"
+            staging = bundles / ".staging-left"
+            staging.mkdir()
+            os.symlink(dangling, staging / "source", target_is_directory=True)
+            (staging / "bundle.json").write_text('{"source_link": true}', encoding="utf-8")
+            unmarked = bundles / "unmarked"
+            unmarked.mkdir()
+            os.symlink(dangling, unmarked / "source", target_is_directory=True)
+            foreign = bundles / "foreign"
+            os.symlink(live_bundle.parent, foreign, target_is_directory=True)
+            # destructive-ok: reason=make two linked bundles dangle by removing release trees this test created; boundary=v1.0.0 release dir inside this test's own temporary directory
+            shutil.rmtree(old)
+            # destructive-ok: reason=make the recorded active bundle dangle too; boundary=v1.0.1 release dir inside this test's own temporary directory
+            shutil.rmtree(active)
+
+            self._build(self._release(root, "v1.1.0"), home)
+
+            self.assertFalse(os.path.lexists(old_bundle.parent))
+            for survivor in (
+                active_bundle.parent, live_bundle.parent, copy_bundle.parent,
+                staging, unmarked, foreign,
+            ):
+                self.assertTrue(os.path.lexists(survivor), survivor)
+            self.assertTrue(live.is_dir())
+
     def test_discarding_a_linked_bundle_never_removes_the_release(self):
         import shutil
         with tempfile.TemporaryDirectory() as temporary:
