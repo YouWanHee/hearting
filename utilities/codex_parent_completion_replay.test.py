@@ -334,7 +334,7 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
     @contextmanager
     def _mock_native_runtime(self, output, *, report_pass=True, action_applied=True,
                              extra_history=False, history_error=False,
-                             assert_d1_before_d2=False):
+                             assert_d1_before_d2=False, report_mutator=None):
         state = {"history_calls": 0, "queue_sends": [], "fixture": None,
                  "followthrough_snapshot": None, "d1_before_d2": False,
                  "completion_record": None, "runtime": None, "jobs": None}
@@ -386,6 +386,8 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
                     "Approved. Before after. Checks pass. Synthetic commit deployment serving. "
                     "Production skipped not measured.\nFACTUAL_REPORT_JSON:\n"
                     + json.dumps(fixture["facts"]["report"], ensure_ascii=False))
+            if report_mutator is not None:
+                final_text = report_mutator(final_text)
             continuation_id = "delivery-replay-continuation"
             state["continuation_turn"] = {
                 "id": "continuation-turn", "status": "completed",
@@ -575,6 +577,27 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self._assert_case_records(stored, (
             "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
             "direct_question", "overall_acceptance"))
+
+    def test_run_replay_denied_completion_still_evaluates_later_cases(self):
+        output = self.root / "orchestration-denied-completion"
+        output.mkdir(mode=0o700)
+        denied = lambda report: report.replace(
+            "I completed the already approved isolated parent follow-through",
+            "I did not complete the already approved isolated parent follow-through", 1)
+        with self._mock_native_runtime(output, report_mutator=denied,
+                                      assert_d1_before_d2=True) as native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertTrue(native["d1_before_d2"])
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertFalse(cases["d1_first_report"]["checks"]
+                         ["report_has_substantive_closing_prose"])
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "PASS")
+        self.assertEqual(cases["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(cases["direct_question"]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
 
     def test_run_replay_missing_first_report_still_evaluates_later_cases(self):
         output = self.root / "orchestration-empty-report"
@@ -927,6 +950,165 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
             self.assertTrue(checks[key], key)
         self.assertTrue(all(checks["prose_content_checks"].values()))
         self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_saved_positive_semantic_mutations_keep_facts_and_tool_trace_constant(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report = (root / "first-report-positive.txt").read_bytes().decode("utf-8")
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        prose, json_tail = report.split(marker, 1)
+        tools = self._fixture_tool_trace(fixture, sentinel)
+
+        def check_mutation(name, mutated_prose, key, expected):
+            with self.subTest(name=name):
+                checks = replay._first_report_checks(mutated_prose + marker + json_tail,
+                                                     tools, fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["every_exact_artifact_was_read"])
+                self.assertTrue(checks["fixture_verifier_passed_in_native_tool_trace"])
+                self.assertTrue(checks["one_approved_followthrough_tool_invocation"])
+                self.assertTrue(checks["followthrough_state_matches_one_time_fixture_action"])
+                self.assertEqual(checks["prose_content_checks"].get(key,
+                                                                     checks["synthetic_value_checks"].get(
+                                                                         key.removeprefix("id_"))), expected)
+                self.assertEqual(checks["report_has_substantive_closing_prose"], expected)
+                return checks
+
+        alternatives = (
+            ("before did not exist", prose.replace(
+                "Before: no follow-through file, action count 0.",
+                "Before: the follow-through file did not exist, action count 0."),
+             "describes_before_state_and_zero_actions"),
+            ("before was not present", prose.replace(
+                "Before: no follow-through file, action count 0.",
+                "Before: the follow-through file was not present, action count 0."),
+             "describes_before_state_and_zero_actions"),
+            ("six passed without zero failures", prose.replace(
+                "passing 6 checks with 0 failures", "passing all 6 checks"),
+             "reports_six_check_verification_result"),
+        )
+        for name, mutated, key in alternatives:
+            self.assertNotEqual(mutated, prose)
+            checks = check_mutation(name, mutated, key, True)
+            self.assertTrue(all(checks["prose_content_checks"].values()))
+            self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+        unrelated_negation = prose.replace(
+            "All seven artifacts were read in the specified order.",
+            "An unrelated task did not complete. All seven artifacts were read in the specified order.", 1)
+        unrelated_checks = check_mutation("unrelated negation does not deny follow-through",
+                                          unrelated_negation, "explains_fixture_reason", True)
+        self.assertTrue(all(unrelated_checks["prose_content_checks"].values()))
+
+        values = facts["synthetic_values"]
+        ids = {key: replay._expected_identifier(key, value) for key, value in values.items()}
+        group_qualified = (prose.replace(
+            "Synthetic commit:", "All displayed values are synthetic fixture data. Commit:", 1)
+            .replace("Synthetic deployment:", "Deployment:", 1)
+            .replace("Synthetic serving:", "Serving:", 1))
+        grouped = check_mutation("one qualifier for adjacent role values", group_qualified,
+                                 "names_actual_synthetic_values", True)
+        self.assertEqual(grouped["synthetic_value_checks"],
+                         {key: True for key in ("commit", "deployment", "serving")})
+        unqualified = group_qualified.replace("All displayed values are synthetic fixture data. ", "", 1)
+        unqualified_checks = replay._first_report_checks(unqualified + marker + json_tail,
+                                                         tools, fixture)
+        self.assertEqual(unqualified_checks["synthetic_value_checks"],
+                         {key: False for key in ids})
+        self.assertFalse(unqualified_checks["report_has_substantive_closing_prose"])
+
+        denied = prose.replace("Completed the approved synthetic fixture follow-through",
+                               "Did not complete the approved synthetic fixture follow-through", 1)
+        denied_checks = replay._first_report_checks(denied + marker + json_tail, tools, fixture)
+        self.assertTrue(denied_checks["report_matches_fixture_facts"])
+        self.assertTrue(denied_checks["every_exact_artifact_was_read"])
+        self.assertTrue(denied_checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertFalse(denied_checks["prose_content_checks"]["explains_fixture_reason"])
+        self.assertFalse(denied_checks["report_has_substantive_closing_prose"])
+
+        operating_change = prose.replace(
+            "No real commit, PR, CI, deployment, production serving, or operating state was changed or measured.",
+            "Production serving was changed, but no CI run, PR, or deployment was changed or measured.", 1)
+        operating_checks = replay._first_report_checks(
+            operating_change + marker + json_tail, tools, fixture)
+        self.assertTrue(operating_checks["report_matches_fixture_facts"])
+        self.assertTrue(operating_checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertFalse(operating_checks["prose_content_checks"]
+                         ["states_fixture_skip_and_operating_limit"])
+        self.assertFalse(operating_checks["report_has_substantive_closing_prose"])
+
+        double_negative = prose.replace(
+            "Before: no follow-through file, action count 0.",
+            "Before: the follow-through file was not absent, action count 0.", 1)
+        double_negative_checks = replay._first_report_checks(
+            double_negative + marker + json_tail, tools, fixture)
+        self.assertFalse(double_negative_checks["prose_content_checks"]
+                         ["describes_before_state_and_zero_actions"])
+        reversed_state = prose.replace("Before: no follow-through file",
+                                       "Before: the follow-through file was present", 1)
+        reversed_checks = replay._first_report_checks(reversed_state + marker + json_tail,
+                                                      tools, fixture)
+        self.assertFalse(reversed_checks["prose_content_checks"]
+                         ["describes_before_state_and_zero_actions"])
+
+        failed_verification = prose.replace("passing 6 checks with 0 failures",
+                                            "failing 2 of 6 checks", 1)
+        failed_checks = replay._first_report_checks(failed_verification + marker + json_tail,
+                                                    tools, fixture)
+        self.assertFalse(failed_checks["prose_content_checks"]
+                         ["reports_six_check_verification_result"])
+        wrong_count = prose.replace("passing 6 checks with 0 failures",
+                                    "passing 5 checks with 0 failures", 1)
+        wrong_count_checks = replay._first_report_checks(wrong_count + marker + json_tail,
+                                                         tools, fixture)
+        self.assertFalse(wrong_count_checks["prose_content_checks"]
+                         ["reports_six_check_verification_result"])
+
+    def test_korean_absence_double_negation_and_denied_completion(self):
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        report = self._report_text(language="ko")
+        prose, json_tail = report.split(marker, 1)
+        tools = self._valid_tool_trace()
+
+        for name, old, new in (
+            ("did not exist", "후속 파일이 없고", "후속 파일이 존재하지 않았고"),
+            ("was not present", "후속 파일이 없고", "후속 파일이 있지 않았고"),
+        ):
+            with self.subTest(name=name):
+                mutated = prose.replace(old, new, 1)
+                checks = replay._first_report_checks(mutated + marker + json_tail,
+                                                     tools, self.fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["prose_content_checks"]
+                                ["describes_before_state_and_zero_actions"])
+                self.assertTrue(checks["report_has_substantive_closing_prose"])
+
+        for name, replacement in (
+            ("없지 않", "후속 파일이 없지 않았고"),
+            ("존재하지 않는 것은 아니다", "후속 파일이 존재하지 않는 것은 아니고"),
+        ):
+            with self.subTest(name=name):
+                mutated = prose.replace("후속 파일이 없고", replacement, 1)
+                checks = replay._first_report_checks(mutated + marker + json_tail,
+                                                     tools, self.fixture)
+                self.assertFalse(checks["prose_content_checks"]
+                                 ["describes_before_state_and_zero_actions"])
+                self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        denied = prose.replace(
+            "이미 승인된 후속 작업을 마치기 위해 정확한 결과를 읽고 처리했습니다.",
+            "이미 승인된 후속 작업을 완료하지 않았기 때문에 정확한 결과를 읽고 처리했습니다.", 1)
+        denied_checks = replay._first_report_checks(denied + marker + json_tail,
+                                                    tools, self.fixture)
+        self.assertFalse(denied_checks["prose_content_checks"]["explains_fixture_reason"])
+        self.assertFalse(denied_checks["report_has_substantive_closing_prose"])
+
+        operating_change = prose.replace(
+            "실제 운영 endpoint, 배포, commit, CI, PR 상태를 측정하거나 변경하지 않았습니다.",
+            "실제 운영 serving 상태는 변경되었지만 CI, PR 및 배포는 측정하거나 변경하지 않았습니다.", 1)
+        operating_checks = replay._first_report_checks(
+            operating_change + marker + json_tail, tools, self.fixture)
+        self.assertFalse(operating_checks["prose_content_checks"]
+                         ["states_fixture_skip_and_operating_limit"])
 
     def test_saved_previous_short_report_remains_negative_with_valid_facts(self):
         root, facts, fixture, sentinel = self._stored_report_fixture()

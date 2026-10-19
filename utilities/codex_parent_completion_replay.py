@@ -891,7 +891,8 @@ def _expected_identifier(field: str, value: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _identifier_is_asserted(sentence: str, field: str, identifier: str) -> bool:
+def _identifier_is_asserted(sentence: str, field: str, identifier: str,
+                            *, group_qualified: bool = False) -> bool:
     identifier_pattern = re.compile(
         rf"(?:(?<![A-Za-z0-9._:/-])|(?<=synthetic-only:))"
         rf"{re.escape(identifier)}(?![A-Za-z0-9_:/-])(?!\.[A-Za-z0-9])")
@@ -916,9 +917,11 @@ def _identifier_is_asserted(sentence: str, field: str, identifier: str) -> bool:
         relation = sentence[role_match.end():identifier_match.start()]
         if len(relation) > 72 or relation_pattern.search(relation) is None:
             continue
-        if not any(marker.end() <= identifier_match.start()
-                   and role_match.start() - 24 <= marker.start() <= role_match.start() + 24
-                   for marker in marker_pattern.finditer(sentence)):
+        local_qualifier = any(
+            marker.end() <= identifier_match.start()
+            and role_match.start() - 24 <= marker.start() <= role_match.start() + 24
+            for marker in marker_pattern.finditer(sentence))
+        if not local_qualifier and not group_qualified:
             continue
 
         before_role = sentence[max(0, role_match.start() - 24):role_match.start()]
@@ -935,39 +938,113 @@ def _identifier_is_asserted(sentence: str, field: str, identifier: str) -> bool:
     return False
 
 
+def _group_synthetic_qualifier(text: str) -> bool:
+    return _has_any(text, (
+        r"\ball\s+(?:of\s+)?(?:the\s+)?(?:displayed|listed|shown)\s+values?\b"
+        r".{0,48}\b(?:synthetic|fixture)\b",
+        r"\b(?:all|these)\s+values?\b.{0,48}\b(?:synthetic|fixture)\b",
+        r"모든\s*(?:표시된\s*)?값.{0,32}(?:합성|fixture)",
+    ))
+
+
 def _file_state(section: str, state: str) -> bool:
     text = section.casefold()
     target = r"(?:follow[- ]?through(?:\.json)?|file|파일|후속)"
+    negated_absence = _has_any(text, (
+        r"\bnot\s+(?:absent|missing|nonexistent|non-existent)\b",
+        r"\b(?:isn't|wasn't|aren't|weren't)\s+(?:absent|missing)\b",
+        r"없지\s*않|없지는\s*않|존재하지\s*않는\s*것은\s*아니|부재하지\s*않|누락되지\s*않",
+    ))
+    negated_presence = _has_any(text, (
+        r"\b(?:not|never)\s+(?:present|created|available|there)\b",
+        r"\b(?:did|does|do)\s+not\s+exist\b|\b(?:didn't|doesn't|don't)\s+exist\b",
+        r"\b(?:wasn't|isn't|aren't|weren't)\s+(?:present|created|available|there)\b",
+        r"생성되지|생성하지\s*않|있지\s*않|존재하지",
+    ))
+    absent = _has_any(text, (
+        r"\babsent\b|\bmissing\b",
+        r"\bno\s+(?:follow[- ]?through\s+)?file\b",
+        r"\b(?:did|does|do)\s+not\s+exist\b|\b(?:didn't|doesn't|don't)\s+exist\b",
+        r"\b(?:was|is|are|were)\s+not\s+(?:present|created|available|there)\b",
+        r"\b(?:wasn't|isn't|aren't|weren't)\s+(?:present|created|available|there)\b",
+        rf"{target}.{{0,24}}(?:없|존재하지|생성되지|만들어지지|있지\s*않)",
+        r"(?:없|존재하지|생성되지|만들어지지|있지\s*않).{0,24}" + target,
+    ))
+    present = _has_any(text, (
+        rf"{target}.{{0,32}}\b(?:present|exists|available|created|there)\b",
+        rf"\b(?:present|exists|available|created|there)\b.{{0,32}}{target}",
+        rf"{target}.{{0,24}}(?:생성|있|존재)",
+        rf"(?:생성|있|존재).{{0,24}}{target}",
+    ))
     if state == "absent":
-        if _has_any(text, (r"\bnot\s+absent\b", r"\bnot\s+missing\b",
-                           r"\b(?:did|does|do)\s+not\s+exist\b",
-                           r"\b(?:didn't|doesn't|don't)\s+exist\b",
-                           r"\b(?:was|is|are)\s+not\s+(?:present|created|available|there)\b",
-                           r"\b(?:wasn't|isn't|aren't)\s+(?:present|created|available|there)\b",
-                           r"(?:없지\s*않|존재하지\s*않는\s*것은\s*아니)",)):
+        if negated_absence or (present and not negated_presence):
             return False
-        return _has_any(text, (r"\babsent\b", r"\bmissing\b",
-                               r"\bno\s+(?:follow[- ]?through\s+)?file\b",
-                               r"\b(?:did|does|do)\s+not\s+exist\b",
-                               r"\b(?:didn't|doesn't|don't)\s+exist\b",
-                               r"\b(?:was|is|are)\s+not\s+(?:present|created|available|there)\b",
-                               r"\b(?:wasn't|isn't|aren't)\s+(?:present|created|available|there)\b",
-                               rf"{target}.{{0,24}}(?:없|존재하지|생성되지|만들어지지)",
-                               r"(?:없|존재하지|생성되지|만들어지지).{0,24}" + target))
-
+        return absent
     if state == "present":
-        negated = _has_any(text, (r"\b(?:not|never|no|without)\b.{0,32}"
-                                  r"(?:present|created|exists|available|there)",
-                                  r"\b(?:wasn't|isn't|aren't|didn't|doesn't)\b.{0,32}"
-                                  r"(?:present|created|exists|available|there)",
-                                  r"(?:생성되지|생성하지\s*않|있지\s*않|존재하지|없는\s*것은\s*아니)",))
-        if negated:
+        if negated_presence or absent:
             return False
-        return _has_any(text, (rf"{target}.{{0,32}}\b(?:present|exists|available|created|there)\b",
-                               rf"\b(?:present|exists|available|created|there)\b.{{0,32}}{target}",
-                               rf"{target}.{{0,24}}(?:생성|있|존재)",
-                               rf"(?:생성|있|존재).{{0,24}}{target}"))
+        return present
     raise ValueError(f"unsupported file state: {state}")
+
+
+def _completion_is_negated(text: str) -> bool:
+    return _has_any(text, (
+        r"\b(?:did|does|do|was|were|is|are|has|have|had)?\s*(?:not|never|didn't|doesn't|"
+        r"don't|wasn't|weren't|isn't|aren't)\s+(?:actually\s+)?"
+        r"(?:complete|completed|finish|finished|fulfill|fulfilled|perform|performed|"
+        r"execute|executed|carry\s+out)\b.{0,80}\b(?:follow[- ]?through|follow[- ]?up|"
+        r"continuation|(?:approved|requested)\s+(?:(?:synthetic|fixture)\s+)?task|"
+        r"(?:approved|requested)\s+replay)\b",
+        r"\b(?:follow[- ]?through|follow[- ]?up|continuation|"
+        r"(?:approved|requested)\s+(?:(?:synthetic|fixture)\s+)?task|"
+        r"(?:approved|requested)\s+replay)\b"
+        r".{0,64}\b(?:(?:was|were|is|are|has\s+been|have\s+been)\s+)?"
+        r"(?:not|never)\s+(?:completed|finished|fulfilled|performed|executed|carried\s+out)\b",
+        r"(?:후속|승인된\s*작업|요청한\s*작업).{0,48}(?:완료|마치|처리|수행)(?:하지|되지)\s*(?:않|못)",
+        r"(?:완료|마치|처리|수행)(?:하지|되지)\s*(?:않|못).{0,48}(?:후속|승인된\s*작업|요청한\s*작업)",
+    ))
+
+
+def _operating_limit_claims(prose: str) -> tuple[bool, bool]:
+    negative_patterns = (
+        r"\bno\b.{0,180}\b(?:production|operating|operational)\b.{0,120}"
+        r"\b(?:changed|measured|probed|altered|modified|deployed|served)\b",
+        r"\b(?:production|operating|operational)\b.{0,120}\b"
+        r"(?:was|were|is|are|has\s+been|have\s+been|did|does|do)?\s*"
+        r"(?:not|never|wasn't|weren't|isn't|aren't|didn't|doesn't|don't)\s+"
+        r"(?:change|changed|measure|measured|probe|probed|alter|altered|modify|modified)\b",
+        r"\b(?:production|operating|operational)\b.{0,80}\b(?:unchanged|unmodified|unmeasured)\b",
+        r"운영.{0,120}(?:변경|측정|조사|확인|배포|서빙).{0,24}(?:않|못|없)",
+        r"운영.{0,100}(?:변하지|측정되지|변경되지|조사되지|확인되지)\s*않",
+    )
+    activity = re.compile(
+        r"\b(?:change|changed|measure|measured|probe|probed|alter|altered|modify|modified|"
+        r"deploy|deployed|serve|served)\b|변경|측정|조사|확인", re.IGNORECASE)
+    subjects = re.compile(r"\b(?:production|operating|operational)\b|운영", re.IGNORECASE)
+    clauses = []
+    for sentence in _prose_sentences(prose):
+        clauses.extend(re.split(
+            r"\s+(?:but|however|although|whereas|yet|하지만|그러나|반면|다만)\s+|;\s*",
+            sentence, flags=re.IGNORECASE))
+
+    has_negative = False
+    has_positive = False
+    for clause in clauses:
+        if not _has_any(clause, (r"\b(?:production|operating|operational)\b|운영",)):
+            continue
+        if _has_any(clause, negative_patterns):
+            has_negative = True
+        for subject in subjects.finditer(clause):
+            for verb in activity.finditer(clause, subject.end(), min(len(clause), subject.end() + 180)):
+                between = clause[subject.end():verb.start()]
+                after = clause[verb.end():min(len(clause), verb.end() + 28)]
+                before = clause[max(0, subject.start() - 120):subject.start()]
+                negated = (_has_any(between, (r"\b(?:not|never|no|without)\b", r"않|못"))
+                           or _has_any(after, (r"\b(?:not|never)\b", r"않|못"))
+                           or _has_any(before, (r"\bno\b",)))
+                if not negated:
+                    has_positive = True
+    return has_negative, has_positive
 
 
 def _count_value(section: str, count_terms: str, value: int) -> bool:
@@ -988,8 +1065,10 @@ def _report_content_checks(prose: str, expected: dict) -> tuple[dict, dict]:
         (r"replay|requested task|parent|task|재현|요청한 작업|작업|부모",),
         (r"\bto\b|\bso\b|\bfor\b|\bafter\b|위해|목적|때문",),
     )
-    explains_reason = any(all(_has_any(window, patterns) for patterns in reason_parts)
-                          for window in windows)
+    explains_reason = any(
+        all(_has_any(window, patterns) for patterns in reason_parts)
+        and not _completion_is_negated(window)
+        for window in windows)
 
     count_terms = (r"action count|execution count|run count|follow[- ]?through count|"
                    r"실행 횟수|작업 횟수|행동 수|실행 수")
@@ -1003,19 +1082,20 @@ def _report_content_checks(prose: str, expected: dict) -> tuple[dict, dict]:
     number = r"(?<!\d)" + str(verification["checks_passed"]) + r"(?!\d)"
     six_words = r"\bsix\b|\b6\b|여섯|육"
     passed = r"\bpass(?:ed|ing)?\b|\bsucceed(?:ed|s)?\b|\bsuccessful\b|통과|성공"
-    no_failures = (r"\b0\s+(?:fail(?:ed|ure)?s?|failures?)\b|"
-                   r"\b(?:fail(?:ed|ure)?s?|failures?)\s*(?:=|:)\s*0\b|"
-                   r"\bno\s+failures?\b|\bzero\s+failures?\b|"
-                   r"실패(?:는|가|:)?\s*0|0건\s*실패|실패(?:가|는)?\s*없")
     pass_negation = (r"\b(?:not|never|did\s+not|didn't|failed\s+to)\s+"
                      r"(?:all\s+)?(?:the\s+)?(?:checks?\s+)?pass(?:ed)?\b|"
-                     r"통과하지\s*않|성공하지\s*않")
+                     r"\b(?:all\s+)?(?:six|6)\s+checks?\s+(?:did\s+not\s+pass|failed)\b|"
+                     r"통과하지\s*않|성공하지\s*않|모든\s*검사가\s*통과하지\s*않")
+    failure_claim = (r"\b[1-9]\d*\s+(?:checks?\s+)?(?:failed|failures?)\b|"
+                     r"\b(?:failed|failures?)\s*(?:=|:)?\s*[1-9]\d*\b|"
+                     r"\bchecks?\s+failed\b|\b(?:some|several|many)\s+checks?\s+failed\b|"
+                     r"[1-9]\d*건\s*실패|실패(?:했|하였|하였다|함)")
     reports_verification = any(
         _has_any(window, (r"verification|verified|verifier|checks?|검증",))
         and _has_any(window, (number, six_words))
         and _has_any(window, (passed,))
-        and _has_any(window, (no_failures,))
         and not _has_any(window, (pass_negation,))
+        and not _has_any(window, (failure_claim,))
         for window in windows)
 
     value_fields = {
@@ -1025,10 +1105,20 @@ def _report_content_checks(prose: str, expected: dict) -> tuple[dict, dict]:
     }
     identifiers = {key: _expected_identifier(key, value)
                    for key, value in value_fields.items()}
+    value_sentences = []
+    for paragraph in re.split(r"\n\s*\n", prose):
+        sentences = _raw_prose_sentences(paragraph)
+        qualified_indices = [index for index, sentence in enumerate(sentences)
+                             if _group_synthetic_qualifier(sentence)]
+        for index, sentence in enumerate(sentences):
+            group_qualified = any(abs(index - qualifier_index) <= 4
+                                  for qualifier_index in qualified_indices)
+            value_sentences.append((sentence, group_qualified))
     values_in_prose = {
         key: bool(identifier) and any(
-            _identifier_is_asserted(sentence, key, identifier)
-            for sentence in _raw_prose_sentences(prose))
+            _identifier_is_asserted(sentence, key, identifier,
+                                    group_qualified=group_qualified)
+            for sentence, group_qualified in value_sentences)
         for key, identifier in identifiers.items()
     }
 
@@ -1038,14 +1128,8 @@ def _report_content_checks(prose: str, expected: dict) -> tuple[dict, dict]:
         and _has_any(window, (r"deployment|deploy|배포|checks?|검사|확인",))
         and _has_any(window, (r"serving|서빙",))
         for window in windows)
-    no_operating_change = any(
-        _has_any(window, (r"production|operating|operational|운영",))
-        and _has_any(window, (
-            r"\bno\b[^.!?;]{0,180}\b(?:changed|measured|probed|altered|modified)\b",
-            r"\b(?:not|never|did\s+not|didn't)\s+(?:change|measure|probe|alter|modify)",
-            r"(?:변경|측정|조사|확인).{0,24}않|운영.{0,50}(?:변경|측정|조사).{0,12}없",
-        ))
-        for window in _prose_sentences(prose))
+    negative_operating_claim, positive_operating_change = _operating_limit_claims(prose)
+    no_operating_change = negative_operating_claim and not positive_operating_change
     replay_scope_limit = any(
         _has_any(window, (r"isolated|격리",))
         and _has_any(window, (r"replay|재현",))
