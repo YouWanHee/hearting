@@ -133,6 +133,37 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 utilities/dispatch_namespace_e2e.test.py -v
 
+      - name: Run pinned native Codex permission-profile tests
+        env:
+          HEARTING_REQUIRE_NATIVE_CODEX: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${RUNNER_TEMP}/hearting-codex-cli.XXXXXX")"
+          mkdir -m 700 "$work/bin" "$work/unpacked"
+          archive="$work/codex-x86_64-unknown-linux-musl.tar.gz"
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 300 \
+            --connect-timeout 20 --max-time 240 \
+            --output "$archive" \
+            https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-x86_64-unknown-linux-musl.tar.gz
+          printf '%s  %s\n' \
+            beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4 \
+            "$archive" | sha256sum --check --strict
+          tar --no-same-owner -xzf "$archive" -C "$work/unpacked"
+          executable="$(find "$work/unpacked" -type f \
+            \( -name codex -o -name codex-x86_64-unknown-linux-musl \) \
+            -print -quit)"
+          test -n "$executable"
+          install -m 700 "$executable" "$work/bin/codex"
+          version="$("$work/bin/codex" --version)"
+          printf 'Pinned native test CLI: %s\n' "$version"
+          case "$version" in
+            *0.163.0*) ;;
+            *) echo "Expected Codex CLI 0.163.0, got: $version" >&2; exit 1 ;;
+          esac
+          PATH="$work/bin:$PATH" python3 utilities/codex_permission_profile.test.py -v
+
   full-suite-shard:
     needs: adaptation-boundary
     if: needs.adaptation-boundary.outputs.full_tests == 'true'
