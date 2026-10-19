@@ -54,8 +54,7 @@ class Case1ParentSessionTest(unittest.TestCase):
             jobs = Path(td) / "jobs.log"
             handover = {"from": "codex-sid", "sid": successor_sid, "harness": successor_harness,
                         "bindings": [HANDOVER.binding_of(jobs, self.OWNER)], "ts": 1}
-            with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
-                 mock.patch.object(HANDOVER, "handover_rows", return_value=[handover]):
+            with mock.patch.object(HANDOVER, "_lineage_seats", return_value={"seat": [handover]}):
                 return RA.owns(self.OWNER, successor_sid, jobs)
 
     def test_the_registered_session_owns_its_route(self):
