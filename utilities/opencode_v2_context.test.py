@@ -183,6 +183,22 @@ class OpenCodeV2ContextTest(unittest.TestCase):
                     command="opencode-fixture",
                 )
 
+    def test_v2_rejects_a_final_api_limit_above_the_applied_cap(self):
+        before = model_info(context_limit=900000, input_limit=600000, output_limit=16000)
+        unchanged = model_info(context_limit=900000, input_limit=600000, output_limit=16000)
+        config = {"providers": {"fixture": {"models": {"catalog-name": {
+            "limit": {"context": 900000, "input": 600000, "output": 16000}}}}}}
+        responses = [self.server, self.model_response(before),
+                     self.server, self.model_response(unchanged)]
+        with mock.patch.object(context, "_installed_version", return_value="2.0.32"), \
+                mock.patch.object(context, "_api_json", side_effect=responses):
+            with self.assertRaisesRegex(context.OpenCodeContextError, "exceeds applied cap"):
+                context.prepare_launch_context(
+                    model="fixture/catalog-name", context_window="800000",
+                    config_content=json.dumps(config), cwd=str(self.cwd), environ={},
+                    command="opencode-fixture",
+                )
+
     def test_version_probe_uses_shared_parser_for_v_prefixed_output(self):
         completed = subprocess.CompletedProcess(
             ["opencode-fixture", "--version"], 0, "opencode v2.0.32\n", "",
