@@ -237,6 +237,16 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(record["receipt"], kwargs["receipt"])
         self.assertEqual(set(record), set(PD.REQUIRED_FIELDS) | {PD.TIMESTAMP_PROVENANCE_FIELD})
         self.assertIsNotNone(record[PD.TIMESTAMP_PROVENANCE_FIELD]["record_materialized_at_utc"])
+        path = PD.record_path(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(persisted), set(PD.REQUIRED_FIELDS))
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD, persisted)
+        self.assertEqual(
+            json.loads(PD.courier_retry_path(path).read_text(encoding="utf-8"))[
+                PD.TIMESTAMP_PROVENANCE_FIELD
+            ],
+            record[PD.TIMESTAMP_PROVENANCE_FIELD],
+        )
 
     def test_create_is_idempotent_o_excl_semantics(self):
         kwargs, first = self._create()
@@ -370,8 +380,9 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         did = self.kwargs["delivery_id"]
         path = PD.record_path(self.root, "sess-claim", did)
         raw = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(PD.read(self.root, "sess-claim", did), raw)
-        self.assertEqual(PD.create(**self.kwargs), raw)
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD, raw)
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         PD.create(**self.kwargs)[PD.TIMESTAMP_PROVENANCE_FIELD])
 
         now = time.time_ns()
         with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
@@ -380,9 +391,11 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
                 retry_context="target-a", retry_base_delay_seconds=2,
             )
         raw_claimed = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(claimed, raw_claimed)
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD, raw_claimed)
+        self.assertEqual(claimed[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD])
         self.assertNotIn("courier_retry", claimed)
-        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_claimed)
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], raw_claimed["state"])
 
         with unittest.mock.patch.object(PD.time, "time_ns", return_value=now):
             released = PD.release_claim(
@@ -390,10 +403,13 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
                 failure_reason="transport-timeout", retry_base_delay_seconds=2,
             )
         raw_released = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(released, raw_released)
+        released_record = dict(released)
+        self.assertIn(PD.TIMESTAMP_PROVENANCE_FIELD, released_record)
+        released_record.pop(PD.TIMESTAMP_PROVENANCE_FIELD)
+        self.assertEqual(released_record, raw_released)
         self.assertNotIn("courier_retry", released)
-        self.assertEqual(PD.create(**self.kwargs), raw_released)
-        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_released)
+        self.assertEqual(PD.create(**self.kwargs), released)
+        self.assertEqual(PD.read(self.root, "sess-claim", did), released)
 
         retry = self._retry_state()
         self.assertEqual(retry["failure_count"], 1)
@@ -406,7 +422,9 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
                     retry_context="target-a", retry_base_delay_seconds=2,
                 )
         self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
-        self.assertEqual(PD.read(self.root, "sess-claim", did), raw_released)
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], raw_released["state"])
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         released[PD.TIMESTAMP_PROVENANCE_FIELD])
         self.assertEqual(self._retry_state(), retry)
 
     def test_owner_release_persists_a_retry_deadline(self):
@@ -484,10 +502,16 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(acked[PD.TIMESTAMP_PROVENANCE_FIELD]["observed_send_count"], 1)
         self.assertEqual(acked[PD.TIMESTAMP_PROVENANCE_FIELD]["receive_source"],
                          "native-queue-consumed")
-        self.assertFalse(retry_path.exists())
+        self.assertTrue(retry_path.exists())
         persisted = json.loads(path.read_text(encoding="utf-8"))
         self.assertNotIn("courier_retry", persisted)
-        self.assertIn(PD.TIMESTAMP_PROVENANCE_FIELD, persisted)
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD, persisted)
+        metadata = json.loads(retry_path.read_text(encoding="utf-8"))
+        self.assertNotIn("retry", metadata)
+        self.assertEqual(metadata[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         acked[PD.TIMESTAMP_PROVENANCE_FIELD])
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         acked[PD.TIMESTAMP_PROVENANCE_FIELD])
 
     def test_changed_delivery_context_and_clock_rollback_clear_stale_wait(self):
         did = self.kwargs["delivery_id"]
@@ -541,6 +565,7 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(released["state"], "pending")
         raw = json.loads(path.read_text(encoding="utf-8"))
         self.assertNotIn("courier_retry", raw)
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD, raw)
         self.assertTrue(PD.courier_retry_path(path).is_file())
         self.assertEqual(old._validate_record(raw)["state"], "pending")
 
@@ -549,7 +574,44 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         old.claim(self.root, "sess-claim", did, claim_owner="old-reader", lease_seconds=30)
         consumed = old.ack(self.root, "sess-claim", did, acked_by="old-recipient-consumed")
         self.assertEqual(consumed["state"], "acked")
-        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], "acked")
+        read_back = PD.read(self.root, "sess-claim", did)
+        self.assertEqual(read_back["state"], "acked")
+        timeline = read_back[PD.TIMESTAMP_PROVENANCE_FIELD]
+        self.assertIsNotNone(timeline["record_materialized_at_utc"])
+        self.assertIsNone(timeline["receive_at_utc"])
+        self.assertEqual(timeline["observed_send_count"], 0)
+        self.assertNotIn(PD.TIMESTAMP_PROVENANCE_FIELD,
+                         json.loads(path.read_text(encoding="utf-8")))
+
+    def test_timestamp_metadata_is_identity_bound_and_retained_until_terminal_prune(self):
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        metadata_path = PD.courier_retry_path(path)
+        original_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        other_id = "delivery-" + "c" * 32
+        other_kwargs = dict(self.kwargs, delivery_id=other_id)
+        PD.create(**other_kwargs)
+        other_path = PD.record_path(self.root, "sess-claim", other_id)
+        other_metadata_path = PD.courier_retry_path(other_path)
+        other_metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
+        with self.assertRaises(PD.PendingDeliveryError) as ctx:
+            PD.read(self.root, "sess-claim", other_id)
+        self.assertEqual(ctx.exception.detail, "courier-retry-identity-invalid")
+
+        PD.claim(self.root, "sess-claim", did, claim_owner="terminal", lease_seconds=30)
+        PD.ack(self.root, "sess-claim", did, acked_by="recipient-consumed")
+        terminal_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertNotIn("retry", terminal_metadata)
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         terminal_metadata[PD.TIMESTAMP_PROVENANCE_FIELD])
+
+        old = time.time() - 10
+        os.utime(path, (old, old))
+        pruned = PD.prune(self.root, apply=True, now=time.time(), retention_seconds=1)
+        self.assertEqual(pruned["pruned_records"], 1)
+        self.assertFalse(path.exists())
+        self.assertFalse(metadata_path.exists())
 
     def test_retry_sidecar_survives_record_write_failure_without_acknowledging(self):
         did = self.kwargs["delivery_id"]
@@ -654,6 +716,7 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         legacy.pop(PD.TIMESTAMP_PROVENANCE_FIELD)
         legacy.pop("claim_authority")
         legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        PD.courier_retry_path(legacy_path).unlink()
         PD.claim(self.root, "sess-claim", legacy_kwargs["delivery_id"],
                  claim_owner="legacy-time", lease_seconds=30)
         observed = PD.record_send(self.root, "sess-claim", legacy_kwargs["delivery_id"],
