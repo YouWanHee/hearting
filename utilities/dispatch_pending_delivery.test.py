@@ -702,6 +702,96 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         self.assertGreater(metadata["retry"]["next_attempt_at_ns"], now)
         self.assertNotEqual(record["state"], "acked")
 
+    def _claim_with_live_retry(self):
+        did = self.kwargs["delivery_id"]
+        path = PD.record_path(self.root, "sess-claim", did)
+        retry_path = PD.courier_retry_path(path)
+        timeline_path = PD.courier_timeline_path(path)
+        failed_at = time.time_ns()
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=failed_at):
+            PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=30)
+            PD.release_claim(
+                self.root, "sess-claim", did, claim_owner="first",
+                failure_reason="transport-timeout", retry_base_delay_seconds=2,
+            )
+        retry_bytes = retry_path.read_bytes()
+        retry_metadata = json.loads(retry_bytes)
+        retry = retry_metadata["retry"]
+        with unittest.mock.patch.object(
+                PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] + 1):
+            claimed = PD.claim(
+                self.root, "sess-claim", did, claim_owner="terminal", lease_seconds=30,
+                retry_base_delay_seconds=2,
+            )
+        return path, retry_path, timeline_path, claimed, retry_bytes, retry
+
+    def test_terminal_ack_record_write_failure_preserves_retry_until_commit(self):
+        did = self.kwargs["delivery_id"]
+        path, retry_path, timeline_path, claimed, retry_bytes, retry = \
+            self._claim_with_live_retry()
+        self.assertGreater(retry["failure_count"], 0)
+        self.assertGreater(retry["next_attempt_at_ns"], retry["last_failure_at_ns"])
+        record_bytes = path.read_bytes()
+
+        real_replace = PD.os.replace
+
+        def fail_record_replace(source, destination):
+            if Path(destination) == path:
+                raise OSError("simulated terminal record CAS write failure")
+            return real_replace(source, destination)
+
+        with unittest.mock.patch.object(PD.os, "replace", side_effect=fail_record_replace):
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.ack(self.root, "sess-claim", did, acked_by="recipient-consumed")
+
+        self.assertEqual(path.read_bytes(), record_bytes)
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], "claimed")
+        self.assertEqual(retry_path.read_bytes(), retry_bytes)
+
+        PD.reclaim(self.root, "sess-claim", did, now_ns=claimed["claim_deadline_ns"])
+        self.assertEqual(retry_path.read_bytes(), retry_bytes)
+        early = retry["last_failure_at_ns"] + (
+            retry["next_attempt_at_ns"] - retry["last_failure_at_ns"]
+        ) // 2
+        with unittest.mock.patch.object(PD.time, "time_ns", return_value=early):
+            with self.assertRaises(PD.PendingDeliveryError) as caught:
+                PD.claim(self.root, "sess-claim", did, claim_owner="too-early", lease_seconds=30)
+        self.assertEqual(caught.exception.reason, "pending-delivery-retry-deferred")
+
+        with unittest.mock.patch.object(
+                PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] + 1):
+            PD.claim(self.root, "sess-claim", did, claim_owner="retry", lease_seconds=30,
+                     retry_base_delay_seconds=2)
+            acked = PD.ack(self.root, "sess-claim", did, acked_by="recipient-consumed")
+        self.assertEqual(acked["state"], "acked")
+        self.assertFalse(retry_path.exists())
+        self.assertTrue(timeline_path.is_file())
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[PD.TIMESTAMP_PROVENANCE_FIELD],
+                         json.loads(timeline_path.read_text(encoding="utf-8"))[
+                             PD.TIMESTAMP_PROVENANCE_FIELD])
+
+    def test_terminal_retry_cleanup_failure_keeps_committed_ack(self):
+        did = self.kwargs["delivery_id"]
+        path, retry_path, timeline_path, _claimed, _retry_bytes, _retry = \
+            self._claim_with_live_retry()
+        real_unlink = Path.unlink
+
+        def fail_retry_unlink(target, *args, **kwargs):
+            if target == retry_path:
+                raise OSError("simulated retry cleanup failure")
+            return real_unlink(target, *args, **kwargs)
+
+        with unittest.mock.patch.object(Path, "unlink", fail_retry_unlink):
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.ack(self.root, "sess-claim", did, acked_by="recipient-consumed")
+
+        self.assertEqual(PD.read(self.root, "sess-claim", did)["state"], "acked")
+        self.assertTrue(retry_path.is_file())
+        self.assertTrue(timeline_path.is_file())
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, "sess-claim", did, claim_owner="must-not-redeliver",
+                     lease_seconds=30)
+
 
     def test_first_claim_succeeds_second_is_refused(self):
         first = PD.claim(

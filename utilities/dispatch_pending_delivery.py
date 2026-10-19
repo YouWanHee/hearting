@@ -519,8 +519,18 @@ def _record_received(value: dict, source: str) -> dict:
     return result
 
 
+def _remove_courier_retry_unlocked(path: Path) -> None:
+    try:
+        courier_retry_path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+
+
 def _write_delivery_metadata_unlocked(path: Path, record: dict, retry: dict | None,
-                                      timeline: dict | None) -> None:
+                                      timeline: dict | None, *,
+                                      defer_retry_cleanup: bool = False) -> None:
     identity = {
         "delivery_id": record["delivery_id"],
         "recipient_digest": record["recipient_digest"],
@@ -528,12 +538,8 @@ def _write_delivery_metadata_unlocked(path: Path, record: dict, retry: dict | No
     }
     retry_path = courier_retry_path(path)
     if retry is None:
-        try:
-            retry_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+        if not defer_retry_cleanup:
+            _remove_courier_retry_unlocked(path)
     else:
         _atomic_write_json(retry_path, {
             "schema_version": COURIER_RETRY_SCHEMA,
@@ -578,9 +584,12 @@ def _write_unlocked(path: Path, record: dict) -> None:
         # State-only transitions (for example claimed -> sent-ambiguous) keep
         # an existing retry deadline while refreshing the timing sidecar.
         retry = _read_courier_retry_unlocked(path, record)
-    _write_delivery_metadata_unlocked(path, record, retry, timeline)
+    _write_delivery_metadata_unlocked(
+        path, record, retry, timeline, defer_retry_cleanup=terminal)
     _validate_record(persisted)
     _atomic_write_json(path, persisted)
+    if terminal:
+        _remove_courier_retry_unlocked(path)
 
 
 def _retry_context_digest(context: str | None) -> str | None:
