@@ -335,6 +335,40 @@ class Expiry(Fixture):
         self.assertEqual(self.sweep(9)["removed"], 1)
         self.assertFalse(split.exists())
 
+    def test_external_read_only_cache_link_does_not_block_home_removal_or_remove_target(self):
+        home = self.add("att-external-cache-link")
+        (home / "plugins/cache/catalog").mkdir(parents=True)
+        (home / "plugins/cache/catalog/index.json").write_text('{"fixture":true}')
+        (home / "cache/remote_plugin_catalog").mkdir(parents=True)
+        (home / "cache/remote_plugin_catalog/catalog.json").write_text('{"fixture":true}')
+
+        shared = self.root / "homes/shared/opencode-sdk/lock-id/node_modules"
+        shared.mkdir(parents=True)
+        payload = shared / "package.js"
+        payload.write_text("immutable fixture bytes")
+        (home / "node_modules").symlink_to(shared, target_is_directory=True)
+
+        def restore_permissions():
+            for parent, dirs, files in os.walk(shared):
+                Path(parent).chmod(0o700)
+                for name in files:
+                    (Path(parent) / name).chmod(0o600)
+            shared.chmod(0o700)
+        self.addCleanup(restore_permissions)
+        for parent, dirs, files in os.walk(shared):
+            for name in files:
+                (Path(parent) / name).chmod(0o444)
+            for name in dirs:
+                (Path(parent) / name).chmod(0o555)
+        shared.chmod(0o555)
+
+        result = self.expire()
+
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(home.exists())
+        self.assertEqual(payload.read_text(), "immutable fixture bytes")
+        self.assertEqual(payload.stat().st_mode & 0o222, 0)
+
 
 class EndedTimestamp(Fixture):
     def _row(self, timestamp, log_file=""):

@@ -612,7 +612,8 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         origins = sorted({str(folder / name) for folder in (source, original_config_dir)
                           for name in ('hooks.json', 'config.toml')})
         values['HEARTING_CODEX_HOOK_SOURCES'] = json.dumps(origins)
-        overrides = ['features.apps=false', 'features.multi_agent=false',
+        # Disabled plugin entries still sync their payloads unless the global feature is off.
+        overrides = ['features.apps=false', 'features.plugins=false', 'features.multi_agent=false',
                      'features.default_mode_request_user_input=false', 'agents.enabled=false']
         def toml_value(value):
             if isinstance(value, bool):
