@@ -1244,8 +1244,10 @@ def _attempt_summary_sid(job):
 def _note_home_view(job, jobs_path=None):
     """Admit a displayed native home; mark an actual retention candidate.
 
-    A candidate's marker (at most one write per home per hour) keeps retention
-    from detaching it during a read. Excluded homes need no retention writes.
+    A candidate's marker (at most one write per home per five minutes) keeps
+    retention from detaching it during a read. An admitted read using a cached
+    marker retains at least 55 minutes of the one-hour view window. Excluded
+    homes need no retention writes.
     Only displayed rows call this, so dropped historical rows never pin a home.
     """
     home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
