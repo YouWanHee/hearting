@@ -4,6 +4,7 @@ import fcntl
 import os
 from pathlib import Path
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -839,23 +840,44 @@ class DispatchSummaryTest(unittest.TestCase):
         root.mkdir()
         log = Path(self.tmp.name) / f"review.{attempt}.codex.jsonl"
         log.write_text("", encoding="utf-8")
-        target = subprocess.Popen(["sleep", "0.5"], start_new_session=True)
-        owner_pid = None
+        target = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            start_new_session=True,
+        )
+        summary_owners = []
+        real_popen = subprocess.Popen
+
+        def track_summary_owner(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            summary_owners.append(process)
+            return process
+
         try:
             start = S.process_observation(target.pid)[1]
-            receipt = S.launch_summary_owner(
-                attempt_id=attempt, harness="codex", transcript=log,
-                target_pid=target.pid, target_start=start,
-                review_artifact_root=root, review_cycle_id=cycle,
-                review_lease_nonce=nonce,
+            with mock.patch.object(
+                S.subprocess, "Popen", side_effect=track_summary_owner
+            ):
+                receipt = S.launch_summary_owner(
+                    attempt_id=attempt, harness="codex", transcript=log,
+                    target_pid=target.pid, target_start=start,
+                    review_artifact_root=root, review_cycle_id=cycle,
+                    review_lease_nonce=nonce,
+                )
+            self.assertEqual(len(summary_owners), 1)
+            self.assertEqual(
+                summary_owners[0].pid, int(receipt["summary_owner_pid"])
             )
-            owner_pid = int(receipt["summary_owner_pid"])
             metadata = {
                 "attempt_id": attempt, "review_cycle_id": cycle,
                 "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
                 "review_governed_lease_nonce": nonce,
             }
             self.assertTrue(D.review_governed_lease_is_held(root, metadata))
+            self.assertIsNone(target.poll())
+            target.stdin.write(b"release\n")
+            target.stdin.flush()
+            target.stdin.close()
             target.wait(timeout=5)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -863,21 +885,26 @@ class DispatchSummaryTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertFalse(D.review_governed_lease_is_held(root, metadata))
-            os.waitpid(owner_pid, 0)
-            owner_pid = None
         finally:
-            if target.poll() is None:
-                os.killpg(target.pid, 15)
-                target.wait(timeout=5)
-            if owner_pid is not None:
+            if target.stdin is not None and not target.stdin.closed:
                 try:
-                    os.killpg(owner_pid, 15)
-                except ProcessLookupError:
+                    target.stdin.close()
+                except BrokenPipeError:
                     pass
+            for process in (target, *summary_owners):
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 try:
-                    os.waitpid(owner_pid, 0)
-                except ChildProcessError:
-                    pass
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
 
 
 if __name__ == "__main__":
