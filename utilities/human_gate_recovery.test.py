@@ -483,8 +483,20 @@ class M4LeaseRecovery(GatewayFixture):
         with mock.patch.object(PD.time, "monotonic_ns", return_value=self.clock):
             old = PD.claim(self.f.jobs.parent, self.f.thread_id, self.f.delivery_id,
                            claim_owner="old-watcher", lease_seconds=1, require_generation_proof=True)
+        raw_after_claim = self.path.read_bytes()
+        timeline_path = PD.courier_timeline_path(self.path)
+        timeline_after_claim = timeline_path.read_bytes()
+        self.assertEqual(
+            json.loads(timeline_after_claim)[PD.TIMESTAMP_PROVENANCE_FIELD],
+            old[PD.TIMESTAMP_PROVENANCE_FIELD],
+        )
         self.one()
-        self.assertEqual(self.record(), old)
+        self.assertEqual(self.path.read_bytes(), raw_after_claim)
+        self.assertEqual(timeline_path.read_bytes(), timeline_after_claim)
+        self.assertEqual(
+            json.loads(timeline_path.read_bytes())[PD.TIMESTAMP_PROVENANCE_FIELD],
+            old[PD.TIMESTAMP_PROVENANCE_FIELD],
+        )
         self.assertEqual(self.transport_calls, 0)
         self.clock += 2_000_000_000  # Change the observed clock, never fake the reclaim argument.
         self.state.steer_ready = True

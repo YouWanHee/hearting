@@ -345,6 +345,14 @@ class NoticeWatcher:
                     client_message_id=claimed["delivery_id"], message=values[0],
                     timeout=5.0,
                 )
+                if queue_result.get("status") == "queued" and not queue_result.get("already_pending"):
+                    try:
+                        pending_delivery.record_send(
+                            self.root, self.recipient, claimed["delivery_id"],
+                            source="codex-native-queue-notice-accepted",
+                            event_id=str(queue_result.get("queued_submission_id") or claimed["delivery_id"]))
+                    except (pending_delivery.PendingDeliveryError, OSError):
+                        pass  # Timing is evidence, never delivery or execution authority.
                 if queue_result.get("status") == "consumed":
                     pending_delivery.ack(self.root, self.recipient, claimed["delivery_id"],
                                          acked_by=self.owner)
@@ -1029,31 +1037,73 @@ def _native_queue_delivery_once(
                                    jobs=args.jobs, retry_context=target,
                                    retry_base_delay_seconds=retry_base)
             claimed.append(delivery_id)
-        if target != args.thread_id and codex_queue_delivery._known_consumed(
-                path, args.thread_id, client_message_id, timeout=5.0,
-                **transport) is not None:
+        turn_thread = target
+        send_observed = False
+        consumed = (codex_queue_delivery._known_consumed(
+            path, args.thread_id, client_message_id, timeout=5.0,
+            strict_history=True, expected_message=context, **transport)
+            if target != args.thread_id else None)
+        if consumed is not None:
             # The item already reached the cleared window's thread before the handover.
-            result = {"status": "consumed"}
+            result = {"status": "consumed", "turn_id": consumed.get("id"),
+                      "turn_status": consumed.get("status")}
+            turn_thread = args.thread_id
         elif allow_enqueue:
             result = codex_queue_delivery.send_at_least_once(
                 path, thread_id=target, client_message_id=client_message_id,
-                message=context, timeout=5.0, **transport)
-        elif codex_queue_delivery._known_consumed(
-                path, target, client_message_id, timeout=5.0, **transport) is not None:
-            result = {"status": "consumed"}
+                message=context, timeout=5.0, require_message_match=True, **transport)
+            send_observed = (result.get("status") == "queued"
+                             and not result.get("already_pending"))
         else:
-            # An item still waiting in the old thread's queue cannot be moved (the local queue API
-            # has no move/remove): it is never restarted there; the successor gets the same record.
-            result = codex_queue_delivery.poll_owned_item(
-                path, thread_id=target, client_message_id=client_message_id, timeout=5.0,
-                **transport)
-            result["status"] = "queued"
+            consumed = codex_queue_delivery._known_consumed(
+                path, target, client_message_id, timeout=5.0, strict_history=True,
+                expected_message=context, **transport)
+            if consumed is not None:
+                result = {"status": "consumed", "turn_id": consumed.get("id"),
+                          "turn_status": consumed.get("status")}
+            else:
+                # An item still waiting in the old thread's queue cannot be moved (the local queue API
+                # has no move/remove): it is never restarted there; the successor gets the same record.
+                result = codex_queue_delivery.poll_owned_item(
+                    path, thread_id=target, client_message_id=client_message_id, timeout=5.0,
+                    **transport)
+                result["status"] = "queued"
 
         if result["status"] == "consumed":
+            turn_id = result.get("turn_id")
+            turn_status = result.get("turn_status")
+            retained = bool(isinstance(turn_id, str) and turn_id and isinstance(turn_status, str))
+            if retained:
+                from peer_obligations import retain_registered_completion
+                receiving_turn = {"thread_id": turn_thread, "turn_id": turn_id,
+                                  "status": turn_status}
+                for row, record in zip(rows, records):
+                    if not retain_registered_completion(
+                            args.jobs, row.attempt_id, turn_thread, "codex-native-queue",
+                            delivery_record={**record, "_storage_key": args.thread_id},
+                            receiving_turn=receiving_turn):
+                        retained = False
+                        break
+            if not retained:
+                for delivery_id in claimed:
+                    pending_delivery.mark_sent_ambiguous(
+                        root, args.thread_id, delivery_id, claim_owner=claim_owner)
+                return {"schema_version": 1, "status": "sent-ambiguous",
+                        "reason": "native-receiving-turn-retain-unavailable",
+                        "submitted": True, "thread_id": args.thread_id,
+                        "client_user_message_id": client_message_id}
             for delivery_id in claimed:
                 pending_delivery.ack(root, args.thread_id, delivery_id, acked_by=acked_by)
             return {"schema_version": 1, "status": "accepted",
                     "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+        if send_observed:
+            for delivery_id in claimed:
+                try:
+                    pending_delivery.record_send(
+                        root, args.thread_id, delivery_id,
+                        source="codex-native-queue-accepted", event_id=client_message_id)
+                except (pending_delivery.PendingDeliveryError, OSError):
+                    pass  # Timestamp evidence is advisory and never changes delivery acceptance.
         for delivery_id in claimed:
             pending_delivery.mark_sent_ambiguous(
                 root, args.thread_id, delivery_id, claim_owner=claim_owner)
@@ -1316,6 +1366,44 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     duty_id = getattr(args, "_obligation_id", None)
     obligation = batch_obligations.read(args.jobs, duty_id) if duty_id else None
     normalized = obligation.get("outcome") if obligation else None
+    if duty_id and normalized is None and args.parent_session_id:
+        # A native prompt may have rendered and exactly ACKed the immutable
+        # receipt before this observer stored its outcome. Recover that receipt
+        # before entering cleanup/join; the receiver's registered-turn duty
+        # remains responsible for review and follow-through.
+        from dispatch_completion_join import recover_acknowledged_batch_outcome
+        effective = set((obligation or {}).get("effective_attempts") or attempts)
+        recovered = recover_acknowledged_batch_outcome(
+            args.jobs, effective, recipient_sid=args.parent_session_id,
+            parent_attempt_id=delivery_parent_id(args),
+            parent_completion_delivery=(CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                                        else MANAGED_SESSION_PARENT_DELIVERY),
+        )
+        if recovered is not None:
+            if _observer_ownership_lost(args):
+                raise ObserverOwnershipLost("completion-observer-ownership-lost")
+            current = batch_obligations.read(args.jobs, duty_id) or {}
+            if current.get("outcome") is None:
+                _update_duty(args, duty_id, state="delivery-pending",
+                    reason="exact-receipt-ack-recovered", delivery="accepted",
+                    outcome=recovered, effective_attempts=sorted(effective))
+            obligation = batch_obligations.read(args.jobs, duty_id) or obligation
+            normalized = obligation.get("outcome") if obligation else recovered
+    if duty_id and normalized is not None and args.parent_session_id:
+        from dispatch_completion_join import current_batch_receipt_projection
+        effective = set((obligation or {}).get("effective_attempts") or attempts)
+        current_receipt = current_batch_receipt_projection(
+            args.jobs, effective, recipient_sid=args.parent_session_id,
+            parent_attempt_id=delivery_parent_id(args),
+            parent_completion_delivery=(CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                                        else MANAGED_SESSION_PARENT_DELIVERY),
+        )
+        if (current_receipt is None
+                or canonical_receipt_digest(current_receipt) != canonical_receipt_digest(normalized)):
+            _update_duty(args, duty_id, state="unknown", reason="cached-outcome-identity-unavailable",
+                         delivery="pending", effective_attempts=sorted(effective))
+            return {"schema_version": 1, "status": "retryable",
+                    "reason": "cached-outcome-identity-unavailable"}, 75
     if normalized is None:
         wait_for_session_launch_claims(args, attempts)
         watcher: HumanGateWatcher | None = None

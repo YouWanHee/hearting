@@ -521,6 +521,74 @@ def _slot(route, node, rows, jobs=None):
     return aid
 
 
+def _harvest_unread_blocked_owner(route, jobs, run):
+    """Consume the exact BLOCKED receipt before normal route continuation."""
+    rows = _rows(jobs)
+    aid = _slot(route, "owner", rows, jobs)
+    if aid not in rows:
+        return None
+    status, metadata = rows[aid]
+    carrier = metadata.get("parent_completion_delivery", "")
+    if (status != "done" or not carrier or metadata.get("delivery_intent") != "1"
+            or metadata.get("parent_completion_harvested") == "1"
+            or route_authority.answerable_owner_end(status, metadata) != "BLOCKED"):
+        return None
+    if not metadata.get("parent_sid") or not metadata.get("attempt_id"):
+        return {"ok": False, "attempt_id": aid, "reason": "blocked-result-identity-incomplete"}
+    from dispatch_contract import terminal_conflict_pending
+    if terminal_conflict_pending(metadata):
+        return {"ok": False, "attempt_id": aid, "reason": "terminal-evidence-conflict"}
+    if carrier != "codex-stop-hook":
+        try:
+            from dispatch_completion_join import acknowledged_attempt_receipt, current_attempt_row
+            from dispatch_seat_handover import effective_parent
+            current = current_attempt_row(Path(jobs), aid)
+            if (current is None or current.status != "done"
+                    or current.metadata.get("note") != metadata.get("note")
+                    or current.metadata.get("parent_sid") != metadata.get("parent_sid")
+                    or current.metadata.get("delivery_id") != metadata.get("delivery_id")):
+                return {"ok": False, "attempt_id": aid,
+                        "reason": "blocked-result-harvest-binding-changed"}
+            recipient = effective_parent(current.metadata, Path(jobs))
+            if not recipient or not current.metadata.get("delivery_id"):
+                return {"ok": False, "attempt_id": aid,
+                        "reason": "blocked-result-receipt-identity-incomplete"}
+            receipt = acknowledged_attempt_receipt(Path(jobs), aid, recipient_sid=recipient,
+                parent_completion_delivery=carrier)
+            if receipt is None:
+                # ACK recovery is optional for modern carriers. Normal start
+                # already inspects the exact terminal owner and applies its
+                # stored-answer/parent-authority path. A missing transport ACK
+                # must not become a new prerequisite for that continuation.
+                return None
+            return {"ok": True, "attempt_id": aid, "status": "exact-result-consumed"}
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            return {"ok": False, "attempt_id": aid,
+                    "reason": "blocked-result-harvest-unavailable", "detail": str(exc)[:160]}
+    command = [sys.executable, str(ROOT / "adapters/codex/bin/dispatch-harvest.py"),
+               "--jobs", str(Path(jobs).resolve()), "--attempt-id", aid, "--status", "all"]
+    env = {**os.environ, "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(Path(jobs).resolve())}
+    try:
+        result = run(command, cwd=str(ROOT), env=env, text=True, capture_output=True,
+                     check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "attempt_id": aid, "reason": "blocked-result-harvest-unavailable",
+                "detail": str(exc)[:160]}
+    if result.returncode != 0 or "parent_completion_receipt=consumed" not in (result.stdout or ""):
+        reason = next((line.partition("=")[2] for line in (result.stdout or "").splitlines()
+                       if line.startswith("reason=")), "exact-harvest-unconfirmed")
+        return {"ok": False, "attempt_id": aid, "reason": reason,
+                "detail": (result.stderr or "").strip()[:160]}
+    latest = _rows(jobs).get(aid)
+    if (latest is None or latest[0] != "done"
+            or latest[1].get("parent_completion_harvested") != "1"
+            or latest[1].get("note") != metadata.get("note")
+            or latest[1].get("parent_sid") != metadata.get("parent_sid")
+            or latest[1].get("delivery_id") != metadata.get("delivery_id")):
+        return {"ok": False, "attempt_id": aid, "reason": "blocked-result-harvest-binding-changed"}
+    return {"ok": True, "attempt_id": aid, "status": "exact-result-consumed"}
+
+
 def _start(route, path, jobs, node, harness, run):
     command = [sys.executable, str(ROOT / "utilities/dispatch-owner.py"), "--start",
                "--route-evidence", str(path), "--jobs", str(jobs),
@@ -1660,6 +1728,18 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                                       "outcome": closed,
                                       **({"completion_delivery": delivery} if delivery else {}),
                                       **({"shared_publication": publication} if publication is not None else {})})
+    harvested = _harvest_unread_blocked_owner(route, jobs, run)
+    if harvested is not None:
+        if not harvested["ok"]:
+            return {**result, "state": "needs-attention",
+                    "reason": "blocked-result-harvest-unconfirmed",
+                    "blocked_result_harvest": harvested,
+                    "required_action": "inspect-recovery",
+                    "next_step": "The normal start attempted the exact BLOCKED-result harvest, but its receipt "
+                        "could not be confirmed. The result and any stored answer remain unchanged. Resolve the "
+                        "reported identity or receipt condition and use the same normal start; no separate harvest "
+                        "command or new answer is needed."}
+        result["blocked_result_harvest"] = harvested
     handoff = _owner_pin_handoff(route, path, jobs, result)
     if handoff is not None:
         return handoff

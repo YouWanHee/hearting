@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+import datetime
 import fcntl
 import hashlib
 import json
@@ -116,6 +117,13 @@ REQUIRED_FIELDS = (
     "last_attempt_at_ns", "acked_at_ns", "acked_by", "expiry_reason", "lineage",
 )
 RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
+TIMESTAMP_PROVENANCE_FIELD = "timestamp_provenance"
+TIMESTAMP_PROVENANCE_KEYS = frozenset({
+    "record_materialized_at_utc", "record_materialized_source",
+    "first_send_at_utc", "first_send_source", "last_send_at_utc", "last_send_source",
+    "last_send_event_id",
+    "receive_at_utc", "receive_source", "observed_send_count", "observed_redelivery_count",
+})
 COURIER_RETRY_FIELD = "courier_retry"
 COURIER_RETRY_FIELDS = frozenset({
     "schema_version", "context_digest", "failure_digest", "failure_count",
@@ -124,6 +132,8 @@ COURIER_RETRY_FIELDS = frozenset({
 COURIER_RETRY_SCHEMA = 1
 COURIER_RETRY_MAX_SECONDS = 15.0
 COURIER_RETRY_SUFFIX = ".courier-retry"
+COURIER_TIMELINE_SCHEMA = 1
+COURIER_TIMELINE_SUFFIX = ".courier-timeline"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
@@ -152,9 +162,15 @@ def record_path(root: Path, recipient_key: str, delivery_id: str) -> Path:
 
 
 def courier_retry_path(path: Path) -> Path:
-    """The retry metadata is invisible to readers scanning ``delivery-*.json``."""
+    """Optional retry state stays outside legacy public records."""
 
     return Path(path).with_name(Path(path).name + COURIER_RETRY_SUFFIX)
+
+
+def courier_timeline_path(path: Path) -> Path:
+    """Optional timestamp provenance stays outside legacy public records."""
+
+    return Path(path).with_name(Path(path).name + COURIER_TIMELINE_SUFFIX)
 
 
 def _validate_courier_retry(retry: object) -> dict:
@@ -198,7 +214,9 @@ def _validate_record(value: object) -> dict:
             value.get("recipient_kind"), _LEGACY_CLAIM_AUTHORITY_DEFAULT
         )
         keys = set(value)
-    optional_fields = RECOVERY_AUDIT_FIELDS | {COURIER_RETRY_FIELD}
+    optional_fields = RECOVERY_AUDIT_FIELDS | {
+        TIMESTAMP_PROVENANCE_FIELD, COURIER_RETRY_FIELD,
+    }
     if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - optional_fields:
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
     if value.get("schema_version") != SCHEMA_VERSION:
@@ -230,6 +248,8 @@ def _validate_record(value: object) -> dict:
         or value["expired_at_ns"] < 1
     ):
         raise PendingDeliveryError("delivery-persistence-refused", "recovery-audit-invalid")
+    if TIMESTAMP_PROVENANCE_FIELD in value:
+        _validate_timestamp_provenance(value[TIMESTAMP_PROVENANCE_FIELD])
     return value
 
 
@@ -285,7 +305,12 @@ def _read_unlocked(path: Path) -> dict | None:
         value = json.loads(raw)
     except ValueError as exc:
         raise PendingDeliveryError("delivery-persistence-refused", "corrupt-record") from exc
-    return _validate_record(value)
+    value = _validate_record(value)
+    timeline = _read_timestamp_provenance_unlocked(path, value)
+    if timeline is not None:
+        value = dict(value)
+        value[TIMESTAMP_PROVENANCE_FIELD] = timeline
+    return value
 
 
 def _public_record(value: dict) -> dict:
@@ -337,31 +362,85 @@ def _courier_retry_identity_digest(record: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
-    """Read retry state bound to this record; legacy inline state is migrated on write."""
-
+def _read_delivery_metadata_unlocked(path: Path, record: dict) -> dict | None:
     metadata_path = courier_retry_path(path)
     try:
         raw = metadata_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        legacy = record.get(COURIER_RETRY_FIELD)
-        return _validate_courier_retry(legacy) if legacy is not None else None
+        return None
     except OSError as exc:
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
     try:
         metadata = json.loads(raw)
     except ValueError as exc:
         raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-corrupt") from exc
+    required = {"schema_version", "delivery_id", "recipient_digest", "identity_digest"}
+    optional = {"retry", TIMESTAMP_PROVENANCE_FIELD}
     if (not isinstance(metadata, dict)
-            or set(metadata) != {
-                "schema_version", "delivery_id", "recipient_digest", "identity_digest", "retry",
-            }
+            or not required <= set(metadata)
+            or set(metadata) - required - optional
+            or not (set(metadata) & optional)
             or metadata.get("schema_version") != COURIER_RETRY_SCHEMA
             or metadata.get("delivery_id") != record.get("delivery_id")
             or metadata.get("recipient_digest") != record.get("recipient_digest")
             or metadata.get("identity_digest") != _courier_retry_identity_digest(record)):
         raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-identity-invalid")
-    return _validate_courier_retry(metadata["retry"])
+    if "retry" in metadata:
+        _validate_courier_retry(metadata["retry"])
+    if TIMESTAMP_PROVENANCE_FIELD in metadata:
+        _validate_timestamp_provenance(metadata[TIMESTAMP_PROVENANCE_FIELD])
+    return metadata
+
+
+def _read_courier_timeline_unlocked(path: Path, record: dict) -> dict | None:
+    metadata_path = courier_timeline_path(path)
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    try:
+        metadata = json.loads(raw)
+    except ValueError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused",
+                                   "courier-timeline-corrupt") from exc
+    if (not isinstance(metadata, dict)
+            or set(metadata) != {
+                "schema_version", "delivery_id", "recipient_digest", "identity_digest",
+                TIMESTAMP_PROVENANCE_FIELD,
+            }
+            or metadata.get("schema_version") != COURIER_TIMELINE_SCHEMA
+            or metadata.get("delivery_id") != record.get("delivery_id")
+            or metadata.get("recipient_digest") != record.get("recipient_digest")
+            or metadata.get("identity_digest") != _courier_retry_identity_digest(record)):
+        raise PendingDeliveryError("delivery-persistence-refused",
+                                   "courier-timeline-identity-invalid")
+    _validate_timestamp_provenance(metadata[TIMESTAMP_PROVENANCE_FIELD])
+    return metadata[TIMESTAMP_PROVENANCE_FIELD]
+
+
+def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
+    """Read retry state bound to this record; legacy inline state is migrated on write."""
+
+    metadata = _read_delivery_metadata_unlocked(path, record)
+    if metadata is not None and "retry" in metadata:
+        return _validate_courier_retry(metadata["retry"])
+    legacy = record.get(COURIER_RETRY_FIELD)
+    return _validate_courier_retry(legacy) if legacy is not None else None
+
+
+def _read_timestamp_provenance_unlocked(path: Path, record: dict) -> dict | None:
+    metadata = _read_delivery_metadata_unlocked(path, record)
+    timeline = _read_courier_timeline_unlocked(path, record)
+    if timeline is not None:
+        return timeline
+    if metadata is not None and TIMESTAMP_PROVENANCE_FIELD in metadata:
+        return metadata[TIMESTAMP_PROVENANCE_FIELD]
+    legacy = record.get(TIMESTAMP_PROVENANCE_FIELD)
+    if legacy is not None:
+        _validate_timestamp_provenance(legacy)
+    return legacy
 
 
 def _atomic_write_json(path: Path, value: dict) -> None:
@@ -383,19 +462,110 @@ def _atomic_write_json(path: Path, value: dict) -> None:
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
 
 
-def _write_courier_retry_unlocked(path: Path, record: dict, retry: dict) -> None:
-    _validate_courier_retry(retry)
-    _atomic_write_json(courier_retry_path(path), {
-        "schema_version": COURIER_RETRY_SCHEMA,
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _timestamp_provenance(*, materialized: str | None = None,
+                          materialized_source: str | None = None) -> dict:
+    return {
+        "record_materialized_at_utc": materialized,
+        "record_materialized_source": materialized_source,
+        "first_send_at_utc": None, "first_send_source": None,
+        "last_send_at_utc": None, "last_send_source": None, "last_send_event_id": None,
+        "receive_at_utc": None, "receive_source": None,
+        "observed_send_count": 0, "observed_redelivery_count": 0,
+    }
+
+
+def _validate_timestamp_provenance(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != TIMESTAMP_PROVENANCE_KEYS:
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    for key in ("record_materialized_at_utc", "first_send_at_utc", "last_send_at_utc", "receive_at_utc"):
+        item = value[key]
+        if item is not None:
+            if not isinstance(item, str):
+                raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+            try:
+                normalized = item.removesuffix("Z") + ("+00:00" if item.endswith("Z") else "")
+                datetime.datetime.fromisoformat(normalized)
+            except ValueError as exc:
+                raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid") from exc
+    for key in ("record_materialized_source", "first_send_source", "last_send_source",
+                "receive_source", "last_send_event_id"):
+        item = value[key]
+        if item is not None and (not isinstance(item, str) or not item or len(item) > 128
+                                 or any(ord(char) < 32 for char in item)):
+            raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    for key in ("observed_send_count", "observed_redelivery_count"):
+        item = value[key]
+        if type(item) is not int or item < 0:
+            raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+    if value["observed_redelivery_count"] > value["observed_send_count"]:
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-provenance-invalid")
+
+
+def _record_received(value: dict, source: str) -> dict:
+    timeline = value.get(TIMESTAMP_PROVENANCE_FIELD)
+    if timeline is None:
+        # A newly observed event never fills in a missing legacy timestamp.
+        timeline = _timestamp_provenance(materialized_source="legacy-unknown")
+    updated = dict(timeline)
+    updated["receive_at_utc"] = _utc_now()
+    updated["receive_source"] = source[:128]
+    result = dict(value)
+    result[TIMESTAMP_PROVENANCE_FIELD] = updated
+    return result
+
+
+def _remove_courier_retry_unlocked(path: Path) -> None:
+    try:
+        courier_retry_path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+
+
+def _write_delivery_metadata_unlocked(path: Path, record: dict, retry: dict | None,
+                                      timeline: dict | None, *,
+                                      defer_retry_cleanup: bool = False) -> None:
+    identity = {
         "delivery_id": record["delivery_id"],
         "recipient_digest": record["recipient_digest"],
         "identity_digest": _courier_retry_identity_digest(record),
-        "retry": retry,
-    })
+    }
+    retry_path = courier_retry_path(path)
+    if retry is None:
+        if not defer_retry_cleanup:
+            _remove_courier_retry_unlocked(path)
+    else:
+        _atomic_write_json(retry_path, {
+            "schema_version": COURIER_RETRY_SCHEMA,
+            **identity,
+            "retry": _validate_courier_retry(retry),
+        })
+
+    timeline_path = courier_timeline_path(path)
+    if timeline is None:
+        try:
+            timeline_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    else:
+        _validate_timestamp_provenance(timeline)
+        _atomic_write_json(timeline_path, {
+            "schema_version": COURIER_TIMELINE_SCHEMA,
+            **identity,
+            TIMESTAMP_PROVENANCE_FIELD: timeline,
+        })
 
 
 def _write_unlocked(path: Path, record: dict) -> None:
-    """Persist retry metadata first, then write the legacy-compatible record CAS."""
+    """Persist sidecar state first, then write the legacy-compatible record CAS."""
 
     _validate_record(record)
     previous = _read_unlocked(path)
@@ -406,13 +576,20 @@ def _write_unlocked(path: Path, record: dict) -> None:
                                    "attempt-reference-admission-missing")
     persisted = dict(record)
     retry = persisted.pop(COURIER_RETRY_FIELD, None)
-    if retry is not None:
-        _write_courier_retry_unlocked(path, record, retry)
+    timeline = persisted.pop(TIMESTAMP_PROVENANCE_FIELD, None)
+    terminal = persisted.get("state") in TERMINAL_STATES
+    if terminal:
+        retry = None
+    elif retry is None:
+        # State-only transitions (for example claimed -> sent-ambiguous) keep
+        # an existing retry deadline while refreshing the timing sidecar.
+        retry = _read_courier_retry_unlocked(path, record)
+    _write_delivery_metadata_unlocked(
+        path, record, retry, timeline, defer_retry_cleanup=terminal)
     _validate_record(persisted)
     _atomic_write_json(path, persisted)
-    if persisted.get("state") in TERMINAL_STATES:
-        with suppress(OSError):
-            courier_retry_path(path).unlink()
+    if terminal:
+        _remove_courier_retry_unlocked(path)
 
 
 def _retry_context_digest(context: str | None) -> str | None:
@@ -565,6 +742,8 @@ def create(
         "acked_by": None,
         "expiry_reason": None,
         "lineage": list(lineage or ()),
+        TIMESTAMP_PROVENANCE_FIELD: _timestamp_provenance(
+            materialized=_utc_now(), materialized_source="dispatch_pending_delivery.create"),
     }
     with _record_reference_lock(path, candidate=candidate):
         existing = _read_unlocked(path)
@@ -857,7 +1036,45 @@ def ack(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated = _record_received(updated, acked_by)
         updated.pop(COURIER_RETRY_FIELD, None)
+        _write_unlocked(path, updated)
+        return _public_record(updated)
+
+
+def record_send(root: Path, recipient_key: str, delivery_id: str, *, source: str,
+                event_id: str, expected_identity: dict | None = None) -> dict:
+    """Record one confirmed send event, outside receipt identity and CAS state."""
+    if (not isinstance(source, str) or not source or len(source) > 128
+            or not isinstance(event_id, str) or not event_id or len(event_id) > 128):
+        raise PendingDeliveryError("delivery-persistence-refused", "timestamp-source-invalid")
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") not in OPEN_STATES | {"acked"}:
+            raise PendingDeliveryError("pending-delivery-claim-refused", f"state={value['state']}")
+        if expected_identity is not None and received_ack_identity(
+                value, recipient_key, delivery_id) != expected_identity:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "send-identity-changed")
+        old = value.get(TIMESTAMP_PROVENANCE_FIELD)
+        timeline = dict(old) if old is not None else _timestamp_provenance(
+            materialized_source="legacy-unknown")
+        if timeline.get("last_send_event_id") == event_id:
+            return _public_record(value)
+        now = _utc_now()
+        count = timeline["observed_send_count"]
+        if count == 0 and timeline["record_materialized_at_utc"] is not None:
+            timeline["first_send_at_utc"] = now
+            timeline["first_send_source"] = source
+        timeline["last_send_at_utc"] = now
+        timeline["last_send_source"] = source
+        timeline["last_send_event_id"] = event_id
+        timeline["observed_send_count"] = count + 1
+        timeline["observed_redelivery_count"] += 1 if count else 0
+        updated = dict(value)
+        updated[TIMESTAMP_PROVENANCE_FIELD] = timeline
         _write_unlocked(path, updated)
         return _public_record(updated)
 
@@ -915,6 +1132,7 @@ def ack_received(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated = _record_received(updated, acked_by)
         updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
         return _public_record(updated)
@@ -1264,6 +1482,10 @@ def prune(
                     except FileNotFoundError:
                         pass
                     try:
+                        courier_timeline_path(path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    try:
                         lock_path.unlink()
                     except FileNotFoundError:
                         pass
@@ -1279,6 +1501,10 @@ def prune(
                 path.unlink()
                 try:
                     courier_retry_path(path).unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    courier_timeline_path(path).unlink()
                 except FileNotFoundError:
                     pass
                 try:

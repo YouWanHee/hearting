@@ -101,6 +101,15 @@ class NoticeTest(unittest.TestCase):
         self.assertEqual(sweep.ack_delivered(self.root, "parent", records, acked_by="test"), 1)
         self.assertEqual(sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent")[0], [])
 
+    def test_exact_already_received_completion_retires_only_its_duplicate_notice(self):
+        record = self.seed("advance-completed")
+        with mock.patch.object(notice, "framed_decision_consumed", return_value=False), \
+             mock.patch.object(notice, "exact_completion_already_received", return_value=True):
+            self.assertFalse(notice.notice_is_current(record, jobs=self.jobs))
+        with mock.patch.object(notice, "framed_decision_consumed", return_value=False), \
+             mock.patch.object(notice, "exact_completion_already_received", return_value=False):
+            self.assertTrue(notice.notice_is_current(record, jobs=self.jobs))
+
     def test_route_wide_terminal_pass_does_not_consume_a_notice(self):
         route = {
             "route_id": "rt-notice", "capability": "route-frame",
