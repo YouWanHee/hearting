@@ -643,7 +643,8 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             continue
         sid = getattr(s, "session_id", None)
         harness = str(getattr(s, "harness", "") or "").lower()
-        if sid and (harness, sid) in index:
+        observation_complete = observation is None or getattr(observation, "complete", True) is True
+        if observation_complete and sid and (harness, sid) in index:
             s.herdr_attached = True
         elif pid_in_panes(getattr(s, "pid", None), shells, fg):
             s.herdr_attached = True

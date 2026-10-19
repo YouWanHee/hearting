@@ -191,6 +191,58 @@ class PaneProcessReuseTest(unittest.TestCase):
             self.assertFalse(unhealthy.complete)
             self.assertIn("OSError: socket lost", herdr._observation_error())
 
+    def test_incomplete_cached_agent_sid_cannot_confirm_presence_or_absence(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, pending, refreshed = Future(), Future(), Future()
+        agent = {"agent": "codex", "agent_session": {"agent": "codex", "value": "thread-current"}}
+
+        def attach(session_id):
+            session = SimpleNamespace(harness="codex", session_id=session_id, pid=4312,
+                                      proc_start=None, cwd="/project", is_child=False,
+                                      app_server=False, mem_worker=False, detached=False)
+            health = herdr.enrich([session])
+            return session.herdr_attached, health
+
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, pending, refreshed]):
+            self.assertIsNone(herdr.observation_view())
+            first.set_result(TestView("fleet-named", "/isolated/herdr.sock", 1, 1,
+                                       agents=(agent,)))
+            self.assertTrue(herdr.observation_view().complete)
+
+            key = ("fleet-named", "/isolated/herdr.sock")
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            stale = herdr.observation_view()
+            self.assertFalse(stale.complete)
+            current, health = attach("thread-current")
+            self.assertIsNone(current)
+            self.assertFalse(health["complete"])
+            absent, health = attach("thread-other")
+            self.assertIsNone(absent)
+            self.assertFalse(health["complete"])
+
+            pending.set_exception(OSError("socket lost"))
+            failed = herdr.observation_view()
+            self.assertFalse(failed.complete)
+            current, health = attach("thread-current")
+            self.assertIsNone(current)
+            self.assertFalse(health["complete"])
+            absent, health = attach("thread-other")
+            self.assertIsNone(absent)
+            self.assertFalse(health["complete"])
+
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            self.assertFalse(herdr.observation_view().complete)
+            refreshed.set_result(TestView("fleet-named", "/isolated/herdr.sock", 2, 1,
+                                           agents=(agent,)))
+            self.assertTrue(herdr.observation_view().complete)
+            current, health = attach("thread-current")
+            self.assertIs(current, True)
+            self.assertTrue(health["complete"])
+
     def test_refresh_discards_old_generation_and_close_clears_cached_views(self):
         for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
                      "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
