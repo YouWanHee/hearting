@@ -76,7 +76,7 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
                 "name": "Fixture", "status": "active", "enabled": True,
                 "limit": {"context": context, "input": input_limit, "output": output}}
 
-    def _invoke(self, *, wrong_location=False, shared_stale=False):
+    def _invoke(self, *, wrong_location=False, shared_stale=False, environment=None):
         calls = []
 
         def native_api(command, *, cwd, env):
@@ -153,7 +153,8 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
             mock.patch.object(DISPATCH.subprocess, "Popen", new=spawn),
         ]
         from contextlib import redirect_stdout
-        with mock.patch.dict(os.environ, self.environment, clear=True), redirect_stdout(stream):
+        with mock.patch.dict(os.environ, environment or self.environment, clear=True), \
+                redirect_stdout(stream):
             for patch in patches:
                 patch.start()
             try:
@@ -195,6 +196,18 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         self.assertIn("context_window_execution_mode=standalone", receipt)
         self.assertIn("context_window_runtime_target=standalone-per-command", receipt)
         self.assertIn("context_window_server_identity=unavailable", receipt)
+
+    def test_v2_spawns_when_the_user_environment_sets_no_xdg_homes(self):
+        # A real user shell often leaves XDG_*_HOME unset; the V2 worker keeps the
+        # shared data home and records no attempt-private runtime directory.
+        environment = {key: value for key, value in self.environment.items()
+                       if not key.startswith("XDG_")}
+        result, receipt, _calls, _spawn, _worker_commands = self._invoke(environment=environment)
+        self.assertEqual(result, 0, receipt)
+        self.assertIn("child_spawned=1", receipt)
+        rows = self.jobs.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("opencode_runtime_dir=", rows[0])
 
     def test_v2_wrong_location_fails_before_spawn_and_closes_attempt(self):
         result, receipt, calls, spawn, worker_commands = self._invoke(wrong_location=True)

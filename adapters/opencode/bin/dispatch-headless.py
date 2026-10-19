@@ -2140,8 +2140,12 @@ def main(argv: list[str]) -> int:
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
-        launch_metadata["opencode_runtime_dir"] = str(
-            Path(dispatch_env["XDG_DATA_HOME"]).parent)
+        # Only an attempt-private runtime (V1 worker home or nested isolation) has
+        # its own data home; a V2 worker uses the shared one, and readers fall back.
+        if (args.worker_runtime_env.get("XDG_DATA_HOME")
+                or args.nested_runtime_env.get("XDG_DATA_HOME")):
+            launch_metadata["opencode_runtime_dir"] = str(
+                Path(dispatch_env["XDG_DATA_HOME"]).parent)
         launch_metadata["runtime_home"] = dispatch_env.get("OPENCODE_CONFIG_DIR") or "shared-service"
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
