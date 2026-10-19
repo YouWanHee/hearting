@@ -40,11 +40,16 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         self.artifacts.mkdir()
         self.state = self.root / "state"
         self.state.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        fake_opencode = self.bin / "opencode"
+        fake_opencode.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+        fake_opencode.chmod(0o755)
         for name in ("config", "data", "cache"):
             (self.root / name).mkdir()
         self.jobs = self.root / "jobs.log"
         self.environment = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PATH": os.pathsep.join((str(self.bin), os.environ.get("PATH", "/usr/bin:/bin"))),
             "HOME": str(self.root),
             "AGENT_HOME": str(ROOT),
             "AGENT_ARTIFACT_ROOT": str(self.artifacts),
