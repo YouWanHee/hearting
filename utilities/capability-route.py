@@ -10359,6 +10359,14 @@ def _git(cwd, *args):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _git_common_dir(cwd):
+    """Absolute common git dir; git < 2.31 lacks --path-format, so absolutize a relative answer."""
+    value = _git(cwd, "rev-parse", "--git-common-dir")
+    if not value:
+        return value
+    return value if os.path.isabs(value) else os.path.normpath(os.path.join(str(cwd), value))
+
+
 def _worktree_git(cwd, *args):
     """Run one preparation command, retaining stderr for a fail-closed receipt."""
     try:
@@ -10397,7 +10405,7 @@ def _primary_worktree(cwd, common):
                   if line.startswith("worktree ")]
     for candidate in candidates:
         root = _git(candidate, "rev-parse", "--show-toplevel")
-        candidate_common = _git(candidate, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        candidate_common = _git_common_dir(candidate)
         if root and candidate_common and os.path.realpath(candidate_common) == os.path.realpath(common):
             if OWNER_WRITE_ADVISORY.git_topology(root) == "primary":
                 return os.path.realpath(root)
@@ -10444,7 +10452,7 @@ def _prepared_record_worktree(record, common, relative):
     path = Path(record.get("path") or "")
     if not path.is_dir():
         return None
-    actual_common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    actual_common = _git_common_dir(path)
     symbolic = _git(path, "symbolic-ref", "-q", "HEAD")
     head = _git(path, "rev-parse", "HEAD")
     branch = str(record.get("branch") or "")
@@ -10566,7 +10574,7 @@ def _ref_namespace_conflict(top, branch, *, allow_local_branch=False):
     valid = _worktree_git(top, "check-ref-format", "--branch", branch)
     if valid.returncode != 0:
         return True
-    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = _git_common_dir(top)
     if not common:
         return True
     # Git's revision DWIM checks these namespaces, while pseudo-ref files live
@@ -10677,7 +10685,7 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         return {"state": "skipped", "reason": "non-git-cwd"}
     if topology not in ("primary", "linked"):
         return {"state": "failed", "reason": "git-topology-unresolved", "cwd": original}
-    common = _git(source_top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = _git_common_dir(source_top)
     if not common:
         return {"state": "failed", "reason": "git-common-dir-unresolved", "cwd": original}
     common = os.path.realpath(common)
@@ -11009,7 +11017,7 @@ def caller_open_route(cwd):
         # Prefer the exact persisted allocation, including an automatically selected collision
         # suffix. Retain the old slug path only as a read-only compatibility lookup for legacy routes.
         top = _git(here, "rev-parse", "--show-toplevel")
-        common = _git(here, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        common = _git_common_dir(here)
         allocated = _recorded_preparation_roots(artifact_root, common) if common else []
         def moved(row):
             if not top:

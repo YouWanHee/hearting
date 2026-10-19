@@ -19,8 +19,12 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 . "$ROOT/tools/checkout-copy.sh"
 source_git() { git -c "safe.directory=$ROOT" -C "$ROOT" "$@"; }
 SOURCE_GIT_DIR=$(source_git rev-parse --absolute-git-dir)
-SOURCE_COMMON_DIR=$(source_git rev-parse --path-format=absolute --git-common-dir)
-SOURCE_INDEX=$(source_git rev-parse --path-format=absolute --git-path index)
+# git < 2.31 has no --path-format=absolute: ask plainly, absolutize against $ROOT.
+source_abs() {
+  case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$ROOT/$1" ;; esac
+}
+SOURCE_COMMON_DIR=$(source_abs "$(source_git rev-parse --git-common-dir)")
+SOURCE_INDEX=$(source_abs "$(source_git rev-parse --git-path index)")
 SOURCE_HEAD=$(source_git rev-parse HEAD)
 SOURCE_REFS=$(source_git show-ref --head | LC_ALL=C sort)
 SOURCE_INDEX_DIGEST=$(sha256sum "$SOURCE_INDEX" | cut -d' ' -f1)
