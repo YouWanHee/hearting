@@ -212,6 +212,28 @@ class Fixture(unittest.TestCase):
             yield
 
     @contextlib.contextmanager
+    def process_inventory(self, *pids, unreadable_environ=()):
+        """Bound /proc enumeration while retaining real observations for listed PIDs."""
+        proc_root = Path("/proc")
+        entries = tuple(proc_root / str(pid) for pid in pids)
+        unreadable = {proc_root / str(pid) / "environ" for pid in unreadable_environ}
+        original_iterdir, original_read_bytes = Path.iterdir, Path.read_bytes
+
+        def iterdir(path):
+            if path == proc_root:
+                return iter(entries)
+            return original_iterdir(path)
+
+        def read_bytes(path):
+            if path in unreadable:
+                raise PermissionError("fixture process environment is unreadable")
+            return original_read_bytes(path)
+
+        with mock.patch.object(Path, "iterdir", iterdir), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            yield
+
+    @contextlib.contextmanager
     def landing(self, mutate, *, key=None):
         """Run `mutate` once, just before the registry lock of a detach is taken.
 
@@ -2613,12 +2635,20 @@ class Orphans(Fixture):
                     return "unknown", "fixture-process-scan-incomplete"
                 return original(ctx, key)
 
-            with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+            # These private HOME paths can only be referenced by this test process
+            # and the children just launched. Enumerate that complete cohort, then
+            # let the production scanner read each process's real env/cwd/fds.
+            with self.process_inventory(os.getpid(), *(child.pid for child in children)), \
+                    mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
                     mock.patch.object(R._Context, "home_process_evidence", process_evidence):
                 first = self.sweep(0)
                 self.assertEqual(first["eligible"], 3, first)
                 self.assertEqual(self.kept(first, "not-quiescent"), 3, first)
                 self.assertEqual(self.unknown(first, "quiescence-unverifiable"), 3, first)
+                self.assertEqual(
+                    first["unknown_causes"]["quiescence-unverifiable"],
+                    {"fixture-process-scan-incomplete": 3},
+                )
                 result = self.sweep(8 / 7)
 
             self.assertEqual(result["removed"], 3, result)
@@ -2628,14 +2658,27 @@ class Orphans(Fixture):
             self.assertEqual(self.kept(result, "not-quiescent"), 3, result)
             self.assertEqual(self.unknown(result, "quiescence-unverifiable"), 3, result)
             self.assertEqual(
-                result["unknown_causes"]["quiescence-unverifiable"]["fixture-process-scan-incomplete"],
-                3,
+                result["unknown_causes"]["quiescence-unverifiable"],
+                {"fixture-process-scan-incomplete": 3},
             )
         finally:
             for child in children:
                 if child.poll() is None:
                     child.terminate()
                 child.wait(timeout=5)
+
+    def test_unmapped_legacy_unreadable_process_metadata_stays_unknown_with_actual_cause(self):
+        home = self.add_unmapped_legacy("att-unmapped-unreadable-process")
+        with self.process_inventory(os.getpid(), unreadable_environ=(os.getpid(),)), \
+                mock.patch.object(DC, "_current_observer_is_host_like", return_value=True):
+            result = self.expire()
+
+        self.assertTrue(home.is_dir())
+        self.assertEqual(self.unknown(result, "quiescence-unverifiable"), 1, result)
+        self.assertEqual(
+            result["unknown_causes"]["quiescence-unverifiable"],
+            {"process-reference-unreadable": 1},
+        )
 
     def test_reader_pin_is_per_home_and_does_not_block_unrelated_detach(self):
         reader = self.add_unmapped_legacy("att-unmapped-reader-pin")
@@ -2815,7 +2858,11 @@ class Mapping(Fixture):
         linked = self.add("att-m12")
         (linked / "worker-home.json").unlink()
         (linked / "worker-home.json").symlink_to(self.outside / "manifest")
-        result = self.expire()
+        # Model a complete bounded inventory whose observer cannot establish
+        # namespace visibility. The production path supplies the real cause.
+        with self.process_inventory(os.getpid()), \
+                mock.patch.object(DC, "_current_observer_is_host_like", return_value=False):
+            result = self.expire()
         for path in (destination, unmapped, broken, oversized, linked):
             self.assertTrue(path.is_dir())
         self.assertEqual(self.unknown(result, "destination-home"), 1)
