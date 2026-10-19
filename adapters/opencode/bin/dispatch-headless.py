@@ -1206,8 +1206,13 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         title=title,
         standalone=standalone,
     )
-    prompt_arg = f'"$(cat -- {shlex.quote(str(prompt_path))})"'
-    return " ".join(shlex.quote(x) for x in cmd) + f" {prompt_arg} >> {shlex.quote(str(log_path))} 2>&1"
+    prompt_arg = f'"$(cat -- {shlex.quote(os.path.abspath(prompt_path))})"'
+    # V2 dropped `--dir`: the worker's Location is its process cwd, and a worker left
+    # in the caller's directory edits there and sees the worktree as an outside path.
+    enter = (f"cd -- {shlex.quote(args.worktree)} && "
+             if args.worktree and "--dir" not in cmd else "")
+    return (enter + " ".join(shlex.quote(x) for x in cmd)
+            + f" {prompt_arg} >> {shlex.quote(os.path.abspath(log_path))} 2>&1")
 
 
 def _effective_parent_cwd(args):

@@ -384,7 +384,7 @@ class OpenCodeSupervisedOwner(unittest.TestCase):
                           dict(intensity="standard"), dict(intensity="strong")):
             with self.subTest(**overrides):
                 self.assertFalse(WH._supervised_owner(self.args(**overrides)))
-                self.assertTrue(self.command(**overrides).startswith("opencode run"))
+                self.assertRegex(self.command(**overrides), r"^(cd -- \S+ && )?opencode run")
 
     def test_quick_owner_command_is_the_session_supervisor_on_the_same_model(self):
         command = self.command()
