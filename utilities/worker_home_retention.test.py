@@ -29,7 +29,7 @@ import session_notice as NOTICE  # noqa: E402
 from route_identity import route_hash  # noqa: E402
 from worker_runtime_home import _builder  # noqa: E402
 
-DAY = 86400 * 10**9
+RETENTION_NS = R.IDLE_SECONDS * 10**9
 SOURCE = str(ROOT)
 
 
@@ -164,12 +164,12 @@ class Fixture(unittest.TestCase):
             (".lock-" + summary.summary_sid(attempt))
         return owner_lock, provider_lock
 
-    def sweep(self, days=0.0, **kwargs):
-        return R.sweep(self.jobs, now_ns=self.now + int(days * DAY), force=True, **kwargs)
+    def sweep(self, windows=0.0, **kwargs):
+        return R.sweep(self.jobs, now_ns=self.now + int(windows * RETENTION_NS), force=True, **kwargs)
 
-    def expire(self, days=8):
+    def expire(self, windows=8 / 7):
         self.sweep(0)
-        return self.sweep(days)
+        return self.sweep(windows)
 
     def state(self):
         return json.loads((self.root / "homes/worker-retention/state.json").read_text())
@@ -238,7 +238,23 @@ class Fixture(unittest.TestCase):
 
 
 class Expiry(Fixture):
-    def test_expired_terminal_home_retires_and_the_clock_starts_at_first_proof(self):
+    def test_completion_clock_expires_at_exact_retention_boundary(self):
+        path = self.add("att-exact-retention-boundary")
+        stamp = datetime.fromtimestamp(self.now / 10**9, timezone.utc).isoformat().replace("+00:00", "Z")
+        self.set_timestamp("att-exact-retention-boundary", stamp)
+        row = R._Snapshot(self.jobs).rows["att-exact-retention-boundary"]
+        completion_ns = R._ended_ns(row)
+        self.assertIsNotNone(completion_ns)
+        os.utime(path, ns=(completion_ns, completion_ns))
+
+        before = R.sweep(self.jobs, now_ns=completion_ns + RETENTION_NS - 1, force=True)
+        self.assertEqual(before["removed"], 0)
+        self.assertEqual(self.kept(before, "within-window"), 1)
+        at_boundary = R.sweep(self.jobs, now_ns=completion_ns + RETENTION_NS, force=True)
+        self.assertEqual(at_boundary["removed"], 1)
+        self.assertFalse(path.exists())
+
+    def test_expired_terminal_home_retires_after_the_completion_window(self):
         path = self.add("att-a1")
         first = self.sweep(0)
         self.assertTrue(path.is_dir())
@@ -246,31 +262,31 @@ class Expiry(Fixture):
         self.assertEqual(self.kept(first, "within-window"), 1)
         started = self.state()["eligible_since"][self.key("att-a1")]
         self.assertEqual(started, self.now)
-        later = self.sweep(3)
+        later = self.sweep((3) / 7)
         self.assertTrue(path.is_dir())
         self.assertEqual(self.state()["eligible_since"][self.key("att-a1")], started)
         self.assertEqual(later["removed"], 0)
-        done = self.sweep(8)
+        done = self.sweep((8) / 7)
         self.assertEqual(done["removed"], 1)
         self.assertFalse(path.exists())
         self.assertEqual(list((self.root / "homes/worker-retention/retiring").iterdir()), [])
         self.assertNotIn(self.key("att-a1"), self.state()["eligible_since"])
-        again = self.sweep(9)
+        again = self.sweep((9) / 7)
         self.assertEqual((again["examined"], again["removed"]), (0, 0))
 
     def test_protection_holds_until_existing_completion_clock_expires(self):
         path = self.add("att-a2")
         self.sweep(0)
         self.set_status("att-a2", "open")
-        mid = self.sweep(4)
+        mid = self.sweep((4) / 7)
         self.assertEqual(self.kept(mid, "not-terminal"), 1)
         self.assertNotIn(self.key("att-a2"), self.state()["eligible_since"])
         self.set_status("att-a2", "done")
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(path.exists())
 
     def test_old_completion_is_removed_on_first_sweep(self):
-        old = self.now - 10 * DAY
+        old = self.now - int(10 / 7 * RETENTION_NS)
         log = self.root / "finished.log"
         log.write_text("finished")
         path = self.add("att-old-completion", log_file=str(log))
@@ -284,8 +300,8 @@ class Expiry(Fixture):
         self.assertFalse(path.exists())
 
     def test_recent_log_mtime_keeps_old_registry_timestamp_within_window(self):
-        old = self.now - 10 * DAY
-        recent = self.now - 2 * DAY
+        old = self.now - int(10 / 7 * RETENTION_NS)
+        recent = self.now - int(2 / 7 * RETENTION_NS)
         log = self.root / "recent-finish.log"
         log.write_text("finished")
         path = self.add("att-recent-log", log_file=str(log))
@@ -307,17 +323,17 @@ class Expiry(Fixture):
 
         self.assertEqual(first["removed"], 0)
         self.assertEqual(self.state()["eligible_since"][path.name], self.now)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(path.exists())
 
     def test_recent_activity_extends_old_completion_window(self):
-        old = self.now - 10 * DAY
+        old = self.now - int(10 / 7 * RETENTION_NS)
         for suffix in ("supervisor", "view", "home"):
             with self.subTest(activity=suffix):
                 attempt = "att-old-activity-" + suffix
                 path = self.add(attempt)
                 self.set_timestamp(attempt, datetime.fromtimestamp(old / 10**9, timezone.utc).isoformat().replace("+00:00", "Z"))
-                recent = self.now - DAY
+                recent = self.now - int(RETENTION_NS / 7)
                 if suffix == "supervisor":
                     state = self.root / "supervisor-state" / f"{attempt}.json"
                     state.parent.mkdir(exist_ok=True)
@@ -336,8 +352,8 @@ class Expiry(Fixture):
 
                 self.assertEqual(first["removed"], 0)
                 self.assertEqual(self.kept(first, "within-window"), 1)
-                self.assertEqual(self.sweep(5)["removed"], 0)
-                self.assertEqual(self.sweep(8)["removed"], 1)
+                self.assertEqual(self.sweep((5) / 7)["removed"], 0)
+                self.assertEqual(self.sweep((8) / 7)["removed"], 1)
 
     def test_running_and_unknown_status_are_kept(self):
         paths = [self.add("att-open", "open"), self.add("att-run", "running"), self.add("att-odd", "weird")]
@@ -352,7 +368,7 @@ class Expiry(Fixture):
         self.assertEqual(self.kept(result, "open-reference"), 1)
         self.assertTrue(path.is_dir())
         self.set_status("att-child", "done")
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(self.sweep((9) / 7)["removed"], 1)
         self.assertFalse(path.exists())
 
     def test_recent_activity_extends_the_window(self):
@@ -362,11 +378,11 @@ class Expiry(Fixture):
         marker.mkdir(exist_ok=True, mode=0o700)
         mark = marker / self.key("att-view")
         mark.write_text("")
-        seen = (self.now + 5 * DAY) / 1e9
+        seen = (self.now + int(5 / 7 * RETENTION_NS)) / 1e9
         os.utime(mark, (seen, seen))
-        self.assertEqual(self.sweep(8)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(path.is_dir())
-        self.assertEqual(self.sweep(13)["removed"], 1)
+        self.assertEqual(self.sweep((13) / 7)["removed"], 1)
 
     def test_split_credential_file_keeps_the_home_and_a_link_does_not(self):
         # A Claude refresh that replaced the generated link leaves a regular file
@@ -385,7 +401,7 @@ class Expiry(Fixture):
         self.assertFalse(linked.exists())
         self.assertEqual(main.read_text(), '{"synthetic": "main"}')
         (split / ".credentials.json").unlink()
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(self.sweep((9) / 7)["removed"], 1)
         self.assertFalse(split.exists())
 
     def test_external_read_only_cache_link_does_not_block_home_removal_or_remove_target(self):
@@ -452,7 +468,7 @@ class EndedTimestamp(Fixture):
         later_ns = registry_ns + 123456789
         os.utime(log, ns=(later_ns, later_ns))
         self.assertEqual(R._ended_ns(self._row("2026-10-01T00:00:00Z", str(log))), later_ns)
-        earlier_ns = registry_ns - DAY
+        earlier_ns = registry_ns - int(RETENTION_NS / 7)
         os.utime(log, ns=(earlier_ns, earlier_ns))
         self.assertEqual(R._ended_ns(self._row("2026-10-01T00:00:00Z", str(log))), registry_ns)
 
@@ -545,7 +561,7 @@ class Routes(Fixture):
         first = self.sweep(0)
         self.assertEqual(self.unknown(first, "route-unknown"), 1)
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.unknown(self.sweep(8), "route-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((8) / 7), "route-unknown"), 1)
         self.assertTrue(home.is_dir())
 
     def test_declared_empty_route_is_not_routeless(self):
@@ -559,14 +575,14 @@ class Routes(Fixture):
                         route_hash=record["route_hash"])
         self.sweep(0)
         path.with_name(path.stem + ".outcome.json").unlink()
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep(8 / 7)["removed"], 1)
         self.assertFalse(home.exists())
         path, record = self.route(name="rt-advanced")
         home = self.add("att-r6", route_file=str(path), route_id=record["route_id"],
                         route_hash=record["route_hash"])
         self.sweep(0)
         path.write_text(json.dumps({**record, "route_id": "rt-next"}))
-        result = self.sweep(8)
+        result = self.sweep(8 / 7)
         self.assertEqual(self.unknown(result, "route-unknown"), 1)
         self.assertTrue(home.is_dir())
 
@@ -601,7 +617,7 @@ class Deliveries(Fixture):
                 claim_owner="test", lease_seconds=60)
         P.ack(self.root, "sess-producer", value["delivery_id"], acked_by="test")
         self.assertEqual(self.sweep(0)["eligible"], 1)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_real_frame_delivery_retires(self):
@@ -611,7 +627,7 @@ class Deliveries(Fixture):
                 claim_owner="test", lease_seconds=60)
         P.ack(self.root, "sess-producer", value["delivery_id"], acked_by="test")
         self.assertEqual(self.sweep(0)["eligible"], 1)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_producer_sent_ambiguous_record_keeps_home(self):
@@ -622,10 +638,10 @@ class Deliveries(Fixture):
         P.mark_sent_ambiguous(self.root, "sess-producer", value["delivery_id"],
                               claim_owner="test")
         self.assertEqual(self.sweep(0)["kept"].get("delivery-open"), 1)
-        self.assertEqual(self.sweep(8)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
 
-    def test_real_depth_one_delivery_and_notice_retire_after_seven_idle_days(self):
+    def test_real_depth_one_delivery_and_notice_retire_after_retention_window(self):
         home, record = self.producer_delivery()
         notice = NOTICE.notify("claude", "sess-notice", key="retention-fixture",
                                subject="Status", text="Read this", jobs=self.jobs)
@@ -637,8 +653,8 @@ class Deliveries(Fixture):
                 claim_owner="test", lease_seconds=60)
         P.ack(self.root, "sess-producer", value["delivery_id"], acked_by="test")
         self.assertEqual(self.sweep(0)["eligible"], 1)
-        self.assertEqual(self.sweep(6.99)["removed"], 0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((6.99) / 7)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_mixed_notice_and_attempt_members_protect_actual_worker(self):
@@ -656,7 +672,7 @@ class Deliveries(Fixture):
             receipt_digest=notice["receipt_digest"],
             row_revisions={notice["attempt_ids"][0]: "notice", "att-mixed": "revision"})
         self.assertEqual(self.sweep(0)["kept"].get("delivery-open"), 1)
-        self.assertEqual(self.sweep(8)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
 
     def test_producer_prune_tombstone_preserves_depth_one_binding(self):
@@ -670,7 +686,7 @@ class Deliveries(Fixture):
         tomb = Path(str(record) + ".pruned")
         self.assertEqual(json.loads(tomb.read_text())["parent_attempt_id"], "-")
         self.assertEqual(self.sweep(0)["eligible"], 1)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def intent(self, attempt, **meta):
@@ -700,7 +716,7 @@ class Deliveries(Fixture):
         self.assertTrue(home.is_dir())
         self.assertFalse(any(path.exists() for path in others))
         with mock.patch.object(R, "_bind", side_effect=TypeError("unexpected")):
-            stalled = self.sweep(9)
+            stalled = self.sweep((9) / 7)
         self.assertEqual(self.unknown(stalled, "examine-error"), 1)
         self.assertEqual(self.state()["last_result"]["unknown"], {"examine-error": 1})
         self.assertTrue(home.is_dir())
@@ -715,11 +731,11 @@ class Deliveries(Fixture):
         path = P.record_path(self.root, recipient, record["delivery_id"])
         P.claim(self.root, recipient, record["delivery_id"], claim_owner="test", lease_seconds=60)
         P.ack(self.root, recipient, record["delivery_id"], acked_by="test")
-        late = self.now + int(7.9 * DAY)
+        late = self.now + int(7.9 / 7 * RETENTION_NS)
         os.utime(path, ns=(late, late))
-        self.assertEqual(self.sweep(8)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.sweep(15)["removed"], 1)
+        self.assertEqual(self.sweep((15) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_open_record_keeps_and_typed_terminal_record_releases(self):
@@ -728,7 +744,7 @@ class Deliveries(Fixture):
         self.delivery_record(record, "att-d2", state="pending")
         self.assertEqual(self.expire()["kept"].get("delivery-open"), 1)
         self.delivery_record(record, "att-d2")
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(self.sweep((9) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_tombstone_releases(self):
@@ -737,7 +753,7 @@ class Deliveries(Fixture):
         self.assertEqual(P.prune(self.root, apply=True, now=time.time() + 1,
                                  retention_seconds=0)["pruned_records"], 1)
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
 
     def test_zero_byte_legacy_or_mismatched_tombstone_cannot_settle(self):
         home, record = self.intent("att-fake")
@@ -751,12 +767,12 @@ class Deliveries(Fixture):
                                     "attempt_ids": ["att-other"],
                                     "parent_attempt_id": "att-parent",
                                     "terminal_state": "acked"}))
-        self.assertEqual(self.unknown(self.sweep(16), "delivery-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((16) / 7), "delivery-unknown"), 1)
         fake = self.outside / "fake-pruned"
         fake.write_text(json.dumps({**json.loads(tomb.read_text()), "attempt_ids": ["att-fake"]}))
         tomb.unlink()
         tomb.symlink_to(fake)
-        self.assertEqual(self.unknown(self.sweep(24), "delivery-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((24) / 7), "delivery-unknown"), 1)
         self.assertTrue(home.is_dir())
 
     def test_unreadable_own_record_is_unknown(self):
@@ -771,21 +787,21 @@ class Deliveries(Fixture):
         home, record = self.intent("att-bind")
         valid = self.delivery_record(record, "att-bind")
         self.sweep(0)
-        for day, change in enumerate((
+        for window, change in zip((8 / 7, 9 / 7, 10 / 7, 11 / 7, 12 / 7), (
                 {"attempt_ids": ["att-other"]},
                 {"parent_attempt_id": "att-other"},
                 {"recipient_digest": "c" * 64},
                 {"delivery_id": "delivery-" + "c" * 32},
                 {"schema_version": -1},
-        ), start=8):
+        )):
             with self.subTest(change=change):
                 record.write_text(json.dumps({**valid, **change}))
-                self.assertEqual(self.sweep(day)["removed"], 0)
+                self.assertEqual(self.sweep(window)["removed"], 0)
                 self.assertTrue(home.is_dir())
         record.write_text("{")
         tomb = Path(str(record) + ".pruned")
         tomb.symlink_to(self.outside / "fake")
-        self.assertEqual(self.sweep(20)["removed"], 0)
+        self.assertEqual(self.sweep((20) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
 
     def test_unreadable_group_and_malformed_open_reference_keep_every_home(self):
@@ -794,12 +810,12 @@ class Deliveries(Fixture):
         group = self.root / "pending-delivery" / ("d" * 64)
         group.parent.mkdir(exist_ok=True)
         group.symlink_to(self.outside, target_is_directory=True)
-        self.assertEqual(self.unknown(self.sweep(8), "delivery-index-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((8) / 7), "delivery-index-unknown"), 1)
         group.unlink()
         group.mkdir()
         (group / ("delivery-" + "a" * 32 + ".json")).write_text(
             json.dumps({"state": "claimed", "attempt_ids": "att-global"}))
-        self.assertEqual(self.unknown(self.sweep(16), "delivery-index-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((16) / 7), "delivery-index-unknown"), 1)
         self.assertTrue(home.is_dir())
 
     def test_record_naming_the_attempt_keeps_it_even_without_an_intent(self):
@@ -823,7 +839,7 @@ class Deliveries(Fixture):
         folder = self.root / "pending-delivery" / digest
         folder.mkdir(parents=True)
         self.delivery_record(folder / (delivery + ".json"), "att-kid", "att-d8")
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(self.sweep((9) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_unattributable_corrupt_record_remains_unknown(self):
@@ -835,7 +851,7 @@ class Deliveries(Fixture):
         stamp = self.now / 1e9
         os.utime(corrupt, (stamp, stamp))
         self.sweep(0)
-        self.assertEqual(self.unknown(self.sweep(8), "delivery-index-unknown"), 1)
+        self.assertEqual(self.unknown(self.sweep((8) / 7), "delivery-index-unknown"), 1)
         self.assertTrue(home.exists())
 
     def test_oversized_index_keeps_everything_that_pass(self):
@@ -873,14 +889,14 @@ class Recovery(Fixture):
         self.assertEqual(self.expire()["kept"].get("replacement-unresolved"), 1)
         self.assertTrue(home.is_dir())
         self.row("att-new", "running")
-        self.assertEqual(self.sweep(9)["kept"].get("replacement-unresolved"), 1)
+        self.assertEqual(self.sweep((9) / 7)["kept"].get("replacement-unresolved"), 1)
 
     def test_resolved_claim_releases_the_home(self):
         self.add("att-v3")
         self.reserve("att-v3", claim={"original_attempt_id": "att-v3", "replacement_attempt_id": "att-new"})
         self.row("att-new", "done")
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
 
     def test_terminal_successor_open_route_alone_releases_source_home(self):
         source = self.add("att-source")
@@ -929,7 +945,7 @@ class Recovery(Fixture):
         stamp = self.now / 1e9
         os.utime(folder / "att-v6.json", (stamp, stamp))
         self.sweep(0)
-        result = self.sweep(8)
+        result = self.sweep((8) / 7)
         self.assertEqual(self.unknown(result, "replacement-unknown"), 1)
         self.assertEqual(self.kept(result, "replacement-unresolved"), 1)
         self.assertTrue(bad.is_dir())
@@ -939,7 +955,7 @@ class Recovery(Fixture):
         detail.write_text(json.dumps({"schema": "recovery-attention-v1",
                                       "original_attempt_id": "att-v6", "recovery_id": "r",
                                       "state": "needs-attention", "reason": "receipt-unavailable"}))
-        self.assertEqual(self.kept(self.sweep(16), "replacement-unresolved"), 1)
+        self.assertEqual(self.kept(self.sweep((16) / 7), "replacement-unresolved"), 1)
         self.assertTrue(good.is_dir())
 
     def test_supervisor_state_leftover_extends_the_window_only(self):
@@ -948,11 +964,11 @@ class Recovery(Fixture):
         state.mkdir()
         leftover = state / "att-v7.json"
         leftover.write_text("{}")
-        stamp = (self.now + 6 * DAY) / 1e9
+        stamp = (self.now + int(6 / 7 * RETENTION_NS)) / 1e9
         os.utime(leftover, (stamp, stamp))
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 0)
-        self.assertEqual(self.sweep(14)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
+        self.assertEqual(self.sweep((14) / 7)["removed"], 1)
 
 
 class Liveness(Fixture):
@@ -974,7 +990,7 @@ class Liveness(Fixture):
             self.assertTrue(home.is_dir())
         finally:
             os.close(fd)
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(self.sweep((9) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_lease_payload_mismatch_does_not_hide_a_holder(self):
@@ -1067,6 +1083,27 @@ class Liveness(Fixture):
             self.assertEqual(self.expire()["removed"], 1)
         self.assertFalse(home.exists())
 
+    def test_real_process_receipt_releases_after_exit(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+        self.addCleanup(lambda: child.kill() if child.poll() is None else None)
+        identity = DC.process_launch_identity(child.pid)
+        home = self.add("att-real-receipt")
+        self.attach_summary_owner("att-real-receipt", home)
+        metadata = self.rows["att-real-receipt"][1]
+        metadata.update(summary_owner_pid=str(child.pid),
+                        summary_owner_pid_start=identity["pid_start"],
+                        summary_owner_pid_observer_ns=DC.process_namespace_identity())
+        self.write_rows()
+        state_path = Path(metadata["summary_state_file"])
+        state = json.loads(state_path.read_text())
+        state.update(pid=child.pid, proc_start=identity["pid_start"],
+                     observer_namespace=DC.process_namespace_identity())
+        state_path.write_text(json.dumps(state))
+        child.wait()
+        self.sweep(0)
+        self.assertEqual(self.sweep(8 / 7)["removed"], 1)
+        self.assertFalse(home.exists())
+
     def test_held_owner_and_old_provider_lockdir_keep_home(self):
         owner_home = self.add("att-summary-owner-lock")
         owner_lock, _provider_lock = self.attach_summary_owner("att-summary-owner-lock", owner_home)
@@ -1113,7 +1150,7 @@ class Liveness(Fixture):
         # between them must not turn this into a timing-dependent assertion.
         with mock.patch.object(DC, "attempt_process_quiescence", return_value=observed):
             self.sweep(0)
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         if observed.state == "quiescent":
             self.assertEqual(result["removed"], 1)
             self.assertFalse(gone.exists())
@@ -1199,7 +1236,7 @@ class Races(Fixture):
                         [f"att-existing-unrelated-{index}"], "att-existing-parent")
                 active.update(attempt=attempt, relation=relation, started=False)
                 self.sweep(0)
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
                 self.assertTrue(active["started"], f"publisher did not run for {attempt}")
                 self.assertTrue(home.is_dir())
                 self.assertEqual(result["removed"], 0)
@@ -1212,7 +1249,6 @@ class Races(Fixture):
         original_final = R._late_candidate_delivery_change
         real_flock = AR.fcntl.flock
         real_rename = R.os.rename
-        real_write = P._atomic_write_json
         active = {"attempt": None, "calls": 0}
         for index, (existing_group, relation) in enumerate((
                 (False, "attempt"), (True, "parent"),
@@ -1256,12 +1292,6 @@ class Races(Fixture):
                     order.append("rename")
                 return real_rename(*args, **kwargs)
 
-            def observed_write(path, value):
-                result = real_write(path, value)
-                if Path(path) == record:
-                    order.append("publish")
-                return result
-
             def publish():
                 if not start_writer.wait(3):
                     errors.append("final admission was not reached")
@@ -1273,6 +1303,7 @@ class Races(Fixture):
                     else:
                         ids, parent = [f"att-detach-unrelated-{index}"], attempt
                     self.publish_delivery(delivery_id, recipient, ids, parent)
+                    order.append("publish")
                 except Exception as exc:
                     errors.append(repr(exc))
                 finally:
@@ -1283,9 +1314,8 @@ class Races(Fixture):
             try:
                 with mock.patch.object(AR.fcntl, "flock", observed_flock), \
                         mock.patch.object(R, "_late_candidate_delivery_change", final_check), \
-                        self.replaced("rename", observed_rename), \
-                        mock.patch.object(P, "_atomic_write_json", observed_write):
-                    result = self.sweep(8)
+                        self.replaced("rename", observed_rename):
+                    result = self.sweep(8 / 7)
                     self.assertTrue(writer_done.wait(5), "normal publisher did not finish after detach")
             finally:
                 start_writer.set()
@@ -1346,7 +1376,7 @@ class Races(Fixture):
         try:
             with mock.patch.object(AR, "_open_locked", tracked_open), \
                     mock.patch.object(R, "_late_candidate_delivery_change", final_check):
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
         finally:
             start_writer.set()
             thread.join(5)
@@ -1362,12 +1392,12 @@ class Races(Fixture):
         self.sweep(0)
         first = self.state()["eligible_since"][home.name]
         with AR.admission(self.root, ["att-reference-busy"]):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
             self.assertEqual(result["removed"], 0)
             self.assertEqual(self.kept(result, "delivery-reference-busy"), 1)
             self.assertTrue(home.is_dir())
             self.assertEqual(self.state()["eligible_since"][home.name], first)
-        result = self.sweep(8.1)
+        result = self.sweep((8.1) / 7)
         self.assertEqual(result["removed"], 1, result)
         self.assertFalse(home.exists())
 
@@ -1404,7 +1434,7 @@ class Races(Fixture):
         thread.start()
         try:
             with mock.patch.object(R, "_registry_lock_until", final_admission):
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
         finally:
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
@@ -1492,7 +1522,7 @@ class Races(Fixture):
                     mock.patch.object(R, "_delivery_record_relation", observed_relation), \
                     mock.patch.object(R, "_prepare_candidate_delivery_baseline", observed_prepare), \
                     mock.patch.object(R, "_registry_lock_until", final_admission):
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
         finally:
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
@@ -1509,8 +1539,8 @@ class Races(Fixture):
     def test_log_activity_before_preparation_or_lock_extends_window(self):
         for phase in ("preparation", "lock"):
             with self.subTest(phase=phase):
-                old = self.now - 10 * DAY
-                recent = self.now - DAY
+                old = self.now - int(10 / 7 * RETENTION_NS)
+                recent = self.now - int(RETENTION_NS / 7)
                 log = self.root / (phase + ".log")
                 log.write_text("finished")
                 attempt = "att-late-log-" + phase
@@ -1542,8 +1572,8 @@ class Races(Fixture):
                 self.assertEqual(result["removed"], 0)
                 self.assertEqual(self.kept(result, reason), 1)
                 self.assertTrue(home.is_dir())
-                self.assertEqual(self.sweep(5)["removed"], 0)
-                self.assertEqual(self.sweep(8)["removed"], 1)
+                self.assertEqual(self.sweep((5) / 7)["removed"], 0)
+                self.assertEqual(self.sweep((8) / 7)["removed"], 1)
                 self.assertFalse(home.exists())
 
     def test_unrelated_append_defers_without_restarting_established_clock(self):
@@ -1554,7 +1584,7 @@ class Races(Fixture):
         key = home.name
         first = self.state()["eligible_since"][key]
         with self.landing(lambda: self.append_row("att-unrelated", "done")):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1)
         self.assertFalse(home.exists())
         self.assertNotIn(key, self.state()["eligible_since"])
@@ -1575,7 +1605,7 @@ class Races(Fixture):
             os.replace(temp, self.jobs)
 
         with self.landing(replace_registry):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1, result)
         self.assertFalse(home.exists())
 
@@ -1589,11 +1619,11 @@ class Races(Fixture):
             self.delivery_record(group / ("delivery-" + "a" * 32 + ".json"),
                                  "att-gate-owner", "att-gate-owner", state="pending")
         with self.landing(publish):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(result["kept"].get("late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.sweep(8.1)["kept"].get("delivery-open"), 1)
+        self.assertEqual(self.sweep((8.1) / 7)["kept"].get("delivery-open"), 1)
         self.assertNotIn(home.name, self.state()["eligible_since"])
 
     def test_known_existing_recipient_group_catches_terminal_supervision(self):
@@ -1607,7 +1637,7 @@ class Races(Fixture):
         self.sweep(0)
         with self.landing(lambda: supervision.materialize(
                 self.jobs, {"att-supervision-owner"}, reason="closure-blocked")):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(result["kept"].get("late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -1616,10 +1646,10 @@ class Races(Fixture):
         home = self.add("att-renewed")
         self.sweep(0)
         with self.landing(lambda: self.row("att-ref", "open", parent_attempt_id="att-renewed")):
-            self.assertEqual(self.sweep(8)["removed"], 0)
+            self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertNotIn(home.name, self.state()["eligible_since"])
         self.set_status("att-ref", "done")
-        self.assertEqual(self.sweep(8.1)["removed"], 1)
+        self.assertEqual(self.sweep((8.1) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_unreadable_preparation_preserves_established_clock(self):
@@ -1634,19 +1664,19 @@ class Races(Fixture):
                 raise R._Unreadable("registry")
             return original(jobs)
         with mock.patch.object(R, "_Snapshot", side_effect=unreadable_second):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["kept"].get("registry-unreadable"), 1)
         self.assertEqual(self.state()["eligible_since"][home.name], first)
-        self.assertEqual(self.sweep(8.1)["removed"], 1)
+        self.assertEqual(self.sweep((8.1) / 7)["removed"], 1)
 
     def test_unreadable_global_registry_defers_without_losing_clock(self):
         home = self.add("att-unreadable-global")
         self.sweep(0)
         first = self.state()["eligible_since"][home.name]
         with mock.patch.object(R, "_Snapshot", side_effect=R._Unreadable("registry")):
-            self.assertEqual(self.sweep(8), {"skipped": "registry-unreadable"})
+            self.assertEqual(self.sweep((8) / 7), {"skipped": "registry-unreadable"})
         self.assertEqual(self.state()["eligible_since"][home.name], first)
-        self.assertEqual(self.sweep(8.1)["removed"], 1)
+        self.assertEqual(self.sweep((8.1) / 7)["removed"], 1)
 
 
     def test_open_reference_that_lands_before_detach_keeps_that_home_only(self):
@@ -1658,7 +1688,7 @@ class Races(Fixture):
             self.row("att-late", "open", parent_attempt_id="att-x1")
 
         with self.landing(land, key=victim):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1)
         self.assertTrue(first.is_dir())
         self.assertFalse(second.exists())
@@ -1710,14 +1740,14 @@ class Races(Fixture):
         with mock.patch.object(P.fcntl, "flock", observed), mock.patch.object(R, "_detach", detach):
             writer.start()
             self.assertTrue(parked.wait(5))
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         writer.join(5)
         self.assertEqual(errors, [])
         self.assertEqual(json.loads(path.read_text())["attempt_ids"], ["att-owner"])
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.kept(self.sweep(8.1), "delivery-open"), 1)
+        self.assertEqual(self.kept(self.sweep((8.1) / 7), "delivery-open"), 1)
 
     def test_process_quiescence_scan_stays_outside_the_registry_lock(self):
         self.add("att-owner-probe")
@@ -1741,7 +1771,7 @@ class Races(Fixture):
 
         with mock.patch.object(R, "_registry_lock", lock), \
                 mock.patch.object(DC, "attempt_process_quiescence", probe):
-            self.assertEqual(self.sweep(8)["removed"], 1)
+            self.assertEqual(self.sweep(8 / 7)["removed"], 1)
         self.assertTrue(calls)
         self.assertNotIn(True, calls)
 
@@ -1762,14 +1792,14 @@ class Races(Fixture):
             return original_check(ctx, candidate, deadline)
 
         with mock.patch.object(R, "_late_candidate_delivery_change", provider_admission):
-            result = self.sweep(8)
+            result = self.sweep(8 / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "protected:summary-live"), 1)
         self.assertTrue(home.is_dir() and provider_lock.is_dir())
 
     def _unmapped_candidate(self, attempt):
         home = self.add_unmapped_legacy(attempt)
-        os.utime(home, ns=(self.now - 9 * DAY, self.now - 9 * DAY))
+        os.utime(home, ns=(self.now - int(9 / 7 * RETENTION_NS), self.now - int(9 / 7 * RETENTION_NS)))
         self._optional_sweep(0)
         return home
 
@@ -1887,7 +1917,7 @@ class Races(Fixture):
         home = self.add("att-x3")
         self.sweep(0)
         with self.landing(lambda: self.set_status("att-x3", "running")):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -1904,7 +1934,7 @@ class Races(Fixture):
                 {"schema": 1, "original_attempt_id": "att-x4", "family_id": "f" * 64}))
 
         with self.landing(land):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(self.jobs.read_bytes(), before)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
@@ -1921,7 +1951,7 @@ class Races(Fixture):
                                  "att-x5", state="pending")
 
         with self.landing(land):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -1937,7 +1967,7 @@ class Races(Fixture):
         home = self.add("att-x6", route_file=str(path), route_id="rt-race", route_hash=record["route_hash"])
         self.sweep(0)
         with self.landing(outcome.unlink):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -1946,9 +1976,9 @@ class Races(Fixture):
         home = self.add("att-x7")
         self.sweep(0)
         wrote = []
-        view = self.now / 1e9 + 7.5 * 86400
+        view = self.now / 1e9 + (7.5 / 7 * R.IDLE_SECONDS)
         with self.landing(lambda: wrote.append(R.note_view(self.jobs, str(home), now=view))):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(wrote, [True])
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "recent-view"), 1)
@@ -1960,9 +1990,9 @@ class Races(Fixture):
                         route_hash=record["route_hash"])
         self.sweep(0)
         outcome = path.with_name(path.stem + ".outcome.json")
-        late = self.now + int(7.5 * DAY)
+        late = self.now + int(7.5 / 7 * RETENTION_NS)
         with self.landing(lambda: os.utime(outcome, ns=(late, late))):
-            self.assertEqual(self.sweep(8)["removed"], 0)
+            self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
 
     def test_late_delivery_home_and_supervisor_writes_get_full_windows(self):
@@ -1977,12 +2007,12 @@ class Races(Fixture):
         state_file.parent.mkdir()
         state_file.write_text("{}")
         self.sweep(0)
-        late = self.now + int(7.5 * DAY)
+        late = self.now + int(7.5 / 7 * RETENTION_NS)
         def land():
             for path in (record, homes[1], state_file):
                 os.utime(path, ns=(late, late))
         with self.landing(land):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertTrue(all(home.is_dir() for home in homes))
 
@@ -1994,7 +2024,7 @@ class Races(Fixture):
             with record.open("w") as stream:
                 stream.write(json.dumps({**value, "state": "pending"}))
         with self.landing(rewrite):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2006,7 +2036,7 @@ class Races(Fixture):
         for number in range(R.MAX_DEPENDENCY_STAMPS + 2):
             (folder / f"delivery-{number:032x}.json.pruned").touch()
         self.sweep(0)
-        result = self.sweep(8)
+        result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1, result)
         self.assertFalse(home.exists())
 
@@ -2027,7 +2057,7 @@ class Races(Fixture):
             }))
 
         with self.landing(prune):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2040,7 +2070,7 @@ class Races(Fixture):
         value = self.delivery_record(record, "att-other")
         self.sweep(0)
         with self.landing(lambda: record.write_text(json.dumps({**value, "state": "pending"}))):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1)
         self.assertFalse(home.exists())
 
@@ -2055,7 +2085,7 @@ class Races(Fixture):
                                  "att-other", "att-parent-only", state="pending")
 
         with self.landing(publish):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2070,7 +2100,7 @@ class Races(Fixture):
             record.write_text(json.dumps({**value, "attempt_ids": ["att-rewritten-reference"]}))
 
         with self.landing(rewrite):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2108,7 +2138,7 @@ class Races(Fixture):
             return result
         try:
             with mock.patch.object(R, "_late_delivery_change", broad_then_barrier):
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
         finally:
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
@@ -2149,7 +2179,7 @@ class Races(Fixture):
             return final_check(ctx, attempt, deadline)
         try:
             with mock.patch.object(R, "_late_candidate_delivery_change", final_barrier):
-                result = self.sweep(8)
+                result = self.sweep((8) / 7)
         finally:
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
@@ -2219,7 +2249,7 @@ class Races(Fixture):
         self.row("att-alias-other", runtime_home=str(alias / home.name))
         self.sweep(0)
         with self.landing(lambda: alias.unlink() or alias.symlink_to(self.workers, target_is_directory=True)):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2244,7 +2274,7 @@ class Races(Fixture):
         with self.landing(lambda: marker.write_text(json.dumps({
                 "schema": "inline_finish_v1", "inline_finish_id": "finish-one",
                 "state": "node-completed"}))):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertTrue(home.is_dir())
@@ -2262,9 +2292,9 @@ class Races(Fixture):
                                      "replacement_attempt_id": "att-successor"}))
         self.row("att-successor", "done")
         self.sweep(0)
-        late = self.now + int(7.5 * DAY)
+        late = self.now + int(7.5 / 7 * RETENTION_NS)
         with self.landing(lambda: os.utime(claim, ns=(late, late))):
-            self.assertEqual(self.sweep(8)["removed"], 0)
+            self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
 
     def test_a_view_cannot_pass_a_detach_in_progress(self):
@@ -2286,11 +2316,11 @@ class Races(Fixture):
             return real(src, dst, **kwargs)
 
         with self.replaced("rename", observe):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(blocked, [True])
         self.assertEqual(result["removed"], 1)
         # After the rename the home is gone, so a late view writes nothing.
-        self.assertFalse(R.note_view(self.jobs, str(home), now=self.now / 1e9 + 8 * 86400))
+        self.assertFalse(R.note_view(self.jobs, str(home), now=self.now / 1e9 + (8 / 7 * R.IDLE_SECONDS)))
         self.assertFalse((self.root / "homes/worker-retention/views" / self.key("att-x8")).exists())
 
     def test_swapped_home_is_not_detached(self):
@@ -2305,7 +2335,7 @@ class Races(Fixture):
             (home / "planted").write_text("different directory")
 
         with self.landing(swap):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
         self.assertEqual((home / "planted").read_text(), "different directory")
@@ -2318,19 +2348,19 @@ class Containment(Fixture):
         alias.symlink_to(self.jobs)
         self.sweep(0)
         with self.landing(lambda: self.set_status("att-canonical", "running")):
-            result = R.sweep(alias, now_ns=self.now + 8 * DAY, force=True)
+            result = R.sweep(alias, now_ns=self.now + int(8 / 7 * RETENTION_NS), force=True)
         self.assertEqual(result["removed"], 0)
         self.assertTrue(home.is_dir())
         self.set_status("att-canonical", "done")
         completion = datetime.fromtimestamp(
-            (self.now + int(8.1 * DAY)) / 10**9, timezone.utc
+            (self.now + int(8.1 / 7 * RETENTION_NS)) / 10**9, timezone.utc
         ).isoformat().replace("+00:00", "Z")
         self.set_timestamp("att-canonical", completion)
-        R.sweep(alias, now_ns=self.now + int(8.1 * DAY), force=True)
+        R.sweep(alias, now_ns=self.now + int(8.1 / 7 * RETENTION_NS), force=True)
         fd = os.open(str(self.jobs) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            result = R.sweep(alias, now_ns=self.now + 17 * DAY, force=True)
+            result = R.sweep(alias, now_ns=self.now + int(17 / 7 * RETENTION_NS), force=True)
             self.assertEqual(result["kept"].get("registry-lock-busy"), 1)
             self.assertTrue(home.is_dir())
         finally:
@@ -2360,13 +2390,13 @@ class Containment(Fixture):
                         return None
                     return actual(fd)
                 with mock.patch.object(R, "_mount_id", side_effect=mount_id):
-                    result = self.sweep(8)
+                    result = self.sweep((8) / 7)
                 self.assertEqual(result["removed"], 0)
                 self.assertGreaterEqual(result["kept"].get("mount-unproven", 0), 1)
                 self.assertTrue(home.is_dir())
                 self.assertEqual(self.state()["eligible_since"][home.name], first)
                 self.assertEqual(list((self.root / "homes/worker-retention/retiring").iterdir()), [])
-                self.sweep(8.1)
+                self.sweep((8.1) / 7)
 
     def test_links_inside_a_home_are_never_followed(self):
         target = self.outside / "release"
@@ -2385,7 +2415,7 @@ class Containment(Fixture):
         (nested / "up").symlink_to(self.outside)
         (nested / "dangling").symlink_to(self.outside / "nowhere")
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
         self.assertEqual((target / "important").read_text(), "keep")
         self.assertEqual(credential.read_text(), "{}")
@@ -2398,7 +2428,7 @@ class Containment(Fixture):
         self.workers.symlink_to(elsewhere)
         result = self.sweep(0)
         self.assertEqual(result, {"skipped": "containment"})
-        self.assertEqual(self.sweep(8), {"skipped": "containment"})
+        self.assertEqual(self.sweep((8) / 7), {"skipped": "containment"})
         self.assertTrue((elsewhere / self.key("att-c2")).is_dir())
 
     def test_symlink_leaf_and_foreign_entries_are_ignored(self):
@@ -2453,7 +2483,7 @@ class Containment(Fixture):
             (planted / "precious").write_text("planted")
 
         with self.landing(substitute):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         # A changed parent defers; neither the pinned original nor the decoy is removed.
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "late-evidence-changed"), 1)
@@ -2477,7 +2507,7 @@ class Containment(Fixture):
             return result
 
         with self.replaced("stat", stat_other_device):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 0)
         self.assertEqual(result["partial"], 1)
         leaf = next((self.root / "homes/worker-retention/retiring").glob("*.*[0-9]"))
@@ -2495,19 +2525,19 @@ class Containment(Fixture):
                     # The descriptor is the actual child; the device stays the same.
                     return invalid if os.readlink(f"/proc/self/fd/{fd}").endswith("/mount") else actual(fd)
                 with mock.patch.object(R, "_mount_id", side_effect=mount_id):
-                    result = self.sweep(8)
+                    result = self.sweep((8) / 7)
                 self.assertEqual(result["removed"], 0)
                 self.assertEqual(result["partial"], 1)
                 leaf = next((self.root / "homes/worker-retention/retiring").glob("*.*[0-9]"))
                 self.assertEqual((leaf / "mount" / "inner").read_text(), "keep")
                 # Clear the interrupted leaf through the normal resumed path.
-                self.sweep(16)
+                self.sweep((16) / 7)
 
     def test_unsupported_platform_detaches_nothing(self):
         home = self.add("att-c8")
         with mock.patch.object(R, "_symlink_safe_removal_supported", return_value=False):
             self.assertEqual(self.sweep(0), {"skipped": "removal-unsupported"})
-            self.assertEqual(self.sweep(8), {"skipped": "removal-unsupported"})
+            self.assertEqual(self.sweep((8) / 7), {"skipped": "removal-unsupported"})
         self.assertTrue(home.is_dir())
 
 
@@ -2534,7 +2564,7 @@ class Orphans(Fixture):
         homes = {"absent": {}, "live": {}, "unknown": {}}
         child_specs = []
         unknown_keys = set()
-        old = self.now - 9 * DAY
+        old = self.now - int(9 / 7 * RETENTION_NS)
         for harness in ("claude", "codex", "opencode"):
             attempt = f"att-unmapped-{harness}"
             homes["absent"][harness] = self.add_unmapped_legacy(
@@ -2589,7 +2619,7 @@ class Orphans(Fixture):
                 self.assertEqual(first["eligible"], 3, first)
                 self.assertEqual(self.kept(first, "not-quiescent"), 3, first)
                 self.assertEqual(self.unknown(first, "quiescence-unverifiable"), 3, first)
-                result = self.sweep(8)
+                result = self.sweep(8 / 7)
 
             self.assertEqual(result["removed"], 3, result)
             self.assertTrue(all(not home.exists() for home in homes["absent"].values()))
@@ -2610,7 +2640,7 @@ class Orphans(Fixture):
     def test_reader_pin_is_per_home_and_does_not_block_unrelated_detach(self):
         reader = self.add_unmapped_legacy("att-unmapped-reader-pin")
         other = self.add_unmapped_legacy("att-unmapped-other-home")
-        old = self.now - 9 * DAY
+        old = self.now - int(9 / 7 * RETENTION_NS)
         for home in (reader, other):
             os.utime(home, ns=(old, old))
         with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
@@ -2620,7 +2650,7 @@ class Orphans(Fixture):
                     self.jobs, reader, None, "att-unmapped-reader-pin", "claude") as admitted:
                 self.assertTrue(admitted)
                 self.sweep(0)
-                result = self.sweep(8)
+                result = self.sweep(8 / 7)
                 self.assertEqual(result["removed"], 1, result)
                 self.assertEqual(self.kept(result, "protected:home-reader-active"), 1, result)
                 self.assertTrue(reader.is_dir())
@@ -2632,7 +2662,7 @@ class Orphans(Fixture):
     def test_unmapped_legacy_reader_and_detach_first_share_path_admission(self):
         attempt = "att-unmapped-reader-race"
         home = self.add_unmapped_legacy(attempt)
-        old = self.now - 9 * DAY
+        old = self.now - int(9 / 7 * RETENTION_NS)
         os.utime(home, ns=(old, old))
         transcript = home / "projects" / "transcript.jsonl"
 
@@ -2643,7 +2673,7 @@ class Orphans(Fixture):
                     self.jobs, home, transcript, attempt, "claude") as admitted:
                 self.assertTrue(admitted)
                 self.sweep(0)
-                result = self.sweep(8)
+                result = self.sweep(8 / 7)
         self.assertEqual(result["removed"], 0, result)
         self.assertEqual(self.kept(result, "protected:home-reader-active"), 1, result)
         self.assertTrue(home.is_dir())
@@ -2653,8 +2683,8 @@ class Orphans(Fixture):
                                   return_value=("absent", "fixture-process-scan-complete")):
             # A live reader restarts the eligibility clock; detach wins only
             # after the reader released and a fresh full window elapsed.
-            self.assertEqual(self.sweep(8.1)["removed"], 0)
-            result = self.sweep(16.2)
+            self.assertEqual(self.sweep(8.1 / 7)["removed"], 0)
+            result = self.sweep(16.2 / 7)
             self.assertEqual(result["removed"], 1, result)
             with R.worker_home_read_admission(
                     self.jobs, home, transcript, attempt, "claude") as admitted:
@@ -2735,14 +2765,14 @@ class Mapping(Fixture):
     def test_schema_two_manifest_binds_without_a_runtime_home_row(self):
         home = self.add("att-m1", declare=False)
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_legacy_manifest_binds_by_runtime_home_or_unique_key(self):
         declared = self.add("att-m2", schema=1)
         derived = self.add("att-m3", schema=1, declare=False)
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 2)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 2)
         self.assertFalse(declared.exists() or derived.exists())
 
     def test_runtime_home_that_only_shares_a_basename_is_a_conflict(self):
@@ -2761,7 +2791,7 @@ class Mapping(Fixture):
         self.write_rows()
         # Only the parent resolves, and it resolves to the real workers directory.
         self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_manifest_and_row_disagreement_is_unknown(self):
@@ -2823,15 +2853,99 @@ class Mapping(Fixture):
         profile = self.root / "homes" / "slug.code-report"
         profile.mkdir()
         (profile / "worker-home.json").write_text("{}")
-        old = (self.now - 100 * DAY) / 1e9
+        old = (self.now - int(100 / 7 * RETENTION_NS)) / 1e9
         for path in (shared, profile):
             os.utime(path, (old, old))
-        result = self.expire(30)
+        result = self.expire((30) / 7)
         self.assertEqual(result["examined"], 0)
         self.assertTrue(shared.is_dir() and profile.is_dir())
 
 
 class Bounds(Fixture):
+    def test_retention_policy_uses_one_hour_and_keeps_time_budgets(self):
+        self.assertEqual(R.IDLE_SECONDS, 3600)
+        self.assertEqual(R.VIEW_REFRESH_SECONDS, 300)
+        self.assertLessEqual(R.VIEW_REFRESH_SECONDS, R.IDLE_SECONDS / 12)
+        self.assertEqual(R.REMOVE_LIMIT, 16)
+        self.assertEqual(R.EXAMINE_LIMIT, 128)
+        self.assertEqual(R.EXAMINE_BUDGET_SECONDS, 10)
+        self.assertEqual(R.REMOVE_DEADLINE_SECONDS, 20)
+
+    def test_operational_scale_pass_makes_progress_within_removal_deadline(self):
+        history_count = 5308
+        home_count = 340
+        due_count = 40
+        protected_count = home_count - due_count
+        attempts = [f"att-scale-{index:05d}" for index in range(history_count)]
+        home_attempts = sorted(attempts[:home_count], key=self.key)
+        due_attempts = set(home_attempts[:due_count])
+        protected_attempts = set(home_attempts[due_count:])
+        old_ns = self.now - 2 * RETENTION_NS
+        old_stamp = datetime.fromtimestamp(old_ns / 10**9, timezone.utc).isoformat().replace("+00:00", "Z")
+        current_stamp = datetime.fromtimestamp(self.now / 10**9, timezone.utc).isoformat().replace("+00:00", "Z")
+
+        for attempt in attempts:
+            is_home = attempt in due_attempts or attempt in protected_attempts
+            status = "running" if attempt in protected_attempts else "done"
+            meta = {"attempt_id": attempt, "harness": "claude", "worker_type": "stage",
+                    "launch_outcome": "never-launched", "padding": "x" * 5000}
+            if is_home:
+                meta["runtime_home"] = str(self.home_path(attempt))
+            self.rows[attempt] = (status, meta)
+            self.timestamps[attempt] = old_stamp if attempt in due_attempts else current_stamp
+        self.write_rows()
+        registry_bytes = self.jobs.stat().st_size
+        self.assertGreaterEqual(registry_bytes, 24 * 1024 * 1024)
+        self.assertLess(registry_bytes, 28 * 1024 * 1024)
+
+        for attempt in sorted(due_attempts | protected_attempts, key=self.key):
+            home = self.home_path(attempt)
+            home.mkdir(mode=0o700)
+            key = home.name
+            manifest = {"harness": "claude", "worker_type": "stage", "source": SOURCE,
+                        "profile": None, "schema": 2, "identity": attempt,
+                        "key": key, "destination": False}
+            (home / "worker-home.json").write_text(json.dumps(manifest))
+            (home / "projects").mkdir()
+            (home / "projects" / "transcript.jsonl").write_text("x" * 100)
+            stamp_ns = old_ns if attempt in due_attempts else self.now
+            os.utime(home, ns=(stamp_ns, stamp_ns))
+
+        delivery_group = self.root / "pending-delivery" / ("c" * 64)
+        for number in range(2000):
+            self.delivery_record(delivery_group / f"delivery-{number:032x}.json",
+                                 f"att-unrelated-{number}", state="acked")
+
+        detach_times = []
+        original_detach = R._detach
+
+        def measured_detach(*args, **kwargs):
+            deadline = kwargs.get("deadline", args[6] if len(args) > 6 else None)
+            outcome = original_detach(*args, **kwargs)
+            if outcome.startswith("detached:"):
+                detach_times.append((time.monotonic(), deadline))
+            return outcome
+
+        sweep_now = self.now + int(8 / 7 * RETENTION_NS)
+        started = time.monotonic()
+        with mock.patch.object(R, "_detach", side_effect=measured_detach):
+            result = R.sweep(self.jobs, now_ns=sweep_now, force=True)
+        elapsed = time.monotonic() - started
+        within_deadline = sum(finished <= deadline for finished, deadline in detach_times)
+        self.assertGreaterEqual(result["due"], due_count)
+        self.assertLessEqual(result["examined"], R.EXAMINE_LIMIT)
+        self.assertLessEqual(result["removed"] + result["partial"], R.REMOVE_LIMIT)
+        self.assertGreaterEqual(within_deadline, 6, result)
+        self.assertEqual(sum(not self.home_path(attempt).exists() for attempt in due_attempts),
+                         result["removed"])
+        self.assertTrue(all(self.home_path(attempt).is_dir() for attempt in protected_attempts))
+        print(json.dumps({"registry_mib": round(registry_bytes / 1024**2, 2),
+                          "history_rows": history_count, "delivery_records": 2000,
+                          "examined": result["examined"], "due": result["due"],
+                          "removed": result["removed"], "partial": result["partial"],
+                          "detached_within_deadline": within_deadline,
+                          "elapsed_s": round(elapsed, 3)}))
+
     def test_real_history_over_32768_stays_bounded_per_candidate(self):
         count = 32769
         for kind in ("bindings", "advances", "recipients", "combined"):
@@ -2889,7 +3003,7 @@ class Bounds(Fixture):
                             mock.patch.object(R, "_detach", detached), \
                             mock.patch.object(R, "_fresh", fresh), \
                             mock.patch.object(R, "_registry_lock", locked):
-                        result = fixture.sweep(8)
+                        result = fixture.sweep((8) / 7)
                     self.assertEqual(result["removed"], 3, (kind, result))
                     self.assertTrue(all(not home.exists() for home in homes))
                     self.assertEqual(len(preparation), 3)
@@ -2904,28 +3018,28 @@ class Bounds(Fixture):
                 finally:
                     fixture.doCleanups()
 
-    def test_at_most_four_removals_per_pass_then_the_rest(self):
-        homes = [self.add(f"att-b{index}") for index in range(7)]
+    def test_default_removal_limit_applies_then_the_rest(self):
+        homes = [self.add(f"att-b{index}") for index in range(R.REMOVE_LIMIT + 3)]
         self.sweep(0)
-        first = self.sweep(8)
-        self.assertEqual(first["removed"], 4)
+        first = self.sweep(8 / 7)
+        self.assertEqual(first["removed"], R.REMOVE_LIMIT)
         self.assertEqual(self.kept(first, "deferred"), 3)
-        second = self.sweep(8.1)
+        second = self.sweep(8.1 / 7)
         self.assertEqual(second["removed"], 3)
         self.assertFalse(any(path.exists() for path in homes))
-        self.assertEqual(self.sweep(8.2)["removed"], 0)
+        self.assertEqual(self.sweep(8.2 / 7)["removed"], 0)
 
     def test_fair_cursor_reaches_eligible_homes_behind_protected_ones(self):
-        attempts = [f"att-f{index}" for index in range(50)]
+        attempts = [f"att-f{index}" for index in range(R.EXAMINE_LIMIT + 5)]
         ordered = sorted(attempts, key=self.key)
-        protected, eligible = ordered[:45], ordered[45:]
+        protected, eligible = ordered[:R.EXAMINE_LIMIT], ordered[R.EXAMINE_LIMIT:]
         for attempt in protected:
             self.add(attempt, "running")
         paths = [self.add(attempt) for attempt in eligible]
         self.sweep(0)
-        self.sweep(0.001)
+        self.sweep((0.001) / 7)
         for step in range(1, 8):
-            self.sweep(8 + step / 1000)
+            self.sweep((8 + step / 1000) / 7)
             if not any(path.exists() for path in paths):
                 break
         self.assertFalse(any(path.exists() for path in paths))
@@ -2935,7 +3049,7 @@ class Bounds(Fixture):
         for index in range(R.EXAMINE_LIMIT + 5):
             self.add(f"att-e{index}", "running")
         first = self.sweep(0)
-        second = self.sweep(0.001)
+        second = self.sweep((0.001) / 7)
         self.assertEqual(first["examined"], R.EXAMINE_LIMIT)
         self.assertEqual(second["examined"], R.EXAMINE_LIMIT)
         self.assertNotEqual(self.state()["cursor"], "")
@@ -2948,9 +3062,62 @@ class Bounds(Fixture):
         fd = os.open(self.root / "homes/worker-retention/lock", os.O_RDWR)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            self.assertEqual(self.sweep(1), {"skipped": "busy"})
+            self.assertEqual(self.sweep((1) / 7), {"skipped": "busy"})
         finally:
             os.close(fd)
+
+    def test_examine_time_budget_stops_before_the_candidate_limit(self):
+        for index in range(5):
+            self.add(f"att-examine-budget-{index}", "running")
+        clock = [0.0]
+        real_examine = R._examine
+        examined = []
+
+        def monotonic():
+            return clock[0]
+
+        def slow_first_examine(ctx, key):
+            examined.append(key)
+            result = real_examine(ctx, key)
+            if len(examined) == 1:
+                clock[0] += R.EXAMINE_BUDGET_SECONDS + 1
+            return result
+
+        with mock.patch.object(R.time, "monotonic", side_effect=monotonic), \
+                mock.patch.object(R, "_examine", side_effect=slow_first_examine):
+            result = self.sweep(0)
+        self.assertEqual(result["examined"], 1)
+        self.assertEqual(len(examined), 1)
+        self.assertEqual(self.kept(result, "not-terminal"), 1)
+
+    def test_remove_deadline_stops_before_starting_another_candidate(self):
+        homes = [self.add(f"att-remove-deadline-{index}") for index in range(2)]
+        clock = [0.0]
+        real_remove = R._remove_leaf
+        real_detach = R._detach
+        detach_deadlines = []
+
+        def monotonic():
+            return clock[0]
+
+        def record_detach(*args, **kwargs):
+            detach_deadlines.append(args[6])
+            return real_detach(*args, **kwargs)
+
+        def advance_after_first_remove(*args, **kwargs):
+            outcome = real_remove(*args, **kwargs)
+            if outcome == "removed" and len(detach_deadlines) == 1:
+                clock[0] = R.REMOVE_DEADLINE_SECONDS + 1
+            return outcome
+
+        with mock.patch.object(R.time, "monotonic", side_effect=monotonic), \
+                mock.patch.object(R, "_detach", side_effect=record_detach), \
+                mock.patch.object(R, "_remove_leaf", side_effect=advance_after_first_remove):
+            result = self.sweep(8 / 7)
+        self.assertEqual(len(detach_deadlines), 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(self.kept(result, "deferred"), 1)
+        self.assertEqual(sum(not home.exists() for home in homes), 1)
 
     def test_leftover_removal_shares_the_cap(self):
         retiring = self.root / "homes/worker-retention/retiring"
@@ -2977,10 +3144,33 @@ class Bounds(Fixture):
             (retiring / (name + ".journal")).write_text(json.dumps(
                 {"schema": 1, "key": self.key(f"att-l{index}"), "name": name,
                  "identity": [st.st_dev, st.st_ino, st.st_uid]}))
-        result = self.sweep(8)
+        with mock.patch.object(R, "REMOVE_LIMIT", 4):
+            result = self.sweep(8 / 7)
         self.assertEqual(result["detached_leftover"], 3)
         self.assertEqual(result["removed"], 1)
         self.assertEqual(sum(1 for path in homes if not path.exists()), 1)
+        self.assertEqual(sorted(path.name for path in retiring.iterdir()), [])
+
+    def test_leftover_removal_shares_the_default_cap(self):
+        homes = [self.add(f"att-default-cap-{index}") for index in range(3)]
+        self.sweep(0)
+        retiring = self.root / "homes/worker-retention/retiring"
+        retiring.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for index in range(R.REMOVE_LIMIT - 1):
+            key = self.key(f"att-default-leftover-{index}")
+            name = f"{key}.{index + 1}"
+            leaf = retiring / name
+            leaf.mkdir()
+            (leaf / "file").write_text("x")
+            st = os.stat(leaf)
+            (retiring / (name + ".journal")).write_text(json.dumps({
+                "schema": 1, "key": key, "name": name,
+                "identity": [st.st_dev, st.st_ino, st.st_uid]}))
+
+        result = self.sweep(8 / 7)
+        self.assertEqual(result["detached_leftover"], R.REMOVE_LIMIT - 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(sum(not path.exists() for path in homes), 1)
         self.assertEqual(sorted(path.name for path in retiring.iterdir()), [])
 
     def test_unfinishable_leftover_does_not_starve_new_removals(self):
@@ -3000,7 +3190,8 @@ class Bounds(Fixture):
             self.skipTest("root bypasses directory permissions")
         homes = [self.add(f"att-s{index}") for index in range(4)]
         self.sweep(0)
-        result = self.sweep(8)
+        with mock.patch.object(R, "REMOVE_LIMIT", 4):
+            result = self.sweep(8 / 7)
         self.assertEqual(result["removed"], 3)
         self.assertEqual(result["partial"], 1)
         self.assertEqual(sum(not path.exists() for path in homes), 3)
@@ -3024,10 +3215,11 @@ class Bounds(Fixture):
         def remove(layout, name, ident, deadline):
             touched.append(name)
             return "partial" if name in stuck else real_remove(layout, name, ident, deadline)
-        with mock.patch.object(R, "_remove_leaf", side_effect=remove):
-            for day in (8, 9, 10):
+        with mock.patch.object(R, "_remove_leaf", side_effect=remove), \
+                mock.patch.object(R, "REMOVE_LIMIT", 4):
+            for window in (8 / 7, 9 / 7, 10 / 7):
                 before = len(touched)
-                result = self.sweep(day)
+                result = self.sweep(window)
                 self.assertLessEqual(len(touched) - before, 4)
                 self.assertEqual(result["removed"], 1)
         self.assertTrue(stuck <= set(touched))
@@ -3038,10 +3230,10 @@ class Bounds(Fixture):
         self.sweep(0)
         with self.jobs.open("a") as out:
             out.write("2026-10-16T00:00:00Z\topen\t/repo\t/wt\tatt-torn\tattempt_id=att-torn")
-        self.assertEqual(self.sweep(8), {"skipped": "registry-unreadable"})
+        self.assertEqual(self.sweep((8) / 7), {"skipped": "registry-unreadable"})
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.state()["last_pass_ns"], self.now + 8 * DAY)
-        self.assertEqual(R.sweep(self.jobs, now_ns=self.now + 8 * DAY + 1),
+        self.assertEqual(self.state()["last_pass_ns"], self.now + int(8 / 7 * RETENTION_NS))
+        self.assertEqual(R.sweep(self.jobs, now_ns=self.now + int(8 / 7 * RETENTION_NS) + 1),
                          {"skipped": "not-due"})
 
     def test_foreign_registry_lock_defers_promptly(self):
@@ -3055,7 +3247,7 @@ class Bounds(Fixture):
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
             began = time.monotonic()
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
             elapsed = time.monotonic() - began
             self.assertLess(elapsed, 1.0)
             self.assertIsNone(holder.poll())
@@ -3078,7 +3270,7 @@ class Bounds(Fixture):
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
             began = time.monotonic()
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
             elapsed = time.monotonic() - began
             holder.wait(timeout=2)
             self.assertLess(elapsed, 0.5)
@@ -3096,15 +3288,15 @@ class Bounds(Fixture):
         fd = os.open(str(self.jobs) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            blocked = self.sweep(8)
+            blocked = self.sweep((8) / 7)
             self.assertEqual(blocked["removed"], 0)
             self.assertGreater(blocked["kept"].get("registry-lock-busy", 0), 0)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
         removed = 0
-        for day in (8.1, 8.2, 8.3):
-            removed += self.sweep(day)["removed"]
+        for window in (8.1 / 7, 8.2 / 7, 8.3 / 7):
+            removed += self.sweep(window)["removed"]
         self.assertEqual(removed, len(homes))
         self.assertFalse(any(home.exists() for home in homes))
 
@@ -3144,7 +3336,7 @@ print("writes=300", flush=True)
         try:
             self.assertEqual(writer.stdout.readline().strip(), "ready")
             time.sleep(0.03)
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
             stdout, stderr = writer.communicate(timeout=3)
             self.assertEqual(writer.returncode, 0, stderr)
             self.assertIn("writes=300", stdout)
@@ -3190,7 +3382,7 @@ print("writes=300", flush=True)
                 mock.patch.object(R, "_Snapshot", outside(snapshot)), \
                 mock.patch.object(R, "_delivery_index", outside(index)), \
                 mock.patch.object(R, "_declared_index", outside(declared)):
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
         self.assertEqual(result["removed"], 1)
         self.assertFalse(home.exists())
         self.assertEqual(len(held), 2)
@@ -3201,14 +3393,14 @@ print("writes=300", flush=True)
         with self.jobs.open("a") as out:
             out.write("\nmalformed\n")
         self.assertEqual(self.sweep(0)["eligible"], 1)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_corrupt_state_preserves_valid_completion_clock(self):
         home = self.add("att-k1")
         self.sweep(0)
         (self.root / "homes/worker-retention/state.json").write_text("{corrupt")
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_corrupt_state_restarts_unparseable_completion_clock(self):
@@ -3216,17 +3408,17 @@ print("writes=300", flush=True)
         self.set_timestamp("att-k1-unparseable", "invalid")
         self.sweep(0)
         (self.root / "homes/worker-retention/state.json").write_text("{corrupt")
-        self.assertEqual(self.sweep(8)["removed"], 0)
+        self.assertEqual(self.sweep((8) / 7)["removed"], 0)
         self.assertTrue(home.is_dir())
-        self.assertEqual(self.state()["eligible_since"][home.name], self.now + 8 * DAY)
-        self.assertEqual(self.sweep(16)["removed"], 1)
+        self.assertEqual(self.state()["eligible_since"][home.name], self.now + int(8 / 7 * RETENTION_NS))
+        self.assertEqual(self.sweep((16) / 7)["removed"], 1)
 
     def test_oversized_registry_and_unreadable_registry_skip_the_pass(self):
         home = self.add("att-k2")
         with mock.patch.object(R, "MAX_REGISTRY_BYTES", 1):
             self.assertEqual(self.sweep(0), {"skipped": "registry-oversized"})
         self.jobs.unlink()
-        self.assertEqual(self.sweep(8), {"skipped": "registry-unreadable"})
+        self.assertEqual(self.sweep((8) / 7), {"skipped": "registry-unreadable"})
         self.assertTrue(home.is_dir())
 
     def test_sweep_best_effort_swallows_everything(self):
@@ -3247,7 +3439,7 @@ class Views(Fixture):
             self.assertLess(time.monotonic() - start, 0.5)
             fcntl.flock(fd, fcntl.LOCK_SH)
             start = time.monotonic()
-            result = self.sweep(8)
+            result = self.sweep((8) / 7)
             self.assertLess(time.monotonic() - start, 0.5)
             self.assertEqual(self.kept(result, "view-lock-busy"), 1)
             writer = os.open(str(self.jobs) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -3271,16 +3463,21 @@ class Views(Fixture):
             self.assertFalse(R.note_view(self.jobs, str(home)))
         self.assertFalse((self.root / "homes/worker-retention/views" / self.key("att-vanished")).exists())
 
-    def test_marker_is_written_once_per_hour_and_only_for_a_present_home(self):
+    def test_marker_refreshes_at_its_window_boundary_and_only_for_a_present_home(self):
         home = self.add("att-w1")
-        stamp = self.now / 1e9
+        stamp = 1_800_000_000.0
         self.assertTrue(R.note_view(self.jobs, str(home), now=stamp))
         mark = self.root / "homes/worker-retention/views" / self.key("att-w1")
         self.assertTrue(mark.is_file())
-        self.assertTrue(R.note_view(self.jobs, str(home), now=stamp + 60))
-        old = stamp - 2 * 3600
+        first_mtime = mark.stat().st_mtime_ns
+        self.assertTrue(R.note_view(self.jobs, str(home), now=stamp + R.VIEW_REFRESH_SECONDS - 1))
+        self.assertEqual(mark.stat().st_mtime_ns, first_mtime)
+        self.assertTrue(R.note_view(self.jobs, str(home), now=stamp + R.VIEW_REFRESH_SECONDS))
+        self.assertEqual(mark.stat().st_mtime_ns, int((stamp + R.VIEW_REFRESH_SECONDS) * 1e9))
+        old = stamp - 2 * R.VIEW_REFRESH_SECONDS
         os.utime(mark, (old, old))
         self.assertTrue(R.note_view(self.jobs, str(home), now=stamp))
+        self.assertEqual(mark.stat().st_mtime_ns, int(stamp * 1e9))
         gone = self.workers / ("e" * 32)
         self.assertFalse(R.note_view(self.jobs, str(gone), now=stamp))
         self.assertFalse((self.root / "homes/worker-retention/views" / gone.name).exists())

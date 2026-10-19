@@ -4033,6 +4033,26 @@ class NextLegReceiptTest(unittest.TestCase):
                                               jobs=str(jobs), surface="/fixture/preflight.sh")
         self.assertNotIn("next leg", plain)
 
+    def test_completion_followup_preserves_original_task_and_requested_output(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        jobs = Path(tmp.name) / "jobs.log"
+        jobs.write_text(row("done", "owner", "parent", "task", process_metadata={
+            "dispatch_depth": "1", "worker_type": "owner",
+            "workflow_completion": "runtime-v1"}))
+        receipt = {"children": [{"attempt_id": "owner",
+                                 "required_action": "advance-completed"}]}
+        text = JOIN.completion_followup_text(
+            receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
+        required = (
+            "Continue and complete the original user task itself",
+            "preserving every explicit content and output-format requirement",
+            "this receipt supplements the task",
+            "does not replace it with a receipt-only response",
+        )
+        self.assertTrue(all(part in text for part in required))
+        receipt_only = "Receipt received. The queue was consumed and ACKed."
+        self.assertFalse(all(part in receipt_only for part in required))
+
 
 class MaterializePendingDeliveryTest(unittest.TestCase):
     """SD-111 P2 round 2 C-1: carrier-independent idempotent materializer.

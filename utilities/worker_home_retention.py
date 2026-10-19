@@ -1,10 +1,15 @@
 """Retire expired per-attempt worker homes without a user step (issue #564).
 
 A home under ``<dispatch-state-root>/homes/workers/<32-hex>`` belongs to exactly
-one attempt. Once that attempt is terminal, quiescent and has been unused for
-`IDLE_SECONDS`, the home is detached with one rename and removed outside every
-lock. Anything unproven stays: the policy never guesses, and every uncertain
-case is counted in ``homes/worker-retention/state.json`` instead of hidden.
+one attempt. It becomes due after one hour without activity, measured from the
+best completion estimate (terminal row timestamp or later regular-log mtime), or
+from the first proven pass only when that timestamp cannot be parsed. Later
+activity, the home mtime and Fleet view markers extend the clock. Fleet markers
+refresh every five minutes; an admitted read using a cached marker retains at
+least 55 minutes of the one-hour view protection. Once terminal, quiescent and
+unused for `IDLE_SECONDS`, the home is detached with one rename and removed
+outside every lock. Anything unproven stays: the policy never guesses, and every
+uncertain case is counted in ``homes/worker-retention/state.json`` instead of hidden.
 
 Two existing carriers call `sweep`: the post-exit reaper tail and a non-exact
 ``reconcile --apply``. Fleet calls `note_view` before it reads a displayed
@@ -40,13 +45,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 import dispatch_attempt_reference as attempt_reference
 
-IDLE_SECONDS = 7 * 86400
+IDLE_SECONDS = 3600
 DUE_SECONDS = 300
-EXAMINE_LIMIT = 32
-REMOVE_LIMIT = 4
+EXAMINE_LIMIT = 128
+REMOVE_LIMIT = 16
 EXAMINE_BUDGET_SECONDS = 10
 REMOVE_DEADLINE_SECONDS = 20
-VIEW_REFRESH_SECONDS = 3600
+VIEW_REFRESH_SECONDS = 300
 
 MAX_REGISTRY_BYTES = 512 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024

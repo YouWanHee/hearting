@@ -387,18 +387,20 @@ and does not turn a duplicate start into a different assignment. Fleet's native
 observations use that attempt's recorded home across the three harnesses.
 
 **Per-attempt home retention.** A per-attempt home under `homes/workers/<key>`
-retires itself once its attempt has been terminal, quiescent and unused for seven
-days; no user command, flag, daemon or approval is involved. An exact, valid open
+retires itself once its attempt has been terminal, quiescent and unused for one
+hour; no user command, flag, daemon or approval is involved. An exact, valid open
 route alone is not a HOME consumer: the home remains only while an existing
 continuation, delivery/replacement, summary/provider, lease, process or recent-view
 obligation can read it. Route and attempt outcomes retain their semantic state;
 an unreadable or conflicting route binding remains unknown. The pass runs at the end
 of every post-exit reaper and in a `reconcile --apply` that is not scoped to one exact attempt. It is due at
-most every five minutes, examines at most 32 homes (a fair cursor), and removes at
-most four destructively touched homes, including partial leftovers of an interrupted removal. The seven-day clock starts
-at the first pass that proves every protection below, because terminal rows record
-no close time; uncertain prepared evidence defers without restarting an established
-clock, while freshly observed renewed protection restarts it. Later activity (a Fleet
+most every five minutes, examines at most 128 homes (a fair cursor), and removes at
+most 16 destructively touched homes, including partial leftovers of an interrupted removal. The idle clock starts
+from the best completion estimate: the terminal row timestamp or, when later, the
+regular log file mtime. Only when that timestamp cannot be parsed does the clock
+start at the first pass that proves every protection below. Uncertain prepared
+evidence defers without restarting an established clock, while freshly observed
+renewed protection restarts it. Later activity (a Fleet
 view, a route outcome, a resolved delivery, a recovery record, a supervisor update,
 or a write to the home) extends it, including activity arriving before detach. A home is
 kept while: its row is not terminal; any open row references the attempt; a
@@ -411,7 +413,7 @@ zero-byte or mismatched tombstone; its route binding is missing, damaged or
 unreadable; a terminal replacement successor still has unresolved delivery or
 source-HOME obligations; a summary owner/provider or the supervisor lease is live or
 unverifiable; process quiescence is not proven; Fleet displayed it within the
-window; or its `.credentials.json` is a regular file, which a Claude native refresh
+one-hour window; or its `.credentials.json` is a regular file, which a Claude native refresh
 left in place of the link and which may hold the only copy of a rotated token. A home
 is also kept, and counted rather than hidden in
 `homes/worker-retention/state.json`, when its manifest is ambiguous or
@@ -438,8 +440,12 @@ tree is then removed outside every lock, by directory descriptor, without follow
 a link or crossing the detached leaf's mount boundary. Deletion belongs to this pass alone,
 outside the builder, Fleet, the installer and registry critical sections. Fleet
 admits excluded native homes without retention bookkeeping and admits each candidate
-native-home read through a valid recent marker written at most hourly;
-if admission cannot be proved promptly, independent attempt summaries, titles and
+native-home read through a valid recent marker, refreshed at most every five minutes.
+A read admitted with a cached marker therefore has at least 55 minutes of the
+one-hour view protection remaining. The examination budget remains 10 seconds and
+candidate removals share the existing 20-second deadline. The count limits bound
+work in short passes too; in-flight operations are not preempted by either time limit.
+If admission cannot be proved promptly, independent attempt summaries, titles and
 streams remain available while native-home reads are withheld. A
 post-exit reaper pass runs only after that reaper exits; selector-less reconcile
 also carries the sweep when normal work invokes it. Neither carrier promises a

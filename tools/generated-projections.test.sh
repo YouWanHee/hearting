@@ -217,11 +217,35 @@ case "$response_policy_flat" in
   *'first close of material work follows the content contract in `core/workflow.md §0.5`'*'card is an optional presentation'*'required facts and explicit user-requested output'*) ;;
   *) echo "not ok - response policy must preserve first-close content without requiring a card" >&2; exit 1 ;;
 esac
+case "$response_policy_flat" in
+  *'continuation keeps the original accepted user task'*'every requested output constraint intact'*'receipt is supplemental context'*'not a replacement or a reason to narrow the task'*'do not assume the original user message was physically deleted'*) ;;
+  *) echo "not ok - shared continuation policy can narrow or replace the original user task" >&2; exit 1 ;;
+esac
 grep -Fq 'auto-proceed without another confirmation, then use the applicable concise' "$ROOT/roles/response-policy.md"
 if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.md"; then
   echo "not ok - one-line follow-up close contradicts the completion report card" >&2
   exit 1
 fi
+followup_flat=$(tr '\n' ' ' < "$ROOT/utilities/dispatch_completion_join.py" | \
+  sed -E 's/"[[:space:]]*"/ /g' | tr -s ' ' | tr 'A-Z' 'a-z')
+has_original_task_followthrough() {
+  case "$1" in
+    *'continue and complete the original user task itself'*'preserving every explicit content and output-format requirement'*'this receipt supplements the task'*'does not replace it with a receipt-only response'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+has_original_task_followthrough "$followup_flat" || {
+  echo "not ok - shared continuation text omits the original task or its requested output format" >&2
+  exit 1
+}
+if has_original_task_followthrough 'Receipt received. Queue consumption and ACK were observed.'; then
+  echo "not ok - generic receipt-only text satisfies original-task follow-through" >&2
+  exit 1
+fi
+grep -Fq 'completion_followup_text(' "$ROOT/utilities/claude-session-supervisor.py"
+grep -Fq 'completion_followup_text(' "$ROOT/utilities/codex-managed-completion.py"
+grep -Fq 'completion_followup_text(' "$ROOT/utilities/dispatch_session_sweep.py"
+grep -Fq 'dispatch_session_sweep.py' "$ROOT/adapters/opencode/plugins/hearting-guards.js"
 has_entry_confirmation() {
   case "$1" in
     *'present the five-field card in §0.4 before'*|*'present the §0.4 five-field card before'*|*'else the §0.4 card unless approved'*|*'for unapproved material work, use the §0.4 card'*) return 0 ;;
@@ -241,6 +265,10 @@ for bootstrap in \
   # Bootstrap prose is hard-wrapped, so match against a whitespace-normalized
   # copy: a restored clause must survive an unrelated reflow.
   bootstrap_flat=$(tr '\n' ' ' < "$bootstrap" | tr -s ' ' | tr 'A-Z' 'a-z')
+  grep -Fq 'Portable behavior contract = `roles/response-policy.md`' "$bootstrap" || {
+    echo "not ok - shared response policy is detached from $bootstrap" >&2
+    exit 1
+  }
   has_entry_confirmation "$bootstrap_flat" || {
     echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
     exit 1

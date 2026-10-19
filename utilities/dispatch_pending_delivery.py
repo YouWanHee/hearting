@@ -130,6 +130,14 @@ COURIER_RETRY_FIELDS = frozenset({
     "last_failure_at_ns", "next_attempt_at_ns", "delay_ns", "base_delay_ns",
 })
 COURIER_RETRY_SCHEMA = 1
+SUBMISSION_FENCE_FIELD = "submission_fence"
+SUBMISSION_FENCE_FIELDS = frozenset({
+    "schema_version", "delivery_id", "recipient_digest", "session_generation",
+    "target_thread_id", "receipt_digest", "attempt", "state", "updated_at_ns",
+    "queue_submission_id", "rejection_reason",
+})
+SUBMISSION_FENCE_SCHEMA = 1
+SUBMISSION_FENCE_STATES = frozenset({"prepared", "accepted", "not-accepted"})
 COURIER_RETRY_MAX_SECONDS = 15.0
 COURIER_RETRY_SUFFIX = ".courier-retry"
 COURIER_TIMELINE_SCHEMA = 1
@@ -201,6 +209,38 @@ def _validate_courier_retry(retry: object) -> dict:
     return retry
 
 
+def _validate_submission_fence(fence: object, record: dict) -> dict:
+    if (not isinstance(fence, dict) or set(fence) != SUBMISSION_FENCE_FIELDS
+            or fence.get("schema_version") != SUBMISSION_FENCE_SCHEMA
+            or fence.get("delivery_id") != record.get("delivery_id")
+            or fence.get("recipient_digest") != record.get("recipient_digest")
+            or fence.get("session_generation") != record.get("session_generation")
+            or fence.get("receipt_digest") != record.get("receipt_digest")
+            or not isinstance(fence.get("target_thread_id"), str)
+            or not fence["target_thread_id"] or len(fence["target_thread_id"]) > 512
+            or any(ord(char) < 32 for char in fence["target_thread_id"])
+            or type(fence.get("attempt")) is not int or fence["attempt"] < 0
+            or fence.get("state") not in SUBMISSION_FENCE_STATES
+            or type(fence.get("updated_at_ns")) is not int or fence["updated_at_ns"] < 1
+            or (fence.get("queue_submission_id") is not None
+                and (not isinstance(fence["queue_submission_id"], str)
+                     or not fence["queue_submission_id"]
+                     or len(fence["queue_submission_id"]) > 256))
+            or (fence.get("rejection_reason") is not None
+                and (not isinstance(fence["rejection_reason"], str)
+                     or not fence["rejection_reason"]
+                     or len(fence["rejection_reason"]) > 256))
+            or (fence["state"] == "prepared" and (
+                fence["attempt"] < 1 or fence["queue_submission_id"] is not None
+                or fence["rejection_reason"] is not None))
+            or (fence["state"] == "accepted" and fence["rejection_reason"] is not None)
+            or (fence["state"] == "not-accepted" and (
+                fence["attempt"] < 1 or fence["queue_submission_id"] is not None
+                or fence["rejection_reason"] is None))):
+        raise PendingDeliveryError("delivery-persistence-refused", "submission-fence-invalid")
+    return fence
+
+
 def _validate_record(value: object) -> dict:
     if not isinstance(value, dict):
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
@@ -215,7 +255,7 @@ def _validate_record(value: object) -> dict:
         )
         keys = set(value)
     optional_fields = RECOVERY_AUDIT_FIELDS | {
-        TIMESTAMP_PROVENANCE_FIELD, COURIER_RETRY_FIELD,
+        TIMESTAMP_PROVENANCE_FIELD, COURIER_RETRY_FIELD, SUBMISSION_FENCE_FIELD,
     }
     if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - optional_fields:
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
@@ -231,6 +271,8 @@ def _validate_record(value: object) -> dict:
         raise PendingDeliveryError("delivery-persistence-refused", "attempts-invalid")
     if COURIER_RETRY_FIELD in value:
         _validate_courier_retry(value[COURIER_RETRY_FIELD])
+    if SUBMISSION_FENCE_FIELD in value:
+        _validate_submission_fence(value[SUBMISSION_FENCE_FIELD], value)
     if (
         value.get("state") in {"claimed", "sent-ambiguous", "acked"}
         and value.get("claim_authority") not in CLAIM_AUTHORITIES
@@ -316,9 +358,10 @@ def _read_unlocked(path: Path) -> dict | None:
 def _public_record(value: dict) -> dict:
     """Return the persisted record shape without internal courier state."""
 
-    if COURIER_RETRY_FIELD not in value:
+    internal = {COURIER_RETRY_FIELD, SUBMISSION_FENCE_FIELD}
+    if not internal.intersection(value):
         return value
-    return {key: item for key, item in value.items() if key != COURIER_RETRY_FIELD}
+    return {key: item for key, item in value.items() if key not in internal}
 
 
 @contextmanager
@@ -665,6 +708,169 @@ def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
     if value is None:
         return None
     return _public_record(value)
+
+
+def submission_fence_identity(record: dict, target_thread_id: str) -> dict:
+    """Bind one native queue destination to the immutable delivery identity."""
+    if (not isinstance(record, dict) or not isinstance(target_thread_id, str)
+            or not target_thread_id or len(target_thread_id) > 512
+            or any(ord(char) < 32 for char in target_thread_id)):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-target-invalid")
+    return {
+        "delivery_id": record.get("delivery_id"),
+        "recipient_digest": record.get("recipient_digest"),
+        "session_generation": record.get("session_generation"),
+        "target_thread_id": target_thread_id,
+        "receipt_digest": record.get("receipt_digest"),
+    }
+
+
+_SUBMISSION_IDENTITY_FIELDS = frozenset({
+    "delivery_id", "recipient_digest", "session_generation",
+    "target_thread_id", "receipt_digest",
+})
+
+
+def _check_submission_identity(record: dict, expected_identity: dict) -> None:
+    if (not isinstance(expected_identity, dict)
+            or set(expected_identity) != _SUBMISSION_IDENTITY_FIELDS
+            or expected_identity.get("delivery_id") != record.get("delivery_id")
+            or expected_identity.get("recipient_digest") != record.get("recipient_digest")
+            or expected_identity.get("session_generation") != record.get("session_generation")
+            or expected_identity.get("receipt_digest") != record.get("receipt_digest")
+            or not isinstance(expected_identity.get("target_thread_id"), str)
+            or not expected_identity["target_thread_id"]
+            or len(expected_identity["target_thread_id"]) > 512
+            or any(ord(char) < 32 for char in expected_identity["target_thread_id"])):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-fence-identity")
+    fence = record.get(SUBMISSION_FENCE_FIELD)
+    if fence is not None and any(fence.get(key) != expected_identity.get(key)
+                                 for key in _SUBMISSION_IDENTITY_FIELDS):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-fence-changed")
+
+
+def read_submission_fence(root: Path, recipient_key: str, delivery_id: str, *,
+                          expected_identity: dict) -> dict | None:
+    """Read internal queue-fence evidence without exposing it in public records."""
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        _check_submission_identity(value, expected_identity)
+        fence = value.get(SUBMISSION_FENCE_FIELD)
+        return dict(fence) if fence is not None else None
+
+
+def prepare_submission_fence(root: Path, recipient_key: str, delivery_id: str, *,
+                             claim_owner: str, expected_identity: dict) -> dict:
+    """Durably fence an exact native queue add before its RPC is issued."""
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") != "claimed" or value.get("claim_owner") != claim_owner:
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-claim")
+        _check_submission_identity(value, expected_identity)
+        old = value.get(SUBMISSION_FENCE_FIELD)
+        if old is None:
+            attempt = 1
+        elif old["state"] == "not-accepted":
+            attempt = old["attempt"] + 1
+        else:
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-already-fenced")
+        fence = {
+            "schema_version": SUBMISSION_FENCE_SCHEMA,
+            **expected_identity,
+            "attempt": attempt,
+            "state": "prepared",
+            "updated_at_ns": time.monotonic_ns(),
+            "queue_submission_id": None,
+            "rejection_reason": None,
+        }
+        updated = dict(value)
+        updated[SUBMISSION_FENCE_FIELD] = fence
+        _write_unlocked(path, updated)
+        return dict(fence)
+
+
+def record_submission_accepted(root: Path, recipient_key: str, delivery_id: str, *,
+                               claim_owner: str, expected_identity: dict,
+                               queue_submission_id: str | None = None,
+                               source: str = "queue-response",
+                               expected_attempt: int | None = None) -> dict:
+    """Persist queue acceptance or an exact pending/consumed observation."""
+    if source not in {"queue-response", "exact-observation"}:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-source-invalid")
+    if (queue_submission_id is not None
+            and (not isinstance(queue_submission_id, str) or not queue_submission_id
+                 or len(queue_submission_id) > 256)):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-id-invalid")
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") != "claimed" or value.get("claim_owner") != claim_owner:
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-claim")
+        _check_submission_identity(value, expected_identity)
+        old = value.get(SUBMISSION_FENCE_FIELD)
+        if old is None:
+            if source != "exact-observation":
+                raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-missing")
+            attempt = 0
+        else:
+            attempt = old["attempt"]
+            if expected_attempt is not None and attempt != expected_attempt:
+                raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-attempt-changed")
+            if old["state"] == "accepted":
+                return dict(old)
+            if old["state"] == "not-accepted" and source != "exact-observation":
+                raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-not-prepared")
+        fence = {
+            "schema_version": SUBMISSION_FENCE_SCHEMA,
+            **expected_identity,
+            "attempt": attempt,
+            "state": "accepted",
+            "updated_at_ns": time.monotonic_ns(),
+            "queue_submission_id": queue_submission_id,
+            "rejection_reason": None,
+        }
+        updated = dict(value)
+        updated[SUBMISSION_FENCE_FIELD] = fence
+        _write_unlocked(path, updated)
+        return dict(fence)
+
+
+def record_submission_not_accepted(root: Path, recipient_key: str, delivery_id: str, *,
+                                   claim_owner: str, expected_identity: dict,
+                                   expected_attempt: int, reason: str) -> dict:
+    """Reopen only an add attempt with an explicit nonacceptance response."""
+    if (not isinstance(reason, str) or not reason.startswith(
+            "queue-rpc-refused:thread/queue/add:") or len(reason) > 256):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "submission-refusal-unproven")
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") != "claimed" or value.get("claim_owner") != claim_owner:
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-claim")
+        _check_submission_identity(value, expected_identity)
+        old = value.get(SUBMISSION_FENCE_FIELD)
+        if (old is None or old["state"] != "prepared"
+                or old["attempt"] != expected_attempt):
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-fence-not-prepared")
+        fence = dict(old)
+        fence.update(
+            state="not-accepted", updated_at_ns=time.monotonic_ns(),
+            queue_submission_id=None, rejection_reason=reason,
+        )
+        updated = dict(value)
+        updated[SUBMISSION_FENCE_FIELD] = fence
+        _write_unlocked(path, updated)
+        return dict(fence)
 
 
 def create(

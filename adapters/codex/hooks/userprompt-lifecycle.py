@@ -493,6 +493,7 @@ def main() -> int:
         ackable = retain_receiving_turn(
             batches, interaction_sid,
             native_receiving_turn(payload, interaction_sid),
+            request_context=current_prompt,
         )
     except Exception:
         parts = []
