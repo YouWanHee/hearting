@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 import opencode_context_window as opencode_context
+import opencode_runtime
 from worker_runtime_home import prepare_worker_home
 from dispatch_contract import (
     _atomic_registry_replace,
@@ -519,6 +520,21 @@ def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     selected = _select_model_settings(args)
+    if (selected.get("source") in {"profile", "role"}
+            and opencode_runtime.is_v2()):
+        original = selected["model"]
+        model, variant, evidence = opencode_runtime.select_automatic_model(
+            original, selected["variant"])
+        if evidence.get("state") == "unavailable" and model == original:
+            raise ModelSelectionError(
+                "opencode-model-unavailable",
+                f"provider={original.split('/', 1)[0]} reason={evidence.get('reason', 'unavailable')}",
+            )
+        if model != original:
+            selected = {**selected, "model": model, "variant": variant,
+                        "source": selected["source"] + "+provider-fallback",
+                        "provider_fallback_from": original,
+                        "provider_fallback_reason": evidence.get("reason") or "primary-unavailable"}
     return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 
@@ -547,6 +563,16 @@ def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
     config_root = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME") or Path.home()) / ".config")
     inventory = env.get("COMPUTE_HOSTS_CONFIG") or config_root / "hearting/compute-hosts.yaml"
     values = {"COMPUTE_HOSTS_CONFIG": str(Path(inventory).expanduser().absolute())}
+    try:
+        v2_runtime = opencode_runtime.is_v2()
+    except Exception:
+        v2_runtime = False
+    if v2_runtime:
+        # V2 owns credentials and sessions in its normal shared service. Let
+        # the CLI discover that service through the user's existing XDG
+        # service registration; never link/copy opencode.db into attempt state.
+        values.update(OPENCODE_DB=None, OPENCODE_AUTH=None, OPENCODE_DATA_DIR=None)
+        return values
     for kind in ("data", "cache", "state", "config"):
         directory = runtime / kind
         if not directory.resolve().is_relative_to(state_root):
@@ -620,6 +646,110 @@ def _add_task_publish_bash_rules(permission: dict, commands: tuple[str, ...], *,
     return True
 
 
+_V1_TO_V2_PERMISSION = {"bash": "shell", "task": "subagent",
+                       "write": "edit", "patch": "edit"}
+
+
+def _permission_object_to_rules(value, action):
+    if isinstance(value, str):
+        return [{"action": action, "resource": "*", "effect": value}]
+    if isinstance(value, dict):
+        return [{"action": action, "resource": str(resource), "effect": effect}
+                for resource, effect in value.items() if isinstance(effect, str)]
+    return []
+
+
+def _opencode_v2_to_legacy_config(config):
+    """Normalize V2 ordered permissions for the shared scoped projection code."""
+    value = dict(config)
+    permission = value.get("permission", {})
+    if isinstance(permission, str):
+        permission = {"*": permission}
+    if not isinstance(permission, dict):
+        permission = {}
+    else:
+        permission = dict(permission)
+    rules = value.get("permissions", [])
+    if isinstance(rules, list):
+        for row in rules:
+            if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
+                                                    for k in ("action", "resource", "effect")):
+                continue
+            action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
+            current = permission.get(action)
+            if isinstance(current, str):
+                current = {"*": current}
+            elif not isinstance(current, dict):
+                current = {}
+            current = dict(current)
+            current[row["resource"]] = row["effect"]
+            permission[action] = current
+    v2_agents = value.get("agents") if isinstance(value.get("agents"), dict) else {}
+    v1_agents = value.get("agent") if isinstance(value.get("agent"), dict) else {}
+    agents = {**v2_agents, **v1_agents}
+    legacy_agents = {}
+    for name, definition in agents.items():
+        if not isinstance(definition, dict):
+            legacy_agents[name] = definition
+            continue
+        item = dict(definition)
+        agent_rules = item.get("permissions", [])
+        agent_permission = item.get("permission", {})
+        if isinstance(agent_permission, str):
+            agent_permission = {"*": agent_permission}
+        if not isinstance(agent_permission, dict):
+            agent_permission = {}
+        agent_permission = dict(agent_permission)
+        if isinstance(agent_rules, list):
+            for row in agent_rules:
+                if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
+                                                        for k in ("action", "resource", "effect")):
+                    continue
+                action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
+                current = agent_permission.get(action)
+                if isinstance(current, str):
+                    current = {"*": current}
+                elif not isinstance(current, dict):
+                    current = {}
+                current = dict(current)
+                current[row["resource"]] = row["effect"]
+                agent_permission[action] = current
+        item.pop("permissions", None)
+        item["permission"] = agent_permission
+        legacy_agents[name] = item
+    value.pop("permissions", None)
+    value.pop("agents", None)
+    value["permission"] = permission
+    if legacy_agents:
+        value["agent"] = legacy_agents
+    return value
+
+
+def _opencode_legacy_to_v2_config(config):
+    """Emit V2 ordered permission rules after the shared scoped policy is applied."""
+    value = dict(config)
+    def rules(permission):
+        result = []
+        for tool, setting in (permission or {}).items():
+            action = _V1_TO_V2_PERMISSION.get(tool, tool)
+            result.extend(_permission_object_to_rules(setting, action))
+        return result
+    permission = value.pop("permission", {})
+    value["permissions"] = rules(permission)
+    agents = value.pop("agent", {})
+    if isinstance(agents, dict):
+        normalized = {}
+        for name, definition in agents.items():
+            if not isinstance(definition, dict):
+                normalized[name] = definition
+                continue
+            item = dict(definition)
+            item["permissions"] = rules(item.pop("permission", {}))
+            normalized[name] = item
+        value["agents"] = normalized
+    return value
+
+
 def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
@@ -633,6 +763,7 @@ def scoped_external_directory_config(
     task_publish_scope: dict[str, str] | None = None,
     merge_observation_only: bool = False,
 ) -> str:
+    v2 = opencode_runtime.is_v2()
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
         config = json.loads(raw) if raw else {}
@@ -640,6 +771,8 @@ def scoped_external_directory_config(
         raise ValueError(f"OPENCODE_CONFIG_CONTENT is not valid JSON: {e}") from e
     if not isinstance(config, dict):
         raise ValueError("OPENCODE_CONFIG_CONTENT must contain a JSON object")
+    if v2:
+        config = _opencode_v2_to_legacy_config(config)
 
     permission = config.get("permission")
     if permission is None:
@@ -911,6 +1044,8 @@ def scoped_external_directory_config(
         selected["permission"] = local
         agents[selected_agent] = selected
         config["agent"] = agents
+    if v2:
+        config = _opencode_legacy_to_v2_config(config)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -921,7 +1056,10 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
     `bash` entry moves last; a selected agent's permissions merge after the
     global ones, so it receives the same rules.
     """
+    v2 = opencode_runtime.is_v2()
     config = json.loads(config_content) if config_content else {}
+    if v2:
+        config = _opencode_v2_to_legacy_config(config)
 
     def with_denies(permission):
         if isinstance(permission, str):
@@ -943,6 +1081,8 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
         selected["permission"] = with_denies(selected.get("permission"))
         agents[selected_agent] = selected
         config["agent"] = agents
+    if v2:
+        config = _opencode_legacy_to_v2_config(config)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1053,20 +1193,15 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                     "--variant", args.resolved_model_settings["variant"]]
         return (" ".join(shlex.quote(x) for x in cmd)
                 + f" < {shlex.quote(str(prompt_path))} >> {shlex.quote(str(log_path))} 2>&1")
-    cmd = [
-        "opencode",
-        "run",
-        "--dir",
-        args.worktree,
-        "--format",
-        "json",
-        "--agent",
-        args.agent,
-    ]
-    if args.resolved_model_settings["source"] != "inherit":
-        cmd += ["--model", args.resolved_model_settings["model"]]
-        if args.resolved_model_settings["variant"] != "runtime-default":
-            cmd += ["--variant", args.resolved_model_settings["variant"]]
+    settings = args.resolved_model_settings
+    title = ("hearting-worker-" + str(args.attempt_id)
+             if opencode_runtime.is_v2() and getattr(args, "attempt_id", None) else None)
+    cmd = opencode_runtime.run_argv(
+        binary="opencode", cwd=args.worktree, agent=args.agent,
+        model=(settings["model"] if settings["source"] != "inherit" else None),
+        variant=(settings["variant"] if settings["source"] != "inherit" else None),
+        title=title,
+    )
     prompt_arg = f'"$(cat -- {shlex.quote(str(prompt_path))})"'
     return " ".join(shlex.quote(x) for x in cmd) + f" {prompt_arg} >> {shlex.quote(str(log_path))} 2>&1"
 

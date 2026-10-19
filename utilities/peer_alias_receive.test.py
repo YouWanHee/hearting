@@ -704,7 +704,21 @@ const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins
 const logs = [], timers = [];
 const scope = {process: {env: {}}, isWorkerSession: () => false, Buffer,
   setTimeout: cb => {const t = {cb, unref() {}}; timers.push(t); return t}, clearTimeout: () => {}};
-vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+function paneProjectionSource(source) {
+  const start = source.indexOf("function sdkResponseData(");
+  const exportStart = source.indexOf("\nexport default {\n", start);
+  const exportEnd = source.indexOf("\n}\n\n// Invocation-time root", exportStart);
+  const end = source.indexOf("\nfunction collectPreflight", exportEnd);
+  if (start < 0 || exportStart < start || exportEnd < exportStart || end < exportEnd)
+    throw Error("OpenCode pane fixture extraction boundary changed");
+  const moduleExport = source.slice(exportStart, exportEnd + 2);
+  if (!moduleExport.includes('id: "hearting-guards"')
+      || !moduleExport.includes("setup: setupOpenCodeV2")
+      || !moduleExport.includes("AgentHarnessGuards"))
+    throw Error("OpenCode V2 plugin export contract changed");
+  return source.slice(start, exportStart) + source.slice(exportEnd + 2, end);
+}
+vm.runInNewContext(paneProjectionSource(source), scope);
 const ctx = {client: {app: {log: async ({body}) => logs.push(body)}}};
 const observation = {schema: "hearting-pane-observation-v1", reason: "report-attempts-finished",
   session_report: "exit0", metadata_report: "timeout", session_report_rc: 0};
@@ -793,7 +807,21 @@ function fixture(options = {}) {
       if (options.syncThrows) throw Object.assign(Error("synthetic sync failure"), {code: "EFAULT", errno: -14});
       return options.syncResult || {pid: 0, error: Object.assign(Error("synthetic fallback denied"), {code: "EACCES", errno: -13})};
     }};
-  vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+  function paneProjectionSource(source) {
+    const start = source.indexOf("function sdkResponseData(");
+    const exportStart = source.indexOf("\nexport default {\n", start);
+    const exportEnd = source.indexOf("\n}\n\n// Invocation-time root", exportStart);
+    const end = source.indexOf("\nfunction collectPreflight", exportEnd);
+    if (start < 0 || exportStart < start || exportEnd < exportStart || end < exportEnd)
+      throw Error("OpenCode pane fixture extraction boundary changed");
+    const moduleExport = source.slice(exportStart, exportEnd + 2);
+    if (!moduleExport.includes('id: "hearting-guards"')
+        || !moduleExport.includes("setup: setupOpenCodeV2")
+        || !moduleExport.includes("AgentHarnessGuards"))
+      throw Error("OpenCode V2 plugin export contract changed");
+    return source.slice(start, exportStart) + source.slice(exportEnd + 2, end);
+  }
+  vm.runInNewContext(paneProjectionSource(source), scope);
   return {scope, commands, children, logs, reads, timers, sync, setNow: value => {now = value},
     ctx: get => ({directory: "/fixture/project", client: {app: {log: async ({body}) => logs.push(body)},
       session: {get: get || (async () => ({data: {id: "ses_A"}}))}}}),
