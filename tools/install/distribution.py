@@ -1086,6 +1086,20 @@ def _selected_update_runtimes(state: dict, requested: Iterable[str]) -> tuple[li
     return selected, skipped
 
 
+def _ordered_runtimes(*groups: Iterable[str]) -> list[str]:
+    """Union of runtime names in canonical order; nothing recorded is dropped."""
+    seen = {name for group in groups for name in group}
+    ordered = [name for name in RUNTIMES if name in seen]
+    ordered.extend(sorted(seen - set(RUNTIMES)))
+    return ordered
+
+
+def _managed_update_runtimes(state: dict) -> list[str]:
+    """Recorded runtimes plus any runtime already packaged at the managed release."""
+    adopted, _ = _selected_update_runtimes(state, RUNTIMES)
+    return _ordered_runtimes(state.get("runtimes", RUNTIMES), adopted)
+
+
 def _release_projection_referenced(target: Path) -> bool:
     resolved = target.resolve(strict=False)
     current = current_path()
@@ -4705,6 +4719,10 @@ def _install_or_update(
             try:
                 repaired = _repair_managed_pointers(previous_state)
                 launcher_result = _reconcile_codex_launcher()
+                adopted, _ = _selected_update_runtimes(previous_state, requested)
+                previous_state["runtimes"] = _ordered_runtimes(
+                    previous_state.get("runtimes", []), adopted
+                )
                 previous_state["channel"] = channel
                 previous_state["pinned_version"] = pinned_version
                 previous_state["last_checked_at"] = _utc_now()
@@ -4841,10 +4859,11 @@ def _install_or_update(
                 "version": release["version"],
                 "archive_sha256": checksum,
                 "release_root": str(target),
-                "runtimes": (
+                "runtimes": _ordered_runtimes(
                     previous_state.get("runtimes", requested)
                     if previous_state
-                    else requested
+                    else requested,
+                    activation["runtimes"],
                 ),
                 "updated_at": _utc_now(),
                 "last_checked_at": _utc_now(),
@@ -5054,7 +5073,7 @@ def update(
     return _install_or_update(
         repository=state["repository"],
         version=requested_version,
-        runtimes=runtimes or state.get("runtimes", RUNTIMES),
+        runtimes=runtimes or _managed_update_runtimes(state),
         bootstrap=False,
         channel=channel,
         pinned_version=pinned_version,
