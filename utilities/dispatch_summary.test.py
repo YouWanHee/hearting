@@ -525,6 +525,8 @@ class DispatchSummaryTest(unittest.TestCase):
         db = runtime / "data/opencode/opencode.db"
         db.parent.mkdir(parents=True)
         con = sqlite3.connect(db)
+        con.execute("CREATE TABLE session(id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER)")
+        con.execute("INSERT INTO session VALUES(?,?,?,?)", ("ses_exact", "/wt", 1, 1))
         con.execute("CREATE TABLE part(session_id TEXT,data TEXT)")
         con.execute("INSERT INTO part VALUES(?,?)", ("ses_exact",json.dumps({
             "type":"text","text":"Preparing the exact owner continuation"})))
@@ -559,6 +561,10 @@ class DispatchSummaryTest(unittest.TestCase):
 
     def test_opencode_native_db_produces_attempt_now_without_claude_transcript(self):
         log, db, _ = self._opencode_source()
+        import opencode_runtime
+        observation = opencode_runtime.read_session_observation("ses_exact", db_path=db)
+        self.assertEqual((observation["state"], observation["generation"]), ("observed", "v1"))
+        self.assertEqual(observation["session"]["directory"], "/wt")
         worker = subprocess.Popen(["sleep","0.5"],start_new_session=True)
         try:
             start = S.process_observation(worker.pid)[1]
