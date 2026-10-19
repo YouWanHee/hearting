@@ -54,16 +54,17 @@ def _token():
 
 
 def _native_credential(integration_id):
-    row = _runtime().read_credential(integration_id)
+    return _native_credential_row(integration_id, _runtime().read_credential(integration_id))
+
+
+def _native_credential_row(integration_id, row):
     if not isinstance(row, dict):
         return None
     value = row.get("value") or {}
-    token = value.get("key") if value.get("type") == "key" else (
-        value.get("access") if value.get("type") == "oauth" else None)
-    identity = row.get("credential_id") or row.get("label") or "active"
-    scope = hashlib.sha256((integration_id + "\0" + str(identity)).encode()).hexdigest()[:20]
+    token = (value.get("access") if value.get("type") == "oauth" else
+             value.get("key") if value.get("type") in {"key", "api"} else None)
     return {"token": token if isinstance(token, str) and token else None,
-            "scope": scope, "integration_id": integration_id,
+            "integration_id": integration_id,
             "credential_type": value.get("type")}
 
 
@@ -86,13 +87,10 @@ def _legacy_go_credential(runtime=None):
 def _v2_usage_credential(runtime=None):
     """OpenCode's active OAuth owns Go first; never bypass a present rejection."""
     runtime = runtime or _runtime()
-    oauth = _native_credential("opencode")
-    if oauth is not None:
-        return oauth
-    api_key = _native_credential("opencode-go")
-    if api_key is not None:
-        return api_key
-    return _legacy_go_credential(runtime)
+    selected = runtime.selected_go_usage_credential()
+    if selected is None:
+        return None
+    return _native_credential_row(selected["integration_id"], selected["credential"])
 
 
 def _record_status(provider, scope, state, reason=None, source="zen-go-usage"):
@@ -190,6 +188,7 @@ def _fetch_v2():
     integration = credential["integration_id"]
     oauth = integration == "opencode"
     scope = runtime.provider_account_scope("opencode-go")
+    entitlement_scope = runtime.account_scope("opencode") if oauth else None
     observed_at = time.time()
 
     def provider_state(state, reason, *, account_scope=scope, http_status=None):
@@ -214,9 +213,9 @@ def _fetch_v2():
             "unavailable", reason, http_status=code)}
         if oauth:
             entitlement = provider_state("unavailable", reason,
-                                         account_scope=credential["scope"], http_status=code)
+                                         account_scope=entitlement_scope, http_status=code)
             states["opencode-go-entitlement"] = entitlement
-            _record_status("opencode-go-entitlement", credential["scope"], "unavailable",
+            _record_status("opencode-go-entitlement", entitlement_scope, "unavailable",
                            reason, source="active-opencode-oauth")
         error = "subscription-missing" if reason == "subscription-missing" else "auth"
         return {"error": error, "detail": code, "reason": reason,
@@ -236,8 +235,8 @@ def _fetch_v2():
     states = {"opencode-go": provider_state("usable", None)}
     if oauth:
         states["opencode-go-entitlement"] = provider_state(
-            "usable", None, account_scope=credential["scope"])
-        _record_status("opencode-go-entitlement", credential["scope"], "usable",
+            "usable", None, account_scope=entitlement_scope)
+        _record_status("opencode-go-entitlement", entitlement_scope, "usable",
                        source="active-opencode-oauth")
     usage["provider_availability"] = states
     return usage

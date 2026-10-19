@@ -198,18 +198,45 @@ def account_scope(integration_id: str, *, environ=None) -> str:
     return _scope_for_row(integration_id, row)
 
 
+def selected_go_usage_credential(*, environ=None) -> dict | None:
+    """Return the selected source for Go usage and model-account scoping.
+
+    OpenCode OAuth wins only when the selected ``opencode`` row is OAuth (or
+    malformed, in which case it remains present and blocks stale fallback).
+    A valid selected API credential on that integration means OAuth is absent;
+    OpenCode itself then permits the Go API-key and legacy compatibility tiers.
+    """
+    env = os.environ if environ is None else environ
+    oauth = read_credential("opencode", environ=env)
+    if oauth is not None:
+        value = oauth.get("value")
+        valid_non_oauth_key = (
+            isinstance(value, dict)
+            and value.get("type") in {"key", "api"}
+            and isinstance(value.get("key"), str)
+            and bool(value.get("key"))
+        )
+        if not valid_non_oauth_key:
+            return {"integration_id": "opencode", "credential": oauth}
+
+    api_key = read_credential("opencode-go", environ=env)
+    if api_key is not None:
+        return {"integration_id": "opencode-go", "credential": api_key}
+    legacy = _legacy_account("opencode-go", env)
+    if legacy is not None:
+        return {"integration_id": "opencode-go", "credential": legacy}
+    return None
+
+
 def provider_account_scope(provider: str, *, environ=None) -> str:
     """Resolve Go models against the account OpenCode actually uses for Go."""
     env = os.environ if environ is None else environ
     if provider != "opencode-go" or not is_v2(environ=env):
         return account_scope(provider, environ=env)
-    oauth = read_credential("opencode", environ=env)
-    if oauth:
-        return _scope_for_row("opencode", oauth)
-    api_key = read_credential("opencode-go", environ=env)
-    if api_key:
-        return _scope_for_row("opencode-go", api_key)
-    return _scope_for_row("opencode-go", _legacy_account("opencode-go", env))
+    selected = selected_go_usage_credential(environ=env)
+    if selected is None:
+        return "unscoped"
+    return _scope_for_row(selected["integration_id"], selected["credential"])
 
 
 def model_availability(model: str, *, environ=None) -> dict:

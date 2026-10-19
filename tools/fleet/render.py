@@ -7394,7 +7394,8 @@ def _opencode_availability_text(snapshot):
     for provider, row in latest.items():
         state, reason = row.get("state"), row.get("reason")
         if provider == "opencode-go":
-            label = ("Go credential expired" if reason == "credential-expired" else
+            label = ("Go subscription missing" if reason == "subscription-missing" else
+                     "Go credential expired" if reason == "credential-expired" else
                      "Go key rejected" if state == "unavailable" else
                      "Go credential valid" if state == "usable" else "Go unknown")
             labels["go"] = label
