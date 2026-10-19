@@ -84,7 +84,17 @@ def _ensure_directory(path: Path) -> None:
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
         raise AttemptReferenceError("attempt-reference-directory-untrusted")
     try:
-        os.chmod(path, DIR_MODE, follow_symlinks=False)
+        try:
+            os.chmod(path, DIR_MODE, follow_symlinks=False)
+        except NotImplementedError:
+            # glibc < 2.32 has no no-follow chmod. The lstat above proved a
+            # real directory, so change it through a no-follow descriptor.
+            fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC |
+                         getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fchmod(fd, DIR_MODE)
+            finally:
+                os.close(fd)
     except OSError as exc:
         raise AttemptReferenceError("attempt-reference-directory-unavailable") from exc
 
