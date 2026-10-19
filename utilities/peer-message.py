@@ -120,7 +120,7 @@ def _transfer_path(ref):
     return peer_state_root() / "peer-messages" / "transfers" / f"{ref}.json"
 
 
-def _read_transfer_record(ref, *, roots=None):
+def _read_transfer_record(ref, *, roots=None, state_root=None):
     """Read Fleet's trusted ledger roots; a message never supplies a path.
 
     Each writer keeps its canonical jobs root. Multiple records for one ref
@@ -128,6 +128,8 @@ def _read_transfer_record(ref, *, roots=None):
     ``roots`` lets one pending scan resolve the roots once, not per row.
     """
     own_path = _transfer_path(ref)  # Validate before querying any roots.
+    if state_root is not None:
+        own_path = Path(state_root).resolve(strict=True) / "peer-messages" / "transfers" / own_path.name
     if roots is None:
         roots, _source = steward_marker_roots()
     paths = [own_path, *(Path(root) / "peer-messages" / "transfers" / own_path.name for root in roots)]
@@ -786,8 +788,19 @@ class UnsupportedPendingSchema(ValueError):
     """A valid pending row written by a newer reader; preserve it for takeover."""
 
 
-def _read_pending(ref, *, roots=None):
-    path = _pending_path(ref)
+def _read_pending(ref, *, roots=None, state_root=None):
+    if state_root is None:
+        path = _pending_path(ref)
+    else:
+        if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+            raise ValueError("peer-ref-invalid")
+        directory = Path(state_root).resolve(strict=True) / "peer-messages" / "pending"
+        if directory.is_symlink() or directory.parent.is_symlink():
+            raise ValueError("peer-pending-parent-symlink")
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("peer-pending-directory-unsafe")
+        path = directory / (ref + ".json")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -803,7 +816,8 @@ def _read_pending(ref, *, roots=None):
     if (isinstance(row, dict) and type(row.get("schema_version")) is int
             and row["schema_version"] > 1):
         raise UnsupportedPendingSchema("peer-pending-schema-unsupported")
-    transfer = _read_transfer_record(ref, roots=roots)
+    transfer = (_read_transfer_record(ref, roots=roots) if state_root is None else
+                _read_transfer_record(ref, roots=roots, state_root=state_root))
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
             or row.get("ref") != ref or row.get("from") != transfer.get("from")

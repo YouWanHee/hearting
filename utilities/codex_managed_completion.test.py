@@ -881,6 +881,53 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
                 else:
                     sleep.assert_not_called()
 
+    def test_exact_native_ack_is_recovered_before_join(self):
+        module = self.module
+        recovered = {"schema_version": 2, "state": "ready", "parent_attempt_id": "parent-session-x",
+                     "job_registry": str(self.jobs), "children": []}
+        args = SimpleNamespace(control_socket=None, queue_socket=Path("/tmp/codex.sock"),
+            jobs=self.jobs, parent_attempt_id=None, parent_session_id=SESSION, thread_id=SESSION,
+            attempt_id=["att-child"], timeout=0, _obligation_id="duty-exact", _resume_execution=False)
+        current = {"outcome": None, "effective_attempts": ["att-child"]}
+        with mock.patch.object(module.batch_obligations, "read",
+                               side_effect=[current, current, {"outcome": recovered}]), \
+             mock.patch.object(module.batch_obligations, "update") as update, \
+             mock.patch("dispatch_completion_join.recover_acknowledged_batch_outcome",
+                        return_value=recovered) as recover, \
+             mock.patch("dispatch_completion_join.current_batch_receipt_projection",
+                        return_value=recovered), \
+             mock.patch.object(module, "wait_for_session_launch_claims", side_effect=AssertionError("must not join")), \
+             mock.patch.object(module, "parent_session_stop_reason", return_value=""), \
+             mock.patch.object(module, "_observer_ownership_lost", return_value=False), \
+             mock.patch.object(module, "deliver_to_native_queue", return_value={"status": "accepted"}) as deliver:
+            result, code = module._execute_once(args)
+        self.assertEqual((code, result["status"]), (0, "accepted"))
+        recover.assert_called_once()
+        update.assert_called_once()
+        self.assertEqual(update.call_args.kwargs["outcome"], recovered)
+        deliver.assert_called_once_with(args, recovered, {"att-child"}, stop_check=mock.ANY)
+
+    def test_cached_outcome_with_changed_exact_identity_is_not_resent(self):
+        module = self.module
+        cached = {"schema_version": 2, "state": "ready", "parent_attempt_id": "parent-session-x",
+                  "job_registry": str(self.jobs), "children": []}
+        args = SimpleNamespace(control_socket=None, queue_socket=Path("/tmp/codex.sock"),
+            jobs=self.jobs, parent_attempt_id=None, parent_session_id=SESSION, thread_id=SESSION,
+            attempt_id=["att-child"], timeout=0, _obligation_id="duty-stale", _resume_execution=True)
+        with mock.patch.object(module.batch_obligations, "read", return_value={
+                "outcome": cached, "effective_attempts": ["att-child"]}), \
+             mock.patch.object(module.batch_obligations, "update") as update, \
+             mock.patch("dispatch_completion_join.current_batch_receipt_projection", return_value=None), \
+             mock.patch.object(module, "wait_for_session_launch_claims",
+                               side_effect=AssertionError("stale outcome must not join")), \
+             mock.patch.object(module, "deliver_to_native_queue") as deliver:
+            result, code = module._execute_once(args)
+        self.assertEqual((code, result["status"], result["reason"]),
+                         (75, "retryable", "cached-outcome-identity-unavailable"))
+        self.assertNotIn("outcome", update.call_args.kwargs)
+        self.assertEqual(update.call_args.kwargs["reason"], "cached-outcome-identity-unavailable")
+        deliver.assert_not_called()
+
     @staticmethod
     def _without_live_timing(value):
         # `delivery_timing` embeds `time.monotonic_ns()` observed at call
@@ -1060,7 +1107,9 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
                     "thread": {"id": SESSION, "cwd": "/repo"}}), \
                  mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                                   return_value={"status": "consumed"}) as send:
+                                   return_value={"status": "consumed", "turn_id": "turn-standalone",
+                                                 "turn_status": "completed"}) as send, \
+                 mock.patch("peer_obligations.retain_registered_completion", return_value=True):
                 result = module.deliver_to_native_queue(args, receipt, {attempt})
             self.assertEqual(result["status"], "accepted")
             self.assertEqual(json.loads(record_path.read_text())["state"], "acked")
@@ -1115,9 +1164,12 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                  mock.patch.object(module, "current_session_children", return_value=[row]), \
                  mock.patch.object(module, "_queue_target_from_rows", return_value=SESSION), \
                  mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=Session), \
+                 mock.patch("peer_obligations.retain_registered_completion",
+                            return_value=True) as retain, \
                  mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=[
                      module.codex_queue_delivery.QueueDeliveryError("transport-timeout"),
-                     {"status": "consumed"},
+                     {"status": "consumed", "turn_id": "turn-after-retry",
+                      "turn_status": "completed"},
                  ]) as send:
                 with mock.patch.object(module.pending_delivery.time, "time_ns", return_value=fixed_now):
                     with self.assertRaisesRegex(
@@ -1145,6 +1197,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                     result = module._native_queue_delivery_once(args, receipt, {attempt})
             self.assertEqual(result["status"], "accepted")
             self.assertEqual(send.call_count, 2)
+            retain.assert_called_once()
             self.assertEqual(send.call_args_list[0].kwargs["client_message_id"],
                              send.call_args_list[1].kwargs["client_message_id"])
             delivered = read(root, SESSION, delivery_id)
@@ -1193,12 +1246,17 @@ class NativeQueueDeliveryTest(unittest.TestCase):
              mock.patch.object(module.pending_delivery, "release_claim") as release, \
              mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
              mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.pending_delivery, "record_send"), \
              mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=[{
                  "status": "queued", "queued_submission_id": item["id"]},
-                 {"status": "consumed"}]) as send, \
+                 {"status": "consumed", "turn_id": "turn-1", "turn_status": "completed"}]) as send, \
              mock.patch.object(module.codex_queue_delivery, "list_queue", side_effect=[[item], []]), \
              mock.patch.object(module.codex_queue_delivery,
-                               "find_turn_by_client_message_id", return_value={"id": "turn-1"}), \
+                               "find_turn_by_client_message_id", return_value={"id": "turn-1",
+                                                                                "status": "completed"}), \
+             mock.patch.object(module.codex_queue_delivery, "_known_consumed",
+                               return_value={"id": "turn-1", "status": "completed"}), \
+             mock.patch("peer_obligations.retain_registered_completion", return_value=True), \
              mock.patch.object(module.codex_queue_delivery, "_latest_turn_status", return_value="interrupted"), \
              mock.patch.object(module.codex_queue_delivery, "poll_owned_item") as restart, \
              mock.patch.object(module.time, "sleep"):
@@ -1243,9 +1301,12 @@ class NativeQueueDeliveryTest(unittest.TestCase):
              mock.patch.object(module.pending_delivery, "release_claim"), \
              mock.patch.object(module.pending_delivery, "mark_sent_ambiguous"), \
              mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.pending_delivery, "record_send"), \
              mock.patch.object(module.codex_queue_delivery, "_known_consumed", return_value=None) as consumed, \
              mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                               return_value={"status": "consumed"}) as send:
+                               return_value={"status": "consumed", "turn_id": "turn-1",
+                                             "turn_status": "completed"}) as send, \
+             mock.patch("peer_obligations.retain_registered_completion", return_value=True):
             result = module.deliver_to_native_queue(args, receipt, {"att-one"})
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(rpc.call_args.args[2], {"threadId": "successor-thread"})
@@ -1322,15 +1383,19 @@ class NativeQueueDeliveryTest(unittest.TestCase):
              mock.patch.object(module.pending_delivery, "release_claim") as release, \
              mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
              mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.pending_delivery, "record_send"), \
              mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=[{
                  "status": "queued", "queued_submission_id": item["id"]},
-                 {"status": "consumed"}]) as send, \
+                 {"status": "consumed", "turn_id": "turn-1", "turn_status": "completed"}]) as send, \
              mock.patch.object(module.codex_queue_delivery, "list_queue", side_effect=[[item], []]), \
              mock.patch.object(module.codex_queue_delivery,
                                "find_turn_by_client_message_id", side_effect=[
                                    module.codex_queue_delivery.QueueDeliveryError("history-unavailable"),
                                    module.codex_queue_delivery.QueueDeliveryError("history-unavailable"),
-                                   {"id": "turn-1"}]), \
+                                   {"id": "turn-1", "status": "completed"}]), \
+             mock.patch.object(module.codex_queue_delivery, "_known_consumed",
+                               side_effect=[None, None, {"id": "turn-1", "status": "completed"}]), \
+             mock.patch("peer_obligations.retain_registered_completion", return_value=True), \
              mock.patch.object(module.codex_queue_delivery, "_latest_turn_status", return_value="interrupted"), \
              mock.patch.object(module.codex_queue_delivery, "poll_owned_item", return_value={"pending": False, "started": False}) as restart, \
              mock.patch.object(module.time, "sleep"):

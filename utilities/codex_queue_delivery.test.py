@@ -100,6 +100,15 @@ def native_fixture(root, *, entries=(), turn_ids=(), thread_id=THREAD,
 
 
 class QueueDeliveryTest(unittest.TestCase):
+    def test_read_exact_turn_confirms_native_turn_id_from_thread_history(self):
+        turn = {"id": "turn-native-exact", "status": "inProgress"}
+        with mock.patch.object(QUEUE, "_rpc", side_effect=[{"data": [turn]}, {"data": [turn]}]) as rpc:
+            self.assertEqual(QUEUE.read_exact_turn(SOCKET, THREAD, "turn-native-exact"),
+                             {"id": "turn-native-exact", "status": "inProgress"})
+            self.assertIsNone(QUEUE.read_exact_turn(SOCKET, THREAD, "message-id-alias"))
+        self.assertEqual(rpc.call_args_list[0].args[1], "thread/turns/list")
+        self.assertEqual(rpc.call_args_list[0].args[2]["threadId"], THREAD)
+
     def test_rpc_server_request_id_collision_is_not_mistaken_for_a_reply(self):
         client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
         client.timeout = 1.0

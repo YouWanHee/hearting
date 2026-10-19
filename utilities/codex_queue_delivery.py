@@ -388,6 +388,38 @@ def _latest_turn_status(path: Path, thread_id: str, *, timeout: float,
     return status if isinstance(status, str) else None
 
 
+def read_exact_turn(path: Path, thread_id: str, turn_id: str, *, timeout: float = 5.0,
+                    session: DeliverySession | None = None) -> dict[str, Any] | None:
+    """Read one exact native turn from the thread history; never use message IDs."""
+    if not isinstance(thread_id, str) or not thread_id or not isinstance(turn_id, str) or not turn_id:
+        raise QueueDeliveryError("queue-turn-identity-invalid")
+    cursor = None
+    matches = []
+    for _ in range(MAX_QUEUE_PAGES):
+        params: dict[str, Any] = {"threadId": thread_id, "limit": MAX_PAGE_SIZE,
+                                  "sortDirection": "desc"}
+        if cursor:
+            params["cursor"] = cursor
+        response = _rpc(path, "thread/turns/list", params, timeout=timeout,
+                        **_session_kwargs(session))
+        turns = response.get("data")
+        if not isinstance(turns, list):
+            raise QueueDeliveryError("queue-turns-response-invalid")
+        matches.extend(turn for turn in turns if isinstance(turn, dict)
+                       and turn.get("id") == turn_id)
+        if len(matches) > 1:
+            raise QueueDeliveryError("queue-turn-identity-conflict")
+        cursor = response.get("nextCursor")
+        if not cursor:
+            if not matches:
+                return None
+            status = matches[0].get("status")
+            if not isinstance(status, str) or not status:
+                raise QueueDeliveryError("queue-turn-status-unavailable")
+            return {"id": turn_id, "status": status}
+    raise QueueDeliveryError("queue-turn-history-page-limit-exceeded")
+
+
 def find_turn_by_client_message_id(
     path: Path, thread_id: str, client_message_id: str, *, timeout: float = 5.0,
     strict_history: bool = False, session: DeliverySession | None = None,
@@ -673,7 +705,8 @@ def send_at_least_once(
             if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
                 raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
             return {"status": "consumed", "queued_submission_id": None,
-                    "already_pending": False, "started_after_interrupt": False}
+                    "already_pending": False, "started_after_interrupt": False,
+                    "turn_id": consumed.get("id"), "turn_status": consumed.get("status")}
         queued = list_queue(path, thread_id, timeout=timeout, **_session_kwargs(session))
         pending, item_id = _pending_item(queued, client_message_id)
         if pending:
@@ -697,7 +730,8 @@ def send_at_least_once(
             if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
                 raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
             return {"status": "consumed", "queued_submission_id": None,
-                    "already_pending": False, "started_after_interrupt": False}
+                    "already_pending": False, "started_after_interrupt": False,
+                    "turn_id": consumed.get("id"), "turn_status": consumed.get("status")}
         if not allow_add:
             raise QueueDeliveryError("queue-add-previously-unconfirmed", ambiguous=True)
         interrupted = allow_restart and _latest_turn_status(
