@@ -1946,14 +1946,19 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
             return False
         from dispatch_attempt_reference import admission
         from dispatch_contract import dispatch_state_root
+        from worker_home_retention import worker_home_read_admission
 
         with admission(dispatch_state_root(jobs), (attempt_id,), blocking=False) as admitted:
             if not admitted:
                 return False
-            return _maybe_spawn_unadmitted(
-                harness, sid, transcript, now, debounce, refresh_source, priority,
-                quota_class, prompt_path, anchor_text,
-                attempt_admission=attempt_id, worker_home=str(home))
+            with worker_home_read_admission(
+                    jobs, home, source, attempt_id, harness) as home_admitted:
+                if not home_admitted:
+                    return False
+                return _maybe_spawn_unadmitted(
+                    harness, sid, transcript, now, debounce, refresh_source, priority,
+                    quota_class, prompt_path, anchor_text,
+                    attempt_admission=attempt_id, worker_home=str(home))
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -2073,6 +2078,7 @@ def main(argv=None):
         try:
             from dispatch_attempt_reference import admission
             from dispatch_contract import dispatch_state_root
+            from worker_home_retention import worker_home_read_admission
 
             admission_scope = admission(
                 dispatch_state_root(jobs), (attempt_id,), blocking=False)
@@ -2086,11 +2092,27 @@ def main(argv=None):
             _remove_empty_dir(args.slotdir)
             _remove_empty_dir(args.lockdir)
             return 0
+        try:
+            read_scope = worker_home_read_admission(
+                jobs, worker_home, args.transcript, attempt_id, args.harness)
+            home_admitted = read_scope.__enter__()
+        except (OSError, RuntimeError, ValueError):
+            admission_scope.__exit__(None, None, None)
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        if not home_admitted:
+            read_scope.__exit__(None, None, None)
+            admission_scope.__exit__(None, None, None)
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
         _HOME_ADMISSION_ACTIVE = True
         try:
             return main(argv)
         finally:
             _HOME_ADMISSION_ACTIVE = False
+            read_scope.__exit__(None, None, None)
             admission_scope.__exit__(None, None, None)
     explicit_anchor = (
         _bounded_data_text(sys.stdin.read(ANCHOR_TEXT_CAP), ANCHOR_TEXT_CAP)

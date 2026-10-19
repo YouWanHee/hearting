@@ -829,11 +829,33 @@ def supervise(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = lock_path.open("a+", encoding="utf-8")
     review_fd: int | None = None
+    home_read_scope = None
     try:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
+        if runtime_home is not None and jobs_env:
+            try:
+                from dispatch_contract import dispatch_state_root
+                jobs_path = Path(jobs_env).expanduser().resolve()
+                state_root = dispatch_state_root(jobs_path)
+                workers = Path(os.path.realpath(state_root / "homes" / "workers"))
+                home = Path(runtime_home).resolve(strict=False)
+                if home.parent == workers:
+                    from worker_home_retention import worker_home_read_admission
+                    home_read_scope = worker_home_read_admission(
+                        jobs_path, home, None, attempt_id, harness)
+                    if not home_read_scope.__enter__():
+                        home_read_scope.__exit__(None, None, None)
+                        home_read_scope = None
+                        return 0
+            except (OSError, RuntimeError, ValueError):
+                if home_read_scope is not None:
+                    home_read_scope.__exit__(None, None, None)
+                    home_read_scope = None
+                return 0
         review_values = (review_artifact_root, review_cycle_id, review_lease_nonce)
         if any(value is not None for value in review_values):
             if not all(value is not None for value in review_values):
@@ -1015,6 +1037,8 @@ def supervise(
                 fcntl.flock(review_fd, fcntl.LOCK_UN)
             finally:
                 os.close(review_fd)
+        if home_read_scope is not None:
+            home_read_scope.__exit__(None, None, None)
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         finally:

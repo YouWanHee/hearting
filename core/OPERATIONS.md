@@ -414,9 +414,15 @@ unverifiable; process quiescence is not proven; Fleet displayed it within the
 window; or its `.credentials.json` is a regular file, which a Claude native refresh
 left in place of the link and which may hold the only copy of a rotated token. A home
 is also kept, and counted rather than hidden in
-`homes/worker-retention/state.json`, when its attempt cannot be proven from the
-manifest, the row's `runtime_home` and the legacy key, or existing process,
-delivery, summary/provider or lease evidence is incomplete. The result preserves
+`homes/worker-retention/state.json`, when its manifest is ambiguous or
+conflicting, or existing process, delivery, summary/provider or lease evidence is
+incomplete. A valid private legacy home whose attempt cannot be recovered at all is
+an identity-less candidate, not an unknown: it is judged by the same path-based
+evidence (process environment/cwd/fd, ledger inventories, leases, provider locks)
+and is reclaimed only on complete affirmative absence after the normal clock; no
+identity or row is invented for it. A native reader or supervisor pins exactly its
+own home with a shared directory lock that detach must take exclusively, so a
+reader never blocks another home and a detach-first outcome refuses new reads. The result preserves
 the existing top-level unknown counts and records bounded causes beside them;
 `summary-owner-unknown`, `quiescence-unverifiable` and `route-unknown` remain
 fail-closed categories. Shared `homes/codex`,

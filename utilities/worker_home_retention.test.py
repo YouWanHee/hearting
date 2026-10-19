@@ -120,6 +120,14 @@ class Fixture(unittest.TestCase):
             (path / "projects" / "transcript.jsonl").write_text("x" * 100)
         return path
 
+    def add_unmapped_legacy(self, attempt, *, harness="claude", worker_type="stage"):
+        """Build a valid schema-1 HOME with no row or retained attempt ledger."""
+        path = self.add(attempt, schema=1, harness=harness, worker_type=worker_type)
+        self.rows.pop(attempt, None)
+        self.timestamps.pop(attempt, None)
+        self.write_rows()
+        return path
+
     def attach_summary_owner(self, attempt, home, harness="claude"):
         import dispatch_summary as summary
 
@@ -1118,6 +1126,12 @@ class Liveness(Fixture):
 
 
 class Races(Fixture):
+    def _optional_sweep(self, days):
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            return self.sweep(days)
+
     def test_normal_publisher_wins_before_final_admission_for_new_and_existing_groups(self):
         original_broad = R._late_delivery_change
         real_open = AR._open_locked
@@ -1427,8 +1441,8 @@ class Races(Fixture):
         real_relation = R._delivery_record_relation
         real_prepare = R._prepare_candidate_delivery_baseline
 
-        def observed_relation(path, related):
-            result = real_relation(path, related)
+        def observed_relation(path, related, binding=None):
+            result = real_relation(path, related, binding)
             if Path(path) == record:
                 late_reads.append(result)
             return result
@@ -1752,6 +1766,122 @@ class Races(Fixture):
         self.assertEqual(result["removed"], 0)
         self.assertEqual(self.kept(result, "protected:summary-live"), 1)
         self.assertTrue(home.is_dir() and provider_lock.is_dir())
+
+    def _unmapped_candidate(self, attempt):
+        home = self.add_unmapped_legacy(attempt)
+        os.utime(home, ns=(self.now - 9 * DAY, self.now - 9 * DAY))
+        self._optional_sweep(0)
+        return home
+
+    def test_unmapped_candidate_late_registry_reference_defers_detach(self):
+        attempt = "att-optional-registry-race"
+        home = self._unmapped_candidate(attempt)
+        with self.landing(lambda: self.row(attempt, "done", runtime_home=str(home)), key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1, result)
+        self.assertTrue(home.is_dir())
+
+    def test_unmapped_candidate_late_delivery_correction_reference_defers_detach(self):
+        attempt = "att-optional-delivery-race"
+        home = self._unmapped_candidate(attempt)
+        delivery_id = "delivery-" + "b" * 32
+        with self.landing(lambda: self.publish_delivery(
+                delivery_id, "optional-identity-correction", [attempt], "att-correction-parent"),
+                key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1, result)
+        self.assertTrue(home.is_dir())
+
+    def test_unmapped_candidate_late_replacement_reservation_defers_detach(self):
+        attempt = "att-optional-replacement-race"
+        home = self._unmapped_candidate(attempt)
+
+        def reserve():
+            path = self.root / "automatic-replacements" / "by-source" / f"{attempt}.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "schema": 1, "original_attempt_id": attempt, "family_id": "a" * 64,
+            }))
+
+        with self.landing(reserve, key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1, result)
+        self.assertTrue(home.is_dir())
+
+    def test_unmapped_candidate_late_held_lease_defers_detach(self):
+        attempt = "att-optional-lease-race"
+        home = self._unmapped_candidate(attempt)
+        lease = DC.supervisor_lease_path(self.jobs, attempt)
+        fd_box = []
+
+        def acquire():
+            lease.parent.mkdir(parents=True, exist_ok=True)
+            lease.write_text("\n".join((
+                f"kind={DC.SUPERVISOR_LEASE_KIND}", f"attempt_id={attempt}",
+                f"nonce={'a' * 64}", "")))
+            fd = os.open(lease, os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            fd_box.append(fd)
+
+        try:
+            with self.landing(acquire, key=home.name):
+                result = self._optional_sweep(8)
+            self.assertEqual(result["removed"], 0, result)
+            self.assertEqual(self.kept(result, "late-evidence-changed"), 1, result)
+            self.assertTrue(home.is_dir())
+            self.assertEqual(self.kept(self._optional_sweep(8.1), "lease-held"), 1)
+        finally:
+            for fd in fd_box:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+    def test_unmapped_candidate_late_provider_reference_defers_detach(self):
+        attempt = "att-optional-provider-race"
+        home = self._unmapped_candidate(attempt)
+        provider_lock = (Path(os.environ["FLEET_TITLE_STATE_DIR"]) / "claude"
+                         / (".lock-dispatch-" + attempt))
+
+        def start_provider():
+            provider_lock.parent.mkdir(parents=True, exist_ok=True)
+            provider_lock.mkdir()
+
+        with self.landing(start_provider, key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "late-evidence-changed"), 1, result)
+        self.assertTrue(home.is_dir())
+        self.assertEqual(self.unknown(self._optional_sweep(8.1), "summary-owner-unknown"), 1)
+
+    def test_unmapped_candidate_recent_view_wins_before_detach(self):
+        home = self._unmapped_candidate("att-optional-view-race")
+        view = self.now / 1e9 + 7.5 * 86400
+        with self.landing(lambda: R.note_view(self.jobs, str(home), now=view), key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "recent-view"), 1, result)
+        self.assertTrue(home.is_dir())
+
+    def test_unmapped_candidate_inode_replacement_is_not_detached(self):
+        home = self._unmapped_candidate("att-optional-inode-race")
+        replacement = self.outside / "replacement-home"
+        original_manifest = (home / "worker-home.json").read_bytes()
+
+        def replace_inode():
+            os.rename(home, replacement)
+            home.mkdir(mode=0o700)
+            (home / "worker-home.json").write_bytes(original_manifest)
+            (home / "projects").mkdir()
+            (home / "projects" / "transcript.jsonl").write_text("replacement")
+
+        with self.landing(replace_inode, key=home.name):
+            result = self._optional_sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "identity-changed")
+                         + self.kept(result, "late-evidence-changed"), 1, result)
+        self.assertTrue(home.is_dir() and replacement.is_dir())
 
     def test_row_reopened_before_detach_keeps_the_home(self):
         home = self.add("att-x3")
@@ -2400,6 +2530,136 @@ class Orphans(Fixture):
         self.assertEqual(result["removed"], 3)
         self.assertTrue(all(not home.exists() for home in homes))
 
+    def test_unmapped_legacy_absence_live_use_and_unknown_observation_across_harnesses(self):
+        homes = {"absent": {}, "live": {}, "unknown": {}}
+        child_specs = []
+        unknown_keys = set()
+        old = self.now - 9 * DAY
+        for harness in ("claude", "codex", "opencode"):
+            attempt = f"att-unmapped-{harness}"
+            homes["absent"][harness] = self.add_unmapped_legacy(
+                attempt + "-absent", harness=harness)
+            homes["live"][harness] = self.add_unmapped_legacy(
+                attempt + "-live", harness=harness)
+            homes["unknown"][harness] = self.add_unmapped_legacy(
+                attempt + "-unknown", harness=harness)
+            unknown_keys.add(homes["unknown"][harness].name)
+        for group in homes.values():
+            for home in group.values():
+                os.utime(home, ns=(old, old))
+
+        live_cases = (
+            ("claude", "env"), ("codex", "cwd"), ("opencode", "fd"),
+        )
+        children = []
+        try:
+            for harness, mode in live_cases:
+                home = homes["live"][harness]
+                if mode == "env":
+                    child_specs.append(subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        env={**os.environ, "HEARTING_WORKER_HOME": str(home)}))
+                elif mode == "cwd":
+                    child_specs.append(subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        cwd=home / "projects"))
+                else:
+                    transcript = home / "projects" / "transcript.jsonl"
+                    fd = os.open(transcript, os.O_RDONLY)
+                    os.set_inheritable(fd, True)
+                    try:
+                        child_specs.append(subprocess.Popen(
+                            [sys.executable, "-c",
+                             "import os,sys,time; f=os.fdopen(int(sys.argv[1])); time.sleep(30)" ,
+                             str(fd)], pass_fds=(fd,)))
+                    finally:
+                        os.close(fd)
+            children = child_specs
+
+            original = R._Context.home_process_evidence
+
+            def process_evidence(ctx, key):
+                if key in unknown_keys:
+                    return "unknown", "fixture-process-scan-incomplete"
+                return original(ctx, key)
+
+            with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                    mock.patch.object(R._Context, "home_process_evidence", process_evidence):
+                first = self.sweep(0)
+                self.assertEqual(first["eligible"], 3, first)
+                self.assertEqual(self.kept(first, "not-quiescent"), 3, first)
+                self.assertEqual(self.unknown(first, "quiescence-unverifiable"), 3, first)
+                result = self.sweep(8)
+
+            self.assertEqual(result["removed"], 3, result)
+            self.assertTrue(all(not home.exists() for home in homes["absent"].values()))
+            self.assertTrue(all(home.is_dir() for home in homes["live"].values()))
+            self.assertTrue(all(home.is_dir() for home in homes["unknown"].values()))
+            self.assertEqual(self.kept(result, "not-quiescent"), 3, result)
+            self.assertEqual(self.unknown(result, "quiescence-unverifiable"), 3, result)
+            self.assertEqual(
+                result["unknown_causes"]["quiescence-unverifiable"]["fixture-process-scan-incomplete"],
+                3,
+            )
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
+
+    def test_reader_pin_is_per_home_and_does_not_block_unrelated_detach(self):
+        reader = self.add_unmapped_legacy("att-unmapped-reader-pin")
+        other = self.add_unmapped_legacy("att-unmapped-other-home")
+        old = self.now - 9 * DAY
+        for home in (reader, other):
+            os.utime(home, ns=(old, old))
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            with R.worker_home_read_admission(
+                    self.jobs, reader, None, "att-unmapped-reader-pin", "claude") as admitted:
+                self.assertTrue(admitted)
+                self.sweep(0)
+                result = self.sweep(8)
+                self.assertEqual(result["removed"], 1, result)
+                self.assertEqual(self.kept(result, "protected:home-reader-active"), 1, result)
+                self.assertTrue(reader.is_dir())
+                self.assertFalse(other.exists())
+                with R.worker_home_read_admission(
+                        self.jobs, other, None, "att-unmapped-other-home", "claude") as late:
+                    self.assertFalse(late)
+
+    def test_unmapped_legacy_reader_and_detach_first_share_path_admission(self):
+        attempt = "att-unmapped-reader-race"
+        home = self.add_unmapped_legacy(attempt)
+        old = self.now - 9 * DAY
+        os.utime(home, ns=(old, old))
+        transcript = home / "projects" / "transcript.jsonl"
+
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            with R.worker_home_read_admission(
+                    self.jobs, home, transcript, attempt, "claude") as admitted:
+                self.assertTrue(admitted)
+                self.sweep(0)
+                result = self.sweep(8)
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(self.kept(result, "protected:home-reader-active"), 1, result)
+        self.assertTrue(home.is_dir())
+
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            # A live reader restarts the eligibility clock; detach wins only
+            # after the reader released and a fresh full window elapsed.
+            self.assertEqual(self.sweep(8.1)["removed"], 0)
+            result = self.sweep(16.2)
+            self.assertEqual(result["removed"], 1, result)
+            with R.worker_home_read_admission(
+                    self.jobs, home, transcript, attempt, "claude") as admitted:
+                self.assertFalse(admitted)
+
     def test_identityless_legacy_home_maps_through_retained_delivery_attempt(self):
         attempt = "att-orphan-legacy"
         home = self.add(attempt, schema=1)
@@ -2529,7 +2789,12 @@ class Mapping(Fixture):
         for path in (destination, unmapped, broken, oversized, linked):
             self.assertTrue(path.is_dir())
         self.assertEqual(self.unknown(result, "destination-home"), 1)
-        self.assertEqual(self.unknown(result, "no-row") + self.unknown(result, "unmapped"), 1)
+        self.assertEqual(self.unknown(result, "quiescence-unverifiable"), 1)
+        self.assertEqual(
+            result["unknown_causes"]["quiescence-unverifiable"].get(
+                "process-namespace-unverifiable", 0),
+            1,
+        )
         self.assertEqual(self.unknown(result, "manifest-unreadable"), 3)
 
     def test_two_attempts_naming_one_home_are_ambiguous(self):

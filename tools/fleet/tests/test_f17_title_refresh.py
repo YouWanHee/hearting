@@ -629,6 +629,35 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
                 runtime_home=str(home)))
             spawn.assert_called_once()
 
+    def test_dispatch_provider_on_identityless_legacy_home_is_refused_after_detach(self):
+        from dispatch_contract import dispatch_state_root
+        from worker_runtime_home import _builder
+
+        attempt = "att-legacy-provider"
+        jobs = Path(self._tmp.name) / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        root = dispatch_state_root(jobs)
+        key = _builder.worker_home_key("/src/repo", "claude", "stage", attempt)
+        home = root / "homes" / "workers" / key
+        source = home / "projects" / "session.jsonl"
+        source.parent.mkdir(parents=True)
+        source.write_text('{"message":"native session"}\n', encoding="utf-8")
+        (home / "worker-home.json").write_text(json.dumps({
+            "harness": "claude", "worker_type": "stage", "source": "/src/repo"}))
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            self.assertTrue(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(source), runtime_home=str(home)))
+            spawn.assert_called_once()
+            # Detach-first: the key is gone, so no native transcript may be read.
+            retired = root / "homes" / "retired-fixture"
+            os.rename(home, retired)
+            spawn.reset_mock()
+            self.assertFalse(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(source), runtime_home=str(home)))
+            spawn.assert_not_called()
+
     def test_native_session_provider_uses_inherited_attempt_admission(self):
         from dispatch_attempt_reference import admission
         from dispatch_contract import dispatch_state_root

@@ -113,6 +113,74 @@ class DispatchSummaryTest(unittest.TestCase):
         provider_lock.rmdir()
         self.assertEqual(S.home_consumer_evidence(metadata)[0], "absent")
 
+    def test_summary_owner_admits_path_based_reads_of_identityless_legacy_home(self):
+        import threading
+        import worker_home_retention as retention
+        from worker_runtime_home import _builder
+
+        attempt = "att-summary-legacy-admission"
+        root = Path(self.tmp.name) / "dispatch-state"
+        jobs = root / "jobs.log"
+        root.mkdir()
+        jobs.write_text("")
+        home_key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+        home = root / "homes" / "workers" / home_key
+        (home / "projects").mkdir(parents=True)
+        (home / "worker-home.json").write_text(json.dumps({
+            "harness": "claude", "worker_type": "stage", "source": str(ROOT),
+            "profile": None,
+        }))
+        transcript = home / "projects" / "transcript.jsonl"
+        transcript.write_text("native legacy transcript\n")
+        owner_log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
+        owner_log.write_text("")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.8)"],
+                                 start_new_session=True)
+        target_start = S.process_observation(child.pid)[1]
+        observed, finished = threading.Event(), threading.Event()
+        result, errors = [], []
+        original_source = S._summary_source
+
+        def source(*args, **kwargs):
+            observed.set()
+            return original_source(*args, **kwargs)
+
+        def run_owner():
+            try:
+                result.append(S.supervise(
+                    attempt_id=attempt, harness="claude", transcript=owner_log,
+                    target_pid=child.pid, target_start=target_start, poll=0.02,
+                    initial_delay=60, final_grace=0, log_quiet=0,
+                    runtime_home=home, attempt_cwd="/wt/owner"))
+            except BaseException as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=run_owner)
+        try:
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                    mock.patch.object(S, "_summary_source", source):
+                thread.start()
+                self.assertTrue(observed.wait(3), "summary owner did not reach native-source resolution")
+                # The owner pins exactly this HOME (shared flock on the leaf the
+                # retention detach must lock exclusively), not a global lock.
+                fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+                self.assertTrue(finished.wait(3))
+        finally:
+            thread.join(timeout=3)
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [0])
+
     def test_first_concrete_claude_model_is_recorded_once(self):
         attempt = "att-resolved-model"
         log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
