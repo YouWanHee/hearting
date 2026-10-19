@@ -1945,6 +1945,7 @@ def main(argv: list[str]) -> int:
             "context_window_native_limit_output": limit_receipt(native_limits["output"]),
             "context_window_applied_limit_context": limit_receipt(applied_limits["context"]),
             "context_window_applied_limit_input": limit_receipt(applied_limits["input"]),
+            "context_window_applied_limit_output": limit_receipt(applied_limits["output"]),
             "context_window_final_limit_context": limit_receipt(final_limits["context"]),
             "context_window_final_limit_input": limit_receipt(final_limits["input"]),
             "context_window_final_limit_output": limit_receipt(final_limits["output"]),
@@ -2073,7 +2074,9 @@ def main(argv: list[str]) -> int:
                 "context_window_native_model", "context_window_native_variant",
                 "context_window_native_application", "context_window_server_identity",
                 "context_window_location_identity", "context_window_config_identity",
-                "context_window_final_limit_context", "context_window_final_limit_input",
+                "context_window_applied_limit_context", "context_window_applied_limit_input",
+                "context_window_applied_limit_output", "context_window_final_limit_context",
+                "context_window_final_limit_input",
                 "context_window_final_limit_output", "context_policy_state",
                 "context_policy_runtime_version",
                 "context_policy_enabled", "context_policy_trigger",
@@ -2455,6 +2458,7 @@ def main(argv: list[str]) -> int:
                 "context_window_configured_limit_output", "context_window_native_limit_context",
                 "context_window_native_limit_input", "context_window_native_limit_output",
                 "context_window_applied_limit_context", "context_window_applied_limit_input",
+                "context_window_applied_limit_output",
                 "context_window_final_limit_context", "context_window_final_limit_input",
                 "context_window_final_limit_output"):
         print(f"{key}={settings.get(key, 'not-launched')}")
