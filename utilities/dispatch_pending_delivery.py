@@ -132,6 +132,8 @@ COURIER_RETRY_FIELDS = frozenset({
 COURIER_RETRY_SCHEMA = 1
 COURIER_RETRY_MAX_SECONDS = 15.0
 COURIER_RETRY_SUFFIX = ".courier-retry"
+COURIER_TIMELINE_SCHEMA = 1
+COURIER_TIMELINE_SUFFIX = ".courier-timeline"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
@@ -160,9 +162,15 @@ def record_path(root: Path, recipient_key: str, delivery_id: str) -> Path:
 
 
 def courier_retry_path(path: Path) -> Path:
-    """Optional retry/timing metadata stays outside legacy public records."""
+    """Optional retry state stays outside legacy public records."""
 
     return Path(path).with_name(Path(path).name + COURIER_RETRY_SUFFIX)
+
+
+def courier_timeline_path(path: Path) -> Path:
+    """Optional timestamp provenance stays outside legacy public records."""
+
+    return Path(path).with_name(Path(path).name + COURIER_TIMELINE_SUFFIX)
 
 
 def _validate_courier_retry(retry: object) -> dict:
@@ -384,6 +392,34 @@ def _read_delivery_metadata_unlocked(path: Path, record: dict) -> dict | None:
     return metadata
 
 
+def _read_courier_timeline_unlocked(path: Path, record: dict) -> dict | None:
+    metadata_path = courier_timeline_path(path)
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    try:
+        metadata = json.loads(raw)
+    except ValueError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused",
+                                   "courier-timeline-corrupt") from exc
+    if (not isinstance(metadata, dict)
+            or set(metadata) != {
+                "schema_version", "delivery_id", "recipient_digest", "identity_digest",
+                TIMESTAMP_PROVENANCE_FIELD,
+            }
+            or metadata.get("schema_version") != COURIER_TIMELINE_SCHEMA
+            or metadata.get("delivery_id") != record.get("delivery_id")
+            or metadata.get("recipient_digest") != record.get("recipient_digest")
+            or metadata.get("identity_digest") != _courier_retry_identity_digest(record)):
+        raise PendingDeliveryError("delivery-persistence-refused",
+                                   "courier-timeline-identity-invalid")
+    _validate_timestamp_provenance(metadata[TIMESTAMP_PROVENANCE_FIELD])
+    return metadata[TIMESTAMP_PROVENANCE_FIELD]
+
+
 def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
     """Read retry state bound to this record; legacy inline state is migrated on write."""
 
@@ -396,6 +432,9 @@ def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
 
 def _read_timestamp_provenance_unlocked(path: Path, record: dict) -> dict | None:
     metadata = _read_delivery_metadata_unlocked(path, record)
+    timeline = _read_courier_timeline_unlocked(path, record)
+    if timeline is not None:
+        return timeline
     if metadata is not None and TIMESTAMP_PROVENANCE_FIELD in metadata:
         return metadata[TIMESTAMP_PROVENANCE_FIELD]
     legacy = record.get(TIMESTAMP_PROVENANCE_FIELD)
@@ -482,20 +521,41 @@ def _record_received(value: dict, source: str) -> dict:
 
 def _write_delivery_metadata_unlocked(path: Path, record: dict, retry: dict | None,
                                       timeline: dict | None) -> None:
-    metadata = {
-        "schema_version": COURIER_RETRY_SCHEMA,
+    identity = {
         "delivery_id": record["delivery_id"],
         "recipient_digest": record["recipient_digest"],
         "identity_digest": _courier_retry_identity_digest(record),
     }
-    if retry is not None:
-        metadata["retry"] = _validate_courier_retry(retry)
-    if timeline is not None:
+    retry_path = courier_retry_path(path)
+    if retry is None:
+        try:
+            retry_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    else:
+        _atomic_write_json(retry_path, {
+            "schema_version": COURIER_RETRY_SCHEMA,
+            **identity,
+            "retry": _validate_courier_retry(retry),
+        })
+
+    timeline_path = courier_timeline_path(path)
+    if timeline is None:
+        try:
+            timeline_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    else:
         _validate_timestamp_provenance(timeline)
-        metadata[TIMESTAMP_PROVENANCE_FIELD] = timeline
-    if len(metadata) == 4:
-        return
-    _atomic_write_json(courier_retry_path(path), metadata)
+        _atomic_write_json(timeline_path, {
+            "schema_version": COURIER_TIMELINE_SCHEMA,
+            **identity,
+            TIMESTAMP_PROVENANCE_FIELD: timeline,
+        })
 
 
 def _write_unlocked(path: Path, record: dict) -> None:
@@ -521,9 +581,6 @@ def _write_unlocked(path: Path, record: dict) -> None:
     _write_delivery_metadata_unlocked(path, record, retry, timeline)
     _validate_record(persisted)
     _atomic_write_json(path, persisted)
-    if terminal and timeline is None:
-        with suppress(OSError):
-            courier_retry_path(path).unlink()
 
 
 def _retry_context_digest(context: str | None) -> str | None:
@@ -1416,6 +1473,10 @@ def prune(
                     except FileNotFoundError:
                         pass
                     try:
+                        courier_timeline_path(path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    try:
                         lock_path.unlink()
                     except FileNotFoundError:
                         pass
@@ -1431,6 +1492,10 @@ def prune(
                 path.unlink()
                 try:
                     courier_retry_path(path).unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    courier_timeline_path(path).unlink()
                 except FileNotFoundError:
                     pass
                 try:
