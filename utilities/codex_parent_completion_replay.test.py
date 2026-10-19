@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -215,6 +216,51 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def _native_queue_fixture(self, thread_id):
+        home = self.root / "native-codex-home"
+        control = home / "app-server-control"
+        sessions = home / "sessions"
+        home.mkdir(mode=0o700)
+        control.mkdir(mode=0o700)
+        sessions.mkdir(mode=0o700)
+        rollout = sessions / "fixture.jsonl"
+        rollout.write_bytes(b"")
+        rollout.chmod(0o600)
+
+        state_path = home / "state_5.sqlite"
+        state = sqlite3.connect(state_path)
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)")
+        state.execute("INSERT INTO threads VALUES (?, ?, 'paginated')",
+                      (thread_id, str(rollout)))
+        state.commit()
+        state.close()
+        state_path.chmod(0o600)
+
+        history_path = home / "thread_history_1.sqlite"
+        history = sqlite3.connect(history_path)
+        history.executescript("""
+            CREATE TABLE thread_turns (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, status TEXT,
+                PRIMARY KEY(thread_id, turn_id)
+            );
+            CREATE TABLE thread_items (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                item_json TEXT NOT NULL, item_type TEXT NOT NULL, rollout_ordinal INTEGER,
+                PRIMARY KEY(thread_id, turn_id, item_id)
+            );
+            CREATE TABLE thread_history_projection_state (
+                thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER,
+                next_rollout_ordinal INTEGER
+            );
+        """)
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?, 0, 0)", (thread_id,))
+        history.commit()
+        history.close()
+        history_path.chmod(0o600)
+        return control / "app-server-control.sock", history_path, rollout
 
     def _fixture_tool_trace(self, fixture, sentinel, *, include_action=True):
         fixture_rel = Path(".agent_reports/native-parent-fixture")
@@ -1086,10 +1132,11 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         courier = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = courier
         spec.loader.exec_module(courier)
+        queue_socket, native_history_path, native_rollout = self._native_queue_fixture("idle-parent")
         watcher_args = SimpleNamespace(
             jobs=jobs.resolve(), parent_session_id="idle-parent",
             sealed_batch_id=metadata["managed_sealed_batch_id"],
-            interval=0.05, queue_socket=Path("/isolated-native-queue.sock"),
+            interval=0.05, queue_socket=queue_socket,
         )
         watcher = courier.NoticeWatcher(watcher_args, {attempt}, capability=None)
         cleanup_path = pending.record_path(self.root, "idle-parent", cleanup["delivery_id"])
@@ -1138,25 +1185,125 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertNotEqual(late["delivery_id"], completion["delivery_id"])
         self.assertEqual(pending.read(self.root, "idle-parent", cleanup["delivery_id"])["expiry_reason"],
                          "supervision-resolved")
-        native_turn = {"id": "isolated-native-turn-1", "status": "completed"}
         late_path = pending.record_path(self.root, "idle-parent", late["delivery_id"])
-        with mock.patch.object(courier.codex_queue_delivery, "send_at_least_once", return_value={
-                 "status": "queued", "already_pending": False,
-                 "queued_submission_id": "isolated-native-turn-1"}) as late_send, \
-             mock.patch.object(courier.codex_queue_delivery, "list_queue", return_value=[]), \
-             mock.patch.object(courier.codex_queue_delivery, "find_turn_by_client_message_id",
-                 return_value=native_turn) as late_find:
+        queue = courier.codex_queue_delivery
+        notice_context = courier.notice_receipt.context(
+            late["receipt"], courier.notice_receipt.gateway_delivery_id(late["receipt"]))
+        additional = notice_context.get("additionalContext")
+        notice_values = [value.get("value") for value in additional.values()
+                         if isinstance(value, dict) and isinstance(value.get("value"), str)] \
+            if isinstance(additional, dict) else []
+        self.assertEqual(len(notice_values), 1)
+        notice_text = notice_values[0]
+        native_turn_id = "isolated-native-turn-1"
+        native_requests = []
+        prepared_fences = []
+        observation_statuses = []
+        observed_turns = []
+        events = []
+        expected_native_item = {
+            "type": "userMessage", "clientId": late["delivery_id"],
+            "content": [{"type": "text", "text": notice_text, "text_elements": []}],
+        }
+
+        def fake_rpc(path, method, params, *, timeout, session=None):
+            native_requests.append((method, dict(params)))
+            if method == "thread/queue/list":
+                return {"data": []}
+            if method == "thread/turns/list":
+                return {"data": [{"id": "isolated-prior-turn", "status": "completed"}]}
+            if method != "thread/queue/add":
+                self.fail(f"unexpected native queue RPC: {method}")
+
+            record = pending.read(self.root, "idle-parent", late["delivery_id"])
+            identity = pending.submission_fence_identity(record, params.get("threadId"))
+            fence = pending.read_submission_fence(
+                self.root, "idle-parent", late["delivery_id"], expected_identity=identity)
+            prepared_fences.append(fence.get("state") if fence else None)
+
+            submitted_input = params.get("input")
+            native_content = [
+                {**item, "text_elements": item.get("text_elements", [])}
+                for item in submitted_input if isinstance(item, dict)
+            ] if isinstance(submitted_input, list) else []
+            native_item = {
+                "type": "userMessage", "clientId": params.get("clientUserMessageId"),
+                "content": native_content,
+            }
+            history = sqlite3.connect(native_history_path)
+            history.execute("INSERT INTO thread_turns VALUES (?, ?, 'completed')",
+                            (params.get("threadId"), native_turn_id))
+            history.execute(
+                "INSERT INTO thread_items VALUES (?, ?, ?, ?, 'userMessage', 1)",
+                (params.get("threadId"), native_turn_id, "isolated-native-item-1",
+                 json.dumps(native_item, ensure_ascii=False)),
+            )
+            history.execute(
+                "UPDATE thread_history_projection_state "
+                "SET next_rollout_byte_offset = ?, next_rollout_ordinal = 2 WHERE thread_id = ?",
+                (native_rollout.stat().st_size, params.get("threadId")),
+            )
+            history.commit()
+            history.close()
+            events.append("queue-add-accepted")
+            return {"queuedSubmission": {"id": native_turn_id}}
+
+        real_observe = queue._observe_peer_message
+
+        def observe_native_history(*args, **kwargs):
+            observation = real_observe(*args, **kwargs)
+            observation_statuses.append(observation.status)
+            if observation.status == "matched":
+                observed_turns.append(observation.turn)
+                events.append("exact-consumption-observed")
+            return observation
+
+        real_send = queue.send_at_least_once
+        real_ack = pending.ack
+
+        def ack_after_exact_consumption(*args, **kwargs):
+            self.assertIn("exact-consumption-observed", events)
+            events.append("acked")
+            return real_ack(*args, **kwargs)
+
+        with ExitStack() as stack:
+            late_send = stack.enter_context(mock.patch.object(
+                queue, "send_at_least_once", wraps=real_send))
+            native_rpc = stack.enter_context(mock.patch.object(
+                queue, "_rpc", side_effect=fake_rpc))
+            native_observe = stack.enter_context(mock.patch.object(
+                queue, "_observe_peer_message", side_effect=observe_native_history))
+            late_ack = stack.enter_context(mock.patch.object(
+                pending, "ack", side_effect=ack_after_exact_consumption))
             watcher._one(late_path)
+
         late_send.assert_called_once()
-        late_find.assert_called_once()
-        self.assertEqual(late_find.call_args.args[0:2],
-                         (watcher_args.queue_socket, "idle-parent"))
-        self.assertEqual(late_find.call_args.args[2], late["delivery_id"])
-        self.assertEqual(late_find.call_args.kwargs["timeout"], 5.0)
+        self.assertEqual(late_send.call_args.kwargs["message"], notice_text)
+        self.assertTrue(late_send.call_args.kwargs["require_message_match"])
+        self.assertTrue(callable(late_send.call_args.kwargs["before_add"]))
+        self.assertEqual([method for method, _params in native_requests], [
+            "thread/queue/list", "thread/turns/list", "thread/queue/add", "thread/queue/list",
+        ])
+        add_params = next(params for method, params in native_requests if method == "thread/queue/add")
+        self.assertEqual(add_params, {
+            "threadId": "idle-parent", "clientUserMessageId": late["delivery_id"],
+            "input": [{"type": "text", "text": notice_text}],
+        })
+        self.assertEqual(prepared_fences, ["prepared"])
+        self.assertEqual(observation_statuses, ["not_observed", "not_observed", "matched"])
+        self.assertEqual(native_observe.call_count, 3)
+        self.assertEqual([turn["id"] for turn in observed_turns], [native_turn_id])
+        self.assertEqual(observed_turns[0]["items"], [expected_native_item])
+        self.assertEqual(events, ["queue-add-accepted", "exact-consumption-observed", "acked"])
+        late_ack.assert_called_once()
         late_record = pending.read(self.root, "idle-parent", late["delivery_id"])
         self.assertEqual(late_record["state"], "acked")
         self.assertEqual(late_record["acked_by"], watcher.owner)
-        self.assertEqual(native_turn["status"], "completed")
+        fence_identity = pending.submission_fence_identity(late_record, "idle-parent")
+        accepted_fence = pending.read_submission_fence(
+            self.root, "idle-parent", late["delivery_id"], expected_identity=fence_identity)
+        self.assertEqual(accepted_fence["state"], "accepted")
+        self.assertEqual(accepted_fence["queue_submission_id"], native_turn_id)
         old_after_conflict = pending.read(self.root, "idle-parent", completion["delivery_id"])
         self.assertEqual(pending.received_ack_identity(
             old_after_conflict, "idle-parent", completion["delivery_id"]), old_ack)
