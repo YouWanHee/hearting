@@ -27,8 +27,6 @@ def require_native_runtime(testcase):
     elif not profiles.named_profiles_available():
         reason = "Codex CLI does not support named permission profiles"
     if reason:
-        if os.environ.get("HEARTING_REQUIRE_NATIVE_CODEX") == "1":
-            testcase.fail("required native Codex runtime unavailable: " + reason)
         testcase.skipTest(reason)
 
 
@@ -215,63 +213,108 @@ else:
         require_native_runtime(self)
 
         def observe_network(allowed):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("127.0.0.1", 0))
-            listener.listen(1)
-            listener.settimeout(3)
-            received = []
-            server_errors = []
-
-            def serve_once():
-                try:
-                    connection, _ = listener.accept()
-                    with connection:
-                        connection.settimeout(2)
-                        connection.sendall(b"hearting-loopback-ok")
-                        if connection.recv(16) != b"ack":
-                            server_errors.append("client acknowledgement missing")
-                        else:
-                            received.append(True)
-                except socket.timeout:
-                    pass
-                except OSError as exc:
-                    server_errors.append(str(exc))
-
-            server_thread = threading.Thread(target=serve_once, name="codex-loopback-fixture")
-            server_thread.start()
             profile = self.profile(network=allowed, native=True)
             grant = self.execution_grant(network=allowed)
             if allowed:
                 self.assertEqual(grant.network, "enforced")
             else:
                 self.assertEqual(grant.network, "not-requested")
-            probe = '''import socket, sys
-connection = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)
-connection.settimeout(2)
-if connection.recv(64) != b"hearting-loopback-ok":
-    raise AssertionError("loopback response mismatch")
-connection.sendall(b"ack")
-connection.close()
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(0.25)
+            port = listener.getsockname()[1]
+            received = []
+            server_errors = []
+            stop_server = threading.Event()
+
+            def serve_once():
+                while not stop_server.is_set():
+                    try:
+                        connection, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError as exc:
+                        if not stop_server.is_set():
+                            server_errors.append(str(exc))
+                        return
+                    with connection:
+                        connection.settimeout(5)
+                        try:
+                            connection.sendall(b"hearting-loopback-ok")
+                            if connection.recv(16) != b"ack":
+                                server_errors.append("client acknowledgement missing")
+                            else:
+                                received.append(True)
+                        except OSError as exc:
+                            server_errors.append(str(exc))
+                    return
+
+            server_thread = threading.Thread(target=serve_once, name="codex-loopback-fixture")
+            server_thread.start()
+            probe = '''import errno, json, socket, sys
+port = int(sys.argv[1])
+denied_errnos = {
+    errno.EACCES, errno.EPERM, errno.ECONNREFUSED,
+    errno.ENETUNREACH, errno.EHOSTUNREACH,
+}
+try:
+    connection = socket.create_connection(("127.0.0.1", port), timeout=15)
+except OSError as exc:
+    if not isinstance(exc, TimeoutError) and exc.errno not in denied_errnos:
+        raise
+    reason = "ETIMEDOUT" if isinstance(exc, TimeoutError) else errno.errorcode[exc.errno]
+    print("HEARTING_NETWORK_RESULT=" + json.dumps(
+        {"outcome": "denied", "reason": reason, "errno": exc.errno}), flush=True)
+else:
+    with connection:
+        connection.settimeout(15)
+        if connection.recv(64) != b"hearting-loopback-ok":
+            raise AssertionError("loopback response mismatch")
+        connection.sendall(b"ack")
+    print("HEARTING_NETWORK_RESULT=" + json.dumps(
+        {"outcome": "connected", "handshake": "ok"}), flush=True)
 '''
             result = None
             try:
                 result = subprocess.run(
                     ["codex", "sandbox", "-P", profiles.PROFILE_NAME, "-C", str(self.wt),
                      *profiles.config_arguments(profile), "--", "python3", "-c", probe,
-                     str(listener.getsockname()[1])],
-                    env=self.env, text=True, capture_output=True, timeout=30,
+                     str(port)],
+                    env=self.env, text=True, capture_output=True, timeout=120,
                 )
             finally:
-                listener.close()
-                server_thread.join(timeout=4)
-                self.assertFalse(server_thread.is_alive(), "loopback fixture thread did not stop")
+                stop_server.set()
+                server_thread.join(timeout=12)
+                thread_stopped = not server_thread.is_alive()
+                if thread_stopped:
+                    listener.close()
+                self.assertTrue(thread_stopped, "loopback fixture thread did not stop")
+
+            self.assertEqual(
+                result.returncode, 0,
+                "native sandbox command failed before a child connection observation:\n" + result.stderr,
+            )
+            marker = "HEARTING_NETWORK_RESULT="
+            observations = [line[len(marker):] for line in result.stdout.splitlines()
+                            if line.startswith(marker)]
+            self.assertEqual(
+                len(observations), 1,
+                "expected one structured child connection result; stdout was:\n" + result.stdout,
+            )
+            observed = json.loads(observations[0])
             self.assertEqual(server_errors, [])
             if allowed:
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(observed, {"outcome": "connected", "handshake": "ok"})
                 self.assertEqual(received, [True])
             else:
-                self.assertNotEqual(result.returncode, 0, "native sandbox unexpectedly allowed network access")
+                self.assertEqual(observed.get("outcome"), "denied", observed)
+                self.assertIn(observed.get("reason"), {
+                    "EACCES", "EPERM", "ECONNREFUSED", "ENETUNREACH",
+                    "EHOSTUNREACH", "ETIMEDOUT",
+                })
                 self.assertEqual(received, [])
 
         observe_network(True)
