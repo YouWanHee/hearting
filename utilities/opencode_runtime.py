@@ -6,6 +6,8 @@ support from V1 flags or read the database independently.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from functools import lru_cache
 import json
 import hashlib
@@ -14,9 +16,11 @@ from pathlib import Path
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
+from types import MappingProxyType
 from urllib.parse import quote
 
 
@@ -30,6 +34,39 @@ MAX_MESSAGE_TEXT = 2048
 
 class OpenCodeRuntimeError(RuntimeError):
     """A bounded runtime or credential read could not be completed safely."""
+
+
+@dataclass(frozen=True)
+class CredentialRead:
+    """One credential read, preserving absence separately from read failure."""
+
+    state: str
+    credential: object = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class AccountScopeObservation:
+    """The selected account scope, or why it could not be observed."""
+
+    state: str
+    scope: str | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class GoUsageSelection:
+    """Immutable credential and canonical scopes for one Go usage observation."""
+
+    state: str
+    integration_id: str | None = None
+    credential: object = None
+    provider_scope: str | None = None
+    opencode_scope: str | None = None
+    entitlement_scope: str | None = None
+    credential_type: str | None = None
+    credential_source: str | None = None
+    reason: str | None = None
 
 
 def parse_version(value: str | None) -> tuple[int, int, int] | None:
@@ -183,60 +220,147 @@ def _scope_for_row(integration_id: str, row: dict | None) -> str:
     return "account:" + digest
 
 
-def _legacy_account(integration_id: str, environ) -> dict | None:
+def _freeze(value):
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value):
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _legacy_auth_path(environ):
     home = Path(environ.get("HOME") or Path.home())
     data = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-    auth_path = environ.get("OPENCODE_AUTH") or data / "opencode" / "auth.json"
-    return read_legacy_credential(integration_id, auth_path=auth_path)
+    return Path(environ.get("OPENCODE_AUTH") or data / "opencode" / "auth.json")
+
+
+def _legacy_account(integration_id: str, environ) -> dict | None:
+    return read_legacy_credential(integration_id, auth_path=_legacy_auth_path(environ))
+
+
+def account_scope_observation(integration_id: str, *, environ=None) -> AccountScopeObservation:
+    """Resolve one account scope without converting a failed read into absence."""
+    env = os.environ if environ is None else environ
+    read = (read_credential_observation(integration_id, environ=env) if is_v2(environ=env)
+            else read_legacy_credential_observation(
+                integration_id, auth_path=_legacy_auth_path(env)))
+    if read.state == "unavailable":
+        return AccountScopeObservation("unavailable", None, read.reason)
+    if read.state == "absent":
+        return AccountScopeObservation("absent", "unscoped")
+    return AccountScopeObservation("present", _scope_for_row(integration_id, read.credential))
 
 
 def account_scope(integration_id: str, *, environ=None) -> str:
     """Stable opaque scope for the runtime's selected account; never a secret."""
-    env = os.environ if environ is None else environ
-    row = (read_credential(integration_id, environ=env) if is_v2(environ=env)
-           else _legacy_account(integration_id, env))
-    return _scope_for_row(integration_id, row)
+    observation = account_scope_observation(integration_id, environ=environ)
+    return observation.scope or "unscoped"
 
 
-def selected_go_usage_credential(*, environ=None) -> dict | None:
-    """Return the selected source for Go usage and model-account scoping.
+def _go_selection_from_row(integration_id: str, credential, opencode_scope: str):
+    value = credential.get("value") if isinstance(credential, Mapping) else None
+    credential_type = value.get("type") if isinstance(value, Mapping) else None
+    provider_scope = _scope_for_row(integration_id, credential)
+    oauth_selected = integration_id == "opencode" and credential_type == "oauth"
+    return GoUsageSelection(
+        "present", integration_id=integration_id, credential=credential,
+        provider_scope=provider_scope, opencode_scope=opencode_scope,
+        entitlement_scope=provider_scope if oauth_selected else None,
+        credential_type=credential_type,
+        credential_source=credential.get("source") if isinstance(credential, Mapping) else None,
+    )
 
-    OpenCode OAuth wins only when the selected ``opencode`` row is OAuth (or
-    malformed, in which case it remains present and blocks stale fallback).
-    A valid selected API credential on that integration means OAuth is absent;
-    OpenCode itself then permits the Go API-key and legacy compatibility tiers.
+
+def _unavailable_go_selection(reason="credential-store-unavailable"):
+    return GoUsageSelection("unavailable", reason=reason)
+
+
+def selected_go_usage_observation(*, environ=None) -> GoUsageSelection:
+    """Select one Go credential and derive every account scope from that read.
+
+    A read failure is not evidence that OAuth is absent. The frozen selection is
+    passed through the usage request and cache write so an account switch during
+    the request cannot retag its result.
     """
     env = os.environ if environ is None else environ
-    oauth = read_credential("opencode", environ=env)
+    if not is_v2(environ=env):
+        legacy = read_legacy_credential_observation(
+            "opencode-go", auth_path=_legacy_auth_path(env))
+        if legacy.state == "unavailable":
+            return _unavailable_go_selection(legacy.reason)
+        if legacy.state == "absent":
+            return GoUsageSelection("absent", provider_scope="unscoped")
+        return _go_selection_from_row("opencode-go", legacy.credential, "unscoped")
+
+    oauth_read = read_credential_observation("opencode", environ=env)
+    if oauth_read.state == "unavailable":
+        return _unavailable_go_selection(oauth_read.reason)
+    oauth = oauth_read.credential if oauth_read.state == "present" else None
+    opencode_scope = (_scope_for_row("opencode", oauth) if oauth is not None
+                      else "unscoped")
     if oauth is not None:
-        value = oauth.get("value")
+        value = oauth.get("value") if isinstance(oauth, Mapping) else None
         valid_non_oauth_key = (
-            isinstance(value, dict)
+            isinstance(value, Mapping)
             and value.get("type") in {"key", "api"}
             and isinstance(value.get("key"), str)
             and bool(value.get("key"))
         )
         if not valid_non_oauth_key:
-            return {"integration_id": "opencode", "credential": oauth}
+            return _go_selection_from_row("opencode", oauth, opencode_scope)
 
-    api_key = read_credential("opencode-go", environ=env)
-    if api_key is not None:
-        return {"integration_id": "opencode-go", "credential": api_key}
-    legacy = _legacy_account("opencode-go", env)
-    if legacy is not None:
-        return {"integration_id": "opencode-go", "credential": legacy}
-    return None
+    api_read = read_credential_observation("opencode-go", environ=env)
+    if api_read.state == "unavailable":
+        return _unavailable_go_selection(api_read.reason)
+    if api_read.state == "present":
+        return _go_selection_from_row("opencode-go", api_read.credential, opencode_scope)
+
+    legacy = read_legacy_credential_observation(
+        "opencode-go", auth_path=_legacy_auth_path(env))
+    if legacy.state == "unavailable":
+        return _unavailable_go_selection(legacy.reason)
+    if legacy.state == "present":
+        return _go_selection_from_row("opencode-go", legacy.credential, opencode_scope)
+    return GoUsageSelection("absent", provider_scope="unscoped",
+                            opencode_scope=opencode_scope)
+
+
+def selected_go_usage_credential(*, environ=None) -> dict | None:
+    """Compatible dictionary boundary for consumers that only need a token row."""
+    selection = selected_go_usage_observation(environ=environ)
+    if selection.state != "present":
+        return None
+    return {"integration_id": selection.integration_id,
+            "credential": _thaw(selection.credential)}
+
+
+def provider_account_observation(provider: str, *, environ=None) -> AccountScopeObservation:
+    """Resolve the account scope used by a provider without hiding read failure."""
+    env = os.environ if environ is None else environ
+    if provider == "opencode-go" and is_v2(environ=env):
+        selection = selected_go_usage_observation(environ=env)
+        if selection.state == "unavailable":
+            return AccountScopeObservation("unavailable", None, selection.reason)
+        return AccountScopeObservation(selection.state,
+                                      selection.provider_scope or "unscoped",
+                                      selection.reason)
+    return account_scope_observation(provider, environ=env)
 
 
 def provider_account_scope(provider: str, *, environ=None) -> str:
     """Resolve Go models against the account OpenCode actually uses for Go."""
-    env = os.environ if environ is None else environ
-    if provider != "opencode-go" or not is_v2(environ=env):
-        return account_scope(provider, environ=env)
-    selected = selected_go_usage_credential(environ=env)
-    if selected is None:
-        return "unscoped"
-    return _scope_for_row(selected["integration_id"], selected["credential"])
+    observation = provider_account_observation(provider, environ=environ)
+    return observation.scope or "unscoped"
 
 
 def model_availability(model: str, *, environ=None) -> dict:
@@ -245,7 +369,20 @@ def model_availability(model: str, *, environ=None) -> dict:
         return {"state": "unknown", "reason": "model-scope-unavailable"}
     provider, model_id = model.split("/", 1)
     model_id = model_id.split("#", 1)[0]
-    scope = provider_account_scope(provider, environ=environ)
+    if provider == "opencode-go" and is_v2(environ=environ):
+        selection = selected_go_usage_observation(environ=environ)
+        if selection.state == "unavailable":
+            return {"state": "unknown", "reason": selection.reason or "account-scope-unavailable"}
+        # The provider observation and entitlement fallback must refer to one
+        # selected row. Do not look up the current OpenCode account a second time.
+        scope = selection.provider_scope or "unscoped"
+        entitlement_scope = selection.entitlement_scope
+    else:
+        account = provider_account_observation(provider, environ=environ)
+        if account.state == "unavailable" or account.scope is None:
+            return {"state": "unknown", "reason": account.reason or "account-scope-unavailable"}
+        scope = account.scope
+        entitlement_scope = None
     tools = Path(__file__).resolve().parents[1] / "tools"
     if str(tools) not in sys.path:
         sys.path.insert(0, str(tools))
@@ -259,8 +396,8 @@ def model_availability(model: str, *, environ=None) -> dict:
             return general
         if result.get("state") == "unknown":
             result = general
-        if provider == "opencode-go" and result.get("state") == "unknown":
-            entitlement_scope = account_scope("opencode", environ=environ)
+        if (provider == "opencode-go" and result.get("state") == "unknown"
+                and entitlement_scope is not None):
             result = usage_cache.read_provider("opencode", "opencode-go-entitlement", "*",
                                                entitlement_scope)
         return result
@@ -275,7 +412,10 @@ def record_model_outcome(model: str | None, *, success=False, error=None, source
         return False
     provider, model_id = model.split("/", 1)
     model_id = model_id.split("#", 1)[0]
-    scope = provider_account_scope(provider)
+    account = provider_account_observation(provider)
+    if account.state == "unavailable" or account.scope is None:
+        return False
+    scope = account.scope
     state, reason = None, None
     if success:
         state = "usable"
@@ -369,6 +509,8 @@ def _selected_row(rows):
     values, the newest NULL row is the legacy selection. Explicitly inactive
     rows are never promoted by this reader.
     """
+    if any(row["active"] not in (None, 0, 1) for row in rows):
+        raise OpenCodeRuntimeError("opencode-credential-active-invalid")
     active = [row for row in rows if row["active"] == 1]
     if len(active) == 1:
         return active[0]
@@ -384,21 +526,29 @@ def _selected_row(rows):
     return legacy[-1]
 
 
-def read_credential(integration_id: str, *, db_path: str | Path | None = None,
-                    environ=None) -> dict | None:
-    """Read one native selected credential with bounded, read-only SQLite access.
-
-    The returned object contains the secret only in process memory for its
-    immediate caller. Callers must not serialize or log its ``value`` field.
-    """
+def read_credential_observation(integration_id: str, *, db_path: str | Path | None = None,
+                                environ=None) -> CredentialRead:
+    """Read one native selected credential without collapsing errors into absence."""
     if not isinstance(integration_id, str) or not integration_id or len(integration_id) > 128:
-        return None
+        return CredentialRead("unavailable", reason="credential-id-invalid")
     path = Path(db_path) if db_path is not None else opencode_db_path(environ)
-    if not path.is_file():
-        return None
-    uri = "file:" + quote(str(path.resolve()), safe="/:\\") + "?mode=ro"
+    try:
+        path_stat = path.stat()
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return CredentialRead("absent")
+        except OSError:
+            return CredentialRead("unavailable", reason="credential-store-read-failed")
+        return CredentialRead("unavailable", reason="credential-store-target-missing")
+    except OSError:
+        return CredentialRead("unavailable", reason="credential-store-read-failed")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return CredentialRead("unavailable", reason="credential-store-not-file")
     con = None
     try:
+        uri = "file:" + quote(str(path.resolve()), safe="/:\\") + "?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=0.5)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only=ON")
@@ -406,12 +556,12 @@ def read_credential(integration_id: str, *, db_path: str | Path | None = None,
         tables = {row[0] for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='credential'")}
         if "credential" not in tables:
-            return None
+            return CredentialRead("unavailable", reason="credential-store-schema-unavailable")
         columns = {row[1] for row in con.execute("PRAGMA table_info(credential)")}
         scope_col = "integration_id" if "integration_id" in columns else (
             "connector_id" if "connector_id" in columns else None)
         if scope_col is None or "value" not in columns:
-            return None
+            return CredentialRead("unavailable", reason="credential-store-schema-unavailable")
         selected = [name for name in ("id", "label", "value", "active", "time_created", "time_updated")
                     if name in columns]
         order = ", ".join(name + " DESC" for name in ("active", "time_created", "time_updated", "id")
@@ -420,8 +570,10 @@ def read_credential(integration_id: str, *, db_path: str | Path | None = None,
             "SELECT " + ", ".join('"' + name + '"' for name in selected)
             + " FROM credential WHERE \"" + scope_col + "\"=?"
             + (" ORDER BY " + order if order else "") + " LIMIT ?",
-            (integration_id, MAX_CREDENTIAL_ROWS),
+            (integration_id, MAX_CREDENTIAL_ROWS + 1),
         ).fetchall()
+        if len(rows) > MAX_CREDENTIAL_ROWS:
+            return CredentialRead("unavailable", reason="credential-store-selection-overflow")
         normalized = []
         for row in rows:
             item = dict(row)
@@ -430,36 +582,75 @@ def read_credential(integration_id: str, *, db_path: str | Path | None = None,
             normalized.append(item)
         chosen = _selected_row(normalized)
         if not chosen:
-            return None
+            return CredentialRead("absent")
         # No secret is returned in diagnostic metadata; the caller needs it
         # only for an immediate request or local eligibility classification.
         # Keep a selected malformed row present with value=None so callers do
         # not mistake it for absent OAuth and fall through to a stale key.
-        return {"integration_id": integration_id, "credential_id": chosen.get("id"),
-                "label": chosen.get("label"), "value": chosen["value"],
-                "source": "opencode-sqlite",
-                "credential_valid": bool(chosen["value"])}
-    except (OSError, sqlite3.Error, OpenCodeRuntimeError):
-        return None
+        credential = {"integration_id": integration_id, "credential_id": chosen.get("id"),
+                      "label": chosen.get("label"), "value": chosen["value"],
+                      "source": "opencode-sqlite",
+                      "credential_valid": bool(chosen["value"])}
+        return CredentialRead("present", _freeze(credential))
+    except OpenCodeRuntimeError as error:
+        reason = ("credential-selection-ambiguous" if "ambiguous" in str(error)
+                  else "credential-selection-invalid")
+        return CredentialRead("unavailable", reason=reason)
+    except (OSError, sqlite3.Error):
+        return CredentialRead("unavailable", reason="credential-store-read-failed")
     finally:
         if con is not None:
-            con.close()
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+
+def read_credential(integration_id: str, *, db_path: str | Path | None = None,
+                    environ=None) -> dict | None:
+    """Compatible selected-credential reader; use the observation API for status."""
+    read = read_credential_observation(integration_id, db_path=db_path, environ=environ)
+    return _thaw(read.credential) if read.state == "present" else None
+
+
+def read_legacy_credential_observation(integration_id: str, *, auth_path: str | Path,
+                                       environ=None) -> CredentialRead:
+    """Read one legacy auth entry while retaining missing-file/read-failure status."""
+    path = Path(auth_path).expanduser()
+    try:
+        path_stat = path.stat()
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return CredentialRead("absent")
+        except OSError:
+            return CredentialRead("unavailable", reason="legacy-credential-read-failed")
+        return CredentialRead("unavailable", reason="legacy-credential-target-missing")
+    except OSError:
+        return CredentialRead("unavailable", reason="legacy-credential-read-failed")
+    if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size > MAX_AUTH_BYTES:
+        return CredentialRead("unavailable", reason="legacy-credential-store-unavailable")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return CredentialRead("unavailable", reason="legacy-credential-read-failed")
+    if not isinstance(value, dict):
+        return CredentialRead("unavailable", reason="legacy-credential-store-malformed")
+    if integration_id not in value:
+        return CredentialRead("absent")
+    entry = value.get(integration_id)
+    if not isinstance(entry, dict):
+        return CredentialRead("unavailable", reason="legacy-credential-entry-malformed")
+    credential = {"integration_id": integration_id, "label": None, "value": entry,
+                  "source": "legacy-auth-json"}
+    return CredentialRead("present", _freeze(credential))
 
 
 def read_legacy_credential(integration_id: str, *, auth_path: str | Path) -> dict | None:
-    """Read the selected V1 ``auth.json`` entry without returning file contents."""
-    path = Path(auth_path).expanduser()
-    try:
-        if path.stat().st_size > MAX_AUTH_BYTES:
-            return None
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    entry = value.get(integration_id) if isinstance(value, dict) else None
-    if not isinstance(entry, dict):
-        return None
-    return {"integration_id": integration_id, "label": None, "value": entry,
-            "source": "legacy-auth-json"}
+    """Compatible legacy reader; use the observation API for status."""
+    read = read_legacy_credential_observation(integration_id, auth_path=auth_path)
+    return _thaw(read.credential) if read.state == "present" else None
 
 
 def classify_usage_rejection(status: int, body: bytes | str | dict) -> dict | None:

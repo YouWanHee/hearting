@@ -38,8 +38,10 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.worktree), "commit", "-qm", "fixture"], check=True)
         self.home = self.base / "home"
         self.home.mkdir()
-        self.artifact_root = self.base / ".agent_reports"
-        self.artifact_root.mkdir()
+        self.artifact_root = self.base / "dispatch-artifact-root" / ".agent_reports"
+        self.artifact_root.mkdir(parents=True)
+        self.outside_root = self.base / "dispatch-outside"
+        self.outside_root.mkdir()
         self.state_root = self.base / "state"
         self.state_root.mkdir()
         self.env = {
@@ -79,6 +81,11 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
         self.assertIn(f"artifact_root={self.artifact_root}", receipt)
         self.assertIn("worker_mode=dev/backend", receipt)
         self.assertIn("dispatch_depth=1", receipt)
+        self.assertFalse(self.artifact_root.is_relative_to(self.worktree))
+        artifact_probe = self.artifact_root / "native-write-probe.txt"
+        blocked_probe = self.outside_root / "blocked.txt"
+        self.assertTrue(artifact_probe.is_relative_to(self.artifact_root))
+        self.assertFalse(artifact_probe.is_relative_to(self.worktree))
 
         with mock.patch.dict(os.environ, self.env, clear=True):
             nested = DISPATCH.prepare_nested_runtime(
@@ -113,10 +120,22 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
                           external)
             self.assertIn({"action": "external_directory", "resource": str(self.artifact_root),
                            "effect": "allow"}, external)
+            self.assertNotIn({"action": "external_directory", "resource": str(self.outside_root),
+                              "effect": "allow"}, external)
         else:
             external = permission.get("external_directory", {})
             self.assertEqual(external.get("*"), "deny")
             self.assertEqual(external.get(str(self.artifact_root)), "allow")
+            self.assertNotEqual(external.get(str(self.outside_root)), "allow")
+
+        bundle_path = os.environ.get("HEARTING_OPENCODE_SUPERVISOR_BUNDLE")
+        if bundle_path:
+            bundle = Path(bundle_path).read_text(encoding="utf-8")
+            self.assertIn('ARTIFACT_ROOT="$WORK/dispatch-artifact-root/.agent_reports"', bundle)
+            self.assertIn("Use the write tool exactly once to create", bundle)
+            self.assertIn('artifact_probe.read_bytes() != b"hearting-artifact-probe-v2\\n"', bundle)
+            self.assertIn("native session log has no failed outside-scope write tool call", bundle)
+            self.assertNotIn('"allowed_write": True', bundle)
 
         prompt = self.state_root / "probe.prompt"
         log = self.state_root / "probe.jsonl"

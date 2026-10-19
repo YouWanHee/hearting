@@ -523,9 +523,25 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
                     if str(utilities) not in sys.path:
                         sys.path.insert(0, str(utilities))
                     import opencode_runtime
-                    scopes = {opencode_runtime.provider_account_scope("opencode-go"),
-                              opencode_runtime.account_scope("opencode"),
-                              opencode_runtime.account_scope("openai")}
+                    opencode_v2 = opencode_runtime.is_v2()
+                    if opencode_v2:
+                        selected = opencode_runtime.selected_go_usage_observation()
+                        if selected.state == "unavailable":
+                            go_scope = opencode_scope = entitlement_scope = None
+                        else:
+                            go_scope = selected.provider_scope or "unscoped"
+                            opencode_scope = selected.opencode_scope or "unscoped"
+                            entitlement_scope = selected.entitlement_scope
+                    else:
+                        go_observation = opencode_runtime.account_scope_observation("opencode-go")
+                        opencode_observation = opencode_runtime.account_scope_observation("opencode")
+                        go_scope = go_observation.scope
+                        opencode_scope = opencode_observation.scope
+                        entitlement_scope = opencode_scope
+                    openai_observation = opencode_runtime.account_scope_observation("openai")
+                    openai_scope = openai_observation.scope
+                    scopes = {scope for scope in (go_scope, opencode_scope, openai_scope)
+                              if scope is not None}
                     providers = usage_cache.provider_records("opencode", account_scopes=scopes)
                     snap["providers"] = providers
                     usage_meta[harness]["providers"] = providers
@@ -533,16 +549,37 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
                     availability = payload.get("provider_availability") if isinstance(payload, dict) else None
                     if isinstance(availability, dict):
                         current_scope = {
-                            "opencode-go": opencode_runtime.provider_account_scope("opencode-go"),
-                            "opencode-go-entitlement": opencode_runtime.account_scope("opencode"),
-                            "opencode": opencode_runtime.account_scope("opencode"),
-                            "openai": opencode_runtime.account_scope("openai"),
+                            "opencode-go": go_scope,
+                            "opencode-go-entitlement": entitlement_scope,
+                            "opencode": opencode_scope,
+                            "openai": openai_scope,
                         }
                         payload["provider_availability"] = {
                             provider: row for provider, row in availability.items()
                             if isinstance(row, dict)
                             and row.get("account_scope") == current_scope.get(provider)
                         }
+                    payload_scope = payload.get("account_scope") if isinstance(payload, dict) else None
+                    if opencode_v2 and isinstance(payload, dict):
+                        if not isinstance(payload_scope, str):
+                            prior_scopes = {
+                                row.get("account_scope")
+                                for provider, row in (availability or {}).items()
+                                if provider in {"opencode-go", "opencode-go-entitlement"}
+                                and isinstance(row, dict)
+                                and isinstance(row.get("account_scope"), str)
+                            }
+                            payload_scope = next(iter(prior_scopes)) if len(prior_scopes) == 1 else None
+                    if (opencode_v2 and isinstance(payload, dict)
+                            and (go_scope is None or payload_scope != go_scope)):
+                        # The account can switch while the usage request is in
+                        # flight. Keep its observation tagged to its source, but
+                        # do not render its quota or denial as the new account's.
+                        for key in ("rl_5h", "rl_7d", "rl_ms", "rs_5h", "rs_7d",
+                                    "rl_windows", "windows", "error", "detail", "reason",
+                                    "credential_integration_id", "credential_source",
+                                    "credential_type"):
+                            payload.pop(key, None)
                 except Exception:
                     usage_meta[harness]["providers"] = []
             payload = snap.get("payload") or {}

@@ -13,6 +13,7 @@ Response shape (probed 2026-09-04): {"usage": {"rolling" | "weekly" | "monthly":
 weekly is a Mon 00:00 window, NOT rolling 7d, so it must not claim the rl_7d slot —
 it rides rl_windows with its true label.
 """
+from collections.abc import Mapping
 import json
 import hashlib
 import os
@@ -58,7 +59,7 @@ def _native_credential(integration_id):
 
 
 def _native_credential_row(integration_id, row):
-    if not isinstance(row, dict):
+    if not isinstance(row, Mapping):
         return None
     value = row.get("value") or {}
     token = (value.get("access") if value.get("type") == "oauth" else
@@ -84,13 +85,13 @@ def _legacy_go_credential(runtime=None):
             "credential_type": "legacy-key"}
 
 
-def _v2_usage_credential(runtime=None):
-    """OpenCode's active OAuth owns Go first; never bypass a present rejection."""
+def _v2_usage_credential(runtime=None, selection=None):
+    """Compatibility token view over the shared selected credential snapshot."""
     runtime = runtime or _runtime()
-    selected = runtime.selected_go_usage_credential()
-    if selected is None:
+    selected = selection or runtime.selected_go_usage_observation()
+    if selected.state != "present":
         return None
-    return _native_credential_row(selected["integration_id"], selected["credential"])
+    return _native_credential_row(selected.integration_id, selected.credential)
 
 
 def _record_status(provider, scope, state, reason=None, source="zen-go-usage"):
@@ -160,8 +161,14 @@ def _usage_payload(d):
     return out
 
 
-def _fetch_v1():
-    tok = _token()
+def _fetch_v1(selection=None):
+    if selection is None:
+        tok = _token()
+    elif selection.state == "present":
+        value = selection.credential.get("value") or {}
+        tok = value.get("key") if isinstance(value, Mapping) else None
+    else:
+        tok = None
     if not tok:
         return None
     body, rejection = _request_usage(tok)
@@ -175,25 +182,40 @@ def _fetch_v1():
     return _usage_payload(body)
 
 
-def _fetch_v2():
+def _fetch_v2(selection=None):
     runtime = _runtime()
-    credential = _v2_usage_credential(runtime)
-    if credential is None:
+    selection = selection or runtime.selected_go_usage_observation()
+    if selection.state == "unavailable":
+        return {"error": "unknown", "reason": selection.reason or "credential-store-unavailable",
+                "provider_availability": {}}
+    if selection.state == "absent":
         return {"error": "missing-credential", "reason": "credential-not-found",
                 "provider_availability": {}}
+    credential = _v2_usage_credential(runtime, selection)
     if not credential.get("token"):
         return {"error": "unknown", "reason": "credential-invalid",
                 "provider_availability": {}}
 
     integration = credential["integration_id"]
     oauth = integration == "opencode"
-    scope = runtime.provider_account_scope("opencode-go")
-    entitlement_scope = runtime.account_scope("opencode") if oauth else None
+    scope = selection.provider_scope
+    entitlement_scope = selection.entitlement_scope
+    if not scope or (oauth and not entitlement_scope):
+        return {"error": "unknown", "reason": "account-scope-unavailable",
+                "provider_availability": {}}
     observed_at = time.time()
+    source = "active-opencode-oauth" if oauth else (
+        "legacy-auth-json" if selection.credential_source == "legacy-auth-json"
+        else "opencode-go-api-key")
+    credential_metadata = {
+        "credential_integration_id": selection.integration_id,
+        "credential_source": selection.credential_source,
+        "credential_type": selection.credential_type,
+    }
 
     def provider_state(state, reason, *, account_scope=scope, http_status=None):
         result = {"state": state, "reason": reason, "account_scope": account_scope,
-                  "observed_at": observed_at}
+                  "observed_at": observed_at, **credential_metadata}
         if http_status is not None:
             result["http_status"] = http_status
         return result
@@ -208,7 +230,7 @@ def _fetch_v2():
                         "unknown", "unclassified-http", http_status=code)}}
         reason = classified["reason"]
         _record_status("opencode-go", scope, "unavailable", reason,
-                       source="active-opencode-oauth" if oauth else "opencode-go-api-key")
+                       source=source)
         states = {"opencode-go": provider_state(
             "unavailable", reason, http_status=code)}
         if oauth:
@@ -216,9 +238,10 @@ def _fetch_v2():
                                          account_scope=entitlement_scope, http_status=code)
             states["opencode-go-entitlement"] = entitlement
             _record_status("opencode-go-entitlement", entitlement_scope, "unavailable",
-                           reason, source="active-opencode-oauth")
+                           reason, source=source)
         error = "subscription-missing" if reason == "subscription-missing" else "auth"
         return {"error": error, "detail": code, "reason": reason,
+                "account_scope": scope, **credential_metadata,
                 "provider_availability": states}
 
     if body is None:
@@ -231,27 +254,28 @@ def _fetch_v2():
                 "provider_availability": {"opencode-go": provider_state(
                     "unknown", "usage-response-invalid")}}
     _record_status("opencode-go", scope, "usable",
-                   source="active-opencode-oauth" if oauth else "opencode-go-api-key")
+                   source=source)
     states = {"opencode-go": provider_state("usable", None)}
     if oauth:
         states["opencode-go-entitlement"] = provider_state(
             "usable", None, account_scope=entitlement_scope)
         _record_status("opencode-go-entitlement", entitlement_scope, "usable",
-                       source="active-opencode-oauth")
+                       source=source)
     usage["provider_availability"] = states
+    usage["account_scope"] = scope
+    usage.update(credential_metadata)
     return usage
 
 
-def _fetch():
-    return _fetch_v2() if _runtime().is_v2() else _fetch_v1()
-
-
-def _usage_account_scope():
+def _fetch(selection=None):
     runtime = _runtime()
-    if runtime.is_v2():
-        credential = _v2_usage_credential(runtime)
-        return runtime.provider_account_scope("opencode-go") if credential else "unscoped"
-    return runtime.account_scope("opencode-go")
+    return _fetch_v2(selection) if runtime.is_v2() else _fetch_v1(selection)
+
+
+def _usage_account_scope(selection=None):
+    runtime = _runtime()
+    selection = selection or runtime.selected_go_usage_observation()
+    return selection.provider_scope or "unscoped"
 
 
 def account_usage():
@@ -260,12 +284,21 @@ def account_usage():
     Serve stale quota windows on transient failure. A confirmed credential or entitlement
     rejection is returned immediately, while the usage cache keeps its original quota
     observation timestamp. A rejected account never inherits a prior success as eligibility."""
+    runtime = _runtime()
+    selection = runtime.selected_go_usage_observation()
+    if selection.state == "unavailable":
+        return {"error": "unknown", "reason": selection.reason or "credential-store-unavailable",
+                "provider_availability": {}}
+    scope = selection.provider_scope or "unscoped"
     now = time.time()
-    scope = _usage_account_scope()
     if _cache.get("scope") != scope:
         _cache.update(ts=0.0, ok_ts=0.0, data=None, scope=scope)
     if now - _cache["ts"] > _TTL:
-        d = _fetch()
+        d = _fetch(selection)
+        # A concurrent call may already have moved the single-entry cache to a
+        # different selected account while this request was in flight.
+        if _cache.get("scope") != scope:
+            return d
         _cache["ts"] = now              # failures throttle too — no retry storm inside the TTL
         if isinstance(d, dict) and d.get("error") in ("auth", "subscription-missing"):
             previous = _cache.get("data")

@@ -210,6 +210,166 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
                 "INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (identifier, integration, identifier, json.dumps(value), active, created, created))
 
+    def activate_opencode(self, identifier):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "UPDATE credential SET active=CASE WHEN id=? THEN 1 ELSE 0 END "
+                "WHERE integration_id='opencode'", (identifier,))
+
+    def test_present_store_query_failure_blocks_stale_native_and_legacy_credentials(self):
+        self.add_credential("default", "opencode", {
+            "type": "oauth", "access": "selected-token"}, 1, 1)
+        self.add_credential("old-go-key", "opencode-go", {
+            "type": "key", "key": "stale-native-go-key"}, 1, 2)
+        self.legacy_auth.write_text(json.dumps({
+            "opencode-go": {"type": "api", "key": "stale-legacy-go-key"}}))
+        runtime = zen_go_usage._runtime()
+        real_connect = sqlite3.connect
+
+        class FailSelectedQuery:
+            def __init__(self, connection):
+                object.__setattr__(self, "connection", connection)
+
+            def __getattr__(self, key):
+                return getattr(self.connection, key)
+
+            def __setattr__(self, key, value):
+                setattr(self.connection, key, value)
+
+            def execute(self, sql, *args):
+                if ("FROM credential WHERE" in sql and args
+                        and args[0][0] == "opencode"):
+                    raise sqlite3.OperationalError("database is locked")
+                return self.connection.execute(sql, *args)
+
+        cached = {"rl_5h": 17, "rl_windows": [["5h", 17, 123.0]]}
+        zen_go_usage._cache.update(ts=0.0, ok_ts=time.time(), data=cached,
+                                   scope="account:previous-known-account")
+        with mock.patch.object(
+                runtime.sqlite3, "connect",
+                side_effect=lambda *args, **kwargs:
+                FailSelectedQuery(real_connect(*args, **kwargs))), \
+             mock.patch.object(zen_go_usage, "_request_usage") as request, \
+             mock.patch.object(zen_go_usage, "_record_status") as record:
+            selected = runtime.selected_go_usage_observation()
+            result = zen_go_usage.account_usage()
+
+        self.assertEqual(selected.state, "unavailable")
+        self.assertEqual(selected.reason, "credential-store-read-failed")
+        self.assertEqual((result["error"], result["reason"]),
+                         ("unknown", "credential-store-read-failed"))
+        request.assert_not_called()
+        record.assert_not_called()
+        self.assertIs(zen_go_usage._cache["data"], cached)
+
+    def test_success_stays_on_selected_account_when_native_account_switches_in_flight(self):
+        self.add_credential("account-a", "opencode", {
+            "type": "oauth", "access": "account-a-token"}, 1, 1)
+        self.add_credential("account-b", "opencode", {
+            "type": "oauth", "access": "account-b-token"}, 0, 2)
+        runtime = zen_go_usage._runtime()
+        scope_a = runtime.selected_go_usage_observation().provider_scope
+        switched = []
+
+        def switch_then_success(token):
+            if not switched:
+                self.assertEqual(token, "account-a-token")
+                self.activate_opencode("account-b")
+                switched.append(True)
+            else:
+                self.assertEqual(token, "account-b-token")
+            return PROBED_BODY, None
+
+        with mock.patch.object(zen_go_usage, "_request_usage",
+                               side_effect=switch_then_success) as request:
+            first = zen_go_usage.account_usage()
+            self.assertEqual(first["account_scope"], scope_a)
+            self.assertEqual(first["provider_availability"]["opencode-go"]["account_scope"],
+                             scope_a)
+            self.assertEqual((first["credential_integration_id"],
+                              first["credential_source"], first["credential_type"]),
+                             ("opencode", "opencode-sqlite", "oauth"))
+            self.assertEqual(zen_go_usage._cache["scope"], scope_a)
+            self.assertEqual(runtime.model_availability(
+                "opencode-go/deepseek-v4.1-flash")["state"], "unknown")
+
+            second = zen_go_usage.account_usage()
+
+        scope_b = runtime.selected_go_usage_observation().provider_scope
+        self.assertNotEqual(scope_a, scope_b)
+        self.assertEqual(request.call_args_list,
+                         [mock.call("account-a-token"), mock.call("account-b-token")])
+        self.assertEqual(second["account_scope"], scope_b)
+        self.assertEqual(zen_go_usage._cache["scope"], scope_b)
+        self.assertEqual(runtime.model_availability(
+            "opencode-go/deepseek-v4.1-flash")["state"], "usable")
+
+    def test_entitlement_denial_stays_on_a_and_fleet_hides_its_quota_after_switch(self):
+        self.add_credential("account-a", "opencode", {
+            "type": "oauth", "access": "account-a-token"}, 1, 1)
+        self.add_credential("account-b", "opencode", {
+            "type": "oauth", "access": "account-b-token"}, 0, 2)
+        runtime = zen_go_usage._runtime()
+        selection_a = runtime.selected_go_usage_observation()
+        scope_a = selection_a.provider_scope
+        denial = (403, json.dumps({"error": {"type": "EntitlementError",
+                                              "message": "Go subscription required"}}).encode())
+        previous = {"rl_5h": 19, "rl_7d": None, "rl_ms": [], "rs_5h": 50.0,
+                    "rs_7d": None, "rl_windows": [["5h", 19, 50.0]],
+                    "account_scope": scope_a}
+        zen_go_usage._cache.update(ts=0.0, ok_ts=time.time(), data=previous, scope=scope_a)
+
+        switched = []
+
+        def switch_then_deny(token):
+            if not switched:
+                self.assertEqual(token, "account-a-token")
+                self.activate_opencode("account-b")
+                switched.append(True)
+                return None, denial
+            self.assertEqual(token, "account-b-token")
+            return PROBED_BODY, None
+
+        with mock.patch.object(zen_go_usage, "_request_usage",
+                               side_effect=switch_then_deny) as request:
+            first = zen_go_usage.account_usage()
+            self.assertEqual(first["error"], "subscription-missing")
+            self.assertEqual(first["account_scope"], scope_a)
+            self.assertEqual(first["rl_windows"], previous["rl_windows"])
+            self.assertEqual(first["provider_availability"]["opencode-go"]["account_scope"],
+                             scope_a)
+            self.assertEqual(runtime.model_availability(
+                "opencode-go/deepseek-v4.1-flash")["state"], "unknown")
+
+            empty_jobs = Path(self.temp.name) / "jobs.log"
+            empty_jobs.touch()
+            prior_cache_payload = dict(first)
+            prior_cache_payload.pop("account_scope")
+            snapshot = {"payload": prior_cache_payload, "freshness": "fresh",
+                        "observed_at": time.time()}
+            with mock.patch.object(collectors.procscan, "scan", return_value=[]), \
+                 mock.patch.object(dispatch, "collect", return_value=[]), \
+                 mock.patch.object(usage_cache, "account_usage", return_value=snapshot):
+                collectors.collect_all(harness_filter={"opencode"},
+                                       jobs_path=str(empty_jobs))
+            fleet_snapshot = collectors.collect_all.last_usage_snapshots["opencode"]
+            fleet_payload = fleet_snapshot["payload"]
+            self.assertNotIn("rl_windows", fleet_payload)
+            self.assertNotIn("opencode-go", fleet_payload["provider_availability"])
+            self.assertNotIn("opencode-go-entitlement", fleet_payload["provider_availability"])
+            self.assertNotIn(scope_a, {
+                row.get("account_scope") for row in fleet_snapshot["providers"]})
+
+            second = zen_go_usage.account_usage()
+
+        scope_b = runtime.selected_go_usage_observation().provider_scope
+        self.assertNotEqual(scope_a, scope_b)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[1], mock.call("account-b-token"))
+        self.assertEqual(second["account_scope"], scope_b)
+        self.assertEqual(runtime.model_availability(
+            "opencode-go/deepseek-v4.1-flash")["state"], "usable")
+
     def test_active_default_oauth_beats_inactive_personal_and_expired_api_key(self):
         runtime = zen_go_usage._runtime()
         self.add_credential("personal", "opencode", {

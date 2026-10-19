@@ -94,6 +94,73 @@ class OpenCodeCredentialReadTest(unittest.TestCase):
         self.assertFalse(row["credential_valid"])
         self.assertIsNone(runtime.read_credential("missing", db_path=self.db))
 
+    def test_observation_distinguishes_missing_store_missing_row_and_bad_schema(self):
+        missing = runtime.read_credential_observation(
+            "opencode", db_path=self.db.with_name("not-created.db"))
+        self.assertEqual(missing.state, "absent")
+        self.assertEqual(runtime.read_credential_observation(
+            "opencode", db_path=self.db).state, "absent")
+        broken_link = Path(self.temp.name) / "broken-link.db"
+        broken_link.symlink_to(Path(self.temp.name) / "missing-target.db")
+        self.assertEqual(runtime.read_credential_observation(
+            "opencode", db_path=broken_link).state, "unavailable")
+
+        malformed = Path(self.temp.name) / "malformed.db"
+        with sqlite3.connect(malformed) as con:
+            con.execute("CREATE TABLE credential (id TEXT, integration_id TEXT)")
+        observation = runtime.read_credential_observation("opencode", db_path=malformed)
+        self.assertEqual(observation.state, "unavailable")
+        self.assertEqual(observation.reason, "credential-store-schema-unavailable")
+        # Keep the public boundary compatible while internal callers retain status.
+        self.assertIsNone(runtime.read_credential("opencode", db_path=malformed))
+
+    def test_selected_query_failure_and_ambiguous_active_rows_are_unavailable(self):
+        with sqlite3.connect(self.db) as con:
+            self._insert(con, "default-a", "opencode",
+                         {"type": "oauth", "access": "a"}, 1, 2)
+            self._insert(con, "default-b", "opencode",
+                         {"type": "oauth", "access": "b"}, 1, 3)
+        ambiguous = runtime.read_credential_observation("opencode", db_path=self.db)
+        self.assertEqual(ambiguous.state, "unavailable")
+        self.assertEqual(ambiguous.reason, "credential-selection-ambiguous")
+
+        real_connect = sqlite3.connect
+
+        class FailSelectedQuery:
+            def __init__(self, connection):
+                object.__setattr__(self, "connection", connection)
+
+            def __getattr__(self, key):
+                return getattr(self.connection, key)
+
+            def __setattr__(self, key, value):
+                setattr(self.connection, key, value)
+
+            def execute(self, sql, *args):
+                if "FROM credential WHERE" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return self.connection.execute(sql, *args)
+
+        with unittest.mock.patch.object(
+                runtime.sqlite3, "connect",
+                side_effect=lambda *args, **kwargs:
+                FailSelectedQuery(real_connect(*args, **kwargs))):
+            failed_query = runtime.read_credential_observation("opencode", db_path=self.db)
+        self.assertEqual(failed_query.state, "unavailable")
+        self.assertEqual(failed_query.reason, "credential-store-read-failed")
+
+    def test_locked_database_is_unavailable_not_absent(self):
+        with sqlite3.connect(self.db, timeout=0.1) as con:
+            self._insert(con, "default", "opencode",
+                         {"type": "oauth", "access": "selected"}, 1, 2)
+        locker = sqlite3.connect(self.db, timeout=0.1)
+        self.addCleanup(locker.close)
+        locker.execute("BEGIN EXCLUSIVE")
+        observation = runtime.read_credential_observation("opencode", db_path=self.db)
+        locker.rollback()
+        self.assertEqual(observation.state, "unavailable")
+        self.assertEqual(observation.reason, "credential-store-read-failed")
+
 
 class OpenCodeSessionObservationTest(unittest.TestCase):
     def test_v2_exact_session_and_sequence_reader_needs_no_session_input_table(self):
@@ -149,6 +216,24 @@ class OpenCodeSessionObservationTest(unittest.TestCase):
 
 
 class OpenCodeProviderEvidenceTest(unittest.TestCase):
+    def test_unavailable_credential_scope_cannot_read_or_record_model_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "opencode.db"
+            with sqlite3.connect(db) as con:
+                con.execute("CREATE TABLE credential (id TEXT, integration_id TEXT)")
+            tools = str(ROOT / "tools")
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from fleet.collectors import usage_cache
+            with unittest.mock.patch.dict(os.environ, {
+                    "OPENCODE_RUNTIME_VERSION": "2.0.32", "OPENCODE_DB": str(db)}, clear=True), \
+                 unittest.mock.patch.object(usage_cache, "record_provider") as record:
+                self.assertEqual(runtime.model_availability("opencode-go/model")["state"],
+                                 "unknown")
+                self.assertFalse(runtime.record_model_outcome(
+                    "opencode-go/model", error={"status": 401}))
+            record.assert_not_called()
+
     def test_only_typed_expiry_and_entitlement_errors_are_hard(self):
         expired = runtime.classify_usage_rejection(
             401, {"error": {"code": "api_key_expired", "message": "expired"}})
