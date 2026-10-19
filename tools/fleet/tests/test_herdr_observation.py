@@ -243,6 +243,84 @@ class PaneProcessReuseTest(unittest.TestCase):
             self.assertIs(current, True)
             self.assertTrue(health["complete"])
 
+    def test_pending_and_failed_cached_pane_pid_cannot_confirm_current_attachment(self):
+        old_pane_cache = herdr._PANE_INFO_CACHE.copy()
+        herdr._PANE_INFO_CACHE.clear()
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+
+        def restore():
+            herdr.close_observations()
+            herdr._PANE_INFO_CACHE.clear()
+            herdr._PANE_INFO_CACHE.update(old_pane_cache)
+
+        self.addCleanup(restore)
+        first, pending = Future(), Future()
+        pane = {"pane_id": "w1:p1", "agent": "codex", "cwd": "/project",
+                "agent_session": {"agent": "codex", "value": "thread-current"}}
+        agent = {"agent": "codex", "pane_id": "w1:p1",
+                 "agent_session": {"agent": "codex", "value": "thread-current"}}
+        view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1,
+                        panes=(pane,), pane_revisions={"w1:p1": 0}, agents=(agent,))
+        cache_key = (view.endpoint, view.socket_path, view.generation, 0, "w1:p1")
+        herdr._PANE_INFO_CACHE[cache_key] = {
+            "shell_pid": 4000,
+            "foreground_processes": [{"pid": 4312, "name": "codex"}],
+        }
+
+        def attach_from_cached_view():
+            session = SimpleNamespace(harness="codex", session_id="thread-other", pid=4312,
+                                      proc_start="pid-start-before-reuse", cwd="/project",
+                                      is_child=False, app_server=False, mem_worker=False,
+                                      detached=False)
+            health = herdr.enrich([session])
+            return session, health
+
+        observation_reads = iter((first, pending))
+
+        def background_read(read):
+            try:
+                return next(observation_reads)
+            except StopIteration:
+                result = Future()
+                try:
+                    result.set_result(read())
+                except Exception as exc:
+                    result.set_exception(exc)
+                return result
+
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+                mock.patch.object(herdr, "background_read", side_effect=background_read):
+            self.assertIsNone(herdr.observation_view())
+            first.set_result(view)
+            self.assertTrue(herdr.observation_view().complete)
+
+            key = (view.endpoint, view.socket_path)
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            stale = herdr.observation_view()
+            self.assertFalse(stale.complete)
+            stale_pids = herdr.pane_evidence(stale.panes, observation=stale)
+            self.assertIn(4312, stale_pids[1])
+            self.assertFalse(stale_pids.complete)
+            with mock.patch("fleet.collectors.procscan.read_proc_start",
+                            return_value="pid-start-after-reuse"):
+                session, health = attach_from_cached_view()
+            self.assertIsNone(session.herdr_attached)
+            self.assertFalse(health["complete"])
+
+            pending.set_exception(OSError("socket lost"))
+            failed = herdr.observation_view()
+            self.assertFalse(failed.complete)
+            failed_pids = herdr.pane_evidence(failed.panes, observation=failed)
+            self.assertIn(4312, failed_pids[1])
+            self.assertFalse(failed_pids.complete)
+            with mock.patch("fleet.collectors.procscan.read_proc_start",
+                            return_value="pid-start-after-reuse"):
+                session, health = attach_from_cached_view()
+            self.assertIsNone(session.herdr_attached)
+            self.assertFalse(health["complete"])
+
     def test_refresh_discards_old_generation_and_close_clears_cached_views(self):
         for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
                      "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
