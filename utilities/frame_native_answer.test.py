@@ -79,6 +79,22 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(seen, ["rt-newer", "rt-older"])
         self.assertIn("/kept/answers.native.json", told["hookSpecificOutput"]["additionalContext"])
 
+    def test_a_partial_reply_tells_claude_and_codex_how_many_questions_remain(self):
+        import tempfile
+        payload = {"tool_name": "AskUserQuestion", "session_id": "s", "tool_input": {"questions": QUESTIONS},
+                   "tool_response": {"answers": {QUESTIONS[1]["question"]: "둘 다"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp) / "answers.native.partial.json"
+            partial.write_text(json.dumps({"missing": ["_understanding", "q-two"]}), encoding="utf-8")
+            with mock.patch.object(N, "record", return_value=partial):
+                for flag in ("--claude", "--codex"):
+                    told = json.loads(self.run_hook(flag, payload))
+                    self.assertIn("2 registered question(s) remain", told["hookSpecificOutput"]["additionalContext"])
+                self.assertEqual(self.run_hook("--opencode", payload), "")
+            partial.write_text("{broken", encoding="utf-8")
+            with mock.patch.object(N, "record", return_value=partial):
+                self.assertEqual(self.run_hook("--claude", payload), "")
+
     def test_nothing_answered_or_a_broken_payload_is_quiet(self):
         payload = {"tool_name": "AskUserQuestion", "session_id": "s", "tool_input": {"questions": QUESTIONS},
                    "tool_response": {"answers": {}}}

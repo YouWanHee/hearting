@@ -191,6 +191,10 @@ def understanding_draft(request: str) -> str:
 
 
 NATIVE_ANSWERS_NAME = "answers.native.json"
+NATIVE_PARTIAL_NAME = "answers.native.partial.json"   # never read as answers: the rows of an unfinished interview
+NATIVE_PARTIAL_SCHEMA = "frame_interview_native_partial_v1"
+UNDERSTANDING_SLOT = "_understanding"                  # question ids match [a-z][a-z0-9-]{0,31}, so no clash
+MAX_NATIVE_PARTIAL_BYTES = MAX_INTERVIEW_BYTES + MAX_ANSWERS_BYTES
 _RECOMMENDED = re.compile(r"\s*[(（](?:권장|recommended)[)）]\s*$", re.I)
 
 
@@ -217,46 +221,94 @@ def _native_option_index(value, labels):
     return matches[0] if len(matches) == 1 else None
 
 
-def answers_from_native(interview: dict, asked) -> dict | None:
-    """The answers file a native question tool's reply makes, or None when that reply is not
-    an answer to this interview.
-
-    `asked` lists what the tool showed and got back: `{question, options: [label], answer}`.
-    The restatement is asked as its own question (the understanding sentence, verbatim):
-    its first option confirms it and typed text is the correction. Every registered question
-    must be there by its own text; a printed label picks that option and typed text is an
-    off-menu answer with that text as its note. The reply came from the person's native
-    question box, so the source is `user`."""
-    shown = [row for row in asked or [] if isinstance(row, dict) and _plain(row.get("question"))]
-    find = lambda text: next((row for row in shown if _plain(text) and _plain(text) in _plain(row["question"])), None)
-    restatement = find(interview.get("understanding"))
-    if restatement is None:
-        return None
-    options = list(restatement.get("options") or [])
-    reply = _text(restatement.get("answer")).strip()
+def _restatement_outcome(row):
+    """`(confirmed, correction)` of the restatement's reply, or None when it is not an answer."""
+    options = list(row.get("options") or [])
+    reply = _text(row.get("answer")).strip()
     if not _plain(reply):
         return None
-    restatement_index = _native_option_index(reply, options)
-    if options and restatement_index == 0:
-        confirmed, correction = True, ""
-    elif restatement_index is not None:
+    index = _native_option_index(reply, options)
+    if options and index == 0:
+        return True, ""
+    if index is not None:
         return None                                   # "no" without saying what is wrong: ask for it
-    else:
-        confirmed, correction = False, _text(restatement.get("answer")).strip()
-    given = {}
+    return False, reply
+
+
+def _question_outcome(question: dict, row):
+    """One registered question's answer entry from its native reply row, or None."""
+    if not _plain(row.get("answer")):
+        return None
+    labels = _labels(question)
+    picked = _text(row.get("answer")).strip()
+    option_index = _native_option_index(picked, labels)
+    if option_index is None and any(_plain(picked) == _plain(label) for label in labels):
+        return None
+    return {"choice": option_index, "note": ""} if option_index is not None else {"choice": NONE_SENTINEL, "note": picked}
+
+
+def native_slots(interview: dict, asked) -> dict | None:
+    """The registered rows one native call answers: `{UNDERSTANDING_SLOT | question id: row}`.
+
+    `asked` lists what the tool showed and got back: `{question, options: [label], answer}`.
+    The restatement is asked as its own question (the understanding sentence, verbatim);
+    every registered question is matched by its own text. A call may carry only some of
+    them. None when a shown registered row is not an answer (empty, "no" without a
+    correction, an ambiguous label, a note over its cap): that call is asked again whole."""
+    shown = [row for row in asked or [] if isinstance(row, dict) and _plain(row.get("question"))]
+    find = lambda text: next((row for row in shown if _plain(text) and _plain(text) in _plain(row["question"])), None)
+    keep = lambda row: {"question": _text(row.get("question")), "options": list(row.get("options") or []),
+                        "answer": _text(row.get("answer"))}
+    slots = {}
+    row = find(interview.get("understanding"))
+    if row is not None:
+        outcome = _restatement_outcome(row)
+        if outcome is None or len(outcome[1]) > MAX_CORRECTION_CHARS:
+            return None
+        slots[UNDERSTANDING_SLOT] = keep(row)
     for question in interview.get("questions") or []:
         row = find(question.get("question"))
-        if row is None or not _plain(row.get("answer")):
+        if row is None:
+            continue
+        outcome = _question_outcome(question, row)
+        if outcome is None or len(outcome["note"]) > MAX_OFFMENU_NOTE_CHARS:
             return None
-        labels = _labels(question)
-        picked = _text(row.get("answer")).strip()
-        option_index = _native_option_index(picked, labels)
-        if option_index is None and any(_plain(picked) == _plain(label) for label in labels):
-            return None
-        given[_text(question.get("id"))] = ({"choice": option_index, "note": ""} if option_index is not None
-                                            else {"choice": NONE_SENTINEL, "note": picked})
+        slots[_text(question.get("id"))] = keep(row)
+    return slots
+
+
+def missing_native_slots(interview: dict, slots) -> list[str]:
+    """The slots (`UNDERSTANDING_SLOT`, then question ids in interview order) with no valid row yet."""
+    slots = slots if isinstance(slots, dict) else {}
+    row = slots.get(UNDERSTANDING_SLOT)
+    missing = [] if isinstance(row, dict) and _restatement_outcome(row) is not None else [UNDERSTANDING_SLOT]
+    for question in interview.get("questions") or []:
+        row = slots.get(_text(question.get("id")))
+        if not (isinstance(row, dict) and _question_outcome(question, row) is not None):
+            missing.append(_text(question.get("id")))
+    return missing
+
+
+def answers_from_native_slots(interview: dict, slots) -> dict | None:
+    """The answers file once `slots` cover the restatement and every registered question, else None."""
+    if missing_native_slots(interview, slots):
+        return None
+    confirmed, correction = _restatement_outcome(slots[UNDERSTANDING_SLOT])
+    given = {_text(question.get("id")): _question_outcome(question, slots[_text(question.get("id"))])
+             for question in interview.get("questions") or []}
     return {"schema": ANSWERS_SCHEMA, "route_id": interview.get("route_id"), "round": interview.get("round", 1),
             "actor_kind": "user", "understanding_confirmed": confirmed, "correction": correction, "answers": given}
+
+
+def answers_from_native(interview: dict, asked) -> dict | None:
+    """The answers file one native question call makes, or None when that call is not a complete
+    answer to this interview (a call that carries only some rows is combined by `work_start`).
+
+    The restatement's first option confirms it and typed text is the correction. A printed
+    label picks that option and typed text is an off-menu answer with that text as its note.
+    The reply came from the person's native question box, so the source is `user`."""
+    slots = native_slots(interview, asked)
+    return None if slots is None else answers_from_native_slots(interview, slots)
 
 
 def approval_question_id(leg, key) -> str:
