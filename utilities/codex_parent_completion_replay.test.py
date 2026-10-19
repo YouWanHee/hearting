@@ -13,10 +13,12 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import codex_parent_completion_replay as replay
+import peer_obligations
 
 
 class HookTrustSetupTests(unittest.TestCase):
@@ -214,24 +216,619 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def _valid_tool_trace(self):
-        paths = [self.fixture["facts_path"], *self.fixture["artifact_paths"]]
-        read_output = "\n".join(path.read_text(encoding="utf-8") for path in paths)
-        read = {"command": "cat " + " ".join(map(str, paths)),
-                "aggregatedOutput": read_output, "status": "completed", "exitCode": 0}
-        verified = subprocess.run(
-            [sys.executable, "-B", str(self.fixture["verifier"])],
-            capture_output=True, text=True, check=False)
-        self.assertEqual(verified.returncode, 0, verified.stderr)
-        verifier = {"command": f"python3 -B {self.fixture['verifier']}",
-                    "aggregatedOutput": verified.stdout, "status": "completed", "exitCode": 0}
-        applied = subprocess.run(
-            [sys.executable, "-B", str(self.fixture["action"]), self.sentinel],
-            capture_output=True, text=True, check=False)
-        self.assertEqual(applied.returncode, 0, applied.stderr)
-        action = {"command": f"python3 -B {self.fixture['action']} {self.sentinel}",
-                  "aggregatedOutput": applied.stdout, "status": "completed", "exitCode": 0}
-        return [read, verifier, action]
+    def _fixture_tool_trace(self, fixture, sentinel, *, include_action=True):
+        fixture_rel = Path(".agent_reports/native-parent-fixture")
+        read_command = f"cat {fixture_rel}/*.md {fixture_rel}/fixture-facts.json"
+        worktree = fixture["fixture"].parents[1]
+        commands = [("read-1", read_command)]
+        if include_action:
+            commands.append(("action-1",
+                             f"python3 -B {fixture_rel}/apply_fixture_followthrough.py {sentinel}"))
+        verifier_command = f"python3 -B {fixture_rel}/verify_fixture.py"
+        commands.append(("verify-1", verifier_command))
+        tools = []
+        for tool_id, command in commands:
+            result = subprocess.run(["/bin/sh", "-lc", command], cwd=worktree,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tools.append({
+                "id": tool_id,
+                "command": "/usr/bin/zsh -lc " + json.dumps(command),
+                "commandActions": [{"command": command, "type": "unknown"}],
+                "cwd": str(worktree),
+                "aggregatedOutput": result.stdout,
+                "status": "completed",
+                "exitCode": 0,
+            })
+        return tools
+
+    def _valid_tool_trace(self, fixture=None, sentinel=None):
+        fixture = fixture or self.fixture
+        return self._fixture_tool_trace(
+            fixture, sentinel or self.sentinel, include_action=True)
+
+    def _report_text(self, language="en", report=None, fixture=None):
+        facts = (fixture or self.fixture)["facts"]["report"]
+        values = facts["synthetic_values"]
+        if language == "ko":
+            prose = (
+                "이미 승인된 후속 작업을 마치기 위해 정확한 결과를 읽고 처리했습니다. "
+                "작업 전에는 후속 파일이 없고 승인된 실행 횟수가 0이었지만, 작업 후에는 파일이 "
+                "생성되어 실행 횟수가 1이 되었습니다. verify_fixture.py 검증에서 여섯 검사가 모두 "
+                "통과했고 실패는 0건입니다. "
+                f"합성 커밋 값은 {values['commit']}입니다. 합성 배포 값은 {values['deployment']}입니다. "
+                f"합성 서빙 값은 {values['serving']}입니다. "
+                "운영 배포 및 서빙 검사는 생략했습니다. 실제 운영 endpoint, 배포, commit, CI, PR "
+                "상태를 측정하거나 변경하지 않았습니다. 격리된 Codex 재현은 전달과 보고만 시험했습니다."
+            )
+        else:
+            prose = (
+                "I completed the already approved isolated parent follow-through after reading the exact result. "
+                "Before the action, the follow-through file was absent and the approved action count was 0; "
+                "after the action, the file was present and the approved action count was 1. "
+                "Verification with verify_fixture.py passed all six checks with 0 failed. "
+                f"The synthetic commit value is {values['commit']}. "
+                f"The synthetic deployment value is {values['deployment']}. "
+                f"The synthetic serving value is {values['serving']}. "
+                "Production deployment and serving checks were skipped. No production endpoint, deployment, "
+                "commit, CI run, PR, or operating state was changed or measured. "
+                "This isolated Codex replay tests delivery and reporting only."
+            )
+        return prose + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(
+            facts if report is None else report, ensure_ascii=False)
+
+    @contextmanager
+    def _mock_native_runtime(self, output, *, report_pass=True, action_applied=True,
+                             extra_history=False, history_error=False,
+                             assert_d1_before_d2=False):
+        state = {"history_calls": 0, "queue_sends": [], "fixture": None,
+                 "followthrough_snapshot": None, "d1_before_d2": False,
+                 "completion_record": None, "runtime": None, "jobs": None}
+        real_run = subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            argv = list(command) if isinstance(command, (list, tuple)) else [str(command)]
+            if argv and argv[0] == "git":
+                return real_run(command, *args, **kwargs)
+            if argv and argv[0] == "/mock/codex":
+                return subprocess.CompletedProcess(command, 0, stdout="codex-test\n", stderr="")
+            if argv and argv[0] == "/bin/sh":
+                script = str(argv[-1])
+                if ".agent_reports/native-parent-fixture/" not in script:
+                    raise AssertionError("fixture helper escaped its isolated worktree")
+                return real_run(command, *args, **kwargs)
+            raise AssertionError(f"unexpected subprocess in mocked replay: {argv!r}")
+
+        def fake_copy_runtime_config(_source_home, codex_home, _env):
+            # Supply disposable test credentials and hook/config files only.
+            (codex_home / "auth.json").write_text('{"test-only":true}\n', encoding="utf-8")
+            (codex_home / "hooks.json").write_text('{"hooks":{}}\n', encoding="utf-8")
+            (codex_home / "config.toml").write_text("[features]\napps = false\n", encoding="utf-8")
+            for name in ("auth.json", "hooks.json", "config.toml"):
+                (codex_home / name).chmod(0o600)
+            return {"auth.json": True, "hooks.json": True, "config.toml": True}, \
+                codex_home / "mock-auth-source.json"
+
+        def fake_copy_regular(_source, target, *, private=False):
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target.write_text('{"test-only":true}\n', encoding="utf-8")
+            target.chmod(0o600)
+            return True
+
+        original_write_fixture = replay._write_native_fixture
+
+        def write_fixture(worktree, sentinel):
+            fixture = original_write_fixture(worktree, sentinel)
+            state["fixture"] = fixture
+            state["tool_trace"] = self._fixture_tool_trace(
+                fixture, sentinel, include_action=action_applied)
+            state["followthrough_snapshot"] = (
+                fixture["followthrough"].read_bytes()
+                if fixture["followthrough"].is_file() else None)
+            if report_pass:
+                final_text = self._report_text(fixture=fixture)
+            else:
+                final_text = (
+                    "Approved. Before after. Checks pass. Synthetic commit deployment serving. "
+                    "Production skipped not measured.\nFACTUAL_REPORT_JSON:\n"
+                    + json.dumps(fixture["facts"]["report"], ensure_ascii=False))
+            continuation_id = "delivery-replay-continuation"
+            state["continuation_turn"] = {
+                "id": "continuation-turn", "status": "completed",
+                "items": [{"type": "userMessage", "clientId": continuation_id},
+                          {"type": "agentMessage", "text": final_text},
+                          *[{"type": "commandExecution", **tool}
+                            for tool in state["tool_trace"]]],
+            }
+            return fixture
+
+        original_fixture_registry = replay._fixture_registry
+
+        def fixture_registry(jobs, thread_id, worktree, sentinel):
+            result = original_fixture_registry(jobs, thread_id, worktree, sentinel)
+            completion_record = result[3]
+            runtime = jobs.resolve().parent
+            replay.pending_delivery.claim(
+                runtime, thread_id, completion_record["delivery_id"],
+                claim_owner="mock-native-hook", lease_seconds=30,
+                require_generation_proof=True, live_recipient_generation=(thread_id, "1"),
+                jobs=jobs)
+            replay.pending_delivery.ack(
+                runtime, thread_id, completion_record["delivery_id"],
+                acked_by="codex-native-queue:" + completion_record["delivery_id"])
+            state.update(completion_record=completion_record, runtime=jobs.resolve().parent,
+                         jobs=jobs, thread_id=thread_id)
+            return result
+
+        class FakeObligationStore:
+            def __init__(self, _root=None):
+                pass
+
+            def get(self, _duty_id):
+                return {
+                    "state": "complete",
+                    "observation": {
+                        "native_receiving_turn": {
+                            "thread_id": state["thread_id"], "turn_id": "initial-turn",
+                            "delivery_id": state["completion_record"]["delivery_id"],
+                        },
+                        "continuation_id": "delivery-replay-continuation",
+                    },
+                }
+
+        class FakeRPCClient:
+            def request(self, method, _params):
+                if method == "turn/start":
+                    return {"turn": {"id": "initial-turn"}}
+                if method == "thread/resume":
+                    return {"thread": {"id": state["thread_id"]}}
+                raise AssertionError(f"unexpected mocked app-server request: {method}")
+
+            def close(self):
+                pass
+
+        def find_conflict_delivery():
+            for record_path in (state["runtime"] / "pending-delivery").glob("*/*.json"):
+                try:
+                    record = json.loads(record_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                receipt = record.get("receipt") if isinstance(record, dict) else None
+                if isinstance(receipt, dict) and receipt.get("reason") == "terminal-evidence-conflict":
+                    return record["delivery_id"]
+            raise AssertionError("production did not materialize the conflict delivery")
+
+        def history(_endpoint, _thread_id):
+            state["history_calls"] += 1
+            call = state["history_calls"]
+            initial = {"id": "initial-turn", "status": "interrupted", "items": []}
+            continuation = state["continuation_turn"]
+            base = [initial, continuation]
+            extra = ([{"id": "unrelated-native-turn", "status": "completed",
+                       "items": [{"type": "userMessage", "clientId": "unrelated"}]}]
+                     if extra_history else [])
+            if call <= 3:
+                if call == 3 and assert_d1_before_d2:
+                    stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        stored["replay_cases"]["d1_first_report"]["status"], "FAIL")
+                    state["d1_before_d2"] = True
+                return base
+            if call == 4:
+                return base + extra
+            if call == 5 and history_error:
+                raise RuntimeError("mock native history transport unavailable")
+            conflict = {
+                "id": "conflict-turn", "status": "completed",
+                "items": [{"type": "userMessage", "clientId": find_conflict_delivery()},
+                          {"type": "agentMessage", "text": "Conflict notice observed."}],
+            }
+            turns = base + extra + [conflict]
+            if state.get("question_started"):
+                turns.append({
+                    "id": "question-turn", "status": "completed",
+                    "items": [{"type": "agentMessage",
+                               "text": "No production deployment was measured; this is fixture-only."}],
+                })
+            return turns
+
+        def turn_record(_endpoint, _thread_id, turn_id):
+            if turn_id == "initial-turn":
+                return {"id": turn_id, "status": "interrupted", "items": []}
+            if turn_id == "question-turn":
+                return {
+                    "id": turn_id, "status": "completed",
+                    "items": [{"type": "agentMessage",
+                               "text": "No production deployment was measured; this is fixture-only."}],
+                }
+            raise AssertionError(f"unexpected native history lookup: {turn_id}")
+
+        def request(_endpoint, method, _params):
+            if method == "turn/start":
+                state["question_started"] = True
+                return {"turn": {"id": "question-turn"}}
+            raise AssertionError(f"unexpected mocked native request: {method}")
+
+        def queue_send(*_args, **_kwargs):
+            state["queue_sends"].append("consumed")
+            return {"status": "consumed"}
+
+        with ExitStack() as stack:
+            masked_daemon_dir = Path("/tmp").resolve() / f"codex-daemon-{os.geteuid()}"
+            path_exists = Path.exists
+
+            def isolated_path_exists(path):
+                if path == masked_daemon_dir:
+                    return False
+                return path_exists(path)
+
+            # The runner's masked-daemon sentinel is environmental; all daemon
+            # and app-server operations below are independently mocked.
+            stack.enter_context(mock.patch.object(Path, "exists", isolated_path_exists))
+            stack.enter_context(mock.patch.object(replay.subprocess, "run", side_effect=fake_run))
+            stack.enter_context(mock.patch.object(replay.shutil, "which", return_value="/mock/codex"))
+            stack.enter_context(mock.patch.object(replay, "_copy_runtime_config",
+                                                  side_effect=fake_copy_runtime_config))
+            stack.enter_context(mock.patch.object(replay, "_copy_regular",
+                                                  side_effect=fake_copy_regular))
+            stack.enter_context(mock.patch.object(replay, "_start_server",
+                                                  return_value=SimpleNamespace()))
+            stack.enter_context(mock.patch.object(replay, "_stop_server"))
+            stack.enter_context(mock.patch.object(replay, "_start_trusted_replay_thread",
+                return_value=("mock-thread", "mock-probe-thread", {"trusted_hook_count": 2})))
+            stack.enter_context(mock.patch.object(replay, "_rpc_session",
+                                                  side_effect=lambda _endpoint: FakeRPCClient()))
+            stack.enter_context(mock.patch.object(replay, "_request", side_effect=request))
+            stack.enter_context(mock.patch.object(replay, "_turn_record", side_effect=turn_record))
+            stack.enter_context(mock.patch.object(replay, "_all_turns", side_effect=history))
+            stack.enter_context(mock.patch.object(replay, "_fixture_registry",
+                                                  side_effect=fixture_registry))
+            stack.enter_context(mock.patch.object(replay, "_write_native_fixture",
+                                                  side_effect=write_fixture))
+            stack.enter_context(mock.patch.object(peer_obligations, "ObligationStore",
+                                                  FakeObligationStore))
+            stack.enter_context(mock.patch.object(replay.codex_queue_delivery, "send_at_least_once",
+                                                  side_effect=queue_send))
+            stack.enter_context(mock.patch.object(replay.codex_queue_delivery, "list_queue",
+                                                  return_value=[]))
+            stack.enter_context(mock.patch.object(replay.time, "sleep", return_value=None))
+            yield state
+
+    def _assert_case_records(self, stored, case_ids):
+        for case_id in case_ids:
+            result = stored["replay_cases"][case_id]
+            self.assertIn(result["status"], {"PASS", "FAIL", "BLOCKED", "not-run"})
+            self.assertTrue(result["reason"])
+            self.assertIsInstance(result["checks"], dict)
+            self.assertIsInstance(result["evidence"], list)
+
+    def test_run_replay_d1_failure_is_durable_before_d2_and_later_cases_run(self):
+        output = self.root / "orchestration-d1-fail"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, report_pass=False,
+                                      assert_d1_before_d2=True) as native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertTrue(native["d1_before_d2"])
+        self.assertEqual(json.loads(native["followthrough_snapshot"])["approved_action_count"], 1)
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "PASS")
+        self.assertEqual(cases["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(cases["direct_question"]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
+        self._assert_case_records(stored, (
+            "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
+            "direct_question", "overall_acceptance"))
+
+    def test_run_replay_missing_first_report_still_evaluates_later_cases(self):
+        output = self.root / "orchestration-empty-report"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, assert_d1_before_d2=True) as native:
+            observed_history = replay._all_turns.side_effect
+
+            def empty_report_history(*args):
+                turns = observed_history(*args)
+                for turn in turns:
+                    if turn.get("id") == "continuation-turn":
+                        turn["items"] = [item for item in turn["items"]
+                                         if item.get("type") != "agentMessage"]
+                return turns
+
+            replay._all_turns.side_effect = empty_report_history
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertTrue(native["d1_before_d2"])
+        self.assertEqual((output / "turn-output.txt").read_text(), "\n")
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertFalse(cases["d1_first_report"]["checks"]["report_matches_fixture_facts"])
+        for case_id in ("d2_duplicate_cleanup", "d3_new_conflict", "direct_question"):
+            self.assertEqual(cases[case_id]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
+        self._assert_case_records(stored, (
+            "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
+            "direct_question", "overall_acceptance"))
+
+    def test_run_replay_d2_failure_does_not_skip_independent_later_cases(self):
+        output = self.root / "orchestration-d2-fail"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, extra_history=True) as _native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertEqual(cases["d1_first_report"]["status"], "PASS")
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "FAIL")
+        self.assertIn("cleanup_created_no_extra_turn", cases["d2_duplicate_cleanup"]["reason"])
+        self.assertEqual(cases["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(cases["direct_question"]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
+
+    def test_run_replay_missing_followthrough_blocks_only_dependent_judgments(self):
+        output = self.root / "orchestration-missing-prerequisite"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, action_applied=False) as native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertIsNone(native["followthrough_snapshot"])
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "PASS")
+        self.assertEqual(cases["d3_new_conflict"]["status"], "BLOCKED")
+        self.assertIn("follow-through state absent", cases["d3_new_conflict"]["reason"])
+        self.assertEqual(cases["direct_question"]["status"], "BLOCKED")
+        self.assertIn("follow-through state absent", cases["direct_question"]["reason"])
+        self.assertEqual(report["verdict"], "FAIL")
+
+    def test_run_replay_later_transport_error_keeps_failure_and_names_unrun_cases(self):
+        output = self.root / "orchestration-transport-error"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, report_pass=False,
+                                      history_error=True) as _native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "PASS")
+        for case_id in ("d3_new_conflict", "direct_question", "overall_acceptance"):
+            self.assertEqual(cases[case_id]["status"], "not-run")
+            self.assertIn("mock native history transport unavailable", cases[case_id]["reason"])
+        self.assertEqual(report["verdict"], "FAIL")
+
+    def test_run_replay_persists_all_pass_aggregate(self):
+        output = self.root / "orchestration-all-pass"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output) as _native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(stored["verdict"], "PASS")
+        for case_id in ("d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
+                        "direct_question", "overall_acceptance"):
+            self.assertEqual(stored["replay_cases"][case_id]["status"], "PASS")
+
+    def test_turn_items_keep_native_cwd_and_command_action_metadata(self):
+        command = "cat .agent_reports/native-parent-fixture/*.md"
+        messages, tools = replay._turn_items({"items": [
+            {"type": "agentMessage", "text": "done"},
+            {"type": "commandExecution", "id": "native-1", "command": "/usr/bin/zsh -lc 'pwd'",
+             "commandActions": [{"type": "unknown", "command": command}],
+             "cwd": str(self.worktree), "aggregatedOutput": "", "exitCode": 0,
+             "status": "completed"},
+        ]})
+        self.assertEqual(messages, ["done"])
+        self.assertEqual(tools[0]["cwd"], str(self.worktree))
+        self.assertEqual(tools[0]["commandActions"][0]["command"], command)
+
+    def test_relative_glob_and_recorded_cwd_prove_each_exact_artifact_read(self):
+        tools = self._valid_tool_trace()
+        facts = self.fixture["facts"]["report"]
+        checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
+        self.assertTrue(checks["every_exact_artifact_was_read"])
+        self.assertTrue(all(checks["artifact_reads"].values()))
+        self.assertTrue(all(evidence[0]["cwd_source"] == "commandExecution"
+                            for evidence in checks["artifact_read_evidence"].values()))
+
+        wrong_cwd = [{**item, "cwd": str(self.root)} for item in tools]
+        checks = replay._first_report_checks(self._report_text(), wrong_cwd, self.fixture)
+        self.assertFalse(checks["every_exact_artifact_was_read"])
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
+
+    def test_marker_only_and_failed_verifier_do_not_satisfy_execution_evidence(self):
+        fake = {
+            "id": "fake-1", "command": "/usr/bin/zsh -lc 'echo FIXTURE_VERIFICATION=PASS checks=6 failed=0'",
+            "commandActions": [{"type": "unknown",
+                                "command": "echo FIXTURE_VERIFICATION=PASS checks=6 failed=0"}],
+            "cwd": str(self.worktree),
+            "aggregatedOutput": "FIXTURE_ID=" + self.fixture["facts"]["fixture_id"]
+                              + "\nFIXTURE_VERIFICATION=PASS checks=6 failed=0",
+            "status": "completed", "exitCode": 0,
+        }
+        checks = replay._first_report_checks("", [fake], self.fixture)
+        self.assertFalse(checks["every_exact_artifact_was_read"])
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+
+        code_argument = {
+            **fake,
+            "commandActions": [{
+                "type": "unknown",
+                "command": ("python3 -c 'print(1)' "
+                            ".agent_reports/native-parent-fixture/verify_fixture.py"),
+            }],
+            "aggregatedOutput": "FIXTURE_VERIFICATION=PASS checks=6 failed=0",
+        }
+        checks = replay._first_report_checks("", [code_argument], self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        verifier["status"] = "failed"
+        verifier["exitCode"] = 1
+        checks = replay._first_report_checks("", tools, self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+
+    def test_case_sequence_helper_continues_after_first_report_failure(self):
+        output = self.root / "evidence"
+        output.mkdir(mode=0o700)
+        report = {"schema_version": 1, "replay_cases": {}}
+        valid_trace = self._valid_tool_trace()
+        filler = ("Approved. Before after. Checks pass. Synthetic commit deployment serving. "
+                  "Production skipped not measured.\nFACTUAL_REPORT_JSON:\n"
+                  + json.dumps(self.fixture["facts"]["report"], ensure_ascii=False))
+        first_report_observation = replay._first_report_checks(filler, valid_trace, self.fixture)
+
+        class FakeNativeTransport:
+            def __init__(transport_self):
+                transport_self.calls = []
+
+            def first_report(transport_self):
+                transport_self.calls.append("d1_first_report")
+                return {key: value for key, value in first_report_observation.items()
+                        if isinstance(value, bool)}
+
+            def cleanup_and_duplicate(transport_self):
+                transport_self.calls.append("d2_duplicate_cleanup")
+                persisted = json.loads((output / "replay.json").read_text())
+                self.assertEqual(persisted["replay_cases"]["d1_first_report"]["status"], "FAIL")
+                return {
+                    "cleanup_is_current": False,
+                    "cleanup_text": "Late deadline retains cleanup observation only",
+                    "duplicate_state": "acked", "duplicate_kept_exact_ack": True,
+                    "cleanup_courier_state": "rejected",
+                    "cleanup_courier_reason": "supervision-resolved",
+                    "old_ack_preserved": True, "no_extra_turn": False,
+                    "no_cleanup_queue_item": True, "no_queued_duplicate": True,
+                }
+
+            def new_conflict(transport_self):
+                transport_self.calls.append("d3_new_conflict")
+                return {"conflict_fixture_valid": True, "notice_is_distinct_current": True,
+                        "notice_ack_observed": True, "notice_turn_status": "completed",
+                        "notice_has_response": True, "notice_occurrences": 1,
+                        "old_ack_preserved": True, "no_duplicate_action_or_response": True}
+
+            def direct_question(transport_self):
+                transport_self.calls.append("direct_question")
+                return {"answer": "No production deployment was measured; result is fixture only.",
+                        "followthrough_unchanged": True, "action_invocations": 0}
+
+        transport = FakeNativeTransport()
+        replay._run_replay_case_sequence(report, output, [
+            {"case_id": "d1_first_report", "observe": transport.first_report,
+             "evidence": ["first-report-checks.json"]},
+            {"case_id": "d2_duplicate_cleanup", "observe": transport.cleanup_and_duplicate,
+             "evidence": ["late-cleanup-courier.json"]},
+            {"case_id": "d3_new_conflict", "observe": transport.new_conflict,
+             "evidence": ["late-conflict-notice.json"]},
+            {"case_id": "direct_question", "observe": transport.direct_question,
+             "evidence": ["direct-question-turn.json"]},
+        ])
+        stored = json.loads((output / "replay.json").read_text())
+        self.assertEqual(transport.calls, ["d1_first_report", "d2_duplicate_cleanup",
+                                           "d3_new_conflict", "direct_question"])
+        self.assertEqual(stored["replay_cases"]["d1_first_report"]["status"], "FAIL")
+        self.assertEqual(stored["replay_cases"]["d2_duplicate_cleanup"]["status"], "FAIL")
+        self.assertEqual(stored["replay_cases"]["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(stored["replay_cases"]["direct_question"]["status"], "PASS")
+        self.assertIn("cleanup_created_no_extra_turn",
+                      stored["replay_cases"]["d2_duplicate_cleanup"]["reason"])
+        self.assertEqual(stored["replay_cases"]["d1_first_report"]["evidence"],
+                         ["first-report-checks.json"])
+
+    def test_case_sequence_helper_blocks_missing_prerequisite_without_fabricating_state(self):
+        output = self.root / "missing-prerequisite"
+        output.mkdir(mode=0o700)
+        report = {"schema_version": 1, "replay_cases": {}}
+        state = {"followthrough": None}
+        d1_checks = {key: value for key, value in
+                     replay._first_report_checks(self._report_text(), self._valid_tool_trace(),
+                                                 self.fixture).items()
+                     if isinstance(value, bool)}
+
+        class IndependentTransport:
+            def d3(self):
+                return {"conflict_fixture_valid": True, "notice_is_distinct_current": True,
+                        "notice_ack_observed": True, "notice_turn_status": "completed",
+                        "notice_has_response": True, "notice_occurrences": 1,
+                        "old_ack_preserved": True, "no_duplicate_action_or_response": True}
+
+            def question(self):
+                return {"answer": "No production result; this is fixture-only.",
+                        "followthrough_unchanged": True, "action_invocations": 0}
+
+        transport = IndependentTransport()
+        replay._run_replay_case_sequence(report, output, [
+            {"case_id": "d1_first_report", "observe": lambda: d1_checks},
+            {"case_id": "d2_duplicate_cleanup", "observe": lambda: self.fail("d2 ran without state"),
+             "prerequisites": [("followthrough state", lambda: state["followthrough"] is not None)]},
+            {"case_id": "d3_new_conflict", "observe": transport.d3},
+            {"case_id": "direct_question", "observe": transport.question},
+        ])
+        stored = json.loads((output / "replay.json").read_text())
+        self.assertIsNone(state["followthrough"])
+        self.assertEqual(stored["replay_cases"]["d2_duplicate_cleanup"]["status"], "BLOCKED")
+        self.assertIn("missing prerequisite state",
+                      stored["replay_cases"]["d2_duplicate_cleanup"]["reason"])
+        self.assertEqual(stored["replay_cases"]["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(stored["replay_cases"]["direct_question"]["status"], "PASS")
+
+    def test_case_sequence_helper_preserves_failure_after_transport_exception(self):
+        output = self.root / "failure-evidence"
+        output.mkdir(mode=0o700)
+        report = {"schema_version": 1, "replay_cases": {}}
+        replay._run_replay_case_sequence(report, output, [
+            {"case_id": "d1_first_report", "observe": lambda: {"exact_facts": False}},
+            {"case_id": "d2_duplicate_cleanup",
+             "observe": lambda: (_ for _ in ()).throw(RuntimeError("queue unavailable"))},
+            {"case_id": "d3_new_conflict", "observe": lambda: self.fail("transport already failed")},
+            {"case_id": "direct_question", "observe": lambda: self.fail("transport already failed")},
+        ])
+        self.assertEqual(json.loads((output / "replay.json").read_text())[
+            "replay_cases"]["d1_first_report"]["status"], "FAIL")
+        finished = replay._finish_after_runtime_error(report, output, "BLOCKED", "queue unavailable")
+        self.assertEqual(finished["verdict"], "FAIL")
+        self.assertEqual(finished["replay_cases"]["d1_first_report"]["status"], "FAIL")
+        self.assertEqual(finished["replay_cases"]["d2_duplicate_cleanup"]["status"], "BLOCKED")
+        self.assertEqual(finished["replay_cases"]["d3_new_conflict"]["status"], "not-run")
+        self.assertIn("queue unavailable", finished["replay_cases"]["d2_duplicate_cleanup"]["reason"])
+
+    def test_case_sequence_helper_aggregates_all_evaluators_pass(self):
+        output = self.root / "all-pass"
+        output.mkdir(mode=0o700)
+        report = {"schema_version": 1, "replay_cases": {}}
+        first = replay._first_report_checks(self._report_text(), self._valid_tool_trace(), self.fixture)
+        d1 = {key: value for key, value in first.items() if isinstance(value, bool)}
+        replay._run_replay_case_sequence(report, output, [
+            {"case_id": "d1_first_report", "observe": lambda: d1},
+            {"case_id": "d2_duplicate_cleanup", "observe": lambda: {
+                "cleanup_is_current": False,
+                "cleanup_text": "Late deadline retains cleanup observation only",
+                "duplicate_state": "acked", "duplicate_kept_exact_ack": True,
+                "cleanup_courier_state": "rejected", "cleanup_courier_reason": "supervision-resolved",
+                "old_ack_preserved": True, "no_extra_turn": True,
+                "no_cleanup_queue_item": True, "no_queued_duplicate": True}},
+            {"case_id": "d3_new_conflict", "observe": lambda: {
+                "conflict_fixture_valid": True, "notice_is_distinct_current": True,
+                "notice_ack_observed": True, "notice_turn_status": "completed",
+                "notice_has_response": True, "notice_occurrences": 1,
+                "old_ack_preserved": True, "no_duplicate_action_or_response": True}},
+            {"case_id": "direct_question", "observe": lambda: {
+                "answer": "No production deployment was measured; fixture only.",
+                "followthrough_unchanged": True, "action_invocations": 0}},
+        ])
+        stored = json.loads((output / "replay.json").read_text())
+        self.assertTrue(all(stored["replay_cases"][case]["status"] == "PASS"
+                            for case in ("d1_first_report", "d2_duplicate_cleanup",
+                                         "d3_new_conflict", "direct_question")))
+        self.assertEqual(replay._aggregate_replay_status(
+            report, {"native_acceptance": True}), "PASS")
 
     def test_ordered_synthetic_facts_and_exact_native_report_are_required(self):
         facts = self.fixture["facts"]
@@ -246,9 +843,7 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertTrue(facts["report"]["limits"])
 
         tools = self._valid_tool_trace()
-        text = ("The isolated fixture action was applied once after I read the exact evidence. "
-                "All external and deployment claims remain synthetic.\nFACTUAL_REPORT_JSON:\n"
-                + json.dumps(facts["report"], ensure_ascii=False))
+        text = self._report_text()
         checks = replay._first_report_checks(text, tools, self.fixture)
         for key in ("report_matches_fixture_facts", "report_has_substantive_closing_prose",
                     "every_exact_artifact_was_read", "fixture_verifier_passed_in_native_tool_trace",
@@ -256,6 +851,11 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
                     "followthrough_state_matches_one_time_fixture_action"):
             self.assertTrue(checks[key], key)
         self.assertTrue(all(checks["artifact_reads"].values()))
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+        self.assertEqual(len(checks["artifact_read_evidence"]), 7)
+        self.assertTrue(checks["verifier_script_unchanged"])
+        self.assertTrue(checks["followthrough_script_unchanged"])
 
     def test_keyword_presence_cannot_substitute_for_factual_values_or_action_trace(self):
         tools = self._valid_tool_trace()
@@ -267,18 +867,96 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         checks = replay._first_report_checks(text, tools, self.fixture)
         self.assertFalse(checks["report_matches_fixture_facts"])
 
-        duplicate = {**tools[-1], "command": tools[-1]["command"]}
-        checks = replay._first_report_checks(
-            "Substantive fixture completion report.\nFACTUAL_REPORT_JSON:\n"
-            + json.dumps(facts["report"]), [*tools, duplicate], self.fixture)
+        action = next(item for item in tools if item["id"] == "action-1")
+        duplicate = {**action, "id": "action-duplicate"}
+        checks = replay._first_report_checks(self._report_text(), [*tools, duplicate], self.fixture)
         self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
 
-        missing_read = [item for item in tools if self.fixture["artifact_paths"][0].as_posix()
-                        not in item["command"]]
-        checks = replay._first_report_checks(
-            "Substantive fixture completion report.\nFACTUAL_REPORT_JSON:\n"
-            + json.dumps(facts["report"]), missing_read, self.fixture)
+        missing_read = list(tools)
+        read_item = dict(next(item for item in tools if item["id"] == "read-1"))
+        missing_path = self.fixture["artifact_paths"][0]
+        remaining = [path for path in [self.fixture["facts_path"], *self.fixture["artifact_paths"]]
+                     if path != missing_path]
+        relative = [path.relative_to(self.worktree) for path in remaining]
+        read_command = "cat " + " ".join(path.as_posix() for path in relative)
+        read_item["commandActions"] = [{"command": read_command, "type": "unknown"}]
+        missing_read[missing_read.index(next(item for item in missing_read if item["id"] == "read-1"))] = read_item
+        checks = replay._first_report_checks(self._report_text(), missing_read, self.fixture)
         self.assertFalse(checks["every_exact_artifact_was_read"])
+
+        disconnected = ("Approved. Before after. Checks pass. Synthetic commit deployment serving. "
+                        "Production skipped not measured.\nFACTUAL_REPORT_JSON:\n"
+                        + json.dumps(facts["report"], ensure_ascii=False))
+        checks = replay._first_report_checks(disconnected, tools, self.fixture)
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+        self.assertFalse(checks["prose_content_checks"]["explains_fixture_reason"])
+        self.assertFalse(checks["prose_content_checks"]["describes_before_state_and_zero_actions"])
+        self.assertFalse(checks["prose_content_checks"]["reports_six_check_verification_result"])
+        self.assertFalse(checks["synthetic_value_checks"]["commit"])
+
+        json_only = "FACTUAL_REPORT_JSON:\n" + json.dumps(facts["report"], ensure_ascii=False)
+        checks = replay._first_report_checks(json_only, tools, self.fixture)
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+    def test_natural_korean_prose_is_bound_to_the_fixture_values(self):
+        checks = replay._first_report_checks(self._report_text(language="ko"),
+                                             self._valid_tool_trace(), self.fixture)
+        self.assertTrue(checks["report_matches_fixture_facts"])
+        self.assertTrue(checks["report_has_substantive_closing_prose"])
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_compound_shell_results_do_not_prove_verifier_or_action_success(self):
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        exact_verifier = dict(verifier)
+        verifier_command = ("python3 -B .agent_reports/native-parent-fixture/verify_fixture.py; "
+                            "echo FIXTURE_VERIFICATION=PASS checks=6 failed=0")
+        verifier["command"] = "/usr/bin/zsh -lc " + json.dumps(verifier_command)
+        verifier["commandActions"] = [{"command": verifier_command, "type": "unknown"}]
+        verifier["aggregatedOutput"] = "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+        checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertIn("ambiguous-shell-compound-no-per-command-result",
+                      checks["verifier_invocations"][0]["execution_result_reason"])
+
+        mismatched = {**exact_verifier,
+                      "command": "/usr/bin/zsh -lc 'echo FIXTURE_VERIFICATION=PASS checks=6 failed=0'"}
+        checks = replay._first_report_checks(
+            self._report_text(), [tools[0], tools[1], mismatched], self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(checks["verifier_invocations"][0]["execution_result_reason"],
+                         "command-action-does-not-match-execution-envelope")
+
+        absolute_command = f"python3 -B {self.fixture['verifier']}"
+        wrong_action_cwd = {
+            **exact_verifier,
+            "command": "/usr/bin/zsh -lc " + json.dumps(absolute_command),
+            "commandActions": [{"command": absolute_command, "cwd": str(self.root),
+                                "type": "unknown"}],
+        }
+        checks = replay._first_report_checks(
+            self._report_text(), [tools[0], tools[1], wrong_action_cwd], self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(checks["verifier_invocations"][0]["execution_result_reason"],
+                         "command-action-cwd-does-not-match-execution-envelope")
+
+        action = next(item for item in tools if item["id"] == "action-1")
+        action_command = (f"python3 -B .agent_reports/native-parent-fixture/"
+                          f"apply_fixture_followthrough.py {self.sentinel} || true")
+        action["command"] = "/usr/bin/zsh -lc " + json.dumps(action_command)
+        action["commandActions"] = [{"command": action_command, "type": "unknown"}]
+        checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
+        self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
+
+    def test_duplicate_identical_action_entries_are_counted_separately(self):
+        tools = self._valid_tool_trace()
+        action = next(item for item in tools if item["id"] == "action-1")
+        action["commandActions"] = [dict(action["commandActions"][0]),
+                                    dict(action["commandActions"][0])]
+        checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
+        self.assertEqual(len(checks["followthrough_invocations"]), 2)
+        self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
 
     def test_fixture_followthrough_script_rejects_a_second_action(self):
         first = subprocess.run([sys.executable, "-B", str(self.fixture["action"]), self.sentinel],

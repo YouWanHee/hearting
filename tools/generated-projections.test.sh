@@ -177,23 +177,46 @@ grep -Fq '작업: <무엇을 어떤 결과로 만들지>' "$ROOT/core/WORKFLOW.m
 grep -Fq '→ 진행 / 수정: <틀린 부분> / 중단' "$ROOT/core/WORKFLOW.md"
 grep -Fq '### 0.5. Post-Execution Completion Report' "$ROOT/core/WORKFLOW.md"
 grep -Fq '[완료 보고]' "$ROOT/core/WORKFLOW.md"
-completion_task_line=$(grep -n -m1 '작업: <수행한 작업>' "$ROOT/core/WORKFLOW.md" | cut -d: -f1)
-completion_result_line=$(grep -n -m1 '결과: <완료 | 부분 완료 | 실패 | 차단 — 실제 결과>' "$ROOT/core/WORKFLOW.md" | cut -d: -f1)
-completion_verify_line=$(grep -n -m1 '검증: <실행한 검증과 결과>' "$ROOT/core/WORKFLOW.md" | cut -d: -f1)
-completion_artifact_line=$(grep -n -m1 '산출물: <사용자가 확인할 경로 또는 없음>' "$ROOT/core/WORKFLOW.md" | cut -d: -f1)
-completion_remaining_line=$(grep -n -m1 '남은 사항: <미완료 항목, 위험, 차단 요인 또는 없음>' "$ROOT/core/WORKFLOW.md" | cut -d: -f1)
-[ "$completion_task_line" -lt "$completion_result_line" ] \
-  && [ "$completion_result_line" -lt "$completion_verify_line" ] \
-  && [ "$completion_verify_line" -lt "$completion_artifact_line" ] \
-  && [ "$completion_artifact_line" -lt "$completion_remaining_line" ] || {
-  echo "not ok - completion report fields must keep canonical order" >&2
+has_first_close_content() {
+  case "$1" in
+    *'first close of material work'*'what changed and why'*'before/after'*'checks actually run'*'commit/pr/deployment/serving state'*'limits or work that remains'*'preserve explicit user-requested content and output formats'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+workflow_flat=$(tr '\n' ' ' < "$ROOT/core/WORKFLOW.md" | tr -s ' ' | tr 'A-Z' 'a-z')
+has_first_close_content "$workflow_flat" || {
+  echo "not ok - shared first-close content contract is incomplete" >&2
   exit 1
 }
+case "$workflow_flat" in
+  *'must not present partial, failed, or blocked work as completed'*) ;;
+  *) echo "not ok - honest completion status contract regressed" >&2; exit 1 ;;
+esac
+case "$workflow_flat" in
+  *'neither the card nor its field order is required'*) ;;
+  *) echo "not ok - completion card is still mandatory" >&2; exit 1 ;;
+esac
+case "$workflow_flat" in
+  *'fully populated five-field report card'*|*'keep the five fields and their order'*)
+    echo "not ok - shared first report still mandates the card or its order" >&2
+    exit 1
+    ;;
+esac
+without_requested_output=$(printf '%s' "$workflow_flat" | \
+  sed 's/preserve explicit user-requested content and output formats/remove/')
+if has_first_close_content "$without_requested_output"; then
+  echo "not ok - first-close check accepts a missing explicit-output priority" >&2
+  exit 1
+fi
 grep -Fq 'A process exit or intermediate stage verdict alone is not task completion.' "$ROOT/core/WORKFLOW.md" || {
   echo "not ok - process/stage completion boundary missing from core/WORKFLOW.md" >&2
   exit 1
 }
-grep -Fq 'material work with the canonical five-field post-execution card' "$ROOT/roles/response-policy.md"
+response_policy_flat=$(tr '\n' ' ' < "$ROOT/roles/response-policy.md" | tr -s ' ' | tr 'A-Z' 'a-z')
+case "$response_policy_flat" in
+  *'first close of material work follows the content contract in `core/workflow.md §0.5`'*'card is an optional presentation'*'required facts and explicit user-requested output'*) ;;
+  *) echo "not ok - response policy must preserve first-close content without requiring a card" >&2; exit 1 ;;
+esac
 grep -Fq 'auto-proceed without another confirmation, then use the applicable concise' "$ROOT/roles/response-policy.md"
 if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.md"; then
   echo "not ok - one-line follow-up close contradicts the completion report card" >&2
@@ -201,7 +224,13 @@ if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.m
 fi
 has_entry_confirmation() {
   case "$1" in
-    *'present the five-field card in §0.4 before'*|*'present the §0.4 five-field card before'*|*'else the §0.4 card unless approved'*) return 0 ;;
+    *'present the five-field card in §0.4 before'*|*'present the §0.4 five-field card before'*|*'else the §0.4 card unless approved'*|*'for unapproved material work, use the §0.4 card'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+has_first_report_reference() {
+  case "$1" in
+    *'first-report content required by §0.5; its card is optional'*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -219,18 +248,27 @@ for bootstrap in \
   # Removing the entry action must fail even with the evidence-check exemption
   # elsewhere in each real bootstrap. Preserve the rest of the text verbatim.
   without_entry=$(printf '%s' "$bootstrap_flat" | sed -E \
-    's/present the (five-field card in §0\.4|§0\.4 five-field card) before//g; s/else the §0\.4 card unless approved//g')
+    's/present the (five-field card in §0\.4|§0\.4 five-field card) before//g; s/else the §0\.4 card unless approved//g; s/for unapproved material work, use the §0\.4 card//g')
   if has_entry_confirmation "$without_entry"; then
     echo "not ok - entry confirmation check accepts a missing action in $bootstrap" >&2
     exit 1
   fi
+  has_first_report_reference "$bootstrap_flat" || {
+    echo "not ok - first-report content pointer missing from $bootstrap" >&2
+    exit 1
+  }
   case "$bootstrap_flat" in
-    *'five-field completion card in §0.5'*|*'§0.5 card'*|*'close with §0.5'*) ;;
-    *)
-      echo "not ok - WORKFLOW §0.5 completion report pointer missing from $bootstrap" >&2
+    *'close with the §0.5 card'*|*'five-field completion card in §0.5'*|*'close with §0.5'*)
+      echo "not ok - adapter bootstrap still requires a completion card" >&2
       exit 1
       ;;
   esac
+  without_first_report=$(printf '%s' "$bootstrap_flat" | sed \
+    's/first-report content required by §0\.5; its card is optional//g')
+  if has_first_report_reference "$without_first_report"; then
+    echo "not ok - adapter check accepts a missing first-report reference in $bootstrap" >&2
+    exit 1
+  fi
   case "$bootstrap_flat" in
     *'continue low-risk reversible work autonomously'*|*'continue reversible in-flow work'*) ;;
     *)

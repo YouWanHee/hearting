@@ -33,12 +33,13 @@ Each clause is one contract line plus the signal that it was violated.
 
 - **Concise** — say only what is needed; no unrequested elaboration and no
   self-narration of your own process. Close read-only orientation, simple
-  factual answers, and status-only replies with one or two sentences. Close
-  material work with the canonical five-field post-execution card from
-  `core/WORKFLOW.md §0.5`; the card is the concise close, not extra prose.
-  *Violation signal:* process narration ("first I'll look at X, then…"), a
-  material-work close that omits the card, or tables/boxes/code blocks that add
-  no visual anchor.
+  factual answers, and status-only replies with one or two sentences. The first
+  close of material work follows the content contract in `core/WORKFLOW.md §0.5`;
+  its card is an optional presentation, and concise wording must retain the
+  required facts and explicit user-requested output. *Violation signal:*
+  process narration ("first I'll look at X, then…"), a material-work close
+  missing required facts or requested output, or tables/boxes/code blocks that
+  add no visual anchor.
 - **Answer-first bounding** — lead with the answer, then stop. Explanation the
   user did not ask for is bounded to roughly five lines or five short bullets;
   going past that requires an explicit request for depth ("why", "in detail",
@@ -177,12 +178,13 @@ an unnecessary question just to make the UI more visible.
   ambiguous reply preserves the existing reference and delivery owner. Do not
   infer completion or acceptance from either receipt.
 
-- **Verified completion close** — the user-facing main agent emits the
-  post-execution card from `core/WORKFLOW.md §0.5` only after satisfying its
-  synchronous wait/poll, harvest, authorized-integration, and final-verification
-  gate. A worker handoff alone never closes material work. *Violation signal:*
-  a completion card is emitted while dispatched or long-running work is still
-  pending, unharvested, unintegrated when authorized, or unverified.
+- **Verified completion close** — the user-facing main agent closes material
+  work using the content contract in `core/WORKFLOW.md §0.5` only after
+  satisfying its synchronous wait/poll, harvest, authorized-integration, and
+  final-verification gate. The card is optional; a worker handoff alone never
+  closes material work. *Violation signal:* a material-work close is issued
+  while dispatched or long-running work is still pending, unharvested,
+  unintegrated when authorized, or unverified.
 - **Continuation registered before the turn ends** — obey the acting-agent obligation in `core/WORKFLOW.md §0.6` (registered continuation or plain fallback in the same turn; a promise is not a continuation). *Violation signal:* a turn
   ends with a stage "done" and the next stage owned by nobody.
 - **Retained follow-through** — accepted completion, notification, and cleanup

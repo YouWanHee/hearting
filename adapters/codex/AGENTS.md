@@ -97,12 +97,10 @@ tool to claim Codex parity.
 
 Route by `core/WORKFLOW.md §0.2`. The main session decides only whether the work is
 direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
-otherwise omit `--shape` and let the frame decide.
-
-Use `hearting run capability-route compose`; presets: loops/promotions.
-Apply §0.3. Peer envelopes get one
-`[경로]` line unless destructive/external-facing; else the §0.4 card unless
-approved. Close with §0.5.
+otherwise omit `--shape` and let the frame decide. Apply §0.3. Use `hearting run
+capability-route compose`. For unapproved material work, use the §0.4 card.
+Close material work with the first-report content
+required by §0.5; its card is optional.
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 ```

@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import glob
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import shlex
 import signal
 import socket
 import stat
@@ -439,8 +442,244 @@ def _turn_items(turn: dict) -> tuple[list[str], list[dict]]:
             messages.append(item["text"])
         elif item.get("type") == "commandExecution":
             tools.append({key: item.get(key) for key in
-                          ("id", "command", "aggregatedOutput", "exitCode", "status") if key in item})
+                          ("id", "command", "commandActions", "cwd", "aggregatedOutput",
+                           "exitCode", "status") if key in item})
     return messages, tools
+
+
+def _successful_tool(item: dict) -> bool:
+    return item.get("status") in {"completed", "success"} and item.get("exitCode") == 0
+
+
+def _file_snapshot(path: Path) -> tuple[bytes | None, int | None]:
+    try:
+        info = path.stat()
+        return path.read_bytes(), info.st_mtime_ns
+    except OSError:
+        return None, None
+
+
+def _file_hash_matches(path: Path, expected_hash: str) -> bool:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash
+    except OSError:
+        return False
+
+
+def _same_file(raw: str, expected: Path, cwd: Path | None) -> bool:
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        if cwd is None:
+            return False
+        candidate = cwd / candidate
+    try:
+        return candidate.samefile(expected)
+    except OSError:
+        return False
+
+
+def _shell_segments(command: str) -> list[list[str]]:
+    """Split a recorded shell command for inspection without executing it."""
+    try:
+        wrapper = shlex.split(command)
+    except ValueError:
+        return []
+    if wrapper and Path(wrapper[0]).name in {"sh", "bash", "zsh"}:
+        for index, token in enumerate(wrapper[:-1]):
+            if token in {"-c", "-lc", "-ec"} or (token.startswith("-") and "c" in token[1:]):
+                return _shell_segments(wrapper[index + 1])
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments, current = [], []
+    for token in tokens:
+        if token and all(character in ";&|" for character in token):
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _single_shell_command(command: str) -> bool:
+    """Whether a native result can be attributed to one exact shell command."""
+    try:
+        wrapper = shlex.split(command)
+    except ValueError:
+        return False
+    if wrapper and Path(wrapper[0]).name in {"sh", "bash", "zsh"}:
+        for index, token in enumerate(wrapper[:-1]):
+            if token in {"-c", "-lc", "-ec"} or (token.startswith("-") and "c" in token[1:]):
+                return _single_shell_command(wrapper[index + 1])
+    if "\n" in command or "\r" in command:
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|><()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    operators = [token for token in tokens
+                 if token and all(character in ";&|><()" for character in token)]
+    shell_flow = {"if", "then", "else", "elif", "fi", "while", "until", "for", "do",
+                  "done", "case", "esac", "function"}
+    return (not operators and not shell_flow.intersection(tokens)
+            and len(_shell_segments(command)) == 1)
+
+
+def _tool_commands(item: dict) -> list[tuple[str, str | None, str]]:
+    actions = item.get("commandActions")
+    commands = []
+    if isinstance(actions, list):
+        for action in actions:
+            if isinstance(action, dict) and isinstance(action.get("command"), str):
+                commands.append((action["command"], action.get("cwd")
+                                 if isinstance(action.get("cwd"), str) else None,
+                                 "commandAction"))
+    if not commands and isinstance(item.get("command"), str):
+        commands.append((item["command"], None, "commandExecution"))
+    # Keep repeated action entries distinct: two invocations with the same
+    # spelling are still two attempts and must fail the one-time check.
+    return commands
+
+
+def _command_contexts(item: dict):
+    enclosing_command = item.get("command") if isinstance(item.get("command"), str) else ""
+    enclosing_segments = _shell_segments(enclosing_command) if enclosing_command else []
+    execution_cwd_value = item.get("cwd") if isinstance(item.get("cwd"), str) else None
+    execution_cwd = Path(execution_cwd_value).expanduser() if execution_cwd_value else None
+    enclosing_result_is_exact = (bool(enclosing_command)
+                                 and _single_shell_command(enclosing_command)
+                                 and len(enclosing_segments) == 1)
+    for command, action_cwd, source in _tool_commands(item):
+        cwd_value = action_cwd or (item.get("cwd") if isinstance(item.get("cwd"), str) else None)
+        cwd = Path(cwd_value).expanduser() if cwd_value else None
+        if cwd is not None and (not cwd.is_absolute() or not cwd.is_dir()):
+            cwd = None
+        segments = _shell_segments(command)
+        action_cwd_matches_envelope = True
+        if source == "commandAction" and action_cwd:
+            action_path = Path(action_cwd).expanduser()
+            try:
+                action_cwd_matches_envelope = (execution_cwd is not None
+                                               and action_path.samefile(execution_cwd))
+            except OSError:
+                action_cwd_matches_envelope = (execution_cwd is not None
+                                               and action_path.absolute() == execution_cwd.absolute())
+        command_matches_envelope = (source == "commandExecution"
+                                    or (len(segments) == 1 and len(enclosing_segments) == 1
+                                        and segments[0] == enclosing_segments[0]))
+        command_is_exact = (enclosing_result_is_exact and _single_shell_command(command)
+                            and command_matches_envelope and action_cwd_matches_envelope)
+        if command_is_exact:
+            result_reason = None
+        elif not enclosing_command:
+            result_reason = "missing-command-execution-envelope"
+        elif not enclosing_result_is_exact:
+            result_reason = "ambiguous-shell-compound-no-per-command-result"
+        elif not action_cwd_matches_envelope:
+            result_reason = "command-action-cwd-does-not-match-execution-envelope"
+        else:
+            result_reason = "command-action-does-not-match-execution-envelope"
+        for segment in segments:
+            yield (segment, cwd, "commandAction" if action_cwd else "commandExecution",
+                   command_is_exact, result_reason)
+
+
+def _resolved_arguments(tokens: list[str], cwd: Path | None) -> list[Path]:
+    resolved = []
+    for token in tokens:
+        if not token or token.startswith("-") or any(char in token for char in "$`\n"):
+            continue
+        candidate = Path(token).expanduser()
+        if not candidate.is_absolute():
+            if cwd is None:
+                continue
+            candidate = cwd / candidate
+        matches = glob.glob(str(candidate), recursive=False) if glob.has_magic(str(candidate)) else [str(candidate)]
+        for match in matches:
+            path = Path(match)
+            try:
+                if path.is_file():
+                    resolved.append(path)
+            except OSError:
+                continue
+    return resolved
+
+
+def _read_evidence(item: dict, expected: Path) -> dict | None:
+    if not _successful_tool(item):
+        return None
+    try:
+        exact_content = expected.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    output = str(item.get("aggregatedOutput", ""))
+    for tokens, cwd, cwd_source, exact_result, _result_reason in _command_contexts(item):
+        if not exact_result:
+            continue
+        if not tokens or Path(tokens[0]).name != "cat":
+            continue
+        matched = [path for path in _resolved_arguments(tokens[1:], cwd)
+                   if _same_file(str(path), expected, None)]
+        if not matched or exact_content not in output:
+            continue
+        return {"tool_id": item.get("id"), "cwd": str(cwd) if cwd else None,
+                "cwd_source": cwd_source, "command": " ".join(tokens),
+                "matched_file": str(expected), "exact_content_observed": True}
+    return None
+
+
+def _script_invocations(tools: list[dict], expected: Path,
+                        output_marker: str | None = None) -> list[dict]:
+    invocations = []
+    for item in tools:
+        for tokens, cwd, cwd_source, exact_result, result_reason in _command_contexts(item):
+            if not tokens:
+                continue
+            executable = Path(tokens[0]).name.lower()
+            if executable.startswith("python"):
+                index = 1
+                script = None
+                while index < len(tokens):
+                    token = tokens[index]
+                    if token in {"-c", "-m"} or token.startswith(("-c", "-m")):
+                        break
+                    if token == "--":
+                        script = tokens[index + 1] if index + 1 < len(tokens) else None
+                        break
+                    if token in {"-W", "-X"}:
+                        index += 2
+                        continue
+                    if token.startswith("-"):
+                        index += 1
+                        continue
+                    script = token
+                    break
+                matches = [script] if script and _same_file(script, expected, cwd) else []
+            elif _same_file(tokens[0], expected, cwd):
+                matches = [tokens[0]]
+            else:
+                matches = []
+            for matched in matches:
+                invocations.append({"tool_id": item.get("id"), "cwd": str(cwd) if cwd else None,
+                                    "cwd_source": cwd_source, "command": " ".join(tokens),
+                                    "matched_script": str(expected),
+                                    "tool_succeeded": exact_result and _successful_tool(item),
+                                    "execution_result_proven": exact_result,
+                                    "execution_result_reason": result_reason,
+                                    "output_marker_observed": output_marker is None or output_marker in str(
+                                        item.get("aggregatedOutput", ""))})
+    return invocations
 
 
 def _write_native_fixture(worktree: Path, sentinel: str) -> dict:
@@ -539,7 +778,9 @@ def _write_native_fixture(worktree: Path, sentinel: str) -> dict:
         encoding="utf-8")
     return {"fixture": fixture, "facts": facts, "facts_path": facts_path,
             "artifact_paths": artifact_paths, "verifier": verifier,
-            "action": action, "followthrough": followthrough}
+            "verifier_sha256": hashlib.sha256(verifier.read_bytes()).hexdigest(),
+            "action": action, "action_sha256": hashlib.sha256(action.read_bytes()).hexdigest(),
+            "followthrough": followthrough}
 
 
 def _factual_report_object(text: str) -> dict | None:
@@ -555,41 +796,136 @@ def _factual_report_object(text: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _prose_sentences(prose: str) -> list[str]:
+    return [part.strip().casefold() for part in
+            re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", prose) if part.strip()]
+
+
+def _has_any(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
 def _first_report_checks(text: str, tools: list[dict], fixture: dict) -> dict:
     expected = fixture["facts"]["report"]
     report = _factual_report_object(text)
-    command_items = [item for item in tools if isinstance(item.get("command"), str)]
-    def successful(item):
-        return item.get("status") in {"completed", "success"} and item.get("exitCode") == 0
-
-    artifact_reads = {}
+    artifact_read_evidence = {}
     for path in [fixture["facts_path"], *fixture["artifact_paths"]]:
-        marker = ("FIXTURE_ID=" + fixture["facts"]["fixture_id"] if path != fixture["facts_path"]
-                  else '"fixture_id"')
-        artifact_reads[str(path)] = any(
-            str(path) in item["command"] and marker in str(item.get("aggregatedOutput", ""))
-            for item in command_items if successful(item))
-    verifier_runs = [item for item in command_items if str(fixture["verifier"]) in item["command"]]
-    action_runs = [item for item in command_items if str(fixture["action"]) in item["command"]]
+        artifact_read_evidence[str(path)] = [evidence for item in tools
+                                             if (evidence := _read_evidence(item, path)) is not None]
+    artifact_reads = {path: bool(evidence) for path, evidence in artifact_read_evidence.items()}
+    verification = expected["verification"]
+    verifier_marker = (f"FIXTURE_VERIFICATION={verification['result']} "
+                      f"checks={verification['checks_passed']} failed={verification['checks_failed']}")
+    verifier_invocations = _script_invocations(tools, fixture["verifier"], verifier_marker)
+    action_invocations = _script_invocations(tools, fixture["action"])
+    verifier_hash_matches = _file_hash_matches(fixture["verifier"], fixture["verifier_sha256"])
+    action_hash_matches = _file_hash_matches(fixture["action"], fixture["action_sha256"])
+    verifier_output = any(invocation["output_marker_observed"] for invocation in verifier_invocations)
     followthrough = None
     try:
         followthrough = json.loads(fixture["followthrough"].read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
     prose = text.split("FACTUAL_REPORT_JSON:", 1)[0].strip()
+    sentences = _prose_sentences(prose)
+    def number_pattern(value: int, *word_forms: str) -> str:
+        forms = [rf"(?<!\d){value}(?!\d)"]
+        forms.extend(rf"\b{re.escape(form)}\b" if form.isascii() else re.escape(form)
+                     for form in word_forms)
+        return "|".join(forms)
+
+    reason_parts = (
+        (r"approved|승인",),
+        (r"follow[- ]?through|follow[- ]?up|continuation|후속|이어",),
+        (r"exact result|정확한 결과",),
+        (r"read|reading|읽|확인",),
+        (r"complete|completed|finish|finished|fulfill|carry out|마치|완료|처리|수행",),
+        (r"because|in order|so that|after|위해|때문|목적|마치|처리",),
+    )
+    explains_reason = any(all(_has_any(sentence, patterns) for patterns in reason_parts)
+                          for sentence in sentences)
+    count_terms = (r"action count|execution count|run count|follow[- ]?through count|"
+                   r"실행 횟수|작업 횟수|행동 수|실행 수")
+    before_and_after = any(
+        _has_any(sentence, (r"before|earlier|previously|prior to|이전|전에는|처음에는",))
+        and _has_any(sentence, (r"absent|missing|not present|did not exist|wasn't there|없|존재하지|생성되지",))
+        and _has_any(sentence, (count_terms,))
+        and _has_any(sentence, (number_pattern(expected["before"]["approved_action_count"],
+                                              "zero", "영"),))
+        and _has_any(sentence, (r"after|subsequently|now|이후|후에는|그 뒤",))
+        and _has_any(sentence, (r"present|created|exists|available|생성|있|존재",))
+        and _has_any(sentence, (number_pattern(expected["after"]["approved_action_count"],
+                                              "one", "한 번"),))
+        for sentence in sentences)
+    reports_verification = any(
+        _has_any(sentence, (r"verification|verified|verifier|checks?|검증",))
+        and _has_any(sentence, (re.escape(verification["result"].casefold()),
+                                r"passed|succeeded|통과|성공"))
+        and _has_any(sentence, (number_pattern(verification["checks_passed"], "six", "여섯"),))
+        and (_has_any(sentence, (r"all|every|모두|전부",))
+             or (verification["checks_failed"] == 0
+                 and _has_any(sentence, (r"(?<!\d)0(?!\d).*fail|실패.{0,12}0",))))
+        for sentence in sentences)
+    synthetic_values = expected["synthetic_values"]
+    value_fields = {
+        "commit": (r"commit|커밋", synthetic_values["commit"]),
+        "deployment": (r"deployment|deploy|배포", synthetic_values["deployment"]),
+        "serving": (r"serving|served|서빙", synthetic_values["serving"]),
+    }
+    values_in_prose = {
+        key: any(_has_any(sentence, (field_pattern,)) and exact_value in sentence
+                 for sentence in sentences)
+        for key, (field_pattern, exact_value) in value_fields.items()
+    }
+    skipped = any(
+        _has_any(sentence, (r"skipped|omitted|not run|생략|실행하지",))
+        and _has_any(sentence, (r"production|operational|운영",))
+        and _has_any(sentence, (r"deployment|deploy|배포|checks?|검사|확인",))
+        and _has_any(sentence, (r"serving|서빙",))
+        for sentence in sentences)
+    no_operating_change = any(
+        _has_any(sentence, (r"production|operating|operational|운영",))
+        and _has_any(sentence, (r"not|never|no |않|없",))
+        and _has_any(sentence, (r"measured|changed|probed|측정|변경|조사",))
+        for sentence in sentences)
+    replay_scope_limit = any(
+        _has_any(sentence, (r"isolated|격리",))
+        and _has_any(sentence, (r"codex",))
+        and _has_any(sentence, (r"replay|재현",))
+        and _has_any(sentence, (r"only|만",))
+        and _has_any(sentence, (r"delivery|report|전달|보고",))
+        for sentence in sentences)
+    prose_content_checks = {
+        "explains_fixture_reason": explains_reason,
+        "describes_before_state_and_zero_actions": before_and_after,
+        "reports_six_check_verification_result": reports_verification,
+        "names_actual_synthetic_values": all(values_in_prose.values()),
+        "states_fixture_skip_and_operating_limit": skipped and no_operating_change,
+        "states_isolated_replay_scope_limit": replay_scope_limit,
+    }
     return {
         "report_matches_fixture_facts": report == expected,
-        "report_has_substantive_closing_prose": len(prose) >= 40,
+        "report_has_substantive_closing_prose": bool(prose) and all(
+            prose_content_checks.values()),
+        "prose_content_checks": prose_content_checks,
+        "synthetic_value_checks": values_in_prose,
         "every_exact_artifact_was_read": bool(artifact_reads) and all(artifact_reads.values()),
         "artifact_reads": artifact_reads,
-        "fixture_verifier_passed_in_native_tool_trace": any(
-            successful(item) and "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
-            in str(item.get("aggregatedOutput", "")) for item in verifier_runs),
-        "one_approved_followthrough_tool_invocation": len(action_runs) == 1 and successful(action_runs[0]),
+        "artifact_read_evidence": artifact_read_evidence,
+        "fixture_verifier_passed_in_native_tool_trace": (
+            verifier_hash_matches and verifier_output
+            and any(item["tool_succeeded"] for item in verifier_invocations)),
+        "verifier_script_unchanged": verifier_hash_matches,
+        "verifier_invocations": verifier_invocations,
+        "one_approved_followthrough_tool_invocation": (
+            len(action_invocations) == 1 and action_invocations[0]["tool_succeeded"]
+            and action_hash_matches),
+        "followthrough_script_unchanged": action_hash_matches,
+        "followthrough_invocations": action_invocations,
         "followthrough_state_matches_one_time_fixture_action": followthrough == {
             "fixture_id": fixture["facts"]["fixture_id"],
             "sentinel": fixture["facts"]["sentinel"],
-            "approved_action_count": 1, "synthetic": True},
+            "approved_action_count": expected["after"]["approved_action_count"], "synthetic": True},
         "report_object": report,
     }
 
@@ -633,11 +969,172 @@ def _fixture_registry(jobs: Path, thread_id: str, workspace: Path, sentinel: str
     return attempt, route_id, receipt, record, metadata
 
 
-def _run_replay(output_dir: Path) -> dict:
-    report = {"schema_version": 1, "source_sha": "unknown", "status": "blocked",
+def _record_case(report: dict, output_dir: Path, case_id: str, checks: dict[str, bool],
+                 *, evidence: list[str] | None = None, status: str | None = None,
+                 reason: str | None = None) -> dict:
+    if status is None:
+        status = "PASS" if all(checks.values()) else "FAIL"
+    if reason is None:
+        failed = [name for name, passed in checks.items() if not passed]
+        reason = "all checks passed" if not failed else "failed checks: " + ", ".join(failed)
+    result = {"status": status, "reason": reason, "checks": checks,
+              "evidence": evidence or []}
+    report.setdefault("replay_cases", {})[case_id] = result
+    report["case_namespace"] = (
+        "replay_cases d1-d3 are native replay checks; route completion ids d1-d5 are separate")
+    if case_id.startswith("d1_"):
+        report["d1"] = status
+    elif case_id.startswith("d2_"):
+        report["d2"] = status
+    elif case_id.startswith("d3_"):
+        report["d3"] = status
+    _write_json(output_dir / "replay.json", report)
+    return result
+
+
+def _evaluate_replay_case(case_id: str, observation: dict) -> dict[str, bool]:
+    """Turn native transport observations into the production case decisions."""
+    if case_id == "d1_first_report":
+        return {key: value for key, value in observation.items() if isinstance(value, bool)}
+    if case_id == "d2_duplicate_cleanup":
+        return {
+            "late_deadline_classified_as_cleanup_only": (
+                not observation["cleanup_is_current"]
+                and "retains cleanup observation only" in observation["cleanup_text"]),
+            "same_result_redelivery_preserved_exact_ack": (
+                observation["duplicate_state"] == "acked"
+                and observation["duplicate_kept_exact_ack"]),
+            "native_courier_rejected_resolved_cleanup": (
+                observation["cleanup_courier_state"] == "rejected"
+                and observation["cleanup_courier_reason"] == "supervision-resolved"),
+            "old_ack_preserved_after_cleanup": observation["old_ack_preserved"],
+            "cleanup_created_no_extra_turn": observation["no_extra_turn"],
+            "cleanup_queue_item_suppressed": observation["no_cleanup_queue_item"],
+            "completion_duplicate_queue_item_suppressed": observation["no_queued_duplicate"],
+        }
+    if case_id == "d3_new_conflict":
+        checks = {
+            "conflict_fixture_preserved_done_row_and_new_failure": observation["conflict_fixture_valid"],
+            "new_notice_is_distinct_and_current": observation["notice_is_distinct_current"],
+            "new_notice_received_exact_ack": observation["notice_ack_observed"],
+            "new_notice_turn_completed": observation["notice_turn_status"] == "completed",
+            "new_notice_has_response": observation["notice_has_response"],
+            "notice_turn_occurs_once": observation["notice_occurrences"] == 1,
+            "old_ack_identity_preserved": observation["old_ack_preserved"],
+            "no_duplicate_action_or_response": observation["no_duplicate_action_or_response"],
+        }
+        for name in ("new_failure_conflict_remains_visible",
+                     "original_ack_identity_still_preserved"):
+            if name in observation:
+                checks[name] = observation[name]
+        return checks
+    if case_id == "direct_question":
+        answer = observation["answer"].casefold()
+        return {
+            "answers_from_exact_production_status": (
+                "production" in answer
+                and any(token in answer for token in ("no", "not", "fixture", "unmeasured"))),
+            "does_not_repeat_followthrough": observation["followthrough_unchanged"],
+            "no_followthrough_action_invocation": observation["action_invocations"] == 0,
+        }
+    raise ValueError("unknown replay case: " + case_id)
+
+
+def _run_replay_case_sequence(report: dict, output_dir: Path, steps: list[dict]) -> dict:
+    """Evaluate and persist ordered cases; failures do not gate independent steps."""
+    for index, step in enumerate(steps):
+        case_id = step["case_id"]
+        missing = [name for name, available in step.get("prerequisites", []) if not available()]
+        if missing:
+            _record_case(report, output_dir, case_id, {"prerequisites_available": False},
+                         status="BLOCKED", reason="missing prerequisite state: " + ", ".join(missing),
+                         evidence=step.get("evidence"))
+            continue
+        if step.get("skip_evaluation"):
+            _record_case(report, output_dir, case_id, step.get("checks", {}),
+                         status=step.get("status", "BLOCKED"), reason=step.get("reason"),
+                         evidence=step.get("evidence"))
+            continue
+        try:
+            observation = step["observe"]()
+            checks = _evaluate_replay_case(case_id, observation)
+        except ReplayFailed as exc:
+            _record_case(report, output_dir, case_id, {"case_evaluation_completed": False},
+                         status="FAIL", reason=str(exc), evidence=step.get("evidence"))
+            continue
+        except Exception as exc:  # preserve prior cases and stop at lost transport
+            _record_case(report, output_dir, case_id, {"transport_observation_available": False},
+                         status="BLOCKED", reason=str(exc) or type(exc).__name__,
+                         evidence=step.get("evidence"))
+            for pending in steps[index + 1:]:
+                _record_case(report, output_dir, pending["case_id"], {}, status="not-run",
+                             reason="not evaluated after transport stopped at " + case_id,
+                             evidence=pending.get("evidence"))
+            break
+        _record_case(report, output_dir, case_id, checks, evidence=step.get("evidence"),
+                     status=step.get("status"), reason=step.get("reason"))
+    return report
+
+
+def _aggregate_replay_status(report: dict, acceptance_checks: dict[str, bool]) -> str:
+    statuses = [result.get("status") for result in report.get("replay_cases", {}).values()
+                if isinstance(result, dict)]
+    if "FAIL" in statuses:
+        return "FAIL"
+    if any(status in {"BLOCKED", "not-run"} for status in statuses):
+        return "BLOCKED"
+    if not all(acceptance_checks.values()):
+        return "BLOCKED"
+    return "PASS"
+
+
+def _case_can_continue(result: dict) -> bool:
+    """A measured PASS or FAIL does not erase independent later cases."""
+    return result.get("status") in {"PASS", "FAIL"}
+
+
+def _record_unfinished_cases(report: dict, output_dir: Path, reason: str) -> None:
+    for case_id in ("d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
+                    "direct_question", "overall_acceptance"):
+        if case_id not in report.get("replay_cases", {}):
+            _record_case(report, output_dir, case_id, {}, status="not-run", reason=reason)
+
+
+def _has_failed_case(report: dict) -> dict | None:
+    for case_id, result in report.get("replay_cases", {}).items():
+        if isinstance(result, dict) and result.get("status") == "FAIL":
+            return {"case_id": case_id, **result}
+    return None
+
+
+def _finish_after_runtime_error(report: dict, output_dir: Path, kind: str,
+                                reason: str, detail: str | None = None) -> dict:
+    _record_unfinished_cases(report, output_dir,
+                             f"not evaluated after {kind.lower()} runtime stop: {reason}")
+    observed_failure = _has_failed_case(report)
+    report["operating_records_changed"] = False
+    if observed_failure:
+        report.update(status="failed", verdict="FAIL",
+                      failure_reason=(f"observed {observed_failure['case_id']} failure: "
+                                      f"{observed_failure['reason']}"),
+                      later_runtime_state=f"{kind}: {reason}")
+    elif kind == "FAIL":
+        report.update(status="failed", verdict="FAIL", failure_reason=reason)
+    else:
+        report.update(status="blocked", verdict="BLOCKED", blocker=reason)
+    if detail:
+        report["detail"] = detail[:240]
+    return report
+
+
+def _run_replay_impl(output_dir: Path) -> dict:
+    report = {"schema_version": 1, "source_sha": "unknown", "status": "running",
               "verdict": "BLOCKED", "d1": "unfinished", "d2": "unfinished",
-              "d3": "not-assessed", "operating_records_changed": False,
+              "d3": "not-assessed", "replay_cases": {},
+              "case_namespace": "replay_cases d1-d3 are native replay checks; route completion ids d1-d5 are separate",
+              "operating_records_changed": False,
               "model": "default (not independently identified)", "limitations": []}
+    _write_json(output_dir / "replay.json", report)
     try:
         report["source_sha"] = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
@@ -894,8 +1391,6 @@ def _run_replay(output_dir: Path) -> dict:
             if continuation_turn.get("status") != "completed":
                 raise ReplayBlocked("native-continuation-turn-interrupted")
             continuation_messages, continuation_tools = _turn_items(continuation_turn)
-            if not continuation_messages:
-                raise ReplayFailed("native-continuation-final-report-missing")
             _write_json(output_dir / "continuation-turn.json", continuation_turn)
             continuation_occurrences = sum(1 for turn in _all_turns(endpoint, thread_id)
                                            if _turn_for_client_message([turn], continuation_id) is not None)
@@ -917,24 +1412,32 @@ def _run_replay(output_dir: Path) -> dict:
                 "duty_state": settled_duty.get("state"),
                 "attempt_row_status": "done",
             })
-            final_text = continuation_messages[-1]
+            final_text = continuation_messages[-1] if continuation_messages else ""
             tool_trace = [*initial_tools, *continuation_tools]
             (output_dir / "turn-output.txt").write_text(final_text + "\n", encoding="utf-8")
             (output_dir / "tool-trace.jsonl").write_text("".join(
                 json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in tool_trace),
                 encoding="utf-8")
             report_check = _first_report_checks(final_text, tool_trace, fixture)
-            if not all(value for key, value in report_check.items()
-                       if key not in {"artifact_reads", "report_object"}):
-                raise ReplayFailed("first-parent-report-does-not-match-exact-fixture-facts")
             original_ack_identity = pending_delivery.received_ack_identity(
                 first_record, thread_id, completion_record["delivery_id"])
-            followthrough_after_first_report = followthrough.read_bytes()
-            followthrough_stat_after_first_report = followthrough.stat().st_mtime_ns
+            followthrough_after_first_report, followthrough_stat_after_first_report = _file_snapshot(
+                followthrough)
             _write_json(output_dir / "first-report-facts.json", fixture["facts"]["report"])
             _write_json(output_dir / "first-report-checks.json", report_check)
+            d1_checks = {key: value for key, value in report_check.items()
+                         if isinstance(value, bool)}
+            _run_replay_case_sequence(report, output_dir, [{
+                "case_id": "d1_first_report", "observe": lambda: d1_checks,
+                "evidence": ["continuation-turn.json", "turn-output.txt", "tool-trace.jsonl",
+                             "first-report-facts.json", "first-report-checks.json"],
+            }])
+            if not _case_can_continue(report["replay_cases"]["d1_first_report"]):
+                raise ReplayBlocked("first-report-case-has-no-judgment")
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "first-closing-report-validated", "turn_id": continuation_turn.get("id"),
+                "case_status": report["replay_cases"]["d1_first_report"]["status"],
+                "case_reason": report["replay_cases"]["d1_first_report"]["reason"],
                 "report_matches_exact_facts": report_check["report_matches_fixture_facts"],
                 "all_exact_artifacts_read": report_check["every_exact_artifact_was_read"],
                 "verifier_tool_trace_passed": report_check["fixture_verifier_passed_in_native_tool_trace"],
@@ -950,8 +1453,6 @@ def _run_replay(output_dir: Path) -> dict:
                 jobs, {attempt}, reason="join-deadline")[0]
             cleanup_text = dispatch_session_sweep._bounded_receipt_text(cleanup_notice)
             cleanup_is_current = dispatch_supervision.notice_is_current(cleanup_notice)
-            if cleanup_is_current or "retains cleanup observation only" not in cleanup_text:
-                raise ReplayFailed("late-join-deadline-was-not-classified-as-cleanup-only")
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "late-cleanup-materialized", "delivery_id": cleanup_notice["delivery_id"],
                 "receipt_digest": cleanup_notice["receipt_digest"],
@@ -973,11 +1474,11 @@ def _run_replay(output_dir: Path) -> dict:
                 row_revisions={attempt: metadata["delivery_row_revision"]})
             ack_after_duplicate = pending_delivery.read(
                 runtime, thread_id, completion_record["delivery_id"])
-            if (duplicate.get("state") != "acked" or ack_after_duplicate is None
-                    or pending_delivery.received_ack_identity(
-                        ack_after_duplicate, thread_id, completion_record["delivery_id"])
-                        != original_ack_identity):
-                raise ReplayFailed("same-result-redelivery-changed-the-exact-old-ack")
+            duplicate_kept_exact_ack = (
+                duplicate.get("state") == "acked" and ack_after_duplicate is not None
+                and pending_delivery.received_ack_identity(
+                    ack_after_duplicate, thread_id, completion_record["delivery_id"])
+                    == original_ack_identity)
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "same-result-redelivery", "delivery_id": duplicate["delivery_id"],
                 "receipt_digest": duplicate["receipt_digest"], "state": duplicate["state"],
@@ -1023,12 +1524,6 @@ def _run_replay(output_dir: Path) -> dict:
                 and pending_delivery.received_ack_identity(
                     old_after_cleanup, thread_id, completion_record["delivery_id"])
                     == original_ack_identity)
-            if (cleanup_record_after_cleanup is None
-                    or cleanup_record_after_cleanup.get("state") != "rejected"
-                    or cleanup_record_after_cleanup.get("expiry_reason") != "supervision-resolved"
-                    or not old_ack_preserved_after_cleanup or not no_extra_turn
-                    or not no_cleanup_queue_item or not no_queued_duplicate):
-                raise ReplayFailed("late-cleanup-native-courier-rejection-or-suppression-failed")
             cleanup_courier_check = {
                 "delivery_id": cleanup_notice["delivery_id"],
                 "state": cleanup_record_after_cleanup.get("state"),
@@ -1042,8 +1537,26 @@ def _run_replay(output_dir: Path) -> dict:
                 "no_duplicate_completion_queue_item": no_queued_duplicate,
             }
             _write_json(output_dir / "late-cleanup-courier.json", cleanup_courier_check)
+            d2_observation = {
+                "cleanup_is_current": cleanup_is_current,
+                "cleanup_text": cleanup_text,
+                "duplicate_state": duplicate.get("state"),
+                "duplicate_kept_exact_ack": duplicate_kept_exact_ack,
+                "cleanup_courier_state": cleanup_record_after_cleanup.get("state"),
+                "cleanup_courier_reason": cleanup_record_after_cleanup.get("expiry_reason"),
+                "old_ack_preserved": old_ack_preserved_after_cleanup,
+                "no_extra_turn": no_extra_turn,
+                "no_cleanup_queue_item": no_cleanup_queue_item,
+                "no_queued_duplicate": no_queued_duplicate,
+            }
+            _run_replay_case_sequence(report, output_dir, [{
+                "case_id": "d2_duplicate_cleanup", "observe": lambda: d2_observation,
+                "evidence": ["late-cleanup-courier.json", "native-events.jsonl"],
+            }])
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "late-cleanup-rejected-by-native-courier",
+                "case_status": report["replay_cases"]["d2_duplicate_cleanup"]["status"],
+                "case_reason": report["replay_cases"]["d2_duplicate_cleanup"]["reason"],
                 **cleanup_courier_check,
                 "courier": "codex-managed-completion.NoticeWatcher._one",
             })
@@ -1065,14 +1578,13 @@ def _run_replay(output_dir: Path) -> dict:
             from dispatch_attempt_policy import terminal_conflict_pending
             from dispatch_supervision import _rows as supervision_rows
             late_row = supervision_rows(jobs, {attempt})[attempt]
-            if not terminal_conflict_pending(late_row[1]) or late_row[0] != "done":
-                raise ReplayFailed("late-conflict-fixture-did-not-preserve-done-row-and-new-failure")
+            conflict_fixture_valid = terminal_conflict_pending(late_row[1]) and late_row[0] == "done"
             late_notice = dispatch_supervision.materialize(
                 jobs, {attempt}, reason="terminal-evidence-conflict")[0]
-            if (late_notice["delivery_id"] == completion_record["delivery_id"]
-                    or late_notice["delivery_id"] == cleanup_notice["delivery_id"]
-                    or not dispatch_supervision.notice_is_current(late_notice)):
-                raise ReplayFailed("new-terminal-conflict-did-not-create-a-current-distinct-notice")
+            conflict_notice_is_distinct_current = (
+                late_notice["delivery_id"] != completion_record["delivery_id"]
+                and late_notice["delivery_id"] != cleanup_notice["delivery_id"]
+                and dispatch_supervision.notice_is_current(late_notice))
             _write_json(output_dir / "late-cleanup-notice.json", cleanup_notice)
             _write_json(output_dir / "late-conflict-notice.json", late_notice)
             _append_event(output_dir / "native-events.jsonl", {
@@ -1109,21 +1621,25 @@ def _run_replay(output_dir: Path) -> dict:
                     time.sleep(0.05)
             finally:
                 watcher.close()
-            if late_notice_turn is None:
-                raise ReplayBlocked("idle-parent-new-notice-not-queued-by-native-courier")
-            if late_notice_record is None or late_notice_record.get("state") != "acked":
-                raise ReplayBlocked("idle-parent-new-notice-exact-ack-not-observed")
-            if late_notice_turn.get("status") != "completed":
-                raise ReplayBlocked("idle-parent-new-notice-turn-unfinished")
+            late_notice_ack_observed = (
+                late_notice_record is not None and late_notice_record.get("state") == "acked")
+            late_notice_status = late_notice_turn.get("status") if late_notice_turn else None
+            if late_notice_status not in {None, "completed", "interrupted"}:
+                _run_replay_case_sequence(report, output_dir, [{
+                    "case_id": "d3_new_conflict", "skip_evaluation": True, "status": "BLOCKED",
+                    "reason": "new conflict turn remains active; independent question is unsafe",
+                    "evidence": ["native-events.jsonl"],
+                }])
+                raise ReplayBlocked("idle-parent-new-notice-turn-still-active")
+            late_notice_turn = late_notice_turn or {}
             late_notice_messages, late_notice_tools = _turn_items(late_notice_turn)
-            if not late_notice_messages:
-                raise ReplayFailed("idle-parent-new-notice-response-missing")
             _write_json(output_dir / "idle-parent-notice-turn.json", late_notice_turn)
-            _write_json(output_dir / "idle-parent-notice-ack.json",
-                        pending_delivery.received_ack_identity(
-                            late_notice_record, thread_id, late_notice["delivery_id"]))
+            late_notice_ack_identity = (pending_delivery.received_ack_identity(
+                late_notice_record, thread_id, late_notice["delivery_id"])
+                if late_notice_ack_observed else None)
+            _write_json(output_dir / "idle-parent-notice-ack.json", late_notice_ack_identity)
             (output_dir / "idle-parent-notice-output.txt").write_text(
-                late_notice_messages[-1] + "\n", encoding="utf-8")
+                (late_notice_messages[-1] if late_notice_messages else "") + "\n", encoding="utf-8")
             (output_dir / "idle-parent-notice-tool-trace.jsonl").write_text("".join(
                 json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
                 for item in late_notice_tools), encoding="utf-8")
@@ -1135,40 +1651,62 @@ def _run_replay(output_dir: Path) -> dict:
                 1 for turn in idle_turns
                 if _turn_for_client_message([turn], cleanup_notice["delivery_id"]) is not None)
             idle_response_count = len(idle_turns) - len(history_after_cleanup)
-            followthrough_after_idle_notice = followthrough.read_bytes()
-            followthrough_stat_after_idle_notice = followthrough.stat().st_mtime_ns
-            late_notice_action_invocations = sum(
-                1 for item in late_notice_tools
-                if str(fixture["action"]) in str(item.get("command", "")))
+            followthrough_after_idle_notice, followthrough_stat_after_idle_notice = _file_snapshot(
+                followthrough)
+            late_notice_action_invocations = len(_script_invocations(late_notice_tools, fixture["action"]))
             no_duplicate_idle_action_or_response = (
                 cleanup_turn_occurrences == 0 and idle_response_count == 1
                 and notice_occurrences == 1 and late_notice_action_invocations == 0
+                and followthrough_after_first_report is not None
                 and followthrough_after_idle_notice == followthrough_after_first_report
                 and followthrough_stat_after_idle_notice == followthrough_stat_after_first_report)
             old_after_notice = pending_delivery.read(
                 runtime, thread_id, completion_record["delivery_id"])
-            if (not no_duplicate_idle_action_or_response or old_after_notice is None
-                    or pending_delivery.received_ack_identity(
-                        old_after_notice, thread_id, completion_record["delivery_id"])
-                        != original_ack_identity):
-                raise ReplayFailed("idle-notice-identity-or-one-response-contract-failed")
+            old_ack_preserved_after_notice = (
+                old_after_notice is not None
+                and pending_delivery.received_ack_identity(
+                    old_after_notice, thread_id, completion_record["delivery_id"])
+                    == original_ack_identity)
             _append_event(output_dir / "native-events.jsonl", {
                 "event": "idle-parent-new-notice-consumed",
                 "new_notice_delivery_id": late_notice["delivery_id"],
                 "new_notice_turn_id": late_notice_turn.get("id"),
-                "new_notice_ack_state": late_notice_record.get("state"),
+                "new_notice_ack_state": late_notice_record.get("state") if late_notice_record else None,
                 "new_notice_turn_status": late_notice_turn.get("status"),
                 "new_notice_turn_occurrences": notice_occurrences,
                 "late_cleanup_turn_occurrences": cleanup_turn_occurrences,
                 "idle_parent_new_turn_count": idle_response_count,
                 "no_duplicate_action_or_response": no_duplicate_idle_action_or_response,
                 "old_ack_delivery_id": completion_record["delivery_id"],
-                "old_ack_identity_preserved": True,
+                "old_ack_identity_preserved": old_ack_preserved_after_notice,
                 "native_turn_count_after_notice": len(idle_turns),
             })
+            d3_observation = {
+                "conflict_fixture_valid": conflict_fixture_valid,
+                "notice_is_distinct_current": conflict_notice_is_distinct_current,
+                "notice_ack_observed": late_notice_ack_observed,
+                "notice_turn_status": late_notice_status,
+                "notice_has_response": bool(late_notice_messages),
+                "notice_occurrences": notice_occurrences,
+                "old_ack_preserved": old_ack_preserved_after_notice,
+                "no_duplicate_action_or_response": no_duplicate_idle_action_or_response,
+            }
+            d3_blocker = None
+            if not late_notice_ack_observed:
+                d3_blocker = "new conflict exact native ACK was not observed"
+            elif late_notice_status != "completed":
+                d3_blocker = "new conflict native turn did not complete"
+            elif followthrough_after_first_report is None:
+                d3_blocker = "follow-through state absent before new notice; no-repeat comparison unavailable"
+            _run_replay_case_sequence(report, output_dir, [{
+                "case_id": "d3_new_conflict", "observe": lambda: d3_observation,
+                "status": "BLOCKED" if d3_blocker else None, "reason": d3_blocker,
+                "evidence": ["late-conflict-notice.json", "idle-parent-notice-turn.json",
+                             "idle-parent-notice-ack.json", "idle-parent-notice-tool-trace.jsonl",
+                             "native-events.jsonl"],
+            }])
 
-            followthrough_before_question = followthrough.read_bytes()
-            stat_before_question = followthrough.stat().st_mtime_ns
+            followthrough_before_question, stat_before_question = _file_snapshot(followthrough)
             question = ("Did this isolated fixture deploy to production? Answer directly from the exact result. "
                         "Do not repeat the fixture follow-through.")
             (output_dir / "direct-question.txt").write_text(question + "\n", encoding="utf-8")
@@ -1196,14 +1734,26 @@ def _run_replay(output_dir: Path) -> dict:
             question_messages, question_tools = _turn_items(question_record)
             _write_json(output_dir / "direct-question-turn.json", question_record)
             direct_answer = question_messages[-1] if question_messages else ""
-            direct_answer_ok = ("production" in direct_answer.lower()
-                                and any(token in direct_answer.lower() for token in
-                                        ("no", "not", "fixture", "unmeasured")))
-            followthrough_unchanged = (followthrough.read_bytes() == followthrough_before_question
-                                       and followthrough.stat().st_mtime_ns == stat_before_question)
-            if not direct_answer_ok or not followthrough_unchanged:
-                raise ReplayFailed("direct-question-or-no-repeat-contract-failed")
+            followthrough_after_question, stat_after_question = _file_snapshot(followthrough)
+            question_action_invocations = len(_script_invocations(question_tools, fixture["action"]))
+            followthrough_unchanged = (
+                followthrough_before_question is not None
+                and followthrough_after_question == followthrough_before_question
+                and stat_after_question == stat_before_question
+                and question_action_invocations == 0)
             (output_dir / "direct-answer.txt").write_text(direct_answer + "\n", encoding="utf-8")
+            question_blocker = ("follow-through state absent before question; no-repeat comparison unavailable"
+                                if followthrough_before_question is None else None)
+            question_observation = {"answer": direct_answer,
+                                    "followthrough_unchanged": followthrough_unchanged,
+                                    "action_invocations": question_action_invocations}
+            question_checks = _evaluate_replay_case("direct_question", question_observation)
+            direct_answer_ok = question_checks["answers_from_exact_production_status"]
+            _run_replay_case_sequence(report, output_dir, [{
+                "case_id": "direct_question", "observe": lambda: question_observation,
+                "status": "BLOCKED" if question_blocker else None, "reason": question_blocker,
+                "evidence": ["direct-question.txt", "direct-question-turn.json", "direct-answer.txt"],
+            }])
             with (output_dir / "tool-trace.jsonl").open("a", encoding="utf-8") as stream:
                 for item in question_tools:
                     stream.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
@@ -1218,9 +1768,25 @@ def _run_replay(output_dir: Path) -> dict:
             conflict_turn_occurrences = sum(
                 1 for turn in all_turns_after_question
                 if _turn_for_client_message([turn], late_notice["delivery_id"]) is not None)
-            report_checks_passed = all(
-                value for key, value in report_check.items()
-                if key not in {"artifact_reads", "report_object"})
+            prior_d3 = report["replay_cases"]["d3_new_conflict"]
+            final_d3_observation = {
+                **d3_observation,
+                "new_failure_conflict_remains_visible": conflict_still_pending,
+                "original_ack_identity_still_preserved": bool(latest_ack)
+                    and pending_delivery.received_ack_identity(
+                        latest_ack, thread_id, completion_record["delivery_id"])
+                        == original_ack_identity,
+            }
+            final_d3_checks = _evaluate_replay_case("d3_new_conflict", final_d3_observation)
+            _run_replay_case_sequence(report, output_dir, [{
+                "case_id": "d3_new_conflict", "observe": lambda: final_d3_observation,
+                "status": prior_d3["status"] if prior_d3["status"] == "BLOCKED" else None,
+                "reason": prior_d3["reason"] if prior_d3["status"] == "BLOCKED" else None,
+                "evidence": ["late-conflict-notice.json", "idle-parent-notice-turn.json",
+                             "idle-parent-notice-ack.json", "native-events.jsonl"],
+            }])
+            report_checks_passed = all(value for value in report_check.values()
+                                       if isinstance(value, bool))
             acceptance_checks = {
                 "first_report_matches_fixture_and_real_tool_evidence": report_checks_passed,
                 "exact_original_ack_identity_preserved": bool(latest_ack)
@@ -1243,6 +1809,18 @@ def _run_replay(output_dir: Path) -> dict:
                 "new_failure_conflict_remains_visible_after_notice": conflict_still_pending,
                 "direct_status_answer_did_not_repeat_followthrough": direct_answer_ok and followthrough_unchanged,
             }
+            observed_failure = _has_failed_case(report)
+            overall_status = _aggregate_replay_status(report, acceptance_checks)
+            failed_acceptance_checks = [name for name, passed in acceptance_checks.items() if not passed]
+            overall_reason = ("all checks passed" if overall_status == "PASS" else
+                              "observed failure in " + observed_failure["case_id"]
+                              if overall_status == "FAIL" and observed_failure else
+                              "required judgment unavailable: " + ", ".join(failed_acceptance_checks))
+            _record_case(report, output_dir, "overall_acceptance", acceptance_checks,
+                         status=overall_status, reason=overall_reason, evidence=[
+                             "first-report-checks.json", "late-cleanup-courier.json",
+                             "idle-parent-notice-turn.json", "direct-question-turn.json",
+                         ])
             # The exact history/queue checks are native Codex evidence; receipt
             # identity, conflict state, and cleanup classification are also
             # tied to the same isolated registry and private Codex queue.
@@ -1299,10 +1877,15 @@ def _run_replay(output_dir: Path) -> dict:
                     "This native Codex result does not establish Claude/OpenCode parity, PR readiness, CI, or "
                     "the later report/test gates."],
             })
-            if not all(acceptance_checks.values()):
+            if overall_status == "FAIL":
                 report["status"] = "failed"
                 report["verdict"] = "FAIL"
-                report["failure_reason"] = "measured-native-parent-acceptance-check-failed"
+                report["failure_reason"] = "measured-native-parent-acceptance-check-failed: " + ", ".join(
+                    name for name, passed in acceptance_checks.items() if not passed)
+            elif overall_status == "BLOCKED":
+                report.update(status="blocked", verdict="BLOCKED",
+                              blocker="required native case judgment unavailable: "
+                              + ", ".join(failed_acceptance_checks))
             else:
                 report.update(status="observed", verdict="PASS", blocker="none",
                     d1="PASS: exact native ACK, crash interruption, stable continuation, factual first report, one-time follow-through",
@@ -1311,6 +1894,33 @@ def _run_replay(output_dir: Path) -> dict:
             return report
         finally:
             _stop_server(server)
+
+
+def _run_replay(output_dir: Path) -> dict:
+    """Run the replay and durably finish any cases left by a runtime error."""
+    try:
+        report = _run_replay_impl(output_dir)
+        _write_json(output_dir / "replay.json", report)
+        return report
+    except ReplayFailed as exc:
+        kind = "FAIL"
+        reason = str(exc)
+        detail = None
+    except ReplayBlocked as exc:
+        kind = "BLOCKED"
+        reason = str(exc)
+        detail = None
+    except Exception as exc:  # preserve the exact runtime limitation in evidence
+        kind = "BLOCKED"
+        reason = str(exc) or type(exc).__name__
+        detail = repr(exc)
+    try:
+        report = json.loads((output_dir / "replay.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        report = {"schema_version": 1, "replay_cases": {}}
+    report = _finish_after_runtime_error(report, output_dir, kind, reason, detail)
+    _write_json(output_dir / "replay.json", report)
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1326,22 +1936,20 @@ def main(argv: list[str] | None = None) -> int:
             report = json.loads((output / "replay.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             report = {"schema_version": 1}
-        report.update(status="failed", verdict="FAIL", failure_reason=str(exc),
-                      operating_records_changed=False)
+        report = _finish_after_runtime_error(report, output, "FAIL", str(exc))
     except ReplayBlocked as exc:
         try:
             report = json.loads((output / "replay.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             report = {"schema_version": 1}
-        report.update(status="blocked", verdict="BLOCKED", blocker=str(exc),
-                      operating_records_changed=False)
+        report = _finish_after_runtime_error(report, output, "BLOCKED", str(exc))
     except Exception as exc:  # noqa: BLE001 -- retain the exact isolated runtime limitation.
         try:
             report = json.loads((output / "replay.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             report = {"schema_version": 1}
-        report.update(status="blocked", verdict="BLOCKED", blocker="isolated-replay-runtime-error",
-                      detail=str(exc)[:240], operating_records_changed=False)
+        report = _finish_after_runtime_error(report, output, "BLOCKED",
+                                             "isolated-replay-runtime-error", str(exc))
     _write_json(output / "replay.json", report)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report.get("verdict") in {"PASS", "BLOCKED"} else 1

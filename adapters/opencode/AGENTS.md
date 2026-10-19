@@ -131,8 +131,9 @@ spec-backed flow requires it. Apply §0.3. Direct routes carry the §0.4 card
 through `question` on user-authored turns; received peer envelopes use one
 `[경로]` line plus a scope clause, unless destructive or external-facing;
 otherwise present the §0.4 five-field card before material work unless already
-approved, and close with the §0.5 card. Load full capability detail only in
-the acting owner or worker.
+approved, and close material work with the first-report content required by
+§0.5; its card is optional. Load full capability detail only in the acting
+owner or worker.
 
 Check `preflight.sh headless [--check] <worktree>`. `preflight.sh dispatch
 --dry-run|--register|--start` runs the raw wrapper; the route commands above
