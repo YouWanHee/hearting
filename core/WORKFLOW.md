@@ -758,6 +758,9 @@ checks), the applicable commit/PR/deployment/serving state, and limits or work
 that remains. Preserve explicit user-requested content and output formats even
 when they differ from the default presentation. Deployment and operating claims
 require observed evidence.
+A continuation or recovery notice resumes that same original task; its receipt
+adds context but does not replace, narrow, or discharge the user's requested
+content, evidence, or output format.
 Writing a report file does not by itself complete the user-facing report.
 
 If any review gate of the work closed without an independent reviewer's PASS —
