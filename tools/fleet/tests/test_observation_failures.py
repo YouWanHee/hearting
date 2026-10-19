@@ -36,6 +36,55 @@ class PaneFailures(unittest.TestCase):
             herdr.enrich(sessions, agents=[], pids=pids)
         self.assertEqual([s.herdr_attached for s in sessions], [True, None, None])
 
+    def test_fresh_pane_positive_survives_cached_peer_and_other_pane_failure(self):
+        panes = [{"pane_id": "fresh", "agent": "codex"},
+                 {"pane_id": "cached", "agent": "codex"},
+                 {"pane_id": "failed", "agent": "claude"}]
+        observation = SimpleNamespace(
+            endpoint="freshness-test", socket_path="/tmp/herdr-freshness-test.sock",
+            generation=9391, pane_revisions={"fresh": 1, "cached": 2, "failed": 3},
+            complete=False)
+        cache_key = (observation.endpoint, observation.socket_path, observation.generation,
+                     observation.pane_revisions["cached"], "cached")
+        herdr._PANE_INFO_CACHE[cache_key] = {
+            "foreground_processes": [{"pid": 4555, "name": "codex"}]}
+        self.addCleanup(herdr._PANE_INFO_CACHE.pop, cache_key, None)
+
+        def runner(argv, **_kwargs):
+            pane_id = argv[-1]
+            if pane_id == "failed":
+                raise TimeoutError("pane unavailable")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"result": {
+                "process_info": {"foreground_processes": [
+                    {"pid": 4321, "name": "codex"}]}}}))
+
+        with mock.patch.object(herdr.subprocess, "run", side_effect=runner):
+            pids = herdr.pane_pids(
+                panes, runner=herdr.subprocess.run, observation=observation)
+        self.assertFalse(pids.complete)
+        self.assertEqual(pids[1], {4321, 4555})
+        self.assertEqual(pids.fresh_foreground, {4321})
+
+        sessions = [Session(harness="codex", pid=4321),
+                    Session(harness="codex", pid=4555),
+                    Session(harness="claude", pid=9877, session_id="unmatched")]
+        with mock.patch.object(herdr, "_ppid_of", return_value=1):
+            herdr.enrich(sessions, agents=[], panes=panes, pids=pids)
+        self.assertEqual([s.herdr_attached for s in sessions], [True, None, None])
+
+        complete_observation = SimpleNamespace(
+            endpoint=observation.endpoint, socket_path=observation.socket_path,
+            generation=observation.generation, pane_revisions=observation.pane_revisions,
+            complete=True)
+        with mock.patch.object(herdr.subprocess, "run", side_effect=runner):
+            complete_pids = herdr.pane_pids(
+                [panes[1]], runner=herdr.subprocess.run, observation=complete_observation)
+        self.assertTrue(complete_pids.complete)
+        self.assertEqual(complete_pids.fresh_foreground, set())
+        cached_session = Session(harness="codex", pid=4555)
+        herdr.enrich([cached_session], agents=[], panes=[panes[1]], pids=complete_pids)
+        self.assertIs(cached_session.herdr_attached, True)
+
     def test_pane_waits_overlap_in_one_bounded_observation(self):
         active = 0
         maximum = 0

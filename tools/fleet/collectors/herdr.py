@@ -275,10 +275,18 @@ def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0):
 
 
 class PaneEvidence(tuple):
-    """Unpackable PID evidence with the completeness needed for a negative fact."""
-    def __new__(cls, values, complete=True, errors=()):
+    """Unpackable PID evidence with negative completeness and fresh-pane provenance."""
+    def __new__(cls, values, complete=True, errors=(), fresh_shells=None,
+                fresh_foreground=None):
         result = super().__new__(cls, values)
         result.complete, result.errors = complete, tuple(errors)
+        shells = result[0] if len(result) > 0 else set()
+        foreground = result[1] if len(result) > 1 else set()
+        result.fresh_shells = set(
+            (shells if complete else ()) if fresh_shells is None else fresh_shells)
+        result.fresh_foreground = set(
+            (foreground if complete else ())
+            if fresh_foreground is None else fresh_foreground)
         return result
 
 
@@ -290,6 +298,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
     conflicting pane claims for one PID are discarded.
     """
     shells, fg = set(), set()
+    fresh_shells, fresh_fg = set(), set()
     identities = {}
     errors = []
     selected = [pane for pane in panes or [] if pane.get("agent")]
@@ -307,7 +316,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                 cached = _PANE_INFO_CACHE.get(cache_key)
                 if cached is not None:
                     _PANE_INFO_CACHE.move_to_end(cache_key)
-                    return dict(cached)
+                    return dict(cached), False
         if observation is not None:
             endpoint = observation.endpoint
         elif runner is subprocess.run:
@@ -334,7 +343,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                 _PANE_INFO_CACHE.move_to_end(cache_key)
                 while len(_PANE_INFO_CACHE) > _PANE_INFO_CACHE_LIMIT:
                     _PANE_INFO_CACHE.popitem(last=False)
-        return info
+        return info, True
 
     # One shared deadline replaces N serial pane deadlines. Daemon reads never
     # hold the TUI open; subprocess.run still owns each child's timeout/cleanup.
@@ -346,13 +355,18 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
         try:
             if not future.done():
                 raise TimeoutError("process-info deadline")
-            info = future.result()
+            info, fresh = future.result()
             if info.get("shell_pid"):
-                shells.add(int(info["shell_pid"]))
+                shell_pid = int(info["shell_pid"])
+                shells.add(shell_pid)
+                if fresh:
+                    fresh_shells.add(shell_pid)
             for proc_rec in info.get("foreground_processes") or []:
                 if isinstance(proc_rec, dict) and proc_rec.get("pid"):
                     pid = int(proc_rec["pid"])
                     fg.add(pid)
+                    if fresh:
+                        fresh_fg.add(pid)
                     if bindings is not None and proc_rec.get("name") == pane.get("agent"):
                         bindings.setdefault(pid, set()).add(str(pane_id))
                     agent_session = pane.get("agent_session") or {}
@@ -368,7 +382,8 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
     return PaneEvidence((shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
                                     if len(sids) == 1}),
                         complete=panes is not None and not errors and observation_complete,
-                        errors=errors)
+                        errors=errors, fresh_shells=fresh_shells,
+                        fresh_foreground=fresh_fg)
 
 
 def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
@@ -377,7 +392,9 @@ def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
                              observation=observation)
     shells, fg, _identities = evidence
     return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
-                        errors=getattr(evidence, "errors", ()))
+                        errors=getattr(evidence, "errors", ()),
+                        fresh_shells=getattr(evidence, "fresh_shells", None),
+                        fresh_foreground=getattr(evidence, "fresh_foreground", None))
 
 
 def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False,
@@ -603,6 +620,9 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
+    fresh_shells = getattr(pids, "fresh_shells", shells if probe_ok else set())
+    fresh_fg = getattr(pids, "fresh_foreground", fg if probe_ok else set())
+    positive_shells, positive_fg = (shells, fg) if probe_ok else (fresh_shells, fresh_fg)
     from ..process_identity import pane_process_claims
     claims = pane_process_claims(sessions, panes, bindings,
                                  complete=pids is not None and getattr(pids, "complete", True))
@@ -646,7 +666,8 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         observation_complete = observation is None or getattr(observation, "complete", True) is True
         if observation_complete and sid and (harness, sid) in index:
             s.herdr_attached = True
-        elif probe_ok and pid_in_panes(getattr(s, "pid", None), shells, fg):
+        elif pids is not None and pid_in_panes(
+                getattr(s, "pid", None), positive_shells, positive_fg):
             s.herdr_attached = True
         elif probe_ok:
             # herdr answered on both surfaces (or on the id surface for a verified-id
