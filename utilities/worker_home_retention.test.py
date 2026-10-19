@@ -38,6 +38,9 @@ class Fixture(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name).resolve()
+        self.old_title_state = os.environ.get("FLEET_TITLE_STATE_DIR")
+        os.environ["FLEET_TITLE_STATE_DIR"] = str(self.root / "fleet-titles")
+        self.addCleanup(self._restore_title_state)
         self.jobs = self.root / "jobs.log"
         self.jobs.write_text("")
         self.workers = self.root / "homes" / "workers"
@@ -48,6 +51,12 @@ class Fixture(unittest.TestCase):
         self.rows = {}
         self.timestamps = {}
         self.now = time.time_ns()
+
+    def _restore_title_state(self):
+        if self.old_title_state is None:
+            os.environ.pop("FLEET_TITLE_STATE_DIR", None)
+        else:
+            os.environ["FLEET_TITLE_STATE_DIR"] = self.old_title_state
 
     # --- builders --------------------------------------------------------
     def key(self, attempt, harness="claude", worker_type="stage"):
@@ -110,6 +119,42 @@ class Fixture(unittest.TestCase):
             (path / "projects").mkdir()
             (path / "projects" / "transcript.jsonl").write_text("x" * 100)
         return path
+
+    def attach_summary_owner(self, attempt, home, harness="claude"):
+        import dispatch_summary as summary
+
+        identity = DC.process_launch_identity(os.getpid())
+        namespace = DC.process_namespace_identity()
+        state_path = summary.owner_state_path(harness, attempt)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript = home / "projects" / "transcript.jsonl"
+        metadata = {
+            "summary_owner": summary.OWNER_KIND,
+            "summary_sid": summary.summary_sid(attempt),
+            "summary_owner_pid": str(os.getpid()),
+            "summary_owner_pid_start": identity["pid_start"],
+            "summary_owner_pid_observer_ns": namespace,
+            "summary_state_file": str(state_path),
+        }
+        self.rows[attempt][1].update(metadata)
+        self.write_rows()
+        state_path.write_text(json.dumps({
+            "schema_version": summary.OWNER_SCHEMA,
+            "status": "active",
+            "attempt_id": attempt,
+            "harness": harness,
+            "sid": summary.summary_sid(attempt),
+            "transcript": str(transcript),
+            "runtime_home": str(home),
+            "pid": os.getpid(),
+            "proc_start": identity["pid_start"],
+            "observer_namespace": namespace,
+        }))
+        owner_lock = state_path.with_suffix(".lock")
+        owner_lock.touch()
+        provider_lock = Path(os.environ["FLEET_TITLE_STATE_DIR"]) / harness / \
+            (".lock-" + summary.summary_sid(attempt))
+        return owner_lock, provider_lock
 
     def sweep(self, days=0.0, **kwargs):
         return R.sweep(self.jobs, now_ns=self.now + int(days * DAY), force=True, **kwargs)
@@ -446,15 +491,30 @@ class Routes(Fixture):
                 json.dumps({"route_id": name, "route_hash": record["route_hash"] if hash_ok else "x"}))
         return path, record
 
-    def test_open_route_keeps_and_closed_route_retires(self):
+    def test_live_attempt_process_keeps_home_even_when_route_is_open(self):
+        attempt = "att-open-route-resume"
+        path, record = self.route(name="rt-open-resume", outcome=False)
+        home = self.add(attempt, route_file=str(path), route_id=record["route_id"],
+                        route_hash=record["route_hash"])
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env={**os.environ, DC.ATTEMPT_DESCENDANT_ENV: attempt,
+                 "HEARTING_WORKER_HOME": str(home), "CLAUDE_CONFIG_DIR": str(home)},
+        )
+        try:
+            result = self.expire()
+            self.assertEqual(self.kept(result, "not-quiescent"), 1)
+            self.assertTrue(home.is_dir())
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
+    def test_valid_open_route_alone_does_not_keep_home(self):
         path, record = self.route(outcome=False)
         home = self.add("att-r1", route_file=str(path), route_id=record["route_id"], route_hash=record["route_hash"])
         result = self.expire()
-        self.assertEqual(self.unknown(result, "route-unknown"), 1)
-        self.assertTrue(home.is_dir())
-        (self.root / "rt-one.outcome.json").write_text(
-            json.dumps({"route_id": "rt-one", "route_hash": record["route_hash"]}))
-        self.assertEqual(self.sweep(9)["removed"], 1)
+        self.assertEqual(result["removed"], 1)
         self.assertFalse(home.exists())
 
     def test_route_closed_exactly_one_generation_only(self):
@@ -462,6 +522,8 @@ class Routes(Fixture):
         self.add("att-r2", route_file=str(path), route_id=record["route_id"], route_hash=record["route_hash"])
         result = self.expire()
         self.assertEqual(self.unknown(result, "route-unknown"), 1)
+        self.assertEqual(self.state()["last_result"]["unknown_causes"]["route-unknown"],
+                         {"route-binding-mismatch": 1})
 
     def test_conflicting_route_binding_is_unknown(self):
         path, record = self.route()
@@ -483,15 +545,21 @@ class Routes(Fixture):
         self.assertEqual(self.unknown(self.expire(), "route-unknown"), 1)
         self.assertTrue(home.is_dir())
 
-    def test_closed_outcome_removed_or_owner_route_advanced_remains_unknown(self):
+    def test_reopened_valid_route_does_not_protect_and_advanced_route_is_unknown(self):
         path, record = self.route()
         home = self.add("att-r5", route_file=str(path), route_id=record["route_id"],
                         route_hash=record["route_hash"])
         self.sweep(0)
         path.with_name(path.stem + ".outcome.json").unlink()
-        self.assertEqual(self.unknown(self.sweep(8), "route-unknown"), 1)
+        self.assertEqual(self.sweep(8)["removed"], 1)
+        self.assertFalse(home.exists())
+        path, record = self.route(name="rt-advanced")
+        home = self.add("att-r6", route_file=str(path), route_id=record["route_id"],
+                        route_hash=record["route_hash"])
+        self.sweep(0)
         path.write_text(json.dumps({**record, "route_id": "rt-next"}))
-        self.assertEqual(self.unknown(self.sweep(16), "route-unknown"), 1)
+        result = self.sweep(8)
+        self.assertEqual(self.unknown(result, "route-unknown"), 1)
         self.assertTrue(home.is_dir())
 
 
@@ -806,7 +874,7 @@ class Recovery(Fixture):
         self.sweep(0)
         self.assertEqual(self.sweep(8)["removed"], 1)
 
-    def test_terminal_successor_with_open_route_or_delivery_keeps_source(self):
+    def test_terminal_successor_open_route_alone_releases_source_home(self):
         source = self.add("att-source")
         self.reserve("att-source", claim={"original_attempt_id": "att-source",
                                           "replacement_attempt_id": "att-successor"})
@@ -817,12 +885,19 @@ class Recovery(Fixture):
         route.write_text(json.dumps(value))
         self.row("att-successor", "done", route_file=str(route), route_id="rt-successor",
                  route_hash=value["route_hash"])
-        self.assertEqual(self.kept(self.expire(), "replacement-unresolved"), 1)
-        route.with_name("successor.outcome.json").write_text(json.dumps(
-            {"route_id": "rt-successor", "route_hash": value["route_hash"]}))
-        self.row("att-successor", "done", delivery_intent="1", delivery_id="delivery-" + "a" * 32,
+        self.assertEqual(self.expire()["removed"], 1)
+        self.assertFalse(source.exists())
+
+    def test_terminal_successor_with_open_delivery_keeps_source_home(self):
+        source = self.add("att-source-delivery")
+        self.reserve("att-source-delivery", claim={"original_attempt_id": "att-source-delivery",
+                                                    "replacement_attempt_id": "att-successor-delivery"})
+        path, record = Routes.route(self, name="rt-successor-delivery")
+        self.row("att-successor-delivery", "done", route_file=str(path), route_id=record["route_id"],
+                 route_hash=record["route_hash"], delivery_intent="1",
+                 delivery_id="delivery-" + "a" * 32,
                  delivery_recipient_digest="b" * 64, parent_attempt_id="att-other")
-        self.assertEqual(self.kept(self.sweep(16), "replacement-unresolved"), 1)
+        self.assertEqual(self.kept(self.expire(), "replacement-unresolved"), 1)
         self.assertTrue(source.is_dir())
 
     def test_malformed_reference_evidence_is_preserved(self):
@@ -941,6 +1016,8 @@ class Liveness(Fixture):
         home = self.add("att-s1", summary_owner_pid="123")  # no start, namespace or state file
         result = self.expire()
         self.assertEqual(self.unknown(result, "summary-owner-unknown"), 1)
+        self.assertEqual(self.state()["last_result"]["unknown_causes"]["summary-owner-unknown"],
+                         {"identity-incomplete": 1})
         self.assertTrue(home.is_dir())
 
     def test_live_identity_without_a_vouching_state_file_is_unknown(self):
@@ -951,38 +1028,55 @@ class Liveness(Fixture):
         self.assertEqual(self.unknown(self.expire(), "summary-owner-unknown"), 1)
         self.assertTrue(home.is_dir())
 
-    def test_owner_in_an_extinct_namespace_is_gone_and_in_a_present_one_is_unknown(self):
+    def test_unknown_owner_namespace_with_valid_free_locks_releases_home(self):
+        home = self.add("att-s4")
+        owner_lock, _provider = self.attach_summary_owner("att-s4", home)
         foreign = "pid:[4026539999]"
-        gone = self.add("att-s4", summary_owner_pid="4242", summary_owner_pid_start="1",
-                        summary_owner_pid_observer_ns=foreign, summary_state_file=str(self.root / "o.json"))
+        row_meta = self.rows["att-s4"][1]
+        row_meta.update(summary_owner_pid="4242", summary_owner_pid_start="1",
+                        summary_owner_pid_observer_ns=foreign)
+        self.write_rows()
+        state_path = Path(row_meta["summary_state_file"])
+        state = json.loads(state_path.read_text())
+        state.update(pid=4242, proc_start="1", observer_namespace=foreign)
+        state_path.write_text(json.dumps(state))
+        self.assertTrue(owner_lock.is_file())
         with mock.patch.object(DC, "_current_observer_is_host_like", return_value=False):
-            result = self.sweep(0)
-        self.assertEqual(self.unknown(result, "summary-owner-unknown"), 1)
-        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True):
-            self.sweep(0.001)
-            self.assertEqual(self.sweep(8)["removed"], 1)
-        self.assertFalse(gone.exists())
+            result = self.expire()
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(home.exists())
 
     def test_provably_gone_summary_owner_releases(self):
-        home = self.add("att-s3", summary_owner_pid=str(self.dead_pid()), summary_owner_pid_start="1",
-                        summary_owner_pid_observer_ns=DC.process_namespace_identity(),
-                        summary_state_file=str(self.root / "owner.json"))
-        self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+        home = self.add("att-s3")
+        self.attach_summary_owner("att-s3", home)
+        self.assertEqual(self.expire()["removed"], 1)
         self.assertFalse(home.exists())
 
-    def test_real_process_receipt_releases_after_exit(self):
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
-        self.addCleanup(lambda: child.kill() if child.poll() is None else None)
-        identity = DC.process_launch_identity(child.pid)
-        home = self.add("att-real-receipt", summary_owner_pid=str(child.pid),
-                        summary_owner_pid_start=identity["pid_start"],
-                        summary_owner_pid_observer_ns=DC.process_namespace_identity(),
-                        summary_state_file=str(self.root / "owner.json"))
-        child.wait()
-        self.sweep(0)
-        self.assertEqual(self.sweep(8)["removed"], 1)
+    def test_exact_free_summary_locks_allow_home_retirement(self):
+        home = self.add("att-summary-free")
+        self.attach_summary_owner("att-summary-free", home)
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True):
+            self.assertEqual(self.expire()["removed"], 1)
         self.assertFalse(home.exists())
+
+    def test_held_owner_and_old_provider_lockdir_keep_home(self):
+        owner_home = self.add("att-summary-owner-lock")
+        owner_lock, _provider_lock = self.attach_summary_owner("att-summary-owner-lock", owner_home)
+        owner_fd = os.open(owner_lock, os.O_RDWR)
+        try:
+            fcntl.flock(owner_fd, fcntl.LOCK_EX)
+            self.assertEqual(self.kept(self.expire(), "summary-live"), 1)
+        finally:
+            os.close(owner_fd)
+
+        provider_home = self.add("att-summary-provider-lock")
+        _owner_lock, provider_lock = self.attach_summary_owner("att-summary-provider-lock", provider_home)
+        provider_lock.parent.mkdir(parents=True, exist_ok=True)
+        provider_lock.mkdir()
+        old = time.time() - 30 * 86400
+        os.utime(provider_lock, (old, old))
+        self.assertEqual(self.kept(self.expire(), "summary-live"), 1)
+        self.assertTrue(provider_home.is_dir())
 
     def test_live_or_unverifiable_quiescence_keeps(self):
         live = self.add("att-q1")
@@ -998,6 +1092,8 @@ class Liveness(Fixture):
             result = self.expire()
         self.assertEqual(self.kept(result, "not-quiescent"), 1)
         self.assertEqual(self.unknown(result, "quiescence-unverifiable"), 1)
+        self.assertEqual(self.state()["last_result"]["unknown_causes"]["quiescence-unverifiable"],
+                         {"process-namespace-unverifiable": 1})
         self.assertTrue(live.is_dir() and unknown.is_dir())
         self.assertIsNotNone(real)
 
@@ -1176,6 +1272,7 @@ class Races(Fixture):
                         self.replaced("rename", observed_rename), \
                         mock.patch.object(P, "_atomic_write_json", observed_write):
                     result = self.sweep(8)
+                    self.assertTrue(writer_done.wait(5), "normal publisher did not finish after detach")
             finally:
                 start_writer.set()
                 thread.join(5)
@@ -1608,13 +1705,12 @@ class Races(Fixture):
         self.assertTrue(home.is_dir())
         self.assertEqual(self.kept(self.sweep(8.1), "delivery-open"), 1)
 
-    def test_summary_owner_is_not_probed_under_the_registry_lock(self):
+    def test_process_quiescence_scan_stays_outside_the_registry_lock(self):
         self.add("att-owner-probe")
         self.sweep(0)
         held, calls = [], []
         original = R._registry_lock
-        import dispatch_summary
-        real = dispatch_summary.owner_process_state
+        real = DC.attempt_process_quiescence
 
         @contextlib.contextmanager
         def lock(jobs):
@@ -1625,15 +1721,37 @@ class Races(Fixture):
                 finally:
                     held.pop()
 
-        def probe(meta):
+        def probe(meta, *, terminal_receipt=False):
             calls.append(bool(held))
-            return real(meta)
+            return real(meta, terminal_receipt=terminal_receipt)
 
         with mock.patch.object(R, "_registry_lock", lock), \
-                mock.patch.object(dispatch_summary, "owner_process_state", probe):
+                mock.patch.object(DC, "attempt_process_quiescence", probe):
             self.assertEqual(self.sweep(8)["removed"], 1)
         self.assertTrue(calls)
         self.assertNotIn(True, calls)
+
+    def test_provider_admitted_before_final_detach_is_rechecked(self):
+        attempt = "att-provider-detach-race"
+        home = self.add(attempt)
+        _owner_lock, provider_lock = self.attach_summary_owner(attempt, home)
+        self.sweep(0)
+
+        original_check = R._late_candidate_delivery_change
+
+        def provider_admission(ctx, candidate, deadline):
+            if not provider_lock.exists():
+                with AR.admission(self.root, (candidate,), blocking=False) as admitted:
+                    if admitted:
+                        provider_lock.parent.mkdir(parents=True, exist_ok=True)
+                        provider_lock.mkdir()
+            return original_check(ctx, candidate, deadline)
+
+        with mock.patch.object(R, "_late_candidate_delivery_change", provider_admission):
+            result = self.sweep(8)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(self.kept(result, "protected:summary-live"), 1)
+        self.assertTrue(home.is_dir() and provider_lock.is_dir())
 
     def test_row_reopened_before_detach_keeps_the_home(self):
         home = self.add("att-x3")
@@ -2263,6 +2381,96 @@ class Containment(Fixture):
         self.assertTrue(home.is_dir())
 
 
+class Orphans(Fixture):
+    def _remove_registry_rows(self, *attempts):
+        for attempt in attempts:
+            self.rows.pop(attempt, None)
+        self.write_rows()
+
+    def test_mixed_harness_no_row_homes_retire_when_existing_evidence_is_clear(self):
+        homes = []
+        for index, harness in enumerate(("claude", "codex", "opencode")):
+            attempt = f"att-orphan-{index}"
+            homes.append(self.add(attempt, harness=harness))
+            self._remove_registry_rows(attempt)
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            result = self.expire()
+        self.assertEqual(result["removed"], 3)
+        self.assertTrue(all(not home.exists() for home in homes))
+
+    def test_identityless_legacy_home_maps_through_retained_delivery_attempt(self):
+        attempt = "att-orphan-legacy"
+        home = self.add(attempt, schema=1)
+        self._remove_registry_rows(attempt)
+        group = self.root / "pending-delivery" / ("d" * 64)
+        record = group / ("delivery-" + "e" * 32 + ".json")
+        self.delivery_record(record, attempt, state="acked")
+        with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True), \
+                mock.patch.object(R._Context, "home_process_evidence",
+                                  return_value=("absent", "fixture-process-scan-complete")):
+            result = self.expire()
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(home.exists())
+
+    def test_no_row_open_delivery_and_exact_supervisor_lease_keep_home(self):
+        delivery_attempt = "att-orphan-delivery"
+        delivery_home = self.add(delivery_attempt)
+        self._remove_registry_rows(delivery_attempt)
+        group = self.root / "pending-delivery" / ("f" * 64)
+        delivery = group / ("delivery-" + "a" * 32 + ".json")
+        self.delivery_record(delivery, delivery_attempt, state="pending")
+
+        lease_attempt = "att-orphan-lease"
+        lease_home = self.add(lease_attempt)
+        self._remove_registry_rows(lease_attempt)
+        lease = DC.supervisor_lease_path(self.jobs, lease_attempt)
+        lease.parent.mkdir(parents=True, exist_ok=True)
+        lease.write_text(chr(10).join((f"kind={DC.SUPERVISOR_LEASE_KIND}",
+                                      f"attempt_id={lease_attempt}",
+                                      f"nonce={'a' * 64}", "")))
+        fd = os.open(lease, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True):
+                result = self.expire()
+            self.assertEqual(self.kept(result, "delivery-open"), 1)
+            self.assertEqual(self.kept(result, "lease-held"), 1)
+            self.assertTrue(delivery_home.is_dir() and lease_home.is_dir())
+        finally:
+            os.close(fd)
+
+    def test_process_environment_cwd_and_open_fd_keep_no_row_homes(self):
+        attempts = ("att-orphan-env", "att-orphan-cwd", "att-orphan-fd")
+        homes = [self.add(attempt) for attempt in attempts]
+        self._remove_registry_rows(*attempts)
+        children = []
+        try:
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                env={**os.environ, "HEARTING_WORKER_HOME": str(homes[0])}))
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"], cwd=homes[1]))
+            transcript = homes[2] / "projects" / "transcript.jsonl"
+            fd = os.open(transcript, os.O_RDONLY)
+            os.set_inheritable(fd, True)
+            try:
+                children.append(subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"], pass_fds=(fd,)))
+            finally:
+                os.close(fd)
+            with mock.patch.object(DC, "_current_observer_is_host_like", return_value=True):
+                result = self.expire()
+            self.assertEqual(self.kept(result, "not-quiescent"), 3)
+            self.assertTrue(all(home.is_dir() for home in homes))
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+
+
 class Mapping(Fixture):
     def test_schema_two_manifest_binds_without_a_runtime_home_row(self):
         home = self.add("att-m1", declare=False)
@@ -2307,7 +2515,7 @@ class Mapping(Fixture):
 
     def test_shared_destination_and_unmapped_homes_are_kept(self):
         destination = self.add("att-m8", destination=True)
-        unmapped = self.add("att-m9", home=True)
+        unmapped = self.add("att-m9", schema=1, home=True)
         self.rows.pop("att-m9")
         self.write_rows()
         broken = self.add("att-m10")

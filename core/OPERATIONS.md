@@ -388,7 +388,11 @@ observations use that attempt's recorded home across the three harnesses.
 
 **Per-attempt home retention.** A per-attempt home under `homes/workers/<key>`
 retires itself once its attempt has been terminal, quiescent and unused for seven
-days; no user command, flag, daemon or approval is involved. The pass runs at the end
+days; no user command, flag, daemon or approval is involved. An exact, valid open
+route alone is not a HOME consumer: the home remains only while an existing
+continuation, delivery/replacement, summary/provider, lease, process or recent-view
+obligation can read it. Route and attempt outcomes retain their semantic state;
+an unreadable or conflicting route binding remains unknown. The pass runs at the end
 of every post-exit reaper and in a `reconcile --apply` that is not scoped to one exact attempt. It is due at
 most every five minutes, examines at most 32 homes (a fair cursor), and removes at
 most four destructively touched homes, including partial leftovers of an interrupted removal. The seven-day clock starts
@@ -403,15 +407,19 @@ pending delivery intent is unresolved or unreadable; only actual attempt IDs in
 delivery records protect worker homes (a depth-1 `-` parent and session notice
 identities refer to no worker home); a delivery record or group
 is malformed, unreadable or unattributable; a pruned delivery has only a legacy
-zero-byte or mismatched tombstone; its route is open, missing or its
-binding is unreadable; a terminal replacement successor still has unresolved
-route or delivery obligations; a summary owner or the supervisor lease is live or
+zero-byte or mismatched tombstone; its route binding is missing, damaged or
+unreadable; a terminal replacement successor still has unresolved delivery or
+source-HOME obligations; a summary owner/provider or the supervisor lease is live or
 unverifiable; process quiescence is not proven; Fleet displayed it within the
 window; or its `.credentials.json` is a regular file, which a Claude native refresh
 left in place of the link and which may hold the only copy of a rotated token. A home
 is also kept, and counted rather than hidden in
 `homes/worker-retention/state.json`, when its attempt cannot be proven from the
-manifest, the row's `runtime_home` and the legacy key; shared `homes/codex`,
+manifest, the row's `runtime_home` and the legacy key, or existing process,
+delivery, summary/provider or lease evidence is incomplete. The result preserves
+the existing top-level unknown counts and records bounded causes beside them;
+`summary-owner-unknown`, `quiescence-unverifiable` and `route-unknown` remain
+fail-closed categories. Shared `homes/codex`,
 `<slug>.<profile>` and `destination=` homes are not enumerated. Detaching is one
 rename into `homes/worker-retention/retiring/` under a nonblocking registry lock
 and a reader-mark lock. Evidence is prepared outside the registry lock; its
@@ -431,7 +439,11 @@ post-exit reaper pass runs only after that reaper exits; selector-less reconcile
 also carries the sweep when normal work invokes it. Neither carrier promises a
 wall-clock cleanup deadline on a machine with no later normal work. Older
 cross-namespace owner evidence without a host-visible death receipt remains
-unknown and keeps its home.
+unknown and keeps its home. The independent seven-day route idle wait protects
+work the observer cannot see; it is not a HOME retention interval. Commit
+`1ed7b9032` records the regression that lengthened this route wait after a
+background sweep closed unseen work and pending runtime settlement, so HOME
+reclamation does not shorten the route policy.
 
 **Dispatch log retention.** Only regular Hearting attempt logs bound by an
 exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are

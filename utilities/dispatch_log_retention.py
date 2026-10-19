@@ -210,7 +210,10 @@ def _log_protection(ctx, attempt, *, probe_processes):
     from dispatch_retention import Protection
     from worker_home_retention import _protections, _route_state
 
-    verdict = _protections(ctx, "", attempt, probe_processes=probe_processes)
+    # Attempt logs remain route evidence for a live workflow even when the
+    # attempt's separate worker HOME has no remaining consumer.
+    verdict = _protections(ctx, "", attempt, probe_processes=probe_processes,
+                           protect_open_route=True)
     row = ctx.snapshot.rows.get(attempt)
     if (verdict.kind == "eligible" and row is not None
             and row.meta.get("worker_type") == "review"

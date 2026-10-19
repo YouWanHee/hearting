@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import fcntl
 import os
 from pathlib import Path
 import shlex
@@ -51,6 +52,66 @@ class DispatchSummaryTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
         self.tmp.cleanup()
+
+    def test_home_consumer_uses_recorded_state_root_and_provider_lock(self):
+        attempt = "att-home-consumer"
+        harness = "claude"
+        recorded_root = Path(self.tmp.name) / "recorded-title-state"
+        state_path = recorded_root / ".dispatch-owners" / harness / f"{attempt}.json"
+        state_path.parent.mkdir(parents=True)
+        runtime_home = Path(self.tmp.name) / "worker-home"
+        runtime_home.mkdir()
+        transcript = runtime_home / "projects" / "session.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("{}\n", encoding="utf-8")
+        owner_start = S.process_observation(os.getpid())[1]
+        namespace = S.process_namespace_identity()
+        sid = S.summary_sid(attempt)
+        state_path.write_text(json.dumps({
+            "schema_version": S.OWNER_SCHEMA,
+            "status": "active",
+            "attempt_id": attempt,
+            "harness": harness,
+            "sid": sid,
+            "transcript": str(transcript),
+            "runtime_home": str(runtime_home),
+            "pid": os.getpid(),
+            "proc_start": owner_start,
+            "observer_namespace": namespace,
+        }), encoding="utf-8")
+        owner_lock = state_path.with_suffix(".lock")
+        owner_lock.touch()
+        metadata = {
+            "attempt_id": attempt,
+            "harness": harness,
+            "runtime_home": str(runtime_home),
+            "log_file": str(transcript),
+            "summary_owner": S.OWNER_KIND,
+            "summary_sid": sid,
+            "summary_owner_pid": str(os.getpid()),
+            "summary_owner_pid_start": owner_start,
+            "summary_owner_pid_observer_ns": namespace,
+            "summary_state_file": str(state_path),
+        }
+        fd = os.open(owner_lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with mock.patch.dict(os.environ, {"FLEET_TITLE_STATE_DIR": str(Path(self.tmp.name) / "wrong-root")}):
+                self.assertEqual(S.home_consumer_evidence(metadata), ("live", "owner-lock-held"))
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        provider_parent = recorded_root / harness
+        provider_parent.mkdir()
+        provider_lock = provider_parent / (".lock-" + sid)
+        provider_lock.mkdir()
+        old = time.time() - 30 * 86400
+        os.utime(provider_lock, (old, old))
+        with mock.patch.dict(os.environ, {"FLEET_TITLE_STATE_DIR": str(Path(self.tmp.name) / "wrong-root")}):
+            self.assertEqual(S.home_consumer_evidence(metadata), ("live", "provider-lockdir-present"))
+        provider_lock.rmdir()
+        self.assertEqual(S.home_consumer_evidence(metadata)[0], "absent")
 
     def test_first_concrete_claude_model_is_recorded_once(self):
         attempt = "att-resolved-model"

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import errno
 import fcntl
 import hashlib
 import json
@@ -54,6 +55,8 @@ MAX_EVIDENCE_BYTES = 1024 * 1024
 MAX_DELIVERY_BYTES = 256 * 1024
 MAX_DELIVERY_RECORDS = 4096
 MAX_DEPENDENCY_STAMPS = MAX_DELIVERY_RECORDS * 8
+MAX_HOME_SCAN_PIDS = 8192
+MAX_HOME_SCAN_FDS = 2048
 MAX_TREE_DEPTH = 128
 REGISTRY_LOCK_WAIT_SECONDS = 0.100
 
@@ -717,9 +720,10 @@ def _replacement_state(root: Path, snapshot: _Snapshot, attempt: str):
         row = snapshot.rows.get(successor)
         if row is None or row.status not in TERMINAL:
             return "unresolved", activity
-        successor_route, route_mtime = _route_state(snapshot.jobs, row.meta)
+        successor_route, route_mtime, _route_reason = _route_evidence(snapshot.jobs, row.meta)
         successor_delivery, delivery_mtime = _delivery_state(root, row.meta)
-        if successor_route in ("open", "unknown") or successor_delivery in ("open", "pending", "unknown"):
+        if (successor_route in ("unknown", "pending")
+                or successor_delivery in ("open", "pending", "unknown")):
             return "unresolved", activity
         activity = max(activity, route_mtime, delivery_mtime)
         children = snapshot.intents.get(successor, ())
@@ -757,12 +761,17 @@ def _replacement_state(root: Path, snapshot: _Snapshot, attempt: str):
     return ("resolved" if activity else "none"), activity
 
 
-def _route_state(jobs: Path, meta: dict):
-    """(state, activity_ns): none | closed | open | unknown."""
+def _route_evidence(jobs: Path, meta: dict):
+    """(state, activity_ns, cause): none | closed | open | pending | unknown.
+
+    A missing outcome is the ordinary state of a valid open route. Binding and
+    read failures remain unknown so callers can distinguish policy from loss of
+    evidence without changing route or attempt state.
+    """
     if not any(key in meta for key in ROUTE_KEYS):
-        return "none", 0
+        return "none", 0, "route-not-bound"
     if not any(meta.get(key) for key in ROUTE_KEYS):
-        return "unknown", 0
+        return "unknown", 0, "route-binding-empty"
     for name in ("route_file", "owner_route_file"):
         if meta.get(name):
             _track(meta[name])
@@ -770,7 +779,7 @@ def _route_state(jobs: Path, meta: dict):
     try:
         bound = bound_route(meta, jobs, observer=_route_observer)
         if bound is None:
-            return "unknown", 0
+            return "unknown", 0, "route-binding-missing"
         path, route = bound
         _track(path)
         _track(path.with_name(path.stem + ".outcome.json"))
@@ -782,18 +791,30 @@ def _route_state(jobs: Path, meta: dict):
                    route_id / "finish.json")
         outcome = closed_outcome(path, route)
     except FileNotFoundError:
-        return "unknown", 0
-    except Exception:  # noqa: BLE001 -- unreadable/conflicting evidence is unknown
-        return "unknown", 0
+        return "unknown", 0, "route-file-missing"
+    except json.JSONDecodeError:
+        return "unknown", 0, "route-json-invalid"
+    except ValueError:
+        return "unknown", 0, "route-binding-mismatch"
+    except OSError:
+        return "unknown", 0, "route-unreadable"
+    except Exception as exc:  # noqa: BLE001 -- unreadable/conflicting evidence is unknown
+        return "unknown", 0, "route-resolver-" + type(exc).__name__.lower()
     if outcome is None:
-        return "unknown", 0
+        return "open", 0, "outcome-absent"
     if outcome.get("finish_pending"):
-        return "open", 0
+        return "pending", 0, "finish-pending"
     try:
         mtime = os.stat(path.with_name(path.stem + ".outcome.json")).st_mtime_ns
     except OSError:
         mtime = 0
-    return "closed", mtime
+    return "closed", mtime, "closed"
+
+
+def _route_state(jobs: Path, meta: dict):
+    """Compatibility pair for callers that need only state and activity."""
+    state, activity, _cause = _route_evidence(jobs, meta)
+    return state, activity
 
 
 def _stat_mtime(path, **kwargs) -> int:
@@ -820,6 +841,8 @@ class _Context:
         self.candidate_delivery_baseline: _CandidateDeliveryBaseline | None = None
         self.by_key: dict[str, set[str]] = {}
         self.legacy: dict[tuple, dict[str, set[str]]] = {}
+        self.legacy_scan_unknown = False
+        self.home_process_scan = None
 
     def delivery_index(self):
         if self.delivery is None:
@@ -844,11 +867,100 @@ class _Context:
         if table is None:
             from worker_runtime_home import _builder
             table = {}
-            for attempt in self.snapshot.rows:
+            # Append-only delivery and recovery records can outlive their
+            # registry row. They retain the exact attempt id needed to verify a
+            # legacy key in the same forward direction used by the builder.
+            _refs, delivery_unknown = self.delivery_index()
+            self.legacy_scan_unknown |= delivery_unknown
+            attempts = set(self.snapshot.rows) | set(self.delivery_records)
+            for directory in (self.root / "automatic-replacements" / "by-source",
+                              self.root / "recovery-attention" / "by-source",
+                              self.root / "supervisor-state"):
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            suffix = ".lease" if directory.name == "supervisor-state" else ".json"
+                            if (entry.name.endswith(suffix)
+                                    and not entry.is_symlink()
+                                    and entry.is_file(follow_symlinks=False)):
+                                attempt = entry.name[:-len(suffix)]
+                                if ATTEMPT_RE.fullmatch(attempt):
+                                    attempts.add(attempt)
+                                if len(attempts) > MAX_DELIVERY_RECORDS * 2:
+                                    self.legacy_scan_unknown = True
+                                    break
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    self.legacy_scan_unknown = True
+            for attempt in attempts:
                 key = _builder.worker_home_key(source, harness, worker_type, attempt)
                 table.setdefault(key, set()).add(attempt)
             self.legacy[(source, harness, worker_type)] = table
         return table
+
+    def home_process_evidence(self, key: str) -> tuple[str, str]:
+        """live | absent | unknown for a process that can address this HOME."""
+        if self.home_process_scan is None:
+            refs: set[str] = set()
+            reason = ""
+            try:
+                entries = tuple(Path("/proc").iterdir())
+            except OSError:
+                entries, reason = (), "process-table-unavailable"
+            if len(entries) > MAX_HOME_SCAN_PIDS:
+                entries, reason = entries[:MAX_HOME_SCAN_PIDS], "process-table-over-limit"
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.geteuid():
+                        continue
+                    raw = (entry / "stat").read_text(encoding="ascii")
+                    tail = raw[raw.rfind(")") + 2:].split()
+                    if tail[0] == "Z":
+                        continue
+                    environ = (entry / "environ").read_bytes()
+                    for item in environ.split(b"\0"):
+                        name, sep, value = item.partition(b"=")
+                        if sep and name in (b"HEARTING_WORKER_HOME", b"CODEX_HOME",
+                                            b"CLAUDE_CONFIG_DIR", b"OPENCODE_CONFIG_DIR",
+                                            b"HOME") and value:
+                            refs.add(os.fsdecode(value))
+                    cmdline = (entry / "cmdline").read_bytes()
+                    refs.update(os.fsdecode(item) for item in cmdline.split(b"\0") if item)
+                    refs.add(os.readlink(entry / "cwd"))
+                    fd_dir = entry / "fd"
+                    fds = tuple(fd_dir.iterdir())
+                    if len(fds) > MAX_HOME_SCAN_FDS:
+                        reason = reason or "process-fd-over-limit"
+                    else:
+                        for fd in fds:
+                            try:
+                                refs.add(os.readlink(fd))
+                            except FileNotFoundError:
+                                continue
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.ESRCH, errno.ENOENT):
+                        continue
+                    reason = reason or "process-reference-unreadable"
+            self.home_process_scan = (refs, reason)
+        refs, reason = self.home_process_scan
+        home = str(self.workers_real + os.sep + key)
+        prefix = home + os.sep
+        for value in refs:
+            clean = value.removesuffix(" (deleted)")
+            if (clean == home or clean.startswith(prefix)
+                    or home in clean):
+                return "live", "home-process-reference"
+        from dispatch_contract import _current_observer_is_host_like
+        if not _current_observer_is_host_like():
+            return "unknown", "process-namespace-unverifiable"
+        if reason:
+            return "unknown", reason
+        return "absent", "process-home-references-absent"
 
 
 def _registry_projection(snapshot: _Snapshot, key: str, attempt: str,
@@ -1329,6 +1441,8 @@ def _bind(ctx: _Context, key: str, home_fd: int):
         attempt = identity
     else:
         matches = ctx.legacy_matches(source, harness, worker_type).get(key, set())
+        if ctx.legacy_scan_unknown:
+            return _Verdict("unknown", "legacy-ledger-unverifiable")
         if len(matches) != 1:
             return _Verdict("unknown", "unmapped" if not matches else "ambiguous")
         attempt = next(iter(matches))
@@ -1338,7 +1452,10 @@ def _bind(ctx: _Context, key: str, home_fd: int):
         return _Verdict("unknown", "key-mismatch")
     row = ctx.snapshot.rows.get(attempt)
     if row is None:
-        return _Verdict("unknown", "no-row")
+        # The manifest's identity or a matching existing ledger key is enough
+        # to investigate this orphan; it is not itself proof of completion or
+        # permission to detach. `_orphan_protection` checks existing consumers.
+        return attempt, identity
     claimed = row.meta.get("runtime_home", "")
     if claimed and _declared_home(ctx.root, ctx.workers_real, claimed) != key:
         return _Verdict("unknown", "runtime-home-conflict")
@@ -1358,25 +1475,110 @@ def _declared_index(ctx_snapshot: _Snapshot, root: Path, workers_real: str) -> d
     return by_key
 
 
-def _protections(ctx: _Context, key: str, attempt: str, *, probe_processes: bool):
+def _protections(ctx: _Context, key: str, attempt: str, *, probe_processes: bool,
+                 protect_open_route: bool = False):
     """Use the shared read-only terminal/consumer decision for this home."""
     from dispatch_retention import terminal_protection
     from dispatch_contract import attempt_process_quiescence
-    from dispatch_summary import owner_process_state
+    from dispatch_summary import home_consumer_evidence
 
     return terminal_protection(
         ctx, attempt, probe_processes=probe_processes,
         delivery_state=lambda meta: _delivery_state(ctx.root, meta),
         replacement_state=lambda identity: _replacement_state(ctx.root, ctx.snapshot, identity),
-        route_state=lambda meta: _route_state(ctx.jobs, meta),
-        owner_state=owner_process_state,
+        route_state=lambda meta: _route_evidence(ctx.jobs, meta),
+        owner_state=home_consumer_evidence,
         lease_state=lambda meta: _lease_state(ctx.jobs, meta),
         delivery_index=ctx.delivery_index,
         supervisor_activity=lambda identity: _stat_mtime(
             "supervisor-state/%s.json" % identity,
             dir_fd=ctx.layout.root_fd, follow_symlinks=False),
         process_quiescence=lambda meta: attempt_process_quiescence(meta, terminal_receipt=True),
+        protect_open_route=protect_open_route,
     )
+
+
+def _orphan_lease_state(jobs: Path, attempt: str) -> str:
+    """Probe an attempt-derived supervisor lease when its registry row is gone."""
+    from dispatch_contract import (SUPERVISOR_LEASE_KIND, SUPERVISOR_LEASE_NONCE_RE,
+                                   supervisor_lease_path)
+    try:
+        path = supervisor_lease_path(jobs, attempt)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "none"
+    except OSError:
+        return "unknown"
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_size > 512):
+            return "unknown"
+        try:
+            payload = os.read(fd, 513).decode("ascii")
+        except (OSError, UnicodeDecodeError):
+            return "unknown"
+        fields = dict(line.split("=", 1) for line in payload.splitlines() if "=" in line)
+        expected = (f"kind={SUPERVISOR_LEASE_KIND}\nattempt_id={attempt}\n"
+                    f"nonce={fields.get('nonce', '')}\n")
+        if (len(payload) > 512 or payload != expected
+                or set(fields) != {"kind", "attempt_id", "nonce"}
+                or fields.get("kind") != SUPERVISOR_LEASE_KIND
+                or fields.get("attempt_id") != attempt
+                or SUPERVISOR_LEASE_NONCE_RE.fullmatch(fields.get("nonce", "")) is None):
+            return "unknown"
+        return _flock_probe(str(path))
+    finally:
+        os.close(fd)
+
+
+def _orphan_protection(ctx: _Context, key: str, attempt: str, harness: str):
+    """Prove a valid no-row HOME unused through the existing evidence surfaces."""
+    if attempt in ctx.snapshot.open_refs:
+        return _Verdict("keep", "open-reference")
+    activity = 0
+    children = ctx.snapshot.intents.get(attempt, ())
+    if len(children) > MAX_INTENT_CHILDREN:
+        return _Verdict("unknown", "delivery-unknown", detail="intent-limit")
+    for child in children:
+        row = ctx.snapshot.rows.get(child)
+        if row is None:
+            return _Verdict("unknown", "delivery-unknown", detail="intent-row-missing")
+        state, mtime = _delivery_state(ctx.root, row.meta)
+        if state in ("open", "pending"):
+            return _Verdict("keep", "delivery-" + state)
+        if state == "unknown":
+            return _Verdict("unknown", "delivery-unknown", detail="intent-state-unreadable")
+        activity = max(activity, mtime)
+    refs, index_unknown = ctx.delivery_index()
+    if index_unknown:
+        return _Verdict("unknown", "delivery-index-unknown", detail="delivery-scan-incomplete")
+    if attempt in refs:
+        return _Verdict("keep", "delivery-open")
+    state, mtime = _replacement_state(ctx.root, ctx.snapshot, attempt)
+    if state == "unresolved":
+        return _Verdict("keep", "replacement-unresolved")
+    if state == "unknown":
+        return _Verdict("unknown", "replacement-unknown", detail="replacement-record-unreadable")
+    activity = max(activity, mtime, ctx.delivery_activity.get(attempt, 0))
+    from dispatch_summary import home_consumer_for_identity
+    summary, summary_reason = home_consumer_for_identity(
+        attempt, harness, str(ctx.workers_real + os.sep + key))
+    if summary == "live":
+        return _Verdict("keep", "summary-live")
+    if summary == "unknown":
+        return _Verdict("unknown", "summary-owner-unknown", detail=summary_reason)
+    lease = _orphan_lease_state(ctx.jobs, attempt)
+    if lease == "held":
+        return _Verdict("keep", "lease-held")
+    if lease == "unknown":
+        return _Verdict("unknown", "lease-unknown", detail="orphan-lease-unverifiable")
+    process, process_reason = ctx.home_process_evidence(key)
+    if process == "live":
+        return _Verdict("keep", "not-quiescent")
+    if process == "unknown":
+        return _Verdict("unknown", "quiescence-unverifiable", detail=process_reason)
+    return _Verdict("eligible", activity_ns=activity, attempt=attempt, raw="")
 
 
 # --- state ---------------------------------------------------------------
@@ -1630,7 +1832,7 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
         except _Unreadable:
             return "registry-unreadable"
         row = fresh.rows.get(attempt)
-        if row is None:
+        if (row is None and raw) or (row is not None and not raw):
             return "row-changed"
         current = _Context(ctx.jobs, ctx.root, layout, fresh, ctx.now_ns)
         token = _DEPENDENCIES.set(watched)
@@ -1647,26 +1849,30 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
             _candidate_recipient_groups(ctx.root, fresh, attempt)
             _track(ctx.root / "supervisor-state" / f"{attempt}.json")
             _track(ctx.root / "homes" / "workers" / key / "worker-home.json")
-            verdict = _protections(current, key, attempt, probe_processes=False)
-            if row.raw != raw or verdict.kind != "eligible":
-                if verdict.kind == "keep":
-                    return "protected:" + verdict.reason
-                if verdict.kind == "unknown":
-                    return "defer:" + verdict.reason
-                return "activity:row-changed"
-            ended = _ended_ns(row)
-            if ended is not None:
-                first_ns = max(first_ns, ended)
             try:
                 home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
             except OSError:
                 return "home-gone"
             try:
                 rebound = _bind(current, key, home)
+                found = _read_json("worker-home.json", MAX_MANIFEST_BYTES, dir_fd=home)
             finally:
                 os.close(home)
-            if isinstance(rebound, _Verdict) or rebound[0] != attempt:
+            if (isinstance(rebound, _Verdict) or rebound[0] != attempt or found is None):
                 return "late-binding"
+            harness = found[0].get("harness", "")
+            verdict = (_protections(current, key, attempt, probe_processes=False)
+                       if row is not None
+                       else _orphan_protection(current, key, attempt, harness))
+            if (row is not None and row.raw != raw) or verdict.kind != "eligible":
+                if verdict.kind == "keep":
+                    return "protected:" + verdict.reason
+                if verdict.kind == "unknown":
+                    return "defer:" + verdict.reason
+                return "activity:row-changed"
+            ended = _ended_ns(row) if row is not None else None
+            if ended is not None:
+                first_ns = max(first_ns, ended)
         finally:
             _DEPENDENCIES.reset(token)
     except (OSError, _Unreadable):
@@ -1732,12 +1938,24 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str, raw: str,
                 with _flock(layout.ret_fd, "view.lock", fcntl.LOCK_EX | fcntl.LOCK_NB) as acquired:
                     if not acquired:
                         return "view-lock-busy"
-                    # The summary owner was proven dead or absent during preparation. A
-                    # dead pid/start cannot return and the unchanged row declares no
-                    # other, so its /proc walk stays out of this lock.
-                    lease = _lease_state(ctx.jobs, row.meta)
-                    if lease in ("held", "unknown"):
-                        return ("protected:" if lease == "held" else "defer:") + "lease-" + lease
+                    # Process-table observation stays outside the registry lock.
+                    # Recheck only the exact existing lease and owner/provider
+                    # admission records here; native provider starts share the
+                    # attempt-reference lock held through this rename.
+                    if row is not None:
+                        lease = _lease_state(ctx.jobs, row.meta)
+                        if lease in ("held", "unknown"):
+                            return ("protected:" if lease == "held" else "defer:") + "lease-" + lease
+                        from dispatch_summary import home_consumer_evidence
+                        summary, _summary_reason = home_consumer_evidence(row.meta)
+                        if summary in ("live", "unknown"):
+                            return ("protected:" if summary == "live" else "defer:") + \
+                                ("summary-live" if summary == "live" else "summary-owner-unknown")
+                    else:
+                        orphan_verdict = _orphan_protection(current, key, attempt, harness)
+                        if orphan_verdict.kind != "eligible":
+                            prefix = "protected:" if orphan_verdict.kind == "keep" else "defer:"
+                            return prefix + orphan_verdict.reason
                     try:
                         home = os.open(key, _DIR_FLAGS, dir_fd=layout.workers_fd)
                     except OSError:
@@ -1817,6 +2035,13 @@ def _count(table: dict, reason: str) -> None:
     table[reason] = table.get(reason, 0) + 1
 
 
+def _cause_bucket(value: str) -> str:
+    """Bound diagnostic cardinality and strip proc identifiers and messages."""
+    token = str(value or "unknown").split(":", 1)[0].lower()
+    token = re.sub(r"[^a-z0-9_-]", "-", token)[:64].strip("-")
+    return token or "unknown"
+
+
 def _renewed_protection(ctx: _Context, key: str, attempt: str) -> bool:
     """Only a fresh, positive protection can restart an established clock."""
     try:
@@ -1873,7 +2098,7 @@ def _sweep(jobs: Path, now_ns: int, force: bool, started: float) -> dict:
 def _pass(jobs: Path, root: Path, layout: _Layout, state: dict, now_ns: int, started: float) -> dict:
     result = {"examined": 0, "eligible": 0, "due": 0, "removed": 0, "partial": 0,
               "ignored": 0, "detached_leftover": 0, "unproven_leftover": 0,
-              "kept": {}, "unknown": {}}
+              "kept": {}, "unknown": {}, "unknown_causes": {}}
     deadline = time.monotonic() + REMOVE_DEADLINE_SECONDS
     budget = REMOVE_LIMIT
     # Keep one slot for newly due homes even if every interrupted leaf is stuck.
@@ -1929,10 +2154,14 @@ def _pass(jobs: Path, root: Path, layout: _Layout, state: dict, now_ns: int, sta
                     if verdict.kind == "keep":
                         since.pop(key, None)
                     _count(result["unknown" if verdict.kind == "unknown" else "kept"], verdict.reason)
+                    if verdict.kind == "unknown" and verdict.detail:
+                        causes = result["unknown_causes"].setdefault(verdict.reason, {})
+                        _count(causes, _cause_bucket(verdict.detail))
                     continue
                 result["eligible"] += 1
                 first = since.setdefault(key, now_ns)
-                ended = _ended_ns(snapshot.rows[verdict.attempt])
+                candidate_row = snapshot.rows.get(verdict.attempt)
+                ended = _ended_ns(candidate_row) if candidate_row is not None else None
                 start = ended if ended is not None else first
                 mark = _stat_mtime(key, dir_fd=layout.views_fd, follow_symlinks=False)
                 idle_from = max(start, verdict.activity_ns, mark, ident[3])
@@ -1996,12 +2225,20 @@ def _examine(ctx: _Context, key: str):
         if st.st_uid != os.geteuid():
             return _Verdict("unknown", "foreign-owner"), None
         bound = _bind(ctx, key, home)
+        harness = ""
+        if not isinstance(bound, _Verdict):
+            found = _read_json("worker-home.json", MAX_MANIFEST_BYTES, dir_fd=home)
+            if found is None:
+                return _Verdict("unknown", "manifest-missing"), None
+            harness = found[0].get("harness", "")
     finally:
         os.close(home)
     if isinstance(bound, _Verdict):
         return bound, None
     attempt, _identity_value = bound
-    verdict = _protections(ctx, key, attempt, probe_processes=True)
+    verdict = (_protections(ctx, key, attempt, probe_processes=True)
+               if attempt in ctx.snapshot.rows
+               else _orphan_protection(ctx, key, attempt, harness))
     return verdict, _identity(st) + [st.st_mtime_ns]
 
 
