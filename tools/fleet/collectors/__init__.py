@@ -367,7 +367,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     try:
         prepare = getattr(modules.get("codex"), "prepare_tick", None)
         if prepare and any(s.harness == "codex" for s in sessions):
-            codex_tick = prepare(sessions)
+            codex_tick = prepare(sessions, wait_timeout=0.0 if fast_first else 0.2)
     except Exception:
         pass
     opencode_tick = None
