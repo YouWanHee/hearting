@@ -316,11 +316,26 @@ class WorkerHomes(unittest.TestCase):
             self.assertFalse((home / 'plugins').exists())
             self.assertEqual((home / 'agent-config/models.conf').read_text(), 'user-model-policy')
             args = codex_worker_arguments(env)
+            self.assertIn('features.plugins=false', args)
             self.assertIn('features.multi_agent=false', args)
             self.assertIn('features.default_mode_request_user_input=false', args)
             self.assertIn('mcp_servers={"external"={"command"="true","enabled"=false}}', args)
             self.assertTrue(any('test-skill' in arg for arg in args))
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()})
+
+    def test_nested_codex_owner_uses_plugin_feature_override_and_is_destination(self):
+        (self.source / 'auth.json').write_text('{}')
+        (self.source / 'config.toml').write_text('[features]\nhooks=true\n')
+        self.env['CODEX_HOME'] = str(self.source)
+        destination = self.base / 'nested-owner-home'
+
+        values = prepare_worker_home(ROOT, 'codex', 'owner', 'nested-owner',
+                                     env=self.env, destination=destination)
+
+        self.assertIn('features.plugins=false', codex_worker_arguments(values))
+        self.assertEqual(Path(values['CODEX_HOME']).resolve(), destination.resolve())
+        manifest = json.loads((destination / 'worker-home.json').read_text())
+        self.assertTrue(manifest['destination'])
 
     def test_worker_accounts_select_only_auth_sources_and_keep_settings_on_parent(self):
         parent_home = self.base / 'parent-home'
