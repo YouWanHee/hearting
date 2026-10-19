@@ -32,9 +32,12 @@ def require_native_runtime(testcase):
 
 class PermissionProfileTest(unittest.TestCase):
     def setUp(self):
-        # Keep this fixture in the isolated runner's writable temp root. Its
-        # sibling worktree and outside targets remain separate from the repo.
-        self.temp = tempfile.TemporaryDirectory(prefix="hearting-codex-git-")
+        # Codex's built-in :workspace profile makes /tmp and the launch
+        # TMPDIR writable. Keep these sibling fixtures under the checkout so
+        # native denial checks measure the named profile's read-only rules.
+        checkout_root = Path(__file__).resolve().parents[1]
+        self.temp = tempfile.TemporaryDirectory(
+            prefix=".hearting-codex-git-", dir=checkout_root)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.repo = self.base / "repo"
@@ -44,7 +47,14 @@ class PermissionProfileTest(unittest.TestCase):
         self.agent_home = self.base / "agent-home"
         for path in (self.artifact, self.dispatch_state, self.agent_home):
             path.mkdir(mode=0o700)
-        self.env = {"PATH": os.environ["PATH"]}
+        self.git_safety_env = {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(self.repo),
+            "GIT_CONFIG_KEY_1": "safe.directory",
+            "GIT_CONFIG_VALUE_1": str(self.wt),
+        }
+        self.env = {"PATH": os.environ["PATH"], **self.git_safety_env}
         for key, name in (("HOME", "home"), ("CODEX_HOME", "codex-home"),
                           ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
                           ("XDG_RUNTIME_DIR", "runtime"), ("TMPDIR", "tmp"),
@@ -66,13 +76,24 @@ class PermissionProfileTest(unittest.TestCase):
         return subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env,
                               capture_output=True, text=True, check=True).stdout.strip()
 
+    def assert_outside_native_temp_roots(self, path):
+        target = Path(path).resolve()
+        temp_roots = {Path("/tmp").resolve()}
+        if self.env.get("TMPDIR"):
+            temp_roots.add(Path(self.env["TMPDIR"]).resolve())
+        for root in temp_roots:
+            self.assertNotEqual(target, root, f"fixture target is a native writable temp root: {root}")
+            self.assertNotIn(root, target.parents,
+                             f"fixture target {target} overlaps native writable temp root {root}")
+
     def profile(self, network=False, *, native=False):
         build = lambda: profiles.commit_profile_config(
             str(self.wt), list(map(str, self.roots)), "workspace-write", network)
-        if native:
-            return build()
-        with mock.patch.object(profiles, "named_profiles_available", return_value=True):
-            return build()
+        with mock.patch.dict(os.environ, self.git_safety_env):
+            if native:
+                return build()
+            with mock.patch.object(profiles, "named_profiles_available", return_value=True):
+                return build()
 
     def execution_grant(self, *, read_roots=(), network=False):
         request_path = self.base / "execution-access.json"
@@ -124,6 +145,8 @@ class PermissionProfileTest(unittest.TestCase):
 
     def test_native_commit_and_protected_paths(self):
         require_native_runtime(self)
+        self.assertEqual(self.repo.parent, self.wt.parent)
+        self.assert_outside_native_temp_roots(self.repo / "source.txt")
         probe = self.base / "probe.py"
         probe.write_text('''from pathlib import Path
 import subprocess,sys
@@ -178,6 +201,8 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
     def test_native_workspace_write_and_granted_external_read_root(self):
         require_native_runtime(self)
         readonly = self.base / "readonly-data"
+        self.assertEqual(readonly.parent, self.wt.parent)
+        self.assert_outside_native_temp_roots(readonly)
         readonly.mkdir(mode=0o700)
         (readonly / "visible.txt").write_text("read granted\n", encoding="utf-8")
         grant = self.execution_grant(read_roots=(readonly,))
