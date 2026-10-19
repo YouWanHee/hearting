@@ -1391,8 +1391,6 @@ def _run_replay_impl(output_dir: Path) -> dict:
             if continuation_turn.get("status") != "completed":
                 raise ReplayBlocked("native-continuation-turn-interrupted")
             continuation_messages, continuation_tools = _turn_items(continuation_turn)
-            if not continuation_messages:
-                raise ReplayFailed("native-continuation-final-report-missing")
             _write_json(output_dir / "continuation-turn.json", continuation_turn)
             continuation_occurrences = sum(1 for turn in _all_turns(endpoint, thread_id)
                                            if _turn_for_client_message([turn], continuation_id) is not None)
@@ -1414,7 +1412,7 @@ def _run_replay_impl(output_dir: Path) -> dict:
                 "duty_state": settled_duty.get("state"),
                 "attempt_row_status": "done",
             })
-            final_text = continuation_messages[-1]
+            final_text = continuation_messages[-1] if continuation_messages else ""
             tool_trace = [*initial_tools, *continuation_tools]
             (output_dir / "turn-output.txt").write_text(final_text + "\n", encoding="utf-8")
             (output_dir / "tool-trace.jsonl").write_text("".join(

@@ -522,6 +522,36 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
             "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
             "direct_question", "overall_acceptance"))
 
+    def test_run_replay_missing_first_report_still_evaluates_later_cases(self):
+        output = self.root / "orchestration-empty-report"
+        output.mkdir(mode=0o700)
+        with self._mock_native_runtime(output, assert_d1_before_d2=True) as native:
+            observed_history = replay._all_turns.side_effect
+
+            def empty_report_history(*args):
+                turns = observed_history(*args)
+                for turn in turns:
+                    if turn.get("id") == "continuation-turn":
+                        turn["items"] = [item for item in turn["items"]
+                                         if item.get("type") != "agentMessage"]
+                return turns
+
+            replay._all_turns.side_effect = empty_report_history
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertTrue(native["d1_before_d2"])
+        self.assertEqual((output / "turn-output.txt").read_text(), "\n")
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertFalse(cases["d1_first_report"]["checks"]["report_matches_fixture_facts"])
+        for case_id in ("d2_duplicate_cleanup", "d3_new_conflict", "direct_question"):
+            self.assertEqual(cases[case_id]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
+        self._assert_case_records(stored, (
+            "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
+            "direct_question", "overall_acceptance"))
+
     def test_run_replay_d2_failure_does_not_skip_independent_later_cases(self):
         output = self.root / "orchestration-d2-fail"
         output.mkdir(mode=0o700)
