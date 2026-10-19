@@ -2608,6 +2608,63 @@ class PermissionPosturePassthrough(unittest.TestCase):
                 self.assertIn("--permission-mode", command)
 
 
+class OwnerRuntimePermissionTurnProjectionTest(unittest.TestCase):
+    def test_known_unknown_known_turns_keep_binding_and_launch_effective_bytes(self):
+        import commit_policy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            git_dir = Path(subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"], text=True
+            ).strip())
+            effective = root / "effective.json"
+            effective.write_bytes(b"immutable launch effective bytes\n")
+            original = effective.read_bytes()
+            context = {
+                "adapter": "claude", "attempt_id": "att-owner", "worker_type": "owner",
+                "dispatch_depth": 1, "capability": "autopilot-code", "worktree": str(root),
+                "route_file": "", "route_id": "", "route_hash": "",
+                "artifact_root": str(root / ".agent_reports"), "artifact_output_dir": "",
+                "permission_mode_requested": "allowlist", "agent_home": str(ROOT),
+            }
+            args = SimpleNamespace(
+                runtime_harness="claude", parent_attempt_id="att-owner", worktree=str(root),
+                jobs=str(root / "jobs.log"), turn_timeout=5, state_file=None,
+                claude_command=None, add_dir=[], model=None, effort=None, disallowed_tool=[],
+                permission_mode="acceptEdits", allowed_tool=[], turn_transport="resume-process",
+                owner_runtime_turn_ordinal=0,
+            )
+            events = []
+            with mock.patch.object(supervisor.commit_policy, "read_runtime_permission_context",
+                                   return_value=context), \
+                 mock.patch.object(supervisor.commit_policy, "runtime_permission_context_is_current",
+                                   return_value=True), \
+                 mock.patch.object(supervisor, "submit_turn", return_value=supervisor.TurnSubmission(
+                     "submitted", {"type": "result", "result": "ok"}, 0)), \
+                 mock.patch.object(supervisor, "emit", side_effect=events.append):
+                modes = []
+                for ordinal, active in enumerate((False, True, False), 1):
+                    marker = git_dir / "MERGE_HEAD"
+                    if active:
+                        marker.write_text("fixture\n", encoding="utf-8")
+                    else:
+                        marker.unlink(missing_ok=True)
+                    args.owner_runtime_turn_ordinal = ordinal
+                    supervisor.run_turn(args, "session-stable", "continue", resume=ordinal > 1)
+                    modes.append(args.permission_mode)
+
+            self.assertEqual(modes, ["acceptEdits", "plan", "acceptEdits"])
+            rows = [item for item in events
+                    if item.get("type") == "dispatch.supervisor.permission-projection"]
+            self.assertEqual([(item["attempt_id"], item["thread_id"], item["turn_id"]) for item in rows],
+                             [("att-owner", "session-stable", str(index)) for index in (1, 2, 3)])
+            self.assertEqual([item["git_operation"] for item in rows], ["none", "merge", "none"])
+            self.assertEqual([item["file_enforcement"] for item in rows],
+                             ["tool-permission"] * 3)
+            self.assertEqual(effective.read_bytes(), original)
+
+
 class ClaudeContextBudgetPropagation(unittest.TestCase):
     def test_first_and_resumed_supervisor_processes_inherit_budget_and_runtime_home(self):
         args = SimpleNamespace(

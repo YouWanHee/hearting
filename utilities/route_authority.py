@@ -1184,6 +1184,108 @@ def recovery_task(record, source, history):
     return history["task"]
 
 
+def permission_mismatch_detail(previous, current):
+    """Describe a historical permission difference with its exact evidence source."""
+    old, new = _granted_permission_pair(previous, current)
+    if old == new:
+        return None
+
+    def first_difference(left, right, prefix=()):
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right)):
+                if key not in left or key not in right:
+                    return (*prefix, key), left.get(key, "<missing>"), right.get(key, "<missing>")
+                found = first_difference(left[key], right[key], (*prefix, key))
+                if found:
+                    return found
+        elif left != right:
+            return prefix, left, right
+        return None
+
+    difference = first_difference(old, new) or ((), old, new)
+    path, before, after = difference
+    labels = ".".join(map(str, path))
+    if any(key in labels for key in ("read_roots", "read_enforcement")):
+        axis = "read"
+    elif any(key in labels for key in ("network", "network_allowed", "nested_headless_network")):
+        axis = "network"
+    elif any(key in labels for key in ("writable_roots", "file_enforcement", "runtime_sandbox")):
+        axis = "file"
+    elif "execution_access" in labels and not any(
+            key in labels for key in ("writable_roots", "read_roots", "network")):
+        old_access = old.get("execution_access") or {}
+        new_access = new.get("execution_access") or {}
+        if not old_access.get("writable_roots") and (old_access.get("read_roots") or new_access.get("read_roots")):
+            axis = "read"
+        else:
+            axis = "file"
+    else:
+        axis = "adapter-permission"
+    evidence = _historical_permission_evidence(previous)
+    return (f"axis={axis} field={labels or 'applied_permissions'} "
+            f"predecessor={before!r} candidate={after!r} {evidence} child_spawned=0")
+
+
+def _historical_permission_evidence(previous):
+    """Name only canonical predecessor files whose bytes can be verified read-only."""
+    import hashlib
+    import stat
+    jobs = previous.get("jobs")
+    attempt = previous.get("attempt_id")
+    if not isinstance(jobs, str) or not isinstance(attempt, str) \
+            or re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt) is None:
+        return "evidence=historical-input-or-effective-unavailable"
+    state_root = Path(jobs).resolve(strict=False).parent
+    sealed = state_root / "automatic-replacements" / "inputs" / f"{attempt}.json"
+    effective = state_root / "execution-access" / "attempts" / attempt / "effective.json"
+    facts = []
+    for label, path in (("sealed_input", sealed), ("effective", effective)):
+        descriptor = None
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or path.is_symlink() or before.st_size > 4 * 1024 * 1024:
+                continue
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                                 | getattr(os, "O_NOFOLLOW", 0))
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                    or opened.st_size > 4 * 1024 * 1024):
+                continue
+            chunks = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 4 * 1024 * 1024:
+                    chunks = []
+                    break
+                chunks.append(chunk)
+            if total > 4 * 1024 * 1024:
+                continue
+            raw = b"".join(chunks)
+            decoded = json.loads(raw)
+            if label == "sealed_input" and decoded != previous:
+                continue
+            if label == "effective":
+                route_id = previous.get("route_id") or previous.get("owner_route_id")
+                if (decoded.get("attempt_id") != attempt or not route_id
+                        or decoded.get("route_id") != route_id
+                        or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                            str(decoded.get("route_hash") or ""))):
+                    continue
+            digest = hashlib.sha256(raw).hexdigest()
+            facts.append(f"{label}={path}#sha256:{digest}")
+        except OSError:
+            continue
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    return "evidence=" + (";".join(facts) if facts else "historical-input-or-effective-unavailable")
+
+
 def require_recovery_binding(record, source, candidate, jobs):
     """The same lineage check at task loading, registration and actual launch.
 
@@ -1294,8 +1396,7 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     for flag, expected in current.items():
         if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
             raise _contract_error("replacement-argv-mismatch", flag)
-    granted = granted_permissions(candidate.get("applied_permissions"), candidate.get("launch_home"), candidate.get("worktree"))
-    sealed = granted_permissions(history.get("applied_permissions"), history.get("launch_home"), history.get("worktree"))
+    sealed, granted = _granted_permission_pair(history, candidate)
     cross_owner = owner and candidate.get("harness") != history.get("harness")
     if cross_owner:
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
@@ -1307,10 +1408,8 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     # Its runtime permission spelling differs, while the exact approved request
     # and addresses above remain bound. Same-harness grants stay comparable.
     if not cross_owner and granted != sealed:
-        if not drift:
-            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
-        from hearting_gates import same_work_or_refuse
-        same_work_or_refuse("replacement-runtime-drift", "applied_permissions")
+        detail = permission_mismatch_detail(history, candidate)
+        raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
     if not owner and _work_options(candidate.get("argv", [])) != _work_options(history.get("argv", [])):
         raise _contract_error("replacement-argv-mismatch")
 
@@ -1509,7 +1608,7 @@ def require_resource_predecessors(rows, candidate):
 # nests inside the parent's -- while the work and the permissions granted to it (argv with
 # `--sandbox` and the parent tuple, network, the access grant, Claude/OpenCode permissions)
 # stay the same and are still compared.
-LAUNCH_LOCATION_VALUES = frozenset({"launch_lifecycle", "runtime_sandbox"})
+LAUNCH_LOCATION_VALUES = frozenset({"launch_lifecycle"})
 
 # The sealed launch input of one attempt: the work and its granted permissions.
 RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task", "retry_brief",
@@ -1558,6 +1657,62 @@ def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
     for root in sorted(roots, key=len, reverse=True):
         text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
     return json.loads(text)
+
+
+def _same_verified_workspace_write_parent(previous, current) -> bool:
+    """Whether both sealed launches name the same known Codex workspace-write parent.
+
+    The current launch's parent tuple is revalidated by the existing wrapper before
+    launch-input sealing. Requiring the complete tuple to match its predecessor keeps
+    this normalization tied to that exact boundary; absent, unknown, or changed parent
+    evidence leaves the launcher sandbox values distinct.
+    """
+    if previous.get("harness") != "codex" or current.get("harness") != "codex":
+        return False
+    old, new = previous.get("resolved") or {}, current.get("resolved") or {}
+    depth = str(old.get("dispatch_depth") or "")
+    if depth not in {"1", "2"} or str(new.get("dispatch_depth") or "") != depth:
+        return False
+    for key in ("parent_harness", "parent_transport", "parent_sandbox", "launch_authority"):
+        value = old.get(key)
+        if (not isinstance(value, str) or not value.strip() or value.lower() == "unknown"
+                or value != new.get(key)):
+            return False
+    if old.get("parent_harness") != "codex" or old.get("parent_sandbox") != "workspace-write":
+        return False
+    for key in ("parent_session_id", "parent_attempt_id"):
+        identity = old.get(key)
+        if identity != new.get(key):
+            return False
+        if (identity is not None and
+                (not isinstance(identity, str) or not identity.strip() or identity.lower() == "unknown")):
+            return False
+    identity_key = "parent_session_id" if depth == "1" else "parent_attempt_id"
+    identity = old.get(identity_key)
+    if (not isinstance(identity, str) or not identity.strip() or identity.lower() == "unknown"
+            or identity != new.get(identity_key)):
+        return False
+    return True
+
+
+def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
+    """Compare effective grants, collapsing only a proven nested Codex sandbox layer."""
+    old_applied = previous.get("applied_permissions") or {}
+    new_applied = current.get("applied_permissions") or {}
+    old = granted_permissions(old_applied, previous.get("launch_home"), previous.get("worktree"))
+    new = granted_permissions(new_applied, current.get("launch_home"), current.get("worktree"))
+    if _same_verified_workspace_write_parent(previous, current):
+        if (old_applied.get("launch_lifecycle") == "foreground-scoped"
+                and new_applied.get("launch_lifecycle") == "detached"
+                and old.get("runtime_sandbox") == "danger-full-access"):
+            old = dict(old)
+            old["runtime_sandbox"] = "workspace-write"
+        elif (new_applied.get("launch_lifecycle") == "foreground-scoped"
+                and old_applied.get("launch_lifecycle") == "detached"
+                and new.get("runtime_sandbox") == "danger-full-access"):
+            new = dict(new)
+            new["runtime_sandbox"] = "workspace-write"
+    return old, new
 
 
 # A sealed fact and the same value computed again now. The release a launch ran from is where it
@@ -1614,9 +1769,9 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
 
 def same_sealed_work(previous, current, *, recovery=None) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
+    old_grants, new_grants = _granted_permission_pair(previous, current)
     exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
-            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"), previous.get("worktree"))
-            == granted_permissions(current.get("applied_permissions"), current.get("launch_home"), current.get("worktree")))
+            and old_grants == new_grants)
     if exact or recovery is None:
         return exact
     record, source, history, route = recovery

@@ -118,6 +118,83 @@ event('step_finish', part={'reason':'stop'})
         with self.assertRaisesRegex(runtime.OpenCodeTransportError, 'binding-unsafe'):
             runtime.read_binding(self.args)
 
+    def test_bound_owner_turn_config_reprojects_and_keeps_read_root(self):
+        import commit_policy
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        git_dir = Path(subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "--absolute-git-dir"], text=True
+        ).strip())
+        read_root = self.root.parent / (self.root.name + "-read-only")
+        read_root.mkdir()
+        import shutil
+        self.addCleanup(shutil.rmtree, read_root, True)
+        effective = self.root / "effective.json"
+        effective.write_bytes(b"immutable launch effective bytes\n")
+        original = effective.read_bytes()
+        capture = self.root / "permission-configs.jsonl"
+        self.program("""
+import json, os
+with open(os.environ['PERMISSION_CONFIGS'], 'a', encoding='utf-8') as out:
+ out.write(json.dumps({'config':json.loads(os.environ['OPENCODE_CONFIG_CONTENT'])}) + '\\n')
+event('step_start', part={})
+event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
+event('step_finish', part={'reason':'stop'})
+""")
+        context = {
+            "adapter": "opencode", "attempt_id": self.args.parent_attempt_id,
+            "worker_type": "owner", "dispatch_depth": 1, "capability": "autopilot-code",
+            "worktree": str(self.root), "route_file": "", "route_id": "", "route_hash": "",
+            "artifact_root": str(self.root / ".agent_reports"), "artifact_output_dir": "",
+            "agent_home": str(ROOT), "opencode_config_base": json.dumps({"permission": {"bash": "allow"}}),
+            "report_bundle_root": None, "execution_access_roots": [],
+            "execution_access_read_roots": [str(read_root)], "contract_read_roots": [],
+            "selected_agent": "build",
+        }
+        args = SimpleNamespace(
+            runtime_harness="opencode", parent_attempt_id=self.args.parent_attempt_id,
+            worktree=str(self.root), jobs=self.args.jobs, turn_timeout=2,
+            opencode_command=shlex.join([sys.executable, str(self.script)]),
+            model=None, variant=None, opencode_agent="build", owner_runtime_turn_ordinal=0,
+        )
+        events = []
+        with unittest.mock.patch.dict(os.environ, {"PERMISSION_CONFIGS": str(capture)}), \
+             unittest.mock.patch.object(commit_policy, "read_runtime_permission_context", return_value=context), \
+             unittest.mock.patch.object(commit_policy, "runtime_permission_context_is_current", return_value=True), \
+             unittest.mock.patch.object(fixture.supervisor, "emit", side_effect=events.append):
+            for ordinal, active in enumerate((False, True, False), 1):
+                marker = git_dir / "MERGE_HEAD"
+                if active:
+                    marker.write_text("fixture\n", encoding="utf-8")
+                else:
+                    marker.unlink(missing_ok=True)
+                args.owner_runtime_turn_ordinal = ordinal
+                fixture.supervisor.run_turn(args, "ignored-session", "continue", resume=ordinal > 1)
+
+        configs = [json.loads(line)["config"] for line in capture.read_text().splitlines()]
+        rows = [item for item in events
+                if item.get("type") == "dispatch.supervisor.permission-projection"]
+        self.assertEqual(len(configs), 3)
+        for index, config in enumerate(configs):
+            permissions = config["permission"]
+            self.assertEqual(permissions["external_directory"][str(read_root)], "allow")
+            edit = permissions["edit"]
+            if index == 1:
+                self.assertEqual(edit["*"], "deny")
+            else:
+                self.assertTrue(edit.get(str(read_root)) == "deny"
+                                or edit.get(str(read_root) + "/**") == "deny", edit)
+        self.assertEqual(configs[0]["permission"]["edit"]["*"], "allow")
+        self.assertEqual(configs[1]["permission"]["edit"]["*"], "deny")
+        self.assertEqual(configs[2]["permission"]["edit"]["*"], "allow")
+        self.assertEqual([(item["attempt_id"], item["thread_id"], item["turn_id"]) for item in rows],
+                         [(self.args.parent_attempt_id, "ses_native", str(index)) for index in (1, 2, 3)])
+        self.assertEqual([item["git_operation"] for item in rows], ["none", "merge", "none"])
+        self.assertEqual([item["file_enforcement"] for item in rows], ["tool-permission"] * 3)
+        self.assertEqual([item["network_enforcement"] for item in rows], ["none"] * 3)
+        self.assertEqual(effective.read_bytes(), original)
+
     def test_exit_before_final_stop_is_not_success(self):
         self.program("event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})\n")
         with self.assertRaisesRegex(runtime.OpenCodeTransportError, 'final-stop-missing'):

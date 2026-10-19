@@ -220,6 +220,10 @@ def _reseal_allowed(jobs, aid, path, payload, *, lines=None, prior=None):
     lines = jobs.read_text(encoding='utf-8', errors='replace').splitlines() if lines is None else lines
     same_work = route_authority.same_sealed_work(previous, stored)
     if not same_work:
+        detail = route_authority.permission_mismatch_detail(previous, stored)
+        if detail:
+            raise DC.DispatchContractError('replacement-input-tuple-mismatch', detail)
+    if not same_work:
         reservation = source_reservation(jobs, prior) if prior else None
         record = _read(_record_path(jobs, reservation['family_id'])) if reservation else None
         if not record or record.get('replacement_attempt_id') != aid:

@@ -228,6 +228,48 @@ class CommitPolicyTest(unittest.TestCase):
             self.assertIsNone(projection["task_publish_scope"])
             self.assertFalse(commit_policy.may_commit(owner))
 
+    def test_launch_projection_is_shared_but_rechecked_at_the_fence(self):
+        owner = self.args("owner", dispatch_depth=1)
+        captured = commit_policy.capture_launch_permission_projection(owner)
+        self.assertEqual(commit_policy.launch_permission_projection(owner), captured)
+        with mock.patch.object(commit_policy, "runtime_permission_projection", return_value=captured) as observe:
+            self.assertEqual(commit_policy.assert_launch_permission_projection(owner), captured)
+        observe.assert_called_once_with(owner)
+
+        changed = dict(captured, git_state_known=False, git_operation=None,
+                       observation_only=True, may_commit=False, task_publish_scope=None)
+        with mock.patch.object(commit_policy, "runtime_permission_projection", return_value=changed):
+            with self.assertRaises(Exception) as raised:
+                commit_policy.assert_launch_permission_projection(owner)
+        self.assertEqual(raised.exception.reason, "runtime-permission-projection-changed")
+        self.assertIn("axis=git_state_known", raised.exception.detail)
+        self.assertIn("predecessor=True", raised.exception.detail)
+        self.assertIn("candidate=False", raised.exception.detail)
+        self.assertIn("child_spawned=0", raised.exception.detail)
+
+    def test_git_marker_and_unknown_to_known_transitions_fail_before_spawn(self):
+        owner = self.args("owner", dispatch_depth=1)
+        commit_policy.capture_launch_permission_projection(owner)
+        git_dir = commit_policy.worktree_git_dirs(owner.worktree)[0]
+        marker = git_dir / "MERGE_HEAD"
+        marker.write_text("fixture\n", encoding="utf-8")
+        try:
+            with self.assertRaises(Exception) as active:
+                commit_policy.assert_launch_permission_projection(owner)
+            self.assertIn("axis=git_operation", active.exception.detail)
+            self.assertIn("candidate='merge'", active.exception.detail)
+        finally:
+            marker.unlink(missing_ok=True)
+
+        with mock.patch.object(commit_policy, "worktree_git_dirs", return_value=None):
+            unknown = commit_policy.capture_launch_permission_projection(owner)
+        self.assertFalse(unknown["git_state_known"])
+        with self.assertRaises(Exception) as restored:
+            commit_policy.assert_launch_permission_projection(owner)
+        self.assertIn("axis=git_state_known", restored.exception.detail)
+        self.assertIn("predecessor=False", restored.exception.detail)
+        self.assertIn("candidate=True", restored.exception.detail)
+
     def test_merge_state_keeps_owner_in_observation_mode(self):
         git = ["git", "-C", str(self.linked)]
         subprocess.run([*git, "switch", "-c", "merge-source"], check=True, capture_output=True)
@@ -288,9 +330,12 @@ class CommitPolicyTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 used = calls(harness) | shared
                 self.assertLessEqual({"prompt_clause", "registry_fragment"}, used)
-        # Each adapter reads the same Git-state and publication projection.
+        # Each launch captures the same projection; the shared registry path
+        # rechecks it at registration and at the final spawn fence.
         for harness in HARNESSES:
-            self.assertIn("runtime_permission_projection", calls(harness))
+            self.assertIn("capture_launch_permission_projection", calls(harness))
+        self.assertIn("launch_permission_projection", calls("codex"))
+        self.assertIn("assert_launch_permission_projection", common_calls())
 
 
 

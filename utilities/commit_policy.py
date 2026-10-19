@@ -15,10 +15,11 @@ means -- a sandbox profile, permission rules, or nothing beyond the prompt.
 """
 from __future__ import annotations
 
-import subprocess
+import copy
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from worker_bootstrap import stage_commit_enabled
@@ -128,6 +129,76 @@ def runtime_permission_projection(args) -> dict[str, object]:
             if not observation_only and getattr(args, "worker_type", None) == "owner"
             else None
         ),
+    }
+
+
+def capture_launch_permission_projection(args) -> dict[str, object]:
+    """Capture one launch's shared Git permission projection for its consumers.
+
+    The snapshot is deliberately scoped to the in-memory launch arguments. It
+    is not a durable authorization record; ``assert_launch_permission_projection``
+    re-observes Git at the existing fenced launch boundary.
+    """
+    projection = runtime_permission_projection(args)
+    args._launch_permission_projection = copy.deepcopy(projection)
+    return copy.deepcopy(projection)
+
+
+def launch_permission_projection(args) -> dict[str, object]:
+    """Return this launch's captured projection, or observe afresh for read-only callers."""
+    snapshot = getattr(args, "_launch_permission_projection", None)
+    if isinstance(snapshot, dict):
+        return copy.deepcopy(snapshot)
+    return runtime_permission_projection(args)
+
+
+def assert_launch_permission_projection(args) -> dict[str, object]:
+    """Keep the existing Git safety boundary and refuse a changed launch tuple."""
+    expected = getattr(args, "_launch_permission_projection", None)
+    current = runtime_permission_projection(args)
+    if not isinstance(expected, dict):
+        return current
+    for axis in ("git_state_known", "git_operation", "observation_only", "may_commit",
+                 "task_publish_scope"):
+        before, after = expected.get(axis), current.get(axis)
+        if before != after:
+            raise _permission_projection_changed(axis, before, after)
+    return current
+
+
+def _permission_projection_changed(axis: str, before: object, after: object):
+    from dispatch_contract import DispatchContractError
+
+    return DispatchContractError(
+        "runtime-permission-projection-changed",
+        f"axis={axis} predecessor={before!r} candidate={after!r} "
+        "evidence=worktree-git-operation child_spawned=0",
+    )
+
+
+def permission_projection_event(state, *, adapter: str, attempt_id: str,
+                                thread_id: str, turn_id: str, sandbox: str,
+                                network_access: bool, file_enforcement: str,
+                                read_enforcement: str, network_enforcement: str) -> dict[str, object] | None:
+    """Build optional per-turn configuration evidence without changing launch records."""
+    if not isinstance(state, dict):
+        return None
+    return {
+        "type": "dispatch.supervisor.permission-projection",
+        "evidence": "turn-start-configuration",
+        "adapter": adapter,
+        "attempt_id": attempt_id,
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "sandbox": sandbox,
+        "network_access": bool(network_access),
+        "file_enforcement": file_enforcement,
+        "read_enforcement": read_enforcement,
+        "network_enforcement": network_enforcement,
+        "git_state_known": bool(state.get("git_state_known")),
+        "git_operation": state.get("git_operation") or "none",
+        "observation_only": bool(state.get("observation_only")),
+        "may_commit": bool(state.get("may_commit")),
     }
 
 

@@ -835,7 +835,7 @@ def uses_enclosing_codex_sandbox(args: argparse.Namespace) -> bool:
 
 def effective_runtime_sandbox(args: argparse.Namespace) -> str:
     """Avoid nested mounts while preserving caller sandbox constraints."""
-    if commit_policy.runtime_permission_projection(args)["observation_only"]:
+    if commit_policy.launch_permission_projection(args)["observation_only"]:
         return "read-only"
     return base_runtime_sandbox(args)
 
@@ -1224,7 +1224,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
 
 def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
     """Apply the shared current-state fence to the existing owner network grant."""
-    projection = commit_policy.runtime_permission_projection(args)
+    projection = commit_policy.launch_permission_projection(args)
     return ((nested_headless_network_eligible(args)
              or bool(projection["task_publish_scope"]))
             and not projection["observation_only"])
@@ -1809,7 +1809,7 @@ def main(argv: list[str]) -> int:
             )
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
-    permission_projection = commit_policy.runtime_permission_projection(args)
+    permission_projection = commit_policy.capture_launch_permission_projection(args)
     args.task_publish_scope = permission_projection["task_publish_scope"]
     args.nested_headless_network_eligible = (
         nested_headless_network_eligible(args) or bool(args.task_publish_scope)

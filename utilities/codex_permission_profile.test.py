@@ -6,28 +6,59 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 import codex_permission_profile as profiles
+from execution_access import AccessContext, build_grant, load_request
+
+
+def require_native_runtime(testcase):
+    reason = None
+    if sys.platform != "linux":
+        reason = "native Codex permission profiles require Linux"
+    elif not shutil.which("codex"):
+        reason = "Codex CLI is unavailable"
+    elif not profiles.named_profiles_available():
+        reason = "Codex CLI does not support named permission profiles"
+    if reason:
+        testcase.skipTest(reason)
 
 
 class PermissionProfileTest(unittest.TestCase):
     def setUp(self):
-        # Keep this fixture in the isolated runner's writable temp root. Its
-        # sibling worktree and outside targets remain separate from the repo.
-        self.temp = tempfile.TemporaryDirectory(prefix="hearting-codex-git-")
+        # Codex's built-in :workspace profile makes /tmp and the launch
+        # TMPDIR writable. Keep these sibling fixtures under the checkout so
+        # native denial checks measure the named profile's read-only rules.
+        checkout_root = Path(__file__).resolve().parents[1]
+        self.temp = tempfile.TemporaryDirectory(
+            prefix=".hearting-codex-git-", dir=checkout_root)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.repo = self.base / "repo"
         self.wt = self.base / "worktree"
-        self.env = {"PATH": os.environ["PATH"]}
+        self.artifact = self.base / "artifacts"
+        self.dispatch_state = self.base / "dispatch-state"
+        self.agent_home = self.base / "agent-home"
+        for path in (self.artifact, self.dispatch_state, self.agent_home):
+            path.mkdir(mode=0o700)
+        self.git_safety_env = {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(self.repo),
+            "GIT_CONFIG_KEY_1": "safe.directory",
+            "GIT_CONFIG_VALUE_1": str(self.wt),
+        }
+        self.env = {"PATH": os.environ["PATH"], **self.git_safety_env}
         for key, name in (("HOME", "home"), ("CODEX_HOME", "codex-home"),
                           ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
-                          ("TMPDIR", "tmp"), ("CODEX_APP_SERVER_SOCKET_DIR", "sockets")):
+                          ("XDG_RUNTIME_DIR", "runtime"), ("TMPDIR", "tmp"),
+                          ("CODEX_APP_SERVER_SOCKET_DIR", "sockets")):
             path = self.base / name
             path.mkdir(mode=0o700)
             self.env[key] = str(path)
@@ -45,10 +76,49 @@ class PermissionProfileTest(unittest.TestCase):
         return subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env,
                               capture_output=True, text=True, check=True).stdout.strip()
 
-    def profile(self):
-        with mock.patch.object(profiles, "named_profiles_available", return_value=True):
-            return profiles.commit_profile_config(str(self.wt), list(map(str, self.roots)),
-                                                  "workspace-write", False)
+    def assert_outside_native_temp_roots(self, path):
+        target = Path(path).resolve()
+        temp_roots = {Path("/tmp").resolve()}
+        if self.env.get("TMPDIR"):
+            temp_roots.add(Path(self.env["TMPDIR"]).resolve())
+        for root in temp_roots:
+            self.assertNotEqual(target, root, f"fixture target is a native writable temp root: {root}")
+            self.assertNotIn(root, target.parents,
+                             f"fixture target {target} overlaps native writable temp root {root}")
+
+    def profile(self, network=False, *, native=False):
+        build = lambda: profiles.commit_profile_config(
+            str(self.wt), list(map(str, self.roots)), "workspace-write", network)
+        with mock.patch.dict(os.environ, self.git_safety_env):
+            if native:
+                return build()
+            with mock.patch.object(profiles, "named_profiles_available", return_value=True):
+                return build()
+
+    def execution_grant(self, *, read_roots=(), network=False):
+        request_path = self.base / "execution-access.json"
+        request_path.write_text(json.dumps({
+            "schema_version": 1,
+            "writable_roots": [str(self.wt)],
+            "read_roots": [str(path) for path in read_roots],
+            "network": {
+                "required": network,
+                "reason": "native loopback permission observation" if network else "",
+                "hosts": [],
+            },
+            "enforcement_required": "os-sandbox",
+            "justification": {str(self.wt): "native permission-profile fixture"},
+        }), encoding="utf-8")
+        context = AccessContext.build(
+            worktree=self.wt, artifact_root=self.artifact,
+            dispatch_state_root=self.dispatch_state, agent_home=self.agent_home,
+            environ=self.env,
+        )
+        request = load_request(request_path, context=context)
+        return build_grant(
+            request, runtime="codex-exec", effective_sandbox="workspace-write",
+            default_writable_roots=(self.wt,), network_available=network,
+        )
 
     def test_only_complete_existing_git_grant_uses_profile(self):
         config = self.profile()
@@ -74,8 +144,9 @@ class PermissionProfileTest(unittest.TestCase):
         self.assertEqual(restored, config)
 
     def test_native_commit_and_protected_paths(self):
-        if sys.platform != "linux" or not shutil.which("codex") or not profiles.named_profiles_available():
-            self.skipTest("native Codex named-permissions sandbox unavailable")
+        require_native_runtime(self)
+        self.assertEqual(self.repo.parent, self.wt.parent)
+        self.assert_outside_native_temp_roots(self.repo / "source.txt")
         probe = self.base / "probe.py"
         probe.write_text('''from pathlib import Path
 import subprocess,sys
@@ -104,8 +175,7 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
         self.assertFalse((self.wt / ".dispatch").exists())
 
     def test_native_app_server_uses_same_profile_without_provider(self):
-        if sys.platform != "linux" or not shutil.which("codex") or not profiles.named_profiles_available():
-            self.skipTest("native Codex named-permissions sandbox unavailable")
+        require_native_runtime(self)
         spec = importlib.util.spec_from_file_location("c4_supervisor", Path(__file__).with_name("codex-app-server-supervisor.py"))
         supervisor = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(supervisor)
@@ -127,6 +197,153 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
             self.assertEqual(self.git("log", "-1", "--format=%s", cwd=self.wt), "rpc commit")
         finally:
             server.close()
+
+    def test_native_workspace_write_and_granted_external_read_root(self):
+        require_native_runtime(self)
+        readonly = self.base / "readonly-data"
+        self.assertEqual(readonly.parent, self.wt.parent)
+        self.assert_outside_native_temp_roots(readonly)
+        readonly.mkdir(mode=0o700)
+        (readonly / "visible.txt").write_text("read granted\n", encoding="utf-8")
+        grant = self.execution_grant(read_roots=(readonly,))
+        self.assertEqual(grant.read_roots, (readonly.resolve(),))
+        self.assertEqual(grant.unwritable_read_roots, (readonly.resolve(),))
+        self.assertEqual(grant.read_enforcement, "os-sandbox")
+
+        profile = self.profile(native=True)
+        self.assertEqual(profile["permissions"][profiles.PROFILE_NAME]["network"], {"enabled": False})
+        probe = '''from pathlib import Path
+import sys
+readonly, worktree = map(Path, sys.argv[1:])
+assert (readonly / "visible.txt").read_text() == "read granted\\n"
+(worktree / "native-task-write.txt").write_text("workspace write allowed\\n")
+try:
+    (readonly / "must-not-write.txt").write_text("forbidden\\n")
+except OSError:
+    pass
+else:
+    raise AssertionError("native sandbox allowed a write to the granted read-only root")
+'''
+        result = subprocess.run(
+            ["codex", "sandbox", "-P", profiles.PROFILE_NAME, "-C", str(self.wt),
+             *profiles.config_arguments(profile), "--", "python3", "-c", probe,
+             str(readonly), str(self.wt)],
+            env=self.env, text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.wt / "native-task-write.txt").read_text(), "workspace write allowed\n")
+        self.assertFalse((readonly / "must-not-write.txt").exists())
+
+    def test_native_network_profile_allows_and_denies_loopback(self):
+        require_native_runtime(self)
+
+        def observe_network(allowed):
+            profile = self.profile(network=allowed, native=True)
+            grant = self.execution_grant(network=allowed)
+            if allowed:
+                self.assertEqual(grant.network, "enforced")
+            else:
+                self.assertEqual(grant.network, "not-requested")
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(0.25)
+            port = listener.getsockname()[1]
+            received = []
+            server_errors = []
+            stop_server = threading.Event()
+
+            def serve_once():
+                while not stop_server.is_set():
+                    try:
+                        connection, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError as exc:
+                        if not stop_server.is_set():
+                            server_errors.append(str(exc))
+                        return
+                    with connection:
+                        connection.settimeout(5)
+                        try:
+                            connection.sendall(b"hearting-loopback-ok")
+                            if connection.recv(16) != b"ack":
+                                server_errors.append("client acknowledgement missing")
+                            else:
+                                received.append(True)
+                        except OSError as exc:
+                            server_errors.append(str(exc))
+                    return
+
+            server_thread = threading.Thread(target=serve_once, name="codex-loopback-fixture")
+            server_thread.start()
+            probe = '''import errno, json, socket, sys
+port = int(sys.argv[1])
+denied_errnos = {
+    errno.EACCES, errno.EPERM, errno.ECONNREFUSED,
+    errno.ENETUNREACH, errno.EHOSTUNREACH,
+}
+try:
+    connection = socket.create_connection(("127.0.0.1", port), timeout=15)
+except OSError as exc:
+    if not isinstance(exc, TimeoutError) and exc.errno not in denied_errnos:
+        raise
+    reason = "ETIMEDOUT" if isinstance(exc, TimeoutError) else errno.errorcode[exc.errno]
+    print("HEARTING_NETWORK_RESULT=" + json.dumps(
+        {"outcome": "denied", "reason": reason, "errno": exc.errno}), flush=True)
+else:
+    with connection:
+        connection.settimeout(15)
+        if connection.recv(64) != b"hearting-loopback-ok":
+            raise AssertionError("loopback response mismatch")
+        connection.sendall(b"ack")
+    print("HEARTING_NETWORK_RESULT=" + json.dumps(
+        {"outcome": "connected", "handshake": "ok"}), flush=True)
+'''
+            result = None
+            try:
+                result = subprocess.run(
+                    ["codex", "sandbox", "-P", profiles.PROFILE_NAME, "-C", str(self.wt),
+                     *profiles.config_arguments(profile), "--", "python3", "-c", probe,
+                     str(port)],
+                    env=self.env, text=True, capture_output=True, timeout=120,
+                )
+            finally:
+                stop_server.set()
+                server_thread.join(timeout=12)
+                thread_stopped = not server_thread.is_alive()
+                if thread_stopped:
+                    listener.close()
+                self.assertTrue(thread_stopped, "loopback fixture thread did not stop")
+
+            self.assertEqual(
+                result.returncode, 0,
+                "native sandbox command failed before a child connection observation:\n" + result.stderr,
+            )
+            marker = "HEARTING_NETWORK_RESULT="
+            observations = [line[len(marker):] for line in result.stdout.splitlines()
+                            if line.startswith(marker)]
+            self.assertEqual(
+                len(observations), 1,
+                "expected one structured child connection result; stdout was:\n" + result.stdout,
+            )
+            observed = json.loads(observations[0])
+            self.assertEqual(server_errors, [])
+            if allowed:
+                self.assertEqual(observed, {"outcome": "connected", "handshake": "ok"})
+                self.assertEqual(received, [True])
+            else:
+                self.assertEqual(observed.get("outcome"), "denied", observed)
+                self.assertIn(observed.get("reason"), {
+                    "EACCES", "EPERM", "ECONNREFUSED", "ENETUNREACH",
+                    "EHOSTUNREACH", "ETIMEDOUT",
+                })
+                self.assertEqual(received, [])
+
+        observe_network(True)
+        observe_network(False)
 
     def test_turn_does_not_replace_active_profile_with_legacy_policy(self):
         spec = importlib.util.spec_from_file_location("c4_supervisor_turn", Path(__file__).with_name("codex-app-server-supervisor.py"))
@@ -209,8 +426,7 @@ class PrimaryCommitProfileTest(unittest.TestCase):
                             if Path(p).parent == self.git_dir))
 
     def test_native_primary_commit_and_protected_paths(self):
-        if sys.platform != "linux" or not shutil.which("codex") or not profiles.named_profiles_available():
-            self.skipTest("native Codex named-permissions sandbox unavailable")
+        require_native_runtime(self)
         for key, value in (("user.email", "fixture@example.com"), ("user.name", "Fixture")):
             subprocess.run(["git", "-C", str(self.repo), "config", key, value], check=True)
         (self.repo / "source.txt").write_text("base\n")

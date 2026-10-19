@@ -305,6 +305,70 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_same_thread_turn_start_reprojects_and_records_bound_permission_evidence(self):
+        import commit_policy
+
+        module = load_supervisor_module()
+        git_dir = Path(subprocess.check_output(
+            ["git", "-C", str(self.base), "rev-parse", "--absolute-git-dir"], text=True
+        ).strip())
+        effective = self.base / "effective.json"
+        effective.write_bytes(b"immutable launch effective bytes\n")
+        original = effective.read_bytes()
+        context = {
+            "adapter": "codex", "attempt_id": PARENT, "worker_type": "owner",
+            "dispatch_depth": 1, "capability": "autopilot-code", "worktree": str(self.base),
+            "route_file": "", "route_id": "", "route_hash": "",
+            "artifact_root": str(self.artifact_root), "artifact_output_dir": "",
+            "base_sandbox": "workspace-write", "network_eligible": True,
+        }
+
+        class Server:
+            def __init__(self):
+                self.requests = []
+                self.events = []
+                self.turn = 0
+
+            def request(self, method, params):
+                self.requests.append((method, params))
+                self.turn += 1
+                return {"turn": {"id": f"turn-{self.turn}"}}
+
+            def next_event(self):
+                return {"method": "turn/completed", "params": {
+                    "turn": {"id": f"turn-{self.turn}", "status": "completed"}}}
+
+        server = Server()
+        args = argparse.Namespace(
+            parent_attempt_id=PARENT, worktree=str(self.base), sandbox="workspace-write",
+            network_access=True, writable_root=[], base_writable_root=[], approval="inherit",
+            model=None, reasoning=None, owner_input=None, native_permission_profile=None,
+        )
+        trace = []
+        with mock.patch.object(commit_policy, "read_runtime_permission_context", return_value=context), \
+             mock.patch.object(commit_policy, "runtime_permission_context_is_current", return_value=True), \
+             mock.patch.object(module, "emit", side_effect=trace.append):
+            for operation in (None, "merge", None):
+                marker = git_dir / "MERGE_HEAD"
+                if operation:
+                    marker.write_text("fixture\n", encoding="utf-8")
+                else:
+                    marker.unlink(missing_ok=True)
+                module.run_turn(server, thread_id="thread-stable", prompt="continue", args=args)
+
+        params = [value for method, value in server.requests if method == "turn/start"]
+        self.assertEqual([item["sandboxPolicy"]["type"] for item in params],
+                         ["workspaceWrite", "readOnly", "workspaceWrite"])
+        self.assertEqual([item["sandboxPolicy"]["networkAccess"] for item in params],
+                         [True, False, True])
+        rows = [item for item in trace if item.get("type") == "dispatch.supervisor.permission-projection"]
+        self.assertEqual([(item["attempt_id"], item["thread_id"], item["turn_id"]) for item in rows],
+                         [(PARENT, "thread-stable", f"turn-{index}") for index in (1, 2, 3)])
+        self.assertEqual([item["git_operation"] for item in rows], ["none", "merge", "none"])
+        self.assertEqual([item["read_enforcement"] for item in rows],
+                         ["os-sandbox", "os-sandbox", "os-sandbox"])
+        self.assertEqual(effective.read_bytes(), original)
+
     def command(self, *, broken_app: Path | None = None,
                 model_context_window: str | None = None) -> list[str]:
         app = broken_app or self.app

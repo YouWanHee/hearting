@@ -931,6 +931,7 @@ def refresh_owner_runtime_permissions(args) -> None:
     except ValueError as exc:
         raise SupervisorError(str(exc)) from exc
     if context is None:
+        args.owner_runtime_permission_state = None
         return
     runtime = getattr(args, "runtime_harness", "claude")
     if context.get("adapter") != runtime:
@@ -953,12 +954,14 @@ def refresh_owner_runtime_permissions(args) -> None:
         owner_route_binding=None,
     )
     state = commit_policy.runtime_permission_projection(projection_args)
+    args.owner_runtime_permission_state = state
     if runtime == "claude":
         adapter = _permission_adapter("claude")
         permission_args = argparse.Namespace(
             **vars(projection_args),
             permission_mode=context.get("permission_mode_requested") or "config",
             agent_home=context.get("agent_home") or str(ROOT),
+            _launch_permission_projection=state,
         )
         posture = adapter.resolve_permission_posture(permission_args)
         args.permission_mode = posture["mode_flag"]
@@ -1026,6 +1029,17 @@ def run_turn(
             return native_turn(args, prompt, emit=native_event, idle_reset=handoff_intent is None)
         except OpenCodeTransportError as exc:
             raise SupervisorError(str(exc)) from exc
+    permission_event = commit_policy.permission_projection_event(
+        getattr(args, "owner_runtime_permission_state", None),
+        adapter="claude", attempt_id=getattr(args, "parent_attempt_id", ""),
+        thread_id=session_id,
+        turn_id=str(getattr(args, "owner_runtime_turn_ordinal", "direct")),
+        sandbox="adapter-default", network_access=False,
+        file_enforcement="tool-permission", read_enforcement="tool-permission",
+        network_enforcement="none",
+    )
+    if permission_event is not None:
+        emit(permission_event)
     def submit(transport):
         if handoff_intent is not None:
             state_root = Path(args.jobs).parent
@@ -1316,6 +1330,7 @@ def main(argv: list[str] | None = None) -> int:
                 receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
             )
             turn_ordinal += 1
+            args.owner_runtime_turn_ordinal = turn_ordinal
             turn_started_ns = time.monotonic_ns()
             emit(
                 {
