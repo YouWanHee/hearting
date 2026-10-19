@@ -129,6 +129,26 @@ def owner_root() -> Path:
     return _state_root() / ".dispatch-owners"
 
 
+def summary_writable_dirs() -> tuple[Path, ...]:
+    """Resolve only the directories used by the title producer, without creating them."""
+    title_root = _state_root()
+    xdg_state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    if os.environ.get("FLEET_TITLE_STATE_DIR"):
+        workdir = title_root / "fleet-title-workdir"
+    else:
+        workdir = xdg_state / "hearting" / "fleet-title-workdir"
+    provider_order = xdg_state / "agent-fleet" / "provider-order"
+
+    resolved = []
+    seen = set()
+    for path in (title_root, workdir, provider_order):
+        path = path.expanduser().resolve()
+        if path not in seen:
+            seen.add(path)
+            resolved.append(path)
+    return tuple(resolved)
+
+
 def owner_state_path(harness: str, attempt_id: str) -> Path:
     _validate_identity(harness, attempt_id)
     return owner_root() / harness / f"{attempt_id}.json"
@@ -644,7 +664,7 @@ def _encoded_cwd(cwd: str) -> str:
 def announced_session(
     path: Path, scan: int = SESSION_ANNOUNCE_SCAN,
 ) -> tuple[bool, dict[str, str] | None]:
-    """Return ``(decided, announcement)`` for the Claude supervisor's session row.
+    """Return ``(decided, announcement)`` for a supervised attempt's source.
 
     A supervised owner's attempt log is a receipt log: control rows plus one final
     ``result``, with model text deliberately withheld.  ``dispatch.supervisor.session``
@@ -653,8 +673,10 @@ def announced_session(
     The summary owner is launched while the governed worker is still behind its
     launch fence, so an empty log means "not yet", not "not supervised" — caching
     that as unsupervised would pin the follower to the receipt log for the whole
-    run. Supervisor control rows may precede the announcement. A first native
-    stream row instead establishes a one-shot transcript.
+    run. Supervisor control rows may precede either a session announcement or native
+    Codex conversation rows. Only actual user/assistant text makes an unannounced
+    supervised log its own source; tool, usage, and lifecycle rows do not. A first
+    native stream row without supervisor controls remains a one-shot transcript.
     """
     try:
         with open(path, "rb") as handle:
@@ -663,20 +685,30 @@ def announced_session(
         return False, None
     found: dict[str, str] | None = None
     saw_supervisor = False
-    terminal_seen = False
-    for raw in head.split(b"\n"):
+    saw_native_stream = False
+    saw_conversation = False
+    supervisor_terminal_seen = False
+    claude_terminal_seen = False
+    # Only complete JSONL rows are evidence. A partial live tail cannot erase
+    # the announcement or conversation already present in complete rows.
+    complete = head.rsplit(b"\n", 1)[0] if head and not head.endswith(b"\n") else head
+    rows = complete.split(b"\n")
+    try:
+        from fleet.refresh_title import _delta_text
+    except Exception:
+        _delta_text = None
+    for raw in rows:
         if not raw.strip():
             continue
         try:
-            row = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError:
-            # A torn trailing line is not evidence either way; keep waiting.
-            if found is not None:
-                return True, found
-            return False, None
+            row = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            # Malformed complete data is not converted into a successful source.
+            return (True, {"invalid": "malformed-supervisor-log"}) if saw_supervisor else (False, None)
         if isinstance(row, dict) and str(row.get("type") or "").startswith("dispatch.supervisor."):
             saw_supervisor = True
-            terminal_seen = terminal_seen or row.get("type") == "dispatch.supervisor.terminal"
+            supervisor_terminal_seen = supervisor_terminal_seen or (
+                row.get("type") == "dispatch.supervisor.terminal")
             if row.get("type") != "dispatch.supervisor.session":
                 continue
             if found is not None:
@@ -694,18 +726,20 @@ def announced_session(
             continue
         if not isinstance(row, dict):
             return (True, {"invalid": "invalid-supervisor-session-event"}) if saw_supervisor else (True, None)
-        terminal_seen = terminal_seen or row.get("type") in {"result", "turn.completed", "turn.failed"}
-        if not str(row.get("type") or "").startswith("dispatch.supervisor."):
-            if saw_supervisor or found is not None:
-                continue
-            return True, None
+        saw_native_stream = True
+        claude_terminal_seen = claude_terminal_seen or row.get("type") == "result"
+        if saw_supervisor and _delta_text is not None:
+            serialized = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+            saw_conversation = saw_conversation or bool(_delta_text(serialized, harness="codex"))
     if found is not None:
         return True, found
+    if saw_conversation:
+        return True, None
     if saw_supervisor:
-        if terminal_seen:
+        if supervisor_terminal_seen or claude_terminal_seen:
             return True, {"invalid": "missing-supervisor-session-event"}
         return False, None
-    return False, None
+    return (True, None) if saw_native_stream else (False, None)
 
 
 def session_transcript(announced: dict[str, str], *, expected_cwd: str | None = None,
@@ -730,11 +764,10 @@ def _summary_source(log_path: Path, cache: dict[str, Any], *,
                     attempt_cwd: str | Path | None = None) -> Path | None:
     """Return the file whose bytes feed this attempt's title/NOW refresh.
 
-    Supervised owners follow the announced child transcript and wait for it: the
-    receipt log holds no conversational text, so refreshing against it would burn
-    the cursor and record an empty title instead of degrading honestly.  Only
-    settled answers are cached, so an announcement that has not been written yet is
-    re-checked on the next poll instead of being frozen into the wrong source.
+    Supervised owners follow an announced child transcript when present. Codex native
+    conversation rows can make the exact attempt log the source when no announcement
+    exists; control, tool, and usage rows cannot. Only settled answers are cached, so
+    an announcement that has not been written yet is re-checked on the next poll.
     """
     if "source" in cache:
         return cache["source"]

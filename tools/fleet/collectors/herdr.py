@@ -27,6 +27,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import wait
+from dataclasses import replace
 
 from ..refresh import background_read
 
@@ -35,6 +36,11 @@ _OBSERVATION_WAIT_MAX_S = 0.75
 _OBSERVATION_LOCK = threading.RLock()
 _OBSERVATION_TRANSPORTS = {}
 _OBSERVATION_FUTURES = {}
+_OBSERVATION_VIEWS = {}
+_OBSERVATION_ERRORS = {}
+_OBSERVATION_LAST_STARTED = {}
+_OBSERVATION_REFRESH_PENDING = {}
+_OBSERVATION_MIN_REFRESH_S = 0.25
 _PANE_INFO_CACHE = OrderedDict()
 _PANE_INFO_CACHE_LIMIT = 512
 
@@ -49,7 +55,7 @@ def _observation_module():
 
 
 def observation_view(session=None, *, refresh=False, wait_timeout=0.0):
-    """Reuse one event subscription for this exact endpoint/socket pair."""
+    """Reuse the last complete view while one read runs for this endpoint/socket."""
     try:
         observation = _observation_module()
         endpoint = observation.endpoint_name(session)
@@ -67,53 +73,109 @@ def observation_view(session=None, *, refresh=False, wait_timeout=0.0):
                     endpoint, socket_path, timeout=0.15)
                 _OBSERVATION_TRANSPORTS[key] = transport
             future = _OBSERVATION_FUTURES.get(key)
+            completed_now = False
             if future is not None:
                 if not future.done() and refresh:
+                    _OBSERVATION_REFRESH_PENDING[key] = True
                     return None
                 if future.done():
                     _OBSERVATION_FUTURES.pop(key, None)
-                    try:
-                        completed = future.result()
-                    except Exception:
-                        completed = None
-                    if completed is not None and not refresh:
-                        return completed
-                elif wait_timeout <= 0:
-                    return None
-                elif wait_timeout > 0:
-                    try:
-                        completed = future.result(timeout=min(
-                            _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
-                    except TimeoutError:
-                        return None
-                    except Exception:
-                        completed = None
-                    _OBSERVATION_FUTURES.pop(key, None)
-                    if completed is not None and not refresh:
-                        return completed
+                    _store_observation_result(key, future)
+                    completed_now = True
+            if _OBSERVATION_REFRESH_PENDING.pop(key, False):
+                refresh = True
             if refresh:
                 transport.close()
-            future = background_read(transport.observe)
-            _OBSERVATION_FUTURES[key] = future
-            if wait_timeout > 0:
-                try:
-                    completed = future.result(timeout=min(
-                        _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
-                except TimeoutError:
-                    return None
-                except Exception:
-                    completed = None
+                _OBSERVATION_VIEWS.pop(key, None)
+                _OBSERVATION_ERRORS.pop(key, None)
+                completed_now = False
+            elif completed_now:
+                # All consumers in this tick share the just-completed result.
+                # Do not immediately start another read from this same call.
+                return _observation_view_for_key(key)
+            elif future is None:
+                last_started = _OBSERVATION_LAST_STARTED.get(key, 0.0)
+                if time.monotonic() - last_started < _OBSERVATION_MIN_REFRESH_S:
+                    return _observation_view_for_key(key)
+
+            if future is None or refresh:
+                future = background_read(transport.observe)
+                _OBSERVATION_FUTURES[key] = future
+                _OBSERVATION_LAST_STARTED[key] = time.monotonic()
+
+            cached = _observation_view_for_key(key, pending=True)
+            if wait_timeout <= 0:
+                return cached
+
+        try:
+            completed = future.result(timeout=min(
+                _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
+        except TimeoutError:
+            return cached
+        except Exception as exc:
+            with _OBSERVATION_LOCK:
+                if _OBSERVATION_FUTURES.get(key) is future:
+                    _OBSERVATION_FUTURES.pop(key, None)
+                    _OBSERVATION_ERRORS[key] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+                return _observation_view_for_key(key)
+        with _OBSERVATION_LOCK:
+            if _OBSERVATION_FUTURES.get(key) is future:
                 _OBSERVATION_FUTURES.pop(key, None)
-                return completed
-            if future.done():
-                _OBSERVATION_FUTURES.pop(key, None)
-                try:
-                    return future.result()
-                except Exception:
-                    return None
-            return None
+                _store_observation_value(key, completed)
+            return _observation_view_for_key(key)
     except Exception:
         return None
+
+
+def _store_observation_value(key, value):
+    if value is not None and getattr(value, "complete", False) is True:
+        _OBSERVATION_VIEWS[key] = value
+        _OBSERVATION_ERRORS.pop(key, None)
+    else:
+        _OBSERVATION_ERRORS[key] = "herdr returned no complete snapshot"
+
+
+def _store_observation_result(key, future):
+    try:
+        value = future.result()
+    except Exception as exc:
+        _OBSERVATION_ERRORS[key] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+    else:
+        _store_observation_value(key, value)
+
+
+def _observation_view_for_key(key, *, pending=False):
+    view = _OBSERVATION_VIEWS.get(key)
+    if view is None:
+        return None
+    active = _OBSERVATION_FUTURES.get(key)
+    pending = pending or (active is not None and not active.done())
+    if pending or key in _OBSERVATION_ERRORS:
+        try:
+            return replace(view, complete=False)
+        except (TypeError, ValueError):
+            return view
+    return view
+
+
+def _observation_error(session=None):
+    try:
+        observation = _observation_module()
+        endpoint = observation.endpoint_name(session)
+        socket_path = observation.socket_path_for_endpoint(session)
+        if not socket_path:
+            return None
+        key = (endpoint, os.path.realpath(socket_path))
+        with _OBSERVATION_LOCK:
+            error = _OBSERVATION_ERRORS.get(key)
+            future = _OBSERVATION_FUTURES.get(key)
+            if error:
+                return error
+            if future is not None and not future.done() and key in _OBSERVATION_VIEWS:
+                return "herdr refresh pending"
+    except Exception:
+        return None
+    return None
 
 
 def close_observations():
@@ -123,6 +185,10 @@ def close_observations():
         futures = list(_OBSERVATION_FUTURES.values())
         _OBSERVATION_TRANSPORTS.clear()
         _OBSERVATION_FUTURES.clear()
+        _OBSERVATION_VIEWS.clear()
+        _OBSERVATION_ERRORS.clear()
+        _OBSERVATION_LAST_STARTED.clear()
+        _OBSERVATION_REFRESH_PENDING.clear()
         _PANE_INFO_CACHE.clear()
     if futures:
         wait(futures, timeout=0.8)
@@ -209,10 +275,18 @@ def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0):
 
 
 class PaneEvidence(tuple):
-    """Unpackable PID evidence with the completeness needed for a negative fact."""
-    def __new__(cls, values, complete=True, errors=()):
+    """Unpackable PID evidence with negative completeness and fresh-pane provenance."""
+    def __new__(cls, values, complete=True, errors=(), fresh_shells=None,
+                fresh_foreground=None):
         result = super().__new__(cls, values)
         result.complete, result.errors = complete, tuple(errors)
+        shells = result[0] if len(result) > 0 else set()
+        foreground = result[1] if len(result) > 1 else set()
+        result.fresh_shells = set(
+            (shells if complete else ()) if fresh_shells is None else fresh_shells)
+        result.fresh_foreground = set(
+            (foreground if complete else ())
+            if fresh_foreground is None else fresh_foreground)
         return result
 
 
@@ -224,6 +298,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
     conflicting pane claims for one PID are discarded.
     """
     shells, fg = set(), set()
+    fresh_shells, fresh_fg = set(), set()
     identities = {}
     errors = []
     selected = [pane for pane in panes or [] if pane.get("agent")]
@@ -241,7 +316,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                 cached = _PANE_INFO_CACHE.get(cache_key)
                 if cached is not None:
                     _PANE_INFO_CACHE.move_to_end(cache_key)
-                    return dict(cached)
+                    return dict(cached), False
         if observation is not None:
             endpoint = observation.endpoint
         elif runner is subprocess.run:
@@ -268,7 +343,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                 _PANE_INFO_CACHE.move_to_end(cache_key)
                 while len(_PANE_INFO_CACHE) > _PANE_INFO_CACHE_LIMIT:
                     _PANE_INFO_CACHE.popitem(last=False)
-        return info
+        return info, True
 
     # One shared deadline replaces N serial pane deadlines. Daemon reads never
     # hold the TUI open; subprocess.run still owns each child's timeout/cleanup.
@@ -280,13 +355,18 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
         try:
             if not future.done():
                 raise TimeoutError("process-info deadline")
-            info = future.result()
+            info, fresh = future.result()
             if info.get("shell_pid"):
-                shells.add(int(info["shell_pid"]))
+                shell_pid = int(info["shell_pid"])
+                shells.add(shell_pid)
+                if fresh:
+                    fresh_shells.add(shell_pid)
             for proc_rec in info.get("foreground_processes") or []:
                 if isinstance(proc_rec, dict) and proc_rec.get("pid"):
                     pid = int(proc_rec["pid"])
                     fg.add(pid)
+                    if fresh:
+                        fresh_fg.add(pid)
                     if bindings is not None and proc_rec.get("name") == pane.get("agent"):
                         bindings.setdefault(pid, set()).add(str(pane_id))
                     agent_session = pane.get("agent_session") or {}
@@ -298,9 +378,12 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                         identities.setdefault(pid, set()).add(agent_session["value"])
         except Exception as exc:
             errors.append("%s: %s: %s" % (pane_id, type(exc).__name__, str(exc)[:120]))
+    observation_complete = observation is None or getattr(observation, "complete", True) is True
     return PaneEvidence((shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
                                     if len(sids) == 1}),
-                        complete=panes is not None and not errors, errors=errors)
+                        complete=panes is not None and not errors and observation_complete,
+                        errors=errors, fresh_shells=fresh_shells,
+                        fresh_foreground=fresh_fg)
 
 
 def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
@@ -309,10 +392,13 @@ def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
                              observation=observation)
     shells, fg, _identities = evidence
     return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
-                        errors=getattr(evidence, "errors", ()))
+                        errors=getattr(evidence, "errors", ()),
+                        fresh_shells=getattr(evidence, "fresh_shells", None),
+                        fresh_foreground=getattr(evidence, "fresh_foreground", None))
 
 
-def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False):
+def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False,
+                        wait_timeout=0.0):
     """Process identities for Codex TUIs currently foreground in herdr panes.
 
     Pane metadata is not thread proof. The live foreground PID's
@@ -335,7 +421,7 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_cu
         found = _CODEX_PANE_CACHE["identities"]
     else:
         if panes is None:
-            panes = list_panes()
+            panes = list_panes(wait_timeout=wait_timeout)
         cwds = {os.path.realpath(s.cwd or "") for s in targets.values()}
         selected = [p for p in panes or []
                     if p.get("agent") == "codex"
@@ -521,7 +607,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         claims = pane_process_claims(sessions, panes, pane_bindings or {}, complete=False)
         for s in sessions:
             s._pane_session_claim = claims.get(s.pid)
-        return {"complete": False, "last_error": "herdr 조회 불가"}
+        return {"complete": False, "last_error": _observation_error() or "herdr 조회 불가"}
     index = attached_index(agents)
     bindings = {} if pane_bindings is None else pane_bindings
     if pids is None:
@@ -534,6 +620,9 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
+    fresh_shells = getattr(pids, "fresh_shells", shells if probe_ok else set())
+    fresh_fg = getattr(pids, "fresh_foreground", fg if probe_ok else set())
+    positive_shells, positive_fg = (shells, fg) if probe_ok else (fresh_shells, fresh_fg)
     from ..process_identity import pane_process_claims
     claims = pane_process_claims(sessions, panes, bindings,
                                  complete=pids is not None and getattr(pids, "complete", True))
@@ -574,9 +663,11 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             continue
         sid = getattr(s, "session_id", None)
         harness = str(getattr(s, "harness", "") or "").lower()
-        if sid and (harness, sid) in index:
+        observation_complete = observation is None or getattr(observation, "complete", True) is True
+        if observation_complete and sid and (harness, sid) in index:
             s.herdr_attached = True
-        elif pid_in_panes(getattr(s, "pid", None), shells, fg):
+        elif pids is not None and pid_in_panes(
+                getattr(s, "pid", None), positive_shells, positive_fg):
             s.herdr_attached = True
         elif probe_ok:
             # herdr answered on both surfaces (or on the id surface for a verified-id
@@ -610,5 +701,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                         list(getattr(s, "session_aliases", None) or [])
                         + [other for other in pane_aliases if (harness, other) not in live]))
     errors = list(getattr(pids, "errors", ()))
-    return {"complete": probe_ok,
-            "last_error": "; ".join(errors) if errors else None if probe_ok else "pane 조회 불가"}
+    last_error = "; ".join(errors) if errors else None
+    if not probe_ok and not last_error:
+        last_error = _observation_error() or "pane 조회 불가"
+    return {"complete": probe_ok, "last_error": last_error}
