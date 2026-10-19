@@ -8559,7 +8559,9 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
              mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
              mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
              mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={
-                 "id": "turn-exact", "status": "interrupted"}), \
+                 "id": "turn-exact", "status": "interrupted",
+                 "items": [{"id": "user-item-exact", "type": "userMessage",
+                            "content": [{"type": "text", "text": "original task and requested format"}]}]}), \
              mock.patch.object(codex_queue_delivery, "_latest_turn", return_value={"id": "turn-exact",
                                                                                   "status": "interrupted"}), \
              mock.patch.object(codex_queue_delivery, "send_at_least_once",
@@ -8570,6 +8572,9 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len(sent), 1, store.get(duty["id"]))
         self.assertTrue(sent[0]["client_message_id"].startswith("delivery-"))
         self.assertIn("turn-exact", sent[0]["message"])
+        self.assertIn("user-item-exact", sent[0]["message"])
+        self.assertIn("original task and requested format", sent[0]["message"])
+        self.assertIn("preserving all requested content and output formats", sent[0]["message"])
         current = store.get(duty["id"])
         self.assertEqual(current["state"], "pending")
         self.assertEqual(current["delivery"], "native-continuation-accepted")
@@ -8579,7 +8584,10 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(join, "pending_record_identity", return_value=("rt-native", "execute", "att-owner")), \
              mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
              mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
-             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={"id": "turn-exact", "status": "interrupted"}), \
+             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={
+                 "id": "turn-exact", "status": "interrupted",
+                 "items": [{"id": "user-item-exact", "type": "userMessage",
+                            "content": [{"type": "text", "text": "original task and requested format"}]}]}), \
              mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id", side_effect=[
                  {"id": "continuation-turn", "status": "inProgress"},
                  {"id": "continuation-turn", "status": "completed"}]), \
@@ -8589,6 +8597,45 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
             peer_steward._reconcile_obligations(store, [store.get(duty["id"])])
             self.assertEqual(store.get(duty["id"])["state"], "complete")
         again.assert_not_called()
+
+    def test_original_request_is_verbatim_at_utf8_limit_and_referenced_above_it(self):
+        marker = "\nOUTPUT_FORMAT_CANARY: exact JSON object\n"
+        item_id = "user-item-final-format"
+        source = [{"item_id": item_id, "text": ""}]
+        empty = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        budget = peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT - len(empty.encode("utf-8"))
+        marker_size = len(marker.encode("utf-8"))
+        fill_bytes = budget - marker_size
+        text = "한" * (fill_bytes // 3) + "x" * (fill_bytes % 3) + marker
+        source[0]["text"] = text
+        exact = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        self.assertEqual(len(exact.encode("utf-8")), peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT)
+        self.assertTrue(exact.endswith(text))
+        self.assertIn("OUTPUT_FORMAT_CANARY: exact JSON object", exact)
+
+        source[0]["text"] = text + "한"
+        bounded = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        self.assertLessEqual(len(bounded.encode("utf-8")),
+                             peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT)
+        self.assertNotIn(text, bounded)
+        self.assertIn(item_id, bounded)
+        self.assertIn("exact userMessage item(s)", bounded)
+        self.assertIn("every requested content and output-format requirement", bounded)
+
+    def test_unreadable_original_user_message_remains_unresolved(self):
+        import codex_queue_delivery
+        with self.assertRaises(codex_queue_delivery.QueueDeliveryError):
+            peer_steward._native_user_message_sources(
+                {"id": "turn-exact", "status": "interrupted", "items":[]})
 
     def test_queued_continuation_keeps_same_duty_and_does_not_resend(self):
         import codex_queue_delivery
@@ -8761,7 +8808,10 @@ class NativeReceivingTurnSettlementTests(unittest.TestCase):
                  mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
                                    return_value=Path(temporary) / "queue.sock"), \
                  mock.patch.object(codex_queue_delivery, "read_exact_turn",
-                                   return_value={"id": "turn-exact", "status": "interrupted"}), \
+                                   return_value={"id": "turn-exact", "status": "interrupted",
+                                                 "items": [{"id": "user-item-exact", "type": "userMessage",
+                                                            "content": [{"type": "text",
+                                                                         "text": "original exact request"}]}]}), \
                  mock.patch.object(codex_queue_delivery, "_latest_turn",
                                    return_value={"id": "turn-exact", "status": "interrupted"}), \
                  mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id",

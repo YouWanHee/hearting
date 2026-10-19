@@ -875,6 +875,109 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         self.assertIsNone(old_timeline["first_send_at_utc"])
         self.assertIsNotNone(old_timeline["last_send_at_utc"])
 
+    def test_submission_fence_survives_acceptance_before_timing_and_claim_recovery(self):
+        did = self.kwargs["delivery_id"]
+        public_before = PD.read(self.root, "sess-claim", did)
+        self.assertNotIn(PD.SUBMISSION_FENCE_FIELD, public_before)
+        self.assertIsNone(PD.read_submission_fence(
+            self.root, "sess-claim", did,
+            expected_identity=PD.submission_fence_identity(public_before, "thread-exact")))
+
+        claimed = PD.claim(self.root, "sess-claim", did, claim_owner="notice-first",
+                           lease_seconds=1)
+        identity = PD.submission_fence_identity(claimed, "thread-exact")
+        prepared = PD.prepare_submission_fence(
+            self.root, "sess-claim", did, claim_owner="notice-first",
+            expected_identity=identity)
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertEqual(prepared["attempt"], 1)
+
+        accepted = PD.record_submission_accepted(
+            self.root, "sess-claim", did, claim_owner="notice-first",
+            expected_identity=identity, expected_attempt=1,
+            queue_submission_id="queue-item-accepted")
+        self.assertEqual(accepted["state"], "accepted")
+        self.assertEqual(accepted["queue_submission_id"], "queue-item-accepted")
+        path = PD.record_path(self.root, "sess-claim", did)
+        self.assertEqual(json.loads(path.read_text())[PD.SUBMISSION_FENCE_FIELD], accepted)
+        self.assertNotIn(PD.SUBMISSION_FENCE_FIELD,
+                         PD.read(self.root, "sess-claim", did))
+        self.assertEqual(PD.read(self.root, "sess-claim", did)[
+            PD.TIMESTAMP_PROVENANCE_FIELD]["observed_send_count"], 0)
+
+        ambiguous = PD.mark_sent_ambiguous(
+            self.root, "sess-claim", did, claim_owner="notice-first")
+        self.assertIsNone(ambiguous["acked_at_ns"])
+        PD.reclaim(self.root, "sess-claim", did,
+                   now_ns=ambiguous["claim_deadline_ns"] + 1)
+        successor = PD.claim(self.root, "sess-claim", did,
+                             claim_owner="notice-restart", lease_seconds=30)
+        observed = PD.read_submission_fence(
+            self.root, "sess-claim", did, expected_identity=identity)
+        self.assertEqual(observed["state"], "accepted")
+        self.assertEqual(observed["attempt"], 1)
+        with self.assertRaises(PD.PendingDeliveryError) as ctx:
+            PD.prepare_submission_fence(
+                self.root, "sess-claim", did, claim_owner=successor["claim_owner"],
+                expected_identity=identity)
+        self.assertEqual(ctx.exception.detail, "submission-already-fenced")
+        self.assertIsNone(successor["acked_at_ns"])
+
+    def test_submission_fence_retries_only_after_explicit_add_nonacceptance(self):
+        did = self.kwargs["delivery_id"]
+        claimed = PD.claim(self.root, "sess-claim", did, claim_owner="notice-first",
+                           lease_seconds=30, retry_context="notice-target")
+        identity = PD.submission_fence_identity(claimed, "thread-exact")
+        first = PD.prepare_submission_fence(
+            self.root, "sess-claim", did, claim_owner="notice-first",
+            expected_identity=identity)
+        reason = "queue-rpc-refused:thread/queue/add:-32600:invalid request"
+        refused = PD.record_submission_not_accepted(
+            self.root, "sess-claim", did, claim_owner="notice-first",
+            expected_identity=identity, expected_attempt=first["attempt"], reason=reason)
+        self.assertEqual(refused["state"], "not-accepted")
+        self.assertEqual(refused["rejection_reason"], reason)
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.record_submission_not_accepted(
+                self.root, "sess-claim", did, claim_owner="notice-first",
+                expected_identity=identity, expected_attempt=first["attempt"],
+                reason="queue-websocket-timeout")
+
+        PD.release_claim(self.root, "sess-claim", did, claim_owner="notice-first",
+                         failure_reason="explicit-add-refusal")
+        retry_metadata = json.loads(PD.courier_retry_path(
+            PD.record_path(self.root, "sess-claim", did)).read_text())
+        with unittest.mock.patch.object(
+                PD.time, "time_ns",
+                return_value=retry_metadata["retry"]["next_attempt_at_ns"] + 1):
+            second_claim = PD.claim(self.root, "sess-claim", did,
+                                    claim_owner="notice-retry", lease_seconds=30,
+                                    retry_context="notice-target")
+        second = PD.prepare_submission_fence(
+            self.root, "sess-claim", did, claim_owner="notice-retry",
+            expected_identity=identity)
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["state"], "prepared")
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.read_submission_fence(
+                self.root, "sess-claim", did,
+                expected_identity=PD.submission_fence_identity(
+                    second_claim, "successor-thread"))
+
+    def test_submission_fence_optional_field_keeps_legacy_record_shape_valid(self):
+        kwargs = dict(self.kwargs, delivery_id="delivery-" + "c" * 32)
+        legacy = PD.create(**kwargs)
+        path = PD.record_path(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
+        raw = json.loads(path.read_text())
+        self.assertNotIn(PD.SUBMISSION_FENCE_FIELD, raw)
+        self.assertEqual(PD.read(self.root, kwargs["recipient_key"], kwargs["delivery_id"]),
+                         legacy)
+        raw[PD.SUBMISSION_FENCE_FIELD] = {"state": "prepared"}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(PD.PendingDeliveryError) as ctx:
+            PD.read(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
+        self.assertEqual(ctx.exception.detail, "submission-fence-invalid")
+
     def test_generic_ack_does_not_gain_pending_state_authority(self):
         path = PD.record_path(self.root, "sess-claim", self.kwargs["delivery_id"])
         before = path.read_bytes()

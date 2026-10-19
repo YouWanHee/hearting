@@ -5384,9 +5384,11 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         from codex_queue_dispatch import resolve_queue_socket
         import codex_queue_delivery
         endpoint = resolve_queue_socket()
-        turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
-        current_turn = codex_queue_delivery.read_exact_turn(
-            endpoint, recipient_sid, turn_id, timeout=5.0)
+        source_turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
+        turn_id = source_turn_id
+        source_turn = codex_queue_delivery.read_exact_turn(
+            endpoint, recipient_sid, source_turn_id, timeout=5.0)
+        current_turn = source_turn
         continuation_id = observation.get("continuation_id")
         if continuation_id:
             continuation = codex_queue_delivery.find_turn_by_client_message_id(
@@ -5423,6 +5425,7 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             store.update(duty["id"], state="unknown", delivery="pending",
                          observation={**observation, "reason": "native-receiving-turn-no-longer-current"})
             return True
+        source_messages = _native_user_message_sources(source_turn)
         receipt = exact.get("receipt")
         if not isinstance(receipt, dict):
             store.update(duty["id"], state="unknown", delivery="pending",
@@ -5433,10 +5436,10 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         followup = completion_followup_text(
             receipt, jobs=str(jobs_path),
             surface=str(_UTILITIES_DIR.parent / "adapters/codex/bin/preflight.sh"))
-        message = ("AGENT_HARNESS_COMPLETION_V1\n" + encoded + "\n" + followup
-                   + f"\nThe exact receiving turn {turn_id} was interrupted. Continue its approved follow-through "
-                     "and report once; check existing exact artifact and next-leg lineage before repeating "
-                     "any action. Preserve new failures, conflicts, and unfinished work.")
+        message = _native_continuation_message(
+            thread_id=recipient_sid, turn_id=turn_id, source_turn_id=source_turn_id,
+            receipt_text=encoded,
+            followup=followup, source_messages=source_messages)
         stable = "delivery-" + hashlib.sha256((
             "codex-native-recovery-v1\0" + delivery_id + "\0" + turn_id + "\0"
             + str(row.metadata.get("delivery_receipt_digest", ""))
@@ -5450,8 +5453,11 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             fresh = current_attempt_row(jobs_path, row.attempt_id)
             from dispatch_seat_handover import effective_parent
             from dispatch_contract import terminal_conflict_pending
-            fresh_turn = codex_queue_delivery.read_exact_turn(
+            fresh_receiving_turn = codex_queue_delivery.read_exact_turn(
                 endpoint, recipient_sid, turn_id, timeout=5.0)
+            fresh_source_turn = (fresh_receiving_turn if source_turn_id == turn_id else
+                                 codex_queue_delivery.read_exact_turn(
+                                     endpoint, recipient_sid, source_turn_id, timeout=5.0))
             newest = codex_queue_delivery._latest_turn(endpoint, recipient_sid, timeout=5.0)
             latest_record = pending.read(root, storage_recipient, delivery_id)
             if (fresh is None or fresh.status != row.status
@@ -5463,7 +5469,9 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                     or terminal_conflict_pending(fresh.metadata)
                     or pending_record_identity(fresh.metadata, jobs_path)
                         != (route_id, route_node, parent_attempt_id)
-                    or not fresh_turn or fresh_turn.get("status") != "interrupted"
+                    or not fresh_receiving_turn
+                    or fresh_receiving_turn.get("status") != "interrupted"
+                    or _native_user_message_sources(fresh_source_turn) != source_messages
                     or not isinstance(newest, dict) or newest.get("id") != turn_id
                     or not latest_record or latest_record.get("state") != "acked"
                     or pending.received_ack_identity(latest_record, storage_recipient, delivery_id)
@@ -5488,6 +5496,66 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                      observation={**observation, "reason": "native-continuation-observation-unavailable",
                                   "detail": str(exc)[:160]})
         return True
+
+
+_NATIVE_QUEUE_MESSAGE_LIMIT = 16 * 1024
+
+
+def _native_user_message_sources(turn):
+    """Return exact text userMessage items from one exact native turn."""
+    import codex_queue_delivery
+
+    items = turn.get("items") if isinstance(turn, dict) else None
+    if not isinstance(items, list):
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-original-user-message-unavailable")
+    sources = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        item_id = item.get("id")
+        content = item.get("content")
+        if (not isinstance(item_id, str) or not item_id
+                or not isinstance(content, list) or len(content) != 1
+                or not isinstance(content[0], dict)
+                or content[0].get("type") != "text"
+                or not isinstance(content[0].get("text"), str)):
+            raise codex_queue_delivery.QueueDeliveryError(
+                "native-original-user-message-unavailable")
+        sources.append({"item_id": item_id, "text": content[0]["text"]})
+    if not sources or len({item["item_id"] for item in sources}) != len(sources):
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-original-user-message-unavailable")
+    return sources
+
+
+def _native_continuation_message(*, thread_id, turn_id, source_turn_id,
+                                 receipt_text, followup, source_messages):
+    import codex_queue_delivery
+
+    prefix = ("AGENT_HARNESS_COMPLETION_V1\n" + receipt_text + "\n" + followup
+              + f"\nThe exact receiving turn {turn_id} was interrupted. Continue its approved follow-through "
+                "and report once; check existing exact artifact and next-leg lineage before repeating "
+                "any action. Preserve new failures, conflicts, and unfinished work.")
+    source_header = (
+        "\nOriginal user request from the exact interrupted turn, verbatim. "
+        "Continue and fulfill that original task, preserving all requested content and output formats; "
+        "this receipt is context and does not replace or narrow the task:\n")
+    source_body = "".join(
+        f"\n[original userMessage item {item['item_id']}]\n{item['text']}"
+        for item in source_messages)
+    full = prefix + source_header + source_body
+    if len(full.encode("utf-8")) <= _NATIVE_QUEUE_MESSAGE_LIMIT:
+        return full
+    references = ", ".join(item["item_id"] for item in source_messages)
+    bounded = (prefix + f"\nOriginal task source: read the exact userMessage item(s) {references} "
+               f"in Codex thread {thread_id}, turn {source_turn_id}. Fulfill the entire original request, "
+               "including every requested content and output-format requirement. This receipt is only "
+               "continuation context; it does not replace, narrow, or summarize the original task.")
+    if len(bounded.encode("utf-8")) > _NATIVE_QUEUE_MESSAGE_LIMIT:
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-continuation-message-over-limit")
+    return bounded
 
 
 def _resume_registered_obligation(duty, store, *, read_context=None):

@@ -906,6 +906,40 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertTrue(all(checks["prose_content_checks"].values()))
         self.assertTrue(all(checks["synthetic_value_checks"].values()))
 
+    def test_natural_multisentence_prose_is_independent_of_exact_json(self):
+        facts = self.fixture["facts"]["report"]
+        values = facts["synthetic_values"]
+        prose = (
+            "I read the exact result. I completed the already approved follow-through after reading it "
+            "so the requested task could be fulfilled.\n"
+            "Before, the follow-through file was absent and the approved action count was 0. "
+            "Afterward, the file was present and the approved action count was 1.\n"
+            "Verification with verify_fixture.py passed all six checks; 0 failed.\n"
+            f"The synthetic commit value is {values['commit']}. "
+            f"The synthetic deployment value is {values['deployment']}. "
+            f"The synthetic serving value is {values['serving']}.\n"
+            "Production deployment and serving checks were skipped. "
+            "No production operating state was changed or measured. "
+            "This isolated Codex replay tests delivery and reporting only."
+        )
+        tools = self._valid_tool_trace()
+        without_json = replay._first_report_checks(prose, tools, self.fixture)
+        with_json = replay._first_report_checks(
+            prose + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False),
+            tools, self.fixture)
+        self.assertTrue(without_json["report_has_substantive_closing_prose"])
+        self.assertTrue(with_json["report_has_substantive_closing_prose"])
+        self.assertFalse(without_json["report_matches_fixture_facts"])
+        self.assertTrue(with_json["report_matches_fixture_facts"])
+        self.assertEqual(without_json["prose_content_checks"], with_json["prose_content_checks"])
+
+        wrong_value = prose.replace(values["deployment"], "wrong-deployment-value")
+        wrong = replay._first_report_checks(
+            wrong_value + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False),
+            tools, self.fixture)
+        self.assertFalse(wrong["report_has_substantive_closing_prose"])
+        self.assertFalse(wrong["synthetic_value_checks"]["deployment"])
+
     def test_compound_shell_results_do_not_prove_verifier_or_action_success(self):
         tools = self._valid_tool_trace()
         verifier = next(item for item in tools if item["id"] == "verify-1")
@@ -948,6 +982,66 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         action["commandActions"] = [{"command": action_command, "type": "unknown"}]
         checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
         self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
+
+    def test_verifier_marker_and_success_must_belong_to_the_same_invocation(self):
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        marker = "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+        failed_with_marker = {
+            **verifier, "id": "verify-failed-with-marker", "status": "failed",
+            "exitCode": 1, "aggregatedOutput": marker,
+        }
+        successful_without_marker = {
+            **verifier, "id": "verify-success-without-marker", "status": "completed",
+            "exitCode": 0, "aggregatedOutput": "unrelated output",
+        }
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], failed_with_marker, successful_without_marker],
+            self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(len(checks["verifier_invocations"]), 2)
+        self.assertTrue(checks["verifier_invocations"][0]["output_marker_observed"])
+        self.assertFalse(checks["verifier_invocations"][0]["tool_succeeded"])
+        self.assertFalse(checks["verifier_invocations"][1]["output_marker_observed"])
+        self.assertTrue(checks["verifier_invocations"][1]["tool_succeeded"])
+
+    def test_compound_shell_uses_only_matching_per_action_result_and_output(self):
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        script = ".agent_reports/native-parent-fixture/verify_fixture.py"
+        command = f"python3 -B {script}; echo unrelated"
+        marker = "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+        compound = {
+            **verifier, "command": "/usr/bin/zsh -lc " + json.dumps(command),
+            "commandActions": [
+                {"command": f"python3 -B {script}", "cwd": str(self.worktree),
+                 "type": "unknown", "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": marker},
+                {"command": "echo unrelated", "cwd": str(self.worktree),
+                 "type": "unknown", "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": "unrelated"},
+            ],
+            "aggregatedOutput": marker + "\nunrelated",
+            "status": "completed", "exitCode": 0,
+        }
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], compound], self.fixture)
+        self.assertTrue(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertTrue(checks["verifier_invocations"][0]["execution_result_proven"])
+
+        mixed = {
+            **compound,
+            "commandActions": [
+                {**compound["commandActions"][0], "status": "failed", "exitCode": 1},
+                {**compound["commandActions"][0], "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": "no marker"},
+            ],
+        }
+        mixed["command"] = "/usr/bin/zsh -lc " + json.dumps(f"python3 -B {script}; python3 -B {script}")
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], mixed], self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(len(checks["verifier_invocations"]), 2)
 
     def test_duplicate_identical_action_entries_are_counted_separately(self):
         tools = self._valid_tool_trace()
