@@ -7050,8 +7050,10 @@ def _continue_look(target, req):
         return "new-session-unknown"
     if native_sid != new:
         return "target-changed"
+    # The continue is input to an idle session: work it dispatched (a supervisor's
+    # owners) keeps running and must not hold the continue back.
     readiness = _pane_readiness(target, state, expected_harness=harness,
-                                expected_sid=new, expected_pane=pane, purpose="completion",
+                                expected_sid=new, expected_pane=pane, purpose="input",
                                 target_observation=(state, ident), pane_info=info,
                                 native_session_id=native_sid)
     if readiness.state != "ready":
