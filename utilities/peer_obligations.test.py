@@ -518,16 +518,64 @@ class ObligationStoreTest(unittest.TestCase):
              mock.patch("harness_capabilities.parent_completion", return_value={"carrier": carrier}), \
              mock.patch.object(obligations, "ensure_normal_runner"):
             self.assertTrue(obligations.retain_registered_completion(
-                self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=turn))
+                self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=turn,
+                request_context="Exact original request\nOUTPUT_FORMAT_CANARY: exact JSON"))
         duties = obligations.ObligationStore(self.jobs.parent).list(kinds={"registered-batch"})
         self.assertEqual(len(duties), 1)
         retained = duties[0]["observation"]["native_receiving_turn"]
         self.assertEqual((retained["thread_id"], retained["turn_id"], retained["delivery_id"]),
                          (sid, "turn-native", delivery_id))
+        context = duties[0]["observation"]["native_request_context"]
+        self.assertEqual(context["source"], "codex-userprompt-submit")
+        self.assertEqual(context["status"], "available")
+        self.assertEqual(context["text"], "Exact original request\nOUTPUT_FORMAT_CANARY: exact JSON")
+        self.assertEqual((context["thread_id"], context["turn_id"], context["delivery_id"],
+                          context["receipt_digest"], context["row_revision"]),
+                         (sid, "turn-native", delivery_id,
+                          metadata["delivery_receipt_digest"], revision))
         self.assertEqual(pending.read(self.root, sid, delivery_id)["state"], "pending")
         invalid_turn = {"thread_id": sid, "message_id": "not-a-turn", "status": "inProgress"}
         self.assertFalse(obligations.retain_registered_completion(
             self.jobs, attempt, sid, carrier, delivery_record=record, receiving_turn=invalid_turn))
+
+    def test_native_continuation_preparation_keeps_first_body_for_same_id(self):
+        duty = self.store.create("registered-batch-prepared-test", "registered-batch",
+                                 {"jobs": str(self.jobs), "attempt_id": "att-prepared",
+                                  "session_id": "sid-prepared", "harness": "codex",
+                                  "server": "default"}, {"carrier": "codex-native-queue"})
+        first = "receipt\nOriginal request and exact output format"
+        _record, prepared = self.store.prepare_native_continuation(
+            duty["id"], continuation_id="delivery-prepared", source_turn_id="turn-prepared",
+            source={"source": "codex-userprompt-submit", "status": "available"},
+            message=first)
+        record = self.store.update(duty["id"], observation={"reason": "after-send"})
+        self.assertEqual(record["observation"]["continuation_prepared"]["message"], first)
+        _record, retried = self.store.prepare_native_continuation(
+            duty["id"], continuation_id="delivery-prepared", source_turn_id="later-turn",
+            source={"source": "unavailable", "status": "unavailable"},
+            message="changed retry body")
+        self.assertEqual(retried, prepared)
+        self.assertEqual(self.store.get(duty["id"])["observation"]["continuation_source"]["source"],
+                         "codex-userprompt-submit")
+
+    def test_oversized_hook_prompt_is_unavailable_without_oversizing_the_duty(self):
+        duty = self.store.create("registered-batch-large-prompt", "registered-batch",
+                                 {"jobs": str(self.jobs), "attempt_id": "att-large-prompt",
+                                  "session_id": "sid-large-prompt", "harness": "codex",
+                                  "server": "default"}, {"carrier": "codex-native-queue"})
+        binding = {"thread_id": "sid-large-prompt", "turn_id": "turn-large-prompt",
+                   "delivery_id": "delivery-large-prompt", "receipt_digest": "digest-large",
+                   "row_revision": "revision-large", "status": "inProgress"}
+        retained = self.store.retain_native_receiving_turn(
+            duty["id"], binding, request_context="x" * 140_000)
+        self.assertEqual(retained["observation"]["native_request_context"]["status"],
+                         "unavailable")
+        self.assertEqual(retained["observation"]["native_request_context"]["reason"],
+                         "hook-prompt-exceeds-obligation-record-limit")
+        reloaded = self.store.get(duty["id"])
+        self.assertEqual(reloaded["observation"]["native_receiving_turn"], binding)
+        self.assertLessEqual(self.store._record_path(duty["id"]).stat().st_size,
+                             obligations._MAX_RECORD_BYTES)
 
     def _parent_handover(self, harness="codex"):
         import dispatch_supervision as supervision

@@ -631,7 +631,8 @@ def _write_atomic(path: Path, value: dict) -> None:
 
 
 def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holder=None,
-                                 delivery_record=None, receiving_turn=None):
+                                 delivery_record=None, receiving_turn=None,
+                                 request_context=None):
     """Retain an exact completion and, when supplied, its native receiving turn."""
     from dispatch_completion_join import JoinContractError, current_attempt_row
     from dispatch_seat_handover import effective_parent
@@ -699,15 +700,14 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     duty = store.create(stable_duty_id("registered-batch", identity),
                         "registered-batch", identity, {"carrier": carrier})
     if duty.get("state") not in {"complete", "cancelled"}:
-        observation = dict(duty.get("observation") or {})
         if receiving_observation is not None:
-            existing = observation.get("native_receiving_turn")
-            if existing is not None and existing != receiving_observation:
+            duty = store.retain_native_receiving_turn(
+                duty["id"], receiving_observation,
+                request_context=request_context, holder=holder)
+            if duty is None:
                 return False
-            observation["native_receiving_turn"] = receiving_observation
-        if holder:
-            observation["holder"] = list(holder)
-        if observation and observation != duty.get("observation"):
+        elif holder:
+            observation = {**(duty.get("observation") or {}), "holder": list(holder)}
             store.update(duty["id"], observation=observation)
         ensure_normal_runner(Path(jobs).parent)
     return True
@@ -1036,6 +1036,135 @@ class ObligationStore:
             os.close(fd)
             self._invalidate_list_record(duty_id)
 
+    def retain_native_receiving_turn(self, duty_id: str, binding: dict, *,
+                                     request_context: str | None = None,
+                                     holder: list | None = None) -> dict | None:
+        """Atomically retain a Codex receive binding and its optional hook prompt."""
+        path = self._record_path(duty_id)
+        fd = self._lock(duty_id)
+        try:
+            record = _read_record(path)
+            if record is None:
+                raise ObligationError("peer-obligation-missing")
+            if record.get("state") in {"complete", "cancelled"}:
+                return record
+            observation = dict(record.get("observation") or {})
+            existing_binding = observation.get("native_receiving_turn")
+            if existing_binding is not None and existing_binding != binding:
+                return None
+            observation["native_receiving_turn"] = binding
+            if holder:
+                observation["holder"] = list(holder)
+
+            context_applied = False
+            if request_context is not None:
+                bound_context = {
+                    "source": "codex-userprompt-submit",
+                    "thread_id": binding["thread_id"],
+                    "turn_id": binding["turn_id"],
+                    "delivery_id": binding["delivery_id"],
+                    "receipt_digest": binding["receipt_digest"],
+                    "row_revision": binding["row_revision"],
+                }
+                if isinstance(request_context, str) and request_context:
+                    candidate_context = {**bound_context, "status": "available",
+                                         "text": request_context}
+                else:
+                    candidate_context = {**bound_context, "status": "unavailable",
+                                         "reason": "hook-prompt-empty-or-invalid"}
+                existing_context = observation.get("native_request_context")
+                existing_valid = (isinstance(existing_context, dict)
+                                  and existing_context.get("status") == "available"
+                                  and isinstance(existing_context.get("text"), str))
+                incoming_valid = candidate_context["status"] == "available"
+                applied = existing_context is None or (incoming_valid and not existing_valid)
+                if applied:
+                    observation["native_request_context"] = candidate_context
+                    context_applied = True
+                elif incoming_valid and existing_valid and existing_context != candidate_context:
+                    observation["native_request_context_conflict"] = True
+
+                proposed = {**record, "observation": observation}
+                serialized_size = len(json.dumps(
+                    proposed, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")) + 1
+                # Reserve one maximum-size queue body plus observation metadata.
+                if (serialized_size > _MAX_RECORD_BYTES - 20 * 1024
+                        and applied and incoming_valid):
+                    observation["native_request_context"] = {
+                        **bound_context, "status": "unavailable",
+                        "reason": "hook-prompt-exceeds-obligation-record-limit",
+                    }
+
+            proposed = {**record, "observation": observation}
+            serialized_size = len(json.dumps(
+                proposed, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")) + 1
+            if serialized_size > _MAX_RECORD_BYTES:
+                # Optional prompt context must never make an otherwise readable
+                # duty exceed the existing record limit.
+                observation.pop("native_request_context_conflict", None)
+                if context_applied:
+                    observation.pop("native_request_context", None)
+                proposed["observation"] = observation
+                serialized_size = len(json.dumps(
+                    proposed, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")) + 1
+                if serialized_size > _MAX_RECORD_BYTES:
+                    return None
+            if observation != record.get("observation"):
+                record["observation"] = observation
+                record["revision"] = int(record.get("revision", 0)) + 1
+                record["updated_at"] = time.time()
+                _write_atomic(path, record)
+            return record
+        finally:
+            os.close(fd)
+            self._invalidate_list_record(duty_id)
+
+    def prepare_native_continuation(self, duty_id: str, *, continuation_id: str,
+                                    source_turn_id: str, source: dict,
+                                    message: str) -> tuple[dict, dict]:
+        """Persist the first body for this continuation ID under the duty lock."""
+        path = self._record_path(duty_id)
+        fd = self._lock(duty_id)
+        try:
+            record = _read_record(path)
+            if record is None:
+                raise ObligationError("peer-obligation-missing")
+            if record.get("state") in {"complete", "cancelled"}:
+                raise ObligationError("native-continuation-duty-settled")
+            observation = dict(record.get("observation") or {})
+            prepared = observation.get("continuation_prepared")
+            if (isinstance(prepared, dict) and prepared.get("id") == continuation_id
+                    and isinstance(prepared.get("message"), str)):
+                return record, prepared
+            prepared = {"id": continuation_id, "source_turn_id": source_turn_id,
+                        "message": message}
+            observation.update({
+                "continuation_id": continuation_id,
+                "continuation_source_turn": source_turn_id,
+                "continuation_source": source,
+                "continuation_prepared": prepared,
+                "reason": "native-continuation-prepared",
+            })
+            proposed = {**record, "observation": observation,
+                        "state": "pending", "delivery": "pending"}
+            size = len(json.dumps(proposed, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":")).encode("utf-8")) + 1
+            if size > _MAX_RECORD_BYTES:
+                raise ObligationError("native-continuation-preparation-exceeds-record-limit")
+            record["observation"] = observation
+            record["state"] = "pending"
+            record["delivery"] = "pending"
+            record["revision"] = int(record.get("revision", 0)) + 1
+            record["updated_at"] = time.time()
+            _write_atomic(path, record)
+            return record, prepared
+        finally:
+            os.close(fd)
+            self._invalidate_list_record(duty_id)
+
     def update(self, duty_id: str, *, state: str | None = None,
                observation: dict | None = None, result: str | None = None,
                delivery: str | None = None, cleanup: str | None = None,
@@ -1063,6 +1192,20 @@ class ObligationStore:
                 state = "unknown"
                 observation = {**(record.get("observation") or {}),
                                "reason": observer_error}
+            if observation is not None:
+                current_observation = record.get("observation") or {}
+                observation = dict(observation)
+                for key in ("native_receiving_turn", "native_request_context",
+                            "native_request_context_conflict"):
+                    if key in current_observation:
+                        observation[key] = current_observation[key]
+                current_prepared = current_observation.get("continuation_prepared")
+                if isinstance(current_prepared, dict):
+                    observation["continuation_prepared"] = current_prepared
+                    for key in ("continuation_id", "continuation_source_turn",
+                                "continuation_source"):
+                        if key in current_observation:
+                            observation[key] = current_observation[key]
             if result is not None and record.get("result") not in {None, result}:
                 raise ObligationError("peer-obligation-result-conflict")
             changed = False

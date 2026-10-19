@@ -112,6 +112,21 @@ class QueueDeliveryTest(unittest.TestCase):
         self.assertEqual(rpc.call_args_list[0].args[2]["threadId"], THREAD)
         self.assertEqual(rpc.call_args_list[0].args[2]["itemsView"], "full")
 
+    def test_read_exact_turn_accepts_codex_0163_full_view_with_empty_items(self):
+        # Shape copied from the recorded first-turn-before-crash.json replay
+        # fixture for Codex 0.163; the native hook later observes interruption.
+        turn = {
+            "completedAt": None, "durationMs": None, "error": None,
+            "id": "turn-empty-native", "items": [], "itemsView": "full",
+            "rootTurnId": "turn-empty-native", "startedAt": 1792389273,
+            "status": "inProgress",
+        }
+        with mock.patch.object(QUEUE, "_rpc", return_value={"data": [turn]}) as rpc:
+            observed = QUEUE.read_exact_turn(SOCKET, THREAD, "turn-empty-native")
+        self.assertEqual(observed, {
+            "id": "turn-empty-native", "status": "inProgress", "items": []})
+        self.assertEqual(rpc.call_args.args[2]["itemsView"], "full")
+
     def test_rpc_server_request_id_collision_is_not_mistaken_for_a_reply(self):
         client = QUEUE._WebSocket.__new__(QUEUE._WebSocket)
         client.timeout = 1.0

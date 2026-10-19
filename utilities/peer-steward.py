@@ -5386,8 +5386,11 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         endpoint = resolve_queue_socket()
         source_turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
         turn_id = source_turn_id
-        source_turn = codex_queue_delivery.read_exact_turn(
-            endpoint, recipient_sid, source_turn_id, timeout=5.0)
+        try:
+            source_turn = codex_queue_delivery.read_exact_turn(
+                endpoint, recipient_sid, source_turn_id, timeout=5.0)
+        except codex_queue_delivery.QueueDeliveryError:
+            source_turn = None
         current_turn = source_turn
         continuation_id = observation.get("continuation_id")
         if continuation_id:
@@ -5425,7 +5428,10 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             store.update(duty["id"], state="unknown", delivery="pending",
                          observation={**observation, "reason": "native-receiving-turn-no-longer-current"})
             return True
-        source_messages = _native_user_message_sources(source_turn)
+        try:
+            source_messages = _native_user_message_sources(source_turn)
+        except codex_queue_delivery.QueueDeliveryError:
+            source_messages = []
         receipt = exact.get("receipt")
         if not isinstance(receipt, dict):
             store.update(duty["id"], state="unknown", delivery="pending",
@@ -5436,18 +5442,73 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         followup = completion_followup_text(
             receipt, jobs=str(jobs_path),
             surface=str(_UTILITIES_DIR.parent / "adapters/codex/bin/preflight.sh"))
+        request_context = observation.get("native_request_context")
+        original_request = None
+        request_reference = None
+        source_reason = "native-original-user-message-unavailable"
+        source_record = None
+        receiving_binding = observation.get("native_receiving_turn") or binding
+        if (isinstance(request_context, dict)
+                and request_context.get("source") == "codex-userprompt-submit"
+                and request_context.get("status") == "available"
+                and isinstance(request_context.get("text"), str)
+                and request_context.get("text")
+                and request_context.get("thread_id") == recipient_sid
+                and request_context.get("turn_id") == receiving_binding.get("turn_id")
+                and request_context.get("delivery_id") == delivery_id
+                and request_context.get("receipt_digest")
+                    == row.metadata.get("delivery_receipt_digest")
+                and request_context.get("row_revision")
+                    == row.metadata.get("delivery_row_revision")):
+            original_request = request_context["text"]
+            source_record = {"source": "codex-userprompt-submit", "status": "available",
+                             "thread_id": recipient_sid,
+                             "turn_id": receiving_binding.get("turn_id")}
+            request_reference = (
+                "\nOriginal user request source: read the exact JSON field "
+                "observation.native_request_context.text in the existing durable obligation "
+                f"file {store._record_path(duty['id']).resolve()} (duty {duty['id']}; "
+                f"Codex thread {recipient_sid}, turn {receiving_binding.get('turn_id')}; "
+                f"delivery {delivery_id}; receipt revision "
+                f"{row.metadata.get('delivery_row_revision')}). Fulfill it verbatim, including "
+                "all requested content and output-format requirements."
+            )
+        elif source_messages:
+            source_record = {"source": "codex-native-userMessage", "status": "available",
+                             "item_ids": [item["item_id"] for item in source_messages]}
+        else:
+            if (isinstance(request_context, dict)
+                    and request_context.get("status") == "unavailable"
+                    and request_context.get("thread_id") == recipient_sid
+                    and request_context.get("turn_id") == receiving_binding.get("turn_id")
+                    and request_context.get("delivery_id") == delivery_id
+                    and request_context.get("receipt_digest")
+                        == row.metadata.get("delivery_receipt_digest")
+                    and request_context.get("row_revision")
+                        == row.metadata.get("delivery_row_revision")):
+                source_reason = request_context.get("reason", source_reason)
+            elif isinstance(request_context, dict):
+                source_reason = "hook-request-context-binding-unavailable"
+            source_record = {"source": "unavailable", "status": "unavailable",
+                             "reason": source_reason}
         message = _native_continuation_message(
             thread_id=recipient_sid, turn_id=turn_id, source_turn_id=source_turn_id,
             receipt_text=encoded,
-            followup=followup, source_messages=source_messages)
+            followup=followup, source_messages=source_messages,
+            original_request=original_request,
+            request_reference=request_reference,
+            source_unavailable_reason=(source_reason if source_record["status"] == "unavailable"
+                                       else None))
         stable = "delivery-" + hashlib.sha256((
             "codex-native-recovery-v1\0" + delivery_id + "\0" + turn_id + "\0"
             + str(row.metadata.get("delivery_receipt_digest", ""))
         ).encode("utf-8")).hexdigest()[:32]
-        observation = {**observation, "continuation_id": stable,
-                       "continuation_source_turn": turn_id}
-        store.update(duty["id"], state="pending", delivery="pending",
-                     observation={**observation, "reason": "native-continuation-prepared"})
+        prepared_record, prepared = store.prepare_native_continuation(
+            duty["id"], continuation_id=stable, source_turn_id=turn_id,
+            source=source_record, message=message)
+        observation = dict(prepared_record.get("observation") or {})
+        stable = prepared["id"]
+        message = prepared["message"]
 
         def before_add():
             fresh = current_attempt_row(jobs_path, row.attempt_id)
@@ -5455,9 +5516,6 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             from dispatch_contract import terminal_conflict_pending
             fresh_receiving_turn = codex_queue_delivery.read_exact_turn(
                 endpoint, recipient_sid, turn_id, timeout=5.0)
-            fresh_source_turn = (fresh_receiving_turn if source_turn_id == turn_id else
-                                 codex_queue_delivery.read_exact_turn(
-                                     endpoint, recipient_sid, source_turn_id, timeout=5.0))
             newest = codex_queue_delivery._latest_turn(endpoint, recipient_sid, timeout=5.0)
             latest_record = pending.read(root, storage_recipient, delivery_id)
             if (fresh is None or fresh.status != row.status
@@ -5471,7 +5529,7 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                         != (route_id, route_node, parent_attempt_id)
                     or not fresh_receiving_turn
                     or fresh_receiving_turn.get("status") != "interrupted"
-                    or _native_user_message_sources(fresh_source_turn) != source_messages
+                    or fresh_receiving_turn.get("id") != turn_id
                     or not isinstance(newest, dict) or newest.get("id") != turn_id
                     or not latest_record or latest_record.get("state") != "acked"
                     or pending.received_ack_identity(latest_record, storage_recipient, delivery_id)
@@ -5523,31 +5581,53 @@ def _native_user_message_sources(turn):
             raise codex_queue_delivery.QueueDeliveryError(
                 "native-original-user-message-unavailable")
         sources.append({"item_id": item_id, "text": content[0]["text"]})
-    if not sources or len({item["item_id"] for item in sources}) != len(sources):
+    if len({item["item_id"] for item in sources}) != len(sources):
         raise codex_queue_delivery.QueueDeliveryError(
             "native-original-user-message-unavailable")
     return sources
 
 
 def _native_continuation_message(*, thread_id, turn_id, source_turn_id,
-                                 receipt_text, followup, source_messages):
+                                 receipt_text, followup, source_messages,
+                                 original_request=None, request_reference=None,
+                                 source_unavailable_reason=None):
     import codex_queue_delivery
 
     prefix = ("AGENT_HARNESS_COMPLETION_V1\n" + receipt_text + "\n" + followup
               + f"\nThe exact receiving turn {turn_id} was interrupted. Continue its approved follow-through "
                 "and report once; check existing exact artifact and next-leg lineage before repeating "
                 "any action. Preserve new failures, conflicts, and unfinished work.")
-    source_header = (
-        "\nOriginal user request from the exact interrupted turn, verbatim. "
-        "Continue and fulfill that original task, preserving all requested content and output formats; "
-        "this receipt is context and does not replace or narrow the task:\n")
-    source_body = "".join(
-        f"\n[original userMessage item {item['item_id']}]\n{item['text']}"
-        for item in source_messages)
+    if original_request is not None:
+        source_header = (
+            "\nOriginal user request received by Codex UserPromptSubmit, verbatim. "
+            "Continue and fulfill that original task, preserving all requested content and output "
+            "formats; this receipt is context and does not replace or narrow the task:\n")
+        source_body = original_request
+    elif source_messages:
+        source_header = (
+            "\nOriginal user request from the exact interrupted turn, verbatim. "
+            "Continue and fulfill that original task, preserving all requested content and output formats; "
+            "this receipt is context and does not replace or narrow the task:\n")
+        source_body = "".join(
+            f"\n[original userMessage item {item['item_id']}]\n{item['text']}"
+            for item in source_messages)
+    else:
+        source_header = (
+            "\nThe original user request could not be recovered from the Codex hook or exact turn "
+            f"({source_unavailable_reason or 'source-unavailable'}). Continue the existing approved "
+            "follow-through in this receipt and record any missing original-task context honestly.\n")
+        source_body = ""
     full = prefix + source_header + source_body
     if len(full.encode("utf-8")) <= _NATIVE_QUEUE_MESSAGE_LIMIT:
         return full
+    if original_request is not None and request_reference:
+        bounded = prefix + request_reference
+        if len(bounded.encode("utf-8")) <= _NATIVE_QUEUE_MESSAGE_LIMIT:
+            return bounded
     references = ", ".join(item["item_id"] for item in source_messages)
+    if not references:
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-continuation-message-over-limit")
     bounded = (prefix + f"\nOriginal task source: read the exact userMessage item(s) {references} "
                f"in Codex thread {thread_id}, turn {source_turn_id}. Fulfill the entire original request, "
                "including every requested content and output-format requirement. This receipt is only "
