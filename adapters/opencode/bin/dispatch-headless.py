@@ -1879,27 +1879,6 @@ def main(argv: list[str]) -> int:
                 "supervised" if _supervised_owner(args) else "poll"
             ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
-            **commit_policy.runtime_permission_context_env(
-                args, adapter="opencode",
-                agent_home=str(args.agent_home),
-                opencode_config_base=args.opencode_config_base_content,
-                report_bundle_root=(str(args.report_bundle_root)
-                                    if args.report_bundle_root is not None else None),
-                execution_access_roots=[
-                    str(value) for value in (
-                        args.execution_access_grant.additional_writable_roots
-                        if args.execution_access_grant is not None else ()
-                    )
-                ],
-                execution_access_read_roots=[
-                    str(value) for value in (
-                        args.execution_access_grant.read_roots
-                        if args.execution_access_grant is not None else ()
-                    )
-                ],
-                contract_read_roots=[str(value) for value in args.contract_read_roots],
-                selected_agent=str(args.agent),
-            ),
             **args.nested_runtime_env,
             # Headless liveness contract: the OpenCode runtime child exposes
             # the dispatch slug to the plugin, which records a plugin-load
@@ -1931,6 +1910,23 @@ def main(argv: list[str]) -> int:
                 raise opencode_context.OpenCodeContextError(
                     "OpenCode runtime version changed between command selection and limit verification"
                 )
+            if observed_mode == "standalone":
+                # Owner permission refresh starts from the original config on
+                # every turn. Carry only the verified selected-model limits in
+                # that base so each fresh permission projection retains them.
+                permission_base, permission_limits = opencode_context.apply_context_override(
+                    args.opencode_config_base_content,
+                    str(context_capture["model"]),
+                    args.resolved_model_settings["context_window"],
+                    context_capture["native_limits"],
+                    provider_key="providers",
+                    provider_keys=("providers", "provider"),
+                )
+                if permission_limits != context_capture["applied_limits"]:
+                    raise opencode_context.OpenCodeContextError(
+                        "OpenCode owner permission base differs from verified context limits"
+                    )
+                args.opencode_config_base_content = permission_base
         except opencode_context.OpenCodeContextError as exc:
             annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": "never-launched"})
             cancel_governor_reservation(governor, governor_root, reservation_token)
@@ -1984,6 +1980,29 @@ def main(argv: list[str]) -> int:
             "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
             "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
         })
+        # Serialize the supervisor refresh base only after native limits have
+        # been verified and, for standalone V2, merged into the original base.
+        dispatch_env.update(commit_policy.runtime_permission_context_env(
+            args, adapter="opencode",
+            agent_home=str(args.agent_home),
+            opencode_config_base=args.opencode_config_base_content,
+            report_bundle_root=(str(args.report_bundle_root)
+                                if args.report_bundle_root is not None else None),
+            execution_access_roots=[
+                str(value) for value in (
+                    args.execution_access_grant.additional_writable_roots
+                    if args.execution_access_grant is not None else ()
+                )
+            ],
+            execution_access_read_roots=[
+                str(value) for value in (
+                    args.execution_access_grant.read_roots
+                    if args.execution_access_grant is not None else ()
+                )
+            ],
+            contract_read_roots=[str(value) for value in args.contract_read_roots],
+            selected_agent=str(args.agent),
+        ))
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
