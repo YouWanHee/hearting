@@ -253,6 +253,12 @@ class HerdrCollectorTest(unittest.TestCase):
             herdr._ppid_of = real
         self.assertEqual([s.herdr_attached for s in sessions], [True, True, False])
 
+    def test_exact_foreground_pid_still_attaches_without_session_id_match(self):
+        session = Session(harness="codex", pid=7312, session_id="thread-current")
+        live_pid = (set(), {7312})
+        herdr.enrich([session], agents=[], pids=live_pid)
+        self.assertIs(session.herdr_attached, True)
+
     def test_pane_pids_parses_the_measured_process_info_shape(self):
         panes = [{"pane_id": "w2:p4", "agent": "opencode"}, {"pane_id": "w5:p1", "agent": None}]
         calls = []

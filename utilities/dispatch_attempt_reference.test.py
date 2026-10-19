@@ -63,6 +63,56 @@ class NoFollowChmodUnavailableTest(unittest.TestCase):
         self.assertEqual(str(caught.exception), "attempt-reference-directory-untrusted")
         self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
 
+    def test_replaced_directory_is_not_chmodded(self):
+        directory = self.root / R.LOCK_DIRECTORY
+        directory.mkdir()
+        REAL_CHMOD(directory, 0o755)
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        REAL_CHMOD(replacement, 0o755)
+        displaced = self.root / "displaced"
+        real_open = os.open
+        swapped = False
+
+        def replace_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if Path(path) == directory and flags & os.O_DIRECTORY and not swapped:
+                directory.rename(displaced)
+                replacement.rename(directory)
+                swapped = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(R.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(R.AttemptReferenceError) as caught:
+                R._ensure_directory(directory)
+
+        self.assertTrue(swapped)
+        self.assertEqual(str(caught.exception), "attempt-reference-directory-untrusted")
+        self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(displaced).st_mode), 0o755)
+
+    def test_fchmod_error_is_typed_and_closes_descriptor(self):
+        directory = self.root / R.LOCK_DIRECTORY
+        directory.mkdir()
+        opened_fds = []
+        real_open = os.open
+
+        def record_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if Path(path) == directory and flags & os.O_DIRECTORY:
+                opened_fds.append(fd)
+            return fd
+
+        with mock.patch.object(R.os, "open", side_effect=record_open), \
+                mock.patch.object(R.os, "fchmod", side_effect=OSError("denied")):
+            with self.assertRaises(R.AttemptReferenceError) as caught:
+                R._ensure_directory(directory)
+
+        self.assertEqual(str(caught.exception), "attempt-reference-directory-unavailable")
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened_fds[0])
+
 
 if __name__ == "__main__":
     unittest.main()

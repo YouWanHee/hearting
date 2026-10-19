@@ -1772,7 +1772,7 @@ def share_managed_registry_state(sessions):
                 client.updated_at = server_updated
 
 
-def prepare_tick(sessions):
+def prepare_tick(sessions, *, wait_timeout=0.0):
     """Reserve only process-owned rollouts before enriching Codex rows.
 
     A TUI without a rollout fd gets a session id only from the pane's
@@ -1800,7 +1800,8 @@ def prepare_tick(sessions):
     pane_ids = {}
     if direct_tuis:
         from . import herdr, procscan
-        pane_ids = herdr.codex_pane_sessions(direct_tuis, force_current=True)
+        pane_ids = herdr.codex_pane_sessions(
+            direct_tuis, force_current=True, wait_timeout=wait_timeout)
         for sess in direct_tuis:
             sid = pane_ids.get(sess.pid)
             if not sid or _sid("rollout-x-%s.jsonl" % sid) != sid:

@@ -75,6 +75,23 @@ class MergeConfigTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertTrue(blocked)
 
+    def test_v2_skills_use_native_list_and_preserve_existing_paths(self):
+        existing = {"skills": {"paths": ["/home/me/team-skills"]}}
+        merged, changed, blocked, _ = self.driver._merge_config(
+            existing, None, self.skills, v2=True)
+        self.assertTrue(changed)
+        self.assertFalse(blocked)
+        self.assertEqual(merged["skills"], ["/home/me/team-skills", self.skills])
+
+    def test_v2_skills_conflict_is_reported_without_overwrite(self):
+        existing = {"skills": "user-choice"}
+        merged, changed, blocked, detail = self.driver._merge_config(
+            existing, None, self.skills, v2=True)
+        self.assertFalse(changed)
+        self.assertTrue(blocked)
+        self.assertEqual(merged, existing)
+        self.assertIn("incompatible V2 type", detail)
+
 
 class BootstrapLoadPathCheckTest(unittest.TestCase):
     """Drive the verify check through each carrier count."""

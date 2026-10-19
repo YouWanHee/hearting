@@ -63,6 +63,11 @@ Concrete model names do not belong in this directory. Use the portable model
 roles and execution profiles from `core/CONVENTIONS.md` and let adapter config
 define concrete mapping.
 
+Profiles describe work level and preferred model settings. Runtime adapters and
+the shared dispatch selector own current provider/account/model availability;
+they apply that evidence before automatic ranking while preserving an explicit
+pin and its native failure.
+
 ## Behavior Contract (separate from the role catalog)
 
 Beyond the delegation-role catalog above, this directory also holds the

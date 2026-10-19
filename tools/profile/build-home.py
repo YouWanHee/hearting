@@ -733,6 +733,14 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         config_root = Path(env.get('XDG_CONFIG_HOME') or Path(env.get('HOME') or Path.home()) / '.config')
         inventory = env.get('COMPUTE_HOSTS_CONFIG') or config_root / 'hearting/compute-hosts.yaml'
         values['COMPUTE_HOSTS_CONFIG'] = str(Path(inventory).expanduser().absolute())
+        utilities = agent_home / 'utilities'
+        if str(utilities) not in sys.path:
+            sys.path.insert(0, str(utilities))
+        import opencode_runtime
+        try:
+            v2_runtime = opencode_runtime.is_v2()
+        except Exception:
+            v2_runtime = False
         source = Path(env.get('OPENCODE_CONFIG_DIR') or Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'opencode')
         config = read_json(first_existing(source / 'opencode.jsonc', source / 'opencode.json') or source / 'opencode.json')
         config = deepcopy(config)
@@ -747,32 +755,54 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         config['instructions'] = [path for path in config.get('instructions', [])
                                   if not (Path(path).name in ('AGENTS.md', 'CLAUDE.md') and
                                           Path(path).is_file() and 'Adapter Bootstrap' in Path(path).read_text())]
-        config['skills'] = {'paths': []}
-        config['mcp'] = {name: {**value, 'enabled': False} for name, value in config.get('mcp', {}).items()}
-        permission = config.get('permission', {})
-        if isinstance(permission, str):
-            permission = {'*': permission}
-        permission['skill'] = {'*': 'deny'}
-        config['permission'] = permission
-        for name in ('plugins', 'plugin'):
-            symlink(source / name, home / name)
+        if v2_runtime:
+            config['skills'] = []
+            config['mcp'] = {'servers': {}}
+            config['plugins'] = []
+            config.pop('plugin', None)
+            permissions = config.get('permissions', [])
+            if not isinstance(permissions, list):
+                permissions = []
+            permissions.append({'action': 'skill', 'resource': '*', 'effect': 'deny'})
+            config['permissions'] = permissions
+            config.pop('permission', None)
+            config['plugins'] = []
+            config.pop('plugin', None)
+        else:
+            config['skills'] = {'paths': []}
+            config['mcp'] = {name: {**value, 'enabled': False} for name, value in config.get('mcp', {}).items()}
+            permission = config.get('permission', {})
+            if isinstance(permission, str):
+                permission = {'*': permission}
+            permission['skill'] = {'*': 'deny'}
+            config['permission'] = permission
+            for name in ('plugins', 'plugin'):
+                symlink(source / name, home / name)
         write_json(home / 'opencode.json', config)
         runtime = home / 'runtime'
         for kind in ('data', 'cache', 'state', 'config'):
             target = runtime / kind
             target.mkdir(parents=True, exist_ok=True, mode=0o700)
-            values['XDG_' + kind.upper() + '_HOME'] = str(target)
-        data = (account_source if account_source is not None else
-                Path(env.get('XDG_DATA_HOME') or Path.home() / '.local/share'))
-        auth_source = data / 'opencode/auth.json'
-        if account_source is not None and not auth_source.is_file():
-            old_link = runtime / 'data/opencode/auth.json'
-            if old_link.is_symlink():
-                old_link.unlink()
-        symlink(auth_source, runtime / 'data/opencode/auth.json')
-        symlink(home, runtime / 'config/opencode')
-        values.update(OPENCODE_CONFIG_DIR=str(home), OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
+            if not v2_runtime:
+                values['XDG_' + kind.upper() + '_HOME'] = str(target)
+        if not v2_runtime:
+            data = (account_source if account_source is not None else
+                    Path(env.get('XDG_DATA_HOME') or Path.home() / '.local/share'))
+            auth_source = data / 'opencode/auth.json'
+            if account_source is not None and not auth_source.is_file():
+                old_link = runtime / 'data/opencode/auth.json'
+                if old_link.is_symlink():
+                    old_link.unlink()
+            symlink(auth_source, runtime / 'data/opencode/auth.json')
+            symlink(home, runtime / 'config/opencode')
+            values['OPENCODE_CONFIG_DIR'] = str(home)
+        values.update(OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
                       OPENCODE_DISABLE_CLAUDE_CODE_SKILLS='1')
+        if v2_runtime:
+            # The OpenCode client discovers the existing shared service through
+            # XDG state/config; it never receives a database path or legacy auth
+            # file to connect directly from this nested worker.
+            values.update(OPENCODE_DB=None, OPENCODE_AUTH=None, OPENCODE_DATA_DIR=None)
     # schema 2 adds the identity retention needs to bind a home to its attempt.
     metadata = {'harness': harness, 'worker_type': worker_type,
                 'source': str(agent_home), 'profile': profile,

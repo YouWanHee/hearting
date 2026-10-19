@@ -88,10 +88,17 @@ def _ensure_directory(path: Path) -> None:
             os.chmod(path, DIR_MODE, follow_symlinks=False)
         except NotImplementedError:
             # glibc < 2.32 has no no-follow chmod. The lstat above proved a
-            # real directory, so change it through a no-follow descriptor.
+            # real directory. Bind that check to the opened inode before
+            # changing it: O_NOFOLLOW rejects a leaf symlink, not a replaced
+            # real directory.
             fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC |
                          getattr(os, "O_NOFOLLOW", 0))
             try:
+                opened = os.fstat(fd)
+                if ((opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)
+                        or not stat.S_ISDIR(opened.st_mode)
+                        or opened.st_uid != os.geteuid()):
+                    raise AttemptReferenceError("attempt-reference-directory-untrusted")
                 os.fchmod(fd, DIR_MODE)
             finally:
                 os.close(fd)
