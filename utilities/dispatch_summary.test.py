@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import json
+import fcntl
 import os
 from pathlib import Path
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -51,6 +53,134 @@ class DispatchSummaryTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
         self.tmp.cleanup()
+
+    def test_home_consumer_uses_recorded_state_root_and_provider_lock(self):
+        attempt = "att-home-consumer"
+        harness = "claude"
+        recorded_root = Path(self.tmp.name) / "recorded-title-state"
+        state_path = recorded_root / ".dispatch-owners" / harness / f"{attempt}.json"
+        state_path.parent.mkdir(parents=True)
+        runtime_home = Path(self.tmp.name) / "worker-home"
+        runtime_home.mkdir()
+        transcript = runtime_home / "projects" / "session.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("{}\n", encoding="utf-8")
+        owner_start = S.process_observation(os.getpid())[1]
+        namespace = S.process_namespace_identity()
+        sid = S.summary_sid(attempt)
+        state_path.write_text(json.dumps({
+            "schema_version": S.OWNER_SCHEMA,
+            "status": "active",
+            "attempt_id": attempt,
+            "harness": harness,
+            "sid": sid,
+            "transcript": str(transcript),
+            "runtime_home": str(runtime_home),
+            "pid": os.getpid(),
+            "proc_start": owner_start,
+            "observer_namespace": namespace,
+        }), encoding="utf-8")
+        owner_lock = state_path.with_suffix(".lock")
+        owner_lock.touch()
+        metadata = {
+            "attempt_id": attempt,
+            "harness": harness,
+            "runtime_home": str(runtime_home),
+            "log_file": str(transcript),
+            "summary_owner": S.OWNER_KIND,
+            "summary_sid": sid,
+            "summary_owner_pid": str(os.getpid()),
+            "summary_owner_pid_start": owner_start,
+            "summary_owner_pid_observer_ns": namespace,
+            "summary_state_file": str(state_path),
+        }
+        fd = os.open(owner_lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with mock.patch.dict(os.environ, {"FLEET_TITLE_STATE_DIR": str(Path(self.tmp.name) / "wrong-root")}):
+                self.assertEqual(S.home_consumer_evidence(metadata), ("live", "owner-lock-held"))
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        provider_parent = recorded_root / harness
+        provider_parent.mkdir()
+        provider_lock = provider_parent / (".lock-" + sid)
+        provider_lock.mkdir()
+        old = time.time() - 30 * 86400
+        os.utime(provider_lock, (old, old))
+        with mock.patch.dict(os.environ, {"FLEET_TITLE_STATE_DIR": str(Path(self.tmp.name) / "wrong-root")}):
+            self.assertEqual(S.home_consumer_evidence(metadata), ("live", "provider-lockdir-present"))
+        provider_lock.rmdir()
+        self.assertEqual(S.home_consumer_evidence(metadata)[0], "absent")
+
+    def test_summary_owner_admits_path_based_reads_of_identityless_legacy_home(self):
+        import threading
+        import worker_home_retention as retention
+        from worker_runtime_home import _builder
+
+        attempt = "att-summary-legacy-admission"
+        root = Path(self.tmp.name) / "dispatch-state"
+        jobs = root / "jobs.log"
+        root.mkdir()
+        jobs.write_text("")
+        home_key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+        home = root / "homes" / "workers" / home_key
+        (home / "projects").mkdir(parents=True)
+        (home / "worker-home.json").write_text(json.dumps({
+            "harness": "claude", "worker_type": "stage", "source": str(ROOT),
+            "profile": None,
+        }))
+        transcript = home / "projects" / "transcript.jsonl"
+        transcript.write_text("native legacy transcript\n")
+        owner_log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
+        owner_log.write_text("")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.8)"],
+                                 start_new_session=True)
+        target_start = S.process_observation(child.pid)[1]
+        observed, finished = threading.Event(), threading.Event()
+        result, errors = [], []
+        original_source = S._summary_source
+
+        def source(*args, **kwargs):
+            observed.set()
+            return original_source(*args, **kwargs)
+
+        def run_owner():
+            try:
+                result.append(S.supervise(
+                    attempt_id=attempt, harness="claude", transcript=owner_log,
+                    target_pid=child.pid, target_start=target_start, poll=0.02,
+                    initial_delay=60, final_grace=0, log_quiet=0,
+                    runtime_home=home, attempt_cwd="/wt/owner"))
+            except BaseException as exc:  # reported on the test thread
+                errors.append(repr(exc))
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=run_owner)
+        try:
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                    mock.patch.object(S, "_summary_source", source):
+                thread.start()
+                self.assertTrue(observed.wait(3), "summary owner did not reach native-source resolution")
+                # The owner pins exactly this HOME (shared flock on the leaf the
+                # retention detach must lock exclusively), not a global lock.
+                fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+                self.assertTrue(finished.wait(3))
+        finally:
+            thread.join(timeout=3)
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [0])
 
     def test_first_concrete_claude_model_is_recorded_once(self):
         attempt = "att-resolved-model"
@@ -627,13 +757,30 @@ class DispatchSummaryTest(unittest.TestCase):
         attempt = "att-supervised-e2e"
         session_id = "abcdabcd-1234-5678-9abc-abcdabcdabcd"
         producer_home = Path(self.tmp.name) / "producer-home"
-        worker_home = Path(self.tmp.name) / "worker-home"
+        dispatch_root = Path(self.tmp.name) / "dispatch-state"
+        jobs = dispatch_root / "jobs.log"
+        dispatch_root.mkdir()
+        from worker_runtime_home import _builder
+        home_key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+        worker_home = dispatch_root / "homes" / "workers" / home_key
         os.environ["CLAUDE_CONFIG_DIR"] = str(producer_home)
+        # The isolated suite runner intentionally removes ambient dispatch
+        # state. Model the real registered launch in this test's private root:
+        # HOME-scoped reads need its jobs path and managed HOME identity.
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
         from claude_project_dir import encode_project_dir
         project = worker_home / "projects" / encode_project_dir("/wt/owner")
         decoy_project = producer_home / "projects" / encode_project_dir("/wt/owner")
         project.mkdir(parents=True)
         decoy_project.mkdir(parents=True)
+        (worker_home / "worker-home.json").write_text(json.dumps({
+            "schema": 2,
+            "identity": attempt,
+            "key": home_key,
+            "harness": "claude",
+            "worker_type": "stage",
+            "source": str(ROOT),
+        }), encoding="utf-8")
         transcript = project / f"{session_id}.jsonl"
         (decoy_project / f"{session_id}.jsonl").write_text(
             json.dumps({"type": "assistant", "message": {"content": [
@@ -651,6 +798,14 @@ class DispatchSummaryTest(unittest.TestCase):
         os.environ["FLEET_TITLE_COMMAND"] = shlex.join([sys.executable, "-c", provider_script])
         log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
         log.write_text(self._announce(session_id, "/wt/owner"), encoding="utf-8")
+        jobs.write_text(
+            "2026-10-19T00:00:00Z\topen\t/wt/owner\t/wt/owner\towner\t"
+            "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            "fallback_hop=same-harness-headless,worker_type=stage,"
+            f"attempt_id={attempt},harness=claude,runtime_home={worker_home},log_file={log}\n",
+            encoding="utf-8",
+        )
         child = subprocess.Popen([
             sys.executable, "-c",
             "import pathlib,sys,time,json; time.sleep(.4); "
@@ -710,23 +865,44 @@ class DispatchSummaryTest(unittest.TestCase):
         root.mkdir()
         log = Path(self.tmp.name) / f"review.{attempt}.codex.jsonl"
         log.write_text("", encoding="utf-8")
-        target = subprocess.Popen(["sleep", "0.5"], start_new_session=True)
-        owner_pid = None
+        target = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            start_new_session=True,
+        )
+        summary_owners = []
+        real_popen = subprocess.Popen
+
+        def track_summary_owner(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            summary_owners.append(process)
+            return process
+
         try:
             start = S.process_observation(target.pid)[1]
-            receipt = S.launch_summary_owner(
-                attempt_id=attempt, harness="codex", transcript=log,
-                target_pid=target.pid, target_start=start,
-                review_artifact_root=root, review_cycle_id=cycle,
-                review_lease_nonce=nonce,
+            with mock.patch.object(
+                S.subprocess, "Popen", side_effect=track_summary_owner
+            ):
+                receipt = S.launch_summary_owner(
+                    attempt_id=attempt, harness="codex", transcript=log,
+                    target_pid=target.pid, target_start=start,
+                    review_artifact_root=root, review_cycle_id=cycle,
+                    review_lease_nonce=nonce,
+                )
+            self.assertEqual(len(summary_owners), 1)
+            self.assertEqual(
+                summary_owners[0].pid, int(receipt["summary_owner_pid"])
             )
-            owner_pid = int(receipt["summary_owner_pid"])
             metadata = {
                 "attempt_id": attempt, "review_cycle_id": cycle,
                 "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
                 "review_governed_lease_nonce": nonce,
             }
             self.assertTrue(D.review_governed_lease_is_held(root, metadata))
+            self.assertIsNone(target.poll())
+            target.stdin.write(b"release\n")
+            target.stdin.flush()
+            target.stdin.close()
             target.wait(timeout=5)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -734,21 +910,26 @@ class DispatchSummaryTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertFalse(D.review_governed_lease_is_held(root, metadata))
-            os.waitpid(owner_pid, 0)
-            owner_pid = None
         finally:
-            if target.poll() is None:
-                os.killpg(target.pid, 15)
-                target.wait(timeout=5)
-            if owner_pid is not None:
+            if target.stdin is not None and not target.stdin.closed:
                 try:
-                    os.killpg(owner_pid, 15)
-                except ProcessLookupError:
+                    target.stdin.close()
+                except BrokenPipeError:
                     pass
+            for process in (target, *summary_owners):
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 try:
-                    os.waitpid(owner_pid, 0)
-                except ChildProcessError:
-                    pass
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
 
 
 if __name__ == "__main__":

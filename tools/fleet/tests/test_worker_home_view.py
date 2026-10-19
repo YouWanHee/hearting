@@ -360,7 +360,8 @@ class WorkerHomeViewTest(unittest.TestCase):
             admissions.append(admitted)
             return admitted
 
-        def land_cached_marker(ctx, home_key, ident, attempt, raw, first_ns, deadline=None, _rechecks=0):
+        def land_cached_marker(ctx, home_key, ident, attempt, raw, first_ns, deadline=None,
+                               _rechecks=0, binding=None):
             marker = self.mark(key)
             marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             marker.write_text("")
@@ -376,7 +377,7 @@ class WorkerHomeViewTest(unittest.TestCase):
             self.assertEqual(marker_after, marker_before[-1])
             self.assertTrue(native_read_allowed)
             return original_detach(ctx, home_key, ident, attempt, raw, first_ns,
-                                   deadline=deadline, _rechecks=_rechecks)
+                                   deadline=deadline, _rechecks=_rechecks, binding=binding)
 
         with mock.patch.object(retention, "_detach", side_effect=land_cached_marker):
             result = retention.sweep(self.jobs, now_ns=later, force=True)

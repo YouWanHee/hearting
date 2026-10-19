@@ -296,6 +296,216 @@ def owner_process_state(metadata: dict[str, str]) -> str:
     return "unknown"
 
 
+def _read_owner_state(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """Read one owner record without following links or trusting unbounded input."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, "state-file-missing"
+    except OSError:
+        return None, "state-file-unreadable"
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_size > 16384):
+            return None, "state-file-untrusted"
+        try:
+            chunks = []
+            remaining = 16385
+            while remaining:
+                chunk = os.read(fd, min(4096, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > 16384:
+                return None, "state-file-oversized"
+            state = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None, "state-file-unreadable"
+        return (state, "") if isinstance(state, dict) else (None, "state-file-invalid")
+    finally:
+        os.close(fd)
+
+
+def _owner_state_binding(metadata: dict[str, str]):
+    """Read the exact recorded owner state without substituting this process' root."""
+    attempt_id = metadata.get("attempt_id", "")
+    harness = metadata.get("harness") or metadata.get("child_harness") or ""
+    raw = metadata.get("summary_state_file", "")
+    pid = metadata.get("summary_owner_pid", "")
+    start = metadata.get("summary_owner_pid_start", "")
+    namespace = metadata.get("summary_owner_pid_observer_ns", "")
+    sid = summary_sid(attempt_id) if ATTEMPT_RE.fullmatch(attempt_id or "") else None
+    if (metadata.get("summary_owner") != OWNER_KIND or harness not in HARNESSES or not sid
+            or metadata.get("summary_sid") != sid or not pid.isdigit() or not start or not namespace
+            or not raw or not Path(raw).is_absolute()):
+        return None, "identity-incomplete"
+    try:
+        path = Path(raw)
+        resolved = path.resolve(strict=True)
+        if str(resolved) != str(path) or path.parent.name != harness:
+            return None, "state-path-conflict"
+        owners_dir = path.parent.parent
+        state_root = owners_dir.parent
+        expected = owners_dir / harness / f"{attempt_id}.json"
+        if (owners_dir.name != ".dispatch-owners" or expected != path
+                or not state_root.is_dir() or state_root.is_symlink()):
+            return None, "state-path-conflict"
+        parent_stat = path.parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.geteuid():
+            return None, "state-directory-untrusted"
+    except FileNotFoundError:
+        return None, "state-file-missing"
+    except OSError:
+        return None, "state-file-unreadable"
+    state, read_reason = _read_owner_state(path)
+    if state is None:
+        return None, read_reason
+    if not isinstance(state, dict) or any((
+        state.get("schema_version") != OWNER_SCHEMA,
+        state.get("attempt_id") != attempt_id,
+        state.get("harness") != harness,
+        state.get("sid") != sid,
+        state.get("pid") != int(pid),
+        state.get("proc_start") != start,
+        state.get("observer_namespace") != namespace,
+    )):
+        return None, "state-identity-conflict"
+    expected_home = metadata.get("runtime_home", "")
+    if expected_home and state.get("runtime_home") != expected_home:
+        return None, "state-home-conflict"
+    expected_transcript = metadata.get("log_file", "")
+    if expected_transcript:
+        try:
+            if Path(state.get("transcript", "")).resolve(strict=False) != Path(expected_transcript).resolve(strict=False):
+                return None, "state-transcript-conflict"
+        except (OSError, ValueError):
+            return None, "state-transcript-conflict"
+    for key, state_key in (("pid", "target_pid"), ("pid_start", "target_proc_start")):
+        if metadata.get(key) and str(state.get(state_key, "")) != metadata[key]:
+            return None, "state-target-conflict"
+    return (path, state, harness, attempt_id, sid, state_root), ""
+
+
+def _probe_owner_lock(path: Path) -> str:
+    """held | free | missing | unknown for the existing exact owner lock."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unknown"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            return "unknown"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "held"
+        except OSError:
+            return "unknown"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "free"
+    finally:
+        os.close(fd)
+
+
+def home_consumer_evidence(metadata: dict[str, str]) -> tuple[str, str]:
+    """Whether this exact attempt's summary owner/provider can still read its HOME.
+
+    This is a resource-use decision, separate from the process-death classifier.
+    The owner lock covers native transcript resolution and remains held while the
+    owner waits for its asynchronous provider. The provider's existing per-sid
+    lockdir extends that use after the owner unlocks.
+    """
+    declared = any(metadata.get(key) for key in (
+        "summary_owner", "summary_sid", "summary_owner_pid", "summary_state_file"))
+    if not declared:
+        return "absent", "no-summary-owner"
+    binding, detail = _owner_state_binding(metadata)
+    if binding is None:
+        return "unknown", detail
+    state_path, _state, harness, attempt_id, sid, state_root = binding
+    owner_lock = _probe_owner_lock(state_path.with_suffix(".lock"))
+    if owner_lock == "held":
+        return "live", "owner-lock-held"
+    if owner_lock != "free":
+        return "unknown", "owner-lock-" + owner_lock
+    provider_parent = state_root / harness
+    provider_lock = provider_parent / (".lock-" + sid)
+    try:
+        parent_stat = provider_parent.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent", "provider-state-absent"
+    except OSError:
+        return "unknown", "provider-state-unreadable"
+    if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.geteuid():
+        return "unknown", "provider-state-untrusted"
+    try:
+        provider_stat = provider_lock.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent", "owner-and-provider-locks-free"
+    except OSError:
+        return "unknown", "provider-lock-unreadable"
+    if stat.S_ISDIR(provider_stat.st_mode) and provider_stat.st_uid == os.geteuid():
+        # The existing lockdir is created before spawn and held through provider
+        # reading. Its age does not prove that a reader has stopped.
+        return "live", "provider-lockdir-present"
+    return "unknown", "provider-lock-untrusted"
+
+
+def home_consumer_for_identity(attempt_id: str, harness: str,
+                               runtime_home: str | Path) -> tuple[str, str]:
+    """Resolve summary use for a no-row HOME from the existing exact attempt state."""
+    try:
+        state_path = owner_state_path(harness, attempt_id)
+        provider_parent = _state_root() / harness
+        provider_lock = provider_parent / (".lock-" + summary_sid(attempt_id))
+    except (ValueError, OSError):
+        return "unknown", "owner-state-path-invalid"
+    state, state_reason = _read_owner_state(state_path)
+    if state is None and state_reason == "state-file-missing":
+        try:
+            state_path.with_suffix(".lock").lstat()
+            return "unknown", "owner-state-missing-lock-remains"
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return "unknown", "owner-lock-unreadable"
+        try:
+            provider_lock.lstat()
+            return "unknown", "provider-state-without-owner"
+        except FileNotFoundError:
+            return "absent", "owner-state-absent"
+        except OSError:
+            return "unknown", "provider-lock-unreadable"
+    if state is None:
+        return "unknown", state_reason
+    if not isinstance(state.get("runtime_home"), str):
+        return "unknown", "owner-state-home-missing"
+    try:
+        if Path(state["runtime_home"]).resolve(strict=False) != Path(runtime_home).resolve(strict=False):
+            return "absent", "owner-state-other-home"
+    except (OSError, ValueError):
+        return "unknown", "owner-state-home-invalid"
+    metadata = {
+        "summary_owner": OWNER_KIND,
+        "summary_sid": summary_sid(attempt_id),
+        "summary_owner_pid": str(state.get("pid", "")),
+        "summary_owner_pid_start": str(state.get("proc_start", "")),
+        "summary_owner_pid_observer_ns": str(state.get("observer_namespace", "")),
+        "summary_state_file": str(state_path),
+        "attempt_id": attempt_id,
+        "harness": harness,
+        "runtime_home": str(state["runtime_home"]),
+        "log_file": str(state.get("transcript", "")),
+    }
+    return home_consumer_evidence(metadata)
+
+
 def _owner_env() -> dict[str, str]:
     env = dict(os.environ)
     env["AGENT_SESSION_ROLE"] = "worker"
@@ -573,12 +783,13 @@ def _summary_source(log_path: Path, cache: dict[str, Any], *,
 def _refresh(
     harness: str, sid: str, transcript: Path, *,
     phase: str, debounce: int, priority: bool, prompt_path: Path | None = None,
-    refresh_source: dict | None = None,
+    refresh_source: dict | None = None, runtime_home: str | Path | None = None,
 ) -> bool:
     try:
         from fleet import refresh_title
 
         source_kw = {"refresh_source": refresh_source} if refresh_source else {}
+        home_kw = {"runtime_home": str(runtime_home)} if runtime_home is not None else {}
         return bool(refresh_title.maybe_spawn(
             harness=harness,
             sid=sid,
@@ -588,6 +799,7 @@ def _refresh(
             quota_class=phase if phase in {"initial", "final"} else None,
             prompt_path=str(prompt_path) if prompt_path else None,
             **source_kw,
+            **home_kw,
         ))
     except Exception:
         return False
@@ -617,11 +829,33 @@ def supervise(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = lock_path.open("a+", encoding="utf-8")
     review_fd: int | None = None
+    home_read_scope = None
     try:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
+        if runtime_home is not None and jobs_env:
+            try:
+                from dispatch_contract import dispatch_state_root
+                jobs_path = Path(jobs_env).expanduser().resolve()
+                state_root = dispatch_state_root(jobs_path)
+                workers = Path(os.path.realpath(state_root / "homes" / "workers"))
+                home = Path(runtime_home).resolve(strict=False)
+                if home.parent == workers:
+                    from worker_home_retention import worker_home_read_admission
+                    home_read_scope = worker_home_read_admission(
+                        jobs_path, home, None, attempt_id, harness)
+                    if not home_read_scope.__enter__():
+                        home_read_scope.__exit__(None, None, None)
+                        home_read_scope = None
+                        return 0
+            except (OSError, RuntimeError, ValueError):
+                if home_read_scope is not None:
+                    home_read_scope.__exit__(None, None, None)
+                    home_read_scope = None
+                return 0
         review_values = (review_artifact_root, review_cycle_id, review_lease_nonce)
         if any(value is not None for value in review_values):
             if not all(value is not None for value in review_values):
@@ -704,7 +938,7 @@ def supervise(
                 if not initial_requested and not previous.get("summary"):
                     initial_requested = _refresh(
                         harness, sid, source, phase="initial", debounce=0, priority=True, prompt_path=prompt,
-                        refresh_source=source_cache.get("refresh_source"))
+                        refresh_source=source_cache.get("refresh_source"), runtime_home=runtime_home)
                     if initial_requested:
                         state.update(last_refresh_phase="initial", last_refresh_at=time.time())
                         _atomic_write(state_path, state)
@@ -717,7 +951,7 @@ def supervise(
                         if _refresh(
                             harness, sid, source, phase="periodic",
                             debounce=periodic_debounce, priority=False, prompt_path=prompt,
-                            refresh_source=source_cache.get("refresh_source"),
+                            refresh_source=source_cache.get("refresh_source"), runtime_home=runtime_home,
                         ):
                             state.update(last_refresh_phase="periodic", last_refresh_at=time.time())
                             _atomic_write(state_path, state)
@@ -783,7 +1017,7 @@ def supervise(
             if not final_started:
                 final_started = _refresh(
                     harness, sid, source, phase="final", debounce=0, priority=True, prompt_path=prompt,
-                    refresh_source=source_cache.get("refresh_source"))
+                    refresh_source=source_cache.get("refresh_source"), runtime_home=runtime_home)
                 if final_started:
                     state.update(last_refresh_phase="final", last_refresh_at=time.time())
                     _atomic_write(state_path, state)
@@ -803,6 +1037,8 @@ def supervise(
                 fcntl.flock(review_fd, fcntl.LOCK_UN)
             finally:
                 os.close(review_fd)
+        if home_read_scope is not None:
+            home_read_scope.__exit__(None, None, None)
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         finally:

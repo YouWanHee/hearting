@@ -32,7 +32,7 @@ carrier wiring withholds it for token-less recipients. The separate
 
 from __future__ import annotations
 
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import datetime
 import fcntl
@@ -380,19 +380,27 @@ def _record_reference_lock(path: Path, *, candidate: dict | None = None):
         before = _read_unlocked(path)
         required.update(attempt_reference.record_attempts(before))
         retry = False
+        from worker_home_retention import home_reference_relevant, home_view_admission
+        home_relevant = home_reference_relevant(root, required)
+        home_scope = (home_view_admission(root / "jobs.log", blocking=True)
+                      if home_relevant is not False else nullcontext(True))
         with attempt_reference.admission(root, required) as admitted:
             if not admitted:
                 raise PendingDeliveryError("delivery-persistence-refused",
                                            "attempt-reference-admission-busy")
-            with _record_lock(path):
-                current = _read_unlocked(path)
-                current_refs = set(attempt_reference.record_attempts(current))
-                if not current_refs.issubset(required):
-                    required.update(current_refs)
-                    retry = True
-                else:
-                    yield current
-                    return
+            with home_scope as home_admitted:
+                if not home_admitted:
+                    raise PendingDeliveryError("delivery-persistence-refused",
+                                               "home-reference-admission-busy")
+                with _record_lock(path):
+                    current = _read_unlocked(path)
+                    current_refs = set(attempt_reference.record_attempts(current))
+                    if not current_refs.issubset(required):
+                        required.update(current_refs)
+                        retry = True
+                    else:
+                        yield current
+                        return
         if not retry:
             break
     raise PendingDeliveryError("delivery-persistence-refused",

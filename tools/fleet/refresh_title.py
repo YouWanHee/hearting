@@ -61,6 +61,7 @@ DEBOUNCE_SEC = 600
 WORKING_DEBOUNCE_SEC = 300
 CHILD_DEBOUNCE_SEC = 600
 SUMMARY_RETRY_DELAYS = (30, 60, 120)
+_HOME_ADMISSION_ACTIVE = False
 DEFAULT_CONCURRENCY = 3
 MAX_CONCURRENCY = 4
 DEFAULT_START_LIMIT = 4
@@ -1753,9 +1754,9 @@ def _minor_peer_delta(delta):
     return not text[cursor:].strip()
 
 
-def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
-                refresh_source=None, priority=False, quota_class=None, prompt_path=None,
-                anchor_text=None):
+def _maybe_spawn_unadmitted(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
+                            refresh_source=None, priority=False, quota_class=None, prompt_path=None,
+                            anchor_text=None, attempt_admission=None, worker_home=None):
     """Start one detached refresh when state is stale and the transcript grew."""
     if (
         refresh_disabled()
@@ -1855,6 +1856,10 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     env = dict(os.environ)
     env["AGENT_SESSION_ROLE"] = "worker"
     env["FLEET_TITLE_REFRESH"] = "1"
+    if attempt_admission:
+        env["AGENT_DISPATCH_ATTEMPT_ID"] = attempt_admission
+    if worker_home:
+        env["HEARTING_WORKER_HOME"] = worker_home
     bounded_anchor = _bounded_data_text(anchor_text, ANCHOR_TEXT_CAP)
     argv = [
         sys.executable,
@@ -1907,6 +1912,65 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         _remove_empty_dir(budget_lease)
         _remove_empty_dir(slotdir)
         _remove_empty_dir(lockdir)
+        return False
+
+
+def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
+                refresh_source=None, priority=False, quota_class=None, prompt_path=None,
+                anchor_text=None, runtime_home=None):
+    """Admit a native-HOME provider before its existing per-session lock/spawn.
+
+    The retention detach holds the same attempt-reference admission through its
+    final proof and rename. A provider admitted first leaves its existing lockdir
+    visible until it exits; a detach admitted first makes this spawn fail closed.
+    Sources outside the worker HOME use the ordinary refresh path.
+    """
+    worker_home = runtime_home or os.environ.get("HEARTING_WORKER_HOME")
+    if worker_home is None or not transcript:
+        return _maybe_spawn_unadmitted(
+            harness, sid, transcript, now, debounce, refresh_source, priority,
+            quota_class, prompt_path, anchor_text)
+    try:
+        home = Path(worker_home).resolve(strict=False)
+        source = Path(transcript).resolve(strict=False)
+        if home not in source.parents:
+            return _maybe_spawn_unadmitted(
+                harness, sid, transcript, now, debounce, refresh_source, priority,
+                quota_class, prompt_path, anchor_text)
+        attempt_id = (sid[len("dispatch-"):] if sid.startswith("dispatch-")
+                      else os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""))
+        if not re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt_id):
+            return False
+        jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
+        if not jobs:
+            return False
+        from dispatch_attempt_reference import admission
+        from dispatch_contract import dispatch_state_root
+        from worker_home_retention import worker_home_read_admission
+
+        with admission(dispatch_state_root(jobs), (attempt_id,), blocking=False) as admitted:
+            if not admitted:
+                return False
+            with worker_home_read_admission(
+                    jobs, home, source, attempt_id, harness) as home_admitted:
+                if not home_admitted:
+                    return False
+                return _maybe_spawn_unadmitted(
+                    harness, sid, transcript, now, debounce, refresh_source, priority,
+                    quota_class, prompt_path, anchor_text,
+                    attempt_admission=attempt_id, worker_home=str(home))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _transcript_is_under_worker_home(transcript: str | None, worker_home: str | None) -> bool:
+    if not transcript or not worker_home:
+        return False
+    try:
+        home = Path(worker_home).resolve(strict=False)
+        source = Path(transcript).resolve(strict=False)
+        return home in source.parents
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -1985,6 +2049,7 @@ def schedule_sessions(sessions, jobs=None):
 
 
 def main(argv=None):
+    global _HOME_ADMISSION_ACTIVE
     parser = argparse.ArgumentParser()
     parser.add_argument("--harness", choices=("claude", "codex", "opencode"), default="claude")
     parser.add_argument("--sid", required=True)
@@ -2000,6 +2065,55 @@ def main(argv=None):
     parser.add_argument("--priority", action="store_true")
     parser.add_argument("--quota-class", choices=("initial", "final"))
     args = parser.parse_args(argv)
+    worker_home = os.environ.get("HEARTING_WORKER_HOME")
+    if (not _HOME_ADMISSION_ACTIVE
+            and _transcript_is_under_worker_home(args.transcript, worker_home)):
+        attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+        jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
+        if (not re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt_id)
+                or not jobs):
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        try:
+            from dispatch_attempt_reference import admission
+            from dispatch_contract import dispatch_state_root
+            from worker_home_retention import worker_home_read_admission
+
+            admission_scope = admission(
+                dispatch_state_root(jobs), (attempt_id,), blocking=False)
+            admitted = admission_scope.__enter__()
+        except (OSError, RuntimeError, ValueError):
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        if not admitted:
+            admission_scope.__exit__(None, None, None)
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        try:
+            read_scope = worker_home_read_admission(
+                jobs, worker_home, args.transcript, attempt_id, args.harness)
+            home_admitted = read_scope.__enter__()
+        except (OSError, RuntimeError, ValueError):
+            admission_scope.__exit__(None, None, None)
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        if not home_admitted:
+            read_scope.__exit__(None, None, None)
+            admission_scope.__exit__(None, None, None)
+            _remove_empty_dir(args.slotdir)
+            _remove_empty_dir(args.lockdir)
+            return 0
+        _HOME_ADMISSION_ACTIVE = True
+        try:
+            return main(argv)
+        finally:
+            _HOME_ADMISSION_ACTIVE = False
+            read_scope.__exit__(None, None, None)
+            admission_scope.__exit__(None, None, None)
     explicit_anchor = (
         _bounded_data_text(sys.stdin.read(ANCHOR_TEXT_CAP), ANCHOR_TEXT_CAP)
         if args.anchor_stdin else ""
