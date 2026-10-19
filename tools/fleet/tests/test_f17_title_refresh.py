@@ -629,6 +629,33 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
                 runtime_home=str(home)))
             spawn.assert_called_once()
 
+    def test_missing_jobs_blocks_home_scoped_provider_but_keeps_external_native_path(self):
+        attempt = "att-home-no-jobs"
+        managed_home = Path(self._tmp.name) / "dispatch-state" / "homes" / "workers" / ("a" * 32)
+        managed_source = managed_home / "projects" / "managed.jsonl"
+        managed_source.parent.mkdir(parents=True)
+        managed_source.write_text('{"message":"managed worker transcript"}\n', encoding="utf-8")
+        external_home = Path(self._tmp.name) / "native-home"
+        external_source = external_home / "projects" / "native.jsonl"
+        external_source.parent.mkdir(parents=True)
+        external_source.write_text('{"message":"external native transcript"}\n', encoding="utf-8")
+
+        # No jobs path means the managed-root boundary cannot be established.
+        # Keep HOME-scoped reads closed while the ordinary native transcript
+        # path, which has no worker HOME claim, remains usable.
+        for name in ("AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "HEARTING_WORKER_HOME"):
+            os.environ.pop(name, None)
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            self.assertFalse(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(managed_source),
+                runtime_home=str(managed_home)))
+            spawn.assert_not_called()
+
+            self.assertTrue(rt.maybe_spawn("claude", "native-session", str(external_source)))
+            spawn.assert_called_once()
+            self.assertNotIn("attempt_admission", spawn.call_args.kwargs)
+            self.assertNotIn("worker_home", spawn.call_args.kwargs)
+
     def test_dispatch_provider_on_identityless_legacy_home_is_refused_after_detach(self):
         from dispatch_contract import dispatch_state_root
         from worker_runtime_home import _builder

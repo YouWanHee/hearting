@@ -757,13 +757,30 @@ class DispatchSummaryTest(unittest.TestCase):
         attempt = "att-supervised-e2e"
         session_id = "abcdabcd-1234-5678-9abc-abcdabcdabcd"
         producer_home = Path(self.tmp.name) / "producer-home"
-        worker_home = Path(self.tmp.name) / "worker-home"
+        dispatch_root = Path(self.tmp.name) / "dispatch-state"
+        jobs = dispatch_root / "jobs.log"
+        dispatch_root.mkdir()
+        from worker_runtime_home import _builder
+        home_key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+        worker_home = dispatch_root / "homes" / "workers" / home_key
         os.environ["CLAUDE_CONFIG_DIR"] = str(producer_home)
+        # The isolated suite runner intentionally removes ambient dispatch
+        # state. Model the real registered launch in this test's private root:
+        # HOME-scoped reads need its jobs path and managed HOME identity.
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
         from claude_project_dir import encode_project_dir
         project = worker_home / "projects" / encode_project_dir("/wt/owner")
         decoy_project = producer_home / "projects" / encode_project_dir("/wt/owner")
         project.mkdir(parents=True)
         decoy_project.mkdir(parents=True)
+        (worker_home / "worker-home.json").write_text(json.dumps({
+            "schema": 2,
+            "identity": attempt,
+            "key": home_key,
+            "harness": "claude",
+            "worker_type": "stage",
+            "source": str(ROOT),
+        }), encoding="utf-8")
         transcript = project / f"{session_id}.jsonl"
         (decoy_project / f"{session_id}.jsonl").write_text(
             json.dumps({"type": "assistant", "message": {"content": [
@@ -781,6 +798,14 @@ class DispatchSummaryTest(unittest.TestCase):
         os.environ["FLEET_TITLE_COMMAND"] = shlex.join([sys.executable, "-c", provider_script])
         log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
         log.write_text(self._announce(session_id, "/wt/owner"), encoding="utf-8")
+        jobs.write_text(
+            "2026-10-19T00:00:00Z\topen\t/wt/owner\t/wt/owner\towner\t"
+            "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            "fallback_hop=same-harness-headless,worker_type=stage,"
+            f"attempt_id={attempt},harness=claude,runtime_home={worker_home},log_file={log}\n",
+            encoding="utf-8",
+        )
         child = subprocess.Popen([
             sys.executable, "-c",
             "import pathlib,sys,time,json; time.sleep(.4); "
