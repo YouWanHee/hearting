@@ -10,6 +10,14 @@ from dispatch_contract import ROUTE_IDENTITY_METADATA_KEYS
 
 
 class NestedRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        # These cases assert the V1 private XDG layout. Keep them bound to
+        # that supported fixture even when the installed CLI is V2.
+        self.runtime = mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"},
+                                       clear=False)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+
     def test_attempt_state_is_writable_without_copying_auth_or_changing_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); worktree = root / "worktree"; worktree.mkdir()
@@ -411,6 +419,14 @@ class OpenCodePermissionDefault(unittest.TestCase):
     # Item 1(b): headless "ask" auto-rejects and truncates the session; "deny"
     # returns a structured tool error instead. Measured 2026-08-07
     # (dev_logs/section4_permission_deny_experiment.md).
+    def setUp(self):
+        # The assertions below exercise V1's singular `permission` schema.
+        # Select it explicitly instead of inheriting the host CLI version.
+        self.runtime = mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"},
+                                       clear=False)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+
     def test_default_external_directory_rule_is_deny_not_ask(self):
         with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
             config = json.loads(WH.scoped_external_directory_config("/tmp/fixture-artifact-root"))

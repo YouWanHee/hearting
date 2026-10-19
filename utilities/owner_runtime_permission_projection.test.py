@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -162,6 +163,7 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.runtime),
             "CLAUDE_CONFIG_DIR": str(self.claude_home),
             "CODEX_HOME": str(self.codex_home),
+            "OPENCODE_RUNTIME_VERSION": "1.19.0",
             "OPENCODE_CONFIG_CONTENT": json.dumps({"permission": {"bash": "allow", "edit": "allow"}}),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -351,6 +353,237 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         module, args, server, thread, _trace = session[:5]
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(module, "emit"):
             module.run_turn(server, thread_id=thread, prompt=prompt, args=args)
+
+    def test_opencode_wrapper_capture_keeps_verified_limits_across_permission_refresh(self):
+        wrapper = load_module("fixture_opencode_owner_dispatch",
+                              ROOT / "adapters/opencode/bin/dispatch-headless.py")
+        context = wrapper.opencode_context
+        attempt = "att-opencode-owner-cap-refresh"
+        opencode = self.fakebin / "opencode"
+        opencode.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        opencode.chmod(0o755)
+
+        env = self.route_binding_env(self.base_env(self.jobs["opencode"]))
+        env["OPENCODE_CONFIG_CONTENT"] = "{}"
+        env["OPENCODE_RUNTIME_VERSION"] = "2.0.32"
+        resolved_settings = []
+
+        def resolve_settings(args):
+            settings = real_resolve_settings(args)
+            resolved_settings.append(settings)
+            provider, model_id = settings["model"].split("/", 1)
+            original_config = {
+                "model": settings["model"] + "#" + settings["variant"],
+                "provider": {provider: {"models": {model_id: {"limit": {
+                    "context": 850000, "input": 580000, "output": 12000,
+                }}}}},
+                "providers": {provider: {
+                    "catalog": "fixture-catalog",
+                    "settings": {"baseURL": "http://provider.invalid"},
+                    "models": {model_id: {
+                        "modelID": "transport/model",
+                        "limit": {"context": 900000, "input": 600000, "output": 32000},
+                        "variants": {settings["variant"]: {"reasoningEffort": "high"}},
+                        "options": {"temperature": 0.2},
+                    }},
+                }},
+                "permission": {"bash": "allow", "edit": "allow"},
+                "plugin": ["fixture-plugin"],
+            }
+            os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(original_config)
+            return settings
+
+        real_resolve_settings = wrapper.resolve_model_settings
+        api_calls = []
+        native_limits = {"context": 900000, "input": 600000, "output": 32000}
+
+        def native_api(command, *, cwd, env):
+            api_calls.append((list(command), cwd, dict(env)))
+            provider, model_id = resolved_settings[0]["model"].split("/", 1)
+            if len(api_calls) == 1:
+                limits = native_limits
+            else:
+                config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+                limits = config["providers"][provider]["models"][model_id]["limit"]
+            return json.dumps({"location": {"directory": str(self.repo)}, "data": [{
+                "providerID": provider, "id": model_id, "modelID": "transport/model",
+                "name": "Fixture model", "status": "active", "enabled": True,
+                "limit": limits,
+            }]})
+
+        argv = [
+            "dispatch-headless.py", "--start", "--worktree", str(self.repo),
+            "--jobs", str(self.jobs["opencode"]), "--log-dir", str(self.logs["opencode"]),
+            "--slug", "opencode-owner-cap-refresh", "--attempt-id", attempt,
+            "--capability", "autopilot-code", "--capability-mode", "dev",
+            "--intensity", "standard", "--dispatch-depth", "1", "--worker-type", "owner",
+            "--unit", "_kernel/owner", "--assigned-contract", "autopilot-code",
+            "--owner", "autopilot-code", "--owner-harness", "opencode",
+            "--launch-lifecycle", "foreground-scoped", "--foreground-timeout", "10",
+            "--model-profile", self.route["owner_model_profile"],
+        ]
+        real_popen = subprocess.Popen
+        spawned = []
+        launch_envs = []
+        worker_commands = []
+
+        def tracked_popen(*args, **kwargs):
+            command = args[0]
+            if any("launch-fence.py" in str(value) for value in command):
+                launch_envs.append(dict(kwargs.get("env") or {}))
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def wait_foreground(process, *_args, **_kwargs):
+            process.wait(timeout=10)
+            return types.SimpleNamespace(exit_code=0, failure="", group_empty=True)
+
+        def no_sidecar(args, *_args, **_kwargs):
+            args.managed_sidecar_state = "not-selected"
+            args.managed_sidecar_reason = "-"
+            args.managed_sidecar_pid = "-"
+            args.managed_sealed_batch_id = "-"
+            args.managed_sidecar_log = "-"
+
+        real_shell_command = wrapper.shell_command
+
+        def capture_command(args, prompt_path, log_path):
+            worker_commands.append(real_shell_command(args, prompt_path, log_path))
+            return "true"
+
+        patches = [
+            mock.patch.object(wrapper, "resolve_artifact_root", return_value=str(self.artifact_root)),
+            mock.patch.object(wrapper, "check_runtime_projection", return_value=0),
+            # This focused permission regression does not publish unrelated
+            # route predecessor markers; completion-marker behavior is covered
+            # by its own dispatch contract suite.
+            mock.patch.object(wrapper, "completion_marker_gate", return_value=None),
+            mock.patch.object(wrapper, "owner_frame_launch_gate", return_value=None),
+            mock.patch.object(wrapper, "resolve_model_settings", side_effect=resolve_settings),
+            mock.patch.object(wrapper, "shell_command", side_effect=capture_command),
+            mock.patch.object(wrapper, "wait_governor_reservation_claim", return_value={}),
+            mock.patch.object(wrapper, "launch_parent_completion_sidecar", side_effect=no_sidecar),
+            mock.patch.object(wrapper, "wait_foreground", side_effect=wait_foreground),
+            mock.patch.object(wrapper, "seal_foreground_result", return_value=object()),
+            mock.patch.object(wrapper, "launch_reap_watch", return_value=4243),
+            mock.patch.object(wrapper.opencode_runtime, "is_v2", return_value=True),
+            mock.patch.object(wrapper.opencode_runtime, "select_automatic_model",
+                              side_effect=lambda model, variant: (model, variant, {"state": "available"})),
+            mock.patch.object(context, "_installed_version", return_value="2.0.32"),
+            mock.patch.object(context, "_run", side_effect=native_api),
+            mock.patch.object(wrapper.subprocess, "Popen", side_effect=tracked_popen),
+        ]
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), redirect_stdout(stream):
+            for patcher in patches:
+                patcher.start()
+            try:
+                result = wrapper.main(argv)
+            finally:
+                for patcher in reversed(patches):
+                    patcher.stop()
+        for process in spawned:
+            if process.poll() is None:
+                process.wait(timeout=10)
+        receipt = stream.getvalue()
+        self.assertEqual(result, 0, receipt)
+        self.assertEqual(len(api_calls), 2)
+        self.assertEqual(len(resolved_settings), 1)
+        self.assertEqual(len(launch_envs), 1)
+        self.assertEqual(len(worker_commands), 1)
+        self.assertIn("--opencode-standalone", worker_commands[0])
+        selected_model = resolved_settings[0]["model"]
+        selected_variant = resolved_settings[0]["variant"]
+        provider, model_id = selected_model.split("/", 1)
+        self.assertIn("--model " + selected_model, worker_commands[0])
+        self.assertIn("--variant " + selected_variant, worker_commands[0])
+
+        launch_env = launch_envs[0]
+        permission_context = commit_policy.read_runtime_permission_context(launch_env)
+        self.assertIsNotNone(permission_context)
+        base_config = json.loads(permission_context["opencode_config_base"])
+        self.assertEqual(base_config["providers"][provider]["models"][model_id]["limit"], {
+            "context": 800000, "input": 580000, "output": 12000,
+        })
+        self.assertNotIn("external_directory", base_config["permission"])
+        self.assertEqual(base_config["permission"]["bash"], "allow")
+        self.assertEqual(base_config["providers"][provider]["models"][model_id]["modelID"],
+                         "transport/model")
+        self.assertEqual(base_config["providers"][provider]["models"][model_id]["variants"],
+                         {selected_variant: {"reasoningEffort": "high"}})
+        self.assertEqual(base_config["providers"][provider]["models"][model_id]["options"], {"temperature": 0.2})
+        self.assertEqual(base_config["providers"][provider]["catalog"], "fixture-catalog")
+        self.assertEqual(base_config["plugin"], ["fixture-plugin"])
+
+        capture = self.root / "opencode-owner-turns.jsonl"
+        fake = self.root / "opencode_owner_fixture.py"
+        fake.write_text(textwrap.dedent("""\
+            import json, os, sys
+            with open(os.environ["OPENCODE_CAPTURE"], "a", encoding="utf-8") as out:
+                out.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
+                    "config": json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])}) + "\\n")
+            print(json.dumps({"type":"text","sessionID":"ses_ownerfixture",
+                              "part":{"text":"ok"}}), flush=True)
+            print(json.dumps({"type":"step_finish","sessionID":"ses_ownerfixture",
+                              "part":{"reason":"stop"}}), flush=True)
+            """), encoding="utf-8")
+        supervisor = load_module("fixture_opencode_owner_refresh_supervisor",
+                                 ROOT / "utilities/claude-session-supervisor.py")
+        args = argparse.Namespace(
+            runtime_harness="opencode", parent_attempt_id=attempt,
+            jobs=str(self.jobs["opencode"]), worktree=str(self.repo), turn_timeout=10,
+            model=selected_model, variant=selected_variant, opencode_agent="build",
+            opencode_standalone=True,
+            opencode_command=shlex.join([sys.executable, str(fake)]),
+            owner_input=None, owner_runtime_turn_ordinal=1,
+        )
+        turn_env = {**launch_env, "OPENCODE_CAPTURE": str(capture)}
+        with mock.patch.dict(os.environ, turn_env, clear=True), mock.patch.object(supervisor, "emit"):
+            supervisor.run_turn(args, "ignored", "first owner turn", resume=False)
+
+        # Settle the temporary merge operation so the next refresh observes
+        # the newly available owner permissions on the same bound route.
+        (self.repo / "engine.py").write_text("value = 'fixture resolution'\n", encoding="utf-8")
+        self._git("add", "engine.py")
+        self._git("commit", "-q", "-m", "settle owner permission fixture")
+        args.owner_runtime_turn_ordinal = 2
+        with mock.patch.dict(os.environ, turn_env, clear=True), mock.patch.object(supervisor, "emit"):
+            supervisor.run_turn(args, "ignored", "resumed owner turn", resume=True)
+
+        turns = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual([row["cwd"] for row in turns], [str(self.repo), str(self.repo)])
+        expected_limits = {"context": 800000, "input": 580000, "output": 12000}
+        for row in turns:
+            self.assertIn("--standalone", row["argv"])
+            self.assertEqual(row["argv"][row["argv"].index("--model") + 1],
+                             selected_model + "#" + selected_variant)
+            provider_config = row["config"]["providers"][provider]
+            model_config = provider_config["models"][model_id]
+            self.assertEqual(model_config["limit"], expected_limits)
+            self.assertEqual(model_config["modelID"], "transport/model")
+            self.assertEqual(provider_config["catalog"], "fixture-catalog")
+            self.assertEqual(model_config["variants"],
+                             {selected_variant: {"reasoningEffort": "high"}})
+            self.assertEqual(model_config["options"], {"temperature": 0.2})
+        self.assertNotIn("--session", turns[0]["argv"])
+        self.assertEqual(turns[1]["argv"][turns[1]["argv"].index("--session") + 1],
+                         "ses_ownerfixture")
+
+        def has_commit_deny(config):
+            scopes = [config.get("permissions", []),
+                      config.get("agents", {}).get("build", {}).get("permissions", [])]
+            return any(isinstance(rows, list)
+                       and any(isinstance(row, dict)
+                               and row.get("action") == "shell"
+                               and str(row.get("resource", "")).startswith("git commit")
+                               and row.get("effect") == "deny"
+                               for row in rows)
+                       for rows in scopes)
+
+        self.assertTrue(has_commit_deny(turns[0]["config"]))
+        self.assertFalse(has_commit_deny(turns[1]["config"]))
 
     def test_all_adapters_resume_same_owner_after_conflict_is_settled(self):
         before = self.merge_snapshot()

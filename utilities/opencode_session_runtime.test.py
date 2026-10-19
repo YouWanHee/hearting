@@ -57,6 +57,7 @@ class NativeSessionTest(unittest.TestCase):
     def test_v2_command_uses_cwd_and_provider_model_variant_syntax(self):
         with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
             argv = runtime.command(self.args, "ses_native")
+        self.assertNotIn("--standalone", argv)
         self.assertIn("--session", argv)
         self.assertIn("ses_native", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash")
@@ -66,6 +67,19 @@ class NativeSessionTest(unittest.TestCase):
         with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
             argv = runtime.command(self.args, "")
         self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash#high")
+        self.args.opencode_standalone = True
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            argv = runtime.command(self.args, "")
+        self.assertIn("--standalone", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash#high")
+
+    def test_supervisor_accepts_the_internal_standalone_worker_mode(self):
+        args = fixture.supervisor.parser().parse_args([
+            "--runtime-harness", "opencode", "--opencode-standalone",
+            "--worktree", str(self.root), "--jobs", str(self.root / "jobs.log"),
+            "--parent-attempt-id", "att-native",
+        ])
+        self.assertTrue(args.opencode_standalone)
 
     def test_v2_stream_without_terminal_event_uses_native_wait_and_exact_session(self):
         self.program("event('step_start', part={})\n"

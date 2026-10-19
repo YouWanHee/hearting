@@ -129,14 +129,18 @@ def run_argv(*, binary: str = "opencode", cwd: str | None = None,
              agent: str | None = None, model: str | None = None,
              variant: str | None = None, session: str | None = None,
              title: str | None = None, pure: bool = False,
+             standalone: bool = False,
              version: tuple[int, int, int] | None = None) -> list[str]:
     """Build a run command while preserving the V1 spelling and V2 cwd contract.
 
     The caller supplies ``cwd`` to ``Popen``/the shell. V2 removed ``--dir`` and
     ``--variant``; a V2 model variant is part of ``provider/model#variant``.
+    ``standalone`` is opt-in and has no effect on V1 or existing callers.
     """
     modern = is_v2(binary, version=version)
     result = [binary, "run"]
+    if modern and standalone:
+        result.append("--standalone")
     if not modern and pure:
         result.append("--pure")
     if not modern and cwd:

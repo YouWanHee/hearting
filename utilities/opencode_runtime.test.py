@@ -26,11 +26,18 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                               model="opencode-go/model", variant="high", session="ses_exact",
                               title="hearting-worker-att-x", pure=True, version=(2, 0, 32))
         self.assertNotIn("--pure", v2)
+        self.assertNotIn("--standalone", v2)
         self.assertNotIn("--dir", v2)
         self.assertNotIn("--variant", v2)
         self.assertEqual(v2[v2.index("--model") + 1], "opencode-go/model#high")
         self.assertEqual(v2[v2.index("--session") + 1], "ses_exact")
         self.assertEqual(v2[v2.index("--title") + 1], "hearting-worker-att-x")
+        private_v2 = runtime.run_argv(binary="opencode", model="fixture/model",
+                                      standalone=True, version=(2, 0, 32))
+        self.assertIn("--standalone", private_v2)
+        self.assertEqual(private_v2[private_v2.index("--model") + 1], "fixture/model")
+        self.assertNotIn("--standalone", runtime.run_argv(
+            binary="opencode", model="fixture/model", standalone=True, version=(1, 19, 0)))
 
     def test_database_generation_never_selects_cli_generation(self):
         with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}), \
