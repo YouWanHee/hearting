@@ -203,6 +203,7 @@ jobs:
         run: bash tools/release/install-ci-fixtures.sh ripgrep strace
 
       - name: Run shard ${{ matrix.shard }} of the full isolated test suite (C-3/C-4)
+        timeout-minutes: 35
         # --seed-baseline uploads the proposed rows stamped with this runner's
         # fingerprint; adopting them is a human decision, never automatic.
         # A known failure that now passes is reported, not failed: a fix
@@ -211,6 +212,7 @@ jobs:
         # computes the same partition; --suite-list is written before any
         # suite runs and lets the aggregate job prove nothing was dropped.
         run: |
+          set -o pipefail
           mkdir -p "${{ runner.temp }}/shard-out"
           python3 tools/run-tests.py --retries 1 \
             --shard ${{ matrix.shard }}/8 \
@@ -219,7 +221,8 @@ jobs:
             --strict-leak-sweep \
             --report ${{ runner.temp }}/shard-out/run-tests-report.tsv \
             --diagnostics-dir ${{ runner.temp }}/shard-out/run-tests-diagnostics \
-            --seed-baseline ${{ runner.temp }}/shard-out/run-tests-seed-baseline.tsv
+            --seed-baseline ${{ runner.temp }}/shard-out/run-tests-seed-baseline.tsv \
+            2>&1 | tee "${{ runner.temp }}/shard-out/progress.log"
 
       - name: Upload shard report, manifest and baseline seed
         if: always()

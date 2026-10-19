@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Strict standard-library loader/validator/query CLI for harness routing policy.
+"""Strict standard-library loader/validator/query CLI for dispatch defaults.
 
 Parses a deliberately narrow YAML subset (scalars, inline lists, nested
 mappings, comments) — no PyYAML/yq dependency. Validates against the
 canonical topology node ids in capabilities/topologies.json and exposes
 affinity/owner/allocation/quality-band queries.  Schemas v1/v2 remain readable;
 schema v3 adds user-local enabled harnesses and per-profile quality bands;
-schema v4 adds `confirmation.mode` and `steward.child_permission_mode`.
+schema v4 adds confirmation/steward policy and optional `worker_account` auth-source paths.
 """
 import copy
 import json
@@ -29,6 +29,7 @@ DEFAULT_USAGE_GATE_USED_PERCENT = 90
 TOP_LEVEL_KEYS = {
     "schema_version", "depth1_owner", "opencode", "allocation", "capabilities",
     "harnesses", "profiles", "headless", "confirmation", "steward", "runtime",
+    "worker_account",
 }
 # PRD §13.53.2: the operator kill switch for the SD-120/121 terminal fast
 # path. `auto` lets the sealed runtime-capability census decide (the default,
@@ -83,16 +84,23 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
-def default_config_path():
-    override = os.environ.get("DISPATCH_DEFAULTS_CONFIG")
+def default_config_path(environ=None):
+    """Resolve the user config from the supplied environment when provided."""
+    environment = os.environ if environ is None else environ
+    override = environment.get("DISPATCH_DEFAULTS_CONFIG")
     if override:
         return override
-    config_home = os.environ.get("XDG_CONFIG_HOME")
+    config_home = environment.get("XDG_CONFIG_HOME")
     if not config_home:
-        config_home = os.path.join(os.path.expanduser("~"), ".config")
-    user_path = os.path.join(config_home, "hearting", "dispatch-defaults.yaml")
-    if os.path.isfile(user_path):
-        return user_path
+        home = environment.get("HOME")
+        if home:
+            config_home = os.path.join(home, ".config")
+        elif environ is None:
+            config_home = os.path.join(os.path.expanduser("~"), ".config")
+    if config_home:
+        user_path = os.path.join(config_home, "hearting", "dispatch-defaults.yaml")
+        if os.path.isfile(user_path):
+            return user_path
     return os.path.join(_repo_root(), "profiles", "dispatch-defaults.yaml")
 
 
@@ -357,6 +365,23 @@ def validate(config, capmap):
             # disjoint quality-peer pair, an unused enabled harness) is a
             # recommendation, not a structural error: `policy_warnings` reports
             # it and `normalize_policy` reads the file as the user wrote it.
+
+    if "worker_account" in config:
+        accounts = config.get("worker_account")
+        if version != 4:
+            errors.append("worker_account requires schema_version 4")
+        if not isinstance(accounts, dict):
+            errors.append("worker_account must be a mapping")
+        else:
+            for harness in sorted(set(accounts) - DISPATCHABLE_HARNESSES):
+                errors.append(f"worker_account names an unknown harness: {harness!r}")
+            for harness, path in accounts.items():
+                if harness in DISPATCHABLE_HARNESSES and (
+                    not isinstance(path, str) or not path.strip() or "\0" in path
+                ):
+                    errors.append(
+                        f"worker_account.{harness} must be a non-empty path string"
+                    )
 
     allocation = config.get("allocation")
     if version in {2, 3, 4}:
@@ -746,6 +771,17 @@ def query_owners(config):
     if config.get("schema_version") in {3, 4}:
         return list((config.get("harnesses") or {}).get("enabled", []))
     return config.get("depth1_owner", [])
+
+
+def query_worker_account(config, harness):
+    """Return the optional authentication-source path for one harness."""
+    if harness not in DISPATCHABLE_HARNESSES or config.get("schema_version") != 4:
+        return None
+    accounts = config.get("worker_account")
+    if not isinstance(accounts, dict):
+        return None
+    path = accounts.get(harness)
+    return path if isinstance(path, str) and path.strip() else None
 
 
 def query_profile_policy(config, profile):

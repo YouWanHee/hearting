@@ -274,6 +274,7 @@ class NoticeWatcher:
 
     def _one(self, path: Path) -> None:
         sent = False
+        retry_failure = "notice-not-consumed"
         try:
             queue_socket = getattr(self.args, "queue_socket", None)
             capability = (
@@ -294,6 +295,8 @@ class NoticeWatcher:
                 expected_attempts=self.attempts,
                 expected_sealed_batch_id=self.args.sealed_batch_id,
             )
+            target = queue_target(self.args.jobs, self.attempts, self.recipient) if queue_socket else ""
+            retry_context = f"{self.recipient}:{self.epoch}:{target}"
             # Reclaim only after checking the live monotonic deadline.  The
             # old carrier's lease may still be valid, so a fresh watcher must
             # preserve that claim; using deadline+1 here incorrectly steals a
@@ -316,6 +319,7 @@ class NoticeWatcher:
                 require_generation_proof=True,
                 live_recipient_generation=(self.recipient, str(self.epoch)),
                 jobs=self.args.jobs,
+                retry_context=retry_context,
             )
             notice_receipt.validate_pending_record(
                 claimed, jobs=self.args.jobs,
@@ -336,7 +340,6 @@ class NoticeWatcher:
                     raise CompletionError("native-queue-notice-context-invalid")
                 sent = True
                 # Claim and ack stay with the registered recipient; the queue is the successor's after a /clear.
-                target = queue_target(self.args.jobs, self.attempts, self.recipient)
                 queue_result = codex_queue_delivery.send_at_least_once(
                     queue_socket, thread_id=target,
                     client_message_id=claimed["delivery_id"], message=values[0],
@@ -365,6 +368,7 @@ class NoticeWatcher:
                     self.root, self.recipient, claimed["delivery_id"],
                     claim_owner=self.owner,
                 )
+                retry_failure = "native-queue-notice-consumption-pending"
                 return
             request = {"schema_version": 1, "op": "deliver-notice",
                        "thread_id": self.recipient,
@@ -387,7 +391,8 @@ class NoticeWatcher:
                     claim_owner=self.owner,
                 )
             elif result.get("status") == "retryable":
-                self._record_error(str(result.get("reason") or "gateway-retryable"))
+                retry_failure = str(result.get("reason") or "gateway-retryable")
+                self._record_error(retry_failure)
             elif result.get("status") == "rejected":
                 reason = result.get("reason")
                 if (result.get("ledger_commit") == "unconfirmed"
@@ -405,6 +410,7 @@ class NoticeWatcher:
                     self.root, self.recipient, claimed["delivery_id"],
                     claim_owner=self.owner, reason=reason)
         except Exception as exc:
+            retry_failure = str(exc) or type(exc).__name__
             if str(exc) == "supervision-resolved" and "record" in locals():
                 try:
                     if record.get("state") == "pending":
@@ -441,7 +447,8 @@ class NoticeWatcher:
             if getattr(self.args, "queue_socket", None) and "claimed" in locals():
                 try:
                     pending_delivery.release_claim(self.root, self.recipient,
-                        claimed["delivery_id"], claim_owner=self.owner)
+                        claimed["delivery_id"], claim_owner=self.owner,
+                        failure_reason=retry_failure)
                 except pending_delivery.PendingDeliveryError as exc:
                     self._record_error(str(exc))
 
@@ -1010,6 +1017,8 @@ def _native_queue_delivery_once(
         raise CompletionError("native-queue-ledger-state-invalid")
     claim_owner = f"codex-native-queue:{os.getpid()}:{client_message_id}"
     claimed: list[str] = []
+    retry_base = min(max(args.delivery_retry_interval, 0.05), 15.0)
+    retry_failure = "native-queue-pass-incomplete"
     try:
         for record in records:
             delivery_id = record["delivery_id"]
@@ -1017,7 +1026,8 @@ def _native_queue_delivery_once(
                 pending_delivery.reclaim(root, args.thread_id, delivery_id, now_ns=time.monotonic_ns())
             pending_delivery.claim(root, args.thread_id, delivery_id,
                                    claim_owner=claim_owner, lease_seconds=60.0,
-                                   jobs=args.jobs)
+                                   jobs=args.jobs, retry_context=target,
+                                   retry_base_delay_seconds=retry_base)
             claimed.append(delivery_id)
         if target != args.thread_id and codex_queue_delivery._known_consumed(
                 path, args.thread_id, client_message_id, timeout=5.0,
@@ -1047,16 +1057,22 @@ def _native_queue_delivery_once(
         for delivery_id in claimed:
             pending_delivery.mark_sent_ambiguous(
                 root, args.thread_id, delivery_id, claim_owner=claim_owner)
+        retry_failure = str(result.get("reason") or "native-queue-consumption-pending")
         return {"schema_version": 1, "status": "sent-ambiguous",
                 "reason": "native-queue-consumption-pending", "submitted": True, "thread_id": args.thread_id,
                 "client_user_message_id": client_message_id,
                 "queued_submission_id": result.get("queued_submission_id")}
+    except Exception as exc:
+        retry_failure = str(exc) or type(exc).__name__
+        raise
     finally:
         # Each network pass owns a bounded claim, never the whole watch window.
         # A rejected send and partial claim cannot hide receipts on the next
         # prompt; an ack or another owner's claim is preserved by the CAS.
         for delivery_id in claimed:
-            pending_delivery.release_claim(root, args.thread_id, delivery_id, claim_owner=claim_owner)
+            pending_delivery.release_claim(
+                root, args.thread_id, delivery_id, claim_owner=claim_owner,
+                failure_reason=retry_failure, retry_base_delay_seconds=retry_base)
 
 
 def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):

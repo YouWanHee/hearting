@@ -67,16 +67,21 @@ class LockOrderTableTests(unittest.TestCase):
         self.assertEqual(len(set(ranks)), len(ranks), "two locks may not share a rank")
         self.assertEqual(len(set(names)), len(names), "lock names must be unique")
         self.assertEqual(L.RANK, {name: rank for rank, name, _ in L.LOCK_ORDER})
-        # The established order this cycle preserves, from `2e0fc2b0`.
-        self.assertEqual(names[:3], ["node-completion", "jobs", "producer-admission"])
+        # The established node -> jobs order remains, with the shared delivery
+        # transition inserted before producer admission.
+        self.assertEqual(names[:4], ["node-completion", "jobs",
+                                     "delivery-reference", "delivery-record"])
+        self.assertLess(L.RANK["delivery-record"], L.RANK["producer-admission"])
         for row in L.table():
             self.assertTrue(row["description"], f"{row['lock']} must carry a description")
 
     def test_ascending_acquisition_is_allowed_and_tracked(self):
         with L.acquired("jobs"):
             self.assertEqual(L.held(), ("jobs",))
-            with L.acquired("producer-admission"):
-                self.assertEqual(L.held(), ("jobs", "producer-admission"))
+            with L.acquired("delivery-reference"):
+                with L.acquired("delivery-record"):
+                    self.assertEqual(L.held(), (
+                        "jobs", "delivery-reference", "delivery-record"))
             self.assertEqual(L.held(), ("jobs",))
         self.assertEqual(L.held(), ())
 
@@ -238,6 +243,12 @@ class WiredAcquisitionSiteTests(unittest.TestCase):
     def test_jobs_lock_declares_its_rank(self):
         calls = self._assigned_and_called("utilities/dispatch_terminal_commit.py")
         self.assertIn(("acquired", "jobs"), calls)
+
+    def test_delivery_reference_and_record_locks_declare_their_order(self):
+        reference_calls = self._assigned_and_called("utilities/dispatch_attempt_reference.py")
+        record_calls = self._assigned_and_called("utilities/dispatch_pending_delivery.py")
+        self.assertIn(("acquired", "delivery-reference"), reference_calls)
+        self.assertIn(("acquired", "delivery-record"), record_calls)
 
     def test_finalize_declares_the_release_before_boundary(self):
         calls = self._assigned_and_called("utilities/artifact_producer.py")

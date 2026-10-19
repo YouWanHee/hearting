@@ -455,6 +455,61 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
         self.assertEqual(D.query_steward_child_permission_mode(config), "bypass")
         self.assertEqual(D.query_small_work_confirmation(config), "notice")
 
+    def test_worker_account_is_optional_and_queries_only_the_named_harness(self):
+        config = self.v4_config()
+        self.assertEqual(D.validate(config, self.capmap), [])
+        self.assertIsNone(D.query_worker_account(config, "claude"))
+        config["worker_account"] = {
+            "claude": "~/.claude-work",
+            "codex": "/accounts/codex",
+            "opencode": "accounts/opencode-data",
+        }
+        self.assertEqual(D.validate(config, self.capmap), [])
+        self.assertEqual(D.query_worker_account(config, "claude"), "~/.claude-work")
+        self.assertEqual(D.query_worker_account(config, "codex"), "/accounts/codex")
+        self.assertEqual(D.query_worker_account(config, "opencode"), "accounts/opencode-data")
+        self.assertIsNone(D.query_worker_account(config, "unknown"))
+
+    def test_worker_account_requires_schema_v4_and_valid_harness_paths(self):
+        config = self.v3_config()
+        config["worker_account"] = {"claude": "/account"}
+        self.assertTrue(any("worker_account requires schema_version 4" in error
+                            for error in D.validate(config, self.capmap)))
+
+        for value, expected in (
+            ([], "worker_account must be a mapping"),
+            ({"future": "/account"}, "worker_account names an unknown harness"),
+            ({"claude": "   "}, "worker_account.claude must be a non-empty path string"),
+            ({"codex": None}, "worker_account.codex must be a non-empty path string"),
+        ):
+            with self.subTest(value=value):
+                config = self.v4_config()
+                config["worker_account"] = value
+                self.assertTrue(any(expected in error for error in D.validate(config, self.capmap)))
+
+    def test_default_config_path_uses_the_passed_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            passed_home = root / "passed-home"
+            ambient_home = root / "ambient-home"
+            passed_path = passed_home / ".config/hearting/dispatch-defaults.yaml"
+            ambient_path = ambient_home / ".config/hearting/dispatch-defaults.yaml"
+            passed_path.parent.mkdir(parents=True)
+            ambient_path.parent.mkdir(parents=True)
+            passed_path.write_text("passed\n", encoding="utf-8")
+            ambient_path.write_text("ambient\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOME": str(ambient_home),
+                                              "XDG_CONFIG_HOME": str(ambient_home / ".config")},
+                                 clear=False):
+                self.assertEqual(
+                    Path(D.default_config_path(environ={"HOME": str(passed_home)})),
+                    passed_path,
+                )
+                self.assertEqual(
+                    Path(D.default_config_path(environ={})),
+                    Path(D.SHIPPED_CONFIG_PATH),
+                )
+
     def test_small_work_confirmation_is_validated_and_queried(self):
         """SD-136: `confirmation.small_work` (notice|card) rides the v4 block."""
         config = self.v4_config()

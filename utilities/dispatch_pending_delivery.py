@@ -14,7 +14,7 @@ emit/ack helpers on a record that already exists.
 Base claim/emission state machine (SD-111 §13.33.1-(4)):
 
     None -> pending -> claimed -> {acked | sent-ambiguous | pending (lease reclaim)}
-    sent-ambiguous -> {acked | pending (bounded reclaim)}
+    sent-ambiguous -> {acked | pending (lease reclaim)}
     pending | claimed | sent-ambiguous -> expired
     acked, expired terminal
 
@@ -32,15 +32,19 @@ carrier wiring withholds it for token-less recipients. The separate
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
+import re
+import dispatch_attempt_reference as attempt_reference
+import dispatch_lock_order
 from dispatch_receipt_identity import CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, receipt_digest
 
 
@@ -101,6 +105,7 @@ ORPHAN_LOCK_RETENTION_SECONDS = 24 * 3600
 TOMBSTONE_SUFFIX = ".pruned"
 PRUNE_TOMBSTONE_SCHEMA = "delivery-prune-v1"
 _LOCK_REOPEN_LIMIT = 16
+_RECORD_LOCK_SUFFIX = ".json.lock"
 
 REQUIRED_FIELDS = (
     "schema_version", "delivery_id", "recipient_kind", "recipient_digest",
@@ -111,6 +116,15 @@ REQUIRED_FIELDS = (
     "last_attempt_at_ns", "acked_at_ns", "acked_by", "expiry_reason", "lineage",
 )
 RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
+COURIER_RETRY_FIELD = "courier_retry"
+COURIER_RETRY_FIELDS = frozenset({
+    "schema_version", "context_digest", "failure_digest", "failure_count",
+    "last_failure_at_ns", "next_attempt_at_ns", "delay_ns", "base_delay_ns",
+})
+COURIER_RETRY_SCHEMA = 1
+COURIER_RETRY_MAX_SECONDS = 15.0
+COURIER_RETRY_SUFFIX = ".courier-retry"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
 
@@ -137,6 +151,40 @@ def record_path(root: Path, recipient_key: str, delivery_id: str) -> Path:
     return record_directory(root, recipient_key) / f"{delivery_id}.json"
 
 
+def courier_retry_path(path: Path) -> Path:
+    """The retry metadata is invisible to readers scanning ``delivery-*.json``."""
+
+    return Path(path).with_name(Path(path).name + COURIER_RETRY_SUFFIX)
+
+
+def _validate_courier_retry(retry: object) -> dict:
+    if (not isinstance(retry, dict) or set(retry) != COURIER_RETRY_FIELDS
+            or retry.get("schema_version") != COURIER_RETRY_SCHEMA
+            or not isinstance(retry.get("context_digest"), str)
+            or (retry["context_digest"] and not _SHA256_RE.fullmatch(retry["context_digest"]))
+            or not isinstance(retry.get("failure_digest"), str)
+            or (retry["failure_digest"] and not _SHA256_RE.fullmatch(retry["failure_digest"]))
+            or any(type(retry.get(name)) is not int for name in (
+                "failure_count", "last_failure_at_ns", "next_attempt_at_ns",
+                "delay_ns", "base_delay_ns"))
+            or retry["failure_count"] < 0
+            or retry["last_failure_at_ns"] < 0
+            or retry["next_attempt_at_ns"] < 0
+            or retry["delay_ns"] < 0
+            or not (1 <= retry["base_delay_ns"] <= int(COURIER_RETRY_MAX_SECONDS * 1e9))
+            or (retry["failure_count"] == 0 and any((
+                retry["failure_digest"], retry["last_failure_at_ns"],
+                retry["next_attempt_at_ns"], retry["delay_ns"])))
+            or (retry["failure_count"] > 0 and (
+                not retry["failure_digest"] or retry["last_failure_at_ns"] < 1
+                or retry["next_attempt_at_ns"] < retry["last_failure_at_ns"]
+                or retry["delay_ns"] < 1
+                or retry["next_attempt_at_ns"] - retry["last_failure_at_ns"]
+                != retry["delay_ns"]))):
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-invalid")
+    return retry
+
+
 def _validate_record(value: object) -> dict:
     if not isinstance(value, dict):
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
@@ -150,7 +198,8 @@ def _validate_record(value: object) -> dict:
             value.get("recipient_kind"), _LEGACY_CLAIM_AUTHORITY_DEFAULT
         )
         keys = set(value)
-    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - RECOVERY_AUDIT_FIELDS:
+    optional_fields = RECOVERY_AUDIT_FIELDS | {COURIER_RETRY_FIELD}
+    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - optional_fields:
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise PendingDeliveryError("delivery-persistence-refused", "schema-version-invalid")
@@ -162,6 +211,8 @@ def _validate_record(value: object) -> dict:
         raise PendingDeliveryError("delivery-persistence-refused", "attempt-ids-invalid")
     if not isinstance(value.get("attempts"), int):
         raise PendingDeliveryError("delivery-persistence-refused", "attempts-invalid")
+    if COURIER_RETRY_FIELD in value:
+        _validate_courier_retry(value[COURIER_RETRY_FIELD])
     if (
         value.get("state") in {"claimed", "sent-ambiguous", "acked"}
         and value.get("claim_authority") not in CLAIM_AUTHORITIES
@@ -190,7 +241,10 @@ def _record_lock(path: Path):
             os.chmod(directory, DIR_MODE)
         except OSError:
             pass
-    lock_path = path.with_name(path.name + ".lock")
+    lock_path = path.with_name(
+        path.name[:-5] + _RECORD_LOCK_SUFFIX if path.name.endswith(".json")
+        else path.name + ".lock"
+    )
     # The lock is identified by inode, not by name: a lock file unlinked while a
     # waiter still holds the old inode (the orphan-lock prune, review round 1
     # M1) must not let two holders into the critical section. After acquiring
@@ -210,7 +264,8 @@ def _record_lock(path: Path):
                 except FileNotFoundError:
                     current = False
                 if current:
-                    yield
+                    with dispatch_lock_order.acquired("delivery-record"):
+                        yield
                     return
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -233,9 +288,84 @@ def _read_unlocked(path: Path) -> dict | None:
     return _validate_record(value)
 
 
-def _write_unlocked(path: Path, record: dict) -> None:
-    _validate_record(record)
-    encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode("utf-8")
+def _public_record(value: dict) -> dict:
+    """Return the persisted record shape without internal courier state."""
+
+    if COURIER_RETRY_FIELD not in value:
+        return value
+    return {key: item for key, item in value.items() if key != COURIER_RETRY_FIELD}
+
+
+@contextmanager
+def _record_reference_lock(path: Path, *, candidate: dict | None = None):
+    """Acquire attempt references before the record CAS lock.
+
+    Read the current immutable references optimistically, then verify them
+    again after the ordered reference set and record lock are held. If a
+    supported writer changed the reference set before admission, reopen with
+    the expanded old/new set. The candidate is supplied for creation, so its
+    group directory and first record become visible under the same admission.
+    """
+    root = Path(path).parents[2]
+    required = set(attempt_reference.record_attempts(candidate))
+    for _attempt in range(_LOCK_REOPEN_LIMIT):
+        before = _read_unlocked(path)
+        required.update(attempt_reference.record_attempts(before))
+        retry = False
+        with attempt_reference.admission(root, required) as admitted:
+            if not admitted:
+                raise PendingDeliveryError("delivery-persistence-refused",
+                                           "attempt-reference-admission-busy")
+            with _record_lock(path):
+                current = _read_unlocked(path)
+                current_refs = set(attempt_reference.record_attempts(current))
+                if not current_refs.issubset(required):
+                    required.update(current_refs)
+                    retry = True
+                else:
+                    yield current
+                    return
+        if not retry:
+            break
+    raise PendingDeliveryError("delivery-persistence-refused",
+                               "attempt-reference-set-changed")
+
+
+def _courier_retry_identity_digest(record: dict) -> str:
+    identity = {key: record.get(key) for key in IMMUTABLE_FIELDS}
+    encoded = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_courier_retry_unlocked(path: Path, record: dict) -> dict | None:
+    """Read retry state bound to this record; legacy inline state is migrated on write."""
+
+    metadata_path = courier_retry_path(path)
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        legacy = record.get(COURIER_RETRY_FIELD)
+        return _validate_courier_retry(legacy) if legacy is not None else None
+    except OSError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
+    try:
+        metadata = json.loads(raw)
+    except ValueError as exc:
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-corrupt") from exc
+    if (not isinstance(metadata, dict)
+            or set(metadata) != {
+                "schema_version", "delivery_id", "recipient_digest", "identity_digest", "retry",
+            }
+            or metadata.get("schema_version") != COURIER_RETRY_SCHEMA
+            or metadata.get("delivery_id") != record.get("delivery_id")
+            or metadata.get("recipient_digest") != record.get("recipient_digest")
+            or metadata.get("identity_digest") != _courier_retry_identity_digest(record)):
+        raise PendingDeliveryError("delivery-persistence-refused", "courier-retry-identity-invalid")
+    return _validate_courier_retry(metadata["retry"])
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -253,10 +383,103 @@ def _write_unlocked(path: Path, record: dict) -> None:
         raise PendingDeliveryError("delivery-persistence-refused", str(exc)) from exc
 
 
+def _write_courier_retry_unlocked(path: Path, record: dict, retry: dict) -> None:
+    _validate_courier_retry(retry)
+    _atomic_write_json(courier_retry_path(path), {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "delivery_id": record["delivery_id"],
+        "recipient_digest": record["recipient_digest"],
+        "identity_digest": _courier_retry_identity_digest(record),
+        "retry": retry,
+    })
+
+
+def _write_unlocked(path: Path, record: dict) -> None:
+    """Persist retry metadata first, then write the legacy-compatible record CAS."""
+
+    _validate_record(record)
+    previous = _read_unlocked(path)
+    references = (attempt_reference.record_attempts(previous)
+                  | attempt_reference.record_attempts(record))
+    if not references.issubset(attempt_reference.held_attempts()):
+        raise PendingDeliveryError("delivery-persistence-refused",
+                                   "attempt-reference-admission-missing")
+    persisted = dict(record)
+    retry = persisted.pop(COURIER_RETRY_FIELD, None)
+    if retry is not None:
+        _write_courier_retry_unlocked(path, record, retry)
+    _validate_record(persisted)
+    _atomic_write_json(path, persisted)
+    if persisted.get("state") in TERMINAL_STATES:
+        with suppress(OSError):
+            courier_retry_path(path).unlink()
+
+
+def _retry_context_digest(context: str | None) -> str | None:
+    if context is None:
+        return None
+    if not isinstance(context, str) or len(context) > 2048:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-context-invalid")
+    return hashlib.sha256(context.encode("utf-8")).hexdigest()
+
+
+def _new_courier_retry(context_digest: str = "", base_delay_ns: int = 50_000_000) -> dict:
+    return {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "context_digest": context_digest,
+        "failure_digest": "",
+        "failure_count": 0,
+        "last_failure_at_ns": 0,
+        "next_attempt_at_ns": 0,
+        "delay_ns": 0,
+        "base_delay_ns": base_delay_ns,
+    }
+
+
+def _delay_ns(seconds: float) -> int:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError) as exc:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-delay-invalid") from exc
+    if not 0.05 <= value <= COURIER_RETRY_MAX_SECONDS:
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "retry-delay-invalid")
+    return int(value * 1_000_000_000)
+
+
+def _advance_courier_retry(retry: dict, failure_reason: str, now_ns: int,
+                           base_delay_ns: int) -> dict:
+    failure_digest = hashlib.sha256(str(failure_reason)[:2048].encode("utf-8")).hexdigest()
+    same = (retry.get("failure_digest") == failure_digest
+            and retry.get("failure_count", 0) > 0
+            and now_ns >= retry.get("last_failure_at_ns", 0))
+    if same:
+        failure_count = retry["failure_count"] + 1
+        previous = max(base_delay_ns, retry.get("delay_ns", base_delay_ns))
+        delay_ns = min(int(COURIER_RETRY_MAX_SECONDS * 1e9), max(
+            base_delay_ns, int(previous * 1.7)))
+    else:
+        failure_count = 1
+        delay_ns = base_delay_ns
+    return {
+        "schema_version": COURIER_RETRY_SCHEMA,
+        "context_digest": retry.get("context_digest", ""),
+        "failure_digest": failure_digest,
+        "failure_count": failure_count,
+        "last_failure_at_ns": now_ns,
+        "next_attempt_at_ns": now_ns + delay_ns,
+        "delay_ns": delay_ns,
+        "base_delay_ns": base_delay_ns,
+    }
+
+
 def read(root: Path, recipient_key: str, delivery_id: str) -> dict | None:
     """Unlocked observer read -- fleet/P6 visibility, never a transition."""
 
-    return _read_unlocked(record_path(root, recipient_key, delivery_id))
+    path = record_path(root, recipient_key, delivery_id)
+    value = _read_unlocked(path)
+    if value is None:
+        return None
+    return _public_record(value)
 
 
 def create(
@@ -343,13 +566,15 @@ def create(
         "expiry_reason": None,
         "lineage": list(lineage or ()),
     }
-    with _record_lock(path):
+    with _record_reference_lock(path, candidate=candidate):
         existing = _read_unlocked(path)
         if existing is not None:
             _verify_identity(existing, candidate)
-            return existing
+            return _public_record(existing)
+        if tombstone_path(path).exists():
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-pruned")
         _write_unlocked(path, candidate)
-        return candidate
+        return _public_record(candidate)
 
 
 def _verify_identity(existing: dict, candidate: dict) -> None:
@@ -496,18 +721,24 @@ def claim(
     live_recipient_generation: tuple[str, str] | None = None,
     expected_state: str = "pending",
     jobs: Path | str | None = None,
+    retry_context: str | None = None,
+    retry_base_delay_seconds: float = 0.05,
 ) -> dict:
     """CAS ``expected_state -> claimed`` under one flock (SD-111 §10.2:
     read-check-write inside one lock; ``os.replace`` atomicity alone is not
     CAS). A courier may supply the recipient/generation it just proved through
     the live runtime. That proof belongs to this claim, not to the immutable
     receipt. The courier must first validate the receipt's own binding rules.
+    The durable retry deadline suppresses repeated failed transport attempts;
+    changed context or a backward wall-clock step makes the obligation eligible.
     """
 
     if lease_seconds <= 0:
         raise PendingDeliveryError("pending-delivery-identity-conflict", "lease_seconds")
+    retry_context_digest = _retry_context_digest(retry_context)
+    retry_base_ns = _delay_ns(retry_base_delay_seconds)
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -530,6 +761,27 @@ def claim(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
+        retry = _read_courier_retry_unlocked(path, value)
+        now_wall_ns = time.time_ns()
+        if retry is None:
+            retry = _new_courier_retry(retry_context_digest or "", retry_base_ns)
+        elif (retry["failure_count"]
+              and now_wall_ns < retry["last_failure_at_ns"]):
+            # A wall clock moved backward across a process or host restart.
+            # Release the stale deadline once; do not make an obligation wait
+            # indefinitely for a clock value that may never recur.
+            retry = _new_courier_retry(
+                retry_context_digest or retry["context_digest"], retry_base_ns)
+        elif (retry_context_digest is not None
+              and retry_context_digest != retry["context_digest"]):
+            # A changed recipient/queue target is fresh delivery evidence.
+            retry = _new_courier_retry(retry_context_digest, retry_base_ns)
+        elif now_wall_ns < retry["next_attempt_at_ns"]:
+            remaining = retry["next_attempt_at_ns"] - now_wall_ns
+            raise PendingDeliveryError(
+                "pending-delivery-retry-deferred", f"remaining_ns={remaining}"
+            )
+        retry = dict(retry, base_delay_ns=retry_base_ns)
         disposition = _replacement_disposition(root, recipient_key, value, jobs=jobs)
         if disposition:
             if disposition in {"consumed", "superseded"}:
@@ -553,10 +805,11 @@ def claim(
         updated["claim_authority"] = (
             "generation-proven" if require_generation_proof else "deliverer-unproven"
         )
+        updated[COURIER_RETRY_FIELD] = retry
         updated["attempts"] = value["attempts"] + 1
         updated["last_attempt_at_ns"] = now
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def mark_sent_ambiguous(
@@ -566,7 +819,7 @@ def mark_sent_ambiguous(
     transition follows on that surface -- the carrier simply stops here)."""
 
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -577,7 +830,7 @@ def mark_sent_ambiguous(
         updated = dict(value)
         updated["state"] = "sent-ambiguous"
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def ack(
@@ -592,7 +845,7 @@ def ack(
     with a real consumption token; token-less surfaces never call this."""
 
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -604,8 +857,9 @@ def ack(
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def received_ack_identity(record: dict, recipient_key: str, delivery_id: str) -> dict:
@@ -646,7 +900,7 @@ def ack_received(
     bytes; only an open delivery can transition to ``acked``.
     """
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -654,15 +908,16 @@ def ack_received(
         if actual_identity != expected_identity:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "received-identity-changed")
         if value["state"] in TERMINAL_STATES:
-            return value
+            return _public_record(value)
         if value["state"] not in OPEN_STATES:
             raise PendingDeliveryError("pending-delivery-claim-refused", f"state={value['state']}")
         updated = dict(value)
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()
         updated["acked_by"] = acked_by
+        updated.pop(COURIER_RETRY_FIELD, None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) -> dict:
@@ -674,7 +929,7 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
     """
 
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -690,29 +945,44 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         updated["claim_owner"] = None
         updated["claim_deadline_ns"] = None
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
-def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str) -> dict:
-    """Return only this carrier's claim, preserving any successor or real ack."""
+def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
+                  failure_reason: str | None = None,
+                  retry_base_delay_seconds: float | None = None) -> dict:
+    """Return only this carrier's claim and persist its next retry interval.
+
+    Claim counts remain ownership transfers. The mutable courier retry fields
+    delay the same failure without changing receipt identity, delivery state,
+    or the carrier's authority to settle it.
+    """
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
         if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
-            return value
+            return _public_record(value)
         updated = dict(value)
+        retry = (_read_courier_retry_unlocked(path, value)
+                 or _new_courier_retry())
+        base_delay_ns = (retry["base_delay_ns"] if retry_base_delay_seconds is None
+                         else _delay_ns(retry_base_delay_seconds))
+        failure = failure_reason or ("sent-ambiguous" if value.get("state") == "sent-ambiguous"
+                                     else "claim-released")
+        updated[COURIER_RETRY_FIELD] = _advance_courier_retry(
+            retry, failure, time.time_ns(), base_delay_ns)
         updated.update(state="pending", claim_owner=None, claim_deadline_ns=None)
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def reject_claimed(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
                    reason: str) -> dict:
     """Close a claimed delivery after a typed, permanent carrier refusal."""
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None or value.get("state") != "claimed" or value.get("claim_owner") != claim_owner:
             raise PendingDeliveryError("pending-delivery-claim-refused", "claim-owner-or-state")
@@ -720,7 +990,7 @@ def reject_claimed(root: Path, recipient_key: str, delivery_id: str, *, claim_ow
         updated["state"] = "rejected"
         updated["expiry_reason"] = str(reason)[:1024] or "gateway-rejected"
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def expire_if_due(
@@ -741,17 +1011,17 @@ def expire_if_due(
     if reason not in EXPIRY_REASONS:
         raise PendingDeliveryError("pending-delivery-identity-conflict", "expiry_reason")
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
         if liveness == "unknown" or value["state"] not in OPEN_STATES:
-            return value
+            return _public_record(value)
         updated = dict(value)
         updated["state"] = "expired"
         updated["expiry_reason"] = reason
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def expire_recovery(
@@ -774,7 +1044,7 @@ def expire_recovery(
     ):
         raise PendingDeliveryError("pending-delivery-recovery-audit-invalid")
     path = record_path(root, recipient_key, delivery_id)
-    with _record_lock(path):
+    with _record_reference_lock(path):
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
@@ -790,19 +1060,19 @@ def expire_recovery(
                 )
         if value.get("state") == "expired":
             if (value.get("expiry_actor"), value.get("expiry_detail")) == (actor, reason):
-                return {**value, "idempotent": True}
+                return _public_record({**value, "idempotent": True})
             raise PendingDeliveryError("pending-delivery-recovery-refused", "already-expired")
         if value.get("state") not in {"pending", "sent-ambiguous"}:
             raise PendingDeliveryError("pending-delivery-recovery-refused", f"state={value.get('state')}")
         preview = {**value, "eligible": True, "idempotent": False}
         if not apply:
-            return preview
+            return _public_record(preview)
         updated = dict(value)
         updated.update({"state": "expired", "expiry_reason": "operator-recovery",
                         "expiry_actor": actor, "expiry_detail": reason,
                         "expired_at_ns": time.time_ns()})
         _write_unlocked(path, updated)
-        return updated
+        return _public_record(updated)
 
 
 def tombstone_path(record_file: Path) -> Path:
@@ -849,53 +1119,94 @@ def prune_plan(
     regardless of age; an unreadable record is counted and kept."""
 
     now = time.time() if now is None else now
+    root = Path(root)
     pending_root = root / "pending-delivery"
+    reference_root = root / attempt_reference.LOCK_DIRECTORY
     plan = {
         "retention_seconds": retention_seconds,
         "lock_retention_seconds": lock_retention_seconds,
         "records": [],
         "orphan_locks": [],
+        "reference_locks": [],
         "kept_open": 0,
         "kept_terminal_recent": 0,
         "kept_locks_recent": 0,
+        "kept_reference_locks_recent": 0,
         "unreadable": 0,
+        "unreadable_reference_locks": 0,
     }
-    if not pending_root.is_dir():
-        return plan
-    for record_file in sorted(pending_root.glob("*/*.json")):
+    if pending_root.is_dir():
+        for record_file in sorted(pending_root.glob("*/*.json")):
+            try:
+                stat_value = record_file.stat()
+                value = json.loads(record_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                plan["unreadable"] += 1
+                continue
+            state = value.get("state") if isinstance(value, dict) else None
+            if state not in TERMINAL_STATES:
+                plan["kept_open"] += 1
+                continue
+            age = now - stat_value.st_mtime
+            if age < retention_seconds:
+                plan["kept_terminal_recent"] += 1
+                continue
+            plan["records"].append({
+                "path": str(record_file),
+                "state": state,
+                "expiry_reason": value.get("expiry_reason"),
+                "delivery_id": value.get("delivery_id"),
+                "age_seconds": int(age),
+                "mtime": stat_value.st_mtime,
+            })
+        for lock_file in sorted(pending_root.glob("*/*.json.lock")):
+            if lock_file.with_name(lock_file.name[: -len(".lock")]).exists():
+                continue
+            try:
+                age = now - lock_file.stat().st_mtime
+            except OSError:
+                continue
+            if age < lock_retention_seconds:
+                plan["kept_locks_recent"] += 1
+                continue
+            plan["orphan_locks"].append({"path": str(lock_file), "age_seconds": int(age)})
+    try:
+        reference_dir_stat = reference_root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        reference_locks = []
+    except OSError:
+        reference_locks = []
+        plan["unreadable_reference_locks"] += 1
+    else:
+        if (not stat.S_ISDIR(reference_dir_stat.st_mode)
+                or reference_dir_stat.st_uid != os.geteuid()):
+            reference_locks = []
+            plan["unreadable_reference_locks"] += 1
+        else:
+            try:
+                reference_locks = sorted(reference_root.iterdir())
+            except OSError:
+                reference_locks = []
+                plan["unreadable_reference_locks"] += 1
+    for lock_file in reference_locks:
+        digest = lock_file.name[:-len(attempt_reference.LOCK_SUFFIX)] \
+            if lock_file.name.endswith(attempt_reference.LOCK_SUFFIX) else ""
         try:
-            stat = record_file.stat()
-            value = json.loads(record_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            plan["unreadable"] += 1
-            continue
-        state = value.get("state") if isinstance(value, dict) else None
-        if state not in TERMINAL_STATES:
-            plan["kept_open"] += 1
-            continue
-        age = now - stat.st_mtime
-        if age < retention_seconds:
-            plan["kept_terminal_recent"] += 1
-            continue
-        plan["records"].append({
-            "path": str(record_file),
-            "state": state,
-            "expiry_reason": value.get("expiry_reason"),
-            "delivery_id": value.get("delivery_id"),
-            "age_seconds": int(age),
-            "mtime": stat.st_mtime,
-        })
-    for lock_file in sorted(pending_root.glob("*/*.json.lock")):
-        if lock_file.with_name(lock_file.name[: -len(".lock")]).exists():
-            continue
-        try:
-            age = now - lock_file.stat().st_mtime
+            stat_value = lock_file.stat(follow_symlinks=False)
         except OSError:
+            plan["unreadable_reference_locks"] += 1
             continue
+        if (not _SHA256_RE.fullmatch(digest) or not stat.S_ISREG(stat_value.st_mode)
+                or stat_value.st_uid != os.geteuid()):
+            plan["unreadable_reference_locks"] += 1
+            continue
+        age = now - stat_value.st_mtime
         if age < lock_retention_seconds:
-            plan["kept_locks_recent"] += 1
+            plan["kept_reference_locks_recent"] += 1
             continue
-        plan["orphan_locks"].append({"path": str(lock_file), "age_seconds": int(age)})
+        plan["reference_locks"].append({
+            "path": str(lock_file), "age_seconds": int(age), "mtime": stat_value.st_mtime,
+        })
     return plan
 
 
@@ -910,11 +1221,13 @@ def prune(
     """Retention prune under the single declared actor (SD-111 §(7) v67).
 
     ``apply=False`` returns the plan only. With ``apply=True`` each planned
-    record is re-read under its own lock and unlinked only if it is still
+    record is re-read under its reference and record locks and unlinked only if it is still
     terminal and unchanged since the plan: tombstone first, then ``.json``,
     then its ``.lock``. A planned orphan lock is unlinked only while this
     process holds it and only if its record is still absent (holders waiting
-    on the old inode reopen, see ``_record_lock``). Recipient directories are
+    on the old inode reopen, see ``_record_lock``). Old attempt-reference
+    locks are pruned under their own flock; their waiters also reopen after an
+    unlink. Recipient directories are
     never removed (the tombstones live there). Open-state records are never
     touched. Never raises: one bad file is counted in ``skipped`` and the sweep
     continues."""
@@ -927,8 +1240,10 @@ def prune(
         "apply": apply,
         "planned_records": len(plan["records"]),
         "planned_locks": len(plan["orphan_locks"]),
+        "planned_reference_locks": len(plan["reference_locks"]),
         "pruned_records": 0,
         "pruned_locks": 0,
+        "pruned_reference_locks": 0,
         "skipped": 0,
         "plan": plan,
     }
@@ -936,14 +1251,18 @@ def prune(
         return result
     for item in plan["records"]:
         path = Path(item["path"])
-        lock_path = path.with_name(path.name + ".lock")
+        lock_path = path.with_name(path.name[:-5] + _RECORD_LOCK_SUFFIX)
         try:
-            with _record_lock(path):
+            with _record_reference_lock(path):
                 value = _read_unlocked(path)
                 if value is None:
                     # Gone since the plan (a concurrent prune): the lock this
                     # process just created must not become a new orphan
                     # (review round 1, minor 2).
+                    try:
+                        courier_retry_path(path).unlink()
+                    except FileNotFoundError:
+                        pass
                     try:
                         lock_path.unlink()
                     except FileNotFoundError:
@@ -958,6 +1277,10 @@ def prune(
                     continue
                 _write_prune_tombstone(path, value)
                 path.unlink()
+                try:
+                    courier_retry_path(path).unlink()
+                except FileNotFoundError:
+                    pass
                 try:
                     lock_path.unlink()
                 except FileNotFoundError:
@@ -977,21 +1300,29 @@ def prune(
             continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                if record_file.exists():
-                    result["skipped"] += 1
-                    continue
+            with dispatch_lock_order.acquired("delivery-record"):
                 try:
-                    lock_path.unlink()
-                    result["pruned_locks"] += 1
-                except FileNotFoundError:
-                    pass
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                    if record_file.exists():
+                        result["skipped"] += 1
+                        continue
+                    try:
+                        lock_path.unlink()
+                        result["pruned_locks"] += 1
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             result["skipped"] += 1
         finally:
             os.close(fd)
+    cutoff_ns = int(((time.time() if now is None else now) - lock_retention_seconds) * 1e9)
+    for item in plan["reference_locks"]:
+        outcome = attempt_reference.prune_stale_lock(Path(item["path"]), cutoff_ns=cutoff_ns)
+        if outcome == "removed":
+            result["pruned_reference_locks"] += 1
+        elif outcome not in {"missing"}:
+            result["skipped"] += 1
     return result
 
 
@@ -1010,12 +1341,16 @@ def _render_prune_table(result: dict) -> str:
         f"retention={int(plan['retention_seconds'] // 86400)}d "
         f"lock_retention={int(plan['lock_retention_seconds'] // 3600)}h",
         f"kept: open={plan['kept_open']} terminal_recent={plan['kept_terminal_recent']} "
-        f"locks_recent={plan['kept_locks_recent']} unreadable={plan['unreadable']}",
-        f"planned: records={result['planned_records']} orphan_locks={result['planned_locks']}",
+        f"locks_recent={plan['kept_locks_recent']} "
+        f"reference_locks_recent={plan['kept_reference_locks_recent']} "
+        f"unreadable={plan['unreadable'] + plan['unreadable_reference_locks']}",
+        f"planned: records={result['planned_records']} orphan_locks={result['planned_locks']} "
+        f"reference_locks={result['planned_reference_locks']}",
     ]
     if result["apply"]:
         lines.append(
             f"pruned: records={result['pruned_records']} locks={result['pruned_locks']} "
+            f"reference_locks={result['pruned_reference_locks']} "
             f"skipped={result['skipped']}"
         )
     lines.append("state          age_d  expiry_reason              delivery_id")

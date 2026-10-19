@@ -17,6 +17,7 @@ Never exit 3 — that code is dispatch-wrapper-owned (preflight gate).
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -447,6 +448,57 @@ def worker_home_key(agent_home, harness, worker_type, identity):
     return hashlib.sha256((str(agent_home) + '\0' + harness + '\0' + worker_type + '\0' + identity).encode()).hexdigest()[:32]
 
 
+def _dispatch_defaults_module():
+    code_root = Path(__file__).resolve().parents[2]
+    path = code_root / 'utilities' / 'dispatch-defaults.py'
+    name = '_hearting_worker_home_dispatch_defaults'
+    module = sys.modules.get(name)
+    if module is not None and Path(module.__file__).resolve() == path.resolve():
+        return module
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError('dispatch defaults loader is unavailable')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _worker_account_selection(harness, env):
+    """Read the existing validated dispatch-defaults config from this env."""
+    defaults = _dispatch_defaults_module()
+    config_path = defaults.default_config_path(environ=env)
+    if not env.get('DISPATCH_DEFAULTS_CONFIG') and not os.path.lexists(config_path):
+        # Account selection is optional. A minimal packaged root may omit the
+        # shipped defaults file entirely; keep the pre-account worker-home
+        # behavior in that case. Explicit paths and present configs still pass
+        # through the validated loader below, so requested-input and content
+        # errors remain visible.
+        return None, None
+    config, _warnings = defaults.load_validated(
+        config_path, defaults.default_topology_path())
+    account = defaults.query_worker_account(config, harness)
+    configured = config.get('worker_account')
+    pin_config = (str(Path(config_path).resolve(strict=False))
+                  if isinstance(configured, dict) and configured else None)
+    return account, pin_config
+
+
+def _resolve_worker_account_path(value, *, env, cwd=None):
+    """Resolve `~` from the passed HOME and relative paths from launch cwd."""
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    home = Path(env.get('HOME') or str(Path.home()))
+    if value == '~':
+        path = home
+    elif value.startswith('~/'):
+        path = home / value[2:]
+    else:
+        path = Path(value)
+        if not path.is_absolute():
+            path = cwd / path
+    return path.resolve(strict=False)
+
+
 def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, destination=None, profile=None):
     """Default typed profile for every launch; never changes the caller's home.
 
@@ -467,6 +519,15 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
     home.chmod(0o700)
     values = {'HEARTING_WORKER_HOME': str(home)}
     home_env = env.get('HOME') or str(Path.home())
+    account_value, defaults_config = _worker_account_selection(harness, env)
+    account_source = (
+        _resolve_worker_account_path(account_value, env=env)
+        if account_value is not None else None
+    )
+    if defaults_config is not None:
+        # OpenCode's worker XDG_CONFIG_HOME is private. Carry the existing
+        # config path so nested workers read the same account selection.
+        values['DISPATCH_DEFAULTS_CONFIG'] = defaults_config
     if harness == 'codex':
         model_config_home = env.get('CODEX_HOME') or Path(home_env) / '.codex'
     elif harness == 'claude':
@@ -520,8 +581,15 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         source = Path(env.get('CODEX_HOME') or Path.home() / '.codex').expanduser()
         symlink(source / 'hooks', home / 'hooks')
         for name in ('auth.json', 'config.toml'):
-            target = source / name
-            if name == 'auth.json' and not target.is_file():
+            auth_source = account_source if account_source is not None else source
+            target = (auth_source if name == 'auth.json' else source) / name
+            if (name == 'auth.json' and account_source is not None
+                    and not target.is_file()):
+                old_link = home / name
+                if old_link.is_symlink():
+                    old_link.unlink()
+            if (name == 'auth.json' and account_source is None
+                    and not target.is_file()):
                 target = Path.home() / '.codex/auth.json'
             symlink(target, home / name)
         hooks = first_existing(source / 'hooks.json', agent_home / 'adapters/codex/hooks/hooks.json')
@@ -589,8 +657,23 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         # its account metadata without inheriting global MCP/onboarding state.
         # The account copy is optional: a config that cannot be read or parsed
         # leaves the launch unscoped instead of failing it.
+        auth_env = env
+        selected_settings_env = {}
+        if account_source is not None:
+            auth_env = dict(env)
+            auth_env['CLAUDE_CONFIG_DIR'] = str(account_source)
+            auth_env.pop('CLAUDE_SECURESTORAGE_CONFIG_DIR', None)
+            account_settings = read_json(account_source / 'settings.json')
+            selected_settings_env = (
+                account_settings.get('env')
+                if isinstance(account_settings, dict)
+                and isinstance(account_settings.get('env'), dict) else {}
+            )
+            if selected_settings_env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR') == '':
+                selected_settings_env = dict(selected_settings_env)
+                selected_settings_env.pop('CLAUDE_SECURESTORAGE_CONFIG_DIR', None)
         try:
-            config = read_json(claude_global_config_file(env, cwd=Path.cwd()))
+            config = read_json(claude_global_config_file(auth_env, cwd=Path.cwd()))
         except (OSError, ValueError):
             config = {}
         account = config.get('oauthAccount') if isinstance(config, dict) else None
@@ -608,10 +691,22 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         from claude_credential_recovery import resolve_storage_binding
 
         settings_env = settings.get('env') if isinstance(settings.get('env'), dict) else {}
-        secure_storage = resolve_storage_binding(
-            env, source, settings_env=settings_env, cwd=Path.cwd())
+        if account_source is not None:
+            secure_env = dict(env)
+            secure_env['CLAUDE_CONFIG_DIR'] = str(account_source)
+            secure_env.pop('CLAUDE_SECURESTORAGE_CONFIG_DIR', None)
+            secure_storage = resolve_storage_binding(
+                secure_env, account_source, settings_env=selected_settings_env,
+                cwd=Path.cwd())
+        else:
+            secure_storage = resolve_storage_binding(
+                env, source, settings_env=settings_env, cwd=Path.cwd())
         if secure_storage is not None:
             values['CLAUDE_SECURESTORAGE_CONFIG_DIR'] = secure_storage
+            if account_source is not None:
+                if not isinstance(settings.get('env'), dict):
+                    settings['env'] = {}
+                settings['env']['CLAUDE_SECURESTORAGE_CONFIG_DIR'] = secure_storage
             # Settings env is applied over the inherited launch environment by
             # Claude. Resolve a relative user value once against this launch's
             # caller directory so later nested launches keep the same store.
@@ -666,8 +761,14 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
             target = runtime / kind
             target.mkdir(parents=True, exist_ok=True, mode=0o700)
             values['XDG_' + kind.upper() + '_HOME'] = str(target)
-        data = Path(env.get('XDG_DATA_HOME') or Path.home() / '.local/share')
-        symlink(data / 'opencode/auth.json', runtime / 'data/opencode/auth.json')
+        data = (account_source if account_source is not None else
+                Path(env.get('XDG_DATA_HOME') or Path.home() / '.local/share'))
+        auth_source = data / 'opencode/auth.json'
+        if account_source is not None and not auth_source.is_file():
+            old_link = runtime / 'data/opencode/auth.json'
+            if old_link.is_symlink():
+                old_link.unlink()
+        symlink(auth_source, runtime / 'data/opencode/auth.json')
         symlink(home, runtime / 'config/opencode')
         values.update(OPENCODE_CONFIG_DIR=str(home), OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
                       OPENCODE_DISABLE_CLAUDE_CODE_SKILLS='1')
