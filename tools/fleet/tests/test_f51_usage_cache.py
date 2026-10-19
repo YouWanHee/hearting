@@ -50,6 +50,35 @@ class F51UsageCacheTest(unittest.TestCase):
         self.assertEqual(after["observed_at"], 1000.0)
         self.assertEqual(after["payload"]["windows"][0][1], 40)
 
+    def test_provider_rejection_does_not_refresh_quota_and_is_account_scoped(self):
+        self.assertTrue(usage_cache.record("opencode", {
+            "rl_5h": 5, "rl_windows": [["5h", 5, 9000.0]]}, now=1000.0))
+        self.assertTrue(usage_cache.record_provider(
+            "opencode", "opencode-go", "*", "account:one", "unavailable",
+            reason="credential-expired", now=1100.0))
+        snapshot = usage_cache.read("opencode", now=1500.0, stale_max=3600)
+        self.assertEqual(snapshot["observed_at"], 1000.0)
+        self.assertEqual(snapshot["payload"]["rl_5h"], 5)
+        self.assertEqual(usage_cache.read_provider(
+            "opencode", "opencode-go", "*", "account:one", now=1500)["reason"],
+            "credential-expired")
+        self.assertEqual(usage_cache.read_provider(
+            "opencode", "opencode-go", "*", "account:two", now=1500)["state"], "unknown")
+        self.assertEqual(usage_cache.provider_records("opencode")[0]["state"], "unavailable")
+
+    def test_new_same_account_success_clears_only_the_matching_scope(self):
+        usage_cache.record_provider("opencode", "opencode-go", "*", "account:one",
+                                    "unavailable", reason="credential-expired", now=1000)
+        usage_cache.record_provider("opencode", "opencode-go", "*", "account:one",
+                                    "usable", now=1100)
+        self.assertEqual(usage_cache.read_provider(
+            "opencode", "opencode-go", "*", "account:one", now=1100)["state"], "usable")
+        usage_cache.record_provider("opencode", "opencode-go", "*", "account:one",
+                                    "unavailable", reason="subscription-missing", now=1200)
+        self.assertEqual(usage_cache.read_provider(
+            "opencode", "opencode-go", "*", "account:one", now=1200)["reason"],
+            "subscription-missing")
+
     def test_cache_only_never_calls_fetcher(self):
         calls = []
         usage_cache.FETCHERS["claude"] = lambda: calls.append(1)

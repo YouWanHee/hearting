@@ -8,6 +8,8 @@ import importlib
 import copy
 from dataclasses import replace
 import os
+from pathlib import Path
+import sys
 import time as _time
 
 from . import procscan
@@ -515,6 +517,34 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
             snap = usage_cache.account_usage(harness, usage=usage if usage == "refresh" else "cache-only")
             usage_snapshots[harness] = snap
             usage_meta[harness] = {k: snap.get(k) for k in ("freshness", "observed_at")}
+            if harness == "opencode":
+                try:
+                    utilities = Path(__file__).resolve().parents[3] / "utilities"
+                    if str(utilities) not in sys.path:
+                        sys.path.insert(0, str(utilities))
+                    import opencode_runtime
+                    scopes = {opencode_runtime.provider_account_scope("opencode-go"),
+                              opencode_runtime.account_scope("opencode"),
+                              opencode_runtime.account_scope("openai")}
+                    providers = usage_cache.provider_records("opencode", account_scopes=scopes)
+                    snap["providers"] = providers
+                    usage_meta[harness]["providers"] = providers
+                    payload = snap.get("payload")
+                    availability = payload.get("provider_availability") if isinstance(payload, dict) else None
+                    if isinstance(availability, dict):
+                        current_scope = {
+                            "opencode-go": opencode_runtime.provider_account_scope("opencode-go"),
+                            "opencode-go-entitlement": opencode_runtime.account_scope("opencode"),
+                            "opencode": opencode_runtime.account_scope("opencode"),
+                            "openai": opencode_runtime.account_scope("openai"),
+                        }
+                        payload["provider_availability"] = {
+                            provider: row for provider, row in availability.items()
+                            if isinstance(row, dict)
+                            and row.get("account_scope") == current_scope.get(provider)
+                        }
+                except Exception:
+                    usage_meta[harness]["providers"] = []
             payload = snap.get("payload") or {}
             if not isinstance(payload, dict):
                 continue

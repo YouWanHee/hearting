@@ -704,13 +704,10 @@ def _codex_job_liveness(cwd, now, stale_min=15, profile=None, slug=None,
 
 
 def _opencode_db():
-    explicit = os.environ.get("OPENCODE_DB")
-    if explicit:
-        return explicit
-    data_home = os.environ.get("OPENCODE_DATA_HOME")
-    if data_home:
-        return os.path.join(data_home, "opencode.db")
-    return os.path.expanduser("~/.local/share/opencode/opencode.db")
+    if str(_ROOT / "utilities") not in sys.path:
+        sys.path.insert(0, str(_ROOT / "utilities"))
+    import opencode_runtime
+    return str(opencode_runtime.opencode_db_path())
 
 
 def _opencode_to_seconds(ts):
@@ -742,40 +739,53 @@ def _opencode_job_liveness(cwd, now, stale_min=15, slug=None, job=None):
         db = os.path.join(runtime_dir, "data", "opencode", "opencode.db")
     if not os.path.exists(db):
         return "unknown"
-    con = None
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
-        rows = con.execute(
-            """
-            SELECT
-              s.directory,
-              MAX(
-                s.time_updated,
-                COALESCE((SELECT MAX(time_updated) FROM message WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_updated) FROM part WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_updated) FROM session_message WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_created) FROM session_input WHERE session_id = s.id), 0)
-              ) AS last_updated
-            FROM session s
-            ORDER BY last_updated DESC
-            """
-        )
-        newest = None
-        for row in rows:
-            if _same_path(row[0], cwd):
-                newest = _opencode_to_seconds(row[1])
-                break
+        import opencode_runtime
+        session_id = ""
+        attempt_id = getattr(job, "attempt_id", None)
+        registry_path = getattr(job, "_registry_path", None)
+        if attempt_id and registry_path:
+            try:
+                from opencode_session_runtime import read_binding
+                from types import SimpleNamespace
+                session_id = read_binding(SimpleNamespace(
+                    jobs=registry_path, parent_attempt_id=attempt_id, worktree=cwd))
+            except Exception:
+                session_id = ""
+        if not session_id and job is not None:
+            try:
+                from opencode_server_log import bind_session
+                session_id = bind_session(getattr(job, "log_file", None)) or ""
+            except Exception:
+                session_id = ""
+        if session_id:
+            observation = opencode_runtime.read_session_observation(session_id, db_path=db)
+        else:
+            candidates = opencode_runtime.list_session_candidates(cwd, db_path=db, limit=2)
+            if len(candidates) != 1:
+                observation = {"state": "unknown", "reason": "session-ambiguous-or-unobserved"}
+            else:
+                candidate = candidates[0]
+                observation = opencode_runtime.read_session_observation(
+                    candidate["id"], db_path=db, generation=candidate.get("generation"))
+        if observation.get("state") != "observed":
+            newest = None
+        else:
+            session = observation.get("session") or {}
+            if session.get("directory") and not _same_path(session["directory"], cwd):
+                return "unknown"
+            stamp = session.get("time_updated") or 0
+            for message in observation.get("messages") or ():
+                stamp = max(stamp, message.get("updated") or message.get("created") or 0)
+            newest = _opencode_to_seconds(stamp) if stamp else None
     except Exception:
         newest = None
-    finally:
-        if con is not None:
-            con.close()
     if newest:
         return "working" if (now - newest) / 60.0 <= stale_min else "stale"
     hb_age = _opencode_heartbeat_age(slug, now, job=job)
     if hb_age is not None and hb_age <= stale_min:
         return "working"
-    return "dead"
+    return "unknown"
 
 
 # F-15c: an `open` registry row with no transcript yet, within this startup grace window,

@@ -775,6 +775,8 @@ def _linked_entries(
         )
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
+        v2_plugin = source_root / "adapters/opencode/plugins/hearting-guards/index.ts"
+        entries.append(_entry(v2_plugin, home / "plugins/hearting-guards/index.ts", "hook_config"))
         herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
         entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
@@ -975,6 +977,7 @@ def _native_present(runtime: str, scope: str = "global") -> bool:
     elif runtime == "opencode":
         candidates.extend((home / "skills").glob("*"))
         candidates.append(home / "plugins/hearting-guards.js")
+        candidates.append(home / "plugins/hearting-guards/index.ts")
     for candidate in candidates:
         if not candidate.is_symlink():
             continue
@@ -1030,7 +1033,8 @@ def _discovered_harness_links(runtime: str, scope: str = "global") -> set[Path]:
     patterns = {
         "codex": ("skills/*", "agents/*.toml", "agent-modes/*/*.md"),
         "claude": ("skills/*", "agents/*.md", "agent-modes/*/*.md"),
-        "opencode": ("skills/*", "agents/*.md", "commands/*.md"),
+        "opencode": ("skills/*", "agents/*.md", "commands/*.md",
+                     "plugins/hearting-guards/index.ts"),
     }[runtime]
     found: set[Path] = set()
     for pattern in patterns:
@@ -2727,6 +2731,10 @@ def _journal_dest_allowed(runtime: str, dest: Path, scope: str) -> bool:
         return True
     if runtime == "opencode" and relative.parts == (
         "plugins", "hearting-guards.js"
+    ):
+        return True
+    if runtime == "opencode" and relative.parts == (
+        "plugins", "hearting-guards", "index.ts"
     ):
         return True
     return False

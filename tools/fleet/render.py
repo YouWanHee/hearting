@@ -7372,13 +7372,56 @@ def live_harnesses(sessions):
             and not getattr(s, "mem_worker", False)}
 
 
+def _opencode_availability_text(snapshot):
+    rows = snapshot.get("providers") if isinstance(snapshot, dict) else None
+    rows = list(rows) if isinstance(rows, list) else []
+    payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
+    extra = payload.get("provider_availability") if isinstance(payload, dict) else None
+    if isinstance(extra, dict):
+        rows.extend({"provider": key, **value} for key, value in extra.items()
+                    if isinstance(value, dict))
+    latest = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("provider")
+        state = row.get("state")
+        reason = row.get("reason")
+        stamp = row.get("observed_at") or 0
+        if provider and (provider not in latest or stamp >= (latest[provider].get("observed_at") or 0)):
+            latest[provider] = row
+    labels = {}
+    for provider, row in latest.items():
+        state, reason = row.get("state"), row.get("reason")
+        if provider == "opencode-go":
+            label = ("Go credential expired" if reason == "credential-expired" else
+                     "Go key rejected" if state == "unavailable" else
+                     "Go credential valid" if state == "usable" else "Go unknown")
+            labels["go"] = label
+        elif provider == "opencode-go-entitlement":
+            label = ("Go subscription missing" if reason == "subscription-missing" else
+                     "Go entitlement valid" if state == "usable" else
+                     "Go entitlement rejected" if state == "unavailable" else
+                     "Go entitlement unknown")
+            labels["entitlement"] = label
+        elif provider in {"opencode", "openai"}:
+            family = "Zen" if provider == "opencode" else "OpenAI"
+            suffix = ("valid" if state == "usable" else
+                      "unavailable" if state == "unavailable" else "unknown")
+            labels[provider] = f"{family} {suffix}"
+    for key, value in (("go", "Go unknown"), ("entitlement", "Go entitlement unknown"),
+                       ("opencode", "Zen unknown"), ("openai", "OpenAI unknown")):
+        labels.setdefault(key, value)
+    return "; ".join(labels[key] for key in ("go", "entitlement", "opencode", "openai"))
+
+
 def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                        usage_snapshots=None, term_width=None):
     """Build account usage rows independently of the main line builder.
 
     F-51c: `api_disabled` (user opted out via FLEET_DISABLE=usage-api / --no-usage-api) is
-    "the user turned it off" — distinct from a harness with no usage source (opencode without
-    an opencode-go key). A claude/codex harness with no passive-tap value while opted out
+    "the user turned it off" — distinct from unknown provider/account availability. A
+    claude/codex harness with no passive-tap value while opted out
     renders as an unknown gauge (blank track + `—`), never the source-absence sentence.
     """
     rl = {}
@@ -7391,7 +7434,7 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             if cur is None or (s.mtime or 0) > (cur[3] or 0):
                 rl[s.harness] = (s.rl_5h, s.rl_7d, s.rl_ms, s.mtime, s.rl_rs,
                                  getattr(s, "rl_windows", None), freshness,
-                                 getattr(s, "_usage_error", None))
+                                 getattr(s, "_usage_error", None), None, None)
     # A quota snapshot is account-scoped.  It must remain visible when there is no current
     # process row for that harness (for example immediately after session cleanup).
     for harness, snapshot in (usage_snapshots or {}).items():
@@ -7399,7 +7442,10 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             continue
         payload = snapshot.get("payload")
         if not isinstance(payload, dict):
-            continue
+            if harness == "opencode" and snapshot.get("providers"):
+                payload = {}
+            else:
+                continue
         r5 = payload.get("rl_5h")
         r7 = payload.get("rl_7d")
         rms = payload.get("rl_ms")
@@ -7407,13 +7453,14 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
         rwins = payload.get("rl_windows")
         if rwins is None:
             rwins = payload.get("windows")
-        if r5 is None and r7 is None and not rms and not rwins and not err:
+        providers = snapshot.get("providers") or []
+        if r5 is None and r7 is None and not rms and not rwins and not err and not providers:
             continue
         observed_at = snapshot.get("observed_at")
         rl[harness] = (
             r5, r7, rms, observed_at,
             (payload.get("rs_5h"), payload.get("rs_7d")), rwins,
-            snapshot.get("freshness"), err,
+            snapshot.get("freshness"), err, providers, payload.get("reason"),
         )
     live = live_harnesses(sessions)
     if not rl and not live:
@@ -7433,17 +7480,29 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                 row += [("·" * _GAUGE_W, "dim"), ("   —", "dim")]
                 row.append(("]", "dim"))
             else:
-                row.append(("no usage api — opencode-go key not found" if h == "opencode"
+                row.append(("provider availability unknown" if h == "opencode"
                             else "no usage api — plan quota is console-only", "dim"))
             rows.append((row, None))
             continue
-        r5, r7, rms, _mt, rrs, rwins, freshness, err = rl[h]
-        if err == "auth":
-            # 401/403 from the provider: the key is present but rejected (rotated,
-            # expired, wrong scope). Say so instead of a silently blank gauge.
-            row.append(("usage api — key rejected (401/403)", "dim"))
+        r5, r7, rms, _mt, rrs, rwins, freshness, err, provider_rows, error_reason = rl[h]
+        if err in {"auth", "subscription-missing", "missing-credential", "unknown"}:
+            detail = _opencode_availability_text({"providers": provider_rows})
+            if err == "auth" and error_reason == "credential-expired" and "Go key expired" not in detail:
+                detail = "Go key expired; " + detail
+            elif err == "auth" and "Go key expired" not in detail and "Go key rejected" not in detail:
+                detail = "Go key rejected; " + detail
+            elif err == "subscription-missing" and "Go subscription missing" not in detail:
+                detail = "Go subscription missing; " + detail
+            elif err == "missing-credential":
+                detail = "Go credential not found; " + detail
+            row.append(("usage api — " + detail, "dim"))
             rows.append((row, None))
             continue
+        if h == "opencode" and provider_rows:
+            row.append((" — " + _opencode_availability_text({"providers": provider_rows}), "dim"))
+            if r5 is None and r7 is None and not rms and not rwins:
+                rows.append((row, None))
+                continue
         rs5, rs7 = (rrs or (None, None))[0], (rrs or (None, None))[1]
         gauges = (list(rwins) if rwins else
                   [("5h", r5, rs5), ("week", r7, rs7)])
