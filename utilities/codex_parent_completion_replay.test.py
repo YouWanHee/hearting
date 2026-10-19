@@ -951,6 +951,35 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertTrue(all(checks["prose_content_checks"].values()))
         self.assertTrue(all(checks["synthetic_value_checks"].values()))
 
+    def test_saved_original_first_report_accepts_fenced_json_whitespace_variants(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-positive.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "253c30c510e0ffc6b0c382b841b12d7a3557bdd0a53c27fce3968eb8675a0aab")
+        report = report_bytes.decode("utf-8")
+        fence_open = "FACTUAL_REPORT_JSON:\n```json\n"
+        self.assertEqual(report.count(fence_open), 1)
+        tools = self._fixture_tool_trace(fixture, sentinel)
+
+        for label, leading_whitespace in (("blank line", "\n"), ("indentation", "  ")):
+            with self.subTest(leading_whitespace=label):
+                varied_report = report.replace(
+                    fence_open, fence_open + leading_whitespace, 1)
+                self.assertEqual(
+                    varied_report.replace(fence_open + leading_whitespace, fence_open, 1),
+                    report)
+                self.assertEqual(replay._factual_report_object(varied_report), facts)
+                checks = replay._first_report_checks(varied_report, tools, fixture)
+                for key in (
+                        "report_matches_fixture_facts", "report_has_substantive_closing_prose",
+                        "every_exact_artifact_was_read",
+                        "fixture_verifier_passed_in_native_tool_trace",
+                        "one_approved_followthrough_tool_invocation",
+                        "followthrough_state_matches_one_time_fixture_action"):
+                    self.assertTrue(checks[key], key)
+                self.assertTrue(all(checks["prose_content_checks"].values()))
+                self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
     def test_saved_positive_semantic_mutations_keep_facts_and_tool_trace_constant(self):
         root, facts, fixture, sentinel = self._stored_report_fixture()
         report = (root / "first-report-positive.txt").read_bytes().decode("utf-8")
@@ -1133,8 +1162,10 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         facts = self.fixture["facts"]["report"]
         plain = "FACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False)
         fenced = "FACTUAL_REPORT_JSON:\n```json\n" + json.dumps(facts, indent=2) + "\n```\n"
+        fenced_blank_line = "FACTUAL_REPORT_JSON:\n```json\n\n" + json.dumps(facts) + "\n```"
+        fenced_indented = "FACTUAL_REPORT_JSON:\n```json\n  " + json.dumps(facts) + "\n```"
         bare_fence = "FACTUAL_REPORT_JSON:\n```\n" + json.dumps(facts) + "\n```"
-        for text in (plain, fenced, bare_fence):
+        for text in (plain, fenced, fenced_blank_line, fenced_indented, bare_fence):
             with self.subTest(text=text[:40]):
                 self.assertEqual(replay._factual_report_object(text), facts)
         for payload in ("```json\n{\n```", "```json\n{}", "[1, 2]", "null", "{} trailing"):

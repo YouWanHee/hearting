@@ -825,7 +825,7 @@ def _factual_report_object(text: str) -> dict | None:
             raw, flags=re.IGNORECASE | re.DOTALL)
         if fenced is None:
             return None
-        raw = fenced.group(1)
+        raw = fenced.group(1).lstrip(" \t\r\n")
     try:
         value, end = json.JSONDecoder().raw_decode(raw)
     except (TypeError, ValueError):
