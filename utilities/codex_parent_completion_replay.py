@@ -1127,7 +1127,7 @@ def _finish_after_runtime_error(report: dict, output_dir: Path, kind: str,
     return report
 
 
-def _run_replay(output_dir: Path) -> dict:
+def _run_replay_impl(output_dir: Path) -> dict:
     report = {"schema_version": 1, "source_sha": "unknown", "status": "running",
               "verdict": "BLOCKED", "d1": "unfinished", "d2": "unfinished",
               "d3": "not-assessed", "replay_cases": {},
@@ -1896,6 +1896,33 @@ def _run_replay(output_dir: Path) -> dict:
             return report
         finally:
             _stop_server(server)
+
+
+def _run_replay(output_dir: Path) -> dict:
+    """Run the replay and durably finish any cases left by a runtime error."""
+    try:
+        report = _run_replay_impl(output_dir)
+        _write_json(output_dir / "replay.json", report)
+        return report
+    except ReplayFailed as exc:
+        kind = "FAIL"
+        reason = str(exc)
+        detail = None
+    except ReplayBlocked as exc:
+        kind = "BLOCKED"
+        reason = str(exc)
+        detail = None
+    except Exception as exc:  # preserve the exact runtime limitation in evidence
+        kind = "BLOCKED"
+        reason = str(exc) or type(exc).__name__
+        detail = repr(exc)
+    try:
+        report = json.loads((output_dir / "replay.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        report = {"schema_version": 1, "replay_cases": {}}
+    report = _finish_after_runtime_error(report, output_dir, kind, reason, detail)
+    _write_json(output_dir / "replay.json", report)
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
