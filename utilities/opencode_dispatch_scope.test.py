@@ -13,12 +13,28 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "utilities"))
+from codex_dispatch_terminal import inspect_terminal_attempt
+from dispatch_supervisor_terminal import opencode_terminal_boundary
+
 SPEC = importlib.util.spec_from_file_location(
     "opencode_dispatch_scope_fixture",
     ROOT / "adapters/opencode/bin/dispatch-headless.py",
 )
 DISPATCH = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DISPATCH)
+
+
+def _terminal_session_matches(rows, expected_sid):
+    terminal_index, _text = opencode_terminal_boundary(rows)
+    if terminal_index is None:
+        return False
+    terminal_row = rows[terminal_index]
+    final_text_row = next((row for row in reversed(rows[:terminal_index])
+                           if row.get("type") == "text"), None)
+    return (terminal_row.get("sessionID") == expected_sid
+            and isinstance(final_text_row, dict)
+            and final_text_row.get("sessionID") == expected_sid)
 
 
 class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
@@ -132,9 +148,16 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
         if bundle_path:
             bundle = Path(bundle_path).read_text(encoding="utf-8")
             self.assertIn('ARTIFACT_ROOT="$WORK/dispatch-artifact-root/.agent_reports"', bundle)
-            self.assertIn("Use the write tool exactly once to create", bundle)
+            self.assertIn('HANDOFF_ARTIFACT="$ARTIFACT_ROOT/native-dispatch-handoff.md"', bundle)
+            self.assertIn("Finish with exactly Hearting's normal three-line worker handoff", bundle)
+            self.assertNotIn("DISPATCH_GUARD_DONE", bundle)
+            self.assertNotIn("Use the write tool exactly once", bundle)
             self.assertIn('artifact_probe.read_bytes() != b"hearting-artifact-probe-v2\\n"', bundle)
             self.assertIn("native session log has no failed outside-scope write tool call", bundle)
+            self.assertIn("native session log has no completed environment-capture tool result", bundle)
+            self.assertIn("terminal text/step_finish session mismatch", bundle)
+            self.assertIn("dispatch_attempt_log_binding=exact", bundle)
+            self.assertIn("codex_dispatch_terminal.inspect_terminal_attempt", bundle)
             self.assertNotIn('"allowed_write": True', bundle)
 
         prompt = self.state_root / "probe.prompt"
@@ -147,6 +170,58 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
             command = DISPATCH.shell_command(command_args, prompt, log)
         self.assertIn("hearting-worker-att-native-fixture", command)
         self.assertIn("--format json", command)
+
+    def _terminal_log(self, sid, text, *, terminal_sid=None):
+        report = self.artifact_root / "native-dispatch-handoff.md"
+        report.write_text("Observed probe evidence.\n", encoding="utf-8")
+        terminal_sid = terminal_sid or sid
+        rows = [
+            {"type": "step_start", "sessionID": sid, "part": {"type": "step-start"}},
+            {"type": "text", "sessionID": sid,
+             "part": {"type": "text", "text": text}},
+            {"type": "step_finish", "sessionID": terminal_sid,
+             "part": {"type": "step-finish", "reason": "stop"}},
+        ]
+        log = self.state_root / "native-attempt.jsonl"
+        log.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return log, report, rows
+
+    def test_shared_terminal_parser_accepts_readable_handoff_from_exact_session(self):
+        sid = "ses-native-probe"
+        report = self.artifact_root / "native-dispatch-handoff.md"
+        log, _report, rows = self._terminal_log(
+            sid, f"artifact: {report}\nverdict: PASS\nblocker: none")
+        result = inspect_terminal_attempt(
+            log, worktree=self.worktree, artifact_root_metadata=self.artifact_root,
+            artifact_binding={"attempt_id": "att-native-probe"})
+        self.assertTrue(_terminal_session_matches(rows, sid))
+        self.assertEqual(result["state"], "valid")
+        self.assertEqual(result["source"], "exact-step-finish-stop")
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["artifact_state"], "readable")
+
+    def test_marker_only_malformed_handoff_and_wrong_session_are_rejected(self):
+        sid = "ses-native-probe"
+        for name, text in (
+            ("marker-only", "DISPATCH_GUARD_DONE"),
+            ("malformed", "artifact: report.md\nverdict: COMPLETE\nblocker: none"),
+        ):
+            with self.subTest(result=name):
+                log, _report, rows = self._terminal_log(sid, text)
+                result = inspect_terminal_attempt(
+                    log, worktree=self.worktree, artifact_root_metadata=self.artifact_root,
+                    artifact_binding={"attempt_id": "att-native-probe"})
+                self.assertEqual(result["state"], "invalid")
+                self.assertEqual(result["reason"], "malformed-handoff")
+                self.assertTrue(_terminal_session_matches(rows, sid))
+
+        handoff = f"artifact: {self.artifact_root / 'native-dispatch-handoff.md'}\nverdict: PASS\nblocker: none"
+        log, _report, rows = self._terminal_log(sid, handoff, terminal_sid="ses-other")
+        result = inspect_terminal_attempt(
+            log, worktree=self.worktree, artifact_root_metadata=self.artifact_root,
+            artifact_binding={"attempt_id": "att-native-probe"})
+        self.assertEqual(result["state"], "valid")
+        self.assertFalse(_terminal_session_matches(rows, sid))
 
 
 if __name__ == "__main__":
