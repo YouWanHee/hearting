@@ -123,7 +123,11 @@ def _minimum_limits(*sources: Mapping[str, int | None]) -> dict[str, int | None]
 
 
 def _api_json(path: str, *, cwd: str, env: Mapping[str, str], command: str) -> object:
-    output = _run([command, "api", "GET", path], cwd=cwd, env=env)
+    # V2's normal API client attaches to the user's managed service. A client
+    # environment change cannot reconfigure that already-running process.
+    # Standalone gives this bounded config-resolution probe its own server
+    # initialized from the exact environment that will be passed to the worker.
+    output = _run([command, "api", "--standalone", "GET", path], cwd=cwd, env=env)
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
@@ -145,21 +149,6 @@ def _v2_location(payload: Mapping[str, object], *, cwd: str) -> str:
             f"OpenCode V2 API location {actual} differs from launch directory {expected}"
         )
     return actual
-
-
-def _v2_server_identity(*, cwd: str, env: Mapping[str, str], command: str) -> str:
-    info = _api_json("/api/info", cwd=cwd, env=env, command=command)
-    if not isinstance(info, dict):
-        raise OpenCodeContextError("OpenCode V2 server info is not an object")
-    version, pid, urls = info.get("version"), info.get("pid"), info.get("urls")
-    if (not isinstance(version, str) or type(pid) is not int or pid < 0
-            or not isinstance(urls, list) or not urls
-            or any(not isinstance(url, str) or not url for url in urls)):
-        raise OpenCodeContextError("OpenCode V2 server identity is incomplete")
-    # Do not put service URLs or other runtime details in receipts. The digest
-    # lets the before/after check prove it observed the same server process.
-    identity = json.dumps([version, pid, urls], ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _v2_model_info(payload: object, *, cwd: str, model: str | None = None) -> dict[str, object]:
@@ -214,13 +203,15 @@ def _v2_model_info(payload: object, *, cwd: str, model: str | None = None) -> di
 
 
 def _v2_snapshot(*, cwd: str, env: Mapping[str, str], command: str,
-                 model: str | None = None) -> tuple[dict[str, object], str]:
+                 model: str | None = None) -> dict[str, object]:
     path = "/api/model/default" if model is None else "/api/model"
     for attempt in range(2):
-        server = _v2_server_identity(cwd=cwd, env=env, command=command)
         payload = _api_json(path, cwd=cwd, env=env, command=command)
         try:
-            return _v2_model_info(payload, cwd=cwd, model=model), server
+            # Each `api --standalone` call owns a short-lived server process.
+            # This is evidence about resolution of this exact config/location,
+            # not a persistent server identity for a later `run` process.
+            return _v2_model_info(payload, cwd=cwd, model=model)
         except OpenCodeContextError as exc:
             first_snapshot = any(marker in str(exc) for marker in (
                 "default model is unavailable", "default model is malformed",
@@ -546,7 +537,7 @@ def prepare_launch_context(*, model: str, context_window: str | int,
         model_variant = model.partition("#")[2] if isinstance(model, str) else ""
         effective_variant = (variant if variant not in (None, "", "runtime-default")
                              else (model_variant or variant))
-        before_info, before_server = _v2_snapshot(
+        before_info = _v2_snapshot(
             cwd=cwd, env=env, command=native_command,
             model=None if model == "inherit" else model,
         )
@@ -559,12 +550,10 @@ def prepare_launch_context(*, model: str, context_window: str | int,
             provider_key="providers", provider_keys=("providers", "provider"),
         )
         final_env = {**env, "OPENCODE_CONFIG_CONTENT": updated}
-        after_info, after_server = _v2_snapshot(
+        after_info = _v2_snapshot(
             cwd=cwd, env=final_env, command=native_command,
             model=None if model == "inherit" else selected_model,
         )
-        if before_server != after_server:
-            raise OpenCodeContextError("OpenCode V2 server changed during model-limit verification")
         if ((before_info["providerID"], before_info["id"], before_info["modelID"])
                 != (after_info["providerID"], after_info["id"], after_info["modelID"])):
             raise OpenCodeContextError("OpenCode V2 selected model changed during context override")
@@ -590,8 +579,12 @@ def prepare_launch_context(*, model: str, context_window: str | int,
             "final_limits": final_limits,
             "compaction_policy": compaction,
             "runtime_version": runtime_version,
-            "native_application": "OPENCODE_CONFIG_CONTENT:providers-model-limit",
-            "server_identity": before_server,
+            "native_application": "standalone-api:OPENCODE_CONFIG_CONTENT:providers-model-limit",
+            "execution_mode": "standalone",
+            "runtime_target": "standalone-per-command",
+            # The probe and worker are separate private server processes. Do
+            # not bind a probe PID to the eventual worker receipt.
+            "server_identity": None,
             "location_identity": str(Path(cwd).resolve(strict=True)),
             "config_identity": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
         }

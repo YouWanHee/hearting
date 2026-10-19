@@ -1175,6 +1175,8 @@ def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> N
 
 
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
+    settings = args.resolved_model_settings
+    standalone = settings.get("context_window_execution_mode") == "standalone"
     if _supervised_owner(args):
         lease = (supervisor_lease_path(args.jobs_path, args.attempt_id) if args.attempt_id
                  else dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease")
@@ -1188,12 +1190,13 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         if route:
             cmd += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
         cmd += ["--opencode-agent", args.agent]
+        if standalone:
+            cmd.append("--opencode-standalone")
         if args.resolved_model_settings["source"] != "inherit":
             cmd += ["--model", args.resolved_model_settings["model"],
                     "--variant", args.resolved_model_settings["variant"]]
         return (" ".join(shlex.quote(x) for x in cmd)
                 + f" < {shlex.quote(str(prompt_path))} >> {shlex.quote(str(log_path))} 2>&1")
-    settings = args.resolved_model_settings
     title = ("hearting-worker-" + str(args.attempt_id)
              if opencode_runtime.is_v2() and getattr(args, "attempt_id", None) else None)
     cmd = opencode_runtime.run_argv(
@@ -1201,6 +1204,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         model=(settings["model"] if settings["source"] != "inherit" else None),
         variant=(settings["variant"] if settings["source"] != "inherit" else None),
         title=title,
+        standalone=standalone,
     )
     prompt_arg = f'"$(cat -- {shlex.quote(str(prompt_path))})"'
     return " ".join(shlex.quote(x) for x in cmd) + f" {prompt_arg} >> {shlex.quote(str(log_path))} 2>&1"
@@ -1726,6 +1730,14 @@ def main(argv: list[str]) -> int:
                 if args.command_attempt_id else f"{args.slug}.opencode.jsonl")
     log_path = log_dir / log_name
     args.log_path = log_path
+    if action == "start":
+        # V2 execution mode is selected at the existing command-construction
+        # boundary. The later context probe must confirm this mode before spawn.
+        v2_execution = opencode_runtime.is_v2()
+        args.resolved_model_settings["context_window_execution_mode"] = (
+            "standalone" if v2_execution else "shared-service")
+        args.resolved_model_settings["context_window_runtime_target"] = (
+            "standalone-per-command" if v2_execution else "shared-service")
     command = shell_command(args, prompt_path, log_path)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
@@ -1913,6 +1925,12 @@ def main(argv: list[str]) -> int:
                 cwd=args.worktree,
                 environ=dispatch_env,
             )
+            selected_mode = args.resolved_model_settings.get("context_window_execution_mode")
+            observed_mode = context_capture.get("execution_mode")
+            if observed_mode is not None and observed_mode != selected_mode:
+                raise opencode_context.OpenCodeContextError(
+                    "OpenCode runtime version changed between command selection and limit verification"
+                )
         except opencode_context.OpenCodeContextError as exc:
             annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": "never-launched"})
             cancel_governor_reservation(governor, governor_root, reservation_token)
@@ -1936,6 +1954,10 @@ def main(argv: list[str]) -> int:
             "context_window_native_variant": str(context_capture.get("variant") or "absent"),
             "context_window_native_application": str(
                 context_capture.get("native_application") or "unavailable"),
+            "context_window_execution_mode": str(
+                context_capture.get("execution_mode") or "shared-service"),
+            "context_window_runtime_target": str(
+                context_capture.get("runtime_target") or "shared-service"),
             "context_window_catalog_limit_context": limit_receipt(catalog_limits["context"]),
             "context_window_configured_limit_context": limit_receipt(configured_limits["context"]),
             "context_window_configured_limit_input": limit_receipt(configured_limits["input"]),
@@ -2072,7 +2094,8 @@ def main(argv: list[str]) -> int:
             args.resolved_model_settings.get("context_window", ""))
         for key in (
                 "context_window_native_model", "context_window_native_variant",
-                "context_window_native_application", "context_window_server_identity",
+                "context_window_native_application", "context_window_execution_mode",
+                "context_window_runtime_target", "context_window_server_identity",
                 "context_window_location_identity", "context_window_config_identity",
                 "context_window_applied_limit_context", "context_window_applied_limit_input",
                 "context_window_applied_limit_output", "context_window_final_limit_context",
@@ -2450,7 +2473,9 @@ def main(argv: list[str]) -> int:
     print(f"variant={settings['variant']}")
     print(f"context_window_requested={settings['context_window']}")
     print(f"context_window_source={settings['context_window_source']}")
-    print(f"context_window_native_application={settings.get('context_window_native_application', 'not-launched')}")
+    for key in ("context_window_native_application", "context_window_execution_mode",
+                "context_window_runtime_target"):
+        print(f"{key}={settings.get(key, 'not-launched')}")
     for key in ("context_window_native_model", "context_window_native_variant",
                 "context_window_server_identity", "context_window_location_identity",
                 "context_window_config_identity", "context_window_catalog_limit_context",

@@ -64,28 +64,38 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
             "AGENT_DISPATCH_OWNER_HARNESS": "claude",
             "AGENT_DISPATCH_PARENT_SESSION_ID": "session-test",
         }
-        self.server = {"version": "2.0.32", "pid": 841, "urls": ["http://127.0.0.1:4096"]}
         self.before = self._model(1000000, 500000, 16000)
-        self.after = self._model(800000, 500000, 16000)
 
     def _model(self, context, input_limit, output):
         return {"providerID": "fixture", "id": "model", "modelID": "provider-model",
                 "name": "Fixture", "status": "active", "enabled": True,
                 "limit": {"context": context, "input": input_limit, "output": output}}
 
-    def _responses(self, *, wrong_location=False):
-        location = str(self.root if wrong_location else self.worktree)
-        return [self.server,
-                {"location": {"directory": location}, "data": [self.before]},
-                self.server,
-                {"location": {"directory": location}, "data": [self.after]}]
-
-    def _invoke(self, *, wrong_location=False):
+    def _invoke(self, *, wrong_location=False, shared_stale=False):
         calls = []
 
-        def api(path, **kwargs):
-            calls.append((path, kwargs))
-            return self._responses(wrong_location=wrong_location)[len(calls) - 1]
+        def native_api(command, *, cwd, env):
+            calls.append((command, cwd, dict(env)))
+            location = str(self.root if wrong_location else self.worktree)
+            if shared_stale:
+                response = {"location": {"directory": location}, "data": [self.before]}
+                return json.dumps(response)
+            content = json.loads(env.get("OPENCODE_CONFIG_CONTENT") or "{}")
+            providers = content.get("providers")
+            provider = providers.get("fixture") if isinstance(providers, dict) else None
+            models = provider.get("models") if isinstance(provider, dict) else None
+            model = models.get("model") if isinstance(models, dict) else None
+            limits = model.get("limit") if isinstance(model, dict) else None
+            if "--standalone" in command and isinstance(limits, dict):
+                response_model = self._model(
+                    limits.get("context", self.before["limit"]["context"]),
+                    limits.get("input", self.before["limit"]["input"]),
+                    limits.get("output", self.before["limit"]["output"]),
+                )
+                response = {"location": {"directory": location}, "data": [response_model]}
+            else:
+                response = {"location": {"directory": location}, "data": [self.before]}
+            return json.dumps(response)
 
         argv = [
             "dispatch-headless.py", "--start", "--worktree", str(self.worktree),
@@ -97,7 +107,9 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         ]
         stream = __import__("io").StringIO()
         real_popen = subprocess.Popen
+        real_shell_command = DISPATCH.shell_command
         spawned = []
+        worker_commands = []
 
         def tracked_popen(*args, **kwargs):
             process = real_popen(*args, **kwargs)
@@ -117,17 +129,22 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
             args.managed_sealed_batch_id = "-"
             args.managed_sidecar_log = "-"
 
+        def capture_worker_command(args, prompt_path, log_path):
+            command = real_shell_command(args, prompt_path, log_path)
+            worker_commands.append(command)
+            return "true"
+
         patches = [
             mock.patch.object(DISPATCH, "resolve_artifact_root", return_value=str(self.artifacts)),
             mock.patch.object(DISPATCH, "check_runtime_projection", return_value=0),
-            mock.patch.object(DISPATCH, "shell_command", return_value="true"),
+            mock.patch.object(DISPATCH, "shell_command", side_effect=capture_worker_command),
             mock.patch.object(DISPATCH, "wait_governor_reservation_claim", return_value={}),
             mock.patch.object(DISPATCH, "launch_parent_completion_sidecar", side_effect=no_sidecar),
             mock.patch.object(DISPATCH, "wait_foreground", side_effect=wait),
             mock.patch.object(DISPATCH, "seal_foreground_result", return_value=object()),
             mock.patch.object(DISPATCH, "launch_reap_watch", return_value=4243),
             mock.patch.object(CONTEXT, "_installed_version", return_value="2.0.32"),
-            mock.patch.object(CONTEXT, "_api_json", side_effect=api),
+            mock.patch.object(CONTEXT, "_run", side_effect=native_api),
             mock.patch.object(DISPATCH.subprocess, "Popen", new=spawn),
         ]
         from contextlib import redirect_stdout
@@ -142,17 +159,18 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         for process in spawned:
             if process.poll() is None:
                 process.wait(timeout=10)
-        return result, stream.getvalue(), calls, spawn
+        return result, stream.getvalue(), calls, spawn, worker_commands
 
     def test_v2_cap_is_applied_to_worker_home_and_dispatch_reaches_spawn(self):
-        result, receipt, calls, spawn = self._invoke()
+        result, receipt, calls, spawn, worker_commands = self._invoke()
         self.assertEqual(result, 0, receipt)
         self.assertIn("child_spawned=1", receipt)
-        self.assertEqual([path for path, _kwargs in calls], [
-            "/api/info", "/api/model", "/api/info", "/api/model",
+        self.assertEqual([call[0][1:] for call in calls], [
+            ["api", "--standalone", "GET", "/api/model"],
+            ["api", "--standalone", "GET", "/api/model"],
         ])
-        before_config = json.loads(calls[1][1]["env"]["OPENCODE_CONFIG_CONTENT"])
-        final_config = json.loads(calls[3][1]["env"]["OPENCODE_CONFIG_CONTENT"])
+        before_config = json.loads(calls[0][2]["OPENCODE_CONFIG_CONTENT"])
+        final_config = json.loads(calls[1][2]["OPENCODE_CONFIG_CONTENT"])
         self.assertFalse(before_config["snapshot"])
         self.assertEqual(final_config["providers"]["fixture"]["models"]["model"]["limit"], {
             "context": 800000, "input": 500000, "output": 16000,
@@ -161,24 +179,61 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
                         if any("launch-fence.py" in str(arg) for arg in call.args[0])]
         self.assertEqual(len(launch_calls), 1)
         child_env = launch_calls[0].kwargs["env"]
-        self.assertEqual(child_env["OPENCODE_CONFIG_CONTENT"], calls[3][1]["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(child_env["OPENCODE_CONFIG_CONTENT"], calls[1][2]["OPENCODE_CONFIG_CONTENT"])
         self.assertNotIn("OPENCODE_DB", child_env)
         self.assertNotIn("OPENCODE_AUTH", child_env)
-        self.assertIn("context_window_native_application=OPENCODE_CONFIG_CONTENT:providers-model-limit",
+        self.assertEqual(len(worker_commands), 1)
+        self.assertIn("opencode run --standalone --format json", worker_commands[0])
+        self.assertIn("fixture/model#fast", worker_commands[0])
+        self.assertIn("context_window_native_application=standalone-api:OPENCODE_CONFIG_CONTENT:providers-model-limit",
                       receipt)
+        self.assertIn("context_window_execution_mode=standalone", receipt)
+        self.assertIn("context_window_runtime_target=standalone-per-command", receipt)
+        self.assertIn("context_window_server_identity=unavailable", receipt)
 
     def test_v2_wrong_location_fails_before_spawn_and_closes_attempt(self):
-        result, receipt, calls, spawn = self._invoke(wrong_location=True)
+        result, receipt, calls, spawn, worker_commands = self._invoke(wrong_location=True)
         self.assertEqual(result, 69, receipt)
         self.assertIn("reason=opencode-context-limit-unavailable", receipt)
         self.assertIn("child_spawned=0", receipt)
-        self.assertEqual([path for path, _kwargs in calls], ["/api/info", "/api/model"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--standalone", calls[0][0])
+        self.assertEqual(len(worker_commands), 1)
+        self.assertIn("--standalone", worker_commands[0])
         self.assertFalse(any(any("launch-fence.py" in str(arg) for arg in call.args[0])
                              for call in spawn.call_args_list))
         rows = self.jobs.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].split("\t")[1], "done")
         self.assertIn("launch_outcome=never-launched", rows[0])
+
+    def test_reused_shared_server_with_unchanged_model_fails_before_worker_spawn(self):
+        result, receipt, calls, spawn, worker_commands = self._invoke(shared_stale=True)
+        self.assertEqual(result, 69, receipt)
+        self.assertIn("reason=opencode-context-limit-unavailable", receipt)
+        self.assertIn("child_spawned=0", receipt)
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0][2]["OPENCODE_CONFIG_CONTENT"],
+                            calls[1][2]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(len(worker_commands), 1)
+        self.assertIn("--standalone", worker_commands[0])
+        self.assertFalse(any(any("launch-fence.py" in str(arg) for arg in call.args[0])
+                             for call in spawn.call_args_list))
+
+    def test_supervised_owner_command_carries_standalone_mode_and_selected_model(self):
+        args = types.SimpleNamespace(
+            jobs_path=str(self.jobs), attempt_id="att-owner-command",
+            worktree=str(self.worktree), agent="build", route_file=None,
+            route_id=None, route_hash=None, route_node=None, owner_route_binding=None,
+            dispatch_depth=1, worker_type="owner", intensity="quick",
+            resolved_model_settings={"source": "explicit", "model": "fixture/model",
+                                     "variant": "fast",
+                                     "context_window_execution_mode": "standalone"},
+        )
+        command = DISPATCH.shell_command(args, self.root / "prompt.txt", self.root / "log.txt")
+        self.assertIn("--opencode-standalone", command)
+        self.assertIn("--model fixture/model", command)
+        self.assertIn("--variant fast", command)
 
 
 if __name__ == "__main__":

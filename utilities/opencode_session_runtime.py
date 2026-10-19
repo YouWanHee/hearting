@@ -119,6 +119,7 @@ def command(args, session: str) -> list[str]:
         binary=binary, cwd=args.worktree,
         agent=getattr(args, "opencode_agent", "build"), model=args.model,
         variant=getattr(args, "variant", None), session=session or None,
+        standalone=bool(getattr(args, "opencode_standalone", False)),
         title=("hearting-worker-" + str(args.parent_attempt_id)
                if not session and opencode_runtime.is_v2(binary) else None),
     )

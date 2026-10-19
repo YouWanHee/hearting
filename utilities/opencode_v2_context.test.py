@@ -37,7 +37,6 @@ class OpenCodeV2ContextTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.cwd = Path(self.temp.name)
         self.location = {"directory": str(self.cwd)}
-        self.server = {"version": "2.0.32", "pid": 417, "urls": ["http://127.0.0.1:4096"]}
 
     def model_response(self, *rows):
         return {"location": self.location, "data": list(rows)}
@@ -62,10 +61,7 @@ class OpenCodeV2ContextTest(unittest.TestCase):
             "plugin": ["retained-plugin"],
             "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
         }
-        responses = [
-            self.server, self.model_response(selected),
-            self.server, self.model_response(applied),
-        ]
+        responses = [self.model_response(selected), self.model_response(applied)]
         with mock.patch.object(context, "_installed_version", return_value="v2.0.32"), \
                 mock.patch.object(context, "_api_json", side_effect=responses) as api:
             launch = context.prepare_launch_context(
@@ -75,7 +71,7 @@ class OpenCodeV2ContextTest(unittest.TestCase):
             )
 
         self.assertEqual([call.args[0] for call in api.call_args_list], [
-            "/api/info", "/api/model", "/api/info", "/api/model",
+            "/api/model", "/api/model",
         ])
         self.assertEqual(launch["model"], "fixture/friendly#quality")
         self.assertEqual(launch["variant"], "quality")
@@ -84,9 +80,12 @@ class OpenCodeV2ContextTest(unittest.TestCase):
         self.assertEqual(launch["native_limits"], {"context": 900000, "input": 700000, "output": 32000})
         self.assertEqual(launch["applied_limits"], {"context": 650000, "input": 500000, "output": 18000})
         self.assertEqual(launch["final_limits"], launch["applied_limits"])
-        self.assertEqual(launch["native_application"], "OPENCODE_CONFIG_CONTENT:providers-model-limit")
+        self.assertEqual(launch["native_application"],
+                         "standalone-api:OPENCODE_CONFIG_CONTENT:providers-model-limit")
+        self.assertEqual(launch["execution_mode"], "standalone")
+        self.assertEqual(launch["runtime_target"], "standalone-per-command")
+        self.assertIsNone(launch["server_identity"])
         self.assertEqual(launch["location_identity"], str(self.cwd))
-        self.assertEqual(len(launch["server_identity"]), 64)
         self.assertEqual(launch["config_identity"], hashlib.sha256(
             launch["config_content"].encode("utf-8")).hexdigest())
         result_config = json.loads(launch["config_content"])
@@ -110,8 +109,7 @@ class OpenCodeV2ContextTest(unittest.TestCase):
         config = {"model": "fixture/default", "providers": {"fixture": {
             "models": {"default": {"limit": {"context": 900000, "input": 500000,
                                                     "output": 32000}}}}}}
-        responses = [self.server, self.default_response(before),
-                     self.server, self.default_response(after)]
+        responses = [self.default_response(before), self.default_response(after)]
         with mock.patch.object(context, "_installed_version", return_value="2.0.32"), \
                 mock.patch.object(context, "_api_json", side_effect=responses):
             launch = context.prepare_launch_context(
@@ -146,9 +144,8 @@ class OpenCodeV2ContextTest(unittest.TestCase):
         after = model_info(context_limit=800000, input_limit=..., output_limit=8192)
         config = {"providers": {"fixture": {"models": {"catalog-name": {
             "limit": {"context": 900000, "output": 8192}}}}}}
-        responses = [self.server, self.model_response(),
-                     self.server, self.model_response(before),
-                     self.server, self.model_response(after)]
+        responses = [self.model_response(), self.model_response(before),
+                     self.model_response(after)]
         with mock.patch.object(context, "_installed_version", return_value="2.0.32"), \
                 mock.patch.object(context, "_api_json", side_effect=responses) as api:
             launch = context.prepare_launch_context(
@@ -156,40 +153,51 @@ class OpenCodeV2ContextTest(unittest.TestCase):
                 config_content=json.dumps(config), cwd=str(self.cwd), environ={},
                 command="opencode-fixture",
             )
-        self.assertEqual(api.call_count, 6)
+        self.assertEqual(api.call_count, 3)
         self.assertEqual(launch["variant"], "quality")
         self.assertEqual(launch["applied_limits"], {
             "context": 800000, "input": None, "output": 8192,
         })
 
-    def test_v2_rejects_wrong_location_and_server_change(self):
+    def test_v2_rejects_wrong_location(self):
         wrong_location = {"location": {"directory": str(self.cwd.parent)},
                           "data": [model_info()]}
         with self.assertRaisesRegex(context.OpenCodeContextError, "differs from launch directory"):
             context._v2_model_info(wrong_location, cwd=str(self.cwd), model="fixture/catalog-name")
 
+    def test_reused_shared_server_ignoring_client_environment_fails_closed(self):
         row = model_info(context_limit=900000)
-        capped = model_info(context_limit=800000)
+        unchanged = model_info(context_limit=900000)
         config = {"providers": {"fixture": {"models": {"catalog-name": {
             "limit": {"context": 900000, "output": 32000}}}}}}
-        responses = [self.server, self.model_response(row),
-                     {**self.server, "pid": self.server["pid"] + 1}, self.model_response(capped)]
+        responses = [self.model_response(row), self.model_response(unchanged)]
         with mock.patch.object(context, "_installed_version", return_value="2.0.32"), \
-                mock.patch.object(context, "_api_json", side_effect=responses):
-            with self.assertRaisesRegex(context.OpenCodeContextError, "server changed"):
+                mock.patch.object(context, "_api_json", side_effect=responses) as api:
+            with self.assertRaisesRegex(context.OpenCodeContextError, "exceeds applied cap"):
                 context.prepare_launch_context(
                     model="fixture/catalog-name", context_window="800000",
                     config_content=json.dumps(config), cwd=str(self.cwd), environ={},
                     command="opencode-fixture",
                 )
+        self.assertEqual(api.call_count, 2)
+        before_env = api.call_args_list[0].kwargs["env"]
+        after_env = api.call_args_list[1].kwargs["env"]
+        self.assertNotEqual(before_env["OPENCODE_CONFIG_CONTENT"],
+                            after_env["OPENCODE_CONFIG_CONTENT"])
+
+    def test_api_probe_uses_the_supported_standalone_native_target(self):
+        with mock.patch.object(context, "_run", return_value='{"location":{},"data":[]}') as run:
+            context._api_json("/api/model", cwd=str(self.cwd), env={}, command="opencode-fixture")
+        self.assertEqual(run.call_args.args[0], [
+            "opencode-fixture", "api", "--standalone", "GET", "/api/model",
+        ])
 
     def test_v2_rejects_a_final_api_limit_above_the_applied_cap(self):
         before = model_info(context_limit=900000, input_limit=600000, output_limit=16000)
         unchanged = model_info(context_limit=900000, input_limit=600000, output_limit=16000)
         config = {"providers": {"fixture": {"models": {"catalog-name": {
             "limit": {"context": 900000, "input": 600000, "output": 16000}}}}}}
-        responses = [self.server, self.model_response(before),
-                     self.server, self.model_response(unchanged)]
+        responses = [self.model_response(before), self.model_response(unchanged)]
         with mock.patch.object(context, "_installed_version", return_value="2.0.32"), \
                 mock.patch.object(context, "_api_json", side_effect=responses):
             with self.assertRaisesRegex(context.OpenCodeContextError, "exceeds applied cap"):
