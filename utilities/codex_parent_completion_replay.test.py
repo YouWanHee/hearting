@@ -293,6 +293,14 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         return self._fixture_tool_trace(
             fixture, sentinel or self.sentinel, include_action=True)
 
+    def _stored_report_fixture(self):
+        root = Path(__file__).resolve().parent / "fixtures" / "codex_parent_completion_replay"
+        facts = json.loads((root / "first-report-facts.json").read_text(encoding="utf-8"))
+        sentinel = facts["after"]["sentinel"]
+        fixture = replay._write_native_fixture(self.worktree, sentinel)
+        self.assertEqual(fixture["facts"]["report"], facts)
+        return root, facts, fixture, sentinel
+
     def _report_text(self, language="en", report=None, fixture=None):
         facts = (fixture or self.fixture)["facts"]["report"]
         values = facts["synthetic_values"]
@@ -902,6 +910,161 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertEqual(len(checks["artifact_read_evidence"]), 7)
         self.assertTrue(checks["verifier_script_unchanged"])
         self.assertTrue(checks["followthrough_script_unchanged"])
+
+    def test_saved_original_first_report_is_positive_with_independent_facts(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-positive.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "253c30c510e0ffc6b0c382b841b12d7a3557bdd0a53c27fce3968eb8675a0aab")
+        report = report_bytes.decode("utf-8")
+        self.assertEqual(replay._factual_report_object(report), facts)
+        checks = replay._first_report_checks(
+            report, self._fixture_tool_trace(fixture, sentinel), fixture)
+        for key in ("report_matches_fixture_facts", "report_has_substantive_closing_prose",
+                    "every_exact_artifact_was_read", "fixture_verifier_passed_in_native_tool_trace",
+                    "one_approved_followthrough_tool_invocation",
+                    "followthrough_state_matches_one_time_fixture_action"):
+            self.assertTrue(checks[key], key)
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_saved_previous_short_report_remains_negative_with_valid_facts(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-negative.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "cf8d6b7ef114cf9e137d43c7f4fcc9875b99e8ec8d919d94bf82f82767a108c3")
+        report = report_bytes.decode("utf-8")
+        tools = self._fixture_tool_trace(fixture, sentinel)
+        checks = replay._first_report_checks(report, tools, fixture)
+        self.assertIsNone(replay._factual_report_object(report))
+        self.assertFalse(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        with_valid_facts = (report.rstrip() + "\nFACTUAL_REPORT_JSON:\n"
+                            + json.dumps(facts, ensure_ascii=False))
+        checks = replay._first_report_checks(with_valid_facts, tools, fixture)
+        self.assertTrue(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+        self.assertFalse(checks["prose_content_checks"]["names_actual_synthetic_values"])
+
+    def test_factual_report_accepts_plain_or_fenced_json_and_rejects_invalid_payloads(self):
+        facts = self.fixture["facts"]["report"]
+        plain = "FACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False)
+        fenced = "FACTUAL_REPORT_JSON:\n```json\n" + json.dumps(facts, indent=2) + "\n```\n"
+        bare_fence = "FACTUAL_REPORT_JSON:\n```\n" + json.dumps(facts) + "\n```"
+        for text in (plain, fenced, bare_fence):
+            with self.subTest(text=text[:40]):
+                self.assertEqual(replay._factual_report_object(text), facts)
+        for payload in ("```json\n{\n```", "```json\n{}", "[1, 2]", "null", "{} trailing"):
+            with self.subTest(payload=payload):
+                self.assertIsNone(replay._factual_report_object(
+                    "FACTUAL_REPORT_JSON:\n" + payload))
+
+    def test_natural_labels_and_unadorned_identifiers_are_accepted(self):
+        facts = self.fixture["facts"]["report"]
+        values = facts["synthetic_values"]
+        identifiers = {key: replay._expected_identifier(key, value)
+                       for key, value in values.items()}
+        prose = (
+            "I completed the approved follow-through to finish the isolated parent replay.\n"
+            "Before the action, no follow-through file existed and the action count was zero.\n"
+            "After the action, the follow-through file exists and the action count is one.\n"
+            "Verification passed all six checks with zero failures.\n"
+            f"Synthetic commit: `{identifiers['commit']}`.\n"
+            f"Synthetic deployment: `{identifiers['deployment']}`.\n"
+            f"Synthetic serving: `{identifiers['serving']}` (not probed).\n"
+            "Production deployment and serving checks were skipped.\n"
+            "No production operating state was changed or measured.\n"
+            "This isolated Codex replay tests delivery and reporting only."
+        )
+        report = prose + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False)
+        checks = replay._first_report_checks(report, self._valid_tool_trace(), self.fixture)
+        self.assertTrue(checks["report_has_substantive_closing_prose"])
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_identifier_negation_mutation_and_reversed_states_are_rejected(self):
+        facts = self.fixture["facts"]["report"]
+        tools = self._valid_tool_trace()
+        values = facts["synthetic_values"]
+        deployment_id = replay._expected_identifier("deployment", values["deployment"])
+        baseline = self._report_text()
+
+        wrong_id = baseline.replace(deployment_id, deployment_id + "-wrong", 1)
+        checks = replay._first_report_checks(wrong_id, tools, self.fixture)
+        self.assertTrue(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["synthetic_value_checks"]["deployment"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        negated_id = baseline.replace(
+            f"deployment value is {values['deployment']}",
+            f"deployment value is not {values['deployment']}", 1)
+        checks = replay._first_report_checks(negated_id, tools, self.fixture)
+        self.assertFalse(checks["synthetic_value_checks"]["deployment"])
+
+        reversed_states = baseline.replace(
+            "the follow-through file was absent", "the follow-through file was present", 1).replace(
+            "the file was present and", "the file was absent and", 1)
+        self.assertNotEqual(reversed_states, baseline)
+        checks = replay._first_report_checks(reversed_states, tools, self.fixture)
+        self.assertFalse(checks["prose_content_checks"]["describes_before_state_and_zero_actions"])
+
+        negated_verification = baseline.replace(
+            "passed all six checks", "did not pass all six checks", 1)
+        checks = replay._first_report_checks(negated_verification, tools, self.fixture)
+        self.assertFalse(checks["prose_content_checks"]["reports_six_check_verification_result"])
+
+    def test_content_mutations_fail_while_valid_json_and_tool_evidence_stay_intact(self):
+        tools = self._valid_tool_trace()
+        values = self.fixture["facts"]["report"]["synthetic_values"]
+        ids = {key: replay._expected_identifier(key, value) for key, value in values.items()}
+        text = self._report_text().split("\nFACTUAL_REPORT_JSON:\n", 1)[0]
+        ko = self._report_text(language="ko").split("\nFACTUAL_REPORT_JSON:\n", 1)[0]
+        swap = text.replace(ids["commit"], "@@").replace(ids["deployment"], ids["commit"]).replace(
+            "@@", ids["deployment"])
+        cases = (
+            ("commit missing", text.replace(ids["commit"], "unknown"), "names_actual_synthetic_values"),
+            ("commit longer fake", text.replace(ids["commit"], ids["commit"] + "x"),
+             "names_actual_synthetic_values"),
+            ("roles swapped", swap, "names_actual_synthetic_values"),
+            ("serving negated", text.replace("serving value is", "serving value is not"),
+             "names_actual_synthetic_values"),
+            ("ko deployment wrong", ko.replace(ids["deployment"], ids["deployment"] + "9"),
+             "names_actual_synthetic_values"),
+            ("reason missing", text.replace("I completed the already approved isolated parent "
+                                            "follow-through after reading the exact result. ", ""),
+             "explains_fixture_reason"),
+            ("before/after missing", text.replace("Before the action", "Earlier").replace(
+                "after the action", "later").replace("the follow-through file was absent and", "x"),
+             "describes_before_state_and_zero_actions"),
+            ("count reversed", text.replace("count was 0", "count was 1", 1).replace(
+                "count was 1.", "count was 0.", 1), "describes_before_state_and_zero_actions"),
+            ("verification failed", text.replace("passed all six checks with 0 failed",
+                                                 "failed 2 of six checks"),
+             "reports_six_check_verification_result"),
+            ("skip missing", text.replace("Production deployment and serving checks were skipped. ", ""),
+             "states_fixture_skip_and_operating_limit"),
+            ("production changed", text.replace("was changed or measured", "was changed and measured")
+             .replace("No production endpoint", "A production endpoint"),
+             "states_fixture_skip_and_operating_limit"),
+            ("scope limit missing", text.replace("This isolated Codex replay tests delivery and "
+                                                 "reporting only.", ""),
+             "states_isolated_replay_scope_limit"),
+        )
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        json_tail = marker + json.dumps(self.fixture["facts"]["report"], ensure_ascii=False)
+        for name, mutated, key in cases:
+            with self.subTest(name):
+                self.assertNotEqual(mutated, text if "ko" not in name else ko)
+                mutated = mutated + json_tail
+                checks = replay._first_report_checks(mutated, tools, self.fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["every_exact_artifact_was_read"])
+                self.assertFalse(checks["report_has_substantive_closing_prose"])
+                failed = [k for k, v in {**checks["prose_content_checks"],
+                                         **{f"id_{k}": v for k, v in
+                                            checks["synthetic_value_checks"].items()}}.items() if not v]
+                self.assertTrue(failed, name)
 
     def test_keyword_presence_cannot_substitute_for_factual_values_or_action_trace(self):
         tools = self._valid_tool_trace()
