@@ -99,9 +99,9 @@ external-facing; otherwise present the five-field card in §0.4 before
 material work unless scope and route are already approved — deliver it
 through `AskUserQuestion` (five fields as the question body, options
 진행(권장)/수정/중단; plain-text card only as fallback) — and close material
-work with the five-field completion card in §0.5. Load full capability detail
-only in the acting owner or worker; spec work retains spec-read
-gate.
+work with the first-report content required by §0.5; its card is optional.
+Load full capability detail only in the acting owner or worker; spec work
+retains spec-read gate.
 
 For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-depth-1
 owner, and `standard+` follows `code-plan -> code-execute -> code-test ->

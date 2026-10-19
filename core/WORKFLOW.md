@@ -730,10 +730,10 @@ approval; an absent answer stays absent.
 
 ### 0.5. Post-Execution Completion Report
 
-After a material-work attempt, the user-facing main agent closes the flow with
-a fully populated five-field report card. Render labels in the user's
-communication language while preserving these five fields and this order. In
-Korean, the canonical card is:
+After a material-work attempt, the user-facing main agent's first close follows
+the content contract below. A five-field card can present that content when it
+fits; neither the card nor its field order is required. Render any labels in the
+user's communication language. In Korean, one optional card is:
 
 ```text
 [완료 보고]
@@ -745,17 +745,19 @@ Korean, the canonical card is:
 남은 사항: <미완료 항목, 위험, 차단 요인 또는 없음>
 ```
 
-Keep the five fields and their order. Values may use a short connected explanation
-or compact bullets when a single line would hide evidence. `결과` names the honest outcome status —
-completed, partial, failed, or blocked, localized for the audience — and must
-not present partial, failed, or blocked work as completed. Use `없음` (or its
-audience-language equivalent) when there is no artifact or remaining item.
+When using this card, values may use a short connected explanation or compact
+bullets when a single line would hide evidence. `결과` names the honest outcome
+status — completed, partial, failed, or blocked, localized for the audience —
+and must not present partial, failed, or blocked work as completed. Use `없음`
+(or its audience-language equivalent) when there is no artifact or remaining item.
 In `작업` and `남은 사항`, retain the source description and any comparison condition needed to identify the target; append its original number as a reference. Report a completion condition using its existing `text`, with its internal ID only where traceability helps. For example: “2명 고정·다중 참조·드롭아웃 없는 모델(E2 best48) 검증 완료; 0~3명 가변·참조 드롭아웃 FT 모델(var03 FT LAST3)은 평가 중단, checkpoint 재개 확인 필요.”
 
 For the first close of material work, explain what changed and why, the observed
 before/after, the checks actually run (including reused, skipped, and unrun
 checks), the applicable commit/PR/deployment/serving state, and limits or work
-that remains. Deployment and operating claims require observed evidence.
+that remains. Preserve explicit user-requested content and output formats even
+when they differ from the default presentation. Deployment and operating claims
+require observed evidence.
 Writing a report file does not by itself complete the user-facing report.
 
 If any review gate of the work closed without an independent reviewer's PASS —
