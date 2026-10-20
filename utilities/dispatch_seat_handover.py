@@ -904,10 +904,6 @@ def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
     If the handover snapshot cannot be read, ``effective_parent`` deliberately
     falls back to the registered parent, preserving the existing safe default.
 
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/occupant-invalidator.ts and
-    packages/daemon/src/domain/seat-delivery-guard.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     if not session:
         return False

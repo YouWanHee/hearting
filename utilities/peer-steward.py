@@ -7468,9 +7468,6 @@ def _continue_claude_prompt(target, pane, sid, ref, text):
     typed, so leaving the ref for the hook leaves the window empty. The guards are the
     idle Claude prompt path of `cmd_prompt`; any refusal keeps the ref pending for the
     hook. A sent ref is never released, so the hook cannot deliver it a second time.
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/session-transport.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     reason, proof = _claude_idle_prompt_guard(target, sid, pane)
     if reason:

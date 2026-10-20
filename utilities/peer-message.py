@@ -768,9 +768,6 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
 def reserve_pending_first_input(ref, recipient, process_proof, *, claimant=None):
     """Reserve one guarded first-turn submission without marking it sent.
 
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     if (not isinstance(recipient, dict)
             or recipient.get("harness") not in ("claude", "codex", "opencode")
@@ -1219,9 +1216,6 @@ def reserve_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
     unverified/inflight. An ambiguous send preserves the payload for actual
     receiver acknowledgement rather than blindly typing it a second time.
 
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     if not _valid_transfer_endpoint(recipient):
         return None
@@ -1263,10 +1257,6 @@ def reserve_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
 def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
     """Mark an exact reserved pending transfer unverified immediately before I/O.
 
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/seat-delivery-guard.ts and
-    packages/daemon/src/domain/session-transport.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     if not isinstance(row, dict) or not isinstance(row.get("rpc_claim"), dict):
         return None
@@ -1346,9 +1336,6 @@ def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitt
 def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
     """Release this exact pending claim only before the external write.
 
-    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
-    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
-    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     with pending_lock(row["ref"]):
         current = _read_pending(row["ref"])
