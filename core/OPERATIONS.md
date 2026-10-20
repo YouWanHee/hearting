@@ -1125,7 +1125,9 @@ spawned a child, and every steward line that reports an armed watch, ends with
 `parent_next=end-turn` (a runtime carrier owns the wake — end the turn, start no
 wait, poll, re-arm, or recap) or `parent_next=bounded-wait` with the exact bounded
 `parent_next_command` to run once. An absent directive is not `end-turn`; never
-filter launch stdout. Completion names the next authorized action; normal success
+filter launch stdout. `parent_next` names the reader's next action; a watch wake
+is observation, not a stage result (§5.14 S3). Completion names the next authorized
+action; normal success
 requires no harvest. For new registered owners, the completion controller also
 closes the workflow and route and finalizes the exact cycle (its completion record).
 For completed official specs, that path invokes checked shared admission with
@@ -1174,6 +1176,68 @@ handoff and quiescent children reports completed work. A missing or stale progre
 ledger does not overturn those settled facts. Parent delivery facts remain
 information beside the completion; unfinished settlement or publication still
 reports its own obligation.
+
+`capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
+file to inspect) targets only a registered dispatch-depth-1 owner attempt (else
+`correction-target-not-owner`). Any session can send it; `correction_source_session`
+records the sender without checking it. The runtime supervisor delivers it; only
+launching a replacement owner is parent-only (below).
+The exact attempt binds one durable input receipt; repeating
+a request ID returns that receipt. Every registered dispatch-depth-1 owner —
+quick and solo as well as standard+ — runs under its harness supervisor, so the
+same command reaches all of them. Registration opens the input channel: a
+correction sent after `--register` and before the first consumer attaches is
+queued and handed to the first turn (a relaunch of a never-claimed row keeps
+that queue). Codex uses its existing App Server connection to steer an active
+turn; Claude and OpenCode retain the input for the next turn of the same
+session. Pending input takes precedence over automatic stage advancement and
+terminal closure. A transport receipt proves delivery, not implementation; an
+interrupted send remains unknown (`delivery-unknown`) and is handed back through
+the existing supervision notice carrier. A host whose supervisor probe does not
+report support runs the owner as the existing one-shot, creates no input state,
+and `correct` reports `owner-input-unsupported` before queueing; an owner
+already running under an older supervisor behaves the same way.
+An interrupted launched supervisor with no terminal event also accepts the existing
+`correct` request once its owner execution and unregistered children are quiescent.
+Registered resource/compute payloads stay under their existing run records when
+the owner is replaced; their survival is not surviving owner execution. The
+shared parent-close classification separates them, with exact route/attempt
+binding and complete observation of the remaining process set. Recovery context
+passes their record locations to the new owner without relaunching or editing
+them. This is an answered continuation on the same route: keep the
+original failure, completed stages, permissions and review budgets. A valid
+terminal result, cancellation or unknown execution retains its existing path.
+Resource registration settles a positively observed previous-boot execution as
+retryable failure even when power loss left no exit sentinel. The same observation
+admits its successor while preserving logs, checkpoints and settled results; a
+missing sentinel or stale PID alone grants no such admission.
+
+An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
+approved fix, keeps the answer (`retained`), and `correct`
+continues its route in the same call through a replacement owner that receives it
+(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
+round-capped check continues once for each exact approved answer;
+absence of a failed check does not refuse the kept correction. Unresolved failed checks
+retain their closure-check ceiling, including refusal when that ceiling is spent.
+No check or extra verdict round is manufactured for an infrastructure correction.
+When the answer comes from a session
+that is not the route's parent, only the parent may launch that replacement: the
+answer stays kept and the parent receives one `answer-awaiting-parent` supervision
+notice. The parent's carrier that delivers it (the shared prompt sweep or the
+Claude rewake) starts the route once under that session's identity
+(`dispatch_supervision.continue_for_parent`) and the notice says so; only when
+nothing could be started does it name the route's start command. Other ended owners still report
+`owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
+follows the replacement lineage to the owner doing the work now.
+Corrections preserve route, completion and cleanup evidence; completed-prefix
+reuse uses the existing `continuation` compiler rather than a fresh recipe.
+
+Newly compiled owner continuation budgets use one finite workload formula that
+accounts for declared nodes, unique retry boundaries, the review-round cap and
+terminal nodes. The separate workload floor applies only to newly derived
+budgets; valid older sealed budgets remain valid. The reserved continuation is
+for terminal handoff after ordinary work is exhausted and does not itself
+guarantee an unfinished report node.
 
 ### §5.10b. Frame — Launch, Join, Interview
 
@@ -1999,69 +2063,23 @@ naming the launching attempt.
 
 ### §5.14. Peer-Session Steering (steward role)
 
-Registered owner corrections belong to the execution supervisor, through
-`capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
-file to inspect). The exact attempt binds one durable input receipt; repeating
-a request ID returns that receipt. Every registered dispatch-depth-1 owner —
-quick and solo as well as standard+ — runs under its harness supervisor, so the
-same command reaches all of them. Registration opens the input channel: a
-correction sent after `--register` and before the first consumer attaches is
-queued and handed to the first turn (a relaunch of a never-claimed row keeps
-that queue). Codex uses its existing App Server connection to steer an active
-turn; Claude and OpenCode retain the input for the next turn of the same
-session. Pending input takes precedence over automatic stage advancement and
-terminal closure. A transport receipt proves delivery, not implementation; an
-interrupted send remains unknown (`delivery-unknown`) and is handed back through
-the existing supervision notice carrier. A host whose supervisor probe does not
-report support runs the owner as the existing one-shot, creates no input state,
-and `correct` reports `owner-input-unsupported` before queueing; an owner
-already running under an older supervisor behaves the same way.
-An interrupted launched supervisor with no terminal event also accepts the existing
-`correct` request once its owner execution and unregistered children are quiescent.
-Registered resource/compute payloads stay under their existing run records when
-the owner is replaced; their survival is not surviving owner execution. The
-shared parent-close classification separates them, with exact route/attempt
-binding and complete observation of the remaining process set. Recovery context
-passes their record locations to the new owner without relaunching or editing
-them. This is an answered continuation on the same route: keep the
-original failure, completed stages, permissions and review budgets. A valid
-terminal result, cancellation or unknown execution retains its existing path.
-Resource registration settles a positively observed previous-boot execution as
-retryable failure even when power loss left no exit sentinel. The same observation
-admits its successor while preserving logs, checkpoints and settled results; a
-missing sentinel or stale PID alone grants no such admission.
+A steward is informally depth −1; not a dispatch depth: the stewarding
+session is an ordinary dispatch depth 0 session, like the peers it addresses. This role
+carries no launch, gate, write, or approval authority over the session it addresses — its
+peer messages are advisory context between two already-running sessions, and the
+append-only ledger below is the only record of them (SD-122 §13.37.2-(1)).
 
-An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
-approved fix, keeps the answer (`retained`), and `correct`
-continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
-round-capped check continues once for each exact approved answer;
-absence of a failed check does not refuse the kept correction. Unresolved failed checks
-retain their closure-check ceiling, including refusal when that ceiling is spent.
-No check or extra verdict round is manufactured for an infrastructure correction.
-When the answer comes from a session
-that is not the route's parent, only the parent may launch that replacement: the
-answer stays kept and the parent receives one `answer-awaiting-parent` supervision
-notice. The parent's carrier that delivers it (the shared prompt sweep or the
-Claude rewake) starts the route once under that session's identity
-(`dispatch_supervision.continue_for_parent`) and the notice says so; only when
-nothing could be started does it name the route's start command. Other ended owners still report
-`owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
-follows the replacement lineage to the owner doing the work now.
-Corrections preserve route, completion and cleanup evidence; completed-prefix
-reuse uses the existing `continuation` compiler rather than a fresh recipe.
+| Question | Existing identifier |
+|---|---|
+| Who talks with the user? | any dispatch depth 0 session: main, peer or steward (elsewhere also "supervisor"). |
+| Who runs the route? | its dispatch depth 1 `owner`, which coordinates dispatch depth 2 stages. |
+| Who keeps the owner alive and carries its input and results? | the runtime supervisor, a process rather than a session (§5.10a, §5.12). |
+| Who receives the result now? | the single `effective_parent`: the registered parent, or the last confirmed same-seat successor after a handover. |
+| Who only observes? | a `watch` holder (Fleet ⚑ shows the steward relation); observation settles no stage result (S3). |
+| Who approves? | the person; the session that received the answer writes the release/approval record (S5). |
+| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor, a separate check from row 4; sending `correct` is not parent-only (§5.10a). |
 
-Newly compiled owner continuation budgets use one finite workload formula that
-accounts for declared nodes, unique retry boundaries, the review-round cap and
-terminal nodes. The separate workload floor applies only to newly derived
-budgets; valid older sealed budgets remain valid. The reserved continuation is
-for terminal handoff after ordinary work is exhausted and does not itself
-guarantee an unfinished report node.
-
-A steward is informally depth −1; not a dispatch depth. This role carries no launch,
-gate, write, or approval authority over the session it addresses — its peer messages are
-advisory context between two already-running sessions, and the append-only ledger below
-is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the role:
+Six invariants govern the role:
 
 An already valid steward relation follows a confirmed same-seat session handover through
 the existing seat ledger. The ledger preserves the original explicit/watch/start evidence,
@@ -2179,7 +2197,8 @@ missing or disposed records and unsupported dead Claude/Codex identity remain
 unknown. Native source availability is not inferred from a label or saved SID.
 Replacement admission and lineage use that same parent judgment: a depth-1
 replacement may be launched by the registered parent or its ledger-confirmed
-successor. Parent attempt bindings remain exact, as do route, node, depth,
+successor. This parent judgment (`route_authority.owns`) is separate from result
+delivery, which follows the single `effective_parent`. Parent attempt bindings remain exact, as do route, node, depth,
 sub-session and input digests. A changed parent label on a depth-1 node replay
 is accepted only for that same parent; depth-2 parent bindings stay exact.
 The launch input follows the confirmed parent's session, harness and ordinary
@@ -2423,28 +2442,28 @@ Git common directories (so linked worktrees count as the same repository) from
 existing session metadata. Unknown or foreign repository targets grant no role,
 connector or pink tag; cross-repository messages remain communication (`✉`).
 No new role probe or execution authority follows from this projection. Fleet
-reads one supervisor per target: the newest same-repository start/watch/explicit
+reads one steward per target: the newest same-repository start/watch/explicit
 evidence wins, with a stable identity tie-break. A session's watch of the
-same-repository supervisor that started it is reply-wait communication, not
-supervisor-role evidence. The common lookup excludes that reverse watch after
+same-repository steward that started it is reply-wait communication, not
+steward-role evidence. The common lookup excludes that reverse watch after
 resolving the start's exact/name/alias identities; the watch record and its actual
 wait/wake behavior stay intact. Each target entry retains its first `start_ts`
 through later watch/explicit updates and name-only-to-SID completion, so the
 common lookup can still identify the launcher after the latest evidence changes.
 Existing `source=start` entries remain readable without migration.
 Sessions with their own winning
-targets form separate supervisor groups; supervisor-to-supervisor relations
+targets form separate steward groups; steward-to-steward relations
 remain communication (`✉`). This shared projection is a display handover, not a
-refusal or marker rewrite. Supervisor groups share one connector column under
+refusal or marker rewrite. Steward groups share one connector column under
 the first character inside `[id]`, drawn as a dashed `┆` on every row rather than
 a box border. Session detail text and box left edges clear that
 column by two spaces, even without a connector; model, routing, NOW and box
-right-edge anchors stay fixed. The supervisor flag appears once on the first row
+right-edge anchors stay fixed. The steward flag appears once on the first row
 below its ID, in the connector column; subsequent rows use `┆`. The connector
 continues through the last visible target's first existing detail row, including
 when both cards are short; it does not cover an identity chip or create a blank
 row just to extend the line. Hidden, folded, cross-repository, and other-group
-targets remain unconnected. A supervisor with no visible target keeps only that
+targets remain unconnected. A steward with no visible target keeps only that
 flag. Idle process view remains limited to observed route or process work,
 independently of steward flags. Resource-waiting owners share a NOW projection across harnesses with
 the exact resource's node and command, observed host/GPU, declared counters
@@ -2533,7 +2552,7 @@ detached watch receipt plus the adapter wake (the watching side reads screen/dis
 directly); `SendMessage` is secondary.
 
 **Detached watch (model-visible).** `peer-steward.py watch <target>` returns one typed
-`state=armed` line carrying the same `parent_next` directive a launch receipt does.
+`state=armed` line carrying the next-action field `parent_next` (§5.10a).
 The exact server/pane/session obligation remains stored when a bounded observer
 times out, loses herdr, or exits; the existing startup/reconnect path replaces
 only that observer and continues the same watch id. `join`/`status`/`ack` report
@@ -2561,9 +2580,7 @@ Peer-message holds and expiries are permission-mode effects on **both** ends:
 sender expires; and a receiving session that is not in bypass mode holds an inbound peer message for
 its own user's approval before its Claude sees it. A running session cannot be raised to bypass (the
 shift+tab cycle has no bypass step), so the launch-time flag is the only deterministic point —
-`peer-steward.py start` applies it. A stewarding session dispatches registered work from its own
-session by default; an interactive child session is reserved for long-running work that needs human
-answers or recovery.
+`peer-steward.py start` applies it.
 
 Probes P-1 through P-5 (Codex `queue` reachability, managed-gateway reachability, gateway
 `steer` single-ingress, idle republish, OpenCode message queue) are closed by decision:

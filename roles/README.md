@@ -68,13 +68,8 @@ the shared dispatch selector own current provider/account/model availability;
 they apply that evidence before automatic ranking while preserving an explicit
 pin and its native failure.
 
-The peer-steward is an advisory session role, outside the delegation catalog. An
-existing role and unresolved watch may follow only a confirmed same-seat successor
-through the common seat ledger. The original evidence generation, exact target and
-watch identity stay attached to that lineage; current responsibility follows its
-confirmed holder. Registered execution and delivery identities stay unchanged.
-Messages, cards, registered work and display aliases do not create a role. Release
-revokes its exact role generation and does not erase an unresolved watch duty.
+The peer-steward is an advisory session role outside the delegation catalog.
+`core/OPERATIONS.md §5.14` defines its relations, same-seat succession and watch duties.
 
 ## Behavior Contract (separate from the role catalog)
 

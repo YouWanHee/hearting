@@ -931,8 +931,8 @@ finishes. Delivery does not restrict the owner's tools or prove stage success;
 launch dependencies, write authorization and terminal cleanup scopes own those
 decisions. Repeating a notification cannot declare the owner abandoned.
 
-A steward's idle-notify subscription is observation, not a continuation; it never
-satisfies the registered-continuation obligation below (`core/OPERATIONS.md §5.14`).
+A steward's idle-notify subscription is observation, not a continuation; the
+registered-continuation obligation below still applies (`core/OPERATIONS.md §5.14`).
 
 This section is capability-independent. `autopilot-lab`, `autopilot-code`,
 `autopilot-ship`, spec/research, CI and GitHub check cycles, external-state
