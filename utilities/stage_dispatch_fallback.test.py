@@ -782,7 +782,7 @@ class FallbackTest(unittest.TestCase):
                       command[command.index("--parent-harness")+1],command[command.index("--parent-sandbox")+1]))
   self.assertEqual(len(set(consumers)),1)
   self.assertEqual((primary/"x").read_text(),"uncommitted\n")
- def route(self,native="unsupported",same_status="unsupported",intensity="strong"):
+ def route(self,native="unsupported",same_status="unsupported",intensity="strong",tuples=None):
   """Compile the fixture route under the SAME runtime root the launch uses.
 
   `launch_compatibility_tuple` seals the runtime root, the artifact root and
@@ -800,7 +800,7 @@ class FallbackTest(unittest.TestCase):
   live registry -- runtime-owned state -- at all.
   """
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
-  evidence={"tuples":[self.tuple("codex",same_status),self.tuple("claude","supported")],"native_subagent":[{
+  evidence={"tuples":tuples or [self.tuple("codex",same_status),self.tuple("claude","supported")],"native_subagent":[{
    "harness":"codex","transport":"headless",
    "execution_surface":"codex-native-subagent","registered_worker":False,
    "status":native,"check_source":"fixture"}]}
@@ -2577,6 +2577,44 @@ class FallbackTest(unittest.TestCase):
     with self.subTest(route=sorted(route.get("selection_pins",{}))):
      _hops,other=F.ordered_fallback_hops(route,node,self.jobs)
      self.assertEqual(other["rank"][0],"opencode")
+ def test_a_sealed_worker_pin_is_not_moved_by_automatic_model_eligibility(self):
+  # Provider/model eligibility filters automatic placement only. A sealed pin
+  # keeps today's harness-level usage check; its launcher refuses only a
+  # confirmed rejection and reports the provider's own error.
+  node={**self._pinned_balanced_node(),"model_profile":"deep"}
+  hold="limited(provider-model-unverified:openai-provider-model-unverified)"
+  def states(jobs,profile=None,recheck=False):
+   return {"claude":"ok","codex":"ok","opencode":hold if profile else "ok"}
+  with mock.patch.object(F,"_usage_states",side_effect=states), \
+      mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+       "claude":50,"codex":50,"opencode":50}):
+   hops,context=F.ordered_fallback_hops(self._pinned_balanced_route(pin="opencode"),node,self.jobs)
+   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
+   self.assertEqual(context["limited"],[])
+   _hops,unpinned=F.ordered_fallback_hops(self._pinned_balanced_route(pin=None),node,self.jobs)
+   self.assertEqual(unpinned["limited"],["opencode"])
+ def test_provider_model_hold_skips_an_opencode_candidate_at_launch(self):
+  # The allocation rank reads the hold once; the launch loop reads it again
+  # per candidate, so a compiled order without an allocation policy cannot
+  # launch an OpenCode model that automatic placement may not select.
+  import dispatch_capacity_evidence as CE
+  hold="limited(provider-model-unverified:openai-provider-model-unverified)"
+  with self.dispatch_env():
+   path=self.route(tuples=[self.tuple("codex","unsupported"),self.tuple("claude","unsupported"),
+                           self.tuple("opencode","supported")])
+   route=json.loads(path.read_text(encoding="utf-8"))
+   del route["dispatch_allocation"]
+   route["route_hash"]=R.route_hash(route)
+   route["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+   path.write_text(json.dumps(route),encoding="utf-8")
+   for held in (True,False):
+    with self.subTest(held=held), mock.patch.object(
+        CE,"model_hold",side_effect=lambda harness,profile,**_: hold if held and harness=="opencode" else None):
+     out=io.StringIO()
+     with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()):
+      self.run_inline_main(path)
+     trace=next(line for line in out.getvalue().splitlines() if line.startswith("attempt_trace="))
+     self.assertEqual(f"opencode/conductor:skipped-usage-{hold}" in trace,held,trace)
  def test_a_sealed_worker_pin_that_is_at_its_limit_goes_to_the_tail_as_today(self):
   node=self._pinned_balanced_node()
   with mock.patch.object(F,"_usage_states",return_value={
