@@ -272,6 +272,134 @@ class SourceSubjectTest(unittest.TestCase):
                     self.assertEqual((fresh["digest"], fresh["epoch"]),
                                      (current_digest, 0))
 
+    def _write_head(self, completion, *, route, node_id, sequence, subject=None,
+                    evidence_sha=None, attempt="att-recorded", history=True, canonical=True):
+        marker = {
+            "schema_version": 2, "route_id": route["route_id"],
+            "route_hash": route["route_hash"], "registry_digest": "sha256:fixture",
+            "node_id": node_id,
+            "completion_gate": next(item["completion_gate"] for item in route["nodes"]
+                                    if item["id"] == node_id),
+            "sequence": sequence, "attempt_id": attempt,
+            "evidence": {"path": "recorded.md",
+                         "sha256": evidence_sha or hashlib.sha256(attempt.encode()).hexdigest()},
+        }
+        if subject is not None:
+            marker["source_subject"] = subject
+        encoded = json.dumps(marker, sort_keys=True).encode("utf-8")
+        completion.mkdir(parents=True, exist_ok=True)
+        if history:
+            (completion / f"{node_id}.{sequence}.json").write_bytes(encoded)
+        if canonical:
+            (completion / f"{node_id}.json").write_bytes(encoded)
+        return marker
+
+    def test_fresh_inline_binding_consumes_canonical_head_with_its_exact_history(self):
+        digest = self.observe()["digest"]
+        old_sha = hashlib.sha256(b"previous review evidence").hexdigest()
+        new_sha = hashlib.sha256(b"unrecorded review evidence").hexdigest()
+        completion_root = Path(self.temp.name) / "head-history"
+
+        def bind(label, evidence_sha):
+            route = {**self.route, "route_id": f"rt-head-{label}"}
+            return route, completion_root / route["route_id"]
+
+        def fresh(route, completion, evidence_sha):
+            return SUBJECT.marker_subject(
+                route, self.node, attempt_id="att-new-inline-review", worktree=self.repo,
+                completion_dir=completion, owner_inline=True, evidence_sha256=evidence_sha)
+
+        # A canonical head without its own numbered history is refused for old and fresh
+        # bytes, whether it is source-unknown or source-known, and nothing is rewritten.
+        for label, subject in (("unknown", None), ("known", {
+                "schema_version": SUBJECT.SCHEMA_VERSION, "digest": digest, "epoch": 0})):
+            for evidence_sha in (old_sha, new_sha):
+                with self.subTest(missing=label, evidence=evidence_sha[:6]):
+                    route, completion = bind(f"missing-{label}-{evidence_sha[:6]}", evidence_sha)
+                    self._write_head(completion, route=route, node_id="impl-review", sequence=1,
+                                     subject=subject, evidence_sha=old_sha, history=False)
+                    before = (completion / "impl-review.json").read_bytes()
+                    with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+                        fresh(route, completion, evidence_sha)
+                    self.assertEqual(refused.exception.reason, "review-source-marker-history-missing")
+                    self.assertEqual((completion / "impl-review.json").read_bytes(), before)
+                    self.assertFalse((completion / "impl-review.1.json").exists())
+
+        # Malformed, foreign and different-content history are refused before any fresh subject.
+        for label in ("malformed", "foreign-route", "foreign-node", "different-content"):
+            with self.subTest(history=label):
+                route, completion = bind(label, new_sha)
+                marker = self._write_head(completion, route=route, node_id="impl-review",
+                                          sequence=1, evidence_sha=old_sha)
+                history = completion / "impl-review.1.json"
+                if label == "malformed":
+                    history.write_text("{invalid", encoding="utf-8")
+                elif label == "foreign-route":
+                    history.write_text(json.dumps({**marker, "route_hash": "sha256:other"}))
+                elif label == "foreign-node":
+                    history.write_text(json.dumps({**marker, "node_id": "smoke"}))
+                else:
+                    history.write_text(json.dumps({**marker, "attempt_id": "att-other"}))
+                with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+                    fresh(route, completion, new_sha)
+                self.assertIn(refused.exception.reason, {
+                    "review-source-marker-unreadable", "review-source-marker-history-conflict"})
+
+        # A foreign or sequence-less canonical head is refused too.
+        for label, patch in (("foreign-canonical", {"route_hash": "sha256:other"}),
+                             ("sequence-less", {"sequence": 0})):
+            with self.subTest(canonical=label):
+                route, completion = bind(label, new_sha)
+                marker = self._write_head(completion, route=route, node_id="impl-review",
+                                          sequence=1, evidence_sha=old_sha)
+                (completion / "impl-review.json").write_text(json.dumps({**marker, **patch}))
+                with self.assertRaises(SUBJECT.SourceSubjectError):
+                    fresh(route, completion, new_sha)
+
+        # Normal relations remain admitted: an intact unknown head, an absent head with a
+        # valid pending history, and an intact head with a valid pending history ahead of it.
+        for label in ("intact-unknown", "absent-canonical-pending", "pending-ahead"):
+            with self.subTest(normal=label):
+                route, completion = bind(label, new_sha)
+                if label == "intact-unknown":
+                    self._write_head(completion, route=route, node_id="impl-review",
+                                     sequence=1, evidence_sha=old_sha)
+                elif label == "absent-canonical-pending":
+                    self._write_head(completion, route=route, node_id="impl-review",
+                                     sequence=1, evidence_sha=old_sha, canonical=False)
+                else:
+                    self._write_head(completion, route=route, node_id="impl-review",
+                                     sequence=1, evidence_sha=old_sha)
+                    self._write_head(completion, route=route, node_id="impl-review",
+                                     sequence=2, evidence_sha=hashlib.sha256(b"pending").hexdigest(),
+                                     canonical=False, subject={
+                                         "schema_version": SUBJECT.SCHEMA_VERSION,
+                                         "digest": digest, "epoch": 0})
+                result = fresh(route, completion, new_sha)
+                self.assertEqual((result["digest"], result["epoch"]), (digest, 0))
+                # The old unknown bytes remain unknown even next to the admitted new evidence.
+                if label != "pending-ahead":
+                    with self.assertRaises(SUBJECT.SourceSubjectError) as rebound:
+                        fresh(route, completion, old_sha)
+                    self.assertEqual(rebound.exception.reason, "review-source-binding-missing")
+
+    def test_source_epoch_does_not_skip_a_known_canonical_head_whose_history_is_missing(self):
+        digest = self.observe()["digest"]
+        route = {**self.route, "route_id": "rt-epoch-history"}
+        completion = Path(self.temp.name) / "epoch-history" / route["route_id"]
+        self._write_head(completion, route=route, node_id="execute", sequence=1, subject={
+            "schema_version": SUBJECT.SCHEMA_VERSION, "digest": "1" * 64, "epoch": 4})
+        # A source-unknown review head has no epoch, so it cannot lower the known maximum.
+        self._write_head(completion, route=route, node_id="impl-review", sequence=1,
+                         history=False)
+        self.assertEqual(SUBJECT.source_epoch(route, self.node, digest, completion), 5)
+        self.assertEqual(SUBJECT.source_epoch(route, self.node, "1" * 64, completion), 4)
+        (completion / "execute.1.json").unlink()
+        with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+            SUBJECT.source_epoch(route, self.node, digest, completion)
+        self.assertEqual(refused.exception.reason, "review-source-marker-history-missing")
+        self.assertEqual((completion / "execute.json").exists(), True)
+
     def observe_test(self):
         return SUBJECT.observe(self.route, self.test_node, worktree=self.repo)
 

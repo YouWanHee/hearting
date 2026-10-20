@@ -1135,6 +1135,125 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         source_a_again = SUBJECT.observe(child, child_exec, worktree=self.repo)
         self.assertEqual(SUBJECT.source_epoch(child, child_exec, source_a_again["digest"], child_dir), 2)
 
+    def _inline_metadata(self, node, attempt_id):
+        return {**self._metadata(node, attempt_id, 'owner'),
+                'registered_worker': '0', 'execution_surface': 'inline',
+                'transport': 'interactive', 'fallback_hop': 'inline'}
+
+    def _completion_state(self, directory):
+        return {path.name: path.read_bytes() for path in sorted(directory.iterdir())
+                if path.is_file() and not path.name.startswith('.')}
+
+    def _legacy_unknown_review(self):
+        """Publish an inline review, then rewrite canonical and history as the old writer did."""
+        node = self.review_node
+        evidence = self.artifact_root / 'historical-unknown.md'
+        evidence.write_text('historical unknown review bytes', encoding='utf-8')
+        old = ROUTE_WRITER._publish_completion_locked(
+            self.route, node, node['id'], evidence, jobs=self.jobs,
+            attempt_id='att-original-inline',
+            attempt_metadata=self._inline_metadata(node, 'att-original-inline'))
+        old.pop('source_subject')
+        directory = ROUTE_WRITER.completion_dir(self.route['route_id'], jobs=self.jobs)
+        canonical = directory / 'impl-review.json'
+        history = directory / f"impl-review.{old['sequence']}.json"
+        canonical.write_text(json.dumps(old, sort_keys=True), encoding='utf-8')
+        history.write_bytes(canonical.read_bytes())
+        return old, evidence, directory, canonical, history
+
+    def test_fresh_inline_review_requires_intact_canonical_head_and_history(self):
+        """Writer-level: a damaged canonical/history pair cannot launder old or new evidence."""
+        node = self.review_node
+        refusals = {
+            'missing': '^review-source-marker-history-missing:',
+            'malformed': '^review-source-marker-unreadable:',
+            'foreign': '^review-source-marker-history-conflict:',
+            'content-mismatch': '^review-source-marker-history-conflict:',
+        }
+        for kind, expected in refusals.items():
+            with self.subTest(history=kind):
+                self.setUp()
+                self.current_smoke_markers('A')
+                old, evidence, directory, canonical, history = self._legacy_unknown_review()
+                if kind == 'missing':
+                    history.unlink()
+                elif kind == 'malformed':
+                    history.write_text('{invalid', encoding='utf-8')
+                elif kind == 'foreign':
+                    history.write_text(json.dumps(
+                        {**old, 'route_hash': 'sha256:' + '0' * 64}), encoding='utf-8')
+                else:
+                    history.write_text(json.dumps(
+                        {**old, 'attempt_id': 'att-different-origin'}), encoding='utf-8')
+                fresh = self.artifact_root / 'fresh-different-bytes.md'
+                fresh.write_text('new unrecorded review bytes', encoding='utf-8')
+                current = SUBJECT.observe(self.route, node, worktree=self.repo)
+                epoch_before = SUBJECT.source_epoch(self.route, node, current['digest'], directory)
+                for label, candidate in (('historical-bytes', evidence), ('fresh-bytes', fresh)):
+                    attempt = f'att-new-inline-{kind}-{label}'
+                    before = self._completion_state(directory)
+                    with self.subTest(history=kind, evidence=label):
+                        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                            with self.assertRaisesRegex(ValueError, expected):
+                                ROUTE_WRITER.complete_node(
+                                    self.route, node, node['id'], candidate, attempt_id=attempt,
+                                    explicit_attempt_metadata=self._inline_metadata(node, attempt))
+                        # Canonical, history, attempt links and epoch are all unchanged.
+                        self.assertEqual(self._completion_state(directory), before)
+                        self.assertEqual(
+                            SUBJECT.source_epoch(self.route, node, current['digest'], directory),
+                            epoch_before)
+                        self.assertEqual(len(list(directory.glob(f'impl-review.{attempt}*'))), 0)
+                    self.assertEqual(canonical.read_bytes(), before['impl-review.json'])
+
+        # An intact legacy unknown canonical/history pair stays unknown and still admits
+        # a new review's fresh evidence; the old record is never rewritten.
+        with self.subTest(history='intact-unknown'):
+            self.setUp()
+            self.current_smoke_markers('A')
+            old, evidence, directory, canonical, history = self._legacy_unknown_review()
+            old_bytes = (canonical.read_bytes(), history.read_bytes())
+            fresh = self.artifact_root / 'intact-fresh.md'
+            fresh.write_text('new review bytes over an intact unknown head', encoding='utf-8')
+            attempt = 'att-new-inline-intact'
+            with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                marker, result = ROUTE_WRITER.complete_node(
+                    self.route, node, node['id'], fresh, attempt_id=attempt,
+                    explicit_attempt_metadata=self._inline_metadata(node, attempt))
+            self.assertEqual(result['status'], 'unregistered-complete')
+            self.assertEqual(marker['sequence'], old['sequence'] + 1)
+            self.assertEqual(self.currency(marker).state, 'current')
+            self.assertEqual((directory / f"impl-review.{old['sequence']}.json").read_bytes(),
+                             old_bytes[1])
+            # The same historical bytes are still refused as unknown, never rebound.
+            with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                with self.assertRaisesRegex(ValueError, '^review-source-binding-missing:'):
+                    ROUTE_WRITER.complete_node(
+                        self.route, node, node['id'], evidence, attempt_id='att-rebind-old',
+                        explicit_attempt_metadata=self._inline_metadata(node, 'att-rebind-old'))
+
+        # A canonical head lost between history and canonical writes recovers by exact replay.
+        with self.subTest(history='canonical-absent-exact-replay'):
+            self.setUp()
+            self.current_smoke_markers('A')
+            attempt = 'att-fresh-then-lose-canonical'
+            fresh = self.artifact_root / 'replay-fresh.md'
+            fresh.write_text('fresh review whose canonical head is lost', encoding='utf-8')
+            with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                marker, _result = ROUTE_WRITER.complete_node(
+                    self.route, node, node['id'], fresh, attempt_id=attempt,
+                    explicit_attempt_metadata=self._inline_metadata(node, attempt))
+                directory = ROUTE_WRITER.completion_dir(self.route['route_id'], jobs=self.jobs)
+                history_bytes = (directory / f"impl-review.{marker['sequence']}.json").read_bytes()
+                (directory / 'impl-review.json').unlink()
+                replay, _result = ROUTE_WRITER.complete_node(
+                    self.route, node, node['id'], fresh, attempt_id=attempt,
+                    explicit_attempt_metadata=self._inline_metadata(node, attempt))
+            self.assertEqual(replay, marker)
+            self.assertEqual((directory / f"impl-review.{marker['sequence']}.json").read_bytes(),
+                             history_bytes)
+            self.assertEqual(json.loads((directory / 'impl-review.json').read_text()), marker)
+
     def test_publication_retry_converges_without_duplicate_verdict_and_reads_do_not_write(self):
         node = self.get_node("execute")
         evidence = self.artifact_root / "retry.md"

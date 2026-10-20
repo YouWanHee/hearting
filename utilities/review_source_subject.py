@@ -621,6 +621,55 @@ def _source_generations(route: dict) -> list[dict]:
         raise SourceSubjectError("review-source-lineage-unverifiable", exc.code) from exc
 
 
+def _canonical_head(generation: dict, generation_dir: Path, node_id: str, candidate: dict,
+                    *, verify_unknown: bool = True) -> dict | None:
+    """Return a canonical marker proven to equal its own numbered history.
+
+    An absent canonical marker is not an error, and a numbered history ahead of
+    the canonical head is a valid pending/crash-replay successor, so neither is
+    judged here. A present canonical must name this route/node/gate, carry a
+    sequence, and have exactly that sequence's immutable history; a missing,
+    unreadable or different history is refused rather than skipped. A legacy
+    marker without a source subject has no epoch to lose, so epoch callers may
+    leave it unverified; fresh evidence binding verifies it and keeps it unknown.
+    """
+    marker_path = generation_dir / f"{node_id}.json"
+    try:
+        info = marker_path.lstat()
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(info.st_mode):
+            raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not isinstance(marker, dict):
+            raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+        if not verify_unknown and not isinstance(marker.get("source_subject"), dict):
+            return marker
+        if (marker.get("route_id") != generation.get("route_id")
+                or marker.get("route_hash") != generation.get("route_hash")
+                or marker.get("node_id") != node_id
+                or marker.get("completion_gate") != candidate.get("completion_gate")):
+            raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+        sequence = marker.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise SourceSubjectError("review-source-marker-sequence-invalid", node_id)
+        history_path = generation_dir / f"{node_id}.{sequence}.json"
+        try:
+            history_info = history_path.lstat()
+        except FileNotFoundError as exc:
+            raise SourceSubjectError("review-source-marker-history-missing", node_id) from exc
+        if not stat.S_ISREG(history_info.st_mode):
+            raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+        if json.loads(history_path.read_text(encoding="utf-8")) != marker:
+            raise SourceSubjectError("review-source-marker-history-conflict", node_id)
+    except (OSError, ValueError, TypeError) as exc:
+        if isinstance(exc, SourceSubjectError):
+            raise
+        raise SourceSubjectError("review-source-marker-unreadable", node_id) from exc
+    return marker
+
+
 def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path) -> int:
     """Predict the route-wide source epoch from append-only marker history.
 
@@ -640,35 +689,20 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
             node_id = str(candidate.get("id", ""))
             if not node_id:
                 continue
-            marker_path = generation_dir / f"{node_id}.json"
             try:
-                info = marker_path.lstat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
-                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                marker = _canonical_head(generation, generation_dir, node_id, candidate,
+                                         verify_unknown=False)
+                if marker is None:
+                    continue
                 subject = marker.get("source_subject")
                 if not isinstance(subject, dict):
                     continue  # Legacy marker: preserve it as unknown history.
-                if (marker.get("route_id") != generation.get("route_id")
-                        or marker.get("route_hash") != generation.get("route_hash")
-                        or marker.get("node_id") != node_id
-                        or marker.get("completion_gate") != candidate.get("completion_gate")):
-                    raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
-                sequence = marker.get("sequence")
-                if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-                    raise SourceSubjectError("review-source-marker-sequence-invalid", node_id)
-                history_path = generation_dir / f"{node_id}.{sequence}.json"
-                history = json.loads(history_path.read_text(encoding="utf-8"))
-                if history != marker:
-                    raise SourceSubjectError("review-source-marker-history-conflict", node_id)
                 if (isinstance(subject.get("epoch"), int)
                         and not isinstance(subject.get("epoch"), bool)
                         and isinstance(subject.get("digest"), str)):
                     observations.append((int(subject["epoch"]), subject["digest"]))
                 else:
                     raise SourceSubjectError("review-source-marker-subject-invalid", node_id)
-            except FileNotFoundError:
-                continue
             except (OSError, ValueError, TypeError) as exc:
                 if isinstance(exc, SourceSubjectError):
                     raise
@@ -699,6 +733,9 @@ def _inline_evidence_subject_unchanged(route: dict, node: dict, evidence_sha256:
             continue
         node_id = str(candidate["id"])
         generation_dir = completion_root / str(generation.get("route_id", ""))
+        # Fresh evidence binding consumes the existing canonical head and its
+        # exact history together, so a missing history cannot hide old evidence.
+        _canonical_head(generation, generation_dir, node_id, candidate)
         for history_path in sorted(generation_dir.glob(f"{node_id}.*.json")):
             suffix = history_path.name[len(node_id) + 1:-5]
             if not suffix.isdigit():
