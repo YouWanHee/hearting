@@ -337,6 +337,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         return {"state": "needs-question", "required_action": "ask-registered-question" if ask_now else "wait-for-user-answer",
                 "interview_file": str(question_path), "interview": question,
                 "answers_template": FI.answers_template(question),
+                "supervisor_answers_template": {**FI.answers_template(question), "actor_kind": "supervisor"},
                 "human_wait": {"state": "pending", "fallback": "ordinary-conversation",
                                "question_block": FI.pending_question_block(question)},
                 "parent_next": "end-turn",
@@ -350,9 +351,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
                     "When the native question tool returns the reply, the runtime keeps it beside the question "
                     "(answers.native.json, recorded by the harness hook): then just rerun resume_command. Otherwise "
-                    "preserve only the person's actual structured or typed reply in answers_template and set "
-                    "actor_kind=user for that reply. Keep supervisor/automatic/unknown sources as such; "
-                    "an acknowledgement or template is never a user decision. Then rerun "
+                    "record the person's reply in answers_template, or use supervisor_answers_template for the "
+                    "depth-0 supervisor's answer on the person's behalf. " + FI.ANSWER_SOURCE_GUIDANCE + " "
+                    "An acknowledgement or template is never a decision. Then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
                     "For a revise/stop decision also pass --decision revise|stop. " + FI.PENDING_ANSWER_RULE}
     if resolution["status"] in {"proceed", "revise", "stop"}:

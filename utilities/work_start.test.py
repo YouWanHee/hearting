@@ -1795,10 +1795,15 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             self.assertEqual((self.calls, record.call_count), (["gate", "release"], 1))
 
     def test_a_supervisor_answer_releases_frame_review_on_the_persons_behalf(self):
+        question, _ = self.routed()
         asked = self.step(interview=self.question_file)
-        answer = self.answers()
-        response = json.loads(answer.read_text())
-        response["actor_kind"] = "supervisor"
+        answer = self.base / "answers.json"
+        response = asked["supervisor_answers_template"]
+        self.assertEqual(response["actor_kind"], "supervisor")
+        response["understanding_confirmed"] = True
+        for item in question["questions"]:
+            self.assertIsNone(response["answers"][item["id"]]["choice"])
+            response["answers"][item["id"]]["choice"] = item["recommended"]
         answer.write_text(json.dumps(response))
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
             with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
@@ -1807,6 +1812,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         released = self.step(answers=answer)
         self.assertEqual(released["state"], "released")
         self.assertEqual(self.resolution()["actor_kind"], "supervisor")
+        self.assertEqual(self.resolution()["answers"]["answers"]["go"]["choice"], 0)
         self.assertIn("status: agreed-on-behalf\nactor_kind: supervisor", Path(released["intent_file"]).read_text())
         self.assertEqual(self.calls, ["gate", "release"])
         self.assertEqual(Path(asked["interview_file"]).parent, Path(released["interview_file"]).parent)
@@ -1897,6 +1903,36 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         brief.unlink()                                       # no brief yet: empty fields, as before
         self.assertEqual(self.step()["interview_template"]["brief"]["problem"], "")
         self.assertEqual(self.calls, [])                     # a draft registers nothing
+
+    def test_generated_draft_registers_unchanged_and_explicit_supervisor_answer_releases_first_time(self):
+        import frame_interview as FI
+        brief = self.output / "shards/frame/direction-brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("## 1. Problem\n\nThe report loses the second result.\n\n"
+                         "## 4. Verdict\n\nKeep both results in one report.\n\n"
+                         "## 5. Boundary\n\nPreserve the measured exit codes.\n\n"
+                         "## 6. Risks\n\nNone known.\n", encoding="utf-8")
+        self.route["work_request"] = {"text": "Run the two commands and keep both results."}
+        draft = self.step()
+        self.assertIn('"actor_kind": "supervisor"', draft["next_step"])
+        self.assertIn('"actor_kind": "user"', draft["next_step"])
+        self.assertEqual(draft["interview_template"]["brief"]["affected"], "")
+        self.question_file.write_text(json.dumps(draft["interview_template"]))
+        asked = self.step(interview=self.question_file)
+        self.assertEqual(asked["state"], "needs-question")
+        self.assertIn(FI.ANSWER_SOURCE_GUIDANCE, asked["next_step"])
+        self.assertEqual(asked["answers_template"]["actor_kind"], "unknown")
+        response = asked["supervisor_answers_template"]
+        self.assertEqual(response["actor_kind"], "supervisor")
+        response["understanding_confirmed"] = True
+        answer = self.base / "supervisor-answer.json"
+        answer.write_text(json.dumps(response))
+        released = self.step(answers=answer)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(self.resolution()["answers"]["actor_kind"], "supervisor")
+        self.assertIn("status: agreed-on-behalf\nactor_kind: supervisor",
+                      Path(released["intent_file"]).read_text())
+        self.assertEqual(self.calls, ["gate", "release"])
 
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
