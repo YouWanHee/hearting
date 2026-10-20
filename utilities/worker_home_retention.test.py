@@ -81,14 +81,18 @@ class Fixture(unittest.TestCase):
 
     def row(self, attempt, status="done", **meta):
         base = {"attempt_id": attempt, "harness": "claude", "worker_type": "stage",
-                "launch_outcome": "never-launched"}
+                "launch_outcome": "never-launched", "main_runtime_harness": "claude",
+                "main_runtime_pid": "2147483647", "main_runtime_pid_start": "1",
+                "main_runtime_ns": DC.process_namespace_identity()}
         base.update(meta)
         self.rows[attempt] = (status, base)
         self.write_rows()
 
     def append_row(self, attempt, status="done", **meta):
         base = {"attempt_id": attempt, "harness": "claude", "worker_type": "stage",
-                "launch_outcome": "never-launched"}
+                "launch_outcome": "never-launched", "main_runtime_harness": "claude",
+                "main_runtime_pid": "2147483647", "main_runtime_pid_start": "1",
+                "main_runtime_ns": DC.process_namespace_identity()}
         base.update(meta)
         self.rows[attempt] = (status, base)
         pipe = ",".join(f"{key}={value}" for key, value in base.items())
@@ -260,6 +264,113 @@ class Fixture(unittest.TestCase):
 
 
 class Expiry(Fixture):
+    def test_terminal_claude_prunes_cache_but_resolves_transcript(self):
+        from claude_project_dir import encode_project_dir, resolve_session_transcript
+        attempt = "att-live-main-retention"
+        home = self.add(attempt)
+        identity = DC.process_launch_identity(os.getpid())
+        self.rows[attempt][1].update(
+            main_runtime_harness="claude", main_runtime_pid=str(os.getpid()),
+            main_runtime_pid_start=identity["pid_start"], main_runtime_ns=DC.process_namespace_identity())
+        self.write_rows()
+        transcript = home / "projects" / encode_project_dir("/repo") / "session-raw.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"message"}\n')
+        raw_inode = transcript.stat().st_ino
+        cache = home / "cache"
+        cache.mkdir()
+        (cache / "large.bin").write_bytes(b"cache" * 1024)
+        os.utime(home, ns=(self.now, self.now))
+        with mock.patch.object(R._Context, "home_process_evidence",
+                               return_value=("absent", "fixture-process-scan-complete")):
+            result = self.sweep(1.01)
+        self.assertEqual(result["partial"], 1, result)
+        self.assertTrue(home.is_dir())
+        self.assertTrue((home / "worker-home.json").is_file())
+        self.assertTrue((home / "projects").is_dir())
+        self.assertFalse(cache.exists())
+        self.assertEqual(transcript.stat().st_ino, raw_inode)
+        resolved, reason = resolve_session_transcript(
+            "session-raw", "/repo", expected_cwd="/repo", runtime_home=str(home))
+        self.assertIsNone(reason)
+        self.assertEqual(resolved, transcript)
+        with R.worker_home_read_admission(
+                self.jobs, home, transcript, attempt, "claude") as admitted:
+            self.assertTrue(admitted)
+
+    def test_terminal_opencode_prunes_cache_preserving_database_wal_and_shm(self):
+        attempt = "att-opencode-live-main-retention"
+        home = self.add(attempt, harness="opencode")
+        identity = DC.process_launch_identity(os.getpid())
+        self.rows[attempt][1].update(
+            main_runtime_harness="opencode", main_runtime_pid=str(os.getpid()),
+            main_runtime_pid_start=identity["pid_start"], main_runtime_ns=DC.process_namespace_identity())
+        self.write_rows()
+        database = home / "runtime/data/opencode/opencode.db"
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b"private-db")
+        wal = Path(str(database) + "-wal")
+        shm = Path(str(database) + "-shm")
+        wal.write_bytes(b"wal-row")
+        shm.write_bytes(b"shared-memory")
+        cache = home / "runtime/cache"
+        cache.mkdir(parents=True)
+        (cache / "entry").write_text("cache")
+        os.utime(home, ns=(self.now, self.now))
+        with mock.patch.object(R._Context, "home_process_evidence",
+                               return_value=("absent", "fixture-process-scan-complete")):
+            result = self.sweep(1.01)
+        self.assertEqual(result["partial"], 1, result)
+        self.assertTrue((home / "worker-home.json").is_file())
+        self.assertEqual(database.read_bytes(), b"private-db")
+        self.assertEqual(wal.read_bytes(), b"wal-row")
+        self.assertEqual(shm.read_bytes(), b"shared-memory")
+        self.assertFalse(cache.exists())
+
+    def test_partial_retire_journal_resumes_without_removing_retained_home(self):
+        attempt = "att-partial-journal-recovery"
+        home = self.add(attempt)
+        identity = DC.process_launch_identity(os.getpid())
+        self.rows[attempt][1].update(
+            main_runtime_harness="claude", main_runtime_pid=str(os.getpid()),
+            main_runtime_pid_start=identity["pid_start"], main_runtime_ns=DC.process_namespace_identity())
+        self.write_rows()
+        cache = home / "cache"
+        cache.mkdir()
+        (cache / "entry").write_text("cache")
+        os.utime(home, ns=(self.now, self.now))
+        remove = R._remove_leaf
+        with mock.patch.object(R._Context, "home_process_evidence",
+                               return_value=("absent", "fixture-process-scan-complete")), \
+                mock.patch.object(R, "_remove_leaf", side_effect=lambda *a: "partial"):
+            result = self.sweep(1.01)
+        self.assertEqual(result["partial"], 1, result)
+        retiring = self.root / "homes/worker-retention/retiring"
+        names = list(retiring.iterdir())
+        self.assertEqual(len(names), 2)  # detached cache directory and its legacy-compatible journal
+        self.assertTrue(home.is_dir())
+        with mock.patch.object(R._Context, "home_process_evidence",
+                               return_value=("absent", "fixture-process-scan-complete")), \
+                mock.patch.object(R, "_remove_leaf", wraps=remove):
+            resumed = self.sweep(2.02)
+        self.assertGreaterEqual(resumed["detached_leftover"], 1)
+        self.assertTrue(home.is_dir())
+        self.assertFalse(any(retiring.iterdir()))
+
+    def test_live_unknown_dead_and_seven_day_retention_boundary(self):
+        live = R._Row("", ["", "done", "", "", "", "harness=claude"])
+        identity = DC.process_launch_identity(os.getpid())
+        live._meta = {"main_runtime_harness": "claude", "main_runtime_pid": str(os.getpid()),
+                      "main_runtime_pid_start": identity["pid_start"],
+                      "main_runtime_ns": DC.process_namespace_identity(), "harness": "claude"}
+        self.assertTrue(R._retain_raw_for_main(live, self.now, self.now + 99 * R.RAW_UNKNOWN_CAP_NS))
+        unknown = R._Row("", ["", "done", "", "", "", "harness=claude"])
+        unknown._meta = {"harness": "claude", "main_runtime_harness": "claude",
+                         "main_runtime_pid": "2147483647", "main_runtime_pid_start": "1",
+                         "main_runtime_ns": "pid:[different]"}
+        self.assertTrue(R._retain_raw_for_main(unknown, self.now, self.now + R.RAW_UNKNOWN_CAP_NS - 1))
+        self.assertFalse(R._retain_raw_for_main(unknown, self.now, self.now + R.RAW_UNKNOWN_CAP_NS))
+
     def test_completion_clock_expires_at_exact_retention_boundary(self):
         path = self.add("att-exact-retention-boundary")
         stamp = datetime.fromtimestamp(self.now / 10**9, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -2935,7 +3046,9 @@ class Bounds(Fixture):
             is_home = attempt in due_attempts or attempt in protected_attempts
             status = "running" if attempt in protected_attempts else "done"
             meta = {"attempt_id": attempt, "harness": "claude", "worker_type": "stage",
-                    "launch_outcome": "never-launched", "padding": "x" * 5000}
+                    "launch_outcome": "never-launched", "padding": "x" * 5000,
+                    "main_runtime_harness": "claude", "main_runtime_pid": "2147483647",
+                    "main_runtime_pid_start": "1", "main_runtime_ns": DC.process_namespace_identity()}
             if is_home:
                 meta["runtime_home"] = str(self.home_path(attempt))
             self.rows[attempt] = (status, meta)
