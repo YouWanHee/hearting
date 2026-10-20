@@ -4168,6 +4168,101 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
                         lambda: build(False, True, False)], term_width)]
 
 
+def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
+    """Render exact native shell jobs as child rows; this function performs no reads."""
+    jobs = [job for job in (getattr(entity, "shell_jobs", None) or [])
+            if isinstance(job, dict)]
+    indent = _conn_indent(depth, in_card)
+    indent_width = _dw(indent)
+    width = max(1, term_width - indent_width) if term_width else None
+    lines = []
+    now = time.time()
+    for job in jobs:
+        command = job.get("command")
+        command = str(command) if isinstance(command, str) and command else "command unavailable"
+        started = job.get("started_at")
+        if (isinstance(started, (int, float)) and not isinstance(started, bool)
+                and math.isfinite(started) and 0 <= started <= now):
+            try:
+                start_label = time.strftime("%H:%M", time.localtime(started))
+            except (OverflowError, OSError, ValueError):
+                start_label = "?"
+        else:
+            start_label = "?" if job.get("time_state") != "invalid" else "invalid"
+        elapsed = job.get("elapsed_s")
+        elapsed_label = ("%ds" % elapsed if elapsed < 60 else "%dm" % (elapsed // 60)) \
+            if isinstance(elapsed, int) and not isinstance(elapsed, bool) and elapsed >= 0 else "time ?"
+        native = str(job.get("native_status") or "unknown").lower()
+        process = str(job.get("process_state") or "unknown").lower()
+        if job.get("exit_code") is not None:
+            native_label = "native exit %s" % job.get("exit_code")
+        elif native in {"failed", "error"}:
+            native_label = "native failed"
+        elif native in {"cancelled", "canceled", "stopped"}:
+            native_label = "native stopped"
+        elif job.get("lifecycle_state") == "completed":
+            native_label = "native complete"
+        elif native in {"running", "in_progress", "ongoing", "background"}:
+            native_label = "native running"
+        elif native == "acknowledged":
+            native_label = "native ack"
+        else:
+            native_label = "native ?"
+        process_label = {"alive": "proc alive", "dead": "proc dead"}.get(process, "proc ?")
+        if job.get("quiet_suspected") and job.get("lifecycle_state") != "completed":
+            output_label = "quiet ≥10m?"
+        elif job.get("last_output_at") is not None:
+            output_label = "out " + _text_age(job.get("last_output_at"), now)
+        elif job.get("output_coverage") == "sampled":
+            output_label = "out sampled"
+        elif job.get("output_coverage") == "unavailable":
+            output_label = "out ?"
+        else:
+            output_label = "out unknown"
+        prefix = "⚙ "
+        if width is not None and width < 68:
+            native_short = {"native exit": "N:exit", "native complete": "N:done",
+                            "native running": "N:run", "native ack": "N:ack",
+                            "native ?": "N:?"}.get(native_label, "N:?")
+            if job.get("exit_code") is not None:
+                native_short = "N:" + str(job.get("exit_code"))
+            process_short = {"proc alive": "P:live", "proc dead": "P:dead"}.get(process_label, "P:?")
+            out_short = ("Q:10m?" if job.get("quiet_suspected") and job.get("lifecycle_state") != "completed"
+                         else "O:" + _text_age(job.get("last_output_at"), now).replace(" ago", "")
+                         if job.get("last_output_at") is not None
+                         else "O:sampled" if job.get("output_coverage") == "sampled" else "O:?")
+            suffix = " S%s E%s %s %s %s" % (start_label, elapsed_label, native_short,
+                                             process_short, out_short)
+        else:
+            suffix = " · start %s · %s · %s · %s" % (
+                start_label, elapsed_label, native_label, process_label)
+            if output_label:
+                suffix += " · " + output_label
+        if width is not None:
+            suffix = _clip_w(suffix, max(0, width - _dw(prefix)))
+            room = max(0, width - _dw(prefix + suffix))
+            command = _clip_w(command, room)
+            text = prefix + command + suffix
+        else:
+            text = prefix + command + suffix
+        key = "g_work_off" if process == "alive" else "dim"
+        lines.append([(indent, None), (text, key)])
+    observation = getattr(entity, "shell_job_observation", None)
+    if isinstance(observation, dict):
+        state = str(observation.get("state") or "unknown")
+        reason = str(observation.get("reason") or "")
+        partial = observation.get("coverage") == "partial"
+        if state in {"catching-up", "unavailable", "unobserved", "failed", "unknown", "missing"} or partial:
+            detail = " history catching up" if state == "catching-up" or partial else " " + state
+            if reason:
+                detail += " · " + reason.replace("-", " ")
+            text = "⚙ tasks" + detail
+            if width is not None:
+                text = _clip_w(text, width)
+            lines.append([(indent, None), (text, "dim")])
+    return lines
+
+
 # The icon says WHAT the relation is, the arrow says which WAY it points. User decision
 # 2026-09-09 ("위 아래로 표시하면 앞뒤 화살표는 왜 있는거임?") — the two must not encode
 # the same thing twice, so no glyph ever varies by direction.
@@ -6980,6 +7075,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
         out.append(_route_job_row(owner, max_width=term_width))
         job_rows.append((len(out) - 1, owner))
         out.extend(_dispatch_summary_detail_row(owner, term_width=term_width))
+        out.extend(_shell_job_rows(owner, term_width=term_width))
         gpu_rows, cpu_rows = _owner_gpu_resource_rows(owner, session_by_identity, gpu_resources, term_width)
         out.extend(gpu_rows + cpu_rows)
     # route._record_view already preserves sealed record order within each
@@ -6996,6 +7092,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
                 if sa.active or _SHOW_ALL]
         if subs:
             out.extend(_subagent_strip(subs))
+        out.extend(_shell_job_rows(job, depth=1, term_width=term_width))
         gpu_rows, cpu_rows = _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width)
         out.extend(gpu_rows + cpu_rows)
 
@@ -7093,6 +7190,8 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
             if sa.active or _SHOW_ALL]
     if subs:
         out.extend(_subagent_strip(subs))
+    out.extend(_shell_job_rows(job, depth=max(1, int(getattr(job, "depth", 1) or 1)),
+                                term_width=term_width))
     gpu_rows, cpu_rows = _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width)
     out.extend(gpu_rows + cpu_rows)
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
@@ -7198,7 +7297,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         s_subs = [sa for sa in (getattr(s, "subagents", None) or []) if sa.active or _SHOW_ALL]
         plugin_subs = plugin_by_parent.pop(getattr(s, "session_id", None), [])
         session_resources = _gpu_resources_for_session(s, gpu_resources)
-        if s_subs or session_resources or plugin_subs:
+        if s_subs or session_resources or plugin_subs or getattr(s, "shell_jobs", None):
             agent_sessions.append((s, s_subs, session_resources, plugin_subs))
     for remaining in plugin_by_parent.values():
         plugin_orphans.extend(remaining)
@@ -7295,7 +7394,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     # skipping any pid already shown under a route/degrade card above (no double draw).
     for s, s_subs, session_resources, plugin_subs in agent_sessions:
         session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
-        if not (s_subs or session_resources or plugin_subs):
+        if not (s_subs or session_resources or plugin_subs or getattr(s, "shell_jobs", None)):
             continue
         covered = bool(s.pid and s.pid in covered_pids)
         if covered and not plugin_subs:
@@ -7312,6 +7411,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         lines.append(anchor)
         if s_subs:
             lines.extend(_subagent_strip(s_subs, term_width=term_width))
+        lines.extend(_shell_job_rows(s, term_width=term_width))
         if session_resources and not covered:
             lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
         for plugin_job in plugin_subs:
@@ -8441,6 +8541,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                 lines.extend(_subagent_strip(
                     shown_job_subs, depth=depth, in_card=in_card,
                     term_width=term_width))
+            lines.extend(_shell_job_rows(job, depth=depth, in_card=in_card,
+                                         term_width=term_width))
             gpu_rows, resource_rows = _owner_gpu_resource_rows(
                 job, session_by_identity, gpu_resources, term_width, depth=depth, in_card=in_card)
             resource_children = getattr(job, "resource_children", ())
@@ -8649,6 +8751,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                          if sa.active or _SHOW_ALL]
             if shown_subs:
                 lines.extend(_subagent_strip(shown_subs, term_width=term_width))
+            lines.extend(_shell_job_rows(s, term_width=term_width))
             session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))

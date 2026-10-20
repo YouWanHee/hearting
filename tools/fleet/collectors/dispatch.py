@@ -70,6 +70,7 @@ from ..token_budget import (context_policy_snapshot, context_policy_used_pct,
                             parse_codex_token_count, telemetry_from_explicit)
 from . import procscan
 from . import parse_cache
+from . import shell_jobs
 
 _AUTOPILOT = re.compile(r"/autopilot-([a-z-]+)")
 _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
@@ -1676,6 +1677,16 @@ def _enrich_claude_stream_session(job, fast_first=False):
     if not session_id:
         return
     job._runtime_session_id = session_id
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    else:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_claude_jobs(telemetry_path, session_id=session_id,
+                                        attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            telemetry_path, ("claude", os.path.abspath(telemetry_path), session_id, job.attempt_id))
 
 
 def _codex_attempt_thread_ids(lines):
@@ -1970,6 +1981,18 @@ def _enrich_codex_attempt_session(job, fast_first=False):
         except OSError:
             pass
     job.exec_tool = parsed.get("exec_tool")
+    if thread_id and not fast_first:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_codex_jobs(path, session_id=thread_id, attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            path, ("codex", os.path.abspath(path), thread_id, job.attempt_id))
+    elif thread_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    elif parsed.get("thread_ambiguity"):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "multiple-attempt-thread-ids"}
 
 
 def _parse_opencode_attempt_tail(path):
@@ -2090,10 +2113,22 @@ _OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
 
 def _enrich_opencode_native_activity(job, session_id, fast_first=False):
     """Observe only the attempt-private DB; first publication remains log-only."""
-    if fast_first or not session_id or not _native_home_admitted(job):
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+        return
+    if not session_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "exact-session-id-unresolved"}
+        return
+    if not _native_home_admitted(job):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "private-runtime-not-admitted"}
         return
     runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
     if not isinstance(runtime, str) or not os.path.isabs(runtime):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "attempt-private-runtime-unresolved"}
         return
     db = os.path.join(runtime, "data", "opencode", "opencode.db")
     try:
@@ -2102,19 +2137,41 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
         if (not signatures[""] or signatures["-journal"] or
                 sum(info[2] for suffix, info in signatures.items()
                     if info and suffix in ("", "-wal")) > _OPENCODE_ACTIVITY_BYTES):
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": "unavailable",
+                                         "reason": "private-db-missing-or-over-read-cap"}
             return
-        key = (db, session_id)
+        from . import opencode as opencode_collector
+        attempt_id = getattr(job, "attempt_id", None)
+        key = (db, session_id, attempt_id)
         cached = _OPENCODE_ACTIVITY_CACHE.get(key)
-        if cached and cached[0] == signatures:
-            activity = cached[1]
+        same_source = bool(cached and cached[0] == signatures)
+        cached_shell = cached[2] if same_source and len(cached) > 2 else None
+        shell_complete = bool(
+            isinstance(cached_shell, dict)
+            and (cached_shell.get("shell_cursor") or {}).get("caught_up"))
+        if same_source and shell_complete:
+            activity, shell_observation = cached[1], cached_shell
         else:
             with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
                 deadline = time.monotonic() + .05
                 connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
-                activity = refresh_title.read_opencode_activity(connection, session_id)
+                activity = cached[1] if same_source else refresh_title.read_opencode_activity(
+                    connection, session_id)
+                opencode_runtime = opencode_collector._opencode_v2_runtime()
+                page = opencode_runtime.read_session_shell_tasks(
+                    connection, session_id,
+                    after_seq=opencode_collector._v2_shell_cursor(db, session_id, attempt_id))
+                signature = signatures.get("")
+                identity = ({"device": signature[0], "inode": signature[1]}
+                            if isinstance(signature, tuple) and len(signature) >= 2 else None)
+                shell_observation = dict(page, database_identity=identity)
             if signatures != refresh_title._opencode_source_signatures(db):
+                job.shell_jobs = []
+                job.shell_job_observation = {"state": "unavailable",
+                                             "reason": "private-db-changed-during-snapshot"}
                 return
-            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity)
+            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity, shell_observation)
             if len(_OPENCODE_ACTIVITY_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
                 _OPENCODE_ACTIVITY_CACHE.pop(next(iter(_OPENCODE_ACTIVITY_CACHE)))
         job.exec_tool = None
@@ -2124,7 +2181,16 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
             job.exec_tool = {"name": label} if label else None
         if activity.get("summary"):
             job._native_now = (activity["summary"], activity.get("summary_ts"))
+        observed = shell_observation
+        if observed.get("state") == "observed" and observed.get("generation") == "v2":
+            opencode_collector._attach_v2_shell_tasks(job, observed, db, session_id)
+        else:
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": observed.get("state", "unknown"),
+                                         "reason": observed.get("reason", "private-v2-db-unavailable")}
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "private-db-read-failed"}
         return
 
 

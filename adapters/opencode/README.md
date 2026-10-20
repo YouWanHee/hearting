@@ -406,6 +406,17 @@ explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
 with an empty prompt, or opens a tab in the same workspace. No pane move or
 extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
 
+## Fleet background shell rows
+
+For OpenCode V2, Fleet recognizes only an exact `shell` invocation whose
+documented input sets `background: true`. Completion of that tool invocation is
+not completion of its background process. The current V2 reader preserves
+mutable row updates and reports process/output as unknown until native evidence
+exposes those facts. OpenCode V1 Bash records do not establish V2 background
+semantics; Fleet reports that limitation instead of treating stale `running`
+records as live. See [V2 Shell](https://opencode.ai/v2/docs/tools/#shell) and
+[V1 bash](https://docs.opencode.ai/docs/tools/#bash).
+
 ## Runtime compaction tidy
 
 `experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary and its parent compaction part through the v1 client. Only a verified `auto=true` part with a nonempty summary successfully saved to the main session's own verified herdr pane can book the existing snapshot/clear/`이어서해` flow. The helper requires the latest ordinary assistant to finish after the matching user and a native idle observation after compaction, then refreshes the card with bounded recent conversation and the transcript path. It waits up to three hours. Manual/unknown parts, missing/empty summaries, failed card writes, project/outside-herdr seats, and workers/sub-sessions remain queue-only; unknown session identity stays ledger-only.

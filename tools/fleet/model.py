@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
-from typing import Optional
+from typing import Optional, TypedDict
 
 from . import gitinfo
 
@@ -81,6 +81,43 @@ INTERACTION_KINDS = ("decision", "approval", "permission", "elicitation")
 # each surface from growing a subtly different PID/start-time classifier.
 ATTEMPT_CLASSIFIER_SOURCE = "tools.fleet.model.classify_attempt_evidence"
 PROGRESS_PHASES = ("launch", "analysis", "tool", "file-write", "test", "artifact", "terminal")
+
+
+class ShellJob(TypedDict, total=False):
+    """Additive, evidence-separated projection of one native background shell task."""
+    harness: str
+    session_id: str
+    attempt_id: Optional[str]
+    source_generation: str
+    source_locator: str
+    native_id: str
+    native_call_id: Optional[str]
+    native_task_id: Optional[str]
+    continuation_handle: Optional[str]
+    command: Optional[str]
+    command_source: Optional[str]
+    command_reason: Optional[str]
+    started_at: Optional[float]
+    start_source: Optional[str]
+    observed_at: Optional[float]
+    completed_at: Optional[float]
+    exit_code: Optional[int]
+    native_status: str
+    lifecycle_state: str
+    process_state: str
+    process_reason: Optional[str]
+    process_identity: Optional[dict]
+    output_path: Optional[str]
+    output_size: Optional[int]
+    output_identity: Optional[dict]
+    output_coverage: str
+    output_reason: Optional[str]
+    last_output_at: Optional[float]
+    last_output_observed_at: Optional[float]
+    quiet_since: Optional[float]
+    quiet_suspected: bool
+    observation_state: Optional[str]
+    observation_reason: Optional[str]
 
 
 def _public_value(value):
@@ -312,6 +349,11 @@ class Session:
     # Both are None when there is no evidence — never a guess (prd.md:263).
     exec_child: Optional[dict] = None
     exec_tool: Optional[dict] = None
+    # Per-call background shell observations are independent of parent liveness.
+    # Empty means no exact native task was found; unknown process/output facts
+    # remain explicit on each task instead of falling back to the legacy badge.
+    shell_jobs: list[ShellJob] = field(default_factory=list)
+    shell_job_observation: Optional[dict] = None
     # Exact privacy-minimal decision/approval evidence. Content is impossible
     # in the sidecar schema; only kind/source/time reach this public projection.
     interaction_state: Optional[dict] = None
@@ -591,6 +633,8 @@ class DispatchJob:
     session_total_tokens: Optional[int] = None
     exec_child: Optional[dict] = None
     exec_tool: Optional[dict] = None
+    shell_jobs: list[ShellJob] = field(default_factory=list)
+    shell_job_observation: Optional[dict] = None
     context: Optional[ContextProjection] = None
     work_projection: Optional[WorkProjection] = None
     cap_grounding: Optional[dict] = None   # {capability, mode?, intensity?} for an inline entry

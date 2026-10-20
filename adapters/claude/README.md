@@ -197,6 +197,15 @@ explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
 with an empty prompt, or opens a tab in the same workspace. No pane move or
 extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
 
+## Fleet background Bash rows
+
+Fleet reads Bash `tool_use`/`tool_result` pairs from the exact session
+transcript. A native background acknowledgement identifies a task and its
+output file; the acknowledgement is not proof that the process is still alive.
+Fleet reports a process as alive only when an identity-checked descendant has
+the exact writable output-file descriptor. File presence alone is output
+evidence, not liveness. See [Claude background Bash documentation](https://code.claude.com/docs/en/interactive-mode#background-bash-commands).
+
 ## Runtime compaction tidy
 
 `PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the card at the session's own verified pane/native seat. Only an explicit automatic trigger with both card files successfully saved can book the existing handover snapshot → clear → `이어서해` flow. Its helper waits up to three hours for transcript evidence that the compacted turn ended; idle alone does not clear. Before clearing, it preserves the full summary, a bounded recent tail, and the transcript path on the card. Manual/unknown compaction, empty or failed cards, project/outside-herdr seats, and workers/sub-sessions stay queue-only; compaction is never held for tidy.

@@ -2547,3 +2547,40 @@ traffic overlaps snapshot acquisition, discard that candidate and retry once;
 continued overlap leaves the endpoint unknown. On `events_lost`, disconnect,
 or protocol fault, invalidate the endpoint view, resubscribe, and require a
 successful complete snapshot before using cached pane state again.
+
+## Fleet background shell observation
+
+Fleet may project several exact native background shell tasks under one exact
+interactive session or registered attempt. A task identity is the harness,
+full session ID, attempt ID when present, source generation, and native call or
+task handle. A native handle is never an operating-system PID. Task discovery,
+native lifecycle, process liveness, command summary, timestamps, and output
+coverage are separate evidence; a missing fact stays unknown with its source
+reason.
+
+The shared row is advisory and passive. It does not alter parent session
+liveness, pulse, route state, gate, or controls. It carries a bounded sanitized
+command, start/elapsed when its timestamp is valid, native completion/exit when
+explicit, and process alive/dead only when the exact process generation and
+namespace or an exact writable output-file descriptor is verified. Stale output
+files, native handles, similar commands/cwd, poll timestamps, and model-turn
+completion do not prove process liveness or task exit. Output age is shown with
+its coverage; a ten-minute quiet hint requires a valid continuous file window
+and is suppressed after completion. Missing clocks and failed or partial reads
+remain visible as gaps.
+
+Readers stay on the existing Claude transcript, Codex rollout, OpenCode native
+reader, and exact attempt/companion paths. Reads are bounded and catch up by
+source generation; rendering performs no observation I/O. JSON keeps the
+legacy `exec_child` and `exec_tool` fields and adds the same per-task evidence.
+Rows use the existing child layout and never borrow another session or attempt.
+No process is started, stopped, or restarted by this observation.
+
+**Accepted PRD delta (2026-10-20):** the current shared Fleet PRD v86 F-47 still
+describes one session badge and hides calls younger than 60 seconds. The
+approved background-task intent expands those display limits for acknowledged
+native background jobs while preserving F-47's parent-classification and
+zero-injection boundaries. The shared PRD snapshot is read-only in this route;
+this text records the delta and does not claim that the canonical PRD revision
+has been amended. The task owner carries the delta through the existing spec
+maintenance path.

@@ -26,9 +26,11 @@ import sqlite3
 import stat
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from ..model import ContextEvidence, SubAgent
+from . import shell_jobs as _shell_jobs
 from .. import session_registry
 from .. import titles
 
@@ -40,6 +42,99 @@ _COLS = ("id, slug, agent, model, cost, tokens_input, tokens_output, tokens_reas
 # collectors must not import render at module scope (see session_registry's import
 # contract), so the two lists are kept in step by name and test rather than by dependency.
 _DEFAULT_VARIANTS = frozenset({"default", "runtime-default", "inherit"})
+_V2_SHELL_TASKS = OrderedDict()
+_V2_SHELL_TASK_LIMIT = 256
+
+
+def _v2_shell_key(db, session_id, attempt_id=None):
+    return (os.path.realpath(db), session_id, attempt_id, "v2")
+
+
+def _v2_shell_cursor(db, session_id, attempt_id=None):
+    state = _V2_SHELL_TASKS.get(_v2_shell_key(db, session_id, attempt_id))
+    if not isinstance(state, dict):
+        return 0
+    try:
+        st = os.stat(db)
+        identity = {"device": st.st_dev, "inode": st.st_ino}
+    except OSError:
+        identity = None
+    return state.get("cursor", 0) if state.get("database_identity") == identity else 0
+
+
+def _attach_v2_shell_tasks(sess, observed, db, session_id):
+    attempt_id = getattr(sess, "attempt_id", None)
+    key = _v2_shell_key(db, session_id, attempt_id)
+    source = observed.get("database_identity")
+    source_label = ("opencode-v2:%s:%s" % (source.get("device"), source.get("inode"))
+                    if isinstance(source, dict) else "opencode-v2:identity-unavailable")
+    state = _V2_SHELL_TASKS.get(key)
+    if (not isinstance(state, dict) or state.get("database_identity") != source):
+        retired = list(state.get("retired_jobs", ())) if isinstance(state, dict) else []
+        overflow = bool(state.get("overflow")) if isinstance(state, dict) else False
+        if isinstance(state, dict):
+            for old in state.get("jobs", {}).values():
+                item = dict(old)
+                item.update(observation_state="unknown",
+                            observation_reason="database-generation-changed",
+                            process_state="unknown",
+                            process_reason="database-generation-changed")
+                retired.append(item)
+        state = {"database_identity": source, "cursor": 0,
+                 "jobs": OrderedDict(), "retired_jobs": retired[-256:],
+                 "overflow": overflow or len(retired) > 256}
+    cursor = observed.get("shell_cursor") or {}
+    if isinstance(cursor.get("next_seq"), int) and not isinstance(cursor.get("next_seq"), bool):
+        state["cursor"] = max(state.get("cursor", 0), cursor["next_seq"])
+    for native in observed.get("shell_tasks") or ():
+        if not isinstance(native, dict) or not native.get("native_id"):
+            continue
+        native_id = str(native["native_id"])
+        previous = state["jobs"].get(native_id, {})
+        started_ms = native.get("started_at_ms")
+        started = _shell_jobs.valid_epoch(
+            started_ms, milliseconds=isinstance(started_ms, (int, float)) and not isinstance(started_ms, bool))
+        updated_ms = native.get("time_updated")
+        observed_at = _shell_jobs.valid_epoch(
+            updated_ms, milliseconds=isinstance(updated_ms, (int, float)) and not isinstance(updated_ms, bool))
+        item = dict(previous)
+        item.update({
+            "harness": "opencode", "session_id": session_id,
+            "attempt_id": attempt_id,
+            "source_generation": source_label,
+            "source_locator": os.path.realpath(db), "native_id": native_id,
+            "native_call_id": native.get("call_id"), "command": (native.get("input") or {}).get("command"),
+            "command_source": "session_message.shell.input.command",
+            "started_at": previous.get("started_at", started),
+            "start_source": "part.time.ran|created", "observed_at": observed_at or time.time(),
+            "native_status": "acknowledged", "invocation_status": native.get("invocation_status"),
+            "invocation_completed_at": _shell_jobs.valid_epoch(
+                native.get("invocation_completed_at_ms"), milliseconds=True),
+            "process_state": "unknown", "process_reason": "opencode-background-process-id-unobserved",
+            "output_coverage": "unavailable", "output_reason": "managed-output-locator-unobserved",
+            "observation_state": cursor.get("state"), "observation_reason": cursor.get("reason"),
+            "source_revision": (native.get("seq"), native.get("time_updated")),
+        })
+        state["jobs"][native_id] = item
+        state["jobs"].move_to_end(native_id)
+        while len(state["jobs"]) > _shell_jobs.MAX_RETAINED_TASKS:
+            state["jobs"].popitem(last=False)
+            state["overflow"] = True
+    _V2_SHELL_TASKS[key] = state
+    _V2_SHELL_TASKS.move_to_end(key)
+    while len(_V2_SHELL_TASKS) > _V2_SHELL_TASK_LIMIT:
+        _V2_SHELL_TASKS.popitem(last=False)
+    sess.shell_jobs = _shell_jobs.observe_jobs(
+        list(state.get("retired_jobs", ())) + list(state["jobs"].values()), now=time.time(),
+        parent_pid=getattr(sess, "pid", None), parent_start=getattr(sess, "proc_start", None),
+        attempt_id=attempt_id)
+    sess.shell_job_observation = {
+        "state": "partial" if state.get("overflow") else cursor.get("state", "unknown"),
+        "reason": "task-retention-limit" if state.get("overflow") else cursor.get("reason"),
+        "coverage": "partial" if (state.get("overflow") or not cursor.get("caught_up")
+                                     or cursor.get("state") != "observed") else "complete",
+        "cursor": state.get("cursor"), "source_generation": source,
+    }
 
 _REG = {"ts": 0.0, "map": None, "by_provider": None}   # → context window (from models.json)
 _REG_TTL = 300.0
@@ -77,9 +172,13 @@ def _enrich_v2(sess, tick, db):
     if not runtime.credential_store_present(db_path=db):
         return False
     sid, binding_source = session_of_process(sess.pid) if getattr(sess, "pid", None) else (None, "")
+    shell_cursor = (None if getattr(sess, "_fast_first", False)
+                    else _v2_shell_cursor(db, sid, getattr(sess, "attempt_id", None))
+                    if sid else 0)
     generation = None
     if sid:
-        observed = runtime.read_session_observation(sid, db_path=db)
+        observed = runtime.read_session_observation(
+            sid, db_path=db, shell_after_seq=shell_cursor)
         if observed.get("state") == "observed":
             generation = observed.get("generation")
     else:
@@ -96,17 +195,33 @@ def _enrich_v2(sess, tick, db):
                 generation = candidates[0].get("generation")
                 binding_source = "unique-process-window"
                 observed = runtime.read_session_observation(
-                    sid, db_path=db, generation=generation)
+                    sid, db_path=db, generation=generation,
+                    shell_after_seq=shell_cursor)
     if not sid:
+        sess.shell_jobs = []
+        sess.shell_job_observation = {"state": "unavailable", "reason": "exact-session-id-unresolved"}
         _attempt_sidecar_fallback(sess)
         return True
     if generation != "v2":
+        sess.shell_jobs = []
+        if generation == "v1":
+            sess.shell_job_observation = {
+                "state": "unobserved", "reason": "v1-background-native-record-not-observed"}
+        else:
+            sess.shell_job_observation = {
+                "state": observed.get("state", "unknown"),
+                "reason": observed.get("reason", "runtime-generation-unresolved")}
         return True
     if "observed" not in locals():
-        observed = runtime.read_session_observation(sid, db_path=db, generation="v2")
+        observed = runtime.read_session_observation(
+            sid, db_path=db, generation="v2", shell_after_seq=shell_cursor)
     if observed.get("state") != "observed" or observed.get("generation") != "v2":
+        sess.shell_jobs = []
+        sess.shell_job_observation = {"state": observed.get("state", "unknown"),
+                                     "reason": observed.get("reason", "v2-source-unavailable")}
         _attempt_sidecar_fallback(sess)
         return True
+    _attach_v2_shell_tasks(sess, observed, db, sid)
     native = observed.get("session") or {}
     if native.get("directory") and sess.cwd and os.path.realpath(native["directory"]) != os.path.realpath(sess.cwd):
         # The process/session binding is exact, but a mismatched directory is
