@@ -281,9 +281,11 @@ class FramedStartPolicyTest(SourceWorktreeFixture):
 
         def readiness(cwd, jobs, parent_harness, children, **kwargs):
             self.probe_cwds.append(str(Path(cwd).resolve()))
+            # The caller's harness follows the session running the test; seal a sandbox its wrapper exports.
             return {"tuples": [{
                 "parent_harness": parent_harness, "parent_transport": "headless",
-                "parent_sandbox": "adapter-default", "child_harness": "codex",
+                "parent_sandbox": {"codex": "workspace-write"}.get(parent_harness, "adapter-default"),
+                "child_harness": "codex",
                 "launch_authority": "conductor", "status": "supported",
                 "probe_source": "fixture", "probe_time": "2026-10-15T00:00:00Z",
                 "failure_class": "", "checked_worktree": str(Path(cwd).resolve()),
