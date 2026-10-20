@@ -222,6 +222,9 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
         if isinstance(state, dict):
             for old in state.get("jobs", {}).values():
                 item = dict(old)
+                item.update(current_generation_valid=False,
+                            current_execution_state="unknown",
+                            current_execution_reason="source-generation-retired")
                 if not _native_terminal(item):
                     item.update(observation_state="unknown",
                                 observation_reason="database-generation-changed",
@@ -239,6 +242,7 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
     pending.difference_update(cursor.get("refreshed_seqs") or ())
     pending.update(cursor.get("mutable_seqs") or ())
     state["mutable_seqs"] = pending
+    collection_at = time.time()
     current_ids = {}
     for native in observed.get("shell_tasks") or ():
         if isinstance(native, dict) and native.get("native_id"):
@@ -250,6 +254,7 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
             current_ids.setdefault(str(old["native_id"]), set()).add(
                 old.get("native_id_kind") or old.get("native_record_kind") or "unknown")
     ambiguous_ids = {native_id for native_id, kinds in current_ids.items() if len(kinds) > 1}
+    observed_job_keys = set()
     for native in observed.get("shell_tasks") or ():
         if not isinstance(native, dict) or not native.get("native_id"):
             continue
@@ -257,6 +262,7 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
         native_id_kind = native.get("native_id_kind") or "assistant-tool-part"
         native_record_kind = native.get("native_record_kind") or "assistant-shell-tool-part"
         job_key = (native_id_kind, native_id)
+        observed_job_keys.add(job_key)
         previous = state["jobs"].get(job_key, {})
         started_ms = native.get("started_at_ms")
         started = _shell_jobs.valid_epoch(
@@ -281,6 +287,10 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
             native.get("invocation_completed_at_ms"), milliseconds=True)
             if not is_native_shell else None)
         item = dict(previous)
+        previous_terminal = _native_terminal(previous)
+        current_native_running = (is_native_shell and native_status.lower() == "running"
+                                  and not previous_terminal)
+        current_native_terminal = native_terminal or previous_terminal
         item.update({
             "harness": "opencode", "session_id": session_id,
             "attempt_id": attempt_id,
@@ -299,7 +309,26 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
                                else "assistant.shell.input.command"),
             "started_at": previous.get("started_at", started),
             "start_source": native.get("start_source") or "assistant-shell-part.time.ran|created",
-            "observed_at": observed_at or time.time(),
+            "native_event_at": observed_at,
+            "observed_at": collection_at,
+            "current_generation_valid": previous.get("current_generation_valid") is not False,
+            "current_execution_state": (
+                "terminal" if current_native_terminal else
+                "running" if current_native_running else
+                "unknown" if is_native_shell else
+                previous.get("current_execution_state", "unknown")),
+            "current_execution_source": (
+                "opencode.v2.session-message.exact-query" if is_native_shell else
+                previous.get("current_execution_source")),
+            "current_execution_reason": (
+                "native-terminal-cache-prevents-resurrection" if previous_terminal and not native_terminal else
+                "native-terminal-row" if native_terminal else
+                None if current_native_running else
+                "exact-native-row-is-not-running" if is_native_shell else
+                previous.get("current_execution_reason")),
+            "current_execution_at": (collection_at if current_native_running else
+                                     None if is_native_shell or current_native_terminal else
+                                     previous.get("current_execution_at")),
             "native_status": native_status,
             "native_status_source": native.get("native_status_source"),
             "invocation_status": native.get("invocation_status") if not is_native_shell else None,
@@ -330,6 +359,13 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
                     item[field] = previous[field]
         state["jobs"][job_key] = item
         state["jobs"].move_to_end(job_key)
+    for job_key, item in state.get("jobs", {}).items():
+        if (job_key not in observed_job_keys
+                and item.get("native_record_kind") == "session-message-shell"
+                and not _native_terminal(item)):
+            item.update(current_execution_state="unknown",
+                        current_execution_reason="native-row-not-refreshed-this-collection",
+                        current_execution_at=None)
     for item in state.get("jobs", {}).values():
         if str(item.get("native_id")) in ambiguous_ids:
             item["identity_link_state"] = "ambiguous-cross-namespace-id"
@@ -345,7 +381,7 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
     pending_overflow = len(state.get("mutable_seqs", ())) > \
         _opencode_v2_runtime().MAX_SHELL_TASK_REFRESH
     sess.shell_jobs = _shell_jobs.observe_jobs(
-        list(state.get("retired_jobs", ())) + list(state["jobs"].values()), now=time.time(),
+        list(state.get("retired_jobs", ())) + list(state["jobs"].values()), now=collection_at,
         parent_pid=getattr(sess, "pid", None), parent_start=getattr(sess, "proc_start", None),
         attempt_id=attempt_id, tree=tree, kids=kids)
     sess.shell_job_observation = {

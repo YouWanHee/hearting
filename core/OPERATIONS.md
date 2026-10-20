@@ -2588,12 +2588,12 @@ record kind, lifecycle, process, and output evidence: `confirmed` needs exact
 native evidence, otherwise it is `unknown` with its source or reason. Runtime
 handles and completion records describe runtime state, not a process.
 
-Completed rows retain the 15-minute dispatch afterglow in JSON and child rows;
-only a known completion age expires them. Live, pending, unknown, and untimed
-terminal work stays visible, and display expiry leaves reader cache available
-for later native updates. A verified writer becomes dead only after the same
-observer proves disappearance or PID-generation replacement; unreadable
-identity checks remain unknown. Stale files, native handles, similar
+Completed rows retain the 15-minute dispatch afterglow in JSON and detailed
+history; only a known completion age expires them. Live, pending, unknown, and
+untimed terminal work stays in that history, and display expiry leaves reader
+cache available for later native updates. A verified writer becomes dead only
+after the same observer proves disappearance or PID-generation replacement;
+unreadable identity checks remain unknown. Stale files, native handles, similar
 commands/cwd, poll times, and model-turn completion are insufficient for
 process liveness or task exit. Output age includes its coverage. A ten-minute
 quiet hint needs a continuous file window with valid, non-future, non-backward
@@ -2672,7 +2672,37 @@ background record form.
 describes one session badge and hides calls younger than 60 seconds. The
 approved background-task intent expands those display limits for acknowledged
 native background jobs while preserving F-47's parent-classification and
-zero-injection boundaries. The shared PRD snapshot is read-only in this route;
-this text records the delta and does not claim that the canonical PRD revision
-has been amended. The task owner carries the delta through the existing spec
-maintenance path.
+zero-injection boundaries, alongside the v86 Codex stale-`idle` correction.
+
+The shared screen selector is separate from JSON/detail history. Its eligible
+jobs have confirmed background mode, a current source generation, nonterminal
+status and current execution evidence. The deduplication key is `(harness,
+full session ID, optional attempt ID, source generation, source locator, optional
+native ID kind, native call/task ID)`; incomplete identities are excluded. Terminal
+facts override stale running caches, and retired generations remain invalid
+through normalization, observation, merging and serialization.
+
+Current evidence comes from an exact live writable-descriptor/process-generation
+observation, an actually queried mutable native running row, or an exact Claude
+nonterminal update / Codex structured ongoing continuation with valid event time
+`0 <= now - evidence_at <= 120`. This internal tolerance is independent of task
+age and adds no setting or runtime freshness guarantee. Acknowledgements,
+start-only records, rereads, retained cache, collection time, output-file
+presence, prior process-alive values and parent liveness supply no new execution
+evidence. Missing, invalid, future, backward or stale evidence stays unknown;
+completion and failure retain their native authority. Unrelated partial source
+coverage leaves independently valid exact process evidence usable.
+
+An existing NOW detail line carries only the newest eligible job, elapsed time
+and `(+N)` for the others. A missing valid start uses current evidence time for
+ordering and `?` for elapsed. The suffix shrinks from sanitized command clipping
+to `⚙ N` to omission; NOW prose/resource text, age, gauge and foreground badge
+retain priority and the existing line count. Shell-only rows and repeated
+observation rows are absent; bounded JSON/detail history retains completed,
+unknown, historical, retired and unobserved tasks. Parent classification,
+pulse, route, gates and controls are unaffected; native handles remain distinct
+from OS process identities.
+
+The read-only shared PRD summary is labelled v85 while this accepted delta is
+labelled v86. This records the boundary for existing spec maintenance without
+claiming an amendment to that shared snapshot.

@@ -179,6 +179,8 @@ class CurrentSessionTest(unittest.TestCase):
                   "agent_session": {"agent": "claude", "value": "current"}}] if bound else None
         bindings = {self.pid: {"wB:p3N"}} if bound else {}
         with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(herdr, "observation_view", return_value=None), \
+                mock.patch.object(herdr._observation_module(), "socket_path_for_endpoint", return_value=""), \
                 mock.patch.object(herdr, "list_agents", return_value=None), \
                 mock.patch.object(herdr, "list_panes", side_effect=AssertionError("extra pane probe")), \
                 mock.patch.object(process_identity, "pane_session_successors", return_value={"old": {"current"}}):

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import render  # noqa: E402
 from fleet.collectors import dispatch, opencode, procscan, shell_jobs  # noqa: E402
 from fleet.model import (DONE_AFTERGLOW_MIN, DispatchJob, Session,
+                         current_background_shell_jobs,
                          display_shell_jobs)  # noqa: E402
 
 
@@ -26,6 +27,12 @@ class BackgroundShellJobsTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    @staticmethod
+    def context_text(session, width, now):
+        with mock.patch("time.time", return_value=now):
+            lines = render._context_detail_row(session, term_width=width)
+        return "\n".join("".join(text for text, _key in line) for line in lines)
 
     def write_jsonl(self, path, rows, mode="w"):
         with open(path, mode, encoding="utf-8") as stream:
@@ -67,7 +74,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
             "attempt_id": "attempt-redaction", "source_generation": "gen-1",
             "source_locator": "/tmp/rollout.jsonl", "native_id": "item:1",
             "native_record_kind": "codex.command_execution",
-            "background_state": "unknown", "native_status": "running",
+            "background_state": "confirmed", "background_source": "fixture",
+            "native_status": "running", "current_generation_valid": True,
+            "current_execution_state": "running", "current_execution_source": "fixture",
+            "current_execution_at": 1792463235,
             "command": command, "command_display": display,
             "command_source": "fixture", "command_display_source": "fixture",
             "process_state": "unknown", "output_coverage": "unavailable",
@@ -77,9 +87,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
                           shell_jobs=[payload])
         public_json = json.dumps(session.to_dict()["shell_jobs"]).lower()
         with mock.patch.object(shell_jobs.time, "time", return_value=1792463235):
-            row_text = "\n".join("".join(text for text, _key in line)
-                                 for line in render._shell_job_rows(
-                                     session, term_width=120)).lower()
+            row_text = self.context_text(session, 120, 1792463235).lower()
         for surface in (summary.lower(), public_json, row_text):
             for secret in ("raw-secret", "quoted secret", "equals-secret",
                            "equals-option-secret",
@@ -116,7 +124,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
                 session_id="session-native-fixture", attempt_id=attempt_id,
                 shell_jobs=attempt.shell_jobs)
             public = session.to_dict()
-            rendered = render._shell_job_rows(session, term_width=140)
+        rendered = self.context_text(session, 140, now)
 
         jobs = {job["native_task_id"]: job for job in public["shell_jobs"]}
         self.assertEqual(set(jobs), {"task-fixture-a", "task-fixture-b"})
@@ -142,9 +150,8 @@ class BackgroundShellJobsTests(unittest.TestCase):
                           job["native_record_kinds"])
             self.assertIn("claude.system.task_updated", job["native_record_kinds"])
             self.assertIn("claude.system.task_notification", job["native_record_kinds"])
-        row_text = "\n".join("".join(text for text, _key in line) for line in rendered)
-        self.assertIn("python3 train.py --epochs 3", row_text)
-        self.assertIn("background confirmed", row_text)
+        self.assertNotIn("python3 train.py --epochs 3", rendered)
+        self.assertNotIn("background confirmed", rendered)
         self.assertNotIn("background_tasks_changed", json.dumps(public))
 
     def test_claude_native_stream_rejects_unmatched_and_echoed_lifecycle_events(self):
@@ -215,6 +222,40 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertNotIn("exit_code", jobs[0])
         self.assertIsNone(jobs[0]["completed_at"])
 
+    def test_claude_running_update_is_current_but_reread_does_not_refresh_it(self):
+        sid = "session-current-update"
+        call_id, task_id, run_id = "toolu-current-call", "task-current", "run-current"
+        path = self.root / "claude-current-update.jsonl"
+        rows = [
+            {"type": "assistant", "session_id": sid, "timestamp": 1000,
+             "message": {"content": [{"type": "tool_use", "name": "Bash",
+                 "id": call_id, "input": {"command": "python train.py",
+                                           "run_in_background": True}}]}},
+            {"type": "system", "subtype": "task_started", "task_id": task_id,
+             "run_id": run_id, "tool_use_id": call_id, "is_backgrounded": True,
+             "task_type": "local_bash", "session_id": sid, "timestamp": 1001},
+            {"type": "system", "subtype": "task_updated", "task_id": task_id,
+             "run_id": run_id, "tool_use_id": call_id, "session_id": sid,
+             "timestamp": 1003, "patch": {"status": "running"}},
+        ]
+        self.write_jsonl(path, rows)
+        first = shell_jobs.read_claude_jobs(path, session_id=sid, now=1003)
+        self.assertEqual(first[0]["background_state"], "confirmed")
+        self.assertEqual(first[0]["current_execution_state"], "running")
+        self.assertEqual(first[0]["current_execution_at"], 1003)
+        self.assertEqual(len(current_background_shell_jobs(first, now=1003)), 1)
+
+        boundary = shell_jobs.read_claude_jobs(path, session_id=sid, now=1123)
+        self.assertEqual(boundary[0]["current_execution_state"], "running")
+        self.assertEqual(boundary[0]["native_event_at"], 1003)
+        self.assertEqual(boundary[0]["observed_at"], 1123)
+        self.assertEqual(len(current_background_shell_jobs(boundary, now=1123)), 1)
+
+        stale = shell_jobs.read_claude_jobs(path, session_id=sid, now=1124)
+        self.assertEqual(stale[0]["current_execution_state"], "unknown")
+        self.assertEqual(stale[0]["native_status"], "running")
+        self.assertEqual(len(current_background_shell_jobs(stale, now=1124)), 0)
+
     def test_claude_native_stream_source_generation_blocks_old_completion(self):
         sid = "session-native-generation"
         call_id = "toolu-generation-call"
@@ -237,6 +278,9 @@ class BackgroundShellJobsTests(unittest.TestCase):
             path, session_id=sid, attempt_id="attempt-generation",
             now=1792463235)
         self.assertEqual(before[0]["native_status"], "running")
+        self.assertEqual(before[0]["current_execution_state"], "unknown")
+        self.assertEqual(before[0]["current_execution_reason"],
+                         "native-task-start-is-not-execution-proof")
         stale_terminal = {
             "type": "system", "subtype": "task_notification", "task_id": task_id,
             "run_id": run_id, "tool_use_id": call_id, "status": "failed",
@@ -252,6 +296,11 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertIsNone(after[0]["completed_at"])
         self.assertNotIn("exit_code", after[0])
         self.assertEqual(after[0]["observation_reason"], "source-generation-changed")
+        self.assertIs(after[0]["current_generation_valid"], False)
+        self.assertEqual(after[0]["current_execution_state"], "unknown")
+        self.assertEqual(shell_jobs.normalize_job(after[0], now=1792463235)[
+            "current_execution_reason"], "source-generation-retired")
+        self.assertEqual(current_background_shell_jobs(after, now=1792463235), [])
 
     def test_claude_native_end_time_keeps_invalid_future_and_missing_clocks_uncertain(self):
         for label, patch, expected_state in (
@@ -361,16 +410,14 @@ class BackgroundShellJobsTests(unittest.TestCase):
                                   shell_jobs=observed)
                 with mock.patch("time.time", return_value=now):
                     public = session.to_dict()
-                    rows = render._shell_job_rows(session, term_width=100)
                 json_job = public["shell_jobs"][0]
                 self.assertEqual(json_job["native_task_id"], task_id)
                 self.assertEqual(json_job["background_state"], "unknown")
                 self.assertIsNone(json_job["background_source"])
                 self.assertEqual(json_job["background_reason"], job["background_reason"])
-                row_text = "\n".join("".join(text for text, _key in line)
-                                      for line in rows)
-                self.assertIn("background unknown", row_text)
-                self.assertNotIn("background confirmed", row_text)
+                row_text = self.context_text(session, 100, now)
+                self.assertNotIn(task_id, row_text)
+                self.assertNotIn("background unknown", row_text)
 
     def test_claude_native_task_metadata_confirms_without_request_flag(self):
         path = self.root / "native-metadata.jsonl"
@@ -413,15 +460,13 @@ class BackgroundShellJobsTests(unittest.TestCase):
                           shell_jobs=observed)
         with mock.patch("time.time", return_value=job["observed_at"]):
             public = session.to_dict()
-            rows = render._shell_job_rows(session, term_width=100)
         json_job = public["shell_jobs"][0]
         self.assertEqual(json_job["native_task_id"], task_id)
         self.assertEqual(json_job["background_state"], "confirmed")
         self.assertEqual(json_job["background_source"], job["background_source"])
         self.assertIsNone(json_job["background_reason"])
-        row_text = "\n".join("".join(text for text, _key in line)
-                              for line in rows)
-        self.assertIn("background confirmed", row_text)
+        row_text = self.context_text(session, 100, job["observed_at"])
+        self.assertNotIn(task_id, row_text)
         self.assertNotIn(echoed_id, row_text)
 
     def test_claude_task_metadata_needs_valid_id_and_exact_result_pair(self):
@@ -668,7 +713,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
             "native_status": "running", "started_at": base}, now=base + 401)
         self.assertEqual(active["elapsed_s"], 401)
 
-    def test_shell_job_afterglow_boundary_and_json_row_selection_match(self):
+    def test_shell_job_afterglow_history_is_not_rendered_as_child_rows(self):
         self.assertEqual(DONE_AFTERGLOW_MIN, 15)
         now = 10000.0
         def job(native_id, state, completed_at=None, started_at=9000):
@@ -696,13 +741,11 @@ class BackgroundShellJobsTests(unittest.TestCase):
         enriched = shell_jobs.observe_jobs(visible, now=live_now)
         session = Session(harness="codex", pid=1, cwd=str(self.root), shell_jobs=enriched)
         public_ids = {item["native_id"] for item in session.to_dict()["shell_jobs"]}
-        rows = "".join(part[0] for line in render._shell_job_rows(
-            session, term_width=180) for part in line)
-        row_ids = {name for name in ("recent", "expired", "active-long", "unknown-long",
-                                     "completion-unknown") if "echo " + name in rows}
-        self.assertEqual(public_ids, row_ids)
+        detail = self.context_text(session, 180, live_now)
+        self.assertNotIn("echo ", detail)
+        self.assertNotIn("completion ?", detail)
         self.assertNotIn("expired", public_ids)
-        self.assertIn("completion ?", rows)
+        self.assertIn("completion-unknown", public_ids)
 
     def test_live_and_unknown_shell_jobs_precede_stable_untimed_history(self):
         now = 10000.0
@@ -723,19 +766,24 @@ class BackgroundShellJobsTests(unittest.TestCase):
         live = {"harness": "codex", "session_id": "s", "native_id": "live-later",
                 "command": "echo live-later", "lifecycle_state": "running",
                 "native_status": "running", "started_at": 9950,
+                "source_generation": "gen-1", "source_locator": "/tmp/codex.jsonl",
+                "background_state": "confirmed", "background_source": "fixture",
+                "current_generation_valid": True, "current_execution_state": "running",
+                "current_execution_source": "codex.continuation",
+                "current_execution_at": now - 1,
                 "process_state": "unknown", "output_coverage": "sampled"}
         jobs = terminal + [pending, unresolved, live]
         session = Session(harness="codex", pid=1, session_id="s", shell_jobs=jobs)
         with mock.patch("time.time", return_value=now):
             public = session.to_dict()
-            rows = render._shell_job_rows(session, term_width=180)
+        screen = self.context_text(session, 180, now)
         expected = ["live-later", "pending-later", "unknown-later"] + [
             "done-%02d" % index for index in range(40)]
         self.assertEqual([job["native_id"] for job in public["shell_jobs"]], expected)
-        texts = ["".join(text for text, _key in line) for line in rows]
-        found_order = [next(name for name in expected if "echo " + name in line)
-                       for line in texts]
-        self.assertEqual(found_order, expected)
+        self.assertIn("echo live-later", screen)
+        self.assertNotIn("pending-later", screen)
+        self.assertNotIn("unknown-later", screen)
+        self.assertNotIn("done-00", screen)
         self.assertEqual(sum(job["lifecycle_state"] == "completed"
                              for job in public["shell_jobs"]), 40)
 
@@ -795,6 +843,22 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertEqual(by_handle["101"]["exit_code"], 2)
         self.assertEqual(by_handle["202"]["lifecycle_state"], "running")
 
+        self.write_jsonl(path, [
+            {"timestamp": "2026-10-20T00:00:08Z", "payload": {
+                "type": "custom_tool_call", "call_id": "late-poll", "name": "write_stdin",
+                "input": {"session_id": 101}}},
+            {"timestamp": "2026-10-20T00:00:09Z", "payload": {
+                "type": "custom_tool_call_output", "call_id": "late-poll",
+                "output": {"session_id": 101, "output": "", "status": "running"}}},
+        ], mode="a")
+        jobs = shell_jobs.read_codex_jobs(path, session_id="thread-a", now=1792454409)
+        by_handle = {item["continuation_handle"]: item for item in jobs}
+        self.assertEqual(by_handle["101"]["native_status"], "completed")
+        self.assertEqual(by_handle["101"]["lifecycle_state"], "completed")
+        self.assertEqual(by_handle["101"]["current_execution_state"], "terminal")
+        self.assertEqual([item["continuation_handle"] for item in
+                          current_background_shell_jobs(jobs, now=1792454409)], ["202"])
+
         session = Session(harness="codex", pid=10, session_id="thread-a",
                           liveness="idle", shell_jobs=jobs)
         with mock.patch("time.time", return_value=1792454407):
@@ -805,15 +869,16 @@ class BackgroundShellJobsTests(unittest.TestCase):
                             for item in public["shell_jobs"]))
         with mock.patch("time.time", return_value=1792454407), \
                 mock.patch("os.stat", side_effect=AssertionError("render attempted observation I/O")):
-            by_width = {width: render._shell_job_rows(session, term_width=width)
+            by_width = {width: render._context_detail_row(session, term_width=width)
                         for width in (60, 100, 120, 168)}
         for width, rows in by_width.items():
             for line in rows:
                 self.assertLessEqual(render._dw("".join(text for text, _key in line)), width)
         rendered = "".join(text for line in by_width[120] for text, _key in line)
-        self.assertIn("native exit 2", rendered)
-        self.assertIn("background confirmed", rendered)
-        self.assertIn("proc ?", rendered)
+        self.assertIn("sleep 12", rendered)
+        self.assertNotIn("sleep 10", rendered)
+        self.assertNotIn("native exit 2", rendered)
+        self.assertNotIn("background confirmed", rendered)
 
         worker = DispatchJob(key="autopilot-code", slug="worker-shell-jobs",
                              harness="codex", liveness="working", shell_jobs=jobs)
@@ -824,8 +889,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
             process_lines, _meta = render._degrade_card(worker, {}, term_width=120)
             process_screen = "\n".join(render._plain(line) for line in process_lines if line)
         self.assertIn("worker-shell-jobs", group_screen)
-        self.assertIn("native exit 2", group_screen)
-        self.assertIn("native exit 2", process_screen)
+        self.assertIn("sleep 12", group_screen)
+        self.assertIn("sleep 12", process_screen)
+        self.assertNotIn("native exit 2", group_screen)
+        self.assertNotIn("native exit 2", process_screen)
 
     def test_codex_native_command_events_project_running_and_exit_without_stdout_parsing(self):
         path = self.root / "native-events.jsonl"
@@ -864,14 +931,12 @@ class BackgroundShellJobsTests(unittest.TestCase):
                           shell_jobs=jobs)
         with mock.patch("time.time", return_value=1792454405):
             public = session.to_dict()
-            rows = render._shell_job_rows(session, term_width=100)
         self.assertEqual(public["shell_jobs"][0]["background_state"], "unknown")
         self.assertEqual(public["shell_jobs"][0]["native_record_kind"],
                          "codex.command_execution")
-        self.assertIn("background unknown", "".join(
-            text for line in rows for text, _key in line))
-        self.assertIn("out sampled", "".join(
-            text for line in rows for text, _key in line))
+        rendered = self.context_text(session, 100, 1792454405)
+        self.assertNotIn("sleep 5", rendered)
+        self.assertNotIn("background unknown", rendered)
         later = shell_jobs.read_codex_jobs(
             path, session_id="thread-native", attempt_id="attempt-a", now=1792455005)
         self.assertEqual(later[0]["elapsed_s"], 5)
@@ -920,23 +985,14 @@ class BackgroundShellJobsTests(unittest.TestCase):
             with mock.patch("time.time", return_value=now), \
                     mock.patch("os.stat", side_effect=AssertionError(
                         "render attempted observation I/O")):
-                rendered = render._shell_job_rows(session, term_width=width)
+                rendered = render._context_detail_row(session, term_width=width)
             texts = ["".join(text for text, _key in line) for line in rendered]
             self.assertTrue(all(render._dw(line) <= width for line in texts))
             joined = "\n".join(texts)
             for _command, display in commands:
-                self.assertIn(display, joined)
-            self.assertIn("start ", joined)
-            self.assertIn("10s", joined)
-            self.assertIn("background unknown", joined)
-            self.assertIn("native running", joined)
-            self.assertIn("proc ?", joined)
-            self.assertIn("out sampled", joined)
+                self.assertNotIn(display, joined)
         self.assertTrue(all(job["command_display_source"] ==
                             "codex.native-shell-command.argv" for job in jobs))
-        label = shell_jobs.shell_job_strip_label(jobs[0])
-        self.assertTrue(label.startswith(jobs[0]["command_display"]))
-        self.assertIn("background unknown", label)
 
     def test_codex_direct_result_without_exact_handle_stays_unobserved(self):
         path = self.root / "missing-native-continuation.jsonl"
@@ -1167,9 +1223,8 @@ class BackgroundShellJobsTests(unittest.TestCase):
                           shell_jobs=[future_after_quiet])
         with mock.patch("os.stat", side_effect=AssertionError("render attempted observation I/O")):
             public = session.to_dict()
-            rows = render._shell_job_rows(session, term_width=100)
         self.assertFalse(public["shell_jobs"][0]["quiet_suspected"])
-        rendered = "".join(text for line in rows for text, _key in line).lower()
+        rendered = self.context_text(session, 100, base + 601).lower()
         self.assertNotIn("quiet", rendered)
 
         os.utime(transition, (base + 701, base + 701))
@@ -1436,7 +1491,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
         def shell_row(shell_id, command, *, background=True, status="running",
                       completed=None, exit_code=None, output=None):
             row = {"metadata": {"background": background},
-                   "time": {"created": now_ms - 5000},
+                   "time": {"created": now_ms - 5 * 60 * 60 * 1000},
                    "shellID": shell_id, "command": command, "status": status}
             if completed is not None:
                 row["time"]["completed"] = completed
@@ -1458,9 +1513,11 @@ class BackgroundShellJobsTests(unittest.TestCase):
                 (other_sid, str(self.root), now_ms - 10000, now_ms),
             ])
             rows = [
-                ("m1", sid, "shell", 1, now_ms - 5000, now_ms - 5000,
+                ("m1", sid, "shell", 1, now_ms - 5 * 60 * 60 * 1000,
+                 now_ms - 5 * 60 * 60 * 1000,
                  shell_row("sh-fixture-ok", "python3 -c 'print(1)'")),
-                ("m2", sid, "shell", 2, now_ms - 4000, now_ms - 4000,
+                ("m2", sid, "shell", 2, now_ms - 5 * 60 * 60 * 1000 + 1000,
+                 now_ms - 5 * 60 * 60 * 1000 + 1000,
                  shell_row("sh-fixture-fail", "python3 -c 'raise SystemExit(3)'")),
                 ("m3", sid, "shell", 3, now_ms - 3000, now_ms - 3000,
                  shell_row("sh-ordinary", "echo ordinary", background=False,
@@ -1490,6 +1547,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
             self.assertEqual(len(session.shell_jobs), 2)
             jobs = {item["native_id"]: item for item in session.shell_jobs}
             self.assertEqual(jobs["sh-fixture-ok"]["native_status"], "running")
+            self.assertEqual(jobs["sh-fixture-ok"]["current_execution_state"], "running")
+            self.assertEqual(jobs["sh-fixture-ok"]["current_execution_source"],
+                             "opencode.v2.session-message.exact-query")
+            self.assertGreaterEqual(jobs["sh-fixture-ok"]["elapsed_s"], 4 * 60 * 60)
             self.assertEqual(jobs["sh-fixture-ok"]["background_state"], "confirmed")
             self.assertEqual(jobs["sh-fixture-ok"]["background_source"],
                              "opencode.v2.session-message.background-true")
@@ -1499,15 +1560,27 @@ class BackgroundShellJobsTests(unittest.TestCase):
             self.assertEqual(jobs["sh-fixture-fail"]["output_reason"],
                              "native-shell-output-not-found")
             self.assertEqual(jobs["sh-fixture-fail"]["process_state"], "unknown")
-            row_text = "".join(part[0] for line in render._shell_job_rows(
-                session, term_width=140) for part in line)
-            self.assertIn("python3 -c", row_text)
-            self.assertIn("background confirmed", row_text)
-            self.assertIn("native running", row_text)
+            self.assertEqual(jobs["sh-fixture-fail"]["current_execution_state"], "running")
+            row_text = self.context_text(session, 140, time.time())
+            self.assertIn("python3 -c 'raise SystemExit(3)'", row_text)
+            self.assertIn("(+1)", row_text)
+            self.assertNotIn("background confirmed", row_text)
+            self.assertNotIn("native running", row_text)
             public_json = session.to_dict()
             self.assertEqual(len(public_json["shell_jobs"]), 2)
             self.assertEqual(public_json["shell_jobs"][0]["native_record_kind"],
                              "session-message-shell")
+
+            absent_query = dict(observed, shell_tasks=[], shell_cursor={
+                "state": "partial", "reason": "fixture-row-not-returned"})
+            opencode._attach_v2_shell_tasks(session, absent_query, db, sid,
+                                            native_data_root=native_root)
+            retained = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(retained["sh-fixture-ok"]["native_status"], "running")
+            self.assertEqual(retained["sh-fixture-ok"]["current_execution_state"], "unknown")
+            self.assertEqual(retained["sh-fixture-ok"]["current_execution_reason"],
+                             "native-row-not-refreshed-this-collection")
+            self.assertEqual(len(current_background_shell_jobs(session.shell_jobs)), 0)
 
             old_observation = observed
             terminal_time = int(time.time() * 1000)
@@ -1534,7 +1607,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
             self.assertEqual(jobs["sh-fixture-ok"]["native_output_size"], 23)
             self.assertEqual(jobs["sh-fixture-ok"]["output_state"], "observed")
             terminal_elapsed = jobs["sh-fixture-ok"]["elapsed_s"]
-            self.assertEqual(terminal_elapsed, 5)
+            self.assertGreaterEqual(terminal_elapsed, 4 * 60 * 60)
             self.assertTrue(ok_output.exists())  # retained file did not revive the exited task
 
             # Replaying the older running snapshot must not resurrect a completed result.
@@ -1623,9 +1696,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertTrue(all(job["identity_link_state"] == "ambiguous-cross-namespace-id"
                             for job in session.shell_jobs))
         self.assertEqual(session.shell_job_observation["state"], "partial")
-        rendered = "".join(part[0] for line in render._shell_job_rows(
-            session, term_width=140) for part in line)
-        self.assertIn("native id cross namespace ambiguous", rendered)
+        rendered = self.context_text(session, 140, time.time())
+        self.assertIn("echo native", rendered)
+        self.assertNotIn("echo assistant", rendered)
+        self.assertNotIn("ambiguous", rendered)
 
     def test_opencode_database_identity_change_retires_running_and_keeps_terminal_result(self):
         runtime = opencode._opencode_v2_runtime()
@@ -1743,6 +1817,190 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertEqual(observed["generation"], "v1")
         self.assertEqual(observed["shell_tasks"], [])
         self.assertEqual(observed["shell_cursor"]["state"], "unobserved")
+
+    def test_current_selector_filters_stale_retired_terminal_and_deduplicates_exact_identity(self):
+        now = 1000.0
+
+        def current(native_id, **changes):
+            job = {
+                "harness": "codex", "session_id": "thread-current", "attempt_id": None,
+                "source_generation": "gen-a", "source_locator": "/tmp/current.jsonl",
+                "native_id": native_id, "native_status": "running",
+                "lifecycle_state": "running", "background_state": "confirmed",
+                "background_source": "codex.exec_command.native-continuation-handle",
+                "current_generation_valid": True, "current_execution_state": "running",
+                "current_execution_source": "codex.exec_command.native-continuation-handle",
+                "current_execution_at": now - 120, "started_at": now - 900,
+                "process_state": "unknown", "command": "echo " + native_id,
+            }
+            job.update(changes)
+            return job
+
+        boundary = current("boundary", observation_state="partial")
+        duplicate = dict(boundary, command="ignored duplicate")
+        terminal_live = current("terminal-collision")
+        terminal_record = dict(terminal_live, native_status="completed",
+                               lifecycle_state="completed", completed_at=now - 1)
+        no_start = current("no-start", started_at=None, current_execution_at=now - 1)
+        stale = current("stale", current_execution_at=now - 121)
+        future = current("future", current_execution_at=now + 1)
+        invalid = current("invalid", current_execution_at=True)
+        too_large = current("too-large", current_execution_at=10 ** 500)
+        retired = current("retired", current_generation_valid=False)
+        unknown_background = current("unknown-background", background_state="unknown")
+        missing_background_source = current("missing-background-source", background_source=None)
+        invalid_attempt = current("invalid-attempt", attempt_id=7)
+        missing_identity = current("missing")
+        missing_identity["native_id"] = ""
+        selected = current_background_shell_jobs([
+            boundary, duplicate, terminal_live, terminal_record, no_start, stale,
+            future, invalid, too_large, retired, unknown_background,
+            missing_background_source, invalid_attempt, missing_identity,
+        ], now=now)
+        self.assertEqual([job["native_id"] for job in selected], ["no-start", "boundary"])
+        self.assertEqual(selected[0]["elapsed_s"], None)
+        self.assertEqual(selected[1]["elapsed_s"], 900)
+        self.assertEqual(current_background_shell_jobs([boundary], now=10 ** 500), [])
+
+    def test_codex_continuation_evidence_survives_reread_but_expires_after_120_seconds(self):
+        path = self.root / "continuation-evidence.jsonl"
+        self.write_jsonl(path, [
+            {"timestamp": 1000, "payload": {
+                "type": "custom_tool_call", "call_id": "exec-quiet",
+                "name": "exec_command", "input": {"cmd": "python train.py"}}},
+            {"timestamp": 19000, "payload": {
+                "type": "custom_tool_call_output", "call_id": "exec-quiet",
+                "output": {"session_id": 44, "output": ""}}},
+        ])
+        first = shell_jobs.read_codex_jobs(path, session_id="thread-quiet", now=19000)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["current_execution_state"], "running")
+        self.assertEqual(first[0]["current_execution_at"], 19000)
+        self.assertEqual(first[0]["native_event_at"], 19000)
+        self.assertEqual(first[0]["elapsed_s"], 18000)
+        self.assertEqual(first[0]["last_output_at"], None)
+
+        at_boundary = shell_jobs.read_codex_jobs(path, session_id="thread-quiet", now=19120)
+        self.assertEqual(at_boundary[0]["current_execution_state"], "running")
+        self.assertEqual(at_boundary[0]["current_execution_at"], 19000)
+        self.assertEqual(at_boundary[0]["native_event_at"], 19000)
+        self.assertEqual(at_boundary[0]["observed_at"], 19120)
+        self.assertEqual(len(current_background_shell_jobs(at_boundary, now=19120)), 1)
+
+        stale = shell_jobs.read_codex_jobs(path, session_id="thread-quiet", now=19121)
+        self.assertEqual(stale[0]["current_execution_state"], "unknown")
+        self.assertEqual(stale[0]["current_execution_reason"],
+                         "current-execution-evidence-stale")
+        self.assertEqual(stale[0]["lifecycle_state"], "running")
+        self.assertEqual(stale[0]["native_event_at"], 19000)
+        self.assertEqual(stale[0]["observed_at"], 19121)
+        self.assertEqual(current_background_shell_jobs(stale, now=19121), [])
+
+    def test_exact_writer_evidence_refreshes_per_collection_and_old_alive_is_not_reused(self):
+        now = 20000.0
+        output = self.root / "writer.out"
+        output.write_text("quiet", encoding="utf-8")
+        job = {
+            "harness": "claude", "session_id": "sid-writer", "attempt_id": None,
+            "source_generation": "gen-writer", "source_locator": "/tmp/writer.jsonl",
+            "native_id": "task-writer", "native_status": "acknowledged",
+            "background_state": "confirmed", "background_source": "native-task-id",
+            "current_generation_valid": True, "current_execution_state": "unknown",
+            "current_execution_reason": "background-acknowledgement-is-not-execution-proof",
+            "started_at": now - 18000, "output_path": str(output),
+            "process_state": "unknown", "output_coverage": "sampled",
+        }
+        exact = {"process_state": "alive",
+                 "process_reason": "exact-descendant-writable-output-fd",
+                 "process_identity": {"pid": 9, "start": "99", "namespace": "pid:[1]"}}
+        with mock.patch.object(shell_jobs, "correlate_output_writers", return_value=exact):
+            observed = shell_jobs.observe_jobs([job], now=now)
+        self.assertEqual(observed[0]["current_execution_state"], "running")
+        self.assertEqual(observed[0]["current_execution_at"], now)
+        self.assertEqual(len(current_background_shell_jobs(observed, now=now)), 1)
+
+        with mock.patch.object(shell_jobs, "correlate_output_writers", return_value={
+                "process_state": "unknown", "process_reason": "exact-writer-not-observed"}):
+            reread = shell_jobs.observe_jobs(observed, now=now + 1)
+        self.assertEqual(reread[0]["process_state"], "unknown")
+        self.assertEqual(reread[0]["current_execution_state"], "unknown")
+        self.assertEqual(reread[0]["current_execution_reason"],
+                         "exact-writer-not-observed-this-collection")
+        self.assertEqual(current_background_shell_jobs(reread, now=now + 1), [])
+
+    def test_now_tail_shrinks_command_then_count_then_omits_without_adding_rows(self):
+        now = 30000.0
+        shell_jobs = []
+        for index, started in enumerate((now - 600, now - 300, now - 100)):
+            shell_jobs.append({
+                "harness": "codex", "session_id": "thread-width", "attempt_id": None,
+                "source_generation": "gen-width", "source_locator": "/tmp/width.jsonl",
+                "native_id": "job-%d" % index, "native_id_kind": "exec-handle",
+                "native_status": "running", "lifecycle_state": "running",
+                "background_state": "confirmed", "background_source": "fixture",
+                "current_generation_valid": True, "current_execution_state": "running",
+                "current_execution_source": "codex.exec_command.native-continuation-handle",
+                "current_execution_at": now, "started_at": started,
+                "process_state": "unknown", "command": "python train.py --run " + "x" * 70,
+            })
+        session = Session(harness="codex", pid=5, session_id="thread-width", liveness="idle",
+                          summary="the existing NOW sentence remains first", shell_jobs=shell_jobs)
+        latest = current_background_shell_jobs(shell_jobs, now=now)[0]
+        full = render._background_shell_tail(session, now=now, width=100)
+        clipped = render._background_shell_tail(session, now=now, width=18)
+        count_width = render._dw("⚙ 3")
+        count_only = render._background_shell_tail(session, now=now, width=count_width)
+        omitted = render._background_shell_tail(session, now=now, width=count_width - 1)
+        self.assertEqual(latest["native_id"], "job-2")
+        self.assertIn("python train.py", full)
+        self.assertIn("(+2)", full)
+        self.assertIn("1m", clipped)
+        self.assertIn("(+2)", clipped)
+        self.assertIn("…", clipped)
+        self.assertEqual(count_only, "⚙ 3")
+        self.assertIsNone(omitted)
+
+        with mock.patch("time.time", return_value=now):
+            baseline_lines = render._context_detail_row(
+                Session(harness="codex", pid=5, session_id="thread-width", liveness="idle",
+                       summary=session.summary), term_width=100)
+            with_jobs_lines = render._context_detail_row(session, term_width=100)
+        self.assertEqual(len(baseline_lines), 1)
+        self.assertEqual(len(with_jobs_lines), 1)
+        baseline = "".join(text for text, _key in baseline_lines[0])
+        rendered = "".join(text for text, _key in with_jobs_lines[0])
+        self.assertEqual(rendered, baseline)
+        self.assertNotIn("(+2)", rendered)
+        self.assertLessEqual(render._dw(rendered), 100)
+        self.assertEqual(session.to_dict()["liveness"], "idle")
+
+        no_start_job = dict(shell_jobs[0], native_id="no-start", started_at=None,
+                            current_execution_at=now - 1)
+        no_start_session = Session(harness="codex", pid=5, session_id="thread-width",
+                                   liveness="idle", shell_jobs=[no_start_job])
+        no_start_tail = render._background_shell_tail(no_start_session, now=now, width=100)
+        self.assertIn(" ?", no_start_tail)
+
+        cjk_jobs = [dict(job) for job in shell_jobs]
+        cjk_jobs[-1]["command"] = "漢字 train " + "界" * 50
+        resource_owner = Session(harness="codex", pid=5, session_id="thread-width",
+                                 liveness="idle", summary="ordinary summary",
+                                 shell_jobs=cjk_jobs)
+        resource_base = Session(harness="codex", pid=5, session_id="thread-width",
+                                liveness="idle", summary="ordinary summary")
+        with mock.patch("time.time", return_value=now), \
+                mock.patch.object(render, "_resource_now_text", return_value="GPU train status"):
+            base_lines = render._context_detail_row(resource_base, term_width=168)
+            resource_lines = render._context_detail_row(resource_owner, term_width=168)
+        self.assertEqual(len(base_lines), 1)
+        self.assertEqual(len(resource_lines), 1)
+        base_text = "".join(text for text, _key in base_lines[0])
+        resource_text = "".join(text for text, _key in resource_lines[0])
+        self.assertTrue(resource_text.startswith(base_text))
+        self.assertIn("GPU train status", resource_text)
+        self.assertIn("⚙", resource_text)
+        self.assertIn("…", resource_text)
+        self.assertLessEqual(render._dw(resource_text), 168)
 
 
 if __name__ == "__main__":

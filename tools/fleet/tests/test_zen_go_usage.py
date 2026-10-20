@@ -530,8 +530,9 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
         rendered = render._usage_header_rows([session], layout="wide",
                                               usage_snapshots={"opencode": filtered})
         text = "\n".join("".join(part for part, _style in row) for row in rendered)
-        self.assertIn("Go subscription missing", text)
-        self.assertNotIn("Go key rejected", text)
+        self.assertIn("Go usage unavailable", text)
+        for detail in ("credential", "entitlement", "Zen", "OpenAI", "subscription"):
+            self.assertNotIn(detail, text)
 
     def test_active_account_change_does_not_inherit_old_entitlement_denial(self):
         runtime = zen_go_usage._runtime()
@@ -631,14 +632,13 @@ class ZenGoCacheIntegrationTest(unittest.TestCase):
 
 
 class ZenGoRenderHeaderTest(unittest.TestCase):
-    """The auth-reject state must be visible in the usage header: 'key rejected'
-    instead of a silently blank gauge (hearting-46 v2.110.0 field report)."""
+    """OpenCode's default usage header is limited to Go quota or one short status."""
 
     @staticmethod
     def _rows_text(rows):
         return "\n".join("".join(t for t, _k in row) for row in rows)
 
-    def test_provider_statuses_render_expiry_entitlement_and_unknown_separately(self):
+    def test_provider_diagnostics_stay_out_of_default_header(self):
         from fleet import render
         from fleet.model import Session
         oc = Session(harness="opencode", pid=1, cwd="/x", liveness="idle", mtime=1000)
@@ -654,18 +654,18 @@ class ZenGoRenderHeaderTest(unittest.TestCase):
             ], "freshness": "fresh", "observed_at": 1000}}
         rows = render._usage_header_rows([oc], layout="wide", usage_snapshots=snapshots)
         text = self._rows_text(rows)
-        self.assertIn("Go credential expired", text)
-        self.assertIn("Go subscription missing", text)
-        self.assertIn("Zen valid", text)
-        self.assertIn("OpenAI unknown", text)
+        self.assertIn("Go usage unavailable", text)
+        for detail in ("credential", "entitlement", "Zen", "OpenAI", "subscription"):
+            self.assertNotIn(detail, text)
 
-    def test_session_error_marker_alone_renders_rejected_message(self):
+    def test_session_error_marker_renders_short_unavailable_status(self):
         from fleet import render
         from fleet.model import Session
         oc = Session(harness="opencode", pid=1, cwd="/x", liveness="idle", mtime=1000)
         oc._usage_error = "auth"
         rows = render._usage_header_rows([oc], layout="wide")
-        self.assertIn("Go key rejected", self._rows_text(rows))
+        self.assertIn("Go usage unavailable", self._rows_text(rows))
+        self.assertNotIn("credential", self._rows_text(rows))
 
     def test_healthy_snapshot_still_renders_gauges(self):
         from fleet import render
@@ -677,8 +677,49 @@ class ZenGoRenderHeaderTest(unittest.TestCase):
         rows = render._usage_header_rows([oc], layout="wide", usage_snapshots=snapshots)
         text = self._rows_text(rows)
         self.assertNotIn("usage api —", text)
+        self.assertNotIn("credential", text)
+        self.assertNotIn("entitlement", text)
+        self.assertNotIn("Zen", text)
+        self.assertNotIn("OpenAI", text)
         self.assertIn("58%", text)
         self.assertIn("25%", text)
+
+    def test_go_header_limits_bars_to_5h_week_month_and_keeps_spacing(self):
+        from fleet import render
+        from fleet.model import Session
+        claude = Session(harness="claude", pid=1, cwd="/x", liveness="idle", mtime=1000)
+        opencode = Session(harness="opencode", pid=2, cwd="/y", liveness="idle", mtime=1000)
+        snapshots = {
+            "claude": {"payload": {"rl_windows": [["5h", None, None]]},
+                       "freshness": "fresh", "observed_at": 1000},
+            "opencode": {"payload": {"rl_windows": [
+                ["5h", 20, 2000], ["week", 30, 3000], ["month", 40, 4000],
+                ["year", 90, 5000]], "rl_ms": [["provider-detail", 99]]},
+                "providers": [{"provider": "opencode-go", "state": "usable",
+                               "reason": None, "observed_at": 1000}],
+                "freshness": "fresh", "observed_at": 1000},
+        }
+        rows = render._usage_header_rows([claude, opencode], usage_snapshots=snapshots,
+                                         now=1000, term_width=168)
+        text_rows = self._rows_text(rows).splitlines()
+        claude_row = next(line for line in text_rows if "claude code" in line)
+        opencode_row = next(line for line in text_rows if "opencode go" in line)
+        self.assertIn("5h [············   —]", claude_row)
+        self.assertIn("5h", opencode_row)
+        self.assertIn("week", opencode_row)
+        self.assertIn("month", opencode_row)
+        self.assertIn("   week [", opencode_row)
+        self.assertIn("   month [", opencode_row)
+        self.assertNotIn("year", opencode_row)
+        self.assertNotIn("provider-detail", opencode_row)
+        joined = "\n".join(text_rows)
+        self.assertNotIn("unknown5h", "".join(text_rows).lower())
+        self.assertNotIn("credential", joined)
+        self.assertNotIn("entitlement", joined)
+        self.assertNotIn("Zen", joined)
+        self.assertNotIn("OpenAI", joined)
+        self.assertEqual(snapshots["opencode"]["providers"][0]["state"], "usable")
+        self.assertLessEqual(render._dw(opencode_row), 168)
 
 
 if __name__ == "__main__":
