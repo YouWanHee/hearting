@@ -174,5 +174,71 @@ class RetentionGoldenTest(unittest.TestCase):
             render.set_process_view(False)
 
 
+
+class PinnedRegistryParityTest(unittest.TestCase):
+    """A Fleet pass reads one registry generation without changing any reader's rows."""
+
+    ROWS = (
+        b"2026-10-20T00:00:00Z\topen\t/repo\t/wt\tslug-a\tattempt_id=att-a,route_id=rt-a,"
+        b"route_node=plan,worker_type=stage,dispatch_depth=2\n"
+        b"2026-10-20T00:00:01Z\tdone\t/repo\t/wt\tslug-a\tattempt_id=att-a,route_id=rt-a,"
+        b"route_node=plan,note=x\x0cy\r"
+        b"2026-10-20T00:00:02Z\topen\t/repo\t/wt\tslug-b\tattempt_id=att-b,route_id=rt-b,"
+        b"route_node=execute,delivery_intent=1\r\n\n"
+        + "2026-10-20T00:00:03Z\topen\t/repo\t/wt\tslug-c\tattempt_id=att-c,note=u v\x85w\n".encode()
+        + b"2026-10-20T00:00:04Z\tdone\t/repo\t/wt\tslug-d\tattempt_id=att-d,note=\xff\x1dz"
+    )
+
+    def setUp(self):
+        import dispatch_registry_cache
+        self.cache = dispatch_registry_cache
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name) / "jobs.log"
+        self.jobs.write_bytes(self.ROWS)
+        self.cache.clear_cache()
+        self.addCleanup(self.cache.clear_cache)
+
+    def readers(self):
+        path = str(self.jobs)
+        jobs, malformed = dispatch._scan_jobs_log(path, set())
+        registry = dispatch._orphan_registry_module()
+        return {
+            "scan_jobs_log": ([(j.slug, j.status) for j in jobs], malformed),
+            "jobs_log_fields": dispatch._jobs_log_fields([path]),
+            "parent_extinction": dispatch._parent_extinction_rows([path]),
+            "registry_evidence": dispatch._scan_registry_evidence([path]),
+            "read_rows": registry.read_rows(self.jobs, lines=dispatch._pinned_registry_lines(path)),
+        }
+
+    def test_pinned_lines_keep_every_reader_result_for_unusual_separators(self):
+        unpinned = self.readers()
+        # An append-built cached generation segments only at LF; the pass must not reuse those lines.
+        self.cache.registry_view(self.jobs, append_only=True)
+        self.cache.reset_metrics()
+        original = builtins.open
+        def opened(path, *args, **kwargs):
+            if str(path) == str(self.jobs):
+                raise AssertionError("a reader reopened the pinned registry")
+            return original(path, *args, **kwargs)
+        with self.cache.registry_read_scope():
+            self.assertEqual(dispatch._pinned_registry_lines(str(self.jobs)),
+                             tuple(self.jobs.read_text(encoding="utf-8", errors="replace").splitlines()))
+            with mock.patch.object(builtins, "open", side_effect=opened):
+                pinned = self.readers()
+        self.assertEqual(pinned, unpinned)
+        self.assertEqual(self.cache.metrics_snapshot()["content_reads"], 1)
+
+    def test_failed_pinned_read_leaves_each_reader_its_own_handling(self):
+        missing = str(self.jobs.with_name("missing.log"))
+        unpinned = (dispatch._scan_jobs_log(missing, set()), dispatch._jobs_log_fields([missing]),
+                    dispatch._parent_extinction_rows([missing]))
+        with self.cache.registry_read_scope():
+            self.assertIsNone(dispatch._pinned_registry_lines(missing))
+            pinned = (dispatch._scan_jobs_log(missing, set()), dispatch._jobs_log_fields([missing]),
+                      dispatch._parent_extinction_rows([missing]))
+        self.assertEqual(pinned, unpinned)
+
+
 if __name__ == "__main__":
     unittest.main()
