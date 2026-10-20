@@ -23,6 +23,48 @@ import session_tidy as st
 
 
 class PaneOwnershipTest(unittest.TestCase):
+    def test_codex_runtime_skips_config_values_before_service_command(self):
+        cases = (
+            (["codex", "-c", "foo=app-server", "app-server"], True),
+            (["codex", "--config", "foo=app-server", "tui"], False),
+            (["codex", "--config=foo=app-server", "resume", "sid"], False),
+            (["codex", "--model", "app-server", "tui"], False),
+            (["codex", "--model", "o3", "app-server"], True),
+            (["codex", "tui", "prompt", "app-server"], False),
+        )
+        for argv, service in cases:
+            with self.subTest(argv=argv), mock.patch.object(
+                    Path, "read_bytes",
+                    return_value=b"\0".join(part.encode() for part in argv) + b"\0"):
+                self.assertEqual(po._runtime(123), ("codex", service))
+
+    def test_codex_daemon_binding_ignores_inherited_pane_and_fails_closed(self):
+        sid = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        binding = {"pid": 1234, "pid_start": "77", "session_id": sid,
+                   "pane": "w:p1", "socket_path": "/tmp/herdr.sock"}
+        with mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(po, "_caller_runtime", return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_tui_process_bindings", return_value=[binding]), \
+                mock.patch.object(po, "_process", return_value=(1234, 1, 1, 0, 0, "77")):
+            got = po.codex_caller_binding(sid, pid=99, environ={
+                "CODEX_THREAD_ID": sid, "HERDR_PANE_ID": "foreign", "HERDR_SOCKET_PATH": "/tmp/foreign"})
+        self.assertEqual(got, binding)
+        with mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(po, "_caller_runtime", return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_tui_process_bindings", return_value=[binding, dict(binding, pane="w:p2")]):
+            self.assertIsNone(po.codex_caller_binding(
+                sid, pid=99, environ={"CODEX_THREAD_ID": sid, "HERDR_PANE_ID": "w:p1"}))
+
+    def test_pane_seat_from_binding_uses_the_bound_socket_not_inherited_environment(self):
+        binding = {"pid": 1, "pid_start": "2", "session_id": "t-A",
+                   "pane": "w:p1", "socket_path": "/run/herdr/one.sock"}
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/other.sock"}):
+            seat = st.pane_seat_from_binding(binding)
+        expected_endpoint = st._endpoint_scope({"HERDR_SOCKET_PATH": binding["socket_path"]})
+        self.assertEqual((seat.pane, seat.endpoint, seat.socket_path),
+                         ("w:p1", expected_endpoint, binding["socket_path"]))
+        self.assertNotEqual(seat.key, st._pane_seat_of("w:p1").key)
+
     def test_import_adds_tools_path_for_isolated_utilities_entrypoint(self):
         utilities = str(ROOT / "utilities")
         script = (

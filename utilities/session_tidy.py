@@ -356,6 +356,7 @@ class Seat:
     native: Optional[dict] = None
     sid: str = ""
     endpoint: str = ""
+    socket_path: str = ""   # raw transport is private; endpoint remains the key hash
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
@@ -428,6 +429,19 @@ def _pane_seat_of(pane: str) -> Seat:
     endpoint = _endpoint_scope()
     key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
     return Seat("pane", key, pane, "codex", "", endpoint=endpoint)
+
+
+def pane_seat_from_binding(binding: dict) -> Seat:
+    """Create a Codex seat only from one exact live TUI binding."""
+    pane = str(binding.get("pane") or "")
+    socket_path = str(binding.get("socket_path") or "")
+    if (not pane or not binding.get("pid") or not binding.get("pid_start")
+            or not binding.get("session_id")):
+        raise ValueError("incomplete Codex pane binding")
+    endpoint = _endpoint_scope({"HERDR_SOCKET_PATH": socket_path})
+    key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+    return Seat("pane", key, pane, "codex", "", sid=str(binding["session_id"]),
+                endpoint=endpoint, socket_path=socket_path)
 
 
 def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
@@ -519,6 +533,18 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     server = env.get("AGENT_HERDR_SESSION") if live_caller else None
     socket_value = env.get("HERDR_SOCKET_PATH", "") if live_caller else ""
     endpoint_unproven = bool(harness == "codex" and server and not socket_value)
+    if live_caller and harness == "codex" and sid:
+        from pane_ownership import _caller_runtime, codex_caller_binding
+        caller, service = _caller_runtime(os.getpid(), "codex")
+        if caller is not None and service:
+            binding = codex_caller_binding(sid, environ=env)
+            if binding:
+                return pane_seat_from_binding(binding)
+            # A shared daemon's inherited pane values belong to no caller.
+            pane = ""
+            server = None
+            socket_value = ""
+            endpoint_unproven = True
     if live_caller and not endpoint_unproven and not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
     from pane_ownership import verified_pane

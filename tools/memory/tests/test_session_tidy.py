@@ -2519,6 +2519,23 @@ class ClearHelperTest(TidyCase):
             self.assertNotIn(dropped, env)
         self.assertNotIn("HERDR_SOCKET_PATH", clear._helper_env({"HERDR_PANE_ID": PANE}))
 
+    def test_helper_restart_uses_only_the_reserved_codex_socket(self):
+        seat = st.Seat("pane", "a" * 32, pane=PANE, harness="codex",
+                       socket_path="/run/herdr/booked.sock")
+        req = {"schema": clear.SCHEMA, "nonce": "0123456789abcdef", "status": "reserved",
+               "seat": seat.as_dict(), "harness": "codex", "sid": "thread-A",
+               "herdr_transport": {"socket_path": seat.socket_path}}
+        clear._write_reservation(req)
+        process = mock.Mock(pid=4321)
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
+                                          "AGENT_HERDR_SESSION": "foreign"}), \
+                mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
+            self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env.get("HERDR_SOCKET_PATH"), seat.socket_path)
+        self.assertNotIn("AGENT_HERDR_SESSION", child_env)
+        self.assertNotIn("HERDR_PANE_ID", child_env)
+
     def booked(self, harness="claude", sid="sid-A"):
         with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
             seat = st.resolve_seat(harness, str(self.cwd))
