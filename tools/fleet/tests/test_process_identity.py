@@ -16,8 +16,41 @@ for entry in (str(ROOT / "tools"), str(ROOT / "utilities")):
 from fleet import herdr_projection as hp  # noqa: E402
 from fleet import process_identity as P  # noqa: E402
 from fleet.collectors import opencode  # noqa: E402
+from fleet.collectors import claude  # noqa: E402
+import claude_process_identity as claude_identity  # noqa: E402
 
 SID = "ses_abcDEF123"
+
+
+class ClaudeNativeIdentityHelperTest(unittest.TestCase):
+    def test_indexed_and_direct_taps_match_fleet_exact_pid_start_claims(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            taps = home / ".statusline"
+            taps.mkdir()
+            (taps / "one.json").write_text(json.dumps({
+                "pid": 17, "proc_start": "100", "session_id": "sid-one"}))
+            (taps / "two.json").write_text(json.dumps({
+                "pid": "17", "proc_start": "100", "session_id": "sid-two"}))
+            (taps / "stale.json").write_text(json.dumps({
+                "pid": 17, "proc_start": "99", "session_id": "sid-stale"}))
+            (taps / "bad.json").write_text("{")
+
+            direct = claude_identity.tap_sids_by_pid(home, 17, "100")
+            indexed = claude_identity.tap_sids_by_pid(
+                home, 17, "100", index=claude_identity.tap_claim_index(home))
+            self.assertEqual(direct, {"sid-one", "sid-two"})
+            self.assertEqual(indexed, direct)
+            self.assertEqual(claude._tap_sids_by_pid(home, 17, "100"), direct)
+            self.assertEqual(claude_identity.tap_sids_by_pid(home, 17, "101"), set())
+
+    def test_strict_census_tap_index_surfaces_unreadable_identity_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taps = Path(temp) / ".statusline"
+            taps.mkdir()
+            (taps / "bad.json").write_text("{")
+            with self.assertRaises(OSError):
+                claude_identity.tap_claim_index(temp, strict=True)
 
 
 class OpenCodeProcessTest(unittest.TestCase):

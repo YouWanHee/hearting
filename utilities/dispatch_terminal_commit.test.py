@@ -1426,6 +1426,19 @@ class OwnerCompletionStateTest(_TerminalCommitFixture):
         meta.update(overrides)
         return meta
 
+    def test_owner_completion_judgment_runs_inside_a_passive_registry_scope(self):
+        import dispatch_registry_cache
+        observed = []
+
+        def scoped(_jobs, _status, _metadata):
+            observed.append(dispatch_registry_cache.registry_scope_active())
+            return T.CompletionState("not-applicable")
+
+        with mock.patch.object(T, "_owner_completion_state_scoped", side_effect=scoped):
+            result = T.owner_completion_state(self.jobs, "done", self._metadata())
+        self.assertEqual(result.state, "not-applicable")
+        self.assertEqual(observed, [True])
+
     def test_completion_state_blocked_on_attempt_not_current(self):
         # A later attempt already claimed this route node -- this attempt can
         # never complete, so the caller must stop waiting on it, not retry

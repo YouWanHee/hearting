@@ -148,6 +148,21 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.live.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.live.chmod(0o755)
 
+    def test_exact_attempt_row_reads_inside_a_passive_registry_scope(self):
+        import dispatch_registry_cache
+        self.jobs.write_text(row("open", "att-scope", "att-parent", "scope"), encoding="utf-8")
+        original = JOIN.registry_view
+        observed = []
+
+        def scoped_view(jobs, *, append_only=False):
+            observed.append(dispatch_registry_cache.registry_scope_active())
+            return original(jobs, append_only=append_only)
+
+        with mock.patch.object(JOIN, "registry_view", side_effect=scoped_view):
+            found = JOIN.exact_attempt_row(self.jobs, "att-scope")
+        self.assertEqual(found.attempt_id, "att-scope")
+        self.assertEqual(observed, [True])
+
     def test_cli_still_waits_for_a_live_parent_and_returns_its_receipt(self):
         self.jobs.write_text(row("open", "att-a", "att-parent", "a"), encoding="utf-8")
         result = subprocess.run(
