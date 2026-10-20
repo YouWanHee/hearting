@@ -2352,6 +2352,10 @@ separate transfer. Lost responses reconcile against exact native history before 
 resume. Ambiguity never submits the body again. Native callbacks preserve pending
 refs when the runtime has no supported wake.
 
+Sender-delay duties retain their logical body digest and match their minted
+transfer through its source digest and delay refs. Each runner checkpoint
+observes the disposition of its own duty.
+
 The obligation runner may cancel delivery only after an exact, complete endpoint
 observation proves that the original recipient is gone, or the original
 pane-bound process lifetime is proven dead. The cancellation closes that

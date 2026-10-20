@@ -5420,7 +5420,9 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                    observation={"ref": ref, "reason": "dispatch-notice-consumed"})
         return
     if row.get("state") == "received":
-        if peer_message.acknowledge_message_obligations(row):
+        peer_message.acknowledge_message_obligations(row)
+        current = store.get(duty_id)
+        if current and current.get("state") in {"complete", "cancelled"}:
             return
         checkpoint(state="unknown", observation={
             "ref": ref, "reason": "received-binding-unverified"})

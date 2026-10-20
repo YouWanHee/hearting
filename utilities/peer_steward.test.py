@@ -4852,6 +4852,82 @@ class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
 
 
 class MessageTerminalObligationTest(_TmpRootMixin, unittest.TestCase):
+    def _normal_delay_notice(self):
+        pm = peer_steward.peer_message
+        sender = {"harness": "claude", "session_id": "delay-sender", "name": None}
+        recipient = {"harness": "codex", "session_id": "delay-recipient", "name": None}
+        _text, original_ref = pm.prepare_peer_message(
+            "original pending message", sender, recipient, defer=True)
+        peer_steward._ensure_sender_delay_notice(pm._read_pending(original_ref))
+        store = peer_steward.peer_obligations.ObligationStore()
+        delay = store.get("delay-" + original_ref)
+        notice_ref = delay["observation"]["transfer_ref"]
+        return store, delay, pm._read_pending(notice_ref), sender, original_ref
+
+    def test_received_delay_notice_closes_its_logical_duty_and_courier(self):
+        store, delay, notice, recipient, original_ref = self._normal_delay_notice()
+        pm = peer_steward.peer_message
+        self.assertNotEqual(delay["intent"]["body_digest"], notice["body_sha256"])
+        self.assertEqual(pm.receive_peer_message(notice["text"], recipient), 0)
+        settled = store.get(delay["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                         ("complete", "received", "acknowledged"))
+        self.assertEqual(store.get("message-" + notice["ref"])["state"], "complete")
+        self.assertEqual(pm._read_pending(original_ref)["state"], "pending")
+        revision = settled["revision"]
+        received_text = pm._read_transfer_record(notice["ref"])
+        self.assertIsNotNone(received_text)
+        self.assertEqual(pm.receive_peer_message(notice["text"], recipient), 0)
+        self.assertEqual(store.get(delay["id"])["revision"], revision)
+        with mock.patch.object(peer_steward, "_resume_message_obligation") as resume:
+            peer_steward._reconcile_obligations(store)
+        resume.assert_not_called()
+
+    def test_another_courier_ack_does_not_settle_mismatched_delay_duty(self):
+        pm = peer_steward.peer_message
+        store = peer_steward.peer_obligations.ObligationStore()
+        original_ref = "e" * 32
+        sender = {"harness": "codex", "session_id": "notice-sender"}
+        recipient = {"harness": "claude", "session_id": "notice-recipient"}
+        body = "notice with incomplete old intent"
+        duty = store.create("delay-" + original_ref, "message", {"server": "default"},
+            {"delay_notice_for": original_ref, "body": body, "body_digest": "0" * 64,
+             "from": sender, "to": recipient, "target": recipient["session_id"]})
+        text, ref = pm.prepare_peer_message(body, sender, recipient, defer=True,
+            refs=["delay-notice:" + original_ref, original_ref])
+        store.update(duty["id"], observation={"transfer_ref": ref})
+        peer_steward._schedule_message_obligation(pm._read_pending(ref), recipient["session_id"],
+                                                 delay_notice_for=original_ref)
+        self.assertEqual(pm.receive_peer_message(text, recipient), 0)
+        self.assertEqual(store.get("message-" + ref)["state"], "complete")
+        peer_steward._resume_message_obligation(store.get(duty["id"]), store)
+        current = store.get(duty["id"])
+        self.assertEqual((current["state"], current["observation"]["reason"]),
+                         ("unknown", "received-binding-unverified"))
+
+    def test_delay_cancellation_validates_source_body_and_keeps_late_ack(self):
+        store, delay, notice, recipient, _original_ref = self._normal_delay_notice()
+        pm = peer_steward.peer_message
+        identity = delay["intent"]["identity"]
+        evidence = {"kind": "recipient-session-absent", "server": "default",
+                    "harness": recipient["harness"], "session_id": recipient["session_id"],
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "default",
+                    "recipient_binding": pm.pending_delivery_binding(notice, include_acked=True)}
+        rejected = store.cancel_message_delivery(delay["id"],
+            expected_revision=delay["revision"], ref=notice["ref"],
+            body_digest=notice["body_sha256"], identity=identity,
+            message=dict(notice, source_sha256="0" * 64), evidence=evidence)
+        self.assertEqual(rejected["state"], "pending")
+        self.assertEqual(pm.cancel_message_obligation(notice["ref"], duty_id=delay["id"],
+            expected_revision=delay["revision"], identity=identity,
+            message=notice, evidence=evidence), "cancelled")
+        self.assertIsNone(store.get(delay["id"])["result"])
+        self.assertEqual(pm.receive_peer_message(notice["text"], recipient), 0)
+        current = store.get(delay["id"])
+        self.assertEqual((current["state"], current["result"], current["delivery"]),
+                         ("cancelled", None, "acknowledged"))
+
     def _queued_duty(self, *, sid, target_name, ref_seed):
         sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
         recipient = {"harness": "claude", "session_id": sid, "name": target_name,

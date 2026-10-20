@@ -48,6 +48,29 @@ def _message_watch_ids(refs):
             for ref in refs if ref.startswith("peer-watch:")]
 
 
+def _message_intent_matches_transfer(record, message):
+    if not isinstance(message, dict):
+        return False
+    intent = record.get("intent") or {}
+    observation = record.get("observation") or {}
+    ref = intent.get("ref") or observation.get("transfer_ref") or observation.get("ref")
+    if ref != message.get("ref"):
+        return False
+    original_ref = intent.get("delay_notice_for")
+    if original_ref and not intent.get("ref"):
+        body = intent.get("body")
+        return (isinstance(original_ref, str)
+                and re.fullmatch(r"[0-9a-f]{32}", original_ref) is not None
+                and record.get("id") == "delay-" + original_ref
+                and isinstance(body, str) and bool(body)
+                and intent.get("body_digest") == hashlib.sha256(body.encode("utf-8")).hexdigest()
+                and message.get("source_sha256") == hashlib.sha256(
+                    body.rstrip("\n").encode("utf-8")).hexdigest()
+                and message.get("refs") == ["delay-notice:" + original_ref, original_ref])
+    return (intent.get("body_digest") == message.get("body_sha256")
+            and intent.get("refs", []) == message.get("refs", []))
+
+
 def _with_current_message_watch_binding(message, binding, action, failure):
     refs = message.get("refs", []) if isinstance(message, dict) else None
     watch_ids = _message_watch_ids(refs)
@@ -1355,9 +1378,7 @@ class ObligationStore:
                 expected_sender = intent.get("from") or {}
                 saved_sender = message.get("from") or {}
                 if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
-                        or (intent.get("ref") or observation.get("transfer_ref")) != ref
-                        or intent.get("body_digest") != body_digest
-                        or intent.get("refs", []) != message.get("refs", [])
+                        or not _message_intent_matches_transfer(record, message)
                         or (expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
                                                     for key in ("harness", "session_id")))):
                     return False
@@ -1461,9 +1482,7 @@ class ObligationStore:
                 intent = record.get("intent") or {}
                 observation = record.get("observation") or {}
                 if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
-                        or (intent.get("ref") or observation.get("transfer_ref")) != ref
-                        or intent.get("body_digest") != body_digest
-                        or intent.get("refs", []) != refs):
+                        or not _message_intent_matches_transfer(record, message)):
                     return False
                 expected_sender, saved_sender = intent.get("from") or {}, message.get("from") or {}
                 if expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
@@ -1524,10 +1543,10 @@ class ObligationStore:
                         or record.get("revision") != expected_revision
                         or intent.get("kind") != "message"
                         or intent.get("handoff_acceptance")
-                        or (intent.get("ref") or observation.get("transfer_ref")) != ref
-                        or intent.get("body_digest") != body_digest
-                        or intent.get("identity") != identity
-                        or intent.get("refs", []) != (message or {}).get("refs", [])):
+                        or ref != (message or {}).get("ref")
+                        or body_digest != (message or {}).get("body_sha256")
+                        or not _message_intent_matches_transfer(record, message)
+                        or intent.get("identity") != identity):
                     return record
                 if (observation.get("native_receiving_turn")
                         or observation.get("continuation_prepared")
