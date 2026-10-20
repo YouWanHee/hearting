@@ -452,6 +452,30 @@ class DryRunCompletionMarkerPathTest(unittest.TestCase):
 
 
 class MainMaterializationTest(unittest.TestCase):
+    def test_checked_codex_dispatch_node_entry_builds_wrapper_command_without_spawning_child(self):
+        node = make_node(depth=2)
+        route = make_route(node)
+        jobs = _FIXTURE_ROOT / "dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        argv = self._run_main(
+            ["--node", "execute", "--adapter", "codex", "--slug", "checked-entry",
+             "--parent", "owner", "--action", "start"],
+            route,
+            environ={"AGENT_DISPATCH_JOBS": str(jobs)},
+        )
+        self.assertIsNotNone(argv)
+        self.assertEqual(argv[1], str(ROOT / "adapters/codex/bin/dispatch-headless.py"))
+        self.assertIn("--start", argv)
+        self.assertEqual(argv[argv.index("--route-node") + 1], "execute")
+        self.assertEqual(argv[argv.index("--dispatch-depth") + 1], "2")
+        for flag, value in (("--parent-harness", "claude"),
+                            ("--parent-transport", "headless"),
+                            ("--parent-sandbox", "default"),
+                            ("--launch-authority", "conductor"),
+                            ("--nested-eligibility", "supported"),
+                            ("--eligibility-source", "fixture-check")):
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+
     def test_frame_public_entry_uses_depth1_selector_for_each_adapter(self):
         node = make_node(depth=1, dispatch_fallback=[])
         node.update(id="frame", kind="map-worker", unit="plan/frame")

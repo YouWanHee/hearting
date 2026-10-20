@@ -470,6 +470,8 @@ def read_binding_record(jobs: str | Path, attempt_id: str, *, route_id=None,
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise SourceSubjectError("review-source-binding-unreadable", attempt_id) from exc
+    if not isinstance(record, dict):
+        raise SourceSubjectError("review-source-binding-unreadable", attempt_id)
     manifest_digest = _sha(_canonical({"schema_version": SCHEMA_VERSION, "manifest": record.get("manifest")}))
     if (record.get("schema_version") != SCHEMA_VERSION
             or record.get("attempt_id") != attempt_id
@@ -966,6 +968,9 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
                 route_id=route.get("route_id"), route_hash=route.get("route_hash"),
                 node_id=node.get("id"))
         except SourceSubjectError:
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
+        if record is None:
             prefix = "completion-test-source" if source_test else "completion-review-source"
             return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
         if (record.get("binding_digest") != binding_digest or _binding_digest(record) != binding_digest
