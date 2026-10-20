@@ -1043,11 +1043,13 @@ def cached_batch_delivery_state(
     """Classify a cached batch outcome against its current per-child ledger.
 
     ``resolved``: the ledger already closed this delivery. Every child record
-    is terminal, or one was retired (expired/rejected, or pruned after a
-    terminal state), so the batch can never be sent as one again.
+    is terminal (acked/expired/rejected) or was pruned after a terminal state.
     ``unmaterialized``: a child row carries intent but has neither a record
     nor a prune tombstone. Its terminal close or the reconcile backstop owns
     that record, never a carrier; absence is not resolution.
+    ``partial``: some child deliveries were retired while another child's
+    record is still open. The batch can no longer be sent as one, and the
+    open record still owes its delivery, so nothing is resent or completed.
     ``current``: every child record is open or acked under the row's exact
     identity and agrees with ``cached`` on every receipt field both carry.
     ``changed``: anything else. A cached outcome is never resent then.
@@ -1094,11 +1096,12 @@ def cached_batch_delivery_state(
         return "changed"
     if any(state not in pending_delivery.STATES | {"pruned", "absent"} for state in ledger):
         return "changed"
-    if (any(state in {"expired", "rejected", "pruned"} for state in ledger)
-            or all(state == "acked" for state in ledger)):
+    if all(state in pending_delivery.TERMINAL_STATES | {"pruned"} for state in ledger):
         return "resolved"
     if "absent" in ledger:
         return "unmaterialized"
+    if any(state in {"expired", "rejected", "pruned"} for state in ledger):
+        return "partial"
     current = current_batch_receipt_projection(
         jobs, attempt_ids, recipient_sid=recipient_sid, parent_attempt_id=parent_attempt_id,
         parent_completion_delivery=parent_completion_delivery)

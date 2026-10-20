@@ -1167,6 +1167,17 @@ def _native_queue_delivery_once(
                 failure_reason=retry_failure, retry_base_delay_seconds=retry_base)
 
 
+def _courier_retry_wait(exc) -> float | None:
+    """Seconds until the ledger's courier backoff admits the next claim."""
+    if (not isinstance(exc, pending_delivery.PendingDeliveryError)
+            or exc.reason != "pending-delivery-retry-deferred"):
+        return None
+    try:
+        return max(0.0, int(exc.detail.partition("remaining_ns=")[2]) / 1e9)
+    except ValueError:
+        return None
+
+
 def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
     from peer_read_context import PeerReadContext
     deadline = time.monotonic() + max(0.0, args.timeout)
@@ -1181,6 +1192,7 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
             if stopped:
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         session = None
+        courier_wait = None
         try:
             path = args.queue_socket or resolve_queue_socket()
             rows = current_session_children(args.jobs, args.thread_id, attempts,
@@ -1202,6 +1214,7 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
                 CompletionError) as exc:
             result = {"schema_version": 1, "status": "retryable", "reason": str(exc),
                       "thread_id": args.thread_id}
+            courier_wait = _courier_retry_wait(exc)
         finally:
             if session is not None:
                 session.close()
@@ -1210,6 +1223,12 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
             if stopped:
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
+        if remaining > 0 and courier_wait is not None:
+            # The ledger's own courier backoff names the next admissible
+            # claim. Waking before it only repeats this pass's registry reads,
+            # and its changing remaining time is not a new observation.
+            time.sleep(min(max(courier_wait, delay), remaining))
+            continue
         if remaining > 0:
             observation = (result.get("status"), result.get("reason"),
                            result.get("client_user_message_id"), bool(submitted))
@@ -1450,8 +1469,9 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             return {"schema_version": 1, "status": "accepted",
                     "reason": "delivery-resolved"}, 0
         if cached_state != "current":
-            reason = ("cached-outcome-delivery-unmaterialized" if cached_state == "unmaterialized"
-                      else "cached-outcome-identity-unavailable")
+            reason = {"unmaterialized": "cached-outcome-delivery-unmaterialized",
+                      "partial": "cached-outcome-delivery-partial"}.get(
+                          cached_state, "cached-outcome-identity-unavailable")
             _update_duty(args, duty_id, state="unknown", reason=reason,
                          delivery="pending", effective_attempts=sorted(effective))
             return {"schema_version": 1, "status": "retryable", "reason": reason}, 75

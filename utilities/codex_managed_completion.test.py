@@ -1091,15 +1091,22 @@ class ObserverGenerationEndTest(unittest.TestCase):
     def test_immediate_pending_end_returns_to_the_runner_instead_of_a_successor(self):
         self.jobs.write_text("fixture\n", encoding="utf-8")
         duty_id = self._duty({"schema_version": 2, "state": "ready", "children": []})
-        with mock.patch("dispatch_completion_join.cached_batch_delivery_state",
-                        return_value="unmaterialized"), \
-             mock.patch.object(self.batch, "handoff_observer") as handoff, \
-             mock.patch.object(self.batch, "request_runner") as runner:
-            result, code = self._resume(duty_id)
-        self.assertEqual((code, result["reason"]), (75, "cached-outcome-delivery-unmaterialized"))
-        self.assertEqual(self.batch.read(self.jobs, duty_id)["state"], "delivery-pending")
-        handoff.assert_not_called()
-        runner.assert_called_once_with(self.jobs)
+        for state, reason in (("unmaterialized", "cached-outcome-delivery-unmaterialized"),
+                              ("partial", "cached-outcome-delivery-partial"),
+                              ("changed", "cached-outcome-identity-unavailable")):
+            with self.subTest(state=state):
+                self._release_leases()
+                with mock.patch("dispatch_completion_join.cached_batch_delivery_state",
+                                return_value=state), \
+                     mock.patch.object(self.module, "deliver_to_native_queue",
+                                       side_effect=AssertionError("never resent")), \
+                     mock.patch.object(self.batch, "handoff_observer") as handoff, \
+                     mock.patch.object(self.batch, "request_runner") as runner:
+                    result, code = self._resume(duty_id)
+                self.assertEqual((code, result["reason"]), (75, reason))
+                self.assertEqual(self.batch.read(self.jobs, duty_id)["state"], "delivery-pending")
+                handoff.assert_not_called()
+                runner.assert_called_once_with(self.jobs)
 
         self._release_leases()
         with mock.patch.object(self.module, "_execute_once",
@@ -1220,6 +1227,48 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         waits = [call.args[0] for call in sleep.call_args_list]
         self.assertEqual(len(waits), 3)
         for actual, expected in zip(waits, [0.05, 0.085, 0.1445]):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_courier_retry_deferral_is_waited_out_not_a_new_observation(self):
+        # The ledger's deferral names a different remaining time on every
+        # pass. Read as a new observation, it reset this wait to 2 s forever
+        # while the courier admitted a claim only every 15 s.
+        module = load_completion_module()
+        args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
+                               jobs=Path("/tmp/jobs.log"), timeout=600.0,
+                               delivery_retry_interval=2.0)
+        row = SimpleNamespace(attempt_id="att-one", metadata={})
+        checks = {"count": 0}
+
+        def stop():
+            checks["count"] += 1
+            return "fixture-stop" if checks["count"] >= 10 else ""
+
+        class Session:
+            def __init__(self, path, *, timeout):
+                self.path = path
+
+            def close(self):
+                pass
+
+        failed = module.codex_queue_delivery.QueueDeliveryError("queue-thread-unavailable")
+        deferred = [module.pending_delivery.PendingDeliveryError(
+            "pending-delivery-retry-deferred", f"remaining_ns={seconds * 1_000_000_000}")
+            for seconds in (14, 13)]
+        with mock.patch.object(module, "current_session_children", return_value=[row]), \
+             mock.patch.object(module, "_queue_target_from_rows", return_value=SESSION), \
+             mock.patch.object(module.codex_queue_delivery, "DeliverySession", side_effect=Session), \
+             mock.patch.object(module, "_native_queue_delivery_once",
+                               side_effect=[failed, deferred[0], failed, deferred[1], failed]), \
+             mock.patch.object(module.time, "sleep") as sleep:
+            result = module.deliver_to_native_queue(args, {"receipt": True}, {"att-one"},
+                                                    stop_check=stop)
+
+        self.assertEqual(result["reason"], "fixture-stop")
+        waits = [call.args[0] for call in sleep.call_args_list]
+        # failure, deferral (waited out), the same failure again backs off.
+        self.assertEqual(len(waits), 4)
+        for actual, expected in zip(waits, [2.0, 14.0, 3.4, 13.0]):
             self.assertAlmostEqual(actual, expected)
 
     def test_standalone_stage_close_creates_the_real_ledger_then_queue_delivery_acks_it(self):
