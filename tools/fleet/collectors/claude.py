@@ -21,6 +21,7 @@ import sys
 from . import procscan
 from .. import session_registry
 from ..model import ContextEvidence, SubAgent
+from . import shell_jobs
 
 # The one projects-dir encoder lives in the harness utilities/, which the
 # dispatch collector already puts on sys.path the same way.
@@ -696,6 +697,26 @@ def enrich(sess, tick=None):
 
     # 3) Liveness mtime and title. Priority: fresh sidecar, AI title, then slug.
     path = _newest_transcript_path(home, sess.cwd, sid)
+    if path and sid:
+        source_key = ("claude", os.path.abspath(path), sid, sess.attempt_id)
+        if getattr(sess, "_fast_first", False):
+            sess.shell_jobs = []
+            sess.shell_job_observation = {"state": "unobserved",
+                                         "reason": "detail-refresh-deferred"}
+        else:
+            jobs = shell_jobs.read_claude_jobs(
+                path, session_id=sid, attempt_id=sess.attempt_id)
+            sess.shell_jobs = shell_jobs.observe_jobs(
+                jobs, parent_pid=sess.pid, parent_start=sess.proc_start,
+                attempt_id=sess.attempt_id, tree=getattr(sess, "_proc_tree", None),
+                kids=getattr(sess, "_proc_kids", None))
+            sess.shell_job_observation = shell_jobs.source_status(path, source_key)
+    else:
+        sess.shell_jobs = []
+        sess.shell_job_observation = {
+            "state": "unavailable",
+            "reason": "exact-transcript-unavailable" if sid else "exact-session-id-unresolved",
+        }
     if sid:
         from .. import session_cwd
         native_cwd = (sj or {}).get("cwd") if evidence.get("current_source") == "registry" else None

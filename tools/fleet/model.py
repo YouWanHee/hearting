@@ -11,8 +11,9 @@ import math
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
-from typing import Optional
+from typing import Optional, TypedDict
 
 from . import gitinfo
 
@@ -76,6 +77,57 @@ def dash(v, fmt=None):
 LIVENESS_STATES = ("working", "idle", "unused", "blocked", "done", "stale", "dead", "unknown")
 INTERACTION_KINDS = ("decision", "approval", "permission", "elicitation")
 
+# Fleet's existing completed dispatch-row afterglow, shared with native shell
+# task rows so readers and consumers use the same display lifetime.
+DONE_AFTERGLOW_MIN = 15
+
+
+def display_shell_jobs(jobs, *, now=None):
+    """Select visible shell rows without mutating the native reader's cache.
+
+    Only completed tasks with a valid, known completion age can age out. Live,
+    pending, unknown, or untimed terminal work stays visible because elapsed
+    observation time is not completion evidence.
+    """
+    now = time.time() if now is None else now
+    if (not isinstance(now, (int, float)) or isinstance(now, bool)
+            or not math.isfinite(now) or now < 0):
+        now = time.time()
+    keep = []
+    max_age = DONE_AFTERGLOW_MIN * 60
+    for job in jobs or ():
+        if not isinstance(job, dict) or job.get("lifecycle_state") != "completed":
+            keep.append(job)
+            continue
+        state = job.get("completion_time_state")
+        completed = job.get("completed_at")
+        if (state not in (None, "valid")
+                or not isinstance(completed, (int, float)) or isinstance(completed, bool)
+                or not math.isfinite(completed) or completed < 0 or completed > now):
+            keep.append(job)
+            continue
+        started = job.get("started_at")
+        if (isinstance(started, (int, float)) and not isinstance(started, bool)
+                and math.isfinite(started) and completed < started):
+            keep.append(job)
+            continue
+        if now - completed <= max_age:
+            keep.append(job)
+    def display_rank(job):
+        if not isinstance(job, dict):
+            return 1
+        state = job.get("lifecycle_state")
+        if state == "running":
+            return 0
+        if state == "completed":
+            return 2
+        return 1
+
+    # Keep each semantic group's source order stable while ensuring retained
+    # unknown-time history cannot push current or unresolved work below it.
+    return [job for _index, job in sorted(
+        enumerate(keep), key=lambda pair: (display_rank(pair[1]), pair[0]))]
+
 # Stable public name consumed by Fleet, the progress watchdog, liveness and
 # registry reconciliation.  Keeping the exact-attempt verdict here prevents
 # each surface from growing a subtly different PID/start-time classifier.
@@ -83,14 +135,74 @@ ATTEMPT_CLASSIFIER_SOURCE = "tools.fleet.model.classify_attempt_evidence"
 PROGRESS_PHASES = ("launch", "analysis", "tool", "file-write", "test", "artifact", "terminal")
 
 
+class ShellJob(TypedDict, total=False):
+    """Additive, evidence-separated projection of one native background shell task."""
+    harness: str
+    session_id: str
+    attempt_id: Optional[str]
+    source_generation: str
+    source_locator: str
+    native_id: str
+    native_id_kind: Optional[str]
+    native_record_kind: Optional[str]
+    native_record_kinds: list[str]
+    background_state: Optional[str]
+    background_source: Optional[str]
+    background_reason: Optional[str]
+    identity_link_state: Optional[str]
+    native_call_id: Optional[str]
+    native_task_id: Optional[str]
+    native_run_id: Optional[str]
+    native_task_type: Optional[str]
+    continuation_handle: Optional[str]
+    command: Optional[str]
+    command_display: Optional[str]
+    command_display_source: Optional[str]
+    command_source: Optional[str]
+    command_reason: Optional[str]
+    started_at: Optional[float]
+    start_source: Optional[str]
+    observed_at: Optional[float]
+    completed_at: Optional[float]
+    completion_time_source: Optional[str]
+    completion_time_state: Optional[str]
+    completion_time_reason: Optional[str]
+    exit_code: Optional[int]
+    exit_code_source: Optional[str]
+    native_status: str
+    lifecycle_state: str
+    process_state: str
+    process_reason: Optional[str]
+    process_identity: Optional[dict]
+    output_path: Optional[str]
+    output_size: Optional[int]
+    output_identity: Optional[dict]
+    native_output_observed: Optional[bool]
+    native_output_cursor: Optional[int]
+    native_output_size: Optional[int]
+    native_output_truncated: Optional[bool]
+    native_status_source: Optional[str]
+    output_coverage: str
+    output_reason: Optional[str]
+    last_output_at: Optional[float]
+    last_output_observed_at: Optional[float]
+    quiet_since: Optional[float]
+    quiet_suspected: bool
+    observation_state: Optional[str]
+    observation_reason: Optional[str]
+
+
 def _public_value(value):
     """Serialize additive Fleet values without exposing private evidence caches."""
     if is_dataclass(value):
-        payload = {
-            f.name: _public_value(getattr(value, f.name))
-            for f in fields(value)
-            if not f.name.startswith("_")
-        }
+        payload = {}
+        for f in fields(value):
+            if f.name.startswith("_"):
+                continue
+            item = getattr(value, f.name)
+            if f.name == "shell_jobs":
+                item = display_shell_jobs(item)
+            payload[f.name] = _public_value(item)
         if value.__class__.__name__ == "WorkProjection":
             ambiguity = payload.get("ambiguity")
             payload["ambiguity"] = [] if ambiguity is None else (
@@ -312,6 +424,11 @@ class Session:
     # Both are None when there is no evidence — never a guess (prd.md:263).
     exec_child: Optional[dict] = None
     exec_tool: Optional[dict] = None
+    # Per-call background shell observations are independent of parent liveness.
+    # Empty means no exact native task was found; unknown process/output facts
+    # remain explicit on each task instead of falling back to the legacy badge.
+    shell_jobs: list[ShellJob] = field(default_factory=list)
+    shell_job_observation: Optional[dict] = None
     # Exact privacy-minimal decision/approval evidence. Content is impossible
     # in the sidecar schema; only kind/source/time reach this public projection.
     interaction_state: Optional[dict] = None
@@ -591,6 +708,8 @@ class DispatchJob:
     session_total_tokens: Optional[int] = None
     exec_child: Optional[dict] = None
     exec_tool: Optional[dict] = None
+    shell_jobs: list[ShellJob] = field(default_factory=list)
+    shell_job_observation: Optional[dict] = None
     context: Optional[ContextProjection] = None
     work_projection: Optional[WorkProjection] = None
     cap_grounding: Optional[dict] = None   # {capability, mode?, intensity?} for an inline entry

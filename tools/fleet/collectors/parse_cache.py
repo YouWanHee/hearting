@@ -8,8 +8,18 @@ from pathlib import Path
 import tempfile
 
 
-# Source changes invalidate derived results across installed releases as well.
-_VERSION = hashlib.sha256(Path(__file__).with_name("dispatch.py").read_bytes()).hexdigest()
+# Parser and projection sources invalidate derived results across installed
+# releases. Shell-job cursors themselves are process-local and are never stored
+# in this cache, which remains metadata-only for bounded attempt parses.
+_VERSION_HASH = hashlib.sha256()
+for _name in ("dispatch.py", "codex.py", "claude.py", "opencode.py", "shell_jobs.py"):
+    _path = Path(__file__).with_name(_name)
+    _VERSION_HASH.update(_name.encode("utf-8") + b"\0")
+    try:
+        _VERSION_HASH.update(_path.read_bytes())
+    except OSError:
+        _VERSION_HASH.update(b"unavailable")
+_VERSION = _VERSION_HASH.hexdigest()
 
 
 def key(parser, path, stamp, limits):
