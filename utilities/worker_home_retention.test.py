@@ -2442,6 +2442,58 @@ class Races(Fixture):
             **value, "attempt_ids": ["att-final-admission-attempt-rewrite"], "state": "pending",
         }), encoding="utf-8"))
 
+    def test_changed_group_record_read_stays_bound_to_scanned_directory(self):
+        base = self.root / "pending-delivery"
+        group = base / ("a" * 64)
+        group.mkdir(parents=True)
+        candidate = "att-group-replacement-race"
+        delivery_id = "delivery-" + "1" * 32 + ".json"
+        original_record = group / delivery_id
+
+        # Capture the checked directory identity before the candidate-related
+        # record appears, so this group is inspected as a late change.
+        old_ns = time.time_ns() - 10_000_000
+        os.utime(group, ns=(old_ns, old_ns))
+        before = R._stamp(group)
+        self.delivery_record(original_record, candidate)
+        baseline = R._CandidateDeliveryBaseline(
+            attempt=candidate,
+            binding=None,
+            related=frozenset({candidate}),
+            related_file_stamps=(),
+            baseline_files=(),
+            baseline_file_paths=frozenset(),
+            group_stamps=((group, before),),
+            group_names=frozenset({group.name}),
+            base=base,
+            base_stamp=R._stamp(base),
+        )
+
+        displaced = self.root / "displaced-pending-group"
+        replacement_attempt = "att-unrelated-group-replacement"
+        real_relation = R._delivery_record_relation
+        swapped = []
+
+        def replace_group_before_read(path, related, binding=None, **kwargs):
+            if not swapped:
+                group.rename(displaced)
+                group.mkdir()
+                self.delivery_record(group / path.name, replacement_attempt)
+                swapped.append(True)
+            return real_relation(path, related, binding, **kwargs)
+
+        with mock.patch.object(R, "_delivery_record_relation", replace_group_before_read):
+            result = R._late_candidate_group_change(
+                baseline, baseline.related, baseline.binding,
+                baseline.baseline_file_paths, time.monotonic() + 2)
+
+        self.assertEqual(swapped, [True])
+        self.assertEqual(result, "changed")
+        self.assertEqual(json.loads((displaced / delivery_id).read_text())["attempt_ids"],
+                         [candidate])
+        self.assertEqual(json.loads((group / delivery_id).read_text())["attempt_ids"],
+                         [replacement_attempt])
+
     def test_late_discovered_group_parent_reference_rewrite_keeps_home(self):
         self._assert_late_discovered_record_rewrite_keeps_home("parent_attempt_id")
 

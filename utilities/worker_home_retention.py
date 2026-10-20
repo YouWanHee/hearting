@@ -1497,12 +1497,14 @@ def _parse_metadata(value: str) -> dict[str, str]:
 
 
 def _delivery_record_relation(path: Path, related: set[str] | frozenset[str],
-                              binding: _HomeBinding | None = None) -> str:
+                              binding: _HomeBinding | None = None, *,
+                              dir_fd: int | None = None) -> str:
     """related | unrelated | unknown for a changed delivery record."""
     from dispatch_pending_delivery import PendingDeliveryError, _validate_record
     for attempt in range(2):
         try:
-            found = _read_json(str(path), MAX_DELIVERY_BYTES)
+            read_path = path.name if dir_fd is not None else str(path)
+            found = _read_json(read_path, MAX_DELIVERY_BYTES, dir_fd=dir_fd)
             if found is None:
                 return "unrelated"
             value = found[0]
@@ -1741,7 +1743,8 @@ def _late_candidate_group_change(baseline: _CandidateDeliveryBaseline,
                     path = group / entry.name
                     if not entry.name.endswith(".json") or path in baseline_files:
                         continue
-                    relation = _delivery_record_relation(path, related, binding)
+                    relation = _delivery_record_relation(
+                        path, related, binding, dir_fd=group_fd)
                     if relation == "related":
                         return "changed"
                     if relation == "unknown":
