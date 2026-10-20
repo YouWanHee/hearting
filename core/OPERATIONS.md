@@ -1021,14 +1021,21 @@ A legacy hash collision is diagnostic
      `utilities/worktree-cleanup.py --check --worktree <path>` and then the
      same command with `--apply` when eligible. The state machine blocks the
      primary worktree, dirty/untracked state, Git operations, locks, unmerged
-     HEADs, an integration ref not synchronized with its upstream, and active
-     exact job PIDs or process cwd. It never uses `--force`, and the branch is
+     HEADs absent from a freshly fetched remote default branch, local
+     integration commits not present in that remote tip, and active exact job
+     PIDs or process cwd. A local integration branch may be behind the remote
+     tip; cleanup does not require switching to or updating that branch. If
+     remote evidence cannot be refreshed, cleanup blocks instead of trusting a
+     cached remote-tracking ref. It never uses `--force`, and the branch is
      retained as a rollback point.
+     An explicit local integration ref must include the target itself and must
+     have a configured upstream that is freshly fetched; an explicit remote ref
+     is checked directly against its freshly fetched remote branch.
      A repository with no remote may instead pass the explicit
-     `--repository-mode local-only`; this skips only the upstream/push-sync
-     gate and records `integration_upstream=local-only`. It does not infer
-     local-only from a missing upstream and does not weaken clean, merged,
-     inactive-process, lock, or Git-operation gates.
+     `--repository-mode local-only`; this checks the selected local integration
+     ref without remote evidence and records `integration_upstream=local-only`.
+     It does not infer local-only from a missing upstream and does not weaken
+     clean, merged, inactive-process, lock, or Git-operation gates.
    - Cleanup does not copy or harvest agent artifacts: workers wrote them to
      the canonical root from the start. A stale matching open registry row is
      reconciled to `done,note=cleanup-merged` only after every other safety
