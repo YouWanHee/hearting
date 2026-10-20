@@ -358,6 +358,14 @@ class Expiry(Fixture):
         cache = home / "cache"
         cache.mkdir()
         (cache / "entry").write_text("cache")
+        transcript = home / "projects" / "repo" / "session-raw.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"message"}\n')
+        (home / "settings.local.json").write_text("{}")
+        outside = self.root / "outside-target"
+        outside.mkdir()
+        (outside / "keep").write_text("not part of the home")
+        (home / "plugins-link").symlink_to(outside, target_is_directory=True)
         os.utime(home, ns=(self.now, self.now))
         remove = R._remove_leaf
         with mock.patch.object(R._Context, "home_process_evidence",
@@ -366,16 +374,80 @@ class Expiry(Fixture):
             result = self.sweep(1.01)
         self.assertEqual(result["partial"], 1, result)
         retiring = self.root / "homes/worker-retention/retiring"
-        names = list(retiring.iterdir())
-        self.assertEqual(len(names), 2)  # detached cache directory and its legacy-compatible journal
+        names = sorted(path.name for path in retiring.iterdir())
+        journals = [name for name in names if name.endswith(".journal")]
+        # Each interrupted entry (directory, file, symlink) left its leaf and journal.
+        self.assertEqual(len(journals), 3, names)
+        self.assertEqual(len(names), 6, names)
+        for name in journals:
+            record = json.loads((retiring / name).read_text())
+            self.assertEqual(record["operation"], "partial-entry")
+            self.assertIn(record["source"], {"cache", "settings.local.json", "plugins-link"})
         self.assertTrue(home.is_dir())
+        self.assertFalse(any((home / name).exists() or (home / name).is_symlink()
+                             for name in ("cache", "settings.local.json", "plugins-link")))
         with mock.patch.object(R._Context, "home_process_evidence",
                                return_value=("absent", "fixture-process-scan-complete")), \
                 mock.patch.object(R, "_remove_leaf", wraps=remove):
             resumed = self.sweep(2.02)
-        self.assertGreaterEqual(resumed["detached_leftover"], 1)
+        self.assertGreaterEqual(resumed["detached_leftover"], 3)
         self.assertTrue(home.is_dir())
         self.assertFalse(any(retiring.iterdir()))
+        self.assertEqual(transcript.read_text(), '{"type":"message"}\n')
+        self.assertTrue((home / "worker-home.json").is_file())
+        self.assertEqual((outside / "keep").read_text(), "not part of the home")
+
+    def test_pruned_homes_stay_resolvable_through_attempt_viewer(self):
+        import sqlite3
+        import attempt_view as VIEW
+        from claude_project_dir import encode_project_dir
+        identity = DC.process_launch_identity(os.getpid())
+        main = dict(main_runtime_pid=str(os.getpid()), main_runtime_pid_start=identity["pid_start"],
+                    main_runtime_ns=DC.process_namespace_identity())
+        claude_attempt, opencode_attempt = "att-viewer-claude", "att-viewer-opencode"
+        claude_home = self.add(claude_attempt)
+        opencode_home = self.add(opencode_attempt, harness="opencode")
+        self.rows[claude_attempt][1].update(main_runtime_harness="claude", **main)
+        self.rows[opencode_attempt][1].update(main_runtime_harness="opencode", **main)
+        self.write_rows()
+        transcript = claude_home / "projects" / encode_project_dir("/repo") / "session-raw.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"message"}\n')
+        database = opencode_home / "runtime/data/opencode/opencode.db"
+        database.parent.mkdir(parents=True)
+        with sqlite3.connect(database) as writer:
+            writer.execute("CREATE TABLE part (id TEXT PRIMARY KEY)")
+        for home in (claude_home, opencode_home):
+            (home / "cache").mkdir()
+            (home / "cache" / "entry").write_text("cache")
+            os.utime(home, ns=(self.now, self.now))
+        with mock.patch.object(R._Context, "home_process_evidence",
+                               return_value=("absent", "fixture-process-scan-complete")):
+            result = self.sweep(1.01)
+        self.assertEqual(result["partial"], 2, result)
+        self.assertFalse((claude_home / "cache").exists() or (opencode_home / "cache").exists())
+        log = self.root / "viewer-owner.jsonl"
+        log.write_text(json.dumps({"type": "dispatch.supervisor.session-announced",
+                                   "session_id": "session-raw", "cwd": "/repo"}) + "\n")
+        cases = (
+            (claude_attempt, "claude", {"runtime_home": str(claude_home)}, "claude", transcript),
+            (opencode_attempt, "opencode", {"runtime_home": str(opencode_home),
+                                            "opencode_runtime_dir": str(opencode_home / "runtime")},
+             "opencode-db", database),
+        )
+        for attempt, harness, meta, kind, expected in cases:
+            row = (self.root, ["2026", "done", "repo", "/repo", "owner", ""],
+                   {"attempt_id": attempt, "harness": harness, "log_file": str(log),
+                    "cwd": "/repo", **meta})
+            with mock.patch.object(VIEW, "_find_attempt", return_value=row), \
+                    mock.patch.object(VIEW, "_log_path", return_value=str(log)):
+                sources, error = VIEW.resolve_sources(attempt)
+            self.assertIsNone(error)
+            native = [source for source in sources if source.kind == kind]
+            self.assertEqual([source.path for source in native], [expected], sources)
+            with R.worker_home_read_admission(
+                    self.jobs, meta["runtime_home"], expected, attempt, harness) as admitted:
+                self.assertTrue(admitted)
 
     def test_live_unknown_dead_and_seven_day_retention_boundary(self):
         live = R._Row("", ["", "done", "", "", "", "harness=claude"])

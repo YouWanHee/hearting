@@ -118,8 +118,9 @@ it does not read or send the target's composer. Clear retains its existing
 foreground, form, draft, and successor checks.
 
 The optional seat-lineage reader is a read-only projection of existing ledger,
-card history and transcript locations. Card injection may include one direct
-predecessor transcript line; the complete hook output, including guidance,
+card history and transcript locations. Card injection may include one
+transcript line for the predecessor that an explicit handover edge names, never
+a merely adjacent session; the complete hook output, including guidance,
 notices, resume data and memory references, remains within the existing 2,400
 UTF-8 byte limit.
 

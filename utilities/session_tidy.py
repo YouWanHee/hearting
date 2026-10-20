@@ -776,8 +776,10 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
     for index, item in enumerate(output):
         key = (item["harness"], item["sid"])
         predecessors = edges.get(key, set())
+        item["predecessor"] = None
         if len(predecessors) == 1:
             item["relation"] = "confirmed"
+            item["predecessor"] = {"harness": item["harness"], "sid": next(iter(predecessors))}
         elif len(predecessors) > 1:
             item["relation"] = "unknown"
         elif index + 1 < len(output) and output[index + 1]["harness"] == item["harness"]:
@@ -879,6 +881,20 @@ def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
                           if generations else [])
         locations[key] = _lineage_transcript(name, session, str(summary.get("transcript") or ""))
     return _project_seat_lineage(rows, cards, locations, harness=harness, sid=sid)
+
+
+def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optional[dict]:
+    """The session an explicit handover edge names as ``sid``'s predecessor; never a neighbour."""
+    current = next((row for row in lineage
+                    if row.get("harness") == harness and row.get("sid") == sid), None)
+    identity = (current or {}).get("predecessor") if (current or {}).get("relation") == "confirmed" else None
+    if not isinstance(identity, dict) or not identity.get("harness") or not identity.get("sid"):
+        return None
+    name, session = identity["harness"], identity["sid"]
+    found = next((row for row in lineage
+                  if row.get("harness") == name and row.get("sid") == session), None)
+    return found or {"harness": name, "sid": session,
+                     "transcript": _lineage_transcript(name, session, "")}
 
 
 def _lineage_row_matches_seat(row: dict, seat: Seat) -> bool:
@@ -1934,10 +1950,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if card_due:
                 previous = None
                 if seat.kind in ("pane", "native") and card_seat.kind in ("pane", "native"):
-                    lineage = seat_lineage(seat, harness=harness, sid=sid)
-                    if (lineage and lineage[0].get("relation") == "confirmed"
-                            and len(lineage) > 1):
-                        previous = lineage[1]
+                    previous = _confirmed_predecessor(
+                        seat_lineage(seat, harness=harness, sid=sid), harness, sid)
                 parts.append(build_card_injection(
                     card, card_text_path(card_seat), now, room, previous_transcript=previous))
             if memory_text:

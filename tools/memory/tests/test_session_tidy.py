@@ -2029,6 +2029,67 @@ class MemoryLayerTest(TidyCase):
         self.assertIn("원문 경로 생략", text)
         self.assertLessEqual(len(text.encode("utf-8")), 1600)
 
+    def test_confirmed_edge_beats_chronology_for_previous_transcript(self):
+        rows = [
+            {"event": "start", "harness": "claude", "sid": "sid-a", "ts": 1, "first_seen": 1,
+             "source": "startup"},
+            {"event": "start", "harness": "claude", "sid": "sid-b", "ts": 2, "first_seen": 2,
+             "source": "startup"},
+            {"event": "start", "harness": "claude", "sid": "sid-c", "ts": 3, "first_seen": 3,
+             "source": "clear"},
+            {"event": "handover", "harness": "claude", "sid": "sid-c",
+             "from": {"harness": "claude", "sid": "sid-a"}, "source": "clear"},
+        ]
+        locations = {("claude", "sid-a"): {"path": "/raw/a.jsonl", "status": "unreadable"},
+                     ("claude", "sid-b"): {"path": "/raw/b.jsonl", "status": "available"}}
+        for harness in (None, "claude"):
+            projected = st._project_seat_lineage(rows, {}, locations, harness=harness, sid="sid-c")
+            self.assertEqual(projected[0]["predecessor"], {"harness": "claude", "sid": "sid-a"})
+            self.assertEqual(projected[1]["sid"], "sid-b")
+            self.assertIsNone(projected[1]["predecessor"])
+            previous = st._confirmed_predecessor(projected, "claude", "sid-c")
+            self.assertEqual(previous["sid"], "sid-a")
+        card = {"author": {"harness": "claude", "sid": "sid-a"}, "authored_at_epoch": 10, "body": "본문"}
+        text = st.build_card_injection(card, Path("/card.json"), 10, 2000, previous_transcript=previous)
+        self.assertIn("이전 대화: claude sid-a · 원문 읽기 불가", text)
+        self.assertNotIn("/raw/b.jsonl", text)
+        chronological = st._project_seat_lineage(rows[:3], {}, locations, sid="sid-c")
+        self.assertIsNone(st._confirmed_predecessor(chronological, "claude", "sid-c"))
+
+    def test_clear_footer_names_handover_source_not_intervening_session(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            before = self.iso.root / "before.jsonl"
+            middle = self.iso.root / "middle.jsonl"
+            for path in (before, middle):
+                path.write_text('{"type":"message"}\n', encoding="utf-8")
+            st.record_event(seat, "claude", "sid-before", "start", source="startup",
+                            transcript=str(before), cwd=str(self.cwd), now=100)
+            st.write_card(seat, "claude", "sid-before", "진행 중: 이전 일", cwd=str(self.cwd), now=101)
+            st.record_event(seat, "claude", "sid-middle", "start", source="startup",
+                            transcript=str(middle), cwd=str(self.cwd), now=150)
+            st._append_ledger_entry(seat, {"ts": 199, "event": "handover", "harness": "claude",
+                                           "sid": "sid-after", "from": {"harness": "claude",
+                                           "sid": "sid-before"}, "source": "clear"})
+            output = st.run_hook("claude", "start", "sid-after", source="clear", cwd=str(self.cwd), now=200)
+        self.assertIn(f"이전 대화: claude sid-befo · 원문 {before}", output)
+        self.assertNotIn(str(middle), output)
+        self.assertNotIn("sid-midd", output)
+        self.assertLessEqual(len(output.encode("utf-8")), st.INJECTION_MAX_BYTES)
+
+    def test_clear_footer_for_unrecorded_handover_source_reports_missing_transcript(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.write_card(seat, "claude", "sid-ghost", "진행 중: 이전 일", cwd=str(self.cwd), now=101)
+            st.record_event(seat, "claude", "sid-other", "start", source="startup",
+                            cwd=str(self.cwd), now=150)
+            st._append_ledger_entry(seat, {"ts": 199, "event": "handover", "harness": "claude",
+                                           "sid": "sid-after", "from": {"harness": "claude",
+                                           "sid": "sid-ghost"}, "source": "clear"})
+            output = st.run_hook("claude", "start", "sid-after", source="clear", cwd=str(self.cwd), now=200)
+        self.assertIn("이전 대화: claude sid-ghos · 원문 없음", output)
+        self.assertNotIn("sid-othe", output.split("이전 대화:", 1)[-1])
+
     def refs(self, n=3, batch="b1", status="applied", **more):
         rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
         return dict(batch=batch, status=status, refs=rows, **more)
