@@ -798,25 +798,34 @@ function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => 
 // while V2 registers only `setup`. Plugin.define is an identity constructor in
 // the pinned V2 implementation, so this default object is its portable result.
 async function responsePrefix(response, cap = 64 * 1024) {
+  let reader
+  let timer
   try {
-    const reader = response.clone().body?.getReader()
+    reader = response.clone().body?.getReader()
     if (!reader) return new Uint8Array()
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ done: true }), 1000)
+    })
     const chunks = []
     let size = 0
     while (size < cap) {
-      const { done, value } = await reader.read()
+      const { done, value } = await Promise.race([reader.read(), deadline])
       if (done) break
       const part = value.subarray(0, cap - size)
       chunks.push(part)
       size += part.byteLength
       if (part.byteLength !== value.byteLength) break
     }
-    try { await reader.cancel() } catch {}
     const merged = new Uint8Array(size)
     let offset = 0
     for (const part of chunks) { merged.set(part, offset); offset += part.byteLength }
     return merged
   } catch { return new Uint8Array() }
+  finally {
+    clearTimeout(timer)
+    // Cancelling a tee branch may wait for the runtime's original consumer.
+    try { void reader?.cancel().catch(() => {}) } catch {}
+  }
 }
 
 async function setupOpenCodeV2(ctx) {
@@ -931,18 +940,23 @@ async function setupOpenCodeV2(ctx) {
     const model = event.model
     const status = event.response?.status
     if (!model?.providerID || !model?.id || !Number.isInteger(status)) return
-    const body = await responsePrefix(event.response)
-    try {
-      const child = spawn("python3", [path.join(root, "utilities", "opencode_runtime.py"),
-        "record-provider-response", "--model", `${model.providerID}/${model.id}`,
-        "--status", String(status)], {
-        cwd: root, env: { ...process.env, AGENT_HOME: root },
-        stdio: ["pipe", "ignore", "ignore"],
-      })
-      child.on("error", () => {})
-      child.stdin.on("error", () => {})
-      child.stdin.end(body)
-    } catch { /* Eligibility telemetry never delays a provider response. */ }
+    // The runtime consumes the original body after this callback returns.
+    // Reading/cancelling its clone must not hold that consumer behind telemetry.
+    void (async () => {
+      const body = status >= 200 && status < 300
+        ? new Uint8Array() : await responsePrefix(event.response)
+      try {
+        const child = spawn("python3", [path.join(root, "utilities", "opencode_runtime.py"),
+          "record-provider-response", "--model", `${model.providerID}/${model.id}`,
+          "--status", String(status)], {
+          cwd: root, env: { ...process.env, AGENT_HOME: root },
+          stdio: ["pipe", "ignore", "ignore"],
+        })
+        child.on("error", () => {})
+        child.stdin.on("error", () => {})
+        child.stdin.end(body)
+      } catch { /* Eligibility telemetry remains best-effort. */ }
+    })().catch(() => {})
   })
 
   void (async () => {
