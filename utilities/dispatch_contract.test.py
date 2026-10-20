@@ -4884,6 +4884,20 @@ class DrainReceiptDeniedEnvironTest(unittest.TestCase):
    with D.process_table_scan_scope():                   # the batch scan reads the same judgement
     self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
 
+ def test_an_unreadable_user_service_manager_is_outside_the_attempt(self):
+  # `systemd --user` and `(sd-pam)` are non-dumpable and may restart after the attempt began.
+  uid=os.getuid()
+  real=Path.read_text
+  target=f"/proc/{self.late.pid}/cgroup"
+  def read_text(path,*args,**kwargs):
+   if str(path)==target:
+    return f"0::/user.slice/user-{uid}.slice/user@{uid}.service/init.scope\n"
+   return real(path,*args,**kwargs)
+  with self.denied(),mock.patch.object(Path,"read_text",read_text):
+   self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+   with D.process_table_scan_scope():
+    self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+
  def test_an_unreadable_process_under_a_same_uid_parent_stays_unverifiable(self):
   # What an attempt's own descendant looks like: its parent runs as the attempt's user.
   with self.denied(),self.parent_uid(os.getuid()):
@@ -5469,6 +5483,29 @@ class DeliveryIntentWiringTest(unittest.TestCase):
             self.assertEqual(
                 after.get("delivery_receipt_digest"), before.get("delivery_receipt_digest")
             )
+
+    def test_w3_fleet_cancellation_keeps_its_result_and_delivery_on_late_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            jobs.write_text(self._row() + "\n", encoding="utf-8")
+            evidence = {"failure_class": "cancelled", "classifier_source": "fleet-cancel-v1",
+                        "reconcile_reason": "user-terminated"}
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "fleet-kill", evidence=evidence), "closed")
+            before = jobs.read_bytes()
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "fleet-kill", evidence=evidence), "already-terminal")
+            self.assertEqual(jobs.read_bytes(), before)
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "completed-supervisor", evidence={"failure_class": "pass"}),
+                "terminal-conflict")
+            original = D.parse_registry_metadata(before.decode().strip().split("\t", 5)[5])
+            after = D.parse_registry_metadata(jobs.read_text().strip().split("\t", 5)[5])
+            self.assertEqual((after["note"], after["failure_class"]), ("fleet-kill", "cancelled"))
+            self.assertEqual(D.committed_outcome("done", after), "cancelled")
+            self.assertTrue(D.terminal_conflict_pending(after))
+            for key in ("delivery_id", "delivery_intent", "delivery_receipt_digest"):
+                self.assertEqual(after.get(key), original.get(key))
 
     def test_w1_marker_bound_delivery_transaction_stamps_intent(self):
         with tempfile.TemporaryDirectory() as td:

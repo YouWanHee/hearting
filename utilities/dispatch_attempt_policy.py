@@ -129,7 +129,7 @@ def committed_outcome(status: str, metadata: Mapping[str, str]) -> str:
     if status not in TERMINAL_STATES:
         return "unknown"
     note = metadata.get("note", "")
-    if note == "cancelled-by-parent" and metadata.get("failure_class") == "cancelled":
+    if note in {"cancelled-by-parent", "fleet-kill"} and metadata.get("failure_class") == "cancelled":
         return "cancelled"
     if note == REVIEW_BLOCKING_NOTE:
         return "review-blocked"

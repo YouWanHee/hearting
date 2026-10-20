@@ -5,7 +5,15 @@ from __future__ import annotations
 
 import argparse
 from model_config import parse_context_window
-from codex_permission_profile import commit_profile_config, config_arguments
+from codex_permission_profile import (
+    OWNER_COMMIT_NO_NETWORK_PROFILE_NAME,
+    OWNER_OBSERVE_PROFILE_NAME,
+    PROFILE_NAME,
+    commit_profile_config,
+    config_arguments,
+    owner_turn_profile_config,
+    turn_permissions_available,
+)
 from worker_runtime_home import codex_worker_arguments
 import json
 import queue
@@ -720,6 +728,7 @@ def apply_owner_runtime_permissions(args: argparse.Namespace) -> None:
         raise SupervisorError("owner-runtime-permission-context-binding-mismatch")
     if not commit_policy.runtime_permission_context_is_current(context):
         raise SupervisorError("owner-runtime-permission-route-changed")
+    args.owner_runtime_base_sandbox = str(context.get("base_sandbox") or args.sandbox)
     projection_args = SimpleNamespace(
         worker_type=context["worker_type"],
         dispatch_depth=context["dispatch_depth"],
@@ -752,6 +761,41 @@ def apply_owner_runtime_permissions(args: argparse.Namespace) -> None:
     args.owner_runtime_permission_state = state
 
 
+def configure_permission_profiles(args: argparse.Namespace, command: list[str]) -> None:
+    """Prepare owner profiles; enable turn selection only on known-capable runtimes."""
+    args.turn_permissions_supported = False
+    args.owner_turn_permission_profiles = None
+    owner_state = getattr(args, "owner_runtime_permission_state", None)
+    if (owner_state is not None
+            and getattr(args, "owner_runtime_base_sandbox", args.sandbox) == "workspace-write"):
+        selector_supported = turn_permissions_available(command)
+        roots = list(getattr(args, "base_writable_root", args.writable_root))
+        git_dirs = commit_policy.worktree_git_dirs(args.worktree)
+        if git_dirs is not None:
+            git_dir, common_dir = git_dirs
+            if git_dir != common_dir:
+                roots.extend(str(path) for path in (
+                    git_dir, common_dir / "objects", common_dir / "refs", common_dir / "logs",
+                ))
+        profile = owner_turn_profile_config(
+            args.worktree, roots, "workspace-write",
+            primary_commit=bool(getattr(args, "primary_git_commit", False)),
+        )
+        if profile is not None:
+            args.native_permission_profile = profile
+            args.turn_permissions_supported = selector_supported
+            args.owner_turn_permission_profiles = {
+                "observation": OWNER_OBSERVE_PROFILE_NAME,
+                "commit": PROFILE_NAME,
+                "commit_no_network": OWNER_COMMIT_NO_NETWORK_PROFILE_NAME,
+            }
+            return
+    args.native_permission_profile = commit_profile_config(
+        args.worktree, args.writable_root, args.sandbox, args.network_access,
+        primary_commit=bool(getattr(args, "primary_git_commit", False)),
+    )
+
+
 def resource_sandbox_command(args, row):
     """Apply this owner's selected native policy; no tool namespace inheritance."""
     from codex_permission_profile import PROFILE_NAME
@@ -760,6 +804,7 @@ def resource_sandbox_command(args, row):
         enforcement = "none"
     elif args.sandbox in {"workspace-write", "read-only"}:
         profile = getattr(args, "native_permission_profile", None)
+        selected_profile = PROFILE_NAME
         if profile is None:
             profile = {"default_permissions": PROFILE_NAME, "permissions": {PROFILE_NAME: {
                 "extends": ":workspace" if args.sandbox == "workspace-write" else ":read-only",
@@ -767,7 +812,22 @@ def resource_sandbox_command(args, row):
                     for root in [args.worktree, *args.writable_root]} if args.sandbox == "workspace-write" else {}),
                 "network": {"enabled": bool(args.network_access)},
             }}}
-        options = [*config_arguments(profile), "-P", PROFILE_NAME]
+        owner_profiles = getattr(args, "owner_turn_permission_profiles", None)
+        owner_state = getattr(args, "owner_runtime_permission_state", None)
+        if owner_profiles and isinstance(owner_state, dict):
+            if owner_state.get("observation_only") or not owner_state.get("may_commit"):
+                selected_profile = owner_profiles["observation"]
+            else:
+                selected_profile = (
+                    owner_profiles["commit"] if args.network_access
+                    else owner_profiles["commit_no_network"]
+                )
+        elif getattr(args, "native_permission_profile", None) is not None \
+                and args.sandbox == "read-only":
+            # A prepared commit profile must not survive a safety downgrade
+            # on runtimes without per-turn profile selection.
+            selected_profile = ":read-only"
+        options = [*config_arguments(profile), "-P", selected_profile]
         enforcement = "os-sandbox"
     else:
         raise SupervisorError("resource-sandbox-selection-unsupported")
@@ -795,7 +855,18 @@ def run_turn(
     # per-turn Git/task overlay is valid only after the exact owner context
     # above has revalidated its route and current worktree state.
     owner_projection = getattr(args, "owner_runtime_permission_state", None)
-    if owner_projection is not None or getattr(args, "native_permission_profile", None) is None:
+    selected_profile = None
+    profiles = getattr(args, "owner_turn_permission_profiles", None)
+    if owner_projection is not None and getattr(args, "turn_permissions_supported", False) and profiles:
+        if owner_projection.get("observation_only"):
+            selected_profile = profiles["observation"]
+        elif owner_projection.get("may_commit") and args.sandbox == "workspace-write":
+            selected_profile = (
+                profiles["commit"] if args.network_access else profiles["commit_no_network"]
+            )
+    if selected_profile is not None:
+        params["permissions"] = selected_profile
+    elif owner_projection is not None or getattr(args, "native_permission_profile", None) is None:
         params["sandboxPolicy"] = sandbox_policy(args)
     if args.approval != "inherit" and getattr(args, "native_permission_profile", None) is None:
         params["approvalPolicy"] = args.approval
@@ -976,10 +1047,7 @@ def run_one_turn(args: argparse.Namespace) -> int:
     ]
     args.base_writable_root = list(args.writable_root)
     apply_owner_runtime_permissions(args)
-    args.native_permission_profile = commit_profile_config(
-        args.worktree, args.writable_root, args.sandbox, args.network_access,
-        primary_commit=args.primary_git_commit,
-    )
+    configure_permission_profiles(args, command)
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
 
@@ -994,7 +1062,8 @@ def run_one_turn(args: argparse.Namespace) -> int:
             "initialize",
             {"clientInfo": {"name": "hearting-dispatch-stage",
                             "title": "Hearting Dispatch Stage", "version": "1"},
-             "capabilities": None},
+             "capabilities": ({"experimentalApi": True}
+                              if args.turn_permissions_supported else None)},
         )
         server.notification("initialized")
         thread_params: dict[str, Any] = {"cwd": args.worktree, "ephemeral": True}
@@ -1081,10 +1150,9 @@ def main(argv: list[str] | None = None) -> int:
     command = shlex.split(args.app_server_command) if args.app_server_command else [
         "codex", "app-server", "--listen", "stdio://"
     ]
-    args.native_permission_profile = commit_profile_config(
-        args.worktree, args.writable_root, args.sandbox, args.network_access,
-        primary_commit=args.primary_git_commit,
-    )
+    args.base_writable_root = list(args.writable_root)
+    apply_owner_runtime_permissions(args)
+    configure_permission_profiles(args, command)
     args.resource_launch_command = lambda row: resource_sandbox_command(args, row)
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
@@ -1149,7 +1217,8 @@ def main(argv: list[str] | None = None) -> int:
                     "title": "Hearting Dispatch Supervisor",
                     "version": "1",
                 },
-                "capabilities": None,
+                "capabilities": ({"experimentalApi": True}
+                                 if args.turn_permissions_supported else None),
             },
         )
         server.notification("initialized")

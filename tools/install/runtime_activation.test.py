@@ -682,6 +682,44 @@ class LinkedReleaseBundleTest(unittest.TestCase):
                 self.assertTrue(os.path.lexists(survivor), survivor)
             self.assertTrue(live.is_dir())
 
+
+    def test_prune_preserves_unexpected_content_in_dangling_marked_bundle(self):
+        import json
+        import os
+        import shutil
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "codex-home"
+            release = self._release(root, "v1.0.0")
+            source, _ = self._build(release, home)
+            bundle = source.parent
+            # Retire the release, then add content that activation did not create.
+            # destructive-ok: reason=make the linked source dangling for the ownership fixture; boundary=the release created inside this test's temporary directory
+            shutil.rmtree(release)
+            foreign = bundle / "operator-data"
+            foreign.write_text("keep\n", encoding="utf-8")
+            self._build(self._release(root, "v1.1.0"), home)
+            self.assertTrue(foreign.exists())
+
+    def test_prune_does_not_treat_stat_error_as_dangling(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "codex-home"
+            release = self._release(root, "v2.0.0")
+            source, _ = self._build(release, home)
+            bundle = source.parent
+            real_stat = os.stat
+            def denied(path, *args, **kwargs):
+                if Path(path) == source:
+                    raise PermissionError("fixture stat denied")
+                return real_stat(path, *args, **kwargs)
+            with mock.patch.object(activation.os, "stat", side_effect=denied):
+                self._build(self._release(root, "v2.1.0"), home)
+            self.assertTrue(bundle.exists())
+
     def test_discarding_a_linked_bundle_never_removes_the_release(self):
         import shutil
         with tempfile.TemporaryDirectory() as temporary:

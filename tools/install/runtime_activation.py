@@ -775,6 +775,8 @@ def _linked_entries(
         )
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
+        v2_plugin = source_root / "adapters/opencode/plugins/hearting-guards/index.ts"
+        entries.append(_entry(v2_plugin, home / "plugins/hearting-guards/index.ts", "hook_config"))
         herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
         entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
@@ -960,19 +962,42 @@ def _prune_dead_release_bundles(runtime: str, scope: str, keep: Path) -> None:
             return
         active = (_load_json(_state_path(runtime, scope)) or {}).get("active_root")
         active_bundle = Path(active).parent if isinstance(active, str) and active else None
+        keep_root = keep.resolve(strict=False)
+        active_root = active_bundle.resolve(strict=False) if active_bundle else None
         for entry in sorted(bundles.iterdir()):
             try:
                 if entry.name.startswith(".") or entry.is_symlink() or not entry.is_dir():
                     continue
-                if entry == keep or entry == active_bundle:
+                if entry.resolve(strict=False) in {keep_root, active_root}:
                     continue
                 source = entry / "source"
-                if not source.is_symlink() or os.path.exists(source):
+                metadata_path = entry / "bundle.json"
+                if not source.is_symlink() or metadata_path.is_symlink() or not metadata_path.is_file():
                     continue
-                metadata = _load_json(entry / "bundle.json") or {}
-                if metadata.get("source_link") is not True:
+                if {child.name for child in entry.iterdir()} != {"source", "bundle.json"}:
                     continue
-                # destructive-ok: reason=retire one linked runtime bundle whose release was removed; boundary=one real bundle directory below runtime state bundles holding only a dangling link
+                metadata = _load_json(metadata_path)
+                if not metadata or (
+                    metadata.get("schema") != SCHEMA
+                    or metadata.get("runtime") != runtime
+                    or metadata.get("source_link") is not True
+                    or not isinstance(metadata.get("source_root"), str)
+                    or not isinstance(metadata.get("source_revision"), str)
+                    or not metadata["source_revision"].startswith("release:")
+                    or not isinstance(metadata.get("checksum"), str)
+                ):
+                    continue
+                if source.resolve(strict=False) != Path(metadata["source_root"]).resolve(strict=False):
+                    continue
+                try:
+                    source.stat()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue
+                else:
+                    continue
+                # destructive-ok: reason=retire one linked runtime bundle whose release was removed; boundary=one real bundle directory below runtime state bundles holding only its exact source and bundle metadata entries
                 _remove_path(entry)
             except Exception:
                 continue
@@ -1013,6 +1038,7 @@ def _native_present(runtime: str, scope: str = "global") -> bool:
     elif runtime == "opencode":
         candidates.extend((home / "skills").glob("*"))
         candidates.append(home / "plugins/hearting-guards.js")
+        candidates.append(home / "plugins/hearting-guards/index.ts")
     for candidate in candidates:
         if not candidate.is_symlink():
             continue
@@ -1068,7 +1094,8 @@ def _discovered_harness_links(runtime: str, scope: str = "global") -> set[Path]:
     patterns = {
         "codex": ("skills/*", "agents/*.toml", "agent-modes/*/*.md"),
         "claude": ("skills/*", "agents/*.md", "agent-modes/*/*.md"),
-        "opencode": ("skills/*", "agents/*.md", "commands/*.md"),
+        "opencode": ("skills/*", "agents/*.md", "commands/*.md",
+                     "plugins/hearting-guards/index.ts"),
     }[runtime]
     found: set[Path] = set()
     for pattern in patterns:
@@ -2765,6 +2792,10 @@ def _journal_dest_allowed(runtime: str, dest: Path, scope: str) -> bool:
         return True
     if runtime == "opencode" and relative.parts == (
         "plugins", "hearting-guards.js"
+    ):
+        return True
+    if runtime == "opencode" and relative.parts == (
+        "plugins", "hearting-guards", "index.ts"
     ):
         return True
     return False

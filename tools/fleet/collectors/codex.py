@@ -43,6 +43,7 @@ from urllib.parse import urlsplit
 from fleet import session_registry
 from fleet.model import ContextEvidence, SESSION_WORK_SEC, SubAgent
 from fleet.token_budget import parse_codex_token_count
+from . import shell_jobs
 
 # rollout filename tail: rollout-<ISO-ts>-<uuid>.jsonl
 _SID_RE = re.compile(r"-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
@@ -1770,9 +1771,14 @@ def share_managed_registry_state(sessions):
             server_updated = getattr(server, "updated_at", None)
             if server_updated is not None:
                 client.updated_at = server_updated
+        if (getattr(server, "session_id", None) == getattr(client, "session_id", None)
+                and getattr(server, "attempt_id", None) == getattr(client, "attempt_id", None)
+                and not getattr(client, "shell_jobs", None) and getattr(server, "shell_jobs", None)):
+            client.shell_jobs = list(server.shell_jobs)
+            client.shell_job_observation = getattr(server, "shell_job_observation", None)
 
 
-def prepare_tick(sessions):
+def prepare_tick(sessions, *, wait_timeout=0.0):
     """Reserve only process-owned rollouts before enriching Codex rows.
 
     A TUI without a rollout fd gets a session id only from the pane's
@@ -1800,7 +1806,8 @@ def prepare_tick(sessions):
     pane_ids = {}
     if direct_tuis:
         from . import herdr, procscan
-        pane_ids = herdr.codex_pane_sessions(direct_tuis, force_current=True)
+        pane_ids = herdr.codex_pane_sessions(
+            direct_tuis, force_current=True, wait_timeout=wait_timeout)
         for sess in direct_tuis:
             sid = pane_ids.get(sess.pid)
             if not sid or _sid("rollout-x-%s.jsonl" % sid) != sid:
@@ -2295,6 +2302,11 @@ def enrich(sess, tick=None):
     if path and herdr_sid and _sid(path) != herdr_sid:
         path = None                      # the pane selected another thread; never borrow this one's
     if not path:
+        sess.shell_jobs = []
+        sess.shell_job_observation = {
+            "state": "unavailable",
+            "reason": "exact-rollout-unavailable" if sess.session_id else "exact-session-id-unresolved",
+        }
         if sess.session_id:
             from fleet.session_handle import resolve_tag
             sess.session_tag = resolve_tag("codex", sess.session_id)
@@ -2312,6 +2324,23 @@ def enrich(sess, tick=None):
     # B-3: a tier-1 session_registry sessionId (set above) outranks the rollout's —
     # preserve it instead of unconditionally overwriting with the rollout-derived id.
     sess.session_id = sess.session_id or _sid(path)
+    if sess.session_id == _sid(path):
+        source_key = ("codex", os.path.abspath(path), sess.session_id, sess.attempt_id)
+        if getattr(sess, "_fast_first", False):
+            sess.shell_jobs = []
+            sess.shell_job_observation = {"state": "unobserved",
+                                         "reason": "detail-refresh-deferred"}
+        else:
+            jobs = shell_jobs.read_codex_jobs(
+                path, session_id=sess.session_id, attempt_id=sess.attempt_id)
+            sess.shell_jobs = shell_jobs.observe_jobs(
+                jobs, parent_pid=sess.pid, parent_start=sess.proc_start,
+                attempt_id=sess.attempt_id, tree=getattr(sess, "_proc_tree", None),
+                kids=getattr(sess, "_proc_kids", None))
+            sess.shell_job_observation = shell_jobs.source_status(path, source_key)
+    else:
+        sess.shell_jobs = []
+        sess.shell_job_observation = {"state": "unavailable", "reason": "rollout-session-mismatch"}
     if sess.session_id == _sid(path):
         from .. import session_cwd
         session_cwd.observe(sess, session_cwd.jsonl_cwd(path, "codex", sess.session_id), sess.session_id)

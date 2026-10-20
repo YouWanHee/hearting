@@ -1580,9 +1580,15 @@ def resource_predecessor_finished(row):
     if resource_never_started(row):
         return True
     identity = classify_identity(row)
+    # A foreign namespace prevents PID observation, not the recorded exit.
+    # The sentinel/exit consistency checks below still prove that exact end.
+    recorded_foreign_exit = (identity == ("stale", None, "process-namespace-mismatch")
+                             and row.get("status") in {"failed", "succeeded"}
+                             and row.get("exit_code") is not None)
     if (row.get("status") == "launching" or row.get("cancel_requested")
             or row.get("parent_close_requested")
-            or (identity[0] != "exited" and not _recorded_pid_reused(row, identity))):
+            or (identity[0] != "exited" and not _recorded_pid_reused(row, identity)
+                and not recorded_foreign_exit)):
         return False
     if (row.get('status') != 'succeeded' and row.get('exit_code') is None
             and reboot_evidence(row)):

@@ -13,6 +13,13 @@ busy, or the launcher closed the row before spawning) is the same kind of pause:
 its receipt's own remedy is to run `resume_command` again after about a minute,
 so the same record runs it `LATER_SECONDS` from now.
 
+A worker-class start budget that is still full after the parent's one bounded
+wait (`launch-capacity-wait`, `report-capacity-wait`) is a pause too: nothing
+was created or failed, and the refusal names when a slot frees (`retry_at`).
+The record runs `start` then instead of handing the parent a capacity report.
+Inside an automatic resume no parent is waiting, so the first refusal of that
+`start` arms the next record the same way.
+
 A BLOCKED owner whose answer another session sent (`answer-awaiting-parent`) is
 paused the same way: only the route's parent launches its continuation, so the
 parent's own carrier arms a record when it hands that notice over, and the
@@ -55,6 +62,7 @@ LATER_SECONDS = 60
 # The usage gate's own probe interval (dispatch_capacity_evidence.PROBE_INTERVAL).
 RECHECK_SECONDS = 600
 LATER_REASONS = ("owner-launch-not-admitted", "owner-launch-not-started")
+LAUNCH_CAPACITY_REASON = "launch-capacity-wait"
 ANSWER_REASON = "answer-awaiting-parent"
 NO_PROGRESS_REASON = "no-progress"
 CHAIN_ENV = "AGENT_CAPACITY_RESUME_CHAIN"
@@ -80,11 +88,15 @@ def replacement_record_path(jobs: Path, route_id: str, route_hash: str, source_a
     return record_path(jobs, route_id, "replacement:" + obligation_key)
 
 
-def _pause(result: dict, now) -> tuple[str | None, str] | None:
+def _pause(result: dict, now, *, automatic: bool = False) -> tuple[str | None, str] | None:
     """`(retry_at, cause)` for a pause this module resumes, else None."""
     if (result.get("state") == "waiting-capacity" and result.get("reason") == "owner-capacity-wait"
             and result.get("required_action") == "resume-after-capacity"):
         return result.get("retry_at"), "capacity"
+    if (result.get("state") == "waiting-capacity" and result.get("reason") == LAUNCH_CAPACITY_REASON
+            and (result.get("required_action") == "report-capacity-wait"
+                 or (automatic and result.get("required_action") == "resume-after-capacity"))):
+        return result.get("retry_at"), "launch-capacity"
     if result.get("required_action") == "resume-later" and result.get("reason") in LATER_REASONS:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() + LATER_SECONDS)), "launch-not-started"
     if result.get("reason") == ANSWER_REASON:
@@ -114,7 +126,7 @@ def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen,
             return None
         pause = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now())), "replacement")
     else:
-        pause = _pause(result, now)
+        pause = _pause(result, now, automatic=bool(env.get(CHAIN_ENV)))
     if pause is None:
         return None
     retry_at, cause = pause
@@ -243,6 +255,7 @@ def _notify(record: dict, receipt: dict) -> None:
         again = state == "waiting-capacity"
         failed = not again and (record.get("exit_code") not in (None, 0) or not receipt.get("state"))
         why = {"launch-not-started": "started again after a launch that did not start",
+               "launch-capacity": "started again after the worker start budget freed",
                "answer": "continued with the answer another session sent"}.get(record.get("cause"))
         if record.get("cause") == "replacement":
             why = ("the parent took over the remaining replacement work" if state in {"running", "completed"}

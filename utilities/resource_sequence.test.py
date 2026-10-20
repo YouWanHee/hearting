@@ -398,6 +398,25 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertTrue(WS.route_node(route, 'one-shot')['verification_only'])
         self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
 
+    def test_failed_exit_in_another_pid_namespace_can_retry_without_rewriting_predecessor(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        data = json.loads(registry.read_text())
+        old = data['runs']['fixture-run']
+        Path(old['sentinel']).write_text('1')
+        old.update(status='failed', exit_code=1, pid_namespace='pid:[foreign]')
+        registry.write_text(json.dumps(data))
+        before = copy.deepcopy(old), Path(old['sentinel']).read_bytes()
+        self.assertEqual(SUP.RR.classify_identity(old),
+                         ('stale', None, 'process-namespace-mismatch'))
+        procs, receipt = self.launch(
+            route, path, jobs, registry, output,
+            self.next_body(registry, 'namespace-retry', output))
+        self.assertEqual(len(procs), 1)
+        self.assertTrue(receipt['payload_spawned'])
+        self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'namespace-retry')
+        self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], before[0])
+        self.assertEqual(Path(old['sentinel']).read_bytes(), before[1])
+
     def test_cross_role_and_aliased_evidence_paths_refuse_without_changing_bytes(self):
         for collision in ('log-sentinel', 'sentinel-log', 'symlink', 'hardlink', 'partial', 'progress'):
             with self.subTest(collision=collision), self.subfixture():

@@ -47,7 +47,7 @@ make_fixture() {
     "$root/adapters/claude/plugin-marketplace/plugins/hearting-claude/.claude-plugin" \
     "$root/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/demo" \
     "$root/adapters/opencode/skills/demo" "$root/adapters/opencode/agents/memory-scout" \
-    "$root/adapters/opencode/commands" "$root/adapters/opencode/plugins" \
+    "$root/adapters/opencode/commands" "$root/adapters/opencode/plugins/hearting-guards" \
     "$root/adapters/opencode/config"
 
   printf '%s\n' '# core fixture' > "$root/core/CORE.md"
@@ -112,6 +112,8 @@ make_fixture() {
   printf '%s\n' '# demo command' > "$root/adapters/opencode/commands/demo.md"
   printf '%s\n' 'export const AgentHarnessGuards = async () => ({})' \
     > "$root/adapters/opencode/plugins/hearting-guards.js"
+  cp "$ROOT/adapters/opencode/plugins/hearting-guards/index.ts" \
+    "$root/adapters/opencode/plugins/hearting-guards/index.ts"
 
   git -C "$root" init -q
   git -C "$root" config user.email fixture@example.com
@@ -365,6 +367,8 @@ test -L "$HOME/.config/opencode/agents/demo.md" || fail "OpenCode plural agents 
 test -L "$HOME/.config/opencode/commands/demo.md" || fail "OpenCode plural commands projection missing"
 test -L "$HOME/.config/opencode/plugins/hearting-guards.js" \
   || fail "OpenCode local plugin projection missing"
+test -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts" \
+  || fail "OpenCode V2 package plugin projection missing"
 test -L "$HOME/.claude/tools" || fail "Claude tools projection missing"
 test -L "$HOME/.claude/utilities" || fail "Claude utilities projection missing"
 test -L "$HOME/.claude/statusline.sh" || fail "Claude statusline projection missing"

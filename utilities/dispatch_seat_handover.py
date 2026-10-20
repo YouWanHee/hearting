@@ -38,10 +38,14 @@ function returns the registered answer on any error.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import shlex
+import stat
 import sys
 import time
 from typing import Iterable, Optional
@@ -150,6 +154,576 @@ def handover_rows(seat, *, read_context=None) -> list[dict]:
 
     rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
+
+
+def _peer_message():
+    """Load the shared steward-evidence reader without duplicating its rule."""
+    path = HERE / "peer-message.py"
+    existing = sys.modules.get("peer_message")
+    if existing is not None and Path(getattr(existing, "__file__", "")).resolve() == path.resolve():
+        return existing
+    spec = importlib.util.spec_from_file_location("peer_message", str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError("peer-message-reader-unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _transition_rows(seat_key: Optional[str] = None) -> list[tuple[str, dict]]:
+    """Read only confirmed steward transitions and releases from the existing seat ledgers."""
+    st = _st()
+    directory = st.state_root() / "sessions"
+    paths = ([directory / f"{seat_key}.jsonl"] if seat_key else
+             sorted(path for path in directory.glob("*.jsonl") if path.is_file() and not path.is_symlink()))
+    out = []
+    for path in paths:
+        if path.is_symlink():
+            continue
+        key = path.stem
+        for row in st._read_ledger_lines(st.Seat("pane", key)):
+            if row.get("event") in {ROW_EVENT, "steward-release"}:
+                out.append((key, row))
+    return out
+
+
+def _role_states(seat_key: Optional[str] = None) -> tuple[dict, set]:
+    states, released = {}, set()
+    for key, row in _transition_rows(seat_key):
+        state = row.get("steward") if isinstance(row.get("steward"), dict) else {}
+        for relation in state.get("roles") or ():
+            if not isinstance(relation, dict) or not relation.get("generation"):
+                continue
+            identity = (key, str(relation["generation"]))
+            item = dict(relation)
+            item.setdefault("seat_key", key)
+            states[identity] = item
+        if row.get("event") == "steward-release" and row.get("generation"):
+            released.add((key, str(row["generation"])))
+    return states, released
+
+
+def steward_marker_generation(marker: dict) -> str:
+    """Stable evidence-generation key, including for source-less legacy markers."""
+    encoded = json.dumps(marker, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return str(marker.get("generation") or digest)
+
+
+def _marker_relation(harness: str, sid: str, marker: dict, evidence: list[dict], seat_key=None) -> dict:
+    encoded = json.dumps(marker, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return {
+        "generation": steward_marker_generation(marker),
+        "marker_digest": digest,
+        "origin": {"harness": harness, "sid": sid},
+        "holder": {"harness": harness, "sid": sid},
+        "targets": [dict(target) for target in evidence],
+        "lineage": [],
+        "seat_key": marker.get("seat_key") or seat_key,
+        "released": False,
+    }
+
+
+def resolved_steward_relations(harness: Optional[str] = None, sid: Optional[str] = None, *,
+                               seat_key: Optional[str] = None, include_released: bool = False) -> list[dict]:
+    """Resolve valid original role evidence to its confirmed current same-seat holder.
+
+    This is a read-only projection. It never creates or copies a marker. Ordinary
+    handover rows and session aliases are not role evidence.
+    """
+    try:
+        pm = _peer_message()
+        roots, _source = pm.steward_marker_roots()
+        markers = pm.read_steward_markers(roots)
+        if seat_key is not None:
+            states, releases = _role_states(seat_key)
+        else:
+            keys = set()
+            legacy_marker = False
+            for snapshot in _all_snapshots():
+                key = ((snapshot.get("seat") or {}).get("key")
+                       if isinstance(snapshot.get("seat"), dict) else None)
+                if key:
+                    keys.add(str(key))
+            for marker in markers.values():
+                key = marker.get("seat_key") if isinstance(marker, dict) else None
+                if key:
+                    keys.add(str(key))
+                else:
+                    legacy_marker = True
+            if legacy_marker:
+                directory = _st().state_root() / "sessions"
+                try:
+                    keys.update(path.stem for path in directory.glob("*.jsonl")
+                                if path.is_file() and not path.is_symlink())
+                except OSError:
+                    pass
+            states, releases = {}, set()
+            for key in keys:
+                current, revoked = _role_states(key)
+                states.update(current)
+                releases.update(revoked)
+    except Exception:  # noqa: BLE001 - unknown authority is never a new role
+        return []
+    seen = set()
+    out = []
+    state_by_generation = {}
+    for (key, generation), relation in states.items():
+        state_by_generation[generation] = (key, relation)
+    marker_reader = getattr(pm, "steward_evidence_targets", None)
+    for (marker_harness, marker_sid), marker in markers.items():
+        if marker_reader is None:
+            continue
+        generation = steward_marker_generation(marker)
+        saved = state_by_generation.get(generation)
+        if saved:
+            key, relation = saved
+            relation = dict(relation)
+        else:
+            try:
+                relation = _marker_relation(marker_harness, marker_sid, marker,
+                                            marker_reader(marker), seat_key)
+                key = str(seat_key or "")
+            except Exception:  # noqa: BLE001
+                continue
+        identity = (key, generation)
+        relation["released"] = relation.get("released") is True or identity in releases
+        holder = relation.get("holder") or {}
+        if ((harness is not None and holder.get("harness") != harness)
+                or (sid is not None and holder.get("sid") != sid)
+                or (seat_key is not None and relation.get("seat_key") not in {None, seat_key})
+                or (relation["released"] and not include_released)
+                or identity in seen):
+            continue
+        if seat_key is not None and not relation.get("seat_key"):
+            relation["seat_key"] = seat_key
+        seen.add(identity)
+        out.append(relation)
+    for (key, generation), saved in states.items():
+        identity = (key, generation)
+        if identity in seen:
+            continue
+        relation = dict(saved)
+        relation["released"] = relation.get("released") is True or identity in releases
+        holder = relation.get("holder") or {}
+        if ((harness is not None and holder.get("harness") != harness)
+                or (sid is not None and holder.get("sid") != sid)
+                or (seat_key is not None and key != seat_key)
+                or (relation["released"] and not include_released)):
+            continue
+        out.append(relation)
+    return out
+
+
+def _watch_states(seat_key: Optional[str] = None) -> dict[str, tuple[str, dict]]:
+    states = {}
+    for key, row in _transition_rows(seat_key):
+        steward = row.get("steward") if isinstance(row.get("steward"), dict) else {}
+        for watch in steward.get("watches") or ():
+            if isinstance(watch, dict) and watch.get("watch_id"):
+                value = dict(watch)
+                value.setdefault("seat_key", key)
+                states[str(watch["watch_id"])] = (key, value)
+    return states
+
+
+def _watch_roots(pm) -> list[Path]:
+    try:
+        roots, _source = pm.steward_marker_roots()
+    except Exception:
+        roots = []
+    own = pm.peer_state_root()
+    return list(dict.fromkeys([Path(own), *(Path(root) for root in roots)]))
+
+
+def watch_ack_valid(path: Path, watch_id: str, harness: str, sid: str) -> bool:
+    """An ACK settles only when its readable record names this exact recipient."""
+    data = _st().read_json(path)
+    if not isinstance(data, dict):
+        return False
+    return (data.get("watch_id") in {None, watch_id}
+            and data.get("session_id") == sid
+            and data.get("harness") in {None, harness})
+
+
+def _write_fsynced_temp(path: Path, payload: bytes) -> Path:
+    """Write a complete sibling file and fsync it before any canonical publication."""
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = None
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short staged state write")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+    except BaseException:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return tmp
+
+
+def _ack_inode(path: Path, watch_id: str, harness: str, sid: str):
+    """Read one regular ACK inode without following links; classify torn vs stale data."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unsafe", None
+    identity = (before.st_dev, before.st_ino)
+    if not stat.S_ISREG(before.st_mode):
+        return "unsafe", identity
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unsafe", identity
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != identity or not stat.S_ISREG(opened.st_mode):
+            return "unsafe", identity
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "torn", identity
+    if not isinstance(data, dict):
+        return "torn", identity
+    if (data.get("watch_id") in {None, watch_id}
+            and data.get("session_id") == sid
+            and data.get("harness") in {None, harness}):
+        return "current", identity
+    return "other", identity
+
+
+def _unlink_torn_ack(path: Path, identity) -> bool:
+    """Remove only the same unreadable regular inode observed under the seat lock."""
+    if identity is None:
+        return False
+    try:
+        current = path.lstat()
+        if (not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != identity):
+            return False
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def resolved_watch_references(harness: Optional[str] = None, sid: Optional[str] = None, *,
+                              seat_key: Optional[str] = None) -> list[dict]:
+    """Return exact, unresolved watch duties and their current confirmed recipient."""
+    try:
+        pm = _peer_message()
+        states = _watch_states(seat_key)
+        roots = _watch_roots(pm)
+    except Exception:  # noqa: BLE001
+        return []
+    arms: dict[str, dict] = {}
+    for root in roots:
+        watch_root = root / "peer-watches"
+        try:
+            paths = sorted(watch_root.glob("*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            if path.name.endswith((".receipt.json", ".ack.json", ".observation.json")) or path.is_symlink():
+                continue
+            arm = _st().read_json(path)
+            if not isinstance(arm, dict) or not arm.get("watch_id"):
+                continue
+            watch_id = str(arm["watch_id"])
+            ack = watch_root / f"{watch_id}.ack.json"
+            original = arm.get("steward") or {}
+            seat = arm.get("steward_seat") or {}
+            value = {
+                "watch_id": watch_id,
+                "origin": {"harness": original.get("harness"), "sid": original.get("session_id")},
+                "holder": {"harness": original.get("harness"), "sid": original.get("session_id")},
+                "seat_key": seat.get("key"),
+                "storage_root": str(root),
+                "server": arm.get("server") or "default",
+                "target": arm.get("target"),
+                "agent": dict(arm.get("agent") or {}),
+                "until": list(arm.get("until") or []),
+                "armed_ts": arm.get("armed_ts"),
+                "deadline": arm.get("deadline"),
+            }
+            previous = states.get(watch_id)
+            ack_holder = ((previous[1].get("holder") or {}) if previous else value["holder"])
+            if watch_ack_valid(ack, watch_id, ack_holder.get("harness"), ack_holder.get("sid")):
+                continue
+            states.setdefault(watch_id, (str(value.get("seat_key") or ""), value))
+            arms[watch_id] = value
+    out = []
+    for watch_id, (key, saved) in states.items():
+        value = dict(saved)
+        if not value.get("seat_key") and key:
+            value["seat_key"] = key
+        root = Path(str(value.get("storage_root") or pm.peer_state_root()))
+        arm = arms.get(watch_id)
+        if arm is not None:
+            identity = {
+                field: arm.get(field) for field in
+                ("storage_root", "server", "target", "agent", "until", "armed_ts",
+                 "deadline", "origin", "seat_key")
+            }
+            if any(value.get(field) != expected for field, expected in identity.items()):
+                continue
+        holder = value.get("holder") or {}
+        if watch_ack_valid(root / "peer-watches" / f"{watch_id}.ack.json", watch_id,
+                           holder.get("harness"), holder.get("sid")):
+            continue
+        if ((harness is not None and holder.get("harness") != harness)
+                or (sid is not None and holder.get("sid") != sid)
+                or (seat_key is not None and value.get("seat_key") != seat_key)):
+            continue
+        out.append(value)
+    return out
+
+
+def _watch_reference_from_arm(watch_id: str, root: Path, arm: dict) -> dict:
+    steward = arm.get("steward") or {}
+    seat = arm.get("steward_seat") or {}
+    return {
+        "watch_id": watch_id,
+        "origin": {"harness": steward.get("harness"), "sid": steward.get("session_id")},
+        "holder": {"harness": steward.get("harness"), "sid": steward.get("session_id")},
+        "seat_key": seat.get("key"), "storage_root": str(root),
+        "server": arm.get("server") or "default", "target": arm.get("target"),
+        "agent": dict(arm.get("agent") or {}), "until": list(arm.get("until") or []),
+        "armed_ts": arm.get("armed_ts"), "deadline": arm.get("deadline"),
+    }
+
+
+def resolve_watch(watch_id: str, *, seat_key: Optional[str] = None,
+                  include_acked: bool = False) -> Optional[dict]:
+    """Resolve one duty by its exact arm and seat ledger without scanning all watches."""
+    try:
+        pm = _peer_message()
+        primary = Path(pm.peer_state_root())
+        roots = [primary]
+        primary_path = primary / "peer-watches" / f"{watch_id}.json"
+        if not primary_path.is_file():
+            roots.extend(Path(root) for root in _watch_roots(pm) if Path(root) != primary)
+        for root in roots:
+            watch_root = root / "peer-watches"
+            arm_path = watch_root / f"{watch_id}.json"
+            arm = _st().read_json(arm_path)
+            if isinstance(arm, dict) and arm.get("watch_id") == watch_id:
+                value = _watch_reference_from_arm(watch_id, root, arm)
+                key = value.get("seat_key")
+                if seat_key is not None and key != seat_key:
+                    continue
+                if key:
+                    saved = _watch_states(key).get(watch_id)
+                    if saved:
+                        row_key, relation = saved
+                        if row_key != key or any(relation.get(field) != value.get(field) for field in
+                                ("origin", "seat_key", "storage_root", "server", "target", "agent",
+                                 "until", "armed_ts", "deadline")):
+                            return None
+                        value = dict(relation)
+                holder = value.get("holder") or {}
+                acked = watch_ack_valid(watch_root / f"{watch_id}.ack.json", watch_id,
+                                        holder.get("harness"), holder.get("sid"))
+                if acked and not include_acked:
+                    return None
+                return value
+        return None
+    except Exception:  # noqa: BLE001 - unreadable lineage remains pending, not retargeted
+        return None
+
+
+def acknowledge_watch(watch_id: str, harness: str, sid: str, carrier: str) -> str:
+    """Create the original watch ACK only for its revalidated current recipient."""
+    try:
+        row = resolve_watch(watch_id, include_acked=True)
+        if row is None:
+            return "unknown"
+        holder = row.get("holder") or {}
+        if holder.get("harness") != harness or holder.get("sid") != sid:
+            return "not-recipient"
+        root = Path(str(row.get("storage_root") or ""))
+        if not root.is_absolute():
+            return "unknown"
+        path = root / "peer-watches" / f"{watch_id}.ack.json"
+        seat_key = row.get("seat_key")
+        lock = _st().seat_lock(str(seat_key)) if seat_key else contextlib.nullcontext()
+        with lock:
+            if root.is_symlink() or path.parent.is_symlink():
+                return "unknown"
+            identity_fields = ("seat_key", "storage_root", "server", "target", "agent",
+                               "until", "armed_ts", "deadline", "origin")
+            for _attempt in range(4):
+                current = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+                if not current:
+                    return "unknown"
+                current_holder = current.get("holder") or {}
+                if current_holder != holder:
+                    return "not-recipient"
+                if any(current.get(field) != row.get(field) for field in identity_fields):
+                    return "unknown"
+
+                status, inode = _ack_inode(path, watch_id, harness, sid)
+                if status == "current":
+                    return "already"
+                if status == "torn":
+                    # Re-resolve immediately before removing the exact corrupt inode. A
+                    # stale predecessor cannot clear a successor's competing ACK.
+                    current = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+                    if (not current or (current.get("holder") or {}) != holder
+                            or any(current.get(field) != row.get(field)
+                                   for field in identity_fields)):
+                        return "not-recipient" if current else "unknown"
+                    if not _unlink_torn_ack(path, inode):
+                        continue
+                    continue
+                if status != "missing":
+                    return "unknown"
+
+                payload = (json.dumps({"watch_id": watch_id, "carrier": str(carrier)[:80],
+                                      "session_id": sid, "harness": harness,
+                                      "ts": _st().now_epoch()}, sort_keys=True) + "\n").encode("utf-8")
+                tmp = _write_fsynced_temp(path, payload)
+                try:
+                    try:
+                        # A hard link claims the canonical name atomically without
+                        # replacing a competing valid ACK.
+                        os.link(tmp, path, follow_symlinks=False)
+                    except FileExistsError:
+                        continue
+                    return "created"
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+            return "unknown"
+    except Exception:  # noqa: BLE001 - uncertainty does not consume the watch
+        return "unknown"
+
+
+def collect_snapshot_steward(seat, harness: str, sid: str) -> Optional[dict]:
+    roles = resolved_steward_relations(harness, sid, seat_key=seat.key)
+    watches = resolved_watch_references(harness, sid, seat_key=seat.key)
+    if not roles and not watches:
+        return None
+    return {"schema": 1, "roles": roles, "watches": watches}
+
+
+def _revalidate_snapshot_steward(seat, harness: str, sid: str, payload: dict) -> Optional[dict]:
+    """Recheck collected role/watch identities inside the seat writer transaction."""
+    if not isinstance(payload, dict) or payload.get("schema") != 1:
+        raise RuntimeError("snapshot-steward-payload-invalid")
+    current_roles = {str(row.get("generation")): row for row in
+                     resolved_steward_relations(seat_key=seat.key, include_released=True)}
+    roles = []
+    for candidate in payload.get("roles") or ():
+        if not isinstance(candidate, dict) or not candidate.get("generation"):
+            raise RuntimeError("snapshot-steward-role-invalid")
+        current = current_roles.get(str(candidate["generation"]))
+        if current is None:
+            raise RuntimeError("snapshot-steward-role-unresolved")
+        if current.get("released") is True:
+            continue
+        holder = current.get("holder") or {}
+        if holder.get("harness") != harness or holder.get("sid") != sid:
+            raise RuntimeError("snapshot-steward-holder-changed")
+        roles.append(current)
+
+    current_watches = {str(row.get("watch_id")): row for row in
+                       resolved_watch_references(seat_key=seat.key)}
+    watches = []
+    for candidate in payload.get("watches") or ():
+        if not isinstance(candidate, dict) or not candidate.get("watch_id"):
+            raise RuntimeError("snapshot-watch-invalid")
+        watch_id = str(candidate["watch_id"])
+        current = current_watches.get(watch_id)
+        if current is None:
+            root = Path(str(candidate.get("storage_root") or ""))
+            holder = candidate.get("holder") or {}
+            if (root.is_absolute() and watch_ack_valid(
+                    root / "peer-watches" / f"{watch_id}.ack.json", watch_id,
+                    holder.get("harness"), holder.get("sid"))):
+                continue
+            raise RuntimeError("snapshot-watch-unresolved")
+        if any(candidate.get(field) != current.get(field) for field in
+               ("seat_key", "storage_root", "server", "target", "agent", "until", "deadline", "origin")):
+            raise RuntimeError("snapshot-watch-identity-changed")
+        holder = current.get("holder") or {}
+        if holder.get("harness") != harness or holder.get("sid") != sid:
+            raise RuntimeError("snapshot-watch-holder-changed")
+        watches.append(current)
+    if not roles and not watches:
+        return None
+    return {"schema": 1, "roles": roles, "watches": watches}
+
+
+def _append_transition_row(seat, row: dict) -> None:
+    """Atomically publish one fsynced transition before any predecessor is retired.
+
+    Rewriting the bounded seat ledger from its complete newline-terminated prefix also
+    discards a torn tail left by an older append writer. A failed staged write/fsync never
+    changes the canonical ledger, so a retry still sees the predecessor as holder.
+    """
+    st = _st()
+    path = st._ledger_path(seat)
+    st.ensure_dir(path.parent)
+    st._reject_symlink(path)
+    payload = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    current = st.read_bytes(path)
+    if current is None:
+        if path.exists() or path.is_symlink():
+            raise OSError("unable to read seat ledger before transition")
+        current = b""
+    complete_end = current.rfind(b"\n") + 1
+    replacement = current[:complete_end] + payload
+    tmp = _write_fsynced_temp(path, replacement)
+    try:
+        st._reject_symlink(path)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    # Folding is compaction after the durable transition boundary. If it fails, the
+    # canonical row is already committed and must not be reported as an uncommitted hop.
+    with contextlib.suppress(Exception):
+        st._fold_ledger(seat)
+
+
+def record_steward_release(seat, harness: str, sid: str, generation: str, now=None) -> bool:
+    """Durably revoke one exact role generation under the caller's seat lock."""
+    if not generation:
+        return False
+    rows = [row for _key, row in _transition_rows(seat.key)
+            if row.get("event") == "steward-release" and row.get("generation") == generation]
+    if rows:
+        return True
+    _append_transition_row(seat, {
+        "ts": _st().now_epoch() if now is None else now,
+        "harness": harness, "sid": sid, "event": "steward-release",
+        "seat_key": seat.key, "generation": generation,
+    })
+    return True
 
 
 def _seat_of(key: str, snapshot: Optional[dict] = None):
@@ -495,7 +1069,9 @@ def current_bindings(harness: str, sid: str, jobs=None, *, read_context=None) ->
 def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
     """Take (or drop) the snapshot; return its flat binding count.  Caller holds the seat lock."""
     bindings = collect_snapshot_bindings(harness, sid, jobs=jobs)
-    return publish_snapshot_locked(seat, harness, sid, bindings, now=now, jobs=jobs)
+    steward = collect_snapshot_steward(seat, harness, sid)
+    return publish_snapshot_locked(seat, harness, sid, bindings, now=now, jobs=jobs,
+                                   steward_payload=steward)
 
 
 def collect_snapshot_bindings(harness: str, sid: str, jobs=None) -> list[dict]:
@@ -505,7 +1081,8 @@ def collect_snapshot_bindings(harness: str, sid: str, jobs=None) -> list[dict]:
 
 def publish_snapshot_locked(seat, harness: str, sid: str, bindings: list[dict], *,
                             now: Optional[float] = None, expected_prompt_seq: Optional[int] = None,
-                            expected_card_generation: Optional[int] = None, jobs=None) -> int:
+                            expected_card_generation: Optional[int] = None, jobs=None,
+                            steward_payload: Optional[dict] = None) -> int:
     """Publish a previously collected snapshot only if the seat's card/input window still matches."""
     st = _st()
     now = st.now_epoch() if now is None else now
@@ -517,16 +1094,21 @@ def publish_snapshot_locked(seat, harness: str, sid: str, bindings: list[dict], 
     generation = int(card.get("generation", 0) or 0) if card else 0
     if expected_card_generation is not None and generation != expected_card_generation:
         raise RuntimeError("snapshot-card-changed")
-    if not bindings:
+    if steward_payload:
+        steward_payload = _revalidate_snapshot_steward(seat, harness, sid, steward_payload)
+    if not bindings and not steward_payload:
         with contextlib.suppress(OSError):
             os.unlink(_snapshot_path(seat.key))
         return 0
     path = _snapshot_path(seat.key)
     st._reject_symlink(path)
-    st.atomic_write_json(_snapshot_path(seat.key), {
+    snapshot = {
         "schema": SCHEMA, "seat": seat.as_dict(), "from": {"harness": harness, "sid": sid},
         "at": now, "prompt_seq": st.read_prompt_seq(seat), "card_generation": generation,
-        "bindings": bindings})
+        "bindings": bindings, "snapshot_id": os.urandom(16).hex()}
+    if steward_payload:
+        snapshot["steward"] = steward_payload
+    st.atomic_write_json(_snapshot_path(seat.key), snapshot)
     return len(bindings)
 
 
@@ -544,8 +1126,9 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
     if not old or old == sid or origin.get("harness") != harness:
         return None
     rows = handover_rows(seat)
-    if any(r.get("sid") == sid for r in rows):
-        return None                                    # the same A -> B again: nothing to do
+    prior = next((r for r in rows if r.get("from") == old and r.get("sid") == sid), None)
+    if prior is not None:
+        return prior                                   # duplicate callback is the same transition
     summary = st.session_summary(seat).get((harness, sid))
     if summary is None or float(summary.get("first_seen", 0) or 0) + 1.0 < float(snap.get("at", 0) or 0):
         return None                                    # a session older than the snapshot is not its successor
@@ -556,8 +1139,56 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
     snapshot_bindings = [b for b in snap["bindings"] if isinstance(b, dict)]
     bindings = [b for b in snapshot_bindings
                 if (b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) not in taken]
-    if not bindings or len(bindings) != len(snap["bindings"]):
+    if len(bindings) != len(snap["bindings"]):
         return None                                    # A -> C while A -> B stands: refused
+
+    # Resolve each role generation again inside the seat transaction. A copied
+    # snapshot is not authority after a release or a newer confirmed holder.
+    snapshot_steward = snap.get("steward") if isinstance(snap.get("steward"), dict) else {}
+    current_roles = {str(row.get("generation")): row for row in
+                     resolved_steward_relations(seat_key=seat.key, include_released=True)}
+    steward_roles = []
+    for candidate in snapshot_steward.get("roles") or ():
+        if not isinstance(candidate, dict) or not candidate.get("generation"):
+            continue
+        current = current_roles.get(str(candidate["generation"]))
+        if not current or current.get("released"):
+            continue
+        holder = current.get("holder") or {}
+        if holder.get("harness") != harness or holder.get("sid") != old:
+            continue
+        adopted = dict(current)
+        adopted["holder"] = {"harness": harness, "sid": sid}
+        adopted["seat_key"] = seat.key
+        adopted["lineage"] = [*(current.get("lineage") or []), {
+            "from": old, "to": sid, "snapshot_id": snap.get("snapshot_id") or "legacy"}]
+        steward_roles.append(adopted)
+
+    current_watches = {str(row.get("watch_id")): row for row in
+                       resolved_watch_references(seat_key=seat.key)}
+    steward_watches = []
+    for candidate in snapshot_steward.get("watches") or ():
+        if not isinstance(candidate, dict) or not candidate.get("watch_id"):
+            continue
+        current = current_watches.get(str(candidate["watch_id"]))
+        if not current:
+            continue
+        holder = current.get("holder") or {}
+        if holder.get("harness") != harness or holder.get("sid") != old:
+            continue
+        if any(candidate.get(field) != current.get(field) for field in
+               ("seat_key", "storage_root", "server", "target", "agent", "until", "deadline", "origin")):
+            continue
+        adopted = dict(current)
+        adopted["holder"] = {"harness": harness, "sid": sid}
+        adopted["seat_key"] = seat.key
+        adopted["lineage"] = [*(current.get("lineage") or []), {
+            "from": old, "to": sid, "snapshot_id": snap.get("snapshot_id") or "legacy"}]
+        steward_watches.append(adopted)
+    steward_payload = ({"schema": 1, "roles": steward_roles, "watches": steward_watches}
+                       if steward_roles or steward_watches else None)
+    if not bindings and not steward_payload:
+        return None
 
     # A selected job can acquire a permitted retry after enqueue but before the
     # confirmed clear hook.  Refresh only those selected logical keys, retaining
@@ -589,21 +1220,19 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
             continue
     bindings = _deduplicate_bindings([*bindings, *refreshed])
     row = {"ts": now, "harness": harness, "sid": sid, "event": ROW_EVENT, "from": old,
+           "seat_key": seat.key, "snapshot_id": snap.get("snapshot_id"),
            "source": source or ("first-message" if harness == "opencode" else "reservation"),
            "bindings": bindings, "epoch": int((summary or {}).get("epoch", 0) or 0)}
-    path = st._ledger_path(seat)
-    st.ensure_dir(path.parent)
-    st._reject_symlink(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
+    if steward_payload:
+        row["steward"] = steward_payload
+    _append_transition_row(seat, row)
     refreshed_snapshot = dict(snap)
     refreshed_snapshot["bindings"] = bindings
+    if steward_payload:
+        refreshed_snapshot["steward"] = steward_payload
     try:
         st.atomic_write_json(_snapshot_path(seat.key), refreshed_snapshot)
-    except Exception:  # noqa: BLE001 - the durable ledger row still carries the refreshed bindings
+    except Exception:  # noqa: BLE001 - the durable ledger row remains the handover authority
         pass
     return row
 

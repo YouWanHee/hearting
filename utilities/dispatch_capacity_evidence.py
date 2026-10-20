@@ -499,6 +499,27 @@ def _limit_models(profile, models, env):
     return models
 
 
+def _opencode_model_state(profile, env):
+    """Hard harness hold only when every automatic provider/model is confirmed unavailable."""
+    if not profile:
+        return None
+    try:
+        from model_profile import resolve_runtime_profile
+        import opencode_runtime
+        selected, _receipt = resolve_runtime_profile(
+            "opencode", profile, environ=env,
+            source_root=Path(__file__).resolve().parents[1])
+        candidates = opencode_runtime.automatic_candidates(
+            selected["model"], selected["budget"], environ=env)
+    except Exception:
+        return None
+    if candidates and all(row.get("state") == "unavailable" for row in candidates):
+        causes = sorted({f"{row.get('model', '').split('/', 1)[0]}-{row.get('reason') or 'unavailable'}"
+                         for row in candidates})
+        return "limited(provider-model-unavailable:" + "+".join(causes) + ")"
+    return None
+
+
 def _scope_covers(model_scope, model):
     """Does a limit on `model_scope` hold the requested `model` (None: no model asked)?"""
     if model_scope == "all":
@@ -957,6 +978,10 @@ def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, 
     with _snapshot_guard(jobs, now) as snapshot:
         states, epochs, recorded = _usage_snapshot(
             snapshot, models=models, unknown_window_min=unknown_window_min, now=now, env=env)
+    if not states["opencode"].startswith("limited("):
+        model_state = _opencode_model_state(profile, env)
+        if model_state:
+            states["opencode"] = model_state
     if states["claude"] == "unknown":
         return states, epochs
     # Outside the snapshot guard: a probe takes seconds and must not hold the cache lock.

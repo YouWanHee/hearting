@@ -1044,6 +1044,7 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
     identity = str((req.get("compact") or {}).get("identity") or "")
     try:
         bindings = handover.collect_snapshot_bindings(req["harness"], req["sid"])
+        steward = handover.collect_snapshot_steward(seat, req["harness"], req["sid"])
         with st.seat_lock(seat.key):
             held = read_reservation(seat.key)
             if not held or held.get("nonce") != req.get("nonce") or held.get("status") != "reserved":
@@ -1051,7 +1052,8 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
             handover.publish_snapshot_locked(
                 seat, req["harness"], req["sid"], bindings,
                 expected_prompt_seq=int(req.get("prompt_seq", -1)),
-                expected_card_generation=int(req.get("card_generation", -1)))
+                expected_card_generation=int(req.get("card_generation", -1)),
+                steward_payload=steward)
             held["snapshot_state"] = "ready"
             held["snapshot_count"] = len(bindings)
             _write_reservation(held)
@@ -1073,6 +1075,8 @@ def _prepare_handover_snapshot(req: dict) -> bool:
     import dispatch_seat_handover as handover
     try:
         bindings = handover.collect_snapshot_bindings(str(req.get("harness") or ""), str(req.get("sid") or ""))
+        steward = handover.collect_snapshot_steward(
+            seat, str(req.get("harness") or ""), str(req.get("sid") or ""))
         with st.seat_lock(seat.key):
             held = read_reservation(seat.key)
             if not held or held.get("nonce") != req.get("nonce") or held.get("status") != "reserved":
@@ -1080,7 +1084,8 @@ def _prepare_handover_snapshot(req: dict) -> bool:
             count = handover.publish_snapshot_locked(
                 seat, str(req.get("harness") or ""), str(req.get("sid") or ""), bindings,
                 expected_prompt_seq=int(req.get("prompt_seq", -1)),
-                expected_card_generation=int(req.get("card_generation", -1)))
+                expected_card_generation=int(req.get("card_generation", -1)),
+                steward_payload=steward)
             held["snapshot_state"] = "ready"
             held["snapshot_count"] = count
             held.pop("last_failure", None)

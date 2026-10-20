@@ -79,13 +79,12 @@ EXEMPT_SUBSTRINGS = (
 # Concrete model-ID patterns (unambiguous identifiers + alias-as-model-value).
 PATTERNS = [
     re.compile(r"gpt-5\.\d"),                                   # codex: gpt-5.6-sol, gpt-5.4-mini, ...
-    # codex: gpt-6-astra and any later gpt-<major>-<name>. The `gpt-5\.\d` pattern above
-    # only matches a dotted minor version, so it never saw Astra — and Astra is the codex
-    # adapter's interactive-main-only model, the one ID that most needs to stay inside
-    # models.conf. Reported by the 2026-09-09 registered review (MA-2b).
-    re.compile(r"\bgpt-\d+-[a-z]"),
+    # codex: gpt-6-astra and any later gpt-<major>-<name>.
     re.compile(r"claude-(?:opus|sonnet|haiku|fable)-\d"),       # claude versioned full ids
+    re.compile(r"(?<![\w./-])openai/gpt-\d+(?:\.\d+)?-[a-z]"), # OpenAI provider/model reference
+    re.compile(r"\bgpt-\d+-[a-z]"),                             # Codex unversioned full ids
     re.compile(r"opencode-go/[a-z0-9]"),                        # opencode-go provider model-id
+    re.compile(r"(?<![\w./@-])opencode/[a-z0-9][a-z0-9.]*-[a-z0-9][a-z0-9.-]*(?![\w./-])"),
     re.compile(r"\bglm-\d"),                                    # opencode glm-5.2
     re.compile(r"\bdeepseek-v\d"),                              # opencode deepseek-v4-*
     # Claude short alias used as a concrete model VALUE (frontmatter / :- default / assignment).
