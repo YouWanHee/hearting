@@ -831,6 +831,14 @@ def supervised_owner_prompt() -> str:
     )
 
 
+def worker_terminal_contract(root: Path) -> str:
+    """The kernel's short completion contract, reusable after native compaction."""
+    kernel = (root / "roles" / "worker-bootstrap.md").read_text(encoding="utf-8")
+    start = "<!-- worker-terminal-contract:start -->"
+    end = "<!-- worker-terminal-contract:end -->"
+    return kernel.split(start, 1)[1].split(end, 1)[0].strip()
+
+
 def render_worker_bootstrap(root: Path, worker_type: str, unit: str | None = None) -> str:
     """Return exactly one canonical kernel plus one type fragment.
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
+import json
 import math
+import sqlite3
 from pathlib import Path
 import tempfile
 import sys
@@ -81,6 +83,77 @@ class ForegroundActivityTests(unittest.TestCase):
         self.assertIsNone(context)
         self.assertEqual(len(error.getvalue().splitlines()), 1)
         self.assertTrue(error.getvalue().startswith("warning="))
+
+    def opencode_context(self, root, *, launch_metadata=None, environment=None):
+        return A.build_activity_context(
+            worker_type="stage", harness="opencode", log_path=root / "attempt.jsonl",
+            jobs=root / "jobs.log", launch_metadata=launch_metadata or {}, attempt_id="a",
+            route_id="route", route_node="test", environment=environment or {"XDG_DATA_HOME": str(root)},
+            worktree=root,
+        )
+
+    def test_optional_opencode_runtime_keeps_context_without_warning(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            error = StringIO()
+            with redirect_stderr(error):
+                shared = self.opencode_context(root)
+            self.assertEqual(error.getvalue(), "")
+            self.assertEqual(shared.opencode_db, root / "opencode/opencode.db")
+            self.assertEqual(shared.transcript_roots, ())
+            self.assertEqual(shared.metadata["attempt_id"], "a")
+            self.assertIsNone(A.ForegroundActivityMonitor(10, "1", shared)._opencode_session_state())
+            private = self.opencode_context(root, launch_metadata={"opencode_runtime_dir": str(root / "private")})
+            self.assertEqual(private.transcript_roots, (
+                root / "private/data/opencode/opencode.db", root / "private/data/opencode/opencode.db-wal"))
+            self.assertIsNone(private.opencode_db)
+            overridden = self.opencode_context(root, environment={
+                "OPENCODE_DATA_DIR": str(root / "shared"), "OPENCODE_DB": "custom.db"})
+            self.assertEqual(overridden.opencode_db, root / "shared/custom.db")
+
+    def test_shared_database_activity_is_exact_session_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            context = self.opencode_context(root)
+            context.log_path.write_text(json.dumps({"type": "step_start", "sessionID": "ses_own"}) + "\n")
+            context.opencode_db.parent.mkdir()
+            db = sqlite3.connect(context.opencode_db)
+            self.addCleanup(db.close)
+            db.executescript("""
+                CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
+                CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER,
+                    time_created INTEGER, time_updated INTEGER, data TEXT);
+            """)
+            for sid in ("ses_own", "ses_other"):
+                db.execute("INSERT INTO session_v2 VALUES (?, ?, 1)", (sid, str(root)))
+                db.execute("INSERT INTO session_message VALUES (?, 'assistant', 1, 1, 1, ?)",
+                           (sid, json.dumps({"content": [{"type": "text", "text": "initial"}]})))
+            db.commit()
+            monitor = A.ForegroundActivityMonitor(10, "1", context)
+            table = {(10, "1"): {"self_cpu": 0, "children_cpu": 0}}
+            with mock.patch.object(monitor, "_processes", return_value=table), \
+                 mock.patch.object(monitor, "_members", return_value=set(table)), \
+                 mock.patch.object(monitor, "_runtime_lineage", return_value=set(table)), \
+                 mock.patch.object(monitor, "_lease_active", return_value=False):
+                self.assertFalse(monitor.sample().active)
+                db.execute("UPDATE session_message SET time_updated=2 WHERE session_id='ses_other'")
+                db.commit()
+                self.assertFalse(monitor.sample().active, "another session reset the attempt clock")
+                db.execute("UPDATE session_v2 SET time_updated=2 WHERE id='ses_own'")
+                db.commit()
+                self.assertFalse(monitor.sample().active, "session metadata alone counted as model work")
+                db.execute("UPDATE session_message SET time_updated=2 WHERE session_id='ses_own'")
+                db.commit()
+                own = monitor.sample()
+                self.assertTrue(own.active)
+                self.assertIn("exact-opencode-session-change", own.reasons)
+                db.close()
+                context.opencode_db.unlink()
+                self.assertFalse(monitor.sample().active, "lost access was treated as progress")
+                context.log_path.write_text(context.log_path.read_text() + "attempt-owned progress\n")
+                self.assertIn("attempt-file-change", monitor.sample().reasons)
 
 
 if __name__ == "__main__":
