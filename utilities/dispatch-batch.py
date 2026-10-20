@@ -42,6 +42,7 @@ from dispatch_contract import (  # noqa: E402
     validate_attempt_metadata,
     validate_dispatch_log_dir,
 )
+from governor_identity import IdentityCaptureError, create_witness  # noqa: E402
 from dispatch_lifecycle import (  # noqa: E402
     FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,
@@ -1280,6 +1281,20 @@ def parallel_slug(prefix: str, node_id: str) -> str:
 replica_slug = parallel_slug
 
 
+# Owner witnesses for this wrapper's reservations, held until the process
+# exits: a wrapper that dies mid-launch leaves slots `reclaim` can prove free.
+_RESERVATION_WITNESSES: list[object] = []
+
+
+def reservation_owner_witness(governor_root: Path) -> list[str]:
+    try:
+        handle = create_witness(governor_root, "reservation")
+    except (IdentityCaptureError, OSError):
+        return []  # still admitted; the slot then waits for the age bound
+    _RESERVATION_WITNESSES.append(handle)
+    return ["--owner-witness", json.dumps(handle.binding(), sort_keys=True, separators=(",", ":"))]
+
+
 def reserve_plain_slots(
     governor: Path,
     governor_root: Path,
@@ -1294,7 +1309,8 @@ def reserve_plain_slots(
     count = len(pending_legs)
     result = subprocess.run(
         [sys.executable, str(governor), "--root", str(governor_root), "reserve",
-         "--class", "dispatch", "--count", str(count), "--pid", str(os.getpid())],
+         "--class", "dispatch", "--count", str(count), "--pid", str(os.getpid()),
+         *reservation_owner_witness(governor_root)],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
     try:
@@ -1340,6 +1356,7 @@ def reserve_batch(
             str(count),
             "--pid",
             str(os.getpid()),
+            *reservation_owner_witness(governor_root),
             "--batch-manifest",
             encoded_manifest,
             *[

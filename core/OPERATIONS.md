@@ -1574,7 +1574,7 @@ resource jobs use the separate `resource-runner.py` lifecycle and its exact
 PID/start/group, command, cwd, log, and registry identity for reattachment.
 
 
-Admission recovery is bounded: only a global/class-cap refusal from `acquire` or `reserve` triggers one `reclaim(root)` transaction after the failed admission has released its state lock. Only `reclaimed_count > 0` permits one complete admission retry. Kill switches, identity/validation errors, and rolling start budgets are never bypassed; start history is not refunded. `check` and refusal messages never scan witnesses. Reclaim returns only leases whose exact witness permits an exclusive nonblocking lock; live claimants, inherited descendant handles, foreign namespaces, and unprovable legacy records stay protected. No PID-only removal, state reset, or cap increase substitutes for this proof. A start-budget or cap refusal is typed on the governor's stdout (`refusal`, `retry_after_seconds`, `frees_at`) and carried onto the adapter's refusal receipt; when the refusal created no registry row, `start --wait` treats this as `waiting-capacity`, not a failed attempt, and waits at most one start window before relaunching the same attempt id exactly once, returning without arming another wait if refused again.
+Admission recovery is bounded: only a global/class-cap refusal from `acquire` or `reserve` triggers one `reclaim(root)` transaction after the failed admission has released its state lock. Only `reclaimed_count > 0` permits one complete admission retry. Kill switches, identity/validation errors, and rolling start budgets are never bypassed; start history is not refunded. `check` and refusal messages never scan witnesses. Reclaim returns only leases whose exact witness permits an exclusive nonblocking lock; live claimants, inherited descendant handles, foreign namespaces, and unprovable legacy records stay protected. Unclaimed reservations follow the same witness proof: every reserving wrapper, batch wrappers included, holds an owner witness until it exits. A reservation lives only while its launch claims or cancels it, so one whose owner witness is not held and that is at least 24 hours old is returned as `unclaimed-past-launch-bound`; a held owner witness keeps its slot at any age. No PID-only removal, state reset, or cap increase substitutes for this proof. A start-budget or cap refusal is typed on the governor's stdout (`refusal`, `retry_after_seconds`, `frees_at`) and carried onto the adapter's refusal receipt; when the refusal created no registry row, `start --wait` treats this as `waiting-capacity`, not a failed attempt, and waits at most one start window before relaunching the same attempt id exactly once, returning without arming another wait if refused again.
 
 Owner, resource and governor observations share the same previous-boot proof.
 A different boot UUID alone is insufficient on shared NAS state: the proof
@@ -1616,6 +1616,17 @@ signals no process, and neither cascades children nor delivers unrelated
 pending attempts. Missing, changed, advanced or still-open route bindings and
 launched owners retain the existing reconciliation rules. Fleet may remove
 the cancelled row from its active set without granting successor readiness.
+
+**Verification leaves nothing running.** A verification lease
+(`utilities/verification-background-lease.py`) owns everything its command
+starts: it is the command's child subreaper and tags the command's environment,
+and when the command exits, expires or the lease is stopped it ends whatever is
+still in that scope, detached fixtures included. The scope's resident memory has
+one ceiling (16 GiB, or a quarter of host memory when smaller); past it the lease
+ends the scope and returns 125, so a leaking check ends instead of other work on
+a shared host. The test runner likewise reaps each suite's fixtures when that
+suite ends, and ends its running suites when it is stopped. A peer obligation
+runner whose state root was removed or replaced ends on its next pass.
 
 **Exact reconcile stays attempt-scoped.** A normal `dispatch-reconcile
 --attempt <id> --apply` covers that attempt, its process drain, and its

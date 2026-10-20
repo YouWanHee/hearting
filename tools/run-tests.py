@@ -735,6 +735,23 @@ _OWNED_LIVE_PATHS_LOCK = threading.Lock()
 _ALL_RUN_PGIDS: set[int] = set()
 _RUN_PGID_SUITE: dict[int, str] = {}
 _ALL_RUN_PGIDS_LOCK = threading.Lock()
+# Groups of suites still running, for a runner that is itself told to stop.
+_LIVE_SUITE_PGIDS: set[int] = set()
+
+
+def _stop_on_signal(signum, _frame):
+    """A stopped runner (e.g. its verification lease timed out) ends its running
+    suites first, so the `finally` cleanup below can reap their fixtures."""
+    own = os.getpgid(0)
+    with _ALL_RUN_PGIDS_LOCK:
+        live = set(_LIVE_SUITE_PGIDS)
+    for pgid in live:
+        if pgid != own:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+    raise SystemExit(128 + signum)
 
 # Whole-run positive-evidence map: live-state path -> set of PGIDs a
 # sampler has actually observed holding it open at some point during the
@@ -892,6 +909,7 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
         with _ALL_RUN_PGIDS_LOCK:
             _ALL_RUN_PGIDS.add(pgid)
             _RUN_PGID_SUITE[pgid] = relpath
+            _LIVE_SUITE_PGIDS.add(pgid)
     if pgid is not None and os.path.isdir("/proc"):
         sampler_thread = threading.Thread(
             target=_sample_pgid_live_state_writes,
@@ -908,6 +926,9 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
             rc = 124
             out, err = reap_process_group(proc)
     finally:
+        if pgid is not None:
+            with _ALL_RUN_PGIDS_LOCK:
+                _LIVE_SUITE_PGIDS.discard(pgid)
         stop_event.set()
         if sampler_thread is not None:
             sampler_thread.join(timeout=2.0)
@@ -1880,10 +1901,12 @@ def run_profile(
 ) -> list[SuiteResult]:
     results_by_index: dict[int, SuiteResult] = {}
     tmp_roots: list[Path] = []
+    tmp_by_index: dict[int, Path] = {}
 
     def make_env(idx: int) -> dict[str, str]:
         tmp = Path(tempfile.mkdtemp(prefix=f"w1-{profile}-{idx}-", dir=str(choose_suite_temp_parent())))
         tmp_roots.append(tmp)
+        tmp_by_index[idx] = tmp
         register_fixture_root(tmp)
         if profile == "isolated":
             return build_isolated_env(tmp, root)
@@ -1897,6 +1920,15 @@ def run_profile(
         if profile == "ci-like":
             return build_ci_like_env(tmp, root)
         raise ValueError(profile)
+
+    def run_reaped(idx: int, suite: Path, env: dict[str, str]) -> SuiteResult:
+        try:
+            return run_suite(suite, root, env, profile, timeout)
+        finally:
+            # A suite's detached fixtures end with that suite, not with the whole
+            # profile: one left running would otherwise run beside every later suite.
+            if idx in tmp_by_index:
+                reap_suite_tmp_processes(tmp_by_index[idx])
 
     def prepare_env(idx: int, suite: Path) -> dict[str, str]:
         relpath = suite_relpath(root, suite)
@@ -1934,7 +1966,7 @@ def run_profile(
             for idx, suite in parallel:
                 env = prepare_env(idx, suite)
                 futures.append(
-                    (idx, pool.submit(run_suite, suite, root, env, profile, timeout))
+                    (idx, pool.submit(run_reaped, idx, suite, env))
                 )
             for idx, fut in futures:
                 results_by_index[idx] = fut.result()
@@ -1944,7 +1976,7 @@ def run_profile(
         # report even though execution order is deliberately different.
         for idx, suite in serial:
             env = prepare_env(idx, suite)
-            results_by_index[idx] = run_suite(suite, root, env, profile, timeout)
+            results_by_index[idx] = run_reaped(idx, suite, env)
     finally:
         for tmp in tmp_roots:
             reap_suite_tmp_processes(tmp)
@@ -1954,6 +1986,8 @@ def run_profile(
 
 def main(argv: list[str]) -> int:
     args = build_arg_parser().parse_args(argv)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _stop_on_signal)
     import artifact_context
     context = artifact_context.resolve_context(environ=os.environ)
     mode_flags = {"--census", "--report-only", "--fingerprint", "--fingerprint-explain",
