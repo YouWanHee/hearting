@@ -40,7 +40,7 @@ import unicodedata
 from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
-from .model import (fmt_min, dash, project_of, exec_child_is_wait,
+from .model import (fmt_min, dash, project_of, exec_child_is_wait, display_shell_jobs,
                     session_parent_visible)
 from . import gitinfo, titles
 from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
@@ -4170,13 +4170,13 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
 
 def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
     """Render exact native shell jobs as child rows; this function performs no reads."""
-    jobs = [job for job in (getattr(entity, "shell_jobs", None) or [])
-            if isinstance(job, dict)]
+    now = time.time()
+    jobs = [job for job in display_shell_jobs(
+        getattr(entity, "shell_jobs", None) or [], now=now) if isinstance(job, dict)]
     indent = _conn_indent(depth, in_card)
     indent_width = _dw(indent)
     width = max(1, term_width - indent_width) if term_width else None
     lines = []
-    now = time.time()
     for job in jobs:
         command = job.get("command")
         command = str(command) if isinstance(command, str) and command else "command unavailable"
@@ -4192,6 +4192,8 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
         elapsed = job.get("elapsed_s")
         elapsed_label = ("%ds" % elapsed if elapsed < 60 else "%dm" % (elapsed // 60)) \
             if isinstance(elapsed, int) and not isinstance(elapsed, bool) and elapsed >= 0 else "time ?"
+        completion_unknown = (job.get("lifecycle_state") == "completed"
+                              and job.get("completion_time_state") not in (None, "valid"))
         native = str(job.get("native_status") or "unknown").lower()
         process = str(job.get("process_state") or "unknown").lower()
         if job.get("exit_code") is not None:
@@ -4231,11 +4233,14 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
                          else "O:" + _text_age(job.get("last_output_at"), now).replace(" ago", "")
                          if job.get("last_output_at") is not None
                          else "O:sampled" if job.get("output_coverage") == "sampled" else "O:?")
-            suffix = " S%s E%s %s %s %s" % (start_label, elapsed_label, native_short,
+            suffix = " S%s E%s%s %s %s %s" % (start_label, elapsed_label,
+                                             " C:?" if completion_unknown else "", native_short,
                                              process_short, out_short)
         else:
             suffix = " · start %s · %s · %s · %s" % (
                 start_label, elapsed_label, native_label, process_label)
+            if completion_unknown:
+                suffix += " · completion ?"
             if output_label:
                 suffix += " · " + output_label
         if width is not None:

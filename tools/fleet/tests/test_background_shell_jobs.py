@@ -12,7 +12,8 @@ from unittest import mock
 
 from fleet import render
 from fleet.collectors import opencode, procscan, shell_jobs
-from fleet.model import DispatchJob, Session
+from fleet.model import (DONE_AFTERGLOW_MIN, DispatchJob, Session,
+                         display_shell_jobs)
 
 
 class BackgroundShellJobsTests(unittest.TestCase):
@@ -71,6 +72,254 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.write_jsonl(other, [wrong_call, wrong_result])
         self.assertEqual(shell_jobs.read_claude_jobs(other, session_id="sid-a"), [])
 
+    def test_claude_native_session_binding_and_trusted_task_notifications(self):
+        path = self.root / "054aa76e-7697-468f-b91c-783e9bd8fd01.jsonl"
+        sid = "054aa76e-7697-468f-b91c-783e9bd8fd01"
+        runtime_sid = "81c65afa-e494-43ba-ab98-9650ed4c9e49"
+        task_a, task_b, task_c, task_d = (
+            "task-native-a", "task-native-b", "task-native-c", "task-native-d")
+        call_a, call_b, call_c, call_d = (
+            "toolu_native_call_a", "toolu_native_call_b", "toolu_native_call_c",
+            "toolu_native_call_d")
+        stamps = {
+            "start_a": "2026-10-20T00:00:00Z", "start_b": "2026-10-20T00:01:00Z",
+            "start_c": "2026-10-20T00:02:00Z", "ack": "2026-10-20T00:02:01Z",
+            "done_a": "2026-10-20T00:00:30Z", "done_c": "2026-10-20T00:02:45Z",
+        }
+
+        def call(call_id, task_start):
+            return {"type": "assistant", "sessionId": sid, "session_id": runtime_sid,
+                    "timestamp": stamps[task_start], "message": {"content": [{
+                        "type": "tool_use", "name": "Bash", "id": call_id,
+                        "input": {"command": "sleep 30", "run_in_background": True}}]}}
+
+        def ack(call_id, task_id):
+            return {"type": "user", "sessionId": sid, "session_id": runtime_sid,
+                    "timestamp": stamps["ack"], "toolUseResult": {
+                        "backgroundTaskId": task_id}, "message": {"content": [{
+                            "type": "tool_result", "tool_use_id": call_id,
+                            "content": ""}]}}
+
+        def notification(task_id, call_id, status, stamp, summary="", output_path=None,
+                         *, origin=True, native_sid=sid, runtime_session=runtime_sid):
+            output = output_path or str(self.root / "tasks" / (task_id + ".output"))
+            body = ("<task-notification><task-id>%s</task-id><tool-use-id>%s</tool-use-id>"
+                    "<output-file>%s</output-file><status>%s</status><summary>%s</summary>"
+                    "</task-notification>" % (task_id, call_id, output, status, summary))
+            row = {"type": "user", "sessionId": native_sid,
+                   "session_id": runtime_session, "timestamp": stamp,
+                   "message": {"content": body}}
+            if isinstance(origin, dict):
+                row.update(origin=origin, promptSource="system",
+                           turnOrigin="task_notification")
+            elif origin:
+                row.update(origin={"kind": "task-notification", "producer": "session-task"},
+                           promptSource="system", turnOrigin="task_notification")
+            return row
+
+        output_a = str(self.root / "tasks" / (task_a + ".output"))
+        output_b = str(self.root / "tasks" / (task_b + ".output"))
+        output_c = str(self.root / "tasks" / (task_c + ".output"))
+        output_d = str(self.root / "tasks" / (task_d + ".output"))
+        rows = [
+            call(call_a, "start_a"), ack(call_a, task_a),
+            call(call_b, "start_b"), ack(call_b, task_b),
+            call(call_c, "start_c"), ack(call_c, task_c),
+            call(call_d, "start_c"), ack(call_d, task_d),
+            notification(task_a, call_a, "completed", stamps["done_a"],
+                         "Background command completed (exit code 0)", output_a),
+            notification(task_b, call_a, "failed", "2026-10-20T00:01:30Z",
+                         "Background command failed (exit code 2)", output_b),
+            notification(task_c, call_c, "stopped", stamps["done_c"], output_path=output_c),
+            notification(task_d, call_d, "failed", "2026-10-20T00:03:00Z",
+                         "Background command failed (exit code 2)", output_d),
+            notification(task_b, call_b, "failed", "2026-10-20T00:01:40Z",
+                         "Background command failed (exit code 2)", output_b, origin=False),
+            notification(task_b, call_b, "failed", "2026-10-20T00:01:45Z",
+                         "Background command failed (exit code 2)", output_b,
+                         origin={"kind": "task-notification", "producer": "untrusted-copy"}),
+            {"type": "assistant", "api_request": {"messages": [
+                "<task-notification><task-id>%s</task-id><tool-use-id>%s</tool-use-id>"
+                "<status>failed</status></task-notification>" % (task_b, call_b)]},
+             "message": {"content": [{"type": "text", "text":
+                 "<task-notification><task-id>%s</task-id><tool-use-id>%s</tool-use-id>"
+                 "<status>failed</status></task-notification>" % (task_b, call_b)}]}},
+            notification(task_b, call_b, "failed", "2026-10-20T00:02:00Z",
+                         "Background command failed (exit code 2)", output_b,
+                         native_sid="neighbor-session"),
+            {"type": "user", "sessionId": sid, "session_id": runtime_sid,
+             "timestamp": "2026-10-20T00:02:10Z",
+             "message": {"content": [{"type": "text", "text":
+                 "<task-notification><task-id>%s</task-id></task-notification>" % task_b}]}},
+        ]
+        continuation = notification(task_b, call_b, "failed", "2026-10-20T00:02:20Z",
+                                    "Background command failed (exit code 2)", output_b,
+                                    native_sid="continued-source-session")
+        continuation["continuedInSessionId"] = sid
+        rows.append(continuation)
+        # The API request copy above is nested text, not a native task-notification
+        # envelope, and therefore cannot finish the acknowledged task.
+        self.write_jsonl(path, rows)
+
+        now = shell_jobs.parse_time("2026-10-20T00:10:00Z")
+        jobs = shell_jobs.read_claude_jobs(path, session_id=sid, attempt_id="attempt-a", now=now)
+        by_task = {job["native_task_id"]: job for job in jobs}
+        self.assertEqual(set(by_task), {task_a, task_b, task_c, task_d})
+        self.assertEqual(by_task[task_a]["native_status"], "completed")
+        self.assertEqual(by_task[task_a]["exit_code"], 0)
+        self.assertEqual(by_task[task_a]["elapsed_s"], 30)
+        self.assertEqual(by_task[task_a]["output_path"], output_a)
+        self.assertEqual(by_task[task_a]["process_state"], "unknown")
+        self.assertEqual(by_task[task_b]["native_status"], "acknowledged")
+        self.assertIsNone(by_task[task_b].get("exit_code"))
+        self.assertEqual(by_task[task_c]["native_status"], "stopped")
+        self.assertIsNone(by_task[task_c].get("exit_code"))
+        self.assertEqual(by_task[task_d]["native_status"], "failed")
+        self.assertEqual(by_task[task_d]["exit_code"], 2)
+        later = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-a", now=now + 3600)
+        self.assertEqual({job["native_task_id"]: job["elapsed_s"] for job in later}[task_a], 30)
+        self.assertEqual({job["native_task_id"]: job["lifecycle_state"]
+                          for job in later}[task_b], "unknown")
+        self.assertIn(task_b, {job["native_task_id"] for job in shell_jobs.observe_jobs(
+            later, now=now + 3600)})
+
+        # The conflicting runtime SID cannot select this native transcript's tasks.
+        self.assertEqual(shell_jobs.read_claude_jobs(
+            path, session_id=runtime_sid, attempt_id="attempt-a", now=now), [])
+        copied = self.root / "copied.jsonl"
+        self.write_jsonl(copied, [notification(
+            task_a, call_a, "completed", stamps["done_a"],
+            "Background command completed (exit code 0)", output_a)])
+        self.assertEqual(shell_jobs.read_claude_jobs(
+            copied, session_id=sid, attempt_id="attempt-a", now=now), [])
+
+    def test_claude_automatic_background_ack_remains_supported_without_flag(self):
+        path = self.root / "automatic-background.jsonl"
+        self.write_jsonl(path, [
+            {"type": "assistant", "sessionId": "sid-auto",
+             "timestamp": "2026-10-20T00:00:00Z", "message": {"content": [{
+                 "type": "tool_use", "name": "Bash", "id": "toolu_auto_call",
+                 "input": {"command": "long-running-command"}}]}},
+            {"type": "user", "sessionId": "sid-auto",
+             "timestamp": "2026-10-20T00:00:01Z", "message": {"content": [{
+                 "type": "tool_result", "tool_use_id": "toolu_auto_call",
+                 "content": "Command running in background. Output: "
+                            "/tmp/tasks/task-auto-123.output"}]}}
+        ])
+        jobs = shell_jobs.read_claude_jobs(
+            path, session_id="sid-auto",
+            now=shell_jobs.parse_time("2026-10-20T00:01:00Z"))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["native_task_id"], "task-auto-123")
+        self.assertEqual(jobs[0]["native_status"], "acknowledged")
+
+    def test_claude_notification_cannot_cross_source_generation(self):
+        sid = "native-session-12345"
+        call_id, task_id = "toolu-generation-call", "task-generation"
+        path = self.root / (sid + ".jsonl")
+        rows = [
+            {"type": "assistant", "sessionId": sid,
+             "timestamp": "2026-10-20T00:00:00Z", "message": {"content": [{
+                 "type": "tool_use", "name": "Bash", "id": call_id,
+                 "input": {"command": "sleep 2", "run_in_background": True}}]}},
+            {"type": "user", "sessionId": sid,
+             "timestamp": "2026-10-20T00:00:01Z", "toolUseResult": {
+                 "backgroundTaskId": task_id}, "message": {"content": [{
+                     "type": "tool_result", "tool_use_id": call_id, "content": ""}]}},
+        ]
+        self.write_jsonl(path, rows)
+        before = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-a",
+            now=shell_jobs.parse_time("2026-10-20T00:00:02Z"))
+        self.assertEqual(before[0]["native_status"], "acknowledged")
+
+        replacement = self.root / "replacement.jsonl"
+        self.write_jsonl(replacement, [
+            {"type": "user", "sessionId": sid,
+             "timestamp": "2026-10-20T00:00:03Z",
+             "origin": {"kind": "task-notification", "producer": "session-task"},
+             "promptSource": "system", "turnOrigin": "task_notification",
+             "message": {"content": "<task-notification><task-id>%s</task-id>"
+                 "<tool-use-id>%s</tool-use-id><status>completed</status>"
+                 "</task-notification>" % (task_id, call_id)}}])
+        os.replace(replacement, path)
+        after = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-a",
+            now=shell_jobs.parse_time("2026-10-20T00:00:04Z"))
+        self.assertTrue(after)
+        self.assertFalse(any(job["native_status"] == "completed" for job in after))
+
+    def test_completed_elapsed_uses_only_valid_native_completion_time(self):
+        base = 1792454400
+        valid = shell_jobs.normalize_job({
+            "harness": "codex", "session_id": "thread-a", "native_id": "done",
+            "native_status": "completed", "started_at": base,
+            "completed_at": base + 30}, now=base + 400)
+        self.assertEqual(valid["elapsed_s"], 30)
+        self.assertEqual(valid["completion_time_state"], "valid")
+        self.assertEqual(shell_jobs.normalize_job({
+            "native_status": "completed", "started_at": base}, now=base + 400)["elapsed_s"], None)
+        invalid = shell_jobs.normalize_job({
+            "native_status": "completed", "started_at": base,
+            "completed_at": "not-a-time"}, now=base + 400)
+        self.assertEqual(invalid["completion_time_state"], "invalid")
+        self.assertEqual(invalid["completion_time_reason"], "invalid-completion-time")
+        self.assertIsNone(invalid["elapsed_s"])
+        invalid_after_enrichment = shell_jobs.observe_jobs([invalid], now=base + 400)[0]
+        self.assertEqual(invalid_after_enrichment["completion_time_state"], "invalid")
+        self.assertEqual(invalid_after_enrichment["completion_time_reason"],
+                         "invalid-completion-time")
+        future = shell_jobs.normalize_job({
+            "native_status": "completed", "started_at": base,
+            "completed_at": base + 401}, now=base + 400)
+        self.assertEqual(future["completion_time_state"], "future")
+        self.assertIsNone(future["elapsed_s"])
+        reversed_time = shell_jobs.normalize_job({
+            "native_status": "completed", "started_at": base + 1,
+            "completed_at": base}, now=base + 400)
+        self.assertEqual(reversed_time["completion_time_reason"], "completion-before-start")
+        self.assertIsNone(reversed_time["elapsed_s"])
+        active = shell_jobs.normalize_job({
+            "native_status": "running", "started_at": base}, now=base + 401)
+        self.assertEqual(active["elapsed_s"], 401)
+
+    def test_shell_job_afterglow_boundary_and_json_row_selection_match(self):
+        self.assertEqual(DONE_AFTERGLOW_MIN, 15)
+        now = 10000.0
+        def job(native_id, state, completed_at=None, started_at=9000):
+            return {"harness": "codex", "session_id": "s", "native_id": native_id,
+                    "command": "echo " + native_id, "lifecycle_state": state,
+                    "completion_time_state": "valid" if completed_at is not None else "missing",
+                    "completed_at": completed_at, "started_at": started_at,
+                    "elapsed_s": 1, "native_status": "completed" if state == "completed" else "running",
+                    "process_state": "unknown", "output_coverage": "unavailable"}
+        jobs = [job("at-boundary", "completed", now - 900),
+                job("outside", "completed", now - 901),
+                job("untimed", "completed"),
+                job("future", "completed", now + 1),
+                job("active-old", "running", started_at=1),
+                job("unknown-old", "unknown", started_at=1)]
+        selected = {item["native_id"] for item in display_shell_jobs(jobs, now=now)}
+        self.assertEqual(selected, {"at-boundary", "untimed", "future", "active-old", "unknown-old"})
+
+        live_now = time.time()
+        visible = [job("recent", "completed", live_now - 30, live_now - 60),
+                   job("expired", "completed", live_now - 901, live_now - 1000),
+                   job("active-long", "running", started_at=live_now - 5000),
+                   job("unknown-long", "unknown", started_at=live_now - 5000),
+                   job("completion-unknown", "completed")]
+        enriched = shell_jobs.observe_jobs(visible, now=live_now)
+        session = Session(harness="codex", pid=1, cwd=str(self.root), shell_jobs=enriched)
+        public_ids = {item["native_id"] for item in session.to_dict()["shell_jobs"]}
+        rows = "".join(part[0] for line in render._shell_job_rows(
+            session, term_width=180) for part in line)
+        row_ids = {name for name in ("recent", "expired", "active-long", "unknown-long",
+                                     "completion-unknown") if "echo " + name in rows}
+        self.assertEqual(public_ids, row_ids)
+        self.assertNotIn("expired", public_ids)
+        self.assertIn("completion ?", rows)
+
     def test_codex_nested_handles_multiple_jobs_exit_and_json_render(self):
         path = self.root / "rollout.jsonl"
         self.write_jsonl(path, [
@@ -124,10 +373,12 @@ class BackgroundShellJobsTests(unittest.TestCase):
 
         session = Session(harness="codex", pid=10, session_id="thread-a",
                           liveness="idle", shell_jobs=jobs)
-        public = session.to_dict()
+        with mock.patch("time.time", return_value=1792454407):
+            public = session.to_dict()
         self.assertEqual(public["liveness"], "idle")
         self.assertEqual(len(public["shell_jobs"]), 2)
-        with mock.patch("os.stat", side_effect=AssertionError("render attempted observation I/O")):
+        with mock.patch("time.time", return_value=1792454407), \
+                mock.patch("os.stat", side_effect=AssertionError("render attempted observation I/O")):
             by_width = {width: render._shell_job_rows(session, term_width=width)
                         for width in (60, 100, 120, 168)}
         for width, rows in by_width.items():
@@ -139,13 +390,14 @@ class BackgroundShellJobsTests(unittest.TestCase):
 
         worker = DispatchJob(key="autopilot-code", slug="worker-shell-jobs",
                              harness="codex", liveness="working", shell_jobs=jobs)
-        group_lines = render._build_lines([], [worker], "dispatch", False, 0,
-                                          term_width=120)
-        group_screen = "\n".join(render._plain(line) for line in group_lines if line)
+        with mock.patch("time.time", return_value=1792454407):
+            group_lines = render._build_lines([], [worker], "dispatch", False, 0,
+                                              term_width=120)
+            group_screen = "\n".join(render._plain(line) for line in group_lines if line)
+            process_lines, _meta = render._degrade_card(worker, {}, term_width=120)
+            process_screen = "\n".join(render._plain(line) for line in process_lines if line)
         self.assertIn("worker-shell-jobs", group_screen)
         self.assertIn("native exit 2", group_screen)
-        process_lines, _meta = render._degrade_card(worker, {}, term_width=120)
-        process_screen = "\n".join(render._plain(line) for line in process_lines if line)
         self.assertIn("native exit 2", process_screen)
 
     def test_codex_native_command_events_project_running_and_exit_without_stdout_parsing(self):
@@ -172,6 +424,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertEqual(jobs[0]["lifecycle_state"], "completed")
         self.assertEqual(jobs[0]["exit_code"], 3)
         self.assertEqual(jobs[0]["process_state"], "unknown")
+        self.assertEqual(jobs[0]["elapsed_s"], 5)
+        later = shell_jobs.read_codex_jobs(
+            path, session_id="thread-native", attempt_id="attempt-a", now=1792455005)
+        self.assertEqual(later[0]["elapsed_s"], 5)
         self.assertEqual(shell_jobs.source_status(
             path, ("codex", os.path.abspath(path), "thread-native", "attempt-a"))["coverage"],
             "complete")
@@ -743,6 +999,8 @@ class BackgroundShellJobsTests(unittest.TestCase):
             self.assertEqual(jobs["sh-fixture-ok"]["native_output_cursor"], 23)
             self.assertEqual(jobs["sh-fixture-ok"]["native_output_size"], 23)
             self.assertEqual(jobs["sh-fixture-ok"]["output_state"], "observed")
+            terminal_elapsed = jobs["sh-fixture-ok"]["elapsed_s"]
+            self.assertEqual(terminal_elapsed, 5)
             self.assertTrue(ok_output.exists())  # retained file did not revive the exited task
 
             # Replaying the older running snapshot must not resurrect a completed result.
@@ -750,6 +1008,7 @@ class BackgroundShellJobsTests(unittest.TestCase):
             jobs = {item["native_id"]: item for item in session.shell_jobs}
             self.assertEqual(jobs["sh-fixture-ok"]["native_status"], "exited")
             self.assertEqual(jobs["sh-fixture-ok"]["process_state"], "dead")
+            self.assertEqual(jobs["sh-fixture-ok"]["elapsed_s"], terminal_elapsed)
 
             terminal_time = int(time.time() * 1000)
             exited_fail = shell_row("sh-fixture-fail", "python3 -c 'raise SystemExit(3)'",

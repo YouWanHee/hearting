@@ -65,7 +65,8 @@ except Exception:  # a monitor must never fail to import over a read helper
 
 from .. import gitinfo
 from .. import model
-from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
+from ..model import (DONE_AFTERGLOW_MIN, ContextEvidence, DispatchJob,
+                     etime_to_min, project_of)
 from ..token_budget import (context_policy_snapshot, context_policy_used_pct,
                             parse_codex_token_count, telemetry_from_explicit)
 from . import procscan
@@ -96,12 +97,6 @@ _MANAGED_SIDECAR_RE = re.compile(
     r"^(.*/\.harness/managed-sessions/[^/]+)/managed-sidecars/[^/]+$"
 )
 _TERMINAL_REGISTRY_STATUSES = frozenset(("done", "killed", "cancelled"))
-# F-46 (v29): a `done` row lingers this long as a display-only afterglow row — the job-row
-# mirror of the group cooling window (render `_COOL_WINDOW_MIN`). Rationale: a multi-minute
-# quick dispatch used to evaporate the instant it finished, so the user read it as "never
-# ran". `killed`/`cancelled` are NOT afterglow (they keep the existing stale/dead path):
-# an interrupted attempt is not a completion worth lingering on.
-DONE_AFTERGLOW_MIN = 15
 _PID_HOST_NAMESPACE_PROOF = "nspid-procfs-root-v1"
 _DEGRADATION_CACHE = {}
 _DEGRADATION_CACHE_LIMIT = 128

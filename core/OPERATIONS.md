@@ -2562,7 +2562,15 @@ The shared row is advisory and passive. It does not alter parent session
 liveness, pulse, route state, gate, or controls. It carries a bounded sanitized
 command, start/elapsed when its timestamp is valid, native completion/exit when
 explicit, and process alive/dead only when the exact process generation and
-namespace or an exact writable output-file descriptor is verified. A previously
+namespace or an exact writable output-file descriptor is verified. A running
+task's elapsed time uses its start and current observation time. A completed
+task's duration uses its observed native completion timestamp and stops there;
+missing, invalid, future, or pre-start completion time leaves duration unknown.
+The row never substitutes a refreshed observation timestamp for completion.
+Completed rows use the existing 15-minute dispatch afterglow in JSON and child
+rows. Only a known completion age can expire a row; live, pending, unknown, or
+untimed terminal work stays visible. Display expiry does not remove reader cache
+state, so later native updates can still revise the same task. A previously
 verified writer becomes dead only after same-observer proof of disappearance or
 PID-generation replacement; permission failures, namespace visibility changes,
 and other unreadable identity checks remain unknown. Stale output files, native
@@ -2580,6 +2588,18 @@ observation I/O. JSON keeps the
 legacy `exec_child` and `exec_tool` fields and adds the same per-task evidence.
 Rows use the existing child layout and never borrow another session or attempt.
 No process is started, stopped, or restarted by this observation.
+
+Claude transcript binding prefers its native `sessionId` when a row also has a
+different runtime `session_id`; the latter is only a fallback when the native
+field is absent. A task notification may update lifecycle only from a native
+user string-content envelope with `origin.kind=task-notification`,
+`origin.producer=session-task`, `promptSource=system`, and
+`turnOrigin=task_notification`, and only when its task ID and tool-use ID match
+an acknowledged Bash task in the same transcript generation, full session, and
+attempt. The notification timestamp is completion evidence; its output file is
+only an output locator and never process-liveness proof. API-request copies,
+ordinary user text, tool output, quotes, and mismatched identities are not
+terminal evidence.
 
 For Codex, trusted App Server `command_execution` events and exact native
 `exec_command`/`write_stdin` call/output pairs may establish task identity and

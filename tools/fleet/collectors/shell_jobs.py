@@ -15,6 +15,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from ..model import display_shell_jobs
+
 
 MAX_COMMAND = 120
 MAX_READ_PER_TICK = 64 * 1024
@@ -308,6 +310,102 @@ def _claude_task_ack(text, *, background_requested=False):
     return (match.group(1), None) if match else (None, None)
 
 
+_CLAUDE_TASK_NOTIFICATION = re.compile(
+    r"<task-notification>(.*?)</task-notification>", re.DOTALL)
+_CLAUDE_NATIVE_ID = re.compile(r"^[A-Za-z0-9_-]{4,}$")
+
+
+def _claude_task_notification(row):
+    """Parse only Claude's native, provenance-marked terminal task envelope."""
+    if not isinstance(row, dict) or row.get("type") != "user":
+        return None
+    origin = row.get("origin")
+    if (not isinstance(origin, dict) or origin.get("kind") != "task-notification"
+            or origin.get("producer") != "session-task"
+            or row.get("promptSource") != "system"
+            or row.get("turnOrigin") != "task_notification"):
+        return None
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        return None
+    blocks = _CLAUDE_TASK_NOTIFICATION.findall(content)
+    if len(blocks) != 1:
+        return None
+    fields = {}
+    for name in ("task-id", "tool-use-id", "output-file", "status", "summary"):
+        matches = re.findall(r"<%s>(.*?)</%s>" % (name, name), blocks[0], re.DOTALL)
+        if len(matches) > 1 or (name in {"task-id", "tool-use-id", "status"}
+                                and len(matches) != 1):
+            return None
+        fields[name] = matches[0].strip() if matches else None
+    task_id, call_id, status = fields["task-id"], fields["tool-use-id"], fields["status"]
+    if (not isinstance(task_id, str) or not _CLAUDE_NATIVE_ID.fullmatch(task_id)
+            or not isinstance(call_id, str) or not _CLAUDE_NATIVE_ID.fullmatch(call_id)):
+        return None
+    statuses = {"completed": "completed", "complete": "completed",
+                "failed": "failed", "error": "failed",
+                "stopped": "stopped", "cancelled": "stopped", "canceled": "stopped"}
+    native_status = statuses.get((status or "").lower())
+    if native_status is None:
+        return None
+    output_path = fields["output-file"]
+    if output_path and (not os.path.isabs(output_path) or "\n" in output_path):
+        return None
+    summary = fields["summary"] or ""
+    exit_codes = re.findall(r"\bexit code\s+(-?\d+)\b", summary, re.IGNORECASE)
+    try:
+        exit_code = int(exit_codes[0]) if len(exit_codes) == 1 else None
+    except (ValueError, OverflowError):
+        exit_code = None
+    return {"task_id": task_id, "call_id": call_id, "status": native_status,
+            "output_path": output_path, "exit_code": exit_code,
+            "completed_at": _row_time(row)}
+
+
+def _claude_row_matches_session(row, session_id):
+    """Prefer Claude's native transcript SID over a conflicting runtime SID."""
+    native_sid = row.get("sessionId")
+    declared_sid = native_sid if isinstance(native_sid, str) and native_sid else row.get("session_id")
+    return not isinstance(declared_sid, str) or declared_sid == session_id
+
+
+def _apply_claude_notification(state, notification, *, path, session_id,
+                               attempt_id, generation):
+    task_id = notification["task_id"]
+    prior = state["jobs"].get(task_id)
+    if (not isinstance(prior, dict) or prior.get("harness") != "claude"
+            or prior.get("native_task_id") != task_id
+            or prior.get("native_call_id") != notification["call_id"]
+            or prior.get("session_id") != session_id
+            or prior.get("attempt_id") != attempt_id
+            or prior.get("source_locator") != os.path.abspath(path)
+            or prior.get("source_generation") != str(generation)):
+        return
+    output_path = notification.get("output_path")
+    prior_path = prior.get("output_path")
+    if output_path and prior_path and output_path != prior_path:
+        return
+    stamp = notification.get("completed_at")
+    prior_stamp = valid_epoch(prior.get("completed_at"))
+    if stamp is not None and prior_stamp is not None and stamp < prior_stamp:
+        return
+    updated = dict(prior)
+    updated.update({"native_status": notification["status"],
+                    "native_status_source": "claude-task-notification",
+                    "completed_at": stamp if stamp is not None else prior.get("completed_at"),
+                    "completion_time_source": "claude-task-notification.timestamp"
+                    if stamp is not None else prior.get("completion_time_source")})
+    if notification.get("exit_code") is not None:
+        updated["exit_code"] = notification["exit_code"]
+        updated["exit_code_source"] = "claude-task-notification.summary"
+    if output_path and not prior_path:
+        updated["output_path"] = output_path
+        updated["output_reason"] = None
+        updated["output_coverage"] = "sampled"
+    _store_task(state, task_id, updated)
+
+
 def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
     """Read exact Claude Bash acknowledgements from an incrementally scanned transcript."""
     source_key = ("claude", os.path.abspath(path), session_id, attempt_id)
@@ -329,14 +427,22 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
         state["coverage_reasons"].clear()
         state["jobs"].clear()
     for row in delta.get("lines", ()):
-        declared_sid = row.get("session_id") or row.get("sessionId")
-        if isinstance(declared_sid, str) and declared_sid != session_id:
+        if not _claude_row_matches_session(row, session_id):
             continue
         stamp = _row_time(row)
         row_type = row.get("type")
         message = row.get("message") if isinstance(row.get("message"), dict) else row
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list) and row_type in ("assistant", "user"):
+            result_parts = [part for part in content if isinstance(part, dict)
+                            and part.get("type") == "tool_result"]
+            result_metadata = row.get("toolUseResult")
+            structured_task_id = None
+            if (row_type == "user" and len(result_parts) == 1
+                    and isinstance(result_metadata, dict)):
+                candidate = result_metadata.get("backgroundTaskId")
+                if isinstance(candidate, str) and _CLAUDE_NATIVE_ID.fullmatch(candidate):
+                    structured_task_id = candidate
             for part in content:
                 if not isinstance(part, dict):
                     continue
@@ -354,9 +460,15 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                     call = state["calls"].pop(call_id, None)
                     if not isinstance(call, dict):
                         continue
-                    task_id, output_path = _claude_task_ack(
+                    text_task_id, text_output_path = _claude_task_ack(
                         _claude_result_text(part.get("content")),
                         background_requested=call.get("run_in_background") is True)
+                    if structured_task_id and call.get("run_in_background") is True:
+                        task_id = structured_task_id
+                        output_path = (text_output_path if text_task_id in (None, task_id)
+                                       else None)
+                    else:
+                        task_id, output_path = text_task_id, text_output_path
                     if not task_id:
                         continue
                     _store_task(state, task_id, {
@@ -376,6 +488,12 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         "observation_state": delta.get("state"),
                         "observation_reason": delta.get("reason"),
                     })
+        notification = _claude_task_notification(row)
+        if (notification is not None
+                and row.get("sessionId") == session_id):
+            _apply_claude_notification(
+                state, notification, path=path, session_id=session_id,
+                attempt_id=attempt_id, generation=delta.get("generation"))
     result = []
     for item in list(state.get("retired_jobs", ())) + list(state["jobs"].values()):
         current = dict(item)
@@ -630,20 +748,32 @@ def normalize_job(job, *, now=None):
     result["observation_time_reason"] = (
         "future-observation-time" if observed_at is not None and observed_at > now
         else "missing-or-invalid-observation-time" if observed_at is None else None)
-    completed_at = valid_epoch(result.get("completed_at"))
-    result["completed_at"] = completed_at if completed_at is not None and completed_at <= now else None
-    result["completion_time_state"] = (
-        "future" if completed_at is not None and completed_at > now
-        else "valid" if completed_at is not None else "unavailable")
-    result["completion_time_reason"] = (
-        "future-completion-time" if completed_at is not None and completed_at > now
-        else None)
+    raw_completed_at = result.get("completed_at")
+    completed_at = valid_epoch(raw_completed_at)
+    started = result["started_at"]
+    result["completed_at"] = completed_at
+    if raw_completed_at is None:
+        previous_state = result.get("completion_time_state")
+        previous_reason = result.get("completion_time_reason")
+        if (previous_state in {"invalid", "future", "missing"}
+                and isinstance(previous_reason, str) and previous_reason):
+            completion_state, completion_reason = previous_state, previous_reason
+        else:
+            completion_state, completion_reason = "missing", "missing-completion-time"
+    elif completed_at is None:
+        completion_state, completion_reason = "invalid", "invalid-completion-time"
+    elif completed_at > now:
+        completion_state, completion_reason = "future", "future-completion-time"
+    elif started is not None and completed_at < started:
+        completion_state, completion_reason = "invalid", "completion-before-start"
+    else:
+        completion_state, completion_reason = "valid", None
+    result["completion_time_state"] = completion_state
+    result["completion_time_reason"] = completion_reason
     if result.get("exit_code") is not None and (
             not isinstance(result["exit_code"], int) or isinstance(result["exit_code"], bool)):
         result["exit_code"] = None
         result["exit_code_reason"] = "invalid-exit-code"
-    started = result["started_at"]
-    result["elapsed_s"] = max(0, int(now - started)) if started is not None and started <= now else None
     reason = result.get("observation_reason")
     if started is None:
         result["time_state"] = "start-unavailable"
@@ -651,19 +781,26 @@ def normalize_job(job, *, now=None):
     elif started > now:
         result["time_state"] = "invalid"
         result["time_reason"] = "future-start"
-        result["elapsed_s"] = None
     else:
         result["time_state"] = "valid"
         result["time_reason"] = None
 
     status = str(result.get("native_status") or "unknown").lower()
-    terminal = status in {"completed", "complete", "exited", "failed", "error", "cancelled", "canceled"}
-    if result["completed_at"] is not None or terminal or result.get("exit_code") is not None:
+    terminal = status in {"completed", "complete", "exited", "failed", "error",
+                          "cancelled", "canceled", "stopped", "timed_out", "timeout"}
+    if completion_state == "valid" or terminal or result.get("exit_code") is not None:
         result["lifecycle_state"] = "completed"
     elif status in {"running", "in_progress", "ongoing", "background"}:
         result["lifecycle_state"] = "running"
     else:
         result["lifecycle_state"] = "unknown"
+    if result["lifecycle_state"] == "completed":
+        result["elapsed_s"] = (max(0, int(completed_at - started))
+                               if completion_state == "valid" and started is not None
+                               and started <= completed_at else None)
+    else:
+        result["elapsed_s"] = (max(0, int(now - started))
+                               if started is not None and started <= now else None)
 
     output_path = result.get("output_path")
     output_reason = result.get("output_reason")
@@ -930,8 +1067,16 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
     """Normalize jobs and add only targeted exact output-writer process evidence."""
     jobs = list(jobs or ())
     now = time.time() if now is None else now
+    normalized = []
+    for raw in jobs:
+        item = normalize_job(raw, now=now)
+        if item is not None:
+            normalized.append(item)
+    visible = display_shell_jobs(normalized, now=now)
     candidates = []
-    needs_candidates = any(isinstance(job, dict) and job.get("output_path") for job in jobs)
+    needs_candidates = any(
+        job.get("output_path") and job.get("lifecycle_state") != "completed"
+        and job.get("process_state") != "dead" for job in visible)
     parent_namespace = ProcObservation("unavailable", reason="parent-identity-not-observed")
     if needs_candidates and parent_pid and parent_start and tree is not None and kids is not None:
         try:
@@ -943,17 +1088,12 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
         except Exception as exc:
             candidates = []
             parent_namespace = ProcObservation("unavailable", reason=type(exc).__name__)
-    result = []
-    for raw in jobs or ():
-        item = normalize_job(raw, now=now)
-        if item is None:
-            continue
+    for item in visible:
         if (item.get("output_path") and item.get("lifecycle_state") != "completed"
                 and item.get("process_state") != "dead"):
             item.update(correlate_output_writers(
                 item, candidates, namespace=parent_namespace, root_pid=parent_pid))
-        result.append(item)
-    return result
+    return visible
 
 
 def shell_job_strip_label(job):

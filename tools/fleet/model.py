@@ -11,6 +11,7 @@ import math
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from typing import Optional, TypedDict
 
@@ -76,6 +77,44 @@ def dash(v, fmt=None):
 LIVENESS_STATES = ("working", "idle", "unused", "blocked", "done", "stale", "dead", "unknown")
 INTERACTION_KINDS = ("decision", "approval", "permission", "elicitation")
 
+# Fleet's existing completed dispatch-row afterglow, shared with native shell
+# task rows so readers and consumers use the same display lifetime.
+DONE_AFTERGLOW_MIN = 15
+
+
+def display_shell_jobs(jobs, *, now=None):
+    """Select visible shell rows without mutating the native reader's cache.
+
+    Only completed tasks with a valid, known completion age can age out. Live,
+    pending, unknown, or untimed terminal work stays visible because elapsed
+    observation time is not completion evidence.
+    """
+    now = time.time() if now is None else now
+    if (not isinstance(now, (int, float)) or isinstance(now, bool)
+            or not math.isfinite(now) or now < 0):
+        now = time.time()
+    keep = []
+    max_age = DONE_AFTERGLOW_MIN * 60
+    for job in jobs or ():
+        if not isinstance(job, dict) or job.get("lifecycle_state") != "completed":
+            keep.append(job)
+            continue
+        state = job.get("completion_time_state")
+        completed = job.get("completed_at")
+        if (state not in (None, "valid")
+                or not isinstance(completed, (int, float)) or isinstance(completed, bool)
+                or not math.isfinite(completed) or completed < 0 or completed > now):
+            keep.append(job)
+            continue
+        started = job.get("started_at")
+        if (isinstance(started, (int, float)) and not isinstance(started, bool)
+                and math.isfinite(started) and completed < started):
+            keep.append(job)
+            continue
+        if now - completed <= max_age:
+            keep.append(job)
+    return keep
+
 # Stable public name consumed by Fleet, the progress watchdog, liveness and
 # registry reconciliation.  Keeping the exact-attempt verdict here prevents
 # each surface from growing a subtly different PID/start-time classifier.
@@ -131,11 +170,14 @@ class ShellJob(TypedDict, total=False):
 def _public_value(value):
     """Serialize additive Fleet values without exposing private evidence caches."""
     if is_dataclass(value):
-        payload = {
-            f.name: _public_value(getattr(value, f.name))
-            for f in fields(value)
-            if not f.name.startswith("_")
-        }
+        payload = {}
+        for f in fields(value):
+            if f.name.startswith("_"):
+                continue
+            item = getattr(value, f.name)
+            if f.name == "shell_jobs":
+                item = display_shell_jobs(item)
+            payload[f.name] = _public_value(item)
         if value.__class__.__name__ == "WorkProjection":
             ambiguity = payload.get("ambiguity")
             payload["ambiguity"] = [] if ambiguity is None else (
