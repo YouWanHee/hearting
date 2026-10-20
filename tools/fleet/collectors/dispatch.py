@@ -55,6 +55,7 @@ except Exception:  # a monitor must never fail to import over a bookkeeping help
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
+import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
 
@@ -103,6 +104,12 @@ _DEGRADATION_CACHE_LIMIT = 128
 _DEGRADATION_REQUIRED = {"schema_version", "kind", "ts", "route_id", "route_node",
                          "route_hash", "dispatch_depth", "fallback_hop",
                          "execution_surface", "writer"}
+
+
+def _pinned_registry_lines(path):
+    if _dispatch_registry_cache.registry_scope_active():
+        return _dispatch_registry_cache.registry_lines(Path(path))
+    return None
 
 
 def _managed_parent_dir(sidecar_log):
@@ -860,7 +867,9 @@ def _parent_extinction_rows(paths):
     for path in paths:
         per_path = {}
         try:
-            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            lines = _pinned_registry_lines(path)
+            content = ("\n".join(lines) if lines is not None else
+                       Path(path).read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
         for line in content.splitlines():
@@ -2566,17 +2575,98 @@ def resolve_plan_qa_artifact(job):
         roots.extend((root, os.path.join(root, ".agent_reports"),
                       os.path.join(root, ".claude_reports")))
     candidates = set()
+    route_id = value("route_id") or value("owner_route_id")
+    cycle_id = value("cycle_id") or value("cycle")
+
+    def inside(path, root):
+        try:
+            return os.path.commonpath((os.path.realpath(path), os.path.realpath(root))) == os.path.realpath(root)
+        except (OSError, ValueError):
+            return False
+
+    def add_cycle_plans(root):
+        if not ((isinstance(route_id, str) and route_id)
+                or (isinstance(cycle_id, str) and cycle_id)):
+            return
+        cycles_dir = os.path.join(root, ".runtime", "artifact-producer", "v1", "cycles")
+        if not os.path.isdir(cycles_dir) or not inside(cycles_dir, root):
+            return
+        selected = []
+        if cycle_id:
+            if isinstance(cycle_id, str) and re.fullmatch(r"cyc_[A-Za-z0-9_-]+", cycle_id):
+                selected.append(os.path.join(cycles_dir, cycle_id + ".json"))
+        elif isinstance(route_id, str) and route_id:
+            hint_path = os.path.join(cycles_dir, ".cycle-routes-index.json")
+            hints = _read_cycle_hints(hint_path)
+            names = hints.get(route_id, ()) if isinstance(hints, dict) else ()
+            for name in names:
+                if (not isinstance(name, str) or os.path.basename(name) != name
+                        or not name.endswith(".json")):
+                    continue
+                selected.append(os.path.join(cycles_dir, name))
+        for record_path in dict.fromkeys(selected):
+            if not inside(record_path, cycles_dir):
+                continue
+            record = _read_cycle_record(record_path)
+            if (not isinstance(record, dict)
+                    or (route_id and record.get("route_id") != route_id)
+                    or (cycle_id and record.get("cycle_id") != cycle_id)):
+                continue
+            campaign_id = record.get("campaign_id")
+            cycle = record.get("cycle_id")
+            if not isinstance(campaign_id, str) or not isinstance(cycle, str):
+                continue
+            campaign_path = os.path.join(root, ".runtime", "artifact-producer", "v1",
+                                         "campaigns", campaign_id + ".json")
+            campaign = _read_cycle_record(campaign_path)
+            campaign_dirs = []
+            campaigns_root = os.path.join(root, "campaigns")
+            if (inside(campaigns_root, root) and isinstance(campaign, dict)
+                    and campaign.get("campaign_id") == campaign_id
+                    and isinstance(campaign.get("locator"), str)):
+                campaign_dir = os.path.join(campaigns_root, campaign["locator"])
+                if inside(campaign_dir, campaigns_root):
+                    campaign_dirs.append(campaign_dir)
+            # Legacy readable layout is derived only from the validated stable ID.
+            legacy_campaign = os.path.join(campaigns_root, campaign_id)
+            if inside(legacy_campaign, campaigns_root):
+                campaign_dirs.append(legacy_campaign)
+            for campaign_dir in dict.fromkeys(campaign_dirs):
+                cpath = os.path.join(campaign_dir, "campaign.json")
+                if os.path.isfile(cpath):
+                    persisted = _read_cycle_record(cpath)
+                    if isinstance(persisted, dict) and persisted.get("campaign_id") != campaign_id:
+                        continue
+                cycle_dirs = [os.path.join(campaign_dir, record["locator"])
+                              if isinstance(record.get("locator"), str) else "",
+                              os.path.join(campaign_dir, "cycles", cycle)]
+                for cycle_dir in cycle_dirs:
+                    if (not cycle_dir or not inside(cycle_dir, campaign_dir)
+                            or not inside(cycle_dir, root)):
+                        continue
+                    plans = os.path.join(cycle_dir, "artifacts", "plans")
+                    if (os.path.isdir(plans) and inside(plans, cycle_dir)
+                            and inside(plans, root)):
+                        try:
+                            with os.scandir(plans) as entries:
+                                for entry in entries:
+                                    if (entry.name.endswith("_" + slug)
+                                            and entry.is_dir(follow_symlinks=False)):
+                                        candidates.add(os.path.realpath(entry.path))
+                        except OSError:
+                            pass
+
     for root in dict.fromkeys(roots):
-        if not (os.path.isdir(os.path.join(root, "campaigns"))
-                or os.path.isdir(os.path.join(root, "plans"))):
-            continue
-        # W7D: cycle plans dirs plus the legacy top-level plans/ read-only fallback.
-        matches = (artifact_reader.glob_bucket(Path(root), "plans", "*_%s" % slug)
-                   if artifact_reader is not None
-                   else glob.glob(os.path.join(root, "plans", "*_%s" % slug)))
-        for path in (str(m) for m in matches):
-            if os.path.isdir(path):
-                candidates.add(os.path.realpath(path))
+        add_cycle_plans(root)
+        legacy = os.path.join(root, "plans")
+        if os.path.isdir(legacy) and inside(legacy, root):
+            try:
+                with os.scandir(legacy) as entries:
+                    for entry in entries:
+                        if entry.name.endswith("_" + slug) and entry.is_dir(follow_symlinks=False):
+                            candidates.add(os.path.realpath(entry.path))
+            except OSError:
+                pass
     if len(candidates) != 1:
         return None
     pd = next(iter(candidates))
@@ -2609,7 +2699,7 @@ _QA_DEFAULT = {
 
 
 def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role=None,
-                 artifact_root=None, lookup_plan=True):
+                 artifact_root=None, lookup_plan=True, *, job=None):
     """Layered qa resolver, first-hit precedence: argv > jobslog(pipe) > plan artifact >
     CONVENTIONS default. Returns (qa, source) — source in argv|jobslog|plan|default|None."""
     if argv_qa:
@@ -2618,9 +2708,14 @@ def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role
         return pipe_qa, "jobslog"
     v = None
     if lookup_plan:
-        v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
+        context = (dict(job) if isinstance(job, dict) else {
+            name: getattr(job, name, None)
+            for name in ("route_id", "owner_route_id", "cycle_id", "cycle")
+        })
+        context.update({"cwd": jcwd, "slug": slug, "key": key,
                                       "artifact_root": artifact_root,
                                       "capability": capability, "worker_role": worker_role})
+        v = resolve_plan_qa_artifact(context)
     if v:
         return v, "plan"
     v = _QA_DEFAULT.get(key)
@@ -2759,8 +2854,10 @@ def _scan_registry_evidence(paths):
         path_result = {}
         path_attempts = {}
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.read().splitlines()
+            rows = _pinned_registry_lines(path)
+            if rows is None:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    rows = f.read().splitlines()
         except OSError:
             continue
         for registry_order, line in enumerate(rows):
@@ -3109,15 +3206,20 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
             continue
         latest = {}
         try:
-            with open(raw_path, encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    fields = line.rstrip("\n").split("\t")
-                    if len(fields) != 6:
-                        continue
-                    meta = _parse_pipe_meta(fields[5])
-                    attempt = meta.get("attempt_id")
-                    if attempt in attempts:
-                        latest[attempt] = meta
+            pinned = _pinned_registry_lines(raw_path)
+            if pinned is not None:
+                lines = pinned
+            else:
+                with open(raw_path, encoding="utf-8", errors="replace") as handle:
+                    lines = handle.read().splitlines()
+            for line in lines:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) != 6:
+                    continue
+                meta = _parse_pipe_meta(fields[5])
+                attempt = meta.get("attempt_id")
+                if attempt in attempts:
+                    latest[attempt] = meta
         except FileNotFoundError:
             continue
         matched = {attempt for attempt, meta in latest.items()
@@ -3150,8 +3252,10 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     malformed = 0
     seen_attempts = set() if seen_attempts is None else seen_attempts
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            rows = f.read().splitlines()
+        rows = _pinned_registry_lines(path)
+        if rows is None:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                rows = f.read().splitlines()
     except FileNotFoundError:
         return jobs, 0
     # Reconcile each job to its LATEST row before deciding live-ness. Identity key = slug,
@@ -3409,8 +3513,10 @@ def _jobs_log_fields(paths):
     for path in paths:
         path_fields = {}
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.read().splitlines()
+            rows = _pinned_registry_lines(path)
+            if rows is None:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    rows = f.read().splitlines()
         except FileNotFoundError:
             continue
         path_attempts = {}
@@ -3587,7 +3693,8 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
     def _rows_for(path):
         if path not in rows_by_path:
             try:
-                rows_by_path[path] = registry.read_rows(_Path(path))
+                rows_by_path[path] = registry.read_rows(
+                    _Path(path), lines=_pinned_registry_lines(path))
             except Exception:
                 rows_by_path[path] = []
         return rows_by_path[path]
@@ -3672,7 +3779,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
         return
     try:
         from pathlib import Path as _Path
-        rows = registry.read_rows(_Path(jobs_path))
+        rows = registry.read_rows(_Path(jobs_path), lines=_pinned_registry_lines(jobs_path))
     except Exception:
         return
     newest = {}
@@ -3741,7 +3848,9 @@ def _pending_delivery_counts(paths):
     intent_rows = set()
     for path in paths:
         try:
-            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = _pinned_registry_lines(path)
+            if lines is None:
+                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for line in lines:
@@ -4207,7 +4316,7 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
             j.qa, j.qa_source = effective_qa(
                 None, None, j.cwd, j.slug, j.key,
                 getattr(j, "capability_owner", None), j.worker_role,
-                artifact_root=j.artifact_root)
+                artifact_root=j.artifact_root, job=j)
     # F-15c(a): a registry-only row (source="jobs") that turns out to be genuinely working
     # re-derives its breadcrumb from the real plan artifacts instead of the raw jobs.log
     # status word ("open"/"running") — otherwise a live job with real progress shows a
@@ -4245,10 +4354,14 @@ _ARTIFACT_READ_CACHE = artifact_reader.ReadCache() if artifact_reader is not Non
 
 def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """One inventory observation per root/tick; unchanged records reuse it live."""
+    from contextlib import ExitStack
     args = (jobs_path, harness_filter, session_rows, fast_first)
-    if artifact_reader is None:
-        return _collect(*args)
-    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+    import artifact_producer
+    with ExitStack() as stack:
+        if artifact_reader is not None:
+            stack.enter_context(artifact_reader.read_scope(_ARTIFACT_READ_CACHE))
+        stack.enter_context(artifact_producer.artifact_index_observation_scope())
+        stack.enter_context(_dispatch_registry_cache.registry_read_scope())
         return _collect(*args)
 
 

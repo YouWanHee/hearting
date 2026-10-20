@@ -157,17 +157,27 @@ def legacy_resource_identity(run: dict) -> dict | None:
             return None
         jobs_path = Path(run['jobs'])
         path = str(jobs_path)
-        try:
-            info = jobs_path.stat()
-            signature = (path, info.st_size, info.st_mtime_ns)
-        except OSError:
-            signature = None
+        import dispatch_registry_cache
+        pinned_view = (dispatch_registry_cache.current_registry_view(jobs_path)
+                       if dispatch_registry_cache.registry_scope_active() else None)
+        if pinned_view is not None:
+            if pinned_view.has_invalid_utf8:
+                return None
+            signature = (path, *pinned_view.signature)
+        else:
+            try:
+                info = jobs_path.stat()
+                signature = (path, info.st_size, info.st_mtime_ns)
+            except OSError:
+                signature = None
         cached = _LEGACY_RESOURCE_IDENTITY_CACHE.get(path)
         if signature is not None and cached is not None and cached[0] == signature:
             owners_by_attempt = cached[1]
         else:
             owners_by_attempt: dict[str, list[dict]] = {}
-            for line in jobs_path.read_text().splitlines():
+            source = (pinned_view.lines if pinned_view is not None
+                      else jobs_path.read_text().splitlines())
+            for line in source:
                 fields = line.split('\t')
                 if len(fields) == 6:
                     meta = parse_registry_metadata(fields[5])

@@ -44,7 +44,8 @@ class InventoryCacheTest(unittest.TestCase):
         self.assertEqual(self.query(), first)
 
     def test_qa_payload_edits_and_deletion_are_live_without_record_rescan(self):
-        plan = self.query()[0]
+        plan = self.root / "plans" / "2026-09-08_hot-path"
+        (plan / "plan").mkdir(parents=True)
         state = plan / "pipeline_state.yaml"
         job = {"slug": "hot-path", "artifact_root": str(self.root)}
         for qa in ("light", "thorough"):
@@ -54,9 +55,34 @@ class InventoryCacheTest(unittest.TestCase):
         state.unlink()
         with reader.read_scope(self.cache):
             self.assertIsNone(dispatch.resolve_plan_qa_artifact(job))
-        shutil.rmtree(plan)
-        self.assertEqual(self.query(), [])
-        self.assertEqual(self.scan.call_count, 1)
+        self.assertEqual(self.scan.call_count, 0)
+
+    def test_cycle_qa_uses_explicit_identity_and_never_reads_manifest(self):
+        route_id = "rt-" + "c" * 16
+        cycle_id = "cyc_" + "d" * 32
+        campaign_id = "camp_" + "e" * 32
+        cycles = self.root / ".runtime" / "artifact-producer" / "v1" / "cycles"
+        campaigns = self.root / ".runtime" / "artifact-producer" / "v1" / "campaigns"
+        cycles.mkdir(parents=True)
+        campaigns.mkdir(parents=True)
+        (cycles / (cycle_id + ".json")).write_text(json.dumps({
+            "cycle_id": cycle_id, "campaign_id": campaign_id, "route_id": route_id,
+            "locator": "2026-10-20_hot-path",
+        }))
+        (campaigns / (campaign_id + ".json")).write_text(json.dumps({
+            "campaign_id": campaign_id, "locator": "fleet-fixture",
+        }))
+        plan = self.root / "campaigns" / "fleet-fixture" / "2026-10-20_hot-path" / "artifacts" / "plans" / "2026-10-20_hot-path"
+        (plan / "plan").mkdir(parents=True)
+        state = plan / "pipeline_state.yaml"
+        state.write_text("qa_level: standard\n")
+        job = {"slug": "hot-path", "artifact_root": str(self.root),
+               "route_id": route_id, "cycle_id": cycle_id}
+        with mock.patch.object(dispatch, "_read_cycle_record", wraps=dispatch._read_cycle_record) as read:
+            self.assertEqual(dispatch.resolve_plan_qa_artifact(job), "standard")
+        self.assertEqual(read.call_count, 2)
+        self.assertIsNone(dispatch.resolve_plan_qa_artifact(dict(job, route_id="rt-other")))
+        self.assertIsNone(dispatch.resolve_plan_qa_artifact(dict(job, cycle_id="cyc_" + "f" * 32)))
 
     def test_cycle_and_campaign_rename_delete_and_recreate(self):
         first = self.query()[0]

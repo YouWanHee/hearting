@@ -350,7 +350,7 @@ def apply_peer_rows(sessions, by_key):
             )[:8]
 
 
-def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
     """Return (sessions, jobs).
 
     harness_filter: optional iterable of harness names (fleet + dispatch both honor it).
@@ -811,6 +811,21 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         if len(_JOB_OBSERVATIONS) > 16:
             _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
     return snapshot
+
+
+def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+    """Run one Fleet observation with shared artifact, admission and registry inputs."""
+    from contextlib import ExitStack
+    from . import dispatch
+    import artifact_producer
+    import dispatch_registry_cache
+    with ExitStack() as stack:
+        if dispatch.artifact_reader is not None:
+            stack.enter_context(dispatch.artifact_reader.read_scope(
+                dispatch._ARTIFACT_READ_CACHE))
+        stack.enter_context(artifact_producer.artifact_index_observation_scope())
+        stack.enter_context(dispatch_registry_cache.registry_read_scope())
+        return _collect_all(harness_filter, jobs_path, usage, fast_first)
 
 
 collect_all.last_resource_jobs = []

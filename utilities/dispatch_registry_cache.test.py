@@ -82,6 +82,21 @@ class RegistryLinesCacheTest(unittest.TestCase):
         CACHE.clear_cache()
         CACHE.reset_metrics()
 
+    def test_scope_pins_one_generation_and_next_scope_observes_replacement(self):
+        self.jobs.write_text("t\topen\t/repo\t/wt\tone\tattempt_id=one\n", encoding="utf-8")
+        CACHE.reset_metrics()
+        with CACHE.registry_read_scope():
+            first = CACHE.registry_view(self.jobs)
+            first_lines = CACHE.registry_lines(self.jobs)
+            self.jobs.write_text("t\tdone\t/repo\t/wt\ttwo\tattempt_id=two\n", encoding="utf-8")
+            self.assertIs(CACHE.registry_view(self.jobs), first)
+            self.assertEqual(CACHE.registry_lines(self.jobs), first_lines)
+            self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 1)
+        with CACHE.registry_read_scope():
+            fresh = CACHE.registry_view(self.jobs)
+        self.assertIsNot(first, fresh)
+        self.assertEqual(fresh.records[0].slug, "two")
+
     def test_unchanged_file_parses_only_once(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
         first = CACHE.registry_lines(self.jobs)

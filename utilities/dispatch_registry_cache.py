@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import codecs
+import contextlib
+import contextvars
 import os
 from pathlib import Path
 import threading
@@ -26,6 +28,7 @@ _MAX_SEGMENTS = 256
 _COMPACT_SEGMENTS = 128
 _LOCK = threading.RLock()
 _CACHE: OrderedDict[str, "RegistryView"] = OrderedDict()
+_READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("dispatch_registry_read_scope", default=None)
 _CACHE_BYTES = 0
 _METRICS = {
     "cache_hits": 0,
@@ -478,7 +481,67 @@ def _stable_read(path: Path, path_identity: str, *, start: int = 0):
                   f"could not read a stable registry generation: {path_identity}") from last_error
 
 
+@contextlib.contextmanager
+def registry_read_scope():
+    """Pin the first stable view of each registry for one passive Fleet pass."""
+    current = _READ_SCOPE.get()
+    if current is not None:
+        yield
+        return
+    token = _READ_SCOPE.set({"views": {}, "lines": {}})
+    try:
+        yield
+    finally:
+        _READ_SCOPE.reset(token)
+
+
+def registry_scope_active() -> bool:
+    return _READ_SCOPE.get() is not None
+
+
+def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
+    """Return the Fleet-pinned view when a registry scope is active."""
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        return registry_view(jobs, append_only=append_only)
+    path = Path(jobs)
+    lexical = str(path.absolute())
+    resolved = str(path.resolve(strict=False))
+    key = (lexical, resolved)
+    held = scope["views"].get(key)
+    if held is None:
+        try:
+            held = _registry_view_fresh(path, append_only=append_only)
+        except Exception as exc:
+            held = exc
+        scope["views"][key] = held
+    if isinstance(held, BaseException):
+        raise held
+    return held
+
+
+def registry_lines(jobs: Path, *, append_only: bool = False) -> tuple[str, ...]:
+    """Return lines from the active pinned view, memoizing its decoded tuple."""
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        return registry_view(jobs, append_only=append_only).lines
+    path = Path(jobs)
+    key = (str(path.absolute()), str(path.resolve(strict=False)))
+    lines = scope["lines"].get(key)
+    if lines is None:
+        lines = current_registry_view(path, append_only=append_only).lines
+        scope["lines"][key] = lines
+    return lines
+
+
 def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
+    scope = _READ_SCOPE.get()
+    if scope is not None:
+        return current_registry_view(jobs, append_only=append_only)
+    return _registry_view_fresh(jobs, append_only=append_only)
+
+
+def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryView:
     """Return the current stable view, rebuilding once when the source generation changes.
 
     A failed or unstable observation invalidates the cached generation; an older
