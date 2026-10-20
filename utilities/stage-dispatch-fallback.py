@@ -560,6 +560,12 @@ def ordered_fallback_hops(
         return apply_worker_pin(route, list(node["fallback_hops"]), parent_identity), None
     counts = attempt_counts(jobs, window=int(allocation["window"]))
     states = _usage_states(jobs, node.get("model_profile"), recheck=recheck)
+    worker_pin = sealed_pin_harness(route, worker_type="stage")
+    if worker_pin in states and states[worker_pin].startswith("limited(provider-model-"):
+        # A sealed pin is an explicit choice: automatic provider/model
+        # eligibility does not move it. Its launcher still refuses a confirmed
+        # rejection and reports the provider's own error.
+        states[worker_pin] = _usage_states(jobs, None, recheck=recheck)[worker_pin]
     headless: dict[str, tuple[dict, dict]] = {}
     trailing_rows: list[tuple[dict, dict]] = []
     tail_hops = []
@@ -634,7 +640,6 @@ def ordered_fallback_hops(
     # A sealed `--pin worker=<harness>` leads the order (CONVENTIONS §2.1) while that harness is ranked,
     # i.e. outside a usage limit and the node's policy. The soft usage gate does not move it; a limited
     # pin is in `limited` and goes to the tail below, as before.
-    worker_pin = sealed_pin_harness(route, worker_type="stage")
     pinned_head = worker_pin in ranked
     if pinned_head:
         ranked = [worker_pin] + [harness for harness in ranked if harness != worker_pin]
@@ -2285,12 +2290,19 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     continue
                 # Re-read after an early failure too: a whole-account quota
                 # cannot be cured by changing models later in this same chain.
-                from dispatch_capacity_evidence import active_limits
+                from dispatch_capacity_evidence import active_limits, model_hold
                 quota = active_limits(args.jobs, profile=node.get("model_profile"),
                                       recheck=row.get("child_harness") == "claude"
                                       and getattr(args, "action", "start") != "dry-run").get(row.get("child_harness"))
                 if quota:
                     row = {**row, "_allocation_skip": f"quota-until-{quota['reset_epoch']}"}
+                elif (not row.get("_allocation_skip")
+                      and row.get("child_harness") != sealed_pin_harness(route, worker_type="stage")):
+                    # Provider/model eligibility also binds a route without an
+                    # allocation policy, whose chain is the compiled order.
+                    hold = model_hold(row.get("child_harness"), node.get("model_profile"))
+                    if hold:
+                        row = {**row, "_allocation_skip": f"usage-{hold}"}
                 if row.get("_allocation_skip"):
                     attempts.append(
                         f"{ordinal}:{key}:skipped-{row['_allocation_skip']}"

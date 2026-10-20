@@ -511,5 +511,184 @@ class OpenCodeProviderEvidenceTest(unittest.TestCase):
         self.assertNotIn(("opencode/beam-free", "runtime-default"), fallbacks)
 
 
+# The exact error OpenCode 2.0.32 returned to the replacement owner that died
+# in 2.8 seconds (2026-10-20): typed, with no numeric status.
+INCIDENT_ERROR = {"type": "provider.auth", "message": "Request failed: 401"}
+
+
+class OpenCodeTypedErrorTest(unittest.TestCase):
+    def test_typed_auth_is_confirmed_without_a_numeric_status(self):
+        self.assertEqual(runtime.classify_model_error(INCIDENT_ERROR),
+                         {"state": "unavailable", "reason": "authentication-rejected"})
+        self.assertEqual(runtime.classify_model_error(
+            {"type": "provider.auth", "code": "api_key_expired"})["reason"], "credential-expired")
+
+    def test_transient_types_and_bare_messages_stay_unknown(self):
+        for kind, reason in runtime.TYPED_TRANSIENT_ERRORS.items():
+            with self.subTest(kind=kind):
+                # A 401 in the text does not turn a typed transient into auth.
+                self.assertEqual(runtime.classify_model_error(
+                    {"type": kind, "message": "Request failed: 401"}),
+                    {"state": "unknown", "reason": reason})
+        for error in ({"message": "Request failed: 401"}, {"status": True},
+                      {"status": "401"}, {}, None):
+            with self.subTest(error=error):
+                self.assertEqual(runtime.classify_model_error(error)["state"], "unknown")
+        self.assertEqual(runtime.classify_model_error({"status": 429}),
+                         {"state": "unknown", "reason": "rate-limited"})
+
+    def test_numeric_statuses_keep_their_existing_meaning(self):
+        self.assertEqual(runtime.classify_model_error({"status": 401})["reason"],
+                         "authentication-rejected")
+        self.assertEqual(runtime.classify_model_error(
+            {"status": 401, "code": "api_key_expired"})["reason"], "credential-expired")
+        self.assertEqual(runtime.classify_model_error(
+            {"status": 403, "type": "EntitlementError",
+             "message": "OpenCode Go subscription required."})["reason"], "subscription-missing")
+
+
+class OpenCodeAutomaticEligibilityTest(unittest.TestCase):
+    """Provider evidence against a real V2 credential store and Fleet cache."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.db = self.root / "opencode.db"
+        self.state = self.root / "state"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, "
+                        "label TEXT, value TEXT, active INTEGER, time_created INTEGER, "
+                        "time_updated INTEGER)")
+        self.put("openai-oauth", "openai", {"type": "oauth", "access": "openai-access-1",
+                                            "refresh": "openai-refresh-1", "expires": 1})
+        self.put("go-oauth", "opencode", {"type": "oauth", "access": "go-access-1"})
+        env = unittest.mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "XDG_STATE_HOME": str(self.state),
+            "XDG_DATA_HOME": str(self.root / "data"), "OPENCODE_DB": str(self.db),
+            "OPENCODE_RUNTIME_VERSION": "2.0.32", "PATH": os.environ.get("PATH", "")},
+            clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.config = self.root / "models.conf"
+        self.fallbacks()
+
+    def put(self, identifier, integration, value, label="Default"):
+        with sqlite3.connect(self.db) as con:
+            con.execute("INSERT OR REPLACE INTO credential VALUES (?, ?, ?, ?, 1, 1, 2)",
+                        (identifier, integration, label, json.dumps(value)))
+
+    def fallbacks(self, *items):
+        self.config.write_text('CFG_V2_AUTO_FALLBACKS="%s"\n' % " ".join(items))
+
+    def cache_text(self):
+        path = self.state / "agent-fleet" / "usage" / "opencode.json"
+        return path.read_text() if path.exists() else ""
+
+    def rows(self, provider):
+        text = self.cache_text()
+        providers = json.loads(text).get("providers", {}) if text else {}
+        return {row["model"]: row for row in providers.values() if row["provider"] == provider}
+
+    def test_incident_error_is_recorded_for_the_openai_account_without_secrets(self):
+        self.assertTrue(runtime.record_model_outcome("openai/gpt-6.1-sol", error=INCIDENT_ERROR))
+        rows = self.rows("openai")
+        self.assertEqual(set(rows), {"gpt-6.1-sol", "*"})
+        for row in rows.values():
+            self.assertEqual((row["state"], row["reason"]),
+                             ("unavailable", "authentication-rejected"))
+            self.assertEqual(row["account_scope"], runtime.account_scope("openai"))
+            self.assertTrue(row["credential_generation"].startswith("gen:"))
+        for secret in ("openai-access-1", "openai-refresh-1", "go-access-1"):
+            self.assertNotIn(secret, self.cache_text())
+        evidence = runtime.model_availability("openai/gpt-6.1-sol")
+        self.assertEqual((evidence["state"], evidence["automatic_eligible"]), ("unavailable", False))
+        self.assertNotIn("credential_generation", evidence)
+        # Go is another provider on the same runtime; its account is untouched.
+        self.assertEqual(self.rows("opencode-go"), {})
+        self.assertTrue(runtime.model_availability("opencode-go/model")["automatic_eligible"])
+
+    def test_changed_credential_releases_the_rejection_and_a_label_change_does_not(self):
+        runtime.record_model_outcome("openai/gpt-6.1-sol", error=INCIDENT_ERROR)
+        self.put("openai-oauth", "openai", {"type": "oauth", "access": "openai-access-1",
+                                            "refresh": "openai-refresh-1", "expires": 1},
+                 label="Renamed")
+        self.assertEqual(runtime.model_availability("openai/gpt-6.1-sol")["state"], "unavailable")
+        # Re-login overwrites the same row id: same account scope, new credential.
+        self.put("openai-oauth", "openai", {"type": "oauth", "access": "openai-access-2",
+                                            "refresh": "openai-refresh-2", "expires": 2})
+        evidence = runtime.model_availability("openai/gpt-6.1-sol")
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertEqual(evidence["observation_reason"], "credential-generation-changed")
+        self.assertFalse(evidence["automatic_eligible"])
+
+    def test_outcome_is_credited_to_the_account_the_request_started_with(self):
+        started = runtime.model_account_observation("openai/gpt-6.1-sol")
+        self.put("openai-oauth", "openai", {"type": "oauth", "access": "openai-access-2",
+                                            "refresh": "openai-refresh-2"})
+        runtime.record_model_outcome("openai/gpt-6.1-sol", error=INCIDENT_ERROR,
+                                     account_observation=started)
+        self.assertEqual(self.rows("openai")["gpt-6.1-sol"]["state"], "unavailable")
+        self.assertEqual(runtime.model_availability("openai/gpt-6.1-sol")["observation_reason"],
+                         "credential-generation-changed")
+
+    def test_transient_errors_neither_persist_nor_clear_a_rejection(self):
+        for kind in runtime.TYPED_TRANSIENT_ERRORS:
+            self.assertFalse(runtime.record_model_outcome("openai/gpt-6.1-sol",
+                                                          error={"type": kind}))
+        self.assertEqual(self.cache_text(), "")
+        runtime.record_model_outcome("openai/gpt-6.1-sol", error=INCIDENT_ERROR)
+        for kind in runtime.TYPED_TRANSIENT_ERRORS:
+            runtime.record_model_outcome("openai/gpt-6.1-sol", error={"type": kind})
+        self.assertEqual(runtime.record_model_http_result("openai/gpt-6.1-sol", 429),
+                         {"state": "unknown", "reason": "rate-limited", "http_status": 429})
+        self.assertEqual(runtime.model_availability("openai/gpt-6.1-sol")["reason"],
+                         "authentication-rejected")
+
+    def test_only_a_probed_provider_unknown_is_automatic(self):
+        openai = runtime.model_availability("openai/gpt-6.1-sol")
+        self.assertEqual((openai["state"], openai["reason"], openai["automatic_eligible"]),
+                         ("unknown", "provider-model-unverified", False))
+        self.assertEqual(openai["observation_reason"], "no-observation")
+        go = runtime.model_availability("opencode-go/model")
+        self.assertEqual((go["state"], go["automatic_eligible"]), ("unknown", True))
+        self.assertFalse(runtime.automatic_eligible("not-a-model", {"state": "unknown"}))
+        self.assertFalse(runtime.automatic_eligible("opencode-go/model", {"state": "unavailable"}))
+
+    def test_account_success_admits_only_its_model_for_an_unprobed_provider(self):
+        self.assertTrue(runtime.record_model_outcome("openai/model-a", success=True))
+        self.assertTrue(runtime.model_availability("openai/model-a")["automatic_eligible"])
+        self.assertFalse(runtime.model_availability("openai/model-b")["automatic_eligible"])
+        runtime.record_model_outcome("opencode-go/model-a", success=True)
+        self.assertEqual(runtime.model_availability("opencode-go/model-b")["state"], "usable")
+
+    def test_selection_prefers_an_eligible_candidate_and_never_trades_a_rejection(self):
+        select = lambda model: runtime.select_automatic_model(
+            model, "xhigh", config_path=self.config)
+        # Unverified primary, verifiable fallback: the fallback runs.
+        self.fallbacks("opencode-go/fallback:max")
+        model, variant, evidence = select("openai/gpt-6.1-sol")
+        self.assertEqual((model, variant), ("opencode-go/fallback", "max"))
+        self.assertEqual(evidence["fallback_from_reason"], "provider-model-unverified")
+        # Nothing eligible: the unverified primary is returned, marked ineligible.
+        self.fallbacks("openai/gpt-6.1-sol:runtime-default")
+        model, variant, evidence = select("openai/gpt-6.1-sol")
+        self.assertEqual((model, variant, evidence["state"], evidence["automatic_eligible"]),
+                         ("openai/gpt-6.1-sol", "xhigh", "unknown", False))
+        # A confirmed rejection is not traded for an unverified fallback.
+        runtime.record_model_outcome("opencode-go/primary", error={"type": "provider.auth"})
+        model, _variant, evidence = select("opencode-go/primary")
+        self.assertEqual((model, evidence["state"]), ("opencode-go/primary", "unavailable"))
+        # An eligible primary stays first.
+        self.assertEqual(select("opencode-go/other")[0], "opencode-go/other")
+
+    def test_candidates_keep_their_requested_model_identity(self):
+        runtime.record_model_outcome("opencode-go/model", success=True)
+        rows = runtime.automatic_candidates("opencode-go/unseen", "high",
+                                            config_path=self.config)
+        self.assertEqual(rows[0]["model"], "opencode-go/unseen")
+        self.assertEqual(rows[0]["evidence_model"], "*")
+
+
 if __name__ == "__main__":
     unittest.main()

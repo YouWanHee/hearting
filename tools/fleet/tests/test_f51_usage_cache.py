@@ -79,6 +79,27 @@ class F51UsageCacheTest(unittest.TestCase):
             "opencode", "opencode-go", "*", "account:one", now=1200)["reason"],
             "subscription-missing")
 
+    def test_credential_generation_scopes_evidence_and_old_rows_keep_their_meaning(self):
+        usage_cache.record_provider("opencode", "openai", "gpt", "account:one", "unavailable",
+                                    reason="authentication-rejected", now=1000,
+                                    credential_generation="gen:first")
+        read = lambda generation: usage_cache.read_provider(
+            "opencode", "openai", "gpt", "account:one", now=1100,
+            credential_generation=generation)
+        self.assertEqual(read("gen:first")["reason"], "authentication-rejected")
+        self.assertNotIn("credential_generation", read("gen:first"))
+        # Re-login under the same row id: same account scope, new credential.
+        self.assertEqual((read("gen:second")["state"], read("gen:second")["reason"]),
+                         ("unknown", "credential-generation-changed"))
+        # A reader that cannot name its generation, and a row recorded before
+        # generations existed, both keep today's meaning.
+        self.assertEqual(read(None)["state"], "unavailable")
+        usage_cache.record_provider("opencode", "openai", "gpt", "account:one", "unavailable",
+                                    reason="authentication-rejected", now=1000)
+        self.assertEqual(read("gen:second")["state"], "unavailable")
+        self.assertNotIn("credential_generation",
+                         json.dumps(usage_cache.provider_records("opencode")))
+
     def test_cache_only_never_calls_fetcher(self):
         calls = []
         usage_cache.FETCHERS["claude"] = lambda: calls.append(1)

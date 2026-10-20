@@ -34,6 +34,20 @@ MAX_MESSAGE_TEXT = 2048
 MAX_SHELL_TASK_PAGE = 64
 MAX_SHELL_TASK_RECENT = 32
 MAX_SHELL_TASK_REFRESH = 64
+# Providers whose account/model eligibility Hearting confirms itself: the Go
+# usage/entitlement probe observes the selected account before placement. Any
+# other provider's ``unknown`` stays unknown until a real request succeeds, so
+# automatic placement does not select it (an explicit choice still runs).
+PROBED_PROVIDERS = frozenset({"opencode-go"})
+# OpenCode 2 reports provider failures by type, without a numeric status.
+# Only an authentication type is a confirmed rejection; the rest are transient.
+TYPED_TRANSIENT_ERRORS = {
+    "provider.rate-limit": "rate-limited",
+    "provider.quota": "quota-exhausted",
+    "provider.transport": "transport-error",
+    "provider.internal": "provider-internal-error",
+    "provider.no-route": "provider-no-route",
+}
 
 
 class OpenCodeRuntimeError(RuntimeError):
@@ -56,6 +70,7 @@ class AccountScopeObservation:
     state: str
     scope: str | None
     reason: str | None = None
+    credential_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,7 @@ class GoUsageSelection:
     credential_type: str | None = None
     credential_source: str | None = None
     reason: str | None = None
+    credential_generation: str | None = None
 
 
 def parse_version(value: str | None) -> tuple[int, int, int] | None:
@@ -663,6 +679,25 @@ def _scope_for_row(integration_id: str, row: dict | None) -> str:
     return "account:" + digest
 
 
+def _credential_generation(row) -> str | None:
+    """Opaque digest of the selected credential's material, never the material.
+
+    A re-login or token refresh can keep the same row id and therefore the same
+    account scope; this digest changes with it, so evidence recorded against an
+    older credential no longer describes the current one.
+    """
+    value = row.get("value") if isinstance(row, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    material = {key: value.get(key) for key in ("type", "key", "access", "refresh")
+                if isinstance(value.get(key), str) and value.get(key)}
+    if not any(key in material for key in ("key", "access", "refresh")):
+        return None
+    payload = json.dumps([row.get("integration_id"), row.get("source"), material],
+                         sort_keys=True, separators=(",", ":"))
+    return "gen:" + hashlib.sha256(payload.encode()).hexdigest()[:20]
+
+
 def _freeze(value):
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -701,7 +736,8 @@ def account_scope_observation(integration_id: str, *, environ=None) -> AccountSc
         return AccountScopeObservation("unavailable", None, read.reason)
     if read.state == "absent":
         return AccountScopeObservation("absent", "unscoped")
-    return AccountScopeObservation("present", _scope_for_row(integration_id, read.credential))
+    return AccountScopeObservation("present", _scope_for_row(integration_id, read.credential),
+                                  credential_generation=_credential_generation(read.credential))
 
 
 def account_scope(integration_id: str, *, environ=None) -> str:
@@ -721,6 +757,7 @@ def _go_selection_from_row(integration_id: str, credential, opencode_scope: str)
         entitlement_scope=provider_scope if oauth_selected else None,
         credential_type=credential_type,
         credential_source=credential.get("source") if isinstance(credential, Mapping) else None,
+        credential_generation=_credential_generation(credential),
     )
 
 
@@ -796,8 +833,19 @@ def provider_account_observation(provider: str, *, environ=None) -> AccountScope
             return AccountScopeObservation("unavailable", None, selection.reason)
         return AccountScopeObservation(selection.state,
                                       selection.provider_scope or "unscoped",
-                                      selection.reason)
+                                      selection.reason,
+                                      credential_generation=selection.credential_generation)
     return account_scope_observation(provider, environ=env)
+
+
+def model_account_observation(model: str | None, *, environ=None) -> AccountScopeObservation | None:
+    """The account a request for ``model`` starts with; None for a malformed model."""
+    if not isinstance(model, str) or "/" not in model:
+        return None
+    try:
+        return provider_account_observation(model.split("/", 1)[0], environ=environ)
+    except Exception:
+        return AccountScopeObservation("unavailable", None, "account-scope-unavailable")
 
 
 def provider_account_scope(provider: str, *, environ=None) -> str:
@@ -806,8 +854,41 @@ def provider_account_scope(provider: str, *, environ=None) -> str:
     return observation.scope or "unscoped"
 
 
+def automatic_eligible(model: str | None, evidence: Mapping) -> bool:
+    """The one automatic-placement rule for OpenCode provider/model evidence.
+
+    A usable observation qualifies, and so does an unknown one for a provider
+    Hearting probes before placement. Anything else is not selected
+    automatically; an explicit model, pin, or harness choice is not filtered.
+    """
+    state = evidence.get("state") if isinstance(evidence, Mapping) else None
+    if state == "usable":
+        return True
+    if state != "unknown" or not isinstance(model, str) or "/" not in model:
+        return False
+    return model.split("/", 1)[0] in PROBED_PROVIDERS
+
+
+def _with_eligibility(model: str, result: dict) -> dict:
+    result = dict(result)
+    eligible = automatic_eligible(model, result)
+    result["automatic_eligible"] = eligible
+    if result.get("state") == "unknown" and not eligible:
+        result["observation_reason"] = result.get("reason")
+        result["reason"] = "provider-model-unverified"
+    return result
+
+
 def model_availability(model: str, *, environ=None) -> dict:
-    """Read provider/account/model evidence from Fleet's existing cache."""
+    """Read provider/account/model evidence from Fleet's existing cache.
+
+    ``state`` stays usable/unavailable/unknown; ``automatic_eligible`` applies
+    the shared automatic-placement rule to that evidence.
+    """
+    return _with_eligibility(model, _model_observation(model, environ=environ))
+
+
+def _model_observation(model: str, *, environ=None) -> dict:
     if not isinstance(model, str) or "/" not in model:
         return {"state": "unknown", "reason": "model-scope-unavailable"}
     provider, model_id = model.split("/", 1)
@@ -820,62 +901,96 @@ def model_availability(model: str, *, environ=None) -> dict:
         # selected row. Do not look up the current OpenCode account a second time.
         scope = selection.provider_scope or "unscoped"
         entitlement_scope = selection.entitlement_scope
+        generation = selection.credential_generation
     else:
         account = provider_account_observation(provider, environ=environ)
         if account.state == "unavailable" or account.scope is None:
             return {"state": "unknown", "reason": account.reason or "account-scope-unavailable"}
         scope = account.scope
         entitlement_scope = None
+        generation = account.credential_generation
     tools = Path(__file__).resolve().parents[1] / "tools"
     if str(tools) not in sys.path:
         sys.path.insert(0, str(tools))
     try:
         from fleet.collectors import usage_cache
-        result = usage_cache.read_provider("opencode", provider, model_id, scope)
+        result = usage_cache.read_provider("opencode", provider, model_id, scope,
+                                           credential_generation=generation)
         if result.get("state") == "unavailable":
             return result
-        general = usage_cache.read_provider("opencode", provider, "*", scope)
+        general = usage_cache.read_provider("opencode", provider, "*", scope,
+                                            credential_generation=generation)
         if general.get("state") == "unavailable":
             return general
-        if result.get("state") == "unknown":
+        # An account-wide success proves authentication, not this model. Only a
+        # probed provider's account observation stands in for an unseen model.
+        if result.get("state") == "unknown" and (
+                provider in PROBED_PROVIDERS or general.get("state") != "usable"):
             result = general
         if (provider == "opencode-go" and result.get("state") == "unknown"
                 and entitlement_scope is not None):
             result = usage_cache.read_provider("opencode", "opencode-go-entitlement", "*",
-                                               entitlement_scope)
+                                               entitlement_scope,
+                                               credential_generation=generation)
         return result
     except Exception:
         return {"state": "unknown", "reason": "availability-cache-unavailable"}
 
 
+def classify_model_error(error) -> dict:
+    """Normalize one runtime model error into confirmed or unknown evidence.
+
+    OpenCode 2 reports ``provider.auth`` without a numeric status; its type is
+    the authority, and the message is never parsed into a rejection. Transient
+    types and rate limits stay unknown so they neither persist nor clear a
+    confirmed rejection.
+    """
+    if not isinstance(error, Mapping):
+        return {"state": "unknown", "reason": "unclassified-error"}
+    kind = str(error.get("type") or "").lower()
+    detail = (str(error.get("code") or "") + " " + str(error.get("message") or "")).lower()
+    if kind == "provider.auth":
+        return {"state": "unavailable",
+                "reason": "credential-expired" if "api_key_expired" in detail
+                else "authentication-rejected"}
+    if kind in TYPED_TRANSIENT_ERRORS:
+        return {"state": "unknown", "reason": TYPED_TRANSIENT_ERRORS[kind]}
+    status = error.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return {"state": "unknown", "reason": "unclassified-error"}
+    classification = classify_usage_rejection(status, {"error": {
+        "type": str(error.get("code") or error.get("type") or ""),
+        "message": str(error.get("message") or "")}})
+    if classification:
+        return {"state": "unavailable", "reason": classification["reason"]}
+    if status == 429:
+        return {"state": "unknown", "reason": "rate-limited"}
+    return {"state": "unknown", "reason": "unclassified-error"}
+
+
 def record_model_outcome(model: str | None, *, success=False, error=None, source="opencode-run",
-                         reason_override=None):
-    """Persist only confirmed account/model outcomes; transient failures do not clear them."""
+                         reason_override=None, account_observation=None):
+    """Persist only confirmed account/model outcomes; transient failures do not clear them.
+
+    ``account_observation`` is the account observed when the request started, so
+    a credential change during a long run is not credited with its outcome.
+    """
     if not isinstance(model, str) or "/" not in model:
         return False
     provider, model_id = model.split("/", 1)
     model_id = model_id.split("#", 1)[0]
-    account = provider_account_observation(provider)
+    account = (account_observation if account_observation is not None
+               else provider_account_observation(provider))
     if account.state == "unavailable" or account.scope is None:
         return False
     scope = account.scope
     state, reason = None, None
     if success:
         state = "usable"
-    elif isinstance(error, dict):
-        status = error.get("status")
-        code = str(error.get("code") or error.get("type") or "")
-        message = str(error.get("message") or "")
-        classification = classify_usage_rejection(
-            status if isinstance(status, int) else 0,
-            {"error": {"type": code, "message": message}},
-        )
-        if classification:
-            state, reason = "unavailable", classification["reason"]
-        elif isinstance(status, int) and status == 401:
-            state, reason = "unavailable", "authentication-rejected"
-        elif isinstance(status, int) and status == 429:
-            state, reason = "unavailable", "rate-limited"
+    elif isinstance(error, Mapping):
+        outcome = classify_model_error(error)
+        if outcome["state"] == "unavailable":
+            state, reason = "unavailable", outcome["reason"]
     if reason_override and not success:
         state, reason = "unavailable", str(reason_override)
     if state is None:
@@ -885,13 +1000,16 @@ def record_model_outcome(model: str | None, *, success=False, error=None, source
         sys.path.insert(0, str(tools))
     try:
         from fleet.collectors import usage_cache
+        generation = account.credential_generation
         exact = usage_cache.record_provider("opencode", provider, model_id, scope,
-                                            state, reason=reason, source=source)
+                                            state, reason=reason, source=source,
+                                            credential_generation=generation)
         # A same-account success proves account authentication recovered. Keep
         # model-specific denials intact while allowing this provider scope to
         # recover from an older account-level rejection.
         general = usage_cache.record_provider("opencode", provider, "*", scope,
-                                              state, reason=reason, source=source)
+                                              state, reason=reason, source=source,
+                                              credential_generation=generation)
         return exact or general
     except Exception:
         return False
@@ -916,22 +1034,28 @@ def automatic_model_fallbacks(config_path: str | Path | None = None) -> list[tup
 
 def select_automatic_model(model: str, variant: str, *, config_path=None,
                            environ=None) -> tuple[str, str, dict]:
-    """Keep a usable/unknown selection; replace only a confirmed unavailable one."""
-    status = model_availability(model, environ=environ)
-    if status.get("state") != "unavailable":
-        return model, variant, status
-    for candidate, effort in automatic_model_fallbacks(config_path):
-        if candidate == model:
-            continue
-        state = model_availability(candidate, environ=environ)
-        if state.get("state") != "unavailable":
-            return candidate, effort, state
-    return model, variant, status
+    """Choose the first automatically eligible candidate in configured order.
+
+    Without one, the primary is returned unchanged: an unknown primary keeps
+    ``automatic_eligible=False`` so an explicitly chosen harness can still run
+    it while automatic callers do not, and a confirmed-unavailable primary is
+    never traded for an unverified fallback.
+    """
+    rows = automatic_candidates(model, variant, config_path=config_path, environ=environ)
+    primary = rows[0]
+    for row in rows:
+        if row["automatic_eligible"]:
+            evidence = {key: value for key, value in row.items() if key not in ("model", "variant")}
+            if row["model"] != model:
+                evidence["fallback_from_reason"] = primary.get("reason")
+            return row["model"], row["variant"], evidence
+    return model, variant, {key: value for key, value in primary.items()
+                            if key not in ("model", "variant")}
 
 
 def automatic_candidates(model: str, variant: str, *, config_path=None,
                          environ=None) -> list[dict]:
-    """Candidate evidence for a hard harness-level availability decision."""
+    """Candidate evidence, in configured order, for automatic placement."""
     rows = []
     candidates = [(model, variant), *automatic_model_fallbacks(config_path)]
     seen = set()
@@ -940,8 +1064,11 @@ def automatic_candidates(model: str, variant: str, *, config_path=None,
         if key in seen:
             continue
         seen.add(key)
-        rows.append({"model": candidate, "variant": effort,
-                     **model_availability(candidate, environ=environ)})
+        evidence = model_availability(candidate, environ=environ)
+        row = {**evidence, "model": candidate, "variant": effort}
+        if evidence.get("model") not in (None, candidate.split("/", 1)[-1].split("#", 1)[0]):
+            row["evidence_model"] = evidence["model"]
+        rows.append(row)
     return rows
 
 
@@ -1171,7 +1298,11 @@ def safe_provider_error(value: object) -> dict:
 
 
 def record_model_http_result(model: str, status: int, body: bytes | str | dict = b"") -> dict:
-    """Record only successful requests or explicit auth/entitlement/rate-limit denials."""
+    """Record only successful requests or explicit auth/entitlement denials.
+
+    A rate limit is capacity, not a credential or entitlement rejection: it is
+    reported as unknown and never persisted as an exclusion.
+    """
     if isinstance(status, bool) or not isinstance(status, int):
         return {"state": "unknown", "reason": "http-status-invalid"}
     if 200 <= status < 300:
@@ -1186,9 +1317,7 @@ def record_model_http_result(model: str, status: int, body: bytes | str | dict =
                              reason_override=classification.get("reason"))
         return classification
     if status == 429:
-        error = {"status": status, "code": "rate_limited", "message": "provider rate limited"}
-        record_model_outcome(model, error=error, source="opencode-v2-http")
-        return {"state": "unavailable", "reason": "rate-limited", "http_status": status}
+        return {"state": "unknown", "reason": "rate-limited", "http_status": status}
     return {"state": "unknown", "reason": "unclassified-http", "http_status": status}
 
 

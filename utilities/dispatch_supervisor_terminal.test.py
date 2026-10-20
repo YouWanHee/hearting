@@ -380,6 +380,20 @@ class RuntimeFailureClassifierTest(unittest.TestCase):
         )
         self.assertEqual(passed.note, "completed-supervisor")
 
+    def test_opencode_typed_provider_auth_stays_a_replaceable_runtime_death(self):
+        # OpenCode 2 reports one provider's rejection by type, without a status.
+        # It is not a whole-harness login failure: `dead-auth` would turn the
+        # automatic replacement into a manual stop.
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import dispatch_replacement
+        result = {"type": "result", "runtime": "opencode", "session_id": "ses_x",
+                  "subtype": "error_during_execution", "is_error": True, "result": "",
+                  "error": {"type": "provider.auth", "message": "Request failed: 401"}}
+        verdict = SUPERVISOR.classify_session_result(result, 1, runtime="opencode")
+        self.assertEqual((verdict.note, verdict.failure_class, verdict.api_status),
+                         ("dead-runtime-error", "runtime", ""))
+        self.assertIn(verdict.note, dispatch_replacement.RUNTIME_DEATH_NOTES)
+
     def test_supervisor_log_reader_agrees_on_codex_capacity(self):
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "att.codex.jsonl"

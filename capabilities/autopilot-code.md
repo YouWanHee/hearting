@@ -251,9 +251,12 @@ Model-role/profile mapping selects the requested execution candidate; runtime
 availability is a separate provider/account/model-scoped decision. Automatic
 fallback keeps the task within existing provider and billing policy, and every
 candidate ordering consumes confirmed unavailability before headroom or
-preference. Explicit pins stay exact and surface the selected provider's error.
-Unknown credential or entitlement evidence remains unknown; model inventory
-and saved credential presence alone do not establish that a request can run.
+preference. Automatic selection admits only usable evidence or the unknown of a
+provider Hearting verifies before placement; an unverified provider is left to
+explicit choice. Explicit pins stay exact and surface the selected provider's
+error. Unknown credential or entitlement evidence remains unknown; model
+inventory and saved credential presence alone do not establish that a request
+can run.
 
 ## Adapter Realization
 
