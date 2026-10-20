@@ -263,11 +263,59 @@ def _prompt_listed_session_id(agent):
     return peer_message.usable_session_id(identity.get("value"))
 
 
+def _prompt_process_session(pane, harness, info):
+    """Return one current native session claim across all foreground processes."""
+    if (not isinstance(info, dict) or info.get("pane_id") != pane
+            or not isinstance(info.get("foreground_processes"), list)):
+        return None, "target-observation-unavailable"
+    claims = set()
+    try:
+        if harness == "codex":
+            from pane_ownership import current_codex_thread
+            executable = shutil.which("herdr")
+            for process in info["foreground_processes"]:
+                pid = process.get("pid") if isinstance(process, dict) else None
+                if type(pid) is not int or pid <= 0:
+                    continue
+                session_id = current_codex_thread(
+                    pane, pid, executable=executable, server=_HERDR_SESSION)
+                if peer_message.usable_session_id(session_id):
+                    claims.add(session_id)
+        else:
+            tools_dir = Path(__file__).resolve().parent.parent / "tools"
+            if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+                sys.path.insert(0, str(tools_dir))
+            from fleet.process_identity import PROVEN, process_identity
+            for process in info["foreground_processes"]:
+                pid = process.get("pid") if isinstance(process, dict) else None
+                if type(pid) is not int or pid <= 0:
+                    continue
+                found = process_identity(pid, harness)
+                if (found.confidence == PROVEN
+                        and peer_message.usable_session_id(found.session_id)):
+                    claims.add(found.session_id)
+    except Exception:
+        return None, "target-observation-unavailable"
+    if len(claims) > 1:
+        return None, "target-identity-changed"
+    return (next(iter(claims)), None) if claims else (None, None)
+
+
 def _prompt_current_candidate(pane, *, expected_harness=None, expected_sid=None,
-                              expected_name=None, require_process_session=False):
-    """Bind one observed pane to its current process identity before prompt admission."""
-    state, ident, _code, unavailable = _retire_target(pane)
-    if unavailable or state in {"agent-not-found", "herdr-unavailable", "timeout"}:
+                              expected_name=None, require_process_session=False,
+                              target_observation=None, pane_info=None):
+    """Bind one pane to a single current native identity before prompt admission."""
+    if target_observation is None:
+        state, ident, _code, unavailable = _retire_target(pane)
+    else:
+        if len(target_observation) == 2:
+            state, ident = target_observation
+            unavailable = None
+        else:
+            state, ident, _code, unavailable = target_observation
+    if state == "agent-not-found":
+        return None, "target-not-found"
+    if unavailable or state in {"herdr-unavailable", "timeout"}:
         return None, "target-observation-unavailable"
     harness = ident.get("harness")
     current_pane = ident.get("pane")
@@ -280,34 +328,37 @@ def _prompt_current_candidate(pane, *, expected_harness=None, expected_sid=None,
     if expected_name is not None and name != expected_name:
         return None, "target-identity-changed"
     herdr_sid = peer_message.usable_session_id(ident.get("session_id"))
-    try:
-        process_sid = _process_session(pane, harness)
-    except Exception:
-        process_sid = None
-    process_sid = peer_message.usable_session_id(process_sid)
-    known_sids = {sid for sid in (expected_sid, herdr_sid, process_sid) if sid}
-    if len(known_sids) > 1:
+    info = pane_info if pane_info is not None else _retire_pane_info(pane)
+    if info is None:
+        return None, "target-observation-unavailable"
+    process_sid, process_error = _prompt_process_session(pane, harness, info)
+    if process_error:
+        return None, process_error
+    expected_sid = peer_message.usable_session_id(expected_sid)
+    if (expected_sid and process_sid and expected_sid != process_sid
+            or herdr_sid and process_sid and herdr_sid != process_sid):
         return None, "target-identity-changed"
+    if expected_sid and not process_sid or herdr_sid and not process_sid:
+        return None, "target-identity-unverified"
     if require_process_session and not process_sid:
         return None, "target-identity-unverified"
-    session_id = process_sid or herdr_sid
-    if expected_sid and not session_id:
-        return None, "target-identity-unverified"
+    session_id = process_sid
     return {"state": state, "harness": harness, "session_id": session_id,
             "name": name if isinstance(name, str) and name and name != "-" else None,
-            "pane": pane}, None
+            "pane": pane, "_identity": dict(ident), "_pane_info": info,
+            "_native_session_id": process_sid}, None
 
 
-def _prompt_fleet_tag(harness, session_id):
-    """Use Fleet's shared tag definition for one currently identified session."""
+def _prompt_fleet_tag(harness, session_id, *, pane=None, cwd=None):
+    """Use Fleet's tag rule with the explicit recipient seat context."""
     if harness not in _PROMPT_HARNESSES or not peer_message.usable_session_id(session_id):
         return None, "target-identity-unverified"
     try:
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
-        from fleet.session_handle import resolve_tag
-        tag = resolve_tag(harness, session_id)
+        from fleet.session_handle import resolve_recipient_tag
+        tag = resolve_recipient_tag(harness, session_id, pane=pane, cwd=cwd)
     except Exception:
         return None, "fleet-tag-observation-unavailable"
     if tag is None:
@@ -322,6 +373,13 @@ def _prompt_inventory_fields(agent):
     if (not isinstance(harness, str) or not harness
             or not isinstance(pane, str) or not pane or pane == "-"):
         return None
+    identity = agent.get("agent_session")
+    if identity is not None:
+        if not isinstance(identity, dict) or identity.get("kind") not in (None, "id"):
+            return None
+        value = identity.get("value")
+        if value not in (None, "", "-") and not peer_message.usable_session_id(value):
+            return None
     if not isinstance(name, str) or not name or name == "-":
         name = None
     return {"harness": harness.lower(), "pane": pane, "name": name,
@@ -348,6 +406,145 @@ def _prompt_collapse_rows(rows):
     return list(by_pane.values())
 
 
+def _prompt_inventory_panes(agents):
+    if not isinstance(agents, list):
+        return set()
+    return {agent["pane_id"] for agent in agents if isinstance(agent, dict)
+            and isinstance(agent.get("pane_id"), str) and agent["pane_id"]}
+
+
+def _prompt_candidate_snapshot():
+    """Join the complete selected-endpoint pane census to herdr's agent list."""
+    agents, inventory_error = _prompt_agent_inventory()
+    census = herdr_observation.pane_census(session=_HERDR_SESSION)
+    endpoint = herdr_observation.endpoint_name(_HERDR_SESSION)
+    if census is None:
+        return None, "pane-census-unavailable", sorted(_prompt_inventory_panes(agents))
+    panes = getattr(census, "panes", None)
+    if not isinstance(panes, (tuple, list)):
+        return None, "pane-census-malformed", sorted(_prompt_inventory_panes(agents))
+    census_ids = sorted({item.get("pane_id") for item in panes
+                         if isinstance(item, dict)
+                         and isinstance(item.get("pane_id"), str)
+                         and item.get("pane_id")})
+    if (getattr(census, "complete", False) is not True
+            or getattr(census, "endpoint", None) != endpoint):
+        return None, "pane-census-unavailable", sorted(
+            set(census_ids) | _prompt_inventory_panes(agents))
+    census_by_pane = {}
+    known_panes = set()
+    for item in panes:
+        pane = item.get("pane_id") if isinstance(item, dict) else None
+        if not isinstance(pane, str) or not pane or pane == "-" or pane in census_by_pane:
+            return None, "pane-census-malformed", sorted(known_panes)
+        known_panes.add(pane)
+        census_by_pane[pane] = item
+
+    if agents is None:
+        return None, inventory_error or "target-observation-unavailable", sorted(known_panes)
+
+    listed_by_pane = {}
+    malformed_panes = set()
+    for agent in agents:
+        fields = _prompt_inventory_fields(agent)
+        if fields is None:
+            pane = agent.get("pane_id") if isinstance(agent, dict) else None
+            if isinstance(pane, str) and pane:
+                malformed_panes.add(pane)
+            else:
+                malformed_panes.update(known_panes)
+            continue
+        listed_by_pane.setdefault(fields["pane"], []).append(fields)
+    if malformed_panes:
+        return None, "herdr-agent-list-malformed", sorted(malformed_panes | known_panes)
+
+    rows, unknown_panes, unknown_reason = [], set(), None
+    for pane, item in census_by_pane.items():
+        raw_harness = item.get("agent")
+        if raw_harness in (None, ""):
+            continue
+        if not isinstance(raw_harness, str):
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "pane-census-malformed"
+            continue
+        harness = raw_harness.lower()
+        if harness not in _PROMPT_HARNESSES:
+            continue
+        listed = _prompt_collapse_rows(listed_by_pane.get(pane, []))
+        if listed is None or len(listed or []) != 1:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "herdr-agent-list-incomplete"
+            continue
+        row = listed[0]
+        census_session = item.get("agent_session")
+        if census_session is not None:
+            if (not isinstance(census_session, dict)
+                    or census_session.get("kind") not in (None, "id")):
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or "pane-census-malformed"
+                continue
+            census_sid = peer_message.usable_session_id(census_session.get("value"))
+            if census_session.get("value") not in (None, "", "-") and not census_sid:
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or "pane-census-malformed"
+                continue
+            if census_sid and row.get("session_id") and census_sid != row["session_id"]:
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or "target-identity-changed"
+                continue
+        else:
+            census_sid = None
+        if row["harness"] != harness:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-identity-changed"
+            continue
+        if row.get("session_id") and census_sid and row["session_id"] != census_sid:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-identity-changed"
+            continue
+        expected_sid = census_sid or row.get("session_id")
+        observed = _retire_target(pane)
+        candidate, reason = _prompt_current_candidate(
+            pane, expected_harness=harness, expected_sid=expected_sid,
+            require_process_session=True, target_observation=observed)
+        if candidate is None:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or reason or "target-identity-unverified"
+            continue
+        names = {value for value in (row.get("name"), candidate.get("name"),
+                 item.get("display_agent"), item.get("title"),
+                 item.get("terminal_title_stripped"))
+                 if isinstance(value, str) and value and value != "-"}
+        try:
+            registry_name = _from_name(harness, candidate["session_id"])
+        except Exception:
+            registry_name = None
+        if isinstance(registry_name, str) and registry_name and registry_name != "-":
+            names.add(registry_name)
+        if not names:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-name-observation-unavailable"
+            continue
+        row_cwd = item.get("cwd") or item.get("foreground_cwd")
+        rows.append({**candidate, "names": names, "cwd": row_cwd,
+                     "endpoint": endpoint, "census": item})
+
+    for pane, listed in listed_by_pane.items():
+        if pane not in census_by_pane:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "pane-census-inconsistent"
+            continue
+        if census_by_pane[pane].get("agent") in (None, ""):
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "pane-census-inconsistent"
+
+    rows_by_pane = {row["pane"]: row for row in rows}
+    for pane in unknown_panes:
+        if pane not in rows_by_pane:
+            rows_by_pane[pane] = {"pane": pane, "unknown": True}
+    return list(rows_by_pane.values()), unknown_reason, sorted(unknown_panes)
+
+
 def _resolve_prompt_target(target):
     """Resolve a prompt address once to a pane and exact current session identity.
 
@@ -365,78 +562,89 @@ def _resolve_prompt_target(target):
         candidate, reason = _prompt_current_candidate(target)
         return (candidate, None, [target]) if candidate else (None, reason, [target])
 
-    agents, reason = _prompt_agent_inventory()
-    if agents is None:
-        return None, reason or "target-observation-unavailable", []
+    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot()
+    if rows is None:
+        return None, snapshot_error or "target-observation-unavailable", unknown_panes
+    wanted_tag = tag_match.group(1).lower() if is_tag else None
+    matches = {}
+    uncertain = set(unknown_panes)
+    uncertainty_reason = snapshot_error
+    for row in rows:
+        if row.get("unknown"):
+            continue
+        if target in row["names"]:
+            matches[row["pane"]] = row
+        if wanted_tag is not None:
+            current_tag, tag_error = _prompt_fleet_tag(
+                row["harness"], row["session_id"], pane=row["pane"], cwd=row.get("cwd"))
+            if tag_error or current_tag is None:
+                uncertain.add(row["pane"])
+                uncertainty_reason = uncertainty_reason or tag_error or "fleet-tag-observation-unavailable"
+            elif current_tag == wanted_tag:
+                matches[row["pane"]] = row
 
-    if is_tag:
-        wanted = tag_match.group(1).lower()
-        rows, seen_panes = [], set()
-        for agent in agents:
-            fields = _prompt_inventory_fields(agent)
-            if fields is None:
-                return None, "target-observation-unavailable", sorted(seen_panes)
-            harness, pane = fields["harness"], fields["pane"]
-            if harness not in _PROMPT_HARNESSES:
-                continue
-            seen_panes.add(pane)
-            rows.append(fields)
-        rows = _prompt_collapse_rows(rows)
-        if rows is None:
-            return None, "target-observation-inconsistent", sorted(seen_panes)
-        matches = []
-        tag_cache = {}
-        for row in rows:
-            pane, harness = row["pane"], row["harness"]
-            try:
-                process_sid = peer_message.usable_session_id(_process_session(pane, harness))
-            except Exception:
-                process_sid = None
-            if not process_sid:
-                return None, "target-observation-unavailable", sorted(seen_panes)
-            listed_sid = row.get("session_id")
-            if listed_sid and listed_sid != process_sid:
-                return None, "target-identity-changed", [pane]
-            key = (harness, process_sid)
-            if key not in tag_cache:
-                tag_cache[key] = _prompt_fleet_tag(harness, process_sid)
-            tag, tag_error = tag_cache[key]
-            if tag_error:
-                return None, tag_error, sorted(seen_panes)
-            if tag == wanted:
-                matches.append({**row, "session_id": process_sid})
-        reason_prefix = "fleet-tag"
-    else:
-        rows = []
-        for agent in agents:
-            fields = _prompt_inventory_fields(agent)
-            if fields is None:
-                return None, "target-observation-unavailable", []
-            if fields["name"] == target:
-                rows.append(fields)
-        rows = _prompt_collapse_rows(rows)
-        if rows is None:
-            return None, "target-observation-inconsistent", []
-        matches = rows
-        reason_prefix = "target-name"
-
-    panes = sorted({row["pane"] for row in matches})
+    candidate_panes = sorted(set(matches) | uncertain)
+    if uncertain:
+        return None, uncertainty_reason or "target-observation-unavailable", candidate_panes
     if not matches:
-        return None, f"{reason_prefix}-not-found", []
-    if len(panes) > 1:
-        return None, f"{reason_prefix}-ambiguous", panes
-    row = matches[0]
+        return None, "fleet-tag-not-found" if is_tag else "target-name-not-found", []
+    if len(matches) > 1:
+        return None, "fleet-tag-ambiguous" if is_tag else "target-name-ambiguous", candidate_panes
+    row = next(iter(matches.values()))
+    # Re-read the pinned pane immediately before admission. Historical names and
+    # tags select a pane but never stand in for its current native identity.
     candidate, reason = _prompt_current_candidate(
         row["pane"], expected_harness=row["harness"], expected_sid=row["session_id"],
-        expected_name=None if is_tag else target,
-        require_process_session=is_tag)
+        require_process_session=True)
     if not candidate:
-        return None, reason, panes
-    if is_tag:
-        current_tag, tag_error = _prompt_fleet_tag(candidate["harness"], candidate["session_id"])
-        if tag_error or current_tag != wanted:
-            return None, tag_error or "target-identity-changed", panes
-    return candidate, None, panes
+        return None, reason, candidate_panes
+    if wanted_tag is not None:
+        current_tag, tag_error = _prompt_fleet_tag(
+            candidate["harness"], candidate["session_id"], pane=candidate["pane"], cwd=row.get("cwd"))
+        if tag_error or current_tag != wanted_tag:
+            return None, tag_error or "target-identity-changed", candidate_panes
+    return candidate, None, candidate_panes
+
+
+def _prompt_failure_ledger(target, reason, candidate_panes, *, kind="steer", ref=(),
+                           from_identity=None, from_name=_UNSET_NAME):
+    """Record a bounded resolution failure without persisting or publishing its body."""
+    target_text = target if isinstance(target, str) else str(target or "")
+    candidates = sorted({pane for pane in candidate_panes
+                         if isinstance(pane, str) and pane})
+    shown, omitted = [], 0
+    for pane in candidates:
+        value = pane[:96]
+        preview = shown + [value]
+        receipt = json.dumps({"reason": str(reason)[:96], "target": target_text[:256],
+                              "candidate_panes": preview,
+                              "candidate_panes_omitted": omitted + len(candidates) - len(preview)},
+                             ensure_ascii=False, separators=(",", ":"))
+        if len(receipt.encode("utf-8")) > 1400 or len(shown) >= 24:
+            omitted += len(candidates) - len(shown)
+            break
+        shown.append(value)
+    receipt = json.dumps({"reason": str(reason)[:96], "target": target_text[:256],
+                          "candidate_panes": shown,
+                          "candidate_panes_omitted": omitted},
+                         ensure_ascii=False, separators=(",", ":"))
+    if from_identity is None:
+        sid, harness = _current_session_identity()
+        from_identity = (sid, harness, _project_of(os.getcwd()))
+    if from_name is _UNSET_NAME:
+        from_name = _from_name(from_identity[1], from_identity[0])
+    _record(to_harness="unknown", to_name=target_text[:256], kind=kind,
+            receipt="prompt-resolution:" + receipt, status="unknown",
+            from_identity=from_identity, from_name=from_name, ref=ref, surface="herdr")
+
+
+def _prompt_message_kind(body):
+    first = body.strip().splitlines()[0] if body.strip() else ""
+    for prefix, value in (("[steer]", "steer"), ("[handoff]", "handoff"),
+                          ("[gate]", "gate-relay")):
+        if first.startswith(prefix):
+            return value
+    return "steer"
 
 
 def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
@@ -5031,6 +5239,11 @@ def _claude_idle_prompt_guard(target, expected_sid, expected_pane, expected_fore
             or ident.get("session_id") != expected_sid
             or ident.get("pane") != expected_pane):
         return reason or "target-identity-changed", None
+    current, identity_error = _prompt_current_candidate(
+        expected_pane, expected_harness="claude", expected_sid=expected_sid,
+        require_process_session=True, target_observation=(state, ident))
+    if current is None:
+        return identity_error or "target-identity-unverified", None
     if state not in ("idle", "done"):
         return "native-state-" + str(state), None
     current_state, current_pane = _agent_state(target)
@@ -5038,7 +5251,8 @@ def _claude_idle_prompt_guard(target, expected_sid, expected_pane, expected_fore
         return "target-state-changed", None
     readiness = _pane_readiness(target, current_state, expected_harness="claude",
                                 expected_sid=expected_sid, expected_pane=expected_pane,
-                                purpose="input")
+                                purpose="input", target_observation=(current_state, ident),
+                                native_session_id=current["_native_session_id"])
     if readiness.state != "ready":
         return readiness.reason or "target-identity-unverified", None
     proof = _claude_prompt_foreground_proof(expected_pane, expected_sid)
@@ -5260,7 +5474,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
         info = (pane_info if pane_info is not None else
                 _retire_pane_info(pane) if pane and pane != "-" else None)
-        if sid == "-" and isinstance(info, dict):
+        if sid == "-" and native_session_id is None and isinstance(info, dict):
             proven = _proven_session(info["foreground_processes"], harness)
             if proven and expected_sid in {None, "-", proven}:
                 sid, expected_sid = proven, None
@@ -5683,11 +5897,22 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                        "reason": reason or "target-identity-changed",
                        "observed_pane": ident.get("pane", "")})
             return
+        pinned_pane = expected_pane or ident.get("pane") or ""
+        current, current_error = _prompt_current_candidate(
+            pinned_pane, expected_harness=recipient.get("harness"),
+            expected_sid=None if pane_bound else recipient.get("session_id"),
+            require_process_session=not pane_bound,
+            target_observation=(state, ident))
+        if current is None:
+            _ensure_sender_delay_notice_if_due(row)
+            checkpoint(state="unknown", observation={"ref": ref,
+                       "reason": current_error or "target-identity-unverified",
+                       "observed_pane": pinned_pane})
+            return
+        ident = current["_identity"]
+        state = current["state"]
         if pane_bound:
-            observed_sid = ident.get("session_id")
-            if observed_sid in (None, "", "-") and recipient.get("harness") == "codex":
-                # The same foreground-TUI proof `prompt` uses while herdr names no thread.
-                observed_sid = _process_session(expected_pane or ident.get("pane"), "codex") or observed_sid
+            observed_sid = current.get("session_id")
             if observed_sid in (None, "", "-"):
                 checkpoint(state="pending", observation={"ref": ref, "reason": "target-session-unresolved",
                                                           "observed_pane": ident.get("pane", "")})
@@ -5720,9 +5945,12 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                                                            "observed_pane": ident.get("pane", "")})
                 return
             recipient = peer_message.pending_delivery_recipient(bound)
-        readiness = _pane_readiness(target, state,
+        readiness = _pane_readiness(pinned_pane, state,
                                     expected_harness=recipient.get("harness"),
                                     expected_sid=recipient.get("session_id"), purpose="input",
+                                    expected_pane=pinned_pane,
+                                    target_observation=(state, ident),
+                                    native_session_id=current.get("_native_session_id") or "",
                                     read_context=read_context)
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
@@ -5742,6 +5970,16 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                 checkpoint(state="unknown", observation={"ref": ref,
                            "reason": "target-process-changed" if latest is not None
                            else "target-process-proof-unknown", "observed_pane": expected_pane})
+                return
+        else:
+            latest, latest_error = _prompt_current_candidate(
+                pinned_pane, expected_harness=recipient.get("harness"),
+                expected_sid=recipient.get("session_id"), require_process_session=True)
+            if latest is None:
+                _ensure_sender_delay_notice_if_due(row)
+                checkpoint(state="unknown", observation={"ref": ref,
+                           "reason": latest_error or "target-identity-unverified",
+                           "observed_pane": pinned_pane})
                 return
         if recipient.get("harness") == "codex":
             peer_message.deliver_pending_codex(ref, timeout=0.25)
@@ -6601,6 +6839,8 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     context emission remains queued; only an exact native receive is true.
     """
     if _herdr_missing():
+        _prompt_failure_ledger(args.target, "herdr-not-found", [],
+                               ref=getattr(args, "ref", ()))
         return _unavailable("herdr-not-found")
     if args.body_file:
         with open(args.body_file, encoding="utf-8", errors="replace", newline="") as handle:
@@ -6620,6 +6860,9 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     resolved, resolve_error, candidate_panes = _resolve_prompt_target(args.target)
     if resolved is None:
         reason = resolve_error or "target-observation-unavailable"
+        _prompt_failure_ledger(args.target, reason, candidate_panes,
+                               kind=_prompt_message_kind(body), ref=args.ref,
+                               from_identity=from_identity, from_name=from_name)
         print("prompted=false reason=%s target=%s candidate_panes=%s" % (
             reason, json.dumps(args.target, ensure_ascii=False),
             json.dumps(candidate_panes, ensure_ascii=False, separators=(",", ":"))))
@@ -6629,6 +6872,9 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                                 resolved["name"] or args.target)
     state_before, target_pane = resolved["state"], resolved["pane"]
     if expected_recipient is not None and (t_harness, t_sid) != expected_recipient:
+        _prompt_failure_ledger(args.target, "target-identity-changed", [target_pane],
+                               kind=_prompt_message_kind(body), ref=args.ref,
+                               from_identity=from_identity, from_name=from_name)
         print("prompted=false reason=target-identity-changed")
         return 5
     recipient = {"harness": t_harness, "session_id": peer_message.usable_session_id(t_sid),
@@ -6642,7 +6888,9 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
             resolved_target, t_harness, target_pane)
     readiness = _pane_readiness(resolved_target, state_before, expected_harness=t_harness,
                                 expected_sid=recipient["session_id"], expected_pane=target_pane,
-                                purpose="input")
+                                purpose="input",
+                                target_observation=(state_before, resolved.get("_identity")),
+                                native_session_id=resolved.get("_native_session_id") or "")
     input_reason = None if readiness.state == "ready" else (
         readiness.reason or "target-identity-unverified")
 
@@ -6664,12 +6912,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
         print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
         return 5
 
-    first = body.strip().splitlines()[0] if body.strip() else ""
-    kind = "steer"
-    for prefix, value in (("[steer]", "steer"), ("[handoff]", "handoff"), ("[gate]", "gate-relay")):
-        if first.startswith(prefix):
-            kind = value
-            break
+    kind = _prompt_message_kind(body)
     started = time.monotonic()
     verify = "private-pending"
     reason = None
@@ -6686,13 +6929,20 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
             verify = "native-callback"
         reason = input_reason
     elif t_harness == "codex" and peer_message.usable_session_id(t_sid):
-        try:
-            result = peer_message.deliver_pending_codex(transfer_ref)
-            outcome = "true" if result["status"] == "received" else (
-                "queued" if result["status"] == "queued" else "unverified")
-            verify, reason = "native-queue-" + result["status"], result.get("reason")
-        except (OSError, ValueError) as exc:
-            outcome, reason = "unverified", "peer-pending-unavailable:" + str(exc)
+        current, current_error = _prompt_current_candidate(
+            resolved_target, expected_harness=t_harness, expected_sid=t_sid,
+            require_process_session=True)
+        if current is None:
+            outcome, reason = "unverified", current_error or "target-identity-unverified"
+            _schedule_message_obligation(pending, resolved_target, target_pane)
+        else:
+            try:
+                result = peer_message.deliver_pending_codex(transfer_ref)
+                outcome = "true" if result["status"] == "received" else (
+                    "queued" if result["status"] == "queued" else "unverified")
+                verify, reason = "native-queue-" + result["status"], result.get("reason")
+            except (OSError, ValueError) as exc:
+                outcome, reason = "unverified", "peer-pending-unavailable:" + str(exc)
     elif (t_harness in {"claude", "codex", "opencode"}
           and not peer_message.usable_session_id(t_sid)):
         direct_reason = None
