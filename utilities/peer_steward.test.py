@@ -3568,6 +3568,11 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         runner = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner.start()
         self.addCleanup(runner.stop)
+        # These tests replace herdr's RPC and native observations below. Declare
+        # the executable boundary too; the isolated runner strips workstation PATH.
+        herdr = mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr")
+        herdr.start()
+        self.addCleanup(herdr.stop)
         self._readiness_patch = mock.patch.object(
             peer_steward, "_pane_readiness",
             return_value=SimpleNamespace(state="ready", reason=""))
