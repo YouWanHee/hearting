@@ -1297,6 +1297,10 @@ and the workflow as CANCELLED, and records the route outcome. Repeated close
 and the existing execution observers resume this same cleanup after interruption.
 Unknown process evidence stays termination-pending; it grants no signal or
 false completion and requires no new caller recovery ritual.
+Fleet's explicit user kill (`note=fleet-kill`, `failure_class=cancelled`)
+is likewise a committed cancellation. Once its process, owner and cleanup
+obligations settle, it no longer blocks pane completion or retirement as an
+unknown result. It grants neither automatic retry nor successful route advance.
 Already-terminal owned attempts settle through the same terminal cleanup gate
 as the runtime join and reconcile, preserving their committed result,
 completion marker, and delivery evidence.
