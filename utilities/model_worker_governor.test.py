@@ -1976,6 +1976,73 @@ class GovernorReclaimTest(unittest.TestCase):
         title_records = [r for r in self.state()["start_records"] if r["class"] == "title"]
         self.assertEqual(len(title_records), 1)
 
+    def _dead_owner_reservation(self):
+        """One reservation whose owner exited without claiming or cancelling."""
+        script = (
+            "import importlib.util, sys\n"
+            f"sys.path.insert(0, {str(PATH.parent)!r})\n"
+            f"spec = importlib.util.spec_from_file_location('g', {str(PATH)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "sys.modules['g'] = m\n"
+            "spec.loader.exec_module(m)\n"
+            f"h = m.create_witness({str(self.root)!r}, 'reservation')\n"
+            f"print(m.reserve({str(self.root)!r}, 'dispatch', 1, witness_binding=h.binding())[0])\n"
+        )
+        source = self.root / "reserving-owner.py"
+        source.write_text(script, encoding="utf-8")
+        done = subprocess.run([sys.executable, str(source)], capture_output=True,
+                              text=True, timeout=120, start_new_session=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout.strip()
+
+    def _age_reservation(self, token, seconds):
+        GOVERNOR._state_change(
+            self.root, lambda data, now: data["reservations"][token].update(reserved_at=now - seconds))
+
+    def test_a_dead_owners_reservation_is_reclaimed_and_a_live_one_is_not(self):
+        dead = self._dead_owner_reservation()
+        handle = GOVERNOR.create_witness(self.root, "reservation")
+        try:
+            live = GOVERNOR.reserve(self.root, "dispatch", 1, witness_binding=handle.binding())[0]
+            # a held witness outranks age: a live owner keeps its slot
+            self._age_reservation(live, GOVERNOR.UNCLAIMED_RESERVATION_MAX_SECONDS + 1)
+            self.assertEqual(GOVERNOR.reclaimable_reservations(self.root, self.state(), time.time()), 1)
+            result = GOVERNOR.reclaim(self.root)
+            self.assertEqual([(row["token"], row["kind"], row["reason"]) for row in result["reclaimed"]],
+                             [(dead, "reservation", "exclusive-lock-acquired")])
+            self.assertEqual([(row["token"], row["reason"]) for row in result["retained"]],
+                             [(live, "exact-witness-lock-held")])
+            self.assertEqual(list(self.state()["reservations"]), [live])
+        finally:
+            GOVERNOR.close_witness(handle)
+
+    def test_a_witnessless_reservation_returns_only_past_the_launch_bound(self):
+        owner = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE)
+        try:
+            stale = GOVERNOR.reserve(self.root, "dispatch", 1, owner.pid)[0]
+        finally:
+            owner.communicate(input=b"", timeout=5)
+        self.assertNotIn("owner_witness", self.state()["reservations"][stale])
+
+        result = GOVERNOR.reclaim(self.root)
+        self.assertEqual(result["reclaimed_count"], 0, result)
+        self.assertEqual(result["retained"][0]["reason"], "no-identity-witness")
+
+        self._age_reservation(stale, GOVERNOR.UNCLAIMED_RESERVATION_MAX_SECONDS)
+        result = GOVERNOR.reclaim(self.root)
+        self.assertEqual([(row["token"], row["reason"]) for row in result["reclaimed"]],
+                         [(stale, "unclaimed-past-launch-bound")])
+        self.assertEqual(self.state()["reservations"], {})
+
+    def test_full_reserve_reclaims_a_dead_owners_reservation(self):
+        dead = self._dead_owner_reservation()
+        with mock.patch.object(GOVERNOR, "reclaim", wraps=GOVERNOR.reclaim) as reclaim:
+            tokens = GOVERNOR.reserve(self.root, "dispatch", 1, total=1, budget=8)
+        reclaim.assert_called_once_with(self.root)
+        self.assertEqual(set(self.state()["reservations"]), set(tokens))
+        self.assertNotIn(dead, self.state()["reservations"])
+
     def test_reclaimed_capacity_lost_to_contender_does_not_loop(self):
         self._dead_claimant_lease()
         original = GOVERNOR.reclaim

@@ -646,108 +646,14 @@ def _add_task_publish_bash_rules(permission: dict, commands: tuple[str, ...], *,
     return True
 
 
-_V1_TO_V2_PERMISSION = {"bash": "shell", "task": "subagent",
-                       "write": "edit", "patch": "edit"}
-
-
-def _permission_object_to_rules(value, action):
-    if isinstance(value, str):
-        return [{"action": action, "resource": "*", "effect": value}]
-    if isinstance(value, dict):
-        return [{"action": action, "resource": str(resource), "effect": effect}
-                for resource, effect in value.items() if isinstance(effect, str)]
-    return []
-
-
 def _opencode_v2_to_legacy_config(config):
-    """Normalize V2 ordered permissions for the shared scoped projection code."""
-    value = dict(config)
-    permission = value.get("permission", {})
-    if isinstance(permission, str):
-        permission = {"*": permission}
-    if not isinstance(permission, dict):
-        permission = {}
-    else:
-        permission = dict(permission)
-    rules = value.get("permissions", [])
-    if isinstance(rules, list):
-        for row in rules:
-            if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
-                                                    for k in ("action", "resource", "effect")):
-                continue
-            action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
-            current = permission.get(action)
-            if isinstance(current, str):
-                current = {"*": current}
-            elif not isinstance(current, dict):
-                current = {}
-            current = dict(current)
-            current[row["resource"]] = row["effect"]
-            permission[action] = current
-    v2_agents = value.get("agents") if isinstance(value.get("agents"), dict) else {}
-    v1_agents = value.get("agent") if isinstance(value.get("agent"), dict) else {}
-    agents = {**v2_agents, **v1_agents}
-    legacy_agents = {}
-    for name, definition in agents.items():
-        if not isinstance(definition, dict):
-            legacy_agents[name] = definition
-            continue
-        item = dict(definition)
-        agent_rules = item.get("permissions", [])
-        agent_permission = item.get("permission", {})
-        if isinstance(agent_permission, str):
-            agent_permission = {"*": agent_permission}
-        if not isinstance(agent_permission, dict):
-            agent_permission = {}
-        agent_permission = dict(agent_permission)
-        if isinstance(agent_rules, list):
-            for row in agent_rules:
-                if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
-                                                        for k in ("action", "resource", "effect")):
-                    continue
-                action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
-                current = agent_permission.get(action)
-                if isinstance(current, str):
-                    current = {"*": current}
-                elif not isinstance(current, dict):
-                    current = {}
-                current = dict(current)
-                current[row["resource"]] = row["effect"]
-                agent_permission[action] = current
-        item.pop("permissions", None)
-        item["permission"] = agent_permission
-        legacy_agents[name] = item
-    value.pop("permissions", None)
-    value.pop("agents", None)
-    value["permission"] = permission
-    if legacy_agents:
-        value["agent"] = legacy_agents
-    return value
+    """Compatibility name for the shared, pure V1/V2 policy decoder."""
+    return opencode_runtime.opencode_v2_to_legacy_config(config)
 
 
-def _opencode_legacy_to_v2_config(config):
-    """Emit V2 ordered permission rules after the shared scoped policy is applied."""
-    value = dict(config)
-    def rules(permission):
-        result = []
-        for tool, setting in (permission or {}).items():
-            action = _V1_TO_V2_PERMISSION.get(tool, tool)
-            result.extend(_permission_object_to_rules(setting, action))
-        return result
-    permission = value.pop("permission", {})
-    value["permissions"] = rules(permission)
-    agents = value.pop("agent", {})
-    if isinstance(agents, dict):
-        normalized = {}
-        for name, definition in agents.items():
-            if not isinstance(definition, dict):
-                normalized[name] = definition
-                continue
-            item = dict(definition)
-            item["permissions"] = rules(item.pop("permission", {}))
-            normalized[name] = item
-        value["agents"] = normalized
-    return value
+def _opencode_legacy_to_v2_config(config, *, original_v2=None):
+    """Compatibility name for the shared V1/V2 policy encoder."""
+    return opencode_runtime.opencode_legacy_to_v2_config(config, original_v2=original_v2)
 
 
 def scoped_external_directory_config(
@@ -771,6 +677,7 @@ def scoped_external_directory_config(
         raise ValueError(f"OPENCODE_CONFIG_CONTENT is not valid JSON: {e}") from e
     if not isinstance(config, dict):
         raise ValueError("OPENCODE_CONFIG_CONTENT must contain a JSON object")
+    original_v2 = config if v2 else None
     if v2:
         config = _opencode_v2_to_legacy_config(config)
 
@@ -785,27 +692,9 @@ def scoped_external_directory_config(
         permission = dict(permission)
 
     def effective_tool(subject, tool, default=None):
-        # Native fromConfig flattens every matching outer wildcard in order.
-        # A scalar replaces all paths, whereas an object replaces only its
-        # matching patterns. Preserve those rules before moving the tool last.
-        value = None if default is None else {"*": default}
-        for key, candidate in subject.items():
-            wildcard = re.escape(key.replace("\\", "/")).replace(r"\ ", " ").replace(r"\*", ".*").replace(r"\?", ".")
-            if wildcard.endswith(" .*"):
-                wildcard = wildcard[:-3] + "( .*)?"
-            if not re.fullmatch(wildcard, tool, re.DOTALL):
-                continue
-            if isinstance(candidate, str):
-                value = {"*": candidate}
-            elif isinstance(candidate, dict):
-                if value is None:
-                    value = {}
-                for pattern, action in candidate.items():
-                    value.pop(pattern, None)
-                    value[pattern] = action
-            else:
-                raise ValueError(f"OpenCode {tool} permission must be a string or object")
-        return value
+        rules = opencode_runtime.opencode_permission_rules_for_action(
+            subject, tool, default=default)
+        return None if rules is None else dict(rules)
 
     def install_merge_observation_rules(subject, inherited):
         def has_deny(rules):
@@ -1045,7 +934,7 @@ def scoped_external_directory_config(
         agents[selected_agent] = selected
         config["agent"] = agents
     if v2:
-        config = _opencode_legacy_to_v2_config(config)
+        config = _opencode_legacy_to_v2_config(config, original_v2=original_v2)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1058,6 +947,7 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
     """
     v2 = opencode_runtime.is_v2()
     config = json.loads(config_content) if config_content else {}
+    original_v2 = config if v2 else None
     if v2:
         config = _opencode_v2_to_legacy_config(config)
 
@@ -1082,7 +972,7 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
         agents[selected_agent] = selected
         config["agent"] = agents
     if v2:
-        config = _opencode_legacy_to_v2_config(config)
+        config = _opencode_legacy_to_v2_config(config, original_v2=original_v2)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 

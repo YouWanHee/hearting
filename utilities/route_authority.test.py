@@ -23,7 +23,9 @@ sys.path.insert(0, str(ROOT / "utilities"))
 
 import route_authority as RA  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
+import dispatch_replacement as DR  # noqa: E402
 import dispatch_seat_handover as HANDOVER  # noqa: E402
+import opencode_runtime  # noqa: E402
 from execution_access import ExecutionAccessRequest  # noqa: E402
 from route_identity import route_hash  # noqa: E402
 
@@ -544,16 +546,76 @@ class Case5ReadRootsTest(unittest.TestCase):
             history = {"harness": "codex", "worktree": str(worktree),
                        "jobs": str(root / "state/jobs.log"), "applied_permissions": {}}
             route = {"cwd": str(worktree), "artifact_root": str(artifact), "work_request": {"text": ""}}
-            with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}):
-                config = json.loads(wrapper.scoped_external_directory_config(
-                    str(artifact), agent_home=install, worktree=str(worktree), selected_agent="build"))
-            candidate = {"harness": "opencode", "launch_home": str(install),
-                         "applied_permissions": {"opencode_permission": config["permission"]}}
-            RA.require_recovery_grant_addresses(candidate, history, route=route)
-            config["permission"]["edit"][f"{install / 'utilities'}/**"] = "allow"
-            with self.assertRaises(DC.DispatchContractError) as refused:
-                RA.require_recovery_grant_addresses(candidate, history, route=route)
-            self.assertEqual(refused.exception.reason, "replacement-input-tuple-mismatch")
+            for version in (None, "1.19.0", "2.0.32"):
+                with self.subTest(version=version), mock.patch.dict(os.environ, {}):
+                    if version is None:
+                        os.environ.pop("OPENCODE_RUNTIME_VERSION", None)
+                        opencode_runtime.runtime_version.cache_clear()
+                        source_v2 = opencode_runtime.is_v2()
+                    else:
+                        os.environ["OPENCODE_RUNTIME_VERSION"] = version
+                        source_v2 = version.startswith("2.")
+                    source = ({"permissions": [], "agents": {}} if source_v2 else {})
+                    os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(source)
+                    config = json.loads(wrapper.scoped_external_directory_config(
+                        str(artifact), agent_home=install, worktree=str(worktree), selected_agent="build"))
+                    if "permissions" in config:
+                        self.assertNotIn("permission", config)
+                        self.assertNotIn("agent", config)
+                        self.assertIn("agents", config)
+                    recorded = DR._applied_permissions(SimpleNamespace(
+                        opencode_config_content=json.dumps(config)))
+                    candidate = {"harness": "opencode", "launch_home": str(install),
+                                 "applied_permissions": recorded}
+                    self.assertTrue(opencode_runtime.opencode_permission_ordered_view(
+                        recorded.get("opencode_permission")))
+                    RA.require_recovery_grant_addresses(candidate, history, route=route)
+
+                    widened = json.loads(json.dumps(config))
+                    if "permissions" in widened:
+                        widened["permissions"].append({
+                            "action": "edit", "resource": f"{install / 'utilities'}/**",
+                            "effect": "allow"})
+                    else:
+                        widened["permission"].setdefault("edit", {}).pop(
+                            f"{install / 'utilities'}/**", None)
+                        widened["permission"]["edit"][f"{install / 'utilities'}/**"] = "allow"
+                    candidate["applied_permissions"] = DR._applied_permissions(SimpleNamespace(
+                        opencode_config_content=json.dumps(widened)))
+                    with self.assertRaises(DC.DispatchContractError) as refused:
+                        RA.require_recovery_grant_addresses(candidate, history, route=route)
+                    self.assertEqual(refused.exception.reason, "replacement-input-tuple-mismatch")
+
+                    outside = json.loads(json.dumps(config))
+                    if "permissions" in outside:
+                        outside["permissions"].append({
+                            "action": "external_directory", "resource": str(root / "outside/**"),
+                            "effect": "allow"})
+                    else:
+                        outside["permission"].setdefault("external_directory", {})[
+                            str(root / "outside/**")] = "allow"
+                    candidate["applied_permissions"] = DR._applied_permissions(SimpleNamespace(
+                        opencode_config_content=json.dumps(outside)))
+                    with self.assertRaises(DC.DispatchContractError) as refused:
+                        RA.require_recovery_grant_addresses(candidate, history, route=route)
+                    self.assertEqual(refused.exception.reason, "replacement-input-tuple-mismatch")
+            opencode_runtime.runtime_version.cache_clear()
+
+    def test_missing_null_and_empty_opencode_permissions_have_no_recovery_authority(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifact, install = root / "worktree", root / "artifact", root / "install"
+            worktree.mkdir(); artifact.mkdir(); install.mkdir()
+            history = {"harness": "codex", "worktree": str(worktree),
+                       "jobs": str(root / "state/jobs.log"), "applied_permissions": {}}
+            route = {"cwd": str(worktree), "artifact_root": str(artifact),
+                     "work_request": {"text": ""}}
+            for applied in ({}, {"opencode_permission": None},
+                            {"opencode_permission": {}}, {"opencode_permission": []}):
+                candidate = {"harness": "opencode", "launch_home": str(install),
+                             "applied_permissions": applied}
+                with self.subTest(applied=applied), self.assertRaises(DC.DispatchContractError):
+                    RA.require_recovery_grant_addresses(candidate, history, route=route)
 
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
@@ -877,12 +939,23 @@ class SealedContractReadTest(unittest.TestCase):
                 config = json.loads(self.opencode.scoped_external_directory_config(
                     args.artifact_root, agent_home=new, worktree=args.worktree,
                     contract_read_roots=args.contract_read_roots, selected_agent="build"))
-                for rules in (config["permission"], config["agent"]["build"]["permission"]):
+                legacy = (opencode_runtime.opencode_v2_to_legacy_config(config)
+                          if "permissions" in config else config)
+                recorded = DR._applied_permissions(SimpleNamespace(
+                    opencode_config_content=json.dumps(config)))
+                global_rules = recorded["opencode_permission"]
+                self.assertTrue(opencode_runtime.opencode_permission_ordered_view(global_rules))
+                if "permissions" in config:
+                    self.assertNotIn("permission", config)
+                    self.assertNotIn("agent", config)
+                    self.assertIn("agents", config)
+                for rules in (global_rules, legacy["agent"]["build"]["permission"]):
                     for home in (old, new):
                         for name in ("capabilities", "core", "utilities"):
                             self.assertEqual(rules["external_directory"][str(home / name) + "/**"], "allow")
                             self.assertEqual(rules["edit"][str(home / name) + "/**"], "deny")
-                    self.assertEqual(rules["external_directory"].get("*", config["permission"]["external_directory"]["*"]), "deny")
+                    self.assertEqual(rules["external_directory"].get(
+                        "*", global_rules["external_directory"].get("*", "deny")), "deny")
                     self.assertNotIn(str(old) + "/**", rules["external_directory"])
                 args.execution_access_grant = None
                 read_dirs, denies = self.claude._read_only_projection(args)
@@ -899,16 +972,43 @@ class SealedContractReadTest(unittest.TestCase):
     def test_same_install_contract_permissions_compare_equal_but_another_checkout_does_not(self):
         old, new = "/opt/hearting/releases/v1", "/opt/hearting/releases/v2"
         worktree = "/work/project"
-        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}):
-            def permissions(home, route=None):
-                return {"opencode_permission": json.loads(self.opencode.scoped_external_directory_config(
-                    "/reports", agent_home=Path(home),
-                    contract_read_roots=RA.contract_read_roots(home, route), worktree=worktree))["permission"]}
-            before = permissions(old)
-            after = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": old}}})
-            self.assertEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(after, new, worktree))
-            other = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": "/work/dev"}}})
-            self.assertNotEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(other, new, worktree))
+        observations = []
+        for version in (None, "1.19.0", "2.0.32"):
+            with self.subTest(version=version), mock.patch.dict(os.environ, {}):
+                if version is None:
+                    os.environ.pop("OPENCODE_RUNTIME_VERSION", None)
+                    opencode_runtime.runtime_version.cache_clear()
+                    source_v2 = opencode_runtime.is_v2()
+                else:
+                    os.environ["OPENCODE_RUNTIME_VERSION"] = version
+                    source_v2 = version.startswith("2.")
+                source = {"permissions": [], "agents": {}} if source_v2 else {}
+                os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(source)
+
+                def permissions(home, route=None):
+                    content = self.opencode.scoped_external_directory_config(
+                        "/reports", agent_home=Path(home),
+                        contract_read_roots=RA.contract_read_roots(home, route), worktree=worktree)
+                    config = json.loads(content)
+                    if "permissions" in config:
+                        self.assertNotIn("permission", config)
+                        self.assertNotIn("agent", config)
+                    applied = DR._applied_permissions(SimpleNamespace(opencode_config_content=content))
+                    self.assertTrue(opencode_runtime.opencode_permission_ordered_view(
+                        applied.get("opencode_permission")))
+                    return applied
+
+                before = permissions(old)
+                after = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": old}}})
+                equal_before = RA.granted_permissions(before, old, worktree)
+                equal_after = RA.granted_permissions(after, new, worktree)
+                self.assertEqual(equal_before, equal_after)
+                other = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": "/work/dev"}}})
+                self.assertNotEqual(equal_before, RA.granted_permissions(other, new, worktree))
+                observations.append(equal_before)
+        self.assertEqual(observations[0], observations[1])
+        self.assertEqual(observations[1], observations[2])
+        opencode_runtime.runtime_version.cache_clear()
 
 
 class ReleaseAxisTest(unittest.TestCase):

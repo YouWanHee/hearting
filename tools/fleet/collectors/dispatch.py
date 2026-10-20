@@ -2422,7 +2422,9 @@ def _scan_degradations(route_ids, agent_home=None, tail=64, jobs=()):
         else:
             try:
                 with open(path, "rb") as stream:
-                    stream.seek(max(0, st.st_size - 256 * tail))
+                    # One bounded candidate record can exceed the old 16KiB
+                    # default window. Include that whole row, still bounded.
+                    stream.seek(max(0, st.st_size - max(65536, 256 * tail)))
                     raw = stream.read().splitlines()[-tail:]
                 rows = []
                 for line in raw:
