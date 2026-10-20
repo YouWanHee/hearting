@@ -80,7 +80,7 @@ from dispatch_mode_contract import (  # noqa: E402
     validate_route_mode_axes,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind  # noqa: E402
-from dispatch_attempt_policy import decide_attempt, committed_outcome, readable_result
+from dispatch_attempt_policy import decide_attempt, committed_outcome, readable_result, terminal_conflict_pending
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE  # noqa: E402
 from review_round_cap import classify_round_row  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
@@ -2482,6 +2482,42 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             candidate_outcomes=candidate_outcomes,
                             direct_failures=direct_failures,
                         )
+                    failure_reason = (
+                        fields.get("reason")
+                        or (worker_failure if worker_failure != "-" else "wrapper-exit")
+                    )
+                    if ((result.returncode != 0 or fields.get("check") == "failed")
+                            and _typed_stop_code(failure_reason, direct=True) is None):
+                        # A deterministic identity can collide with a successful
+                        # earlier launch. Re-read the exact row after the wrapper
+                        # returns: it may have settled while this candidate ran.
+                        success_row = next((item for item in reversed(registry_rows(
+                            args.jobs, route["route_id"], node["id"]))
+                            if item.get("attempt_id") == attempt_id), None)
+                        if (success_row is not None
+                                and success_row.get("_status") in {"done", "closed"}
+                                and committed_outcome(success_row["_status"], success_row) == "succeeded"
+                                and not terminal_conflict_pending(success_row)):
+                            try:
+                                quiescence = attempt_process_quiescence(
+                                    success_row, terminal_receipt=True)
+                            except (DispatchContractError, OSError, ValueError, TypeError):
+                                quiescence = None
+                            if quiescence is not None and quiescence.state == "quiescent":
+                                detail = "the exact attempt identity already has a committed successful result"
+                                _candidate_outcome(
+                                    candidate_outcomes, ordinal, key, attempted=False,
+                                    attempt_id=attempt_id, exit_code=result.returncode,
+                                    reason="successful-attempt-conflict", detail=detail,
+                                )
+                                return fail(
+                                    "successful-attempt-conflict", 78,
+                                    attempt_id=attempt_id, child_spawned="0", detail=detail,
+                                    next_action="For a correction, provide the changed request with --prompt-file.",
+                                    candidate_outcomes=candidate_outcomes,
+                                    attempt_trace="|".join(attempts),
+                                    **_last_failure_fields(direct_failures),
+                                )
                     if (result.returncode != 0 or fields.get("check") == "failed"
                             or worker_failure != "-"):
                         failure_reason = (

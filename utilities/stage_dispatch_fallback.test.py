@@ -1403,28 +1403,97 @@ class FallbackTest(unittest.TestCase):
  def test_new_execute_request_can_reuse_its_failed_slug(self):
   self.assert_new_execute_request("gap-two")
 
- def assert_new_execute_request(self, slug):
+ def test_new_execute_request_after_success_has_a_fresh_unlinked_attempt(self):
+  for harness in ("claude","codex","opencode"):
+   with self.subTest(harness=harness):
+    self.assert_new_execute_request("gap-two-success",outcome="succeeded",harness=harness)
+
+ def test_successful_execute_identity_conflict_stops_before_another_harness(self):
+  import dispatch_replacement as REPLACEMENT
+  import dispatch_contract as DC
+  for task_mode in ("same", "whitespace", "missing", "race"):
+   with self.subTest(task_mode=task_mode), self.dispatch_env():
+    path=self.route(same_status="supported",tuples=[self.tuple("codex","supported"),
+                                                       self.tuple("claude","supported")])
+    route=json.loads(path.read_text());node=next(n for n in route["nodes"] if n["id"]=="execute")
+    self.seed_parent();self.seed_predecessor_markers(path,"execute")
+    parent_attempt=F.parent_attempt_generation(self.jobs,"owner",route)
+    old_task="Close migration fixtures and import integration."
+    prompt=self.art/"same-execute-request.md";prompt.write_text(old_task)
+    aid=F.attempt_identity(SimpleNamespace(slug="same-success",parent="owner",
+                          parent_attempt_id=parent_attempt),route,node,
+                          {"child_harness":"codex"},1)
+    seal_args=SimpleNamespace(attempt_id=aid,jobs_path=self.jobs,worktree=self.repo,
+       replacement_input_argv=["--slug","same-success"],route_id=route["route_id"],route_node="execute")
+    sealed=DC.parse_registry_metadata(REPLACEMENT.seal_launch_input(seal_args,"codex",old_task))
+    success={"attempt_schema_version":"2","dispatch_depth":"2","registered_worker":"1",
+       "fallback_hop":"same-harness-headless","worker_type":"stage","harness":"codex",
+       "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"execute",
+       "attempt_id":aid,"parent_attempt_id":parent_attempt,"parent_sid":"fixture-native-parent",
+       "note":"completed-marker","failure_class":"pass","launch_outcome":"never-launched",**sealed}
+    if task_mode != "race":
+     with self.jobs.open("a") as handle:
+      handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tsame-success\t"+
+                   ",".join(f"{k}={v}" for k,v in success.items())+"\n")
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[self.tuple("codex","supported")]},
+          {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[self.tuple("claude","supported")] }]
+    called=[];out=io.StringIO()
+    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug","same-success",
+       "--parent","owner","--capability-mode","dev",
+       "--jobs",str(self.jobs),"--start"]
+    if task_mode != "missing":
+     if task_mode == "whitespace": prompt.write_text("  Close migration\n fixtures and import integration.  ")
+     argv.extend(["--prompt-file",str(prompt)])
+    def refused(_args,command):
+     called.append(command)
+     if task_mode == "race":
+      with self.jobs.open("a") as handle:
+       handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tsame-success\t"+
+                    ",".join(f"{k}={v}" for k,v in success.items())+"\n")
+     return SimpleNamespace(returncode=73,stdout="check=failed\nreason=replacement-record-conflict\ndetail=sealed input exists\n",stderr="")
+    with mock.patch.object(sys,"argv",argv), self.compiled_order(), \
+         mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+         mock.patch.object(F,"attempt_identity",return_value=aid), \
+         mock.patch.object(F,"run_wrapper",side_effect=refused), \
+         mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent")), \
+         mock.patch.object(DC,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent")), \
+         contextlib.redirect_stdout(out):
+     code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+    receipt=self.cli_verdict(out.getvalue())
+    self.assertEqual((code,receipt.get("reason"),receipt.get("child_spawned")),
+                     (78,"successful-attempt-conflict","0"),out.getvalue())
+    self.assertEqual(receipt["attempt_id"],aid)
+    self.assertIn("--prompt-file",receipt["next_action"])
+    self.assertEqual(len(called),1)
+    self.assertIn("attempt_trace",receipt)
+
+ def assert_new_execute_request(self, slug, outcome="failed", harness="codex"):
   import dispatch_contract as DC
   import dispatch_replacement as REPLACEMENT
   with self.dispatch_env():
-   path=self.route(same_status="supported",intensity="standard")
+   tuples=[self.tuple(name,"supported") for name in (harness,"codex","claude","opencode")]
+   tuples=list({item["child_harness"]:item for item in tuples}.values())
+   path=self.route(same_status="supported",intensity="standard",tuples=tuples)
    route=json.loads(path.read_text())
    self.seed_parent()
    self.seed_predecessor_markers(path,"execute")
    old_id=F.attempt_identity(
     SimpleNamespace(slug="gap-two",parent="owner",parent_attempt_id="att-fallback-parent"),
-    route,{"id":"execute"},{"child_harness":"codex"},1)
+    route,{"id":"execute"},{"child_harness":harness},1)
    args=SimpleNamespace(attempt_id=old_id,jobs_path=self.jobs,
                         worktree=self.repo,replacement_input_argv=["--slug","gap-two"])
    old_task="Close migration fixtures and import integration."
    meta={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
          "execution_surface":"registered-headless","registered_worker":"1",
-         "fallback_hop":"same-harness-headless","worker_type":"stage","harness":"codex",
+         "fallback_hop":"same-harness-headless","worker_type":"stage","harness":harness,
          "attempt_id":args.attempt_id,"route_id":route["route_id"],"route_hash":route["route_hash"],
          "route_node":"execute","parent_attempt_id":"att-fallback-parent",
-         "parent_sid":"fixture-native-parent","automatic_retry_of":"att-execute-gap-one",
-         "note":"dead-parent-terminated","failure_class":"runtime","launch_outcome":"never-launched"}
-   meta.update(DC.parse_registry_metadata(REPLACEMENT.seal_launch_input(args,"codex",old_task)))
+         "parent_sid":"fixture-native-parent","launch_outcome":"never-launched"}
+   if outcome=="succeeded":
+    meta.update(note="completed-marker",failure_class="pass")
+   else:
+    meta.update(automatic_retry_of="att-execute-gap-one",note="dead-parent-terminated",failure_class="runtime")
+   meta.update(DC.parse_registry_metadata(REPLACEMENT.seal_launch_input(args,harness,old_task)))
    with self.jobs.open("a") as handle:
     handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tgap-two\t"+
                  ",".join(f"{k}={v}" for k,v in meta.items())+"\n")
@@ -1450,12 +1519,16 @@ class FallbackTest(unittest.TestCase):
                           f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
    def run_wrapper(_args,command):
     return wrapper(command)
+   other=next(name for name in ("codex","claude","opencode") if name!=harness)
+   success_hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[self.tuple(harness,"supported")]},
+                 {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[self.tuple(other,"supported")]}]
    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug",slug,
          "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),
          "--prompt-file",str(prompt),"--start"]
    out=io.StringIO()
    with mock.patch.object(sys,"argv",argv),self.compiled_order(), \
         mock.patch.object(F,"run_wrapper",side_effect=run_wrapper), \
+        (mock.patch.object(F,"ordered_fallback_hops",return_value=(success_hops,None)) if outcome=="succeeded" else contextlib.nullcontext()), \
         mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
         contextlib.redirect_stdout(out):
     code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())

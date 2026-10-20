@@ -495,6 +495,36 @@ class Case4RetryLinkTest(unittest.TestCase):
             replacement._directory(jobs).joinpath("inputs", args.attempt_id + ".json").write_text("{}")
             self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
 
+    def test_changed_request_after_success_is_new_work_but_same_request_is_not(self):
+        import dispatch_replacement as replacement
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            attempt_id = "att-success"
+            args = SimpleNamespace(attempt_id=attempt_id, jobs_path=jobs, worktree=td,
+                                   replacement_input_argv=["--slug", "execute"])
+            old_task = "Close migration fixtures and import integration."
+            row = {"_status": "done", "attempt_id": attempt_id,
+                   "note": "completed-marker", "failure_class": "pass",
+                   "launch_outcome": "never-launched"}
+            row.update(DC.parse_registry_metadata(
+                replacement.seal_launch_input(args, "codex", old_task)))
+            changed = "Close historical/current conflict and actual DB parity."
+            with mock.patch.object(DC, "attempt_process_quiescence",
+                                   return_value=SimpleNamespace(state="quiescent")):
+                self.assertTrue(RA.new_owner_request(row, jobs=jobs, task=changed))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=old_task))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task="  Close migration\n fixtures and import integration.  "))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=None))
+                self.assertEqual(RA.retry_predecessor([row], jobs=jobs, task=changed), "")
+                for task in (None, old_task, "  Close migration\n fixtures and import integration.  "):
+                    self.assertEqual(RA.retry_predecessor([row], jobs=jobs, task=task), "")
+                self.assertFalse(RA.new_owner_request({**row, "terminal_conflict": "1"},
+                                                      jobs=jobs, task=changed))
+            for state in ("live", "unverifiable"):
+                with mock.patch.object(DC, "attempt_process_quiescence",
+                                       return_value=SimpleNamespace(state=state)):
+                    self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=changed))
+
     def test_changed_task_cannot_skip_an_open_unlaunched_transport_successor(self):
         latest = {"_status": "open", "launch_claimed": "0", "attempt_id": "att-gap-two",
                   "automatic_retry_of": "att-gap-one"}
