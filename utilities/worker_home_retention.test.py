@@ -308,6 +308,7 @@ class Expiry(Fixture):
         self.assertEqual(transcript.read_text(), '{"type":"message"}\n')
 
     def test_terminal_opencode_prunes_cache_preserving_database_wal_and_shm(self):
+        import sqlite3
         attempt = "att-opencode-live-main-retention"
         home = self.add(attempt, harness="opencode")
         identity = DC.process_launch_identity(os.getpid())
@@ -317,11 +318,16 @@ class Expiry(Fixture):
         self.write_rows()
         database = home / "runtime/data/opencode/opencode.db"
         database.parent.mkdir(parents=True)
-        database.write_bytes(b"private-db")
+        writer = sqlite3.connect(database)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE part (id TEXT PRIMARY KEY, data TEXT)")
+        writer.commit()
+        writer.execute("INSERT INTO part VALUES ('wal-row', 'still readable')")
+        writer.commit()
+        self.addCleanup(writer.close)
         wal = Path(str(database) + "-wal")
         shm = Path(str(database) + "-shm")
-        wal.write_bytes(b"wal-row")
-        shm.write_bytes(b"shared-memory")
+        self.assertGreater(wal.stat().st_size, 0)
         cache = home / "runtime/cache"
         cache.mkdir(parents=True)
         (cache / "entry").write_text("cache")
@@ -331,10 +337,15 @@ class Expiry(Fixture):
             result = self.sweep(1.01)
         self.assertEqual(result["partial"], 1, result)
         self.assertTrue((home / "worker-home.json").is_file())
-        self.assertEqual(database.read_bytes(), b"private-db")
-        self.assertEqual(wal.read_bytes(), b"wal-row")
-        self.assertEqual(shm.read_bytes(), b"shared-memory")
+        self.assertTrue(wal.is_file() and shm.is_file())
         self.assertFalse(cache.exists())
+        sys.path.insert(0, str(ROOT / "tools"))
+        import tidy_transcripts
+        with tidy_transcripts._opencode_view(database) as reader:
+            self.assertEqual(reader.execute("SELECT data FROM part WHERE id='wal-row'").fetchone(),
+                             ("still readable",))
+            with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                reader.execute("DELETE FROM part WHERE id='wal-row'")
 
     def test_partial_retire_journal_resumes_without_removing_retained_home(self):
         attempt = "att-partial-journal-recovery"
