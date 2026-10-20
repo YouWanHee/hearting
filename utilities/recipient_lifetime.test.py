@@ -101,6 +101,25 @@ class RecipientLifetimeTest(unittest.TestCase):
             self.assertIn("session-identity-unresolved", reasons)
             (process / "cmdline").write_bytes(b"claude\0daemon\0")
             complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertFalse(complete)
+            self.assertEqual(holders, set())
+            self.assertIn("session-identity-unresolved", reasons)
+
+            (home / "sessions" / "123.json").write_text(json.dumps({
+                "pid": 123, "procStart": "42", "sessionId": "daemon-sid"}))
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertTrue(complete, reasons)
+            self.assertEqual(holders, {"daemon-sid"})
+
+            (home / "sessions" / "123.json").unlink()
+            (process / "cmdline").write_bytes(b"claude\0remote-control\0")
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertFalse(complete)
+            self.assertEqual(holders, set())
+            self.assertIn("session-identity-unresolved", reasons)
+
+            (process / "cmdline").write_bytes(b"claude\0doctor\0")
+            complete, holders, reasons = claude_session_census(proc_root=root)
             self.assertTrue(complete, reasons)
             self.assertEqual(holders, set())
 
@@ -126,15 +145,40 @@ class RecipientLifetimeTest(unittest.TestCase):
 
     def test_native_invocation_classifier_separates_commands_from_conversations(self):
         for argv, expected in (
-            (["/usr/bin/claude", "daemon"], "command"),
+            (["/usr/bin/claude", "daemon"], "session"),
+            (["/usr/bin/claude", "remote-control"], "session"),
+            (["/usr/bin/claude", "doctor"], "command"),
             (["claude", "mcp", "serve"], "command"),
             (["claude", "--resume", "sid"], "session"),
             (["claude", "-p", "prompt"], "session"),
             (["claude", "--unknown-option"], "unknown"),
-            (["node", "/opt/@anthropic-ai/claude-code/cli.js", "daemon"], "command"),
+            (["node", "/opt/@anthropic-ai/claude-code/cli.js", "daemon"], "session"),
+            (["bun", "/opt/@anthropic-ai/claude-code/cli.js", "daemon"], "session"),
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(invocation_kind(argv), expected)
+
+    def test_fake_proc_node_and_bun_daemon_launchers_stay_unresolved_in_both_inventories(self):
+        for launcher in ("node", "bun"):
+            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "proc"
+                self._fake_proc_root(root)
+                proc, home = self._fake_runtime(
+                    root, 123, exe=f"/usr/bin/{launcher}",
+                    argv=(launcher, "/opt/@anthropic-ai/claude-code/cli.js", "daemon"))
+
+                complete, holders, reasons = claude_session_census(proc_root=root)
+
+                self.assertFalse(complete)
+                self.assertEqual(holders, set())
+                self.assertIn("session-identity-unresolved", reasons)
+                self.assertNotIn("process-inventory-changed", reasons)
+
+                (home / "sessions" / "123.json").write_text(json.dumps({
+                    "pid": 123, "procStart": "123", "sessionId": f"{launcher}-daemon-sid"}))
+                complete, holders, reasons = claude_session_census(proc_root=root)
+                self.assertTrue(complete, reasons)
+                self.assertEqual(holders, {f"{launcher}-daemon-sid"})
 
     def test_fake_proc_native_version_executable_with_claude_argv_is_a_holder(self):
         with tempfile.TemporaryDirectory() as temp:

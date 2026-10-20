@@ -122,8 +122,8 @@ def _argument_sessions(argv: list[str]) -> set[str]:
     return values
 
 
-_CLAUDE_COMMANDS = {"agents", "auth", "daemon", "doctor", "install", "mcp",
-                    "plugin", "remote-control", "setup-token", "update", "upgrade"}
+_CLAUDE_COMMANDS = {"agents", "auth", "doctor", "install", "mcp", "plugin",
+                    "setup-token", "update", "upgrade"}
 _CLAUDE_VALUE_OPTIONS = set("--model -m --effort --config -c --enable --disable --remote "
                             "--remote-auth-token-env --local-provider --profile -p "
                             "--sandbox -s --add-dir --ask-for-approval -a --session-id "
@@ -143,7 +143,7 @@ def invocation_kind(argv: list[str]) -> str:
         return "unknown"
     executable = os.path.basename(argv[0]).lower()
     tokens = list(argv)
-    if executable in {"node", "nodejs"} and len(tokens) > 1:
+    if executable in {"node", "nodejs", "bun"} and len(tokens) > 1:
         script = tokens[1]
         if "@anthropic-ai/claude-code" not in script and "claude-code" not in script:
             return "unknown"
