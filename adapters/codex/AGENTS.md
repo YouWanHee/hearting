@@ -108,10 +108,8 @@ hearting run capability-route compose --start --prompt-file <task> \
   [--shape direct] [--campaign-key <stream>]
 ```
 
-Use `--shape direct` only for one atomic, reversible inline change; otherwise
-omit it and let the frame decide. Other shape-free flags are hints. Follow
-decided routes under §0.2.1; person-named stages use
-`--shape staged --graph <stage,…>`.
+Shape-free flags are hints. Follow decided routes under §0.2.1; person-named
+stages use `--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` uses `AGENT_HOME` when set (dev
 activation: that checkout), else the installed release. The slug comes from the
@@ -138,8 +136,9 @@ Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallb
 route and environment, and a member of a sealed parallel group starts its
 whole group in one batch. Dispatch depth 3 is forbidden.
 
-Default to this session's route; start an interactive peer only for long work
-needing human answers or recovery.
+Default to this session's route; start an interactive peer with `hearting run
+peer-steward start` only for long work needing human answers or recovery.
+Command output panes use `hearting run pane open <command>`.
 
 Message another session only with `hearting run peer-steward prompt
 <name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
