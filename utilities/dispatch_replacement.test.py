@@ -3308,6 +3308,39 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
             self.snapshot(states, readiness="unsettled")
         self.assertEqual(unsettled.exception.reason, "replacement-completion-unsettled")
 
+    def test_unproven_refusal_carries_the_node_judgement_and_its_supported_action(self):
+        import shlex
+        evidence = str(self.root / "spec dir" / "eval-spec.md")
+        marker = {**self.markers["impl-review"], "evidence": {"path": evidence, "sha256": "old"}}
+        (self.completion / "impl-review.json").write_text(json.dumps(marker), encoding="utf-8")
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("revised-unrecorded", "completion-evidence-revised-unrecorded")
+        with self.assertRaises(D.DispatchContractError) as revised:
+            self.snapshot(states)
+        error = revised.exception
+        self.assertEqual((error.reason, error.detail), ("replacement-completion-unproven", "impl-review"))
+        self.assertEqual(error.completion, {
+            "completion_node": "impl-review", "completion_currency": "revised-unrecorded",
+            "completion_reason": "completion-evidence-revised-unrecorded",
+            "completion_evidence": evidence})
+        self.assertIn("capability-route.py revise --route rt-reuse --node impl-review "
+                      f"--evidence {shlex.quote(evidence)} ", error.next_step)
+        self.assertIn("cannot change that", error.next_step)
+        self.assertFalse(getattr(error, "retry_when", ""))
+
+        states["impl-review"] = ("integrity-broken:history-conflict", "completion-marker-history-conflict")
+        with self.assertRaises(D.DispatchContractError) as broken:
+            self.snapshot(states)
+        self.assertNotIn("revise", broken.exception.next_step)
+        self.assertIn("Inspect that node's completion marker", broken.exception.next_step)
+
+        # Waiting does clear an unsettled completion, so it keeps no next_step of its own.
+        states["impl-review"] = ("current", "completion-marker-verified")
+        with self.assertRaises(D.DispatchContractError) as unsettled:
+            self.snapshot(states, readiness="unsettled")
+        self.assertFalse(hasattr(unsettled.exception, "next_step"))
+
     def test_merge_index_snapshot_is_pending_only_while_merge_is_observed(self):
         git = ["git", "-C", str(self.root)]
         subprocess.run([*git, "init", "-q", "-b", "main"], check=True)

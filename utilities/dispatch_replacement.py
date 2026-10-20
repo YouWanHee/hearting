@@ -1287,6 +1287,30 @@ def _bind_source(jobs, lines, aid, record):
     raise DC.DispatchContractError('replacement-source-missing')
 
 
+def _completion_unproven(route, node, marker, currency):
+    """A completed node's evidence judgement blocks reuse; retrying cannot change it.
+
+    Carry the judgement and the existing supported action so the caller does
+    not have to rediagnose the marker.
+    """
+    node_id = str(node['id'])
+    error = DC.DispatchContractError('replacement-completion-unproven', node_id)
+    evidence = str(((marker or {}).get('evidence') or {}).get('path') or '')
+    error.completion = {'completion_node': node_id, 'completion_currency': currency.state,
+                        'completion_reason': currency.reason,
+                        **({'completion_evidence': evidence} if evidence else {})}
+    action = DC.route_state_next_action(currency.reason, node_id, route.get('route_id'), node,
+                                        evidence=evidence or None)
+    judged = (f"Completed node {node_id} reads {currency.state} ({currency.reason}); "
+              "running the same start again cannot change that.")
+    if action != '-':
+        error.next_step = (f"{judged} Run: {action} (outside an owner add "
+                           "--author-attempt-id <attempt that made the change>), then resume.")
+    else:
+        error.next_step = f"{judged} Inspect that node's completion marker and evidence, then resume."
+    return error
+
+
 def _reuse_snapshot(jobs, route, lines):
     """Pin settled current completions and identify only provenance-proved stale results."""
     module = DC._route_module()
@@ -1306,7 +1330,7 @@ def _reuse_snapshot(jobs, route, lines):
             import commit_policy
             merge_unobservable = commit_policy.git_operation(route.get('cwd', '')) == 'merge'
         if currency.state not in {'current', 'superseded'} and not merge_unobservable:
-            raise DC.DispatchContractError('replacement-completion-unproven', str(node['id']))
+            raise _completion_unproven(route, node, marker, currency)
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
             raise DC.DispatchContractError('replacement-completion-unsettled', str(node['id']))
@@ -2122,8 +2146,11 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
         elif not isinstance(exc, DC.DispatchContractError):
             result['detail'] = f'{type(exc).__name__}: {exc}'[:240]
         result.update(getattr(exc,'live',None) or {})
+        result.update(getattr(exc,'completion',None) or {})
         if getattr(exc, 'retry_when', ''):
             result.update(next_action=exc.next_action, retry_when=exc.retry_when)
+        elif getattr(exc, 'next_step', ''):
+            result['next_step'] = exc.next_step
         return result
 
 
