@@ -680,11 +680,19 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
 
 def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
                    attempt_metadata: dict | None = None, jobs: str | Path | None = None,
-                   worktree: str | Path | None = None, completion_dir: str | Path) -> dict | None:
+                   worktree: str | Path | None = None, completion_dir: str | Path,
+                   owner_inline: bool = False) -> dict | None:
     """Subject fields to put on a newly published completion marker."""
     if not has_source_subject(route, node):
         return None
     if is_implementation_review(route, node) or is_source_test(node):
+        if is_implementation_review(route, node) and owner_inline and attempt_id:
+            current = observe(route, node, worktree=worktree)
+            epoch = source_epoch(route, node, current["digest"], completion_dir)
+            return {"schema_version": SCHEMA_VERSION, "digest": current["digest"],
+                    "epoch": epoch, "inline_provenance": {
+                        "kind": "owner-inline", "attempt_id": attempt_id,
+                        "manifest_sha256": _sha(_canonical(current["manifest"]))}}
         if not attempt_metadata:
             if is_source_test(node):
                 raise SourceSubjectError("review-source-binding-missing", str(attempt_id or ""))
@@ -770,6 +778,21 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
     if implementation_review or source_test:
         attempt_id = marker.get("attempt_id")
         binding_digest = subject.get("binding_digest")
+        if implementation_review and "inline_provenance" in subject:
+            inline = subject["inline_provenance"]
+            if (not isinstance(inline, dict)
+                    or set(inline) != {"kind", "attempt_id", "manifest_sha256"}
+                    or inline.get("kind") != "owner-inline"
+                    or not attempt_id or inline.get("attempt_id") != attempt_id
+                    or inline.get("manifest_sha256") != _sha(_canonical(current["manifest"]))
+                    or marker.get("reviewer_kind") != "owner-inline"
+                    or marker.get("review_independence") != "degraded"
+                    or marker.get("reviewer_identity") != attempt_id
+                    or marker.get("registered_worker") is not False
+                    or marker.get("execution_surface") != "inline"
+                    or binding_digest is not None):
+                return "integrity-broken:identity-mismatch", "completion-review-inline-provenance-invalid"
+            return None
         if source_test and not binding_digest:
             inline = (marker.get("registered_worker") is False
                       and marker.get("execution_surface") == "inline")

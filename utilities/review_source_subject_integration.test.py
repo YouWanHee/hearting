@@ -35,6 +35,321 @@ DISPATCH_NODE = _load("dispatch_node_source_subject_fixture", "utilities/dispatc
 
 
 class SourceSubjectIntegrationTest(unittest.TestCase):
+    def test_replacement_reruns_inline_review_and_consumes_fresh_completion(self):
+        import artifact_producer
+        import dispatch_replacement as replacement
+        import route_lineage
+        from types import SimpleNamespace
+
+        checked = {
+            'parent_harness': 'claude', 'parent_transport': 'headless',
+            'parent_sandbox': 'adapter-default', 'child_harness': 'codex',
+            'launch_authority': 'conductor', 'status': 'supported',
+            'probe_source': 'fixture-probe', 'probe_time': '2026-07-16T00:00:00Z',
+            'failure_class': '', 'checked_worktree': str(self.repo),
+            'failure_scope': 'none', 'codex_command': 'ok',
+            'retry_on_isolated_worktree': 0,
+        }
+        with mock.patch.object(ROUTE_WRITER, '_compose_readiness', return_value={
+                'tuples': [checked], 'candidates': [{
+                    'harness': 'codex', 'transport': 'headless',
+                    'surface': 'registered-headless', 'status': 'supported',
+                    'probe_source': 'fixture-probe',
+                    'probe_time': '2026-07-20T00:00:00Z'}]}):
+            self.route = ROUTE_WRITER.compose_route(
+                capability='autopilot-code', capability_mode='debug',
+                shape='staged', graph='plan,execute,impl-review,test,report',
+                slug='fixture', cwd=self.repo, artifact_root=self.artifact_root,
+                unassigned=True)
+        ROUTE_WRITER.verify_route(self.route, expected_cwd=self.repo)
+        self.review_node = self.get_node('impl-review')
+        self.route_file = route_lineage.canonical_route_path(
+            self.artifact_root, self.route['route_id'])
+        self.route_file.parent.mkdir(parents=True, exist_ok=True)
+        self.route_file.write_text(json.dumps(self.route), encoding='utf-8')
+        artifact_producer.activate(
+            self.artifact_root, repository_id='repo_' + 'a' * 32,
+            artifact_root_id='root_' + 'b' * 32,
+            w7={'campaign_id': 'camp_' + 'c' * 32},
+        )
+        begun = artifact_producer.begin(
+            self.artifact_root, route_file=self.route_file,
+            capability='autopilot-code', intensity='standard')
+        self.output_dir = Path(begun['cycle_dir']) / 'artifacts'
+        cycle = artifact_producer.route_cycle_for(self.artifact_root, self.route)
+        self.assertTrue(artifact_producer.cycle_route_admission(
+            self.artifact_root, cycle, self.route).allow)
+        self.assertFalse(artifact_producer.cycle_route_admission(
+            self.artifact_root, cycle,
+            {**self.route, 'route_hash': 'sha256:' + '0' * 64}).allow)
+
+        def finished_process():
+            process = subprocess.Popen(['sleep', '0.05'], start_new_session=True)
+            identity = {'pid': str(process.pid), 'pgid': str(os.getpgid(process.pid)),
+                        'pid_start': str(DC.process_start_ticks(process.pid))}
+            process.wait(timeout=3)
+            return identity
+
+        for node_id in ('plan', 'execute'):
+            self.complete_node(node_id, f'att-replacement-inline-{node_id}', node_id)
+            metadata = (self._row_metadata(f'att-replacement-inline-{node_id}')
+                        if node_id == 'plan' and SUBJECT.has_review_subject(
+                            self.route, self.get_node(node_id), self.jobs) else
+                        self._metadata(self.get_node(node_id),
+                                       f'att-replacement-inline-{node_id}', 'stage'))
+            self._row(metadata,
+                      extra=finished_process())
+        node = self.review_node
+        attempt = 'att-owner-inline-review'
+        evidence = self.output_dir / 'owner-inline-review.md'
+        evidence.write_text('historical owner review', encoding='utf-8')
+        metadata = {**self._metadata(node, attempt, 'owner'),
+                    'registered_worker': '0', 'execution_surface': 'inline',
+                    'transport': 'interactive', 'fallback_hop': 'inline'}
+        old = ROUTE_WRITER._publish_completion_locked(
+            self.route, node, node['id'], evidence, jobs=self.jobs,
+            attempt_id=attempt, attempt_metadata=metadata)
+        # Materialize a marker published by the old writer. Both historical
+        # bytes and the canonical head begin without source provenance.
+        old.pop('source_subject')
+        marker_dir = ROUTE_WRITER.completion_dir(self.route['route_id'], jobs=self.jobs)
+        for path in (marker_dir / 'impl-review.json',
+                     marker_dir / f"impl-review.{old['sequence']}.json"):
+            path.write_text(json.dumps(old, sort_keys=True), encoding='utf-8')
+        old_history = (marker_dir / f"impl-review.{old['sequence']}.json").read_bytes()
+        self.assertEqual(old['reviewer_kind'], 'owner-inline')
+        self.assertEqual(self.currency(old).reason, 'completion-source-subject-unknown')
+        self.complete_node('test', 'att-historical-test', 'historical test')
+        self._row(self._row_metadata('att-historical-test'),
+                  extra=finished_process())
+        self.complete_node('report', 'att-historical-report', 'historical report')
+        self._row(self._metadata(self.get_node('report'), 'att-historical-report', 'stage'),
+                  extra=finished_process())
+        report_path = ROUTE_WRITER.completion_dir(
+            self.route['route_id'], jobs=self.jobs) / 'report.json'
+        original_report = report_path.read_bytes()
+        invalid_report = {**json.loads(original_report), 'route_hash': 'sha256:' + '0' * 64}
+        report_path.write_text(json.dumps(invalid_report), encoding='utf-8')
+        try:
+            with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                self.assertTrue(DC.gate_currency(
+                    self.route, self.get_node('report'), report_path,
+                    jobs=self.jobs).state.startswith('integrity-broken'))
+                with self.assertRaises(DC.DispatchContractError) as corrupt:
+                    replacement._reuse_snapshot(
+                        self.jobs, self.route, self.jobs.read_text().splitlines())
+                self.assertEqual((corrupt.exception.reason, corrupt.exception.detail),
+                                 ('replacement-completion-unproven', 'report'))
+        finally:
+            report_path.write_bytes(original_report)
+        snapshot = replacement._reuse_snapshot(self.jobs, self.route,
+                                                self.jobs.read_text().splitlines())
+        self.assertEqual(snapshot['pending'],
+                         ['impl-review', 'test', 'report'])
+        self.assertEqual([row['node'] for row in snapshot['completed']], ['plan', 'execute'])
+
+        # Verify the sealed route, claim, answer retention, admission and reuse.
+        # Only model launch and short-lived process identity are fixture seams.
+        import dispatch_owner_input as owner_input
+        owner = 'att-blocked-owner'
+        args = SimpleNamespace(attempt_id=owner, jobs_path=self.jobs,
+            worktree=str(self.repo), route_id=self.route['route_id'], route_node='plan',
+            launch_lifecycle='detached', replacement_input_argv=[
+                '--start', '--attempt-id', owner, '--prompt-text', 'finish the route'])
+        sealed = DC.parse_registry_metadata(replacement.seal_launch_input(
+            args, 'codex', 'finish the route'))
+        owner_meta = {**self._metadata(node, owner, 'owner'), **sealed,
+            'dispatch_depth': '1', 'route_node': 'frame', 'parent_sid': 'fixture-parent',
+            'harness': 'codex', 'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
+        owner_meta.update(finished_process())
+        self.assertEqual(DC.attempt_process_quiescence(owner_meta).state, 'quiescent')
+        self._row(owner_meta, status='open', note='dead-worker-blocked',
+                  extra={'failure_class': 'blocked'})
+        owner_input.initialize_owner_input(self.jobs, owner, 'claude-next-turn')
+        self._row(owner_meta, status='done', note='dead-worker-blocked',
+                  extra={'failure_class': 'blocked'})
+        answer = owner_input.submit(self.jobs, owner, 'approved: rerun fresh review', 'answer-1')
+        self.assertTrue(answer['retained'])
+        launches = []
+        def fake_model_launch(command, **_kwargs):
+            launches.append(command)
+            record = replacement.claim(self.jobs, owner)
+            source = replacement._rows(self.jobs.read_text().splitlines())[owner][1]
+            replay = replacement.launch_input(self.jobs, owner, source)
+            successor_args = SimpleNamespace(**vars(args))
+            successor_args.attempt_id = record['replacement_attempt_id']
+            successor_args.replacement_input_argv = replacement._replacement_argv(
+                record, source, replay)
+            candidate = {**owner_meta, 'attempt_id': record['replacement_attempt_id'],
+                         'automatic_retry_of': owner}
+            for transient in ('note', 'failure_class', 'pid', 'pid_start', 'pgid'):
+                candidate.pop(transient, None)
+            candidate.update(DC.parse_registry_metadata(replacement.seal_launch_input(
+                successor_args, 'codex', 'finish the route')))
+            self.assertEqual(replacement.admission(
+                self.jobs, self.jobs.read_text().splitlines(), candidate), record)
+            row = '\t'.join(('fixture', 'open', str(self.repo), str(self.repo),
+                             'replacement', ','.join(f'{k}={v}' for k, v in sorted(candidate.items()))))
+            self.assertTrue(DC.claim_attempt_row(
+                self.jobs, candidate['attempt_id'], row, launch=False))
+            registered = replacement._rows(self.jobs.read_text().splitlines())[
+                candidate['attempt_id']][1]
+            self.assertEqual(replacement.admission(
+                self.jobs, self.jobs.read_text().splitlines(), registered), record)
+            self.assertTrue(DC.claim_attempt_row(
+                self.jobs, candidate['attempt_id'], row, launch=True))
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        with mock.patch.dict(os.environ, {
+                 'CODEX_THREAD_ID': 'fixture-parent',
+                 'AGENT_DISPATCH_PARENT_SESSION_ID': 'fixture-parent'}), \
+             mock.patch('dispatch_capacity_evidence.harness_hold', return_value=None):
+            DC._route_module().verify_route(json.loads(self.route_file.read_text()))
+            claim = replacement.claim(self.jobs, owner)
+            report_path = ROUTE_WRITER.completion_dir(
+                self.route['route_id'], jobs=self.jobs) / 'report.json'
+            original_report = report_path.read_bytes()
+            altered_report = {**json.loads(original_report), 'fixture_drift': 'after-claim'}
+            report_path.write_text(json.dumps(altered_report), encoding='utf-8')
+            try:
+                with self.assertRaises(DC.DispatchContractError) as drift:
+                    replacement.validate_claim_source(
+                        self.jobs, self.jobs.read_text().splitlines(), claim)
+                self.assertEqual((drift.exception.reason, drift.exception.detail),
+                                 ('replacement-completion-unproven', 'report'))
+            finally:
+                report_path.write_bytes(original_report)
+            started = replacement.advance(
+                self.jobs, owner, resume_capacity=True, run=fake_model_launch)
+            repeated = replacement.advance(
+                self.jobs, owner, resume_capacity=True, run=fake_model_launch)
+        self.assertEqual(claim['proof']['death_kind'], replacement.CORRECTED)
+        self.assertEqual(started['state'], 'running')
+        self.assertIn(repeated['state'], ('running', 'reused'))
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(started['record']['replacement_attempt_id'],
+                         claim['replacement_attempt_id'])
+        self.assertEqual(claim['reuse']['pending'],
+                         ['impl-review', 'test', 'report'])
+        self.assertEqual(owner_input.retained(self.jobs, owner)[0]['text'],
+                         'approved: rerun fresh review')
+
+        fresh = 'att-fresh-owner-inline-review'
+        new_evidence = self.output_dir / 'fresh-review.md'
+        new_evidence.write_text('fresh owner inline review', encoding='utf-8')
+        inline_meta = {**self._metadata(node, fresh, 'owner'),
+                       'registered_worker': '0', 'execution_surface': 'inline',
+                       'transport': 'interactive', 'fallback_hop': 'inline'}
+        marker, result = ROUTE_WRITER.complete_node(
+            self.route, node, node['id'], new_evidence,
+            attempt_id=fresh, explicit_attempt_metadata=inline_meta)
+        self.assertEqual(result['status'], 'unregistered-complete')
+        self.assertEqual((marker['reviewer_kind'], marker['review_independence']),
+                         ('owner-inline', 'degraded'))
+        self.assertEqual(marker['sequence'], old['sequence'] + 1)
+        self.assertEqual(self.currency(marker).state, 'current')
+        self.assertEqual((marker_dir / f"impl-review.{old['sequence']}.json").read_bytes(),
+                         old_history)
+        self.assertEqual(DC.completion_marker_gate(
+            str(self.route_file), 'test', 'start', self.agent_home, self.jobs), None)
+        def consume_stage(node_id, attempt_id):
+            stage_node = self.get_node(node_id)
+            metadata = self._metadata(stage_node, attempt_id, 'stage')
+            if SUBJECT.has_review_subject(self.route, stage_node, self.jobs):
+                metadata.update(SUBJECT.seal_attempt(
+                    self.jobs, self.route, stage_node, attempt_id,
+                    worktree=self.repo))
+            self._row(metadata,
+                      status='running', note='launch-started',
+                      extra=finished_process())
+            evidence = self.output_dir / f'{attempt_id}.md'
+            evidence.write_text(f'fresh {node_id}', encoding='utf-8')
+            marker, result = ROUTE_WRITER.complete_node(
+                self.route, stage_node, node_id, evidence,
+                jobs=self.jobs, attempt_id=attempt_id)
+            self.assertEqual(result['status'], 'closed')
+            return marker
+
+        consume_stage('test', 'att-fresh-test')
+        self.assertEqual(DC.gate_currency(
+            self.route, self.get_node('test'),
+            ROUTE_WRITER.completion_dir(self.route['route_id'], jobs=self.jobs) / 'test.json',
+            jobs=self.jobs).state, 'current')
+        consume_stage('report', 'att-fresh-report')
+        self.assertEqual(DC.gate_currency(
+            self.route, self.get_node('report'),
+            ROUTE_WRITER.completion_dir(self.route['route_id'], jobs=self.jobs) / 'report.json',
+            jobs=self.jobs).state, 'current')
+
+        completed_snapshot = replacement._reuse_snapshot(
+            self.jobs, self.route, self.jobs.read_text().splitlines())
+        self.assertEqual(completed_snapshot['pending'], [])
+        self.assertEqual([item['node'] for item in completed_snapshot['completed']],
+                         ['plan', 'execute', 'impl-review', 'test', 'report'])
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+            self.assertEqual(self.currency(marker).state, 'current')
+            self.assertEqual(replacement._reuse_snapshot(
+                self.jobs, self.route, self.jobs.read_text().splitlines())['pending'], [])
+
+        bad = json.loads(json.dumps(marker))
+        bad['source_subject']['inline_provenance'].pop('manifest_sha256')
+        self.assertEqual(SUBJECT.marker_currency(
+            self.route, node, bad, marker_dir, jobs=self.jobs),
+            ('integrity-broken:identity-mismatch', 'completion-review-inline-provenance-invalid'))
+        unbound = json.loads(json.dumps(marker))
+        unbound['source_subject'].pop('inline_provenance')
+        self.assertEqual(SUBJECT.marker_currency(
+            self.route, node, unbound, marker_dir, jobs=self.jobs),
+            ('superseded', 'completion-review-source-binding-unknown'))
+
+        forged_markers = []
+        for field, value in (
+                ('attempt_id', 'att-other-attempt'),
+                ('reviewer_identity', 'att-other-reviewer'),
+                ('reviewer_kind', 'registered-worker'),
+                ('review_independence', 'independent'),
+                ('registered_worker', True),
+                ('execution_surface', 'registered')):
+            forged = json.loads(json.dumps(marker))
+            forged[field] = value
+            forged_markers.append((field, forged))
+        forged = json.loads(json.dumps(marker))
+        forged['source_subject']['inline_provenance']['attempt_id'] = 'att-other-provenance'
+        forged_markers.append(('inline_provenance.attempt_id', forged))
+        for identity_field, forged in forged_markers:
+            with self.subTest(identity_field=identity_field):
+                self.assertEqual(SUBJECT.marker_currency(
+                    self.route, node, forged, marker_dir, jobs=self.jobs),
+                    ('integrity-broken:identity-mismatch',
+                     'completion-review-inline-provenance-invalid'))
+
+        (self.repo / 'engine.py').write_text("value = 'after-inline'\n", encoding='utf-8')
+        self.assertEqual(self.currency(marker).reason, 'completion-review-source-stale')
+        b_attempt = 'att-owner-inline-review-B'
+        b_evidence = self.output_dir / 'fresh-review-B.md'
+        b_evidence.write_text('fresh owner inline review at source B', encoding='utf-8')
+        b_metadata = {**self._metadata(node, b_attempt, 'owner'),
+                      'registered_worker': '0', 'execution_surface': 'inline',
+                      'transport': 'interactive', 'fallback_hop': 'inline'}
+        b_marker, b_result = ROUTE_WRITER.complete_node(
+            self.route, node, node['id'], b_evidence,
+            attempt_id=b_attempt, explicit_attempt_metadata=b_metadata)
+        self.assertEqual(b_result['status'], 'unregistered-complete')
+        self.assertEqual(b_marker['source_subject']['epoch'], marker['source_subject']['epoch'] + 1)
+        self.assertEqual(self.currency(b_marker).state, 'current')
+        (self.repo / 'engine.py').write_text("value = 'A'\n", encoding='utf-8')
+        source_a_again = SUBJECT.observe(self.route, node, worktree=self.repo)
+        self.assertEqual(SUBJECT.source_epoch(
+            self.route, node, source_a_again['digest'], marker_dir),
+            marker['source_subject']['epoch'] + 2)
+        self.assertEqual(SUBJECT.marker_currency(
+            self.route, node, marker, marker_dir, jobs=self.jobs),
+            ('superseded', 'completion-review-source-stale'))
+        self.assertEqual(self.currency(b_marker).reason, 'completion-review-source-stale')
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+            pending = replacement._reuse_snapshot(
+                self.jobs, self.route, self.jobs.read_text().splitlines())['pending']
+            self.assertIn('impl-review', pending)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -60,7 +375,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.stable_home.mkdir()
         self.route = {
             "schema_version": 2, "dispatch_contract_version": 3,
-            "route_id": "", "route_hash": "", "registry_digest": "fixture-registry",
+            "route_id": "", "route_hash": "", "registry_digest": ROUTE_WRITER.TOPO.registry_digest(ROUTE_WRITER.TOPO.load_registry()),
             "capability": "autopilot-code", "capability_mode": "debug",
             "effective_intensity": "standard",
             "continuation_budget": {"review_round_cap": 2},
@@ -156,7 +471,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
 
     def complete_node(self, node_id, attempt_id, evidence_text):
         node = self.get_node(node_id)
-        evidence = self.artifact_root / f"{attempt_id}.md"
+        evidence = getattr(self, "output_dir", self.artifact_root) / f"{attempt_id}.md"
         evidence.write_text(evidence_text, encoding="utf-8")
         metadata = self._metadata(node, attempt_id, "stage")
         if SUBJECT.has_review_subject(self.route, node, self.jobs):
@@ -170,7 +485,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         )
 
     def revise_execute(self, attempt_id, evidence_text):
-        evidence = self.artifact_root / f"{attempt_id}.md"
+        evidence = getattr(self, "output_dir", self.artifact_root) / f"{attempt_id}.md"
         evidence.write_text(evidence_text, encoding="utf-8")
         return ROUTE_WRITER.publish_revision_locked(
             self.route, "execute", evidence, basis="user-direction",
@@ -202,7 +517,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
 
     def complete_review(self, attempt_id, *, evidence_text="independent PASS"):
         metadata = self.prepare_review(attempt_id)
-        evidence = self.artifact_root / f"{attempt_id}.md"
+        evidence = getattr(self, "output_dir", self.artifact_root) / f"{attempt_id}.md"
         evidence.write_text(evidence_text, encoding="utf-8")
         marker = ROUTE_WRITER._publish_completion_locked(
             self.route, self.review_node, self.review_node["id"], evidence, jobs=self.jobs,

@@ -195,6 +195,28 @@ class SourceSubjectTest(unittest.TestCase):
         self.assertEqual(SUBJECT.marker_currency(self.route, self.test_node, legacy, completion),
                          ("superseded", "completion-source-subject-unknown"))
 
+    def test_owner_inline_review_provenance_needs_its_exact_attempt(self):
+        completion = Path(self.temp.name) / "completion" / self.route["route_id"]
+        attempt = "att-owner-inline-review"
+        subject = SUBJECT.marker_subject(
+            self.route, self.node, attempt_id=attempt, worktree=self.repo,
+            completion_dir=completion, owner_inline=True,
+        )
+        self.assertEqual(subject["inline_provenance"]["attempt_id"], attempt)
+        marker = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                  "node_id": self.node["id"], "completion_gate": "code-impl-review",
+                  "attempt_id": attempt, "registered_worker": False,
+                  "execution_surface": "inline", "reviewer_kind": "owner-inline",
+                  "review_independence": "degraded", "reviewer_identity": attempt,
+                  "source_subject": subject}
+        self.assertIsNone(SUBJECT.marker_currency(self.route, self.node, marker, completion))
+        # Without an exact attempt the provenance could never validate, so the
+        # marker keeps the historical source-unknown shape and is rerun.
+        self.assertIsNone(SUBJECT.marker_subject(
+            self.route, self.node, attempt_id=None, worktree=self.repo,
+            completion_dir=completion, owner_inline=True,
+        ))
+
     def observe_test(self):
         return SUBJECT.observe(self.route, self.test_node, worktree=self.repo)
 
