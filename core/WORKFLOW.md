@@ -668,7 +668,8 @@ not identify affected users or systems; unspecified scope stays unspecified.
 For answers, set `actor_kind: user` only for the person's actual reply, or
 `actor_kind: supervisor` when the depth-0 supervisor answers on the person's
 behalf (including adopting a recommendation). The answer template keeps
-`actor_kind: unknown` until its source is explicitly recorded. Unmarked answers
+`actor_kind: unknown` until its source is explicitly recorded; the separate
+`supervisor_answers_template` already carries `actor_kind: supervisor`. Unmarked answers
 remain unknown, and registered workers cannot claim either release authority.
 A supervisor answer releases frame-review with its source preserved in intent;
 person-only start approvals keep their existing gates. This meaning is shared

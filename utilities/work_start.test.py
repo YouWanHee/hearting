@@ -1795,10 +1795,15 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             self.assertEqual((self.calls, record.call_count), (["gate", "release"], 1))
 
     def test_a_supervisor_answer_releases_frame_review_on_the_persons_behalf(self):
+        question, _ = self.routed()
         asked = self.step(interview=self.question_file)
-        answer = self.answers()
-        response = json.loads(answer.read_text())
-        response["actor_kind"] = "supervisor"
+        answer = self.base / "answers.json"
+        response = asked["supervisor_answers_template"]
+        self.assertEqual(response["actor_kind"], "supervisor")
+        response["understanding_confirmed"] = True
+        for item in question["questions"]:
+            self.assertIsNone(response["answers"][item["id"]]["choice"])
+            response["answers"][item["id"]]["choice"] = item["recommended"]
         answer.write_text(json.dumps(response))
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
             with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
@@ -1807,6 +1812,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         released = self.step(answers=answer)
         self.assertEqual(released["state"], "released")
         self.assertEqual(self.resolution()["actor_kind"], "supervisor")
+        self.assertEqual(self.resolution()["answers"]["answers"]["go"]["choice"], 0)
         self.assertIn("status: agreed-on-behalf\nactor_kind: supervisor", Path(released["intent_file"]).read_text())
         self.assertEqual(self.calls, ["gate", "release"])
         self.assertEqual(Path(asked["interview_file"]).parent, Path(released["interview_file"]).parent)
@@ -1915,9 +1921,10 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         asked = self.step(interview=self.question_file)
         self.assertEqual(asked["state"], "needs-question")
         self.assertIn(FI.ANSWER_SOURCE_GUIDANCE, asked["next_step"])
-        response = asked["answers_template"]
-        self.assertEqual(response["actor_kind"], "unknown")
-        response.update(actor_kind="supervisor", understanding_confirmed=True)
+        self.assertEqual(asked["answers_template"]["actor_kind"], "unknown")
+        response = asked["supervisor_answers_template"]
+        self.assertEqual(response["actor_kind"], "supervisor")
+        response["understanding_confirmed"] = True
         answer = self.base / "supervisor-answer.json"
         answer.write_text(json.dumps(response))
         released = self.step(answers=answer)
