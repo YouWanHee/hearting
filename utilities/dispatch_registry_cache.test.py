@@ -106,6 +106,31 @@ class RegistryLinesCacheTest(unittest.TestCase):
                 self.assertIsNot(first, second)
                 self.assertIs(CACHE.registry_view(self.jobs, append_only=True), second)
 
+    def test_scope_pins_alias_across_retarget_and_next_scope_observes_new_target(self):
+        other = self.jobs.with_name("other.log")
+        alias = self.jobs.with_name("alias.log")
+        self.jobs.write_text("old\topen\t/repo\t/wt\tworker\tf=1\n", encoding="utf-8")
+        other.write_text("new\tdone\t/repo\t/wt\tworker\tf=2\n", encoding="utf-8")
+        alias.symlink_to(self.jobs)
+        with CACHE.registry_read_scope():
+            first = CACHE.registry_view(alias)
+            first_lines = CACHE.registry_text_lines(alias)
+            alias.unlink()
+            alias.symlink_to(other)
+            with CACHE.registry_read_scope():
+                self.assertIs(CACHE.current_registry_view(alias), first)
+                self.assertEqual(CACHE.registry_text_lines(alias), first_lines)
+            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
+        with CACHE.registry_read_scope():
+            second = CACHE.current_registry_view(alias)
+            self.assertEqual(second.lines[0].split("\t")[0], "new")
+            self.assertEqual(CACHE.registry_text_lines(alias),
+                             tuple(other.read_text(errors="replace").splitlines()))
+            self.assertIsNot(first, second)
+        # Unscoped aliases still have independent lexical cache slots.
+        self.assertIsNot(CACHE.registry_view(other), second)
+        self.assertIs(CACHE.registry_view(alias), second)
+
     def test_scope_pins_one_generation_and_next_scope_observes_replacement(self):
         self.jobs.write_text("t\topen\t/repo\t/wt\tone\tattempt_id=one\n", encoding="utf-8")
         CACHE.reset_metrics()

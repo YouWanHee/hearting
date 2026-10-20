@@ -512,7 +512,9 @@ def registry_scope_active() -> bool:
 
 def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str, ...]]:
     path = Path(jobs)
-    key = (str(path.absolute()), str(path.resolve(strict=False)))
+    # Bind an alias on first access too: retargeting it must not split one
+    # Fleet pass across generations. The next pass resolves the alias afresh.
+    key = str(path.absolute())
     held = scope.get(key)
     if held is None:
         try:
