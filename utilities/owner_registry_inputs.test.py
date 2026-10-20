@@ -69,7 +69,7 @@ class OwnerRegistryInputsTest(unittest.TestCase):
         return route_module._owner_terminal_observation(
             self.route, self.node, jobs=self.jobs)
 
-    def test_repeated_identity_reads_share_bytes_but_still_validate_current_proof(self):
+    def test_repeated_identity_reads_share_parsing_but_validate_current_bytes_and_proof(self):
         unrelated = self.row(attempt="att-unrelated", route_id="rt-other",
                              route_hash="sha256:" + "f" * 64)
         self.jobs.write_text(unrelated * 300 + self.row())
@@ -87,8 +87,14 @@ class OwnerRegistryInputsTest(unittest.TestCase):
                 terminal.verify_request_identity(self.request, self.route)
                 result = self.observe()
                 self.assertTrue(result["passed"], result)
-        self.assertEqual(direct_bytes[0] + cache.metrics_snapshot()["bytes_read"],
-                         self.jobs.stat().st_size)
+        metrics = cache.metrics_snapshot()
+        self.assertEqual(direct_bytes[0], 0)
+        # Each of the two readers validates two snapshots on all eight passes;
+        # the shared view still parses the same 301 rows only once.
+        self.assertEqual(metrics["content_reads"], 32)
+        self.assertEqual(metrics["bytes_read"], self.jobs.stat().st_size * 32)
+        self.assertEqual(metrics["full_metadata_parses"], 1)
+        self.assertEqual(metrics["metadata_rows_parsed"], 301)
         # Cached raw rows cannot replace a changed non-registry proof.
         self.validate.side_effect = terminal.TerminalCommitError(
             "route-identity-unverified", "fixture-changed-binding")
