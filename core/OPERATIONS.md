@@ -2589,6 +2589,19 @@ text; that path is reported as unobserved with partial source coverage. Pending
 call correlation is bounded; eviction that may lose a pair also makes coverage
 partial.
 
+OpenCode V2 exposes two distinct native record forms: assistant `shell` tool
+parts and `session_message` rows whose type is `shell` and whose native
+metadata says `background: true`. Keep their native ID namespaces separate;
+do not infer an alias from matching command, cwd, or time. A shell row's own
+status, `time.created`/`time.completed`, exit code, and output cursor/size are
+task evidence; completion of an assistant invocation alone is not process
+exit. Page across every session-message type so non-candidates advance the
+cursor, and refresh known mutable rows by exact sequence even after they leave
+the recent window. Resolve a live output file only by exact `shellID` beneath
+the configured original OpenCode data directory. A copied snapshot database's
+parent, guessed location key, or retained file cannot prove a process alive or
+exited. V1 remains unobserved for this native background record form.
+
 **Accepted PRD delta (2026-10-20):** the current shared Fleet PRD v86 F-47 still
 describes one session badge and hides calls younger than 60 seconds. The
 approved background-task intent expands those display limits for acknowledged

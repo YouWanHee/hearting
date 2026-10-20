@@ -4253,7 +4253,8 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
         reason = str(observation.get("reason") or "")
         partial = observation.get("coverage") == "partial"
         if state in {"catching-up", "unavailable", "unobserved", "failed", "unknown", "missing"} or partial:
-            detail = " history catching up" if state == "catching-up" or partial else " " + state
+            detail = (" history catching up" if state == "catching-up" else
+                      " observation partial" if partial else " " + state)
             if reason:
                 detail += " · " + reason.replace("-", " ")
             text = "⚙ tasks" + detail

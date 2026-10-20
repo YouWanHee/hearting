@@ -2161,7 +2161,9 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
                 opencode_runtime = opencode_collector._opencode_v2_runtime()
                 page = opencode_runtime.read_session_shell_tasks(
                     connection, session_id,
-                    after_seq=opencode_collector._v2_shell_cursor(db, session_id, attempt_id))
+                    after_seq=opencode_collector._v2_shell_cursor(db, session_id, attempt_id),
+                    refresh_seqs=opencode_collector._v2_shell_refresh_seqs(
+                        db, session_id, attempt_id))
                 signature = signatures.get("")
                 identity = ({"device": signature[0], "inode": signature[1]}
                             if isinstance(signature, tuple) and len(signature) >= 2 else None)
@@ -2183,7 +2185,11 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
             job._native_now = (activity["summary"], activity.get("summary_ts"))
         observed = shell_observation
         if observed.get("state") == "observed" and observed.get("generation") == "v2":
-            opencode_collector._attach_v2_shell_tasks(job, observed, db, session_id)
+            opencode_collector._attach_v2_shell_tasks(
+                job, observed, db, session_id,
+                tree=getattr(job, "_proc_tree", None),
+                kids=getattr(job, "_proc_kids", None),
+                native_data_root=os.path.join(runtime, "data", "opencode"))
         else:
             job.shell_jobs = []
             job.shell_job_observation = {"state": observed.get("state", "unknown"),

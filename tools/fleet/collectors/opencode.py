@@ -44,6 +44,10 @@ _COLS = ("id, slug, agent, model, cost, tokens_input, tokens_output, tokens_reas
 _DEFAULT_VARIANTS = frozenset({"default", "runtime-default", "inherit"})
 _V2_SHELL_TASKS = OrderedDict()
 _V2_SHELL_TASK_LIMIT = 256
+_NATIVE_SHELL_OUTPUT_LOCATORS = OrderedDict()
+_NATIVE_SHELL_LOCATION_LIMIT = 256
+_NATIVE_SHELL_DIRECTORY_ENTRY_LIMIT = 512
+_NATIVE_SHELL_LOCATOR_TTL = 3.0
 
 
 def _v2_shell_key(db, session_id, attempt_id=None):
@@ -62,76 +66,296 @@ def _v2_shell_cursor(db, session_id, attempt_id=None):
     return state.get("cursor", 0) if state.get("database_identity") == identity else 0
 
 
-def _attach_v2_shell_tasks(sess, observed, db, session_id):
+def _v2_shell_refresh_seqs(db, session_id, attempt_id=None):
+    state = _V2_SHELL_TASKS.get(_v2_shell_key(db, session_id, attempt_id))
+    if not isinstance(state, dict):
+        return []
+    try:
+        st = os.stat(db)
+        identity = {"device": st.st_dev, "inode": st.st_ino}
+    except OSError:
+        identity = None
+    if state.get("database_identity") != identity or not identity:
+        return []
+    pending = sorted(seq for seq in state.get("mutable_seqs", ())
+                     if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0)
+    if not pending:
+        return []
+    runtime = _opencode_v2_runtime()
+    limit = runtime.MAX_SHELL_TASK_REFRESH
+    offset = state.get("refresh_offset", 0)
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        offset = 0
+    offset %= len(pending)
+    selected = (pending[offset:] + pending[:offset])[:limit]
+    state["refresh_offset"] = (offset + len(selected)) % len(pending)
+    return selected
+
+
+def _verified_native_shell_output(path, data_root, shell_root):
+    try:
+        output = Path(path)
+        parent = output.parent
+        parent_stat = os.lstat(parent)
+        output_stat = os.lstat(output)
+        return (not stat.S_ISLNK(parent_stat.st_mode)
+                and stat.S_ISDIR(parent_stat.st_mode)
+                and not stat.S_ISLNK(output_stat.st_mode)
+                and stat.S_ISREG(output_stat.st_mode)
+                and parent.parent.resolve() == shell_root
+                and output.resolve(strict=True).is_relative_to(data_root))
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _native_shell_output_locator(native_id, *, data_root=None):
+    """Find only an exact native shellID output file under OpenCode's data root."""
+    if not isinstance(native_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", native_id):
+        return {"state": "unknown", "reason": "native-shell-id-invalid"}
+    try:
+        if data_root is None:
+            runtime = _opencode_v2_runtime()
+            data_root = runtime.opencode_data_dir()
+        data_root = Path(data_root).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {"state": "unknown", "reason": "native-data-root-unavailable"}
+    shell_root = data_root / "shell"
+    cache_key = (str(data_root), native_id)
+    now = time.monotonic()
+    cached = _NATIVE_SHELL_OUTPUT_LOCATORS.get(cache_key)
+    if isinstance(cached, dict) and now - cached.get("checked_at", 0) <= _NATIVE_SHELL_LOCATOR_TTL:
+        path = cached.get("path")
+        if path is None:
+            return {"state": cached.get("state", "unknown"),
+                    "reason": cached.get("reason")}
+        if _verified_native_shell_output(path, data_root, shell_root):
+            return {"state": "observed", "path": path, "reason": None}
+        _NATIVE_SHELL_OUTPUT_LOCATORS.pop(cache_key, None)
+    candidates = []
+    failure = None
+    scanned = 0
+    locations = 0
+    try:
+        entries = os.scandir(shell_root)
+    except FileNotFoundError:
+        result = {"state": "unavailable", "reason": "native-shell-storage-not-found"}
+    except OSError as exc:
+        result = {"state": "unavailable",
+                  "reason": "native-shell-storage-" + type(exc).__name__}
+    else:
+        try:
+            with entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > _NATIVE_SHELL_DIRECTORY_ENTRY_LIMIT:
+                        failure = "native-shell-location-scan-limit"
+                        break
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        failure = "native-shell-location-unreadable"
+                        break
+                    locations += 1
+                    if locations > _NATIVE_SHELL_LOCATION_LIMIT:
+                        failure = "native-shell-location-scan-limit"
+                        break
+                    if len(candidates) >= _NATIVE_SHELL_LOCATION_LIMIT:
+                        failure = "native-shell-location-scan-limit"
+                        break
+                    candidate = os.path.join(entry.path, native_id + ".out")
+                    try:
+                        candidate_stat = os.lstat(candidate)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        failure = "native-shell-output-unreadable"
+                        break
+                    if (not stat.S_ISREG(candidate_stat.st_mode)
+                            or stat.S_ISLNK(candidate_stat.st_mode)
+                            or not _verified_native_shell_output(candidate, data_root, shell_root)):
+                        failure = "native-shell-output-not-regular"
+                        break
+                    candidates.append(candidate)
+        except OSError:
+            failure = failure or "native-shell-location-read-failed"
+        if failure:
+            result = {"state": "partial", "reason": failure}
+        elif len(candidates) > 1:
+            result = {"state": "ambiguous", "reason": "native-shell-output-id-ambiguous"}
+        elif len(candidates) == 1:
+            result = {"state": "observed", "path": candidates[0], "reason": None}
+        else:
+            result = {"state": "unavailable", "reason": "native-shell-output-not-found"}
+    _NATIVE_SHELL_OUTPUT_LOCATORS[cache_key] = {**result, "checked_at": now}
+    _NATIVE_SHELL_OUTPUT_LOCATORS.move_to_end(cache_key)
+    while len(_NATIVE_SHELL_OUTPUT_LOCATORS) > 512:
+        _NATIVE_SHELL_OUTPUT_LOCATORS.popitem(last=False)
+    return result
+
+
+def _native_terminal(item):
+    status = str(item.get("native_status") or "").lower()
+    return (status in {"completed", "complete", "exited", "failed", "error",
+                       "cancelled", "canceled", "stopped"}
+            or item.get("completed_at") is not None
+            or (isinstance(item.get("exit_code"), int)
+                and not isinstance(item.get("exit_code"), bool)))
+
+
+def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=None,
+                           native_data_root=None):
     attempt_id = getattr(sess, "attempt_id", None)
     key = _v2_shell_key(db, session_id, attempt_id)
     source = observed.get("database_identity")
+    source_valid = (isinstance(source, dict)
+                    and isinstance(source.get("device"), int)
+                    and not isinstance(source.get("device"), bool)
+                    and isinstance(source.get("inode"), int)
+                    and not isinstance(source.get("inode"), bool))
     source_label = ("opencode-v2:%s:%s" % (source.get("device"), source.get("inode"))
-                    if isinstance(source, dict) else "opencode-v2:identity-unavailable")
-    state = _V2_SHELL_TASKS.get(key)
-    if (not isinstance(state, dict) or state.get("database_identity") != source):
+                    if source_valid else "opencode-v2:identity-unavailable")
+    state = _V2_SHELL_TASKS.get(key) if source_valid else _V2_SHELL_TASKS.pop(key, None)
+    if not isinstance(state, dict) or state.get("database_identity") != source:
         retired = list(state.get("retired_jobs", ())) if isinstance(state, dict) else []
         overflow = bool(state.get("overflow")) if isinstance(state, dict) else False
         if isinstance(state, dict):
             for old in state.get("jobs", {}).values():
                 item = dict(old)
-                item.update(observation_state="unknown",
-                            observation_reason="database-generation-changed",
-                            process_state="unknown",
-                            process_reason="database-generation-changed")
+                if not _native_terminal(item):
+                    item.update(observation_state="unknown",
+                                observation_reason="database-generation-changed",
+                                process_state="unknown",
+                                process_reason="database-generation-changed")
                 retired.append(item)
         state = {"database_identity": source, "cursor": 0,
                  "jobs": OrderedDict(), "retired_jobs": retired[-256:],
+                 "mutable_seqs": set(), "refresh_offset": 0,
                  "overflow": overflow or len(retired) > 256}
     cursor = observed.get("shell_cursor") or {}
     if isinstance(cursor.get("next_seq"), int) and not isinstance(cursor.get("next_seq"), bool):
         state["cursor"] = max(state.get("cursor", 0), cursor["next_seq"])
+    pending = set(state.get("mutable_seqs", ()))
+    pending.difference_update(cursor.get("refreshed_seqs") or ())
+    pending.update(cursor.get("mutable_seqs") or ())
+    state["mutable_seqs"] = pending
+    current_ids = {}
+    for native in observed.get("shell_tasks") or ():
+        if isinstance(native, dict) and native.get("native_id"):
+            native_id = str(native["native_id"])
+            kind = native.get("native_id_kind") or native.get("native_record_kind") or "unknown"
+            current_ids.setdefault(native_id, set()).add(kind)
+    for old in state.get("jobs", {}).values():
+        if old.get("native_id"):
+            current_ids.setdefault(str(old["native_id"]), set()).add(
+                old.get("native_id_kind") or old.get("native_record_kind") or "unknown")
+    ambiguous_ids = {native_id for native_id, kinds in current_ids.items() if len(kinds) > 1}
     for native in observed.get("shell_tasks") or ():
         if not isinstance(native, dict) or not native.get("native_id"):
             continue
         native_id = str(native["native_id"])
-        previous = state["jobs"].get(native_id, {})
+        native_id_kind = native.get("native_id_kind") or "assistant-tool-part"
+        native_record_kind = native.get("native_record_kind") or "assistant-shell-tool-part"
+        job_key = (native_id_kind, native_id)
+        previous = state["jobs"].get(job_key, {})
         started_ms = native.get("started_at_ms")
         started = _shell_jobs.valid_epoch(
             started_ms, milliseconds=isinstance(started_ms, (int, float)) and not isinstance(started_ms, bool))
         updated_ms = native.get("time_updated")
         observed_at = _shell_jobs.valid_epoch(
             updated_ms, milliseconds=isinstance(updated_ms, (int, float)) and not isinstance(updated_ms, bool))
+        is_native_shell = native_record_kind == "session-message-shell"
+        native_status = str(native.get("native_status") or "unknown") if is_native_shell else "acknowledged"
+        completed_at = (_shell_jobs.valid_epoch(native.get("completed_at_ms"), milliseconds=True)
+                        if is_native_shell else None)
+        exit_code = native.get("exit_code") if isinstance(native.get("exit_code"), int) \
+            and not isinstance(native.get("exit_code"), bool) else None
+        locator = (_native_shell_output_locator(native_id, data_root=native_data_root)
+                   if is_native_shell else None)
+        output_path = locator.get("path") if isinstance(locator, dict) else None
+        native_terminal = is_native_shell and (
+            native_status.lower() in {"completed", "complete", "exited", "failed", "error",
+                                      "cancelled", "canceled", "stopped"}
+            or completed_at is not None or exit_code is not None)
+        invocation_completed = (_shell_jobs.valid_epoch(
+            native.get("invocation_completed_at_ms"), milliseconds=True)
+            if not is_native_shell else None)
         item = dict(previous)
         item.update({
             "harness": "opencode", "session_id": session_id,
             "attempt_id": attempt_id,
             "source_generation": source_label,
             "source_locator": os.path.realpath(db), "native_id": native_id,
+            "native_id_kind": native_id_kind,
+            "native_record_kind": native_record_kind,
+            "identity_link_state": "ambiguous-cross-namespace-id"
+            if native_id in ambiguous_ids else "native-id-unlinked",
             "native_call_id": native.get("call_id"), "command": (native.get("input") or {}).get("command"),
-            "command_source": "session_message.shell.input.command",
+            "command_source": ("session_message.shell.command" if is_native_shell
+                               else "assistant.shell.input.command"),
             "started_at": previous.get("started_at", started),
-            "start_source": "part.time.ran|created", "observed_at": observed_at or time.time(),
-            "native_status": "acknowledged", "invocation_status": native.get("invocation_status"),
-            "invocation_completed_at": _shell_jobs.valid_epoch(
-                native.get("invocation_completed_at_ms"), milliseconds=True),
-            "process_state": "unknown", "process_reason": "opencode-background-process-id-unobserved",
-            "output_coverage": "unavailable", "output_reason": "managed-output-locator-unobserved",
+            "start_source": native.get("start_source") or "assistant-shell-part.time.ran|created",
+            "observed_at": observed_at or time.time(),
+            "native_status": native_status,
+            "native_status_source": native.get("native_status_source"),
+            "invocation_status": native.get("invocation_status") if not is_native_shell else None,
+            "invocation_completed_at": invocation_completed,
+            "completed_at": completed_at,
+            "exit_code": exit_code,
+            "process_state": "dead" if native_terminal else "unknown",
+            "process_reason": ("native-shell-terminal-record" if native_terminal
+                               else "opencode-background-process-id-unobserved"),
+            "output_path": output_path,
+            "output_coverage": "sampled" if output_path or native.get("native_output_observed")
+            else "unavailable",
+            "output_reason": (None if output_path else
+                              locator.get("reason") if isinstance(locator, dict) else
+                              "assistant-shell-output-locator-unobserved"),
+            "native_output_observed": native.get("native_output_observed"),
+            "native_output_cursor": native.get("native_output_cursor"),
+            "native_output_size": native.get("native_output_size"),
+            "native_output_truncated": native.get("native_output_truncated"),
             "observation_state": cursor.get("state"), "observation_reason": cursor.get("reason"),
             "source_revision": (native.get("seq"), native.get("time_updated")),
         })
-        state["jobs"][native_id] = item
-        state["jobs"].move_to_end(native_id)
-        while len(state["jobs"]) > _shell_jobs.MAX_RETAINED_TASKS:
-            state["jobs"].popitem(last=False)
-            state["overflow"] = True
-    _V2_SHELL_TASKS[key] = state
-    _V2_SHELL_TASKS.move_to_end(key)
-    while len(_V2_SHELL_TASKS) > _V2_SHELL_TASK_LIMIT:
-        _V2_SHELL_TASKS.popitem(last=False)
+        if _native_terminal(previous) and not _native_terminal(item):
+            for field in ("native_status", "native_status_source", "completed_at", "exit_code",
+                          "process_state", "process_reason", "native_output_observed",
+                          "native_output_cursor", "native_output_size", "native_output_truncated"):
+                if field in previous:
+                    item[field] = previous[field]
+        state["jobs"][job_key] = item
+        state["jobs"].move_to_end(job_key)
+    for item in state.get("jobs", {}).values():
+        if str(item.get("native_id")) in ambiguous_ids:
+            item["identity_link_state"] = "ambiguous-cross-namespace-id"
+    while len(state["jobs"]) > _shell_jobs.MAX_RETAINED_TASKS:
+        state["jobs"].popitem(last=False)
+        state["overflow"] = True
+    if source_valid:
+        _V2_SHELL_TASKS[key] = state
+        _V2_SHELL_TASKS.move_to_end(key)
+        while len(_V2_SHELL_TASKS) > _V2_SHELL_TASK_LIMIT:
+            _V2_SHELL_TASKS.popitem(last=False)
+    ambiguous = bool(ambiguous_ids)
+    pending_overflow = len(state.get("mutable_seqs", ())) > \
+        _opencode_v2_runtime().MAX_SHELL_TASK_REFRESH
     sess.shell_jobs = _shell_jobs.observe_jobs(
         list(state.get("retired_jobs", ())) + list(state["jobs"].values()), now=time.time(),
         parent_pid=getattr(sess, "pid", None), parent_start=getattr(sess, "proc_start", None),
-        attempt_id=attempt_id)
+        attempt_id=attempt_id, tree=tree, kids=kids)
     sess.shell_job_observation = {
-        "state": "partial" if state.get("overflow") else cursor.get("state", "unknown"),
-        "reason": "task-retention-limit" if state.get("overflow") else cursor.get("reason"),
-        "coverage": "partial" if (state.get("overflow") or not cursor.get("caught_up")
+        "state": "partial" if (state.get("overflow") or ambiguous or pending_overflow
+                                 or not source_valid
+                                 or cursor.get("state") == "partial")
+        else cursor.get("state", "unknown"),
+        "reason": ("task-retention-limit" if state.get("overflow") else
+                   "native-id-cross-namespace-ambiguous" if ambiguous else
+                   "pending-row-refresh-limit" if pending_overflow else
+                   "database-identity-unavailable" if not source_valid else cursor.get("reason")),
+        "coverage": "partial" if (state.get("overflow") or ambiguous or pending_overflow
+                                     or not source_valid
+                                     or not cursor.get("caught_up")
                                      or cursor.get("state") != "observed") else "complete",
         "cursor": state.get("cursor"), "source_generation": source,
     }
@@ -175,10 +399,13 @@ def _enrich_v2(sess, tick, db):
     shell_cursor = (None if getattr(sess, "_fast_first", False)
                     else _v2_shell_cursor(db, sid, getattr(sess, "attempt_id", None))
                     if sid else 0)
+    shell_refresh_seqs = (_v2_shell_refresh_seqs(db, sid, getattr(sess, "attempt_id", None))
+                          if sid and not getattr(sess, "_fast_first", False) else [])
     generation = None
     if sid:
         observed = runtime.read_session_observation(
-            sid, db_path=db, shell_after_seq=shell_cursor)
+            sid, db_path=db, shell_after_seq=shell_cursor,
+            shell_refresh_seqs=shell_refresh_seqs)
         if observed.get("state") == "observed":
             generation = observed.get("generation")
     else:
@@ -194,9 +421,15 @@ def _enrich_v2(sess, tick, db):
                 sid = candidates[0].get("id")
                 generation = candidates[0].get("generation")
                 binding_source = "unique-process-window"
+                shell_cursor = (None if getattr(sess, "_fast_first", False)
+                                else _v2_shell_cursor(db, sid, getattr(sess, "attempt_id", None)))
+                shell_refresh_seqs = (
+                    _v2_shell_refresh_seqs(db, sid, getattr(sess, "attempt_id", None))
+                    if not getattr(sess, "_fast_first", False) else [])
                 observed = runtime.read_session_observation(
                     sid, db_path=db, generation=generation,
-                    shell_after_seq=shell_cursor)
+                    shell_after_seq=shell_cursor,
+                    shell_refresh_seqs=shell_refresh_seqs)
     if not sid:
         sess.shell_jobs = []
         sess.shell_job_observation = {"state": "unavailable", "reason": "exact-session-id-unresolved"}
@@ -214,14 +447,17 @@ def _enrich_v2(sess, tick, db):
         return True
     if "observed" not in locals():
         observed = runtime.read_session_observation(
-            sid, db_path=db, generation="v2", shell_after_seq=shell_cursor)
+            sid, db_path=db, generation="v2", shell_after_seq=shell_cursor,
+            shell_refresh_seqs=shell_refresh_seqs)
     if observed.get("state") != "observed" or observed.get("generation") != "v2":
         sess.shell_jobs = []
         sess.shell_job_observation = {"state": observed.get("state", "unknown"),
                                      "reason": observed.get("reason", "v2-source-unavailable")}
         _attempt_sidecar_fallback(sess)
         return True
-    _attach_v2_shell_tasks(sess, observed, db, sid)
+    _attach_v2_shell_tasks(sess, observed, db, sid,
+                           tree=getattr(sess, "_proc_tree", None),
+                           kids=getattr(sess, "_proc_kids", None))
     native = observed.get("session") or {}
     if native.get("directory") and sess.cwd and os.path.realpath(native["directory"]) != os.path.realpath(sess.cwd):
         # The process/session binding is exact, but a mismatched directory is

@@ -215,7 +215,7 @@ def source_status(path, cache_key):
 def _job_key(job):
     return tuple(str(job.get(key) or "") for key in (
         "harness", "session_id", "attempt_id", "source_generation",
-        "source_locator", "native_id"))
+        "source_locator", "native_id_kind", "native_id"))
 
 
 def merge_jobs(*groups):
@@ -226,7 +226,8 @@ def merge_jobs(*groups):
             if not isinstance(item, dict) or not item.get("native_id"):
                 continue
             key = tuple(str(item.get(field) or "") for field in (
-                "harness", "session_id", "attempt_id", "source_generation", "native_id"))
+                "harness", "session_id", "attempt_id", "source_generation",
+                "source_locator", "native_id_kind", "native_id"))
             merged[key] = {**merged.get(key, {}), **item}
     return list(merged.values())
 
@@ -947,7 +948,8 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
         item = normalize_job(raw, now=now)
         if item is None:
             continue
-        if item.get("output_path"):
+        if (item.get("output_path") and item.get("lifecycle_state") != "completed"
+                and item.get("process_state") != "dead"):
             item.update(correlate_output_writers(
                 item, candidates, namespace=parent_namespace, root_pid=parent_pid))
         result.append(item)

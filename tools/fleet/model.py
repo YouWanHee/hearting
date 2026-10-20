@@ -91,6 +91,9 @@ class ShellJob(TypedDict, total=False):
     source_generation: str
     source_locator: str
     native_id: str
+    native_id_kind: Optional[str]
+    native_record_kind: Optional[str]
+    identity_link_state: Optional[str]
     native_call_id: Optional[str]
     native_task_id: Optional[str]
     continuation_handle: Optional[str]
@@ -110,6 +113,11 @@ class ShellJob(TypedDict, total=False):
     output_path: Optional[str]
     output_size: Optional[int]
     output_identity: Optional[dict]
+    native_output_observed: Optional[bool]
+    native_output_cursor: Optional[int]
+    native_output_size: Optional[int]
+    native_output_truncated: Optional[bool]
+    native_status_source: Optional[str]
     output_coverage: str
     output_reason: Optional[str]
     last_output_at: Optional[float]

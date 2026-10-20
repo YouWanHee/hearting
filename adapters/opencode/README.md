@@ -56,6 +56,17 @@ fallback uses only source-declared candidates after confirmed unavailability;
 explicit model pins remain exact. An expired Go credential or missing Go
 entitlement does not mark Zen or OpenAI unavailable.
 
+Fleet's V2 background-shell reader accepts both assistant `shell` tool parts
+and native `session_message` rows with `type=shell` and
+`metadata.background=true`. These are separate native ID namespaces unless an
+explicit ID link is present. A shell row's own status, millisecond lifecycle
+times, exit code, and output cursor/size are retained; assistant invocation
+completion does not stand in for shell exit. The reader pages through other
+message types and refreshes known pending rows by sequence. Output-file lookup
+uses an exact `shellID` beneath the configured original OpenCode data directory;
+an attempt snapshot's parent directory and retained output files are not
+liveness evidence. V1 background-shell rows remain unobserved.
+
 ## Worker bootstrap boundary
 
 Headless dispatch wraps generated and caller-supplied assignments with the

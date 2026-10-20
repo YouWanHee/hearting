@@ -628,6 +628,297 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertEqual(session.shell_job_observation["state"], "partial")
         self.assertEqual(session.shell_job_observation["coverage"], "partial")
 
+    def test_opencode_native_shell_rows_flow_to_common_jobs_render_and_json(self):
+        runtime = opencode._opencode_v2_runtime()
+        snapshot_dir = self.root / "private-snapshot"
+        snapshot_dir.mkdir()
+        db = snapshot_dir / "opencode.db"
+        native_root = self.root / "original-opencode-data"
+        output_dir = native_root / "shell" / "native-location-key"
+        output_dir.mkdir(parents=True)
+        ok_output = output_dir / "sh-fixture-ok.out"
+        ok_output.write_text("native output\n", encoding="utf-8")
+        # A copied snapshot's parent is deliberately not the native shell root.
+        decoy_dir = snapshot_dir / "shell" / "copied-location"
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "sh-fixture-fail.out").write_text("stale copied output\n", encoding="utf-8")
+        sid = "ses_nativefixture123"
+        other_sid = "ses_otherfixture123"
+        attempt_id = "attempt-opencode-fixture"
+        now_ms = int(time.time() * 1000)
+
+        def shell_row(shell_id, command, *, background=True, status="running",
+                      completed=None, exit_code=None, output=None):
+            row = {"metadata": {"background": background},
+                   "time": {"created": now_ms - 5000},
+                   "shellID": shell_id, "command": command, "status": status}
+            if completed is not None:
+                row["time"]["completed"] = completed
+            if exit_code is not None:
+                row["exit"] = exit_code
+            if output is not None:
+                row["output"] = output
+            return row
+
+        with sqlite3.connect(db) as connection:
+            connection.executescript("""
+                CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER,
+                                         time_updated INTEGER);
+                CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                                              time_created INTEGER, time_updated INTEGER, data TEXT);
+            """)
+            connection.executemany("INSERT INTO session_v2 VALUES(?,?,?,?)", [
+                (sid, str(self.root), now_ms - 10000, now_ms),
+                (other_sid, str(self.root), now_ms - 10000, now_ms),
+            ])
+            rows = [
+                ("m1", sid, "shell", 1, now_ms - 5000, now_ms - 5000,
+                 shell_row("sh-fixture-ok", "python3 -c 'print(1)'")),
+                ("m2", sid, "shell", 2, now_ms - 4000, now_ms - 4000,
+                 shell_row("sh-fixture-fail", "python3 -c 'raise SystemExit(3)'")),
+                ("m3", sid, "shell", 3, now_ms - 3000, now_ms - 3000,
+                 shell_row("sh-ordinary", "echo ordinary", background=False,
+                           status="exited", completed=now_ms - 2900, exit_code=0)),
+                ("m4", sid, "shell", 4, now_ms - 2000, now_ms - 2000,
+                 shell_row("sh-promoted", "echo promoted", background=False)),
+                ("other", other_sid, "shell", 1, now_ms - 1000, now_ms - 1000,
+                 shell_row("sh-other-session", "echo another session")),
+            ]
+            connection.executemany(
+                "INSERT INTO session_message VALUES(?,?,?,?,?,?,?)",
+                [(mid, row_sid, kind, seq, created, updated, json.dumps(data))
+                 for mid, row_sid, kind, seq, created, updated, data in rows])
+
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(native_root)}):
+            opencode._NATIVE_SHELL_OUTPUT_LOCATORS.clear()
+            observed = runtime.read_session_observation(
+                sid, db_path=db, generation="v2", shell_after_seq=0)
+            self.assertEqual([item["native_id"] for item in observed["shell_tasks"]],
+                             ["sh-fixture-ok", "sh-fixture-fail"])
+            self.assertEqual(observed["shell_cursor"]["caught_up"], True)
+
+            session = Session(harness="opencode", pid=4242, cwd=str(self.root),
+                              proc_start="1", attempt_id=attempt_id)
+            session.session_id = sid
+            opencode._attach_v2_shell_tasks(session, observed, db, sid)
+            self.assertEqual(len(session.shell_jobs), 2)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(jobs["sh-fixture-ok"]["native_status"], "running")
+            self.assertEqual(jobs["sh-fixture-ok"]["process_state"], "unknown")
+            self.assertEqual(jobs["sh-fixture-ok"]["output_path"], str(ok_output))
+            self.assertEqual(jobs["sh-fixture-fail"]["output_path"], None)
+            self.assertEqual(jobs["sh-fixture-fail"]["output_reason"],
+                             "native-shell-output-not-found")
+            self.assertEqual(jobs["sh-fixture-fail"]["process_state"], "unknown")
+            row_text = "".join(part[0] for line in render._shell_job_rows(
+                session, term_width=140) for part in line)
+            self.assertIn("python3 -c", row_text)
+            self.assertIn("native running", row_text)
+            public_json = session.to_dict()
+            self.assertEqual(len(public_json["shell_jobs"]), 2)
+            self.assertEqual(public_json["shell_jobs"][0]["native_record_kind"],
+                             "session-message-shell")
+
+            old_observation = observed
+            terminal_time = int(time.time() * 1000)
+            terminal_output = {"output": "fixture-secret-output", "cursor": 23,
+                               "size": 23, "truncated": False}
+            exited_ok = shell_row("sh-fixture-ok", "python3 -c 'print(1)'",
+                                  status="exited", completed=terminal_time,
+                                  exit_code=0, output=terminal_output)
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE session_message SET data=?, time_updated=? "
+                                   "WHERE session_id=? AND seq=1",
+                                   (json.dumps(exited_ok), terminal_time, sid))
+            refresh = opencode._v2_shell_refresh_seqs(db, sid, attempt_id)
+            updated = runtime.read_session_observation(
+                sid, db_path=db, generation="v2",
+                shell_after_seq=opencode._v2_shell_cursor(db, sid, attempt_id),
+                shell_refresh_seqs=refresh)
+            opencode._attach_v2_shell_tasks(session, updated, db, sid)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(jobs["sh-fixture-ok"]["lifecycle_state"], "completed")
+            self.assertEqual(jobs["sh-fixture-ok"]["exit_code"], 0)
+            self.assertEqual(jobs["sh-fixture-ok"]["process_state"], "dead")
+            self.assertEqual(jobs["sh-fixture-ok"]["native_output_cursor"], 23)
+            self.assertEqual(jobs["sh-fixture-ok"]["native_output_size"], 23)
+            self.assertEqual(jobs["sh-fixture-ok"]["output_state"], "observed")
+            self.assertTrue(ok_output.exists())  # retained file did not revive the exited task
+
+            # Replaying the older running snapshot must not resurrect a completed result.
+            opencode._attach_v2_shell_tasks(session, old_observation, db, sid)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(jobs["sh-fixture-ok"]["native_status"], "exited")
+            self.assertEqual(jobs["sh-fixture-ok"]["process_state"], "dead")
+
+            terminal_time = int(time.time() * 1000)
+            exited_fail = shell_row("sh-fixture-fail", "python3 -c 'raise SystemExit(3)'",
+                                    status="exited", completed=terminal_time, exit_code=3,
+                                    output={"output": "", "cursor": 0, "size": 0,
+                                            "truncated": False})
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE session_message SET data=?, time_updated=? "
+                                   "WHERE session_id=? AND seq=2",
+                                   (json.dumps(exited_fail), terminal_time, sid))
+            refresh = opencode._v2_shell_refresh_seqs(db, sid, attempt_id)
+            updated = runtime.read_session_observation(
+                sid, db_path=db, generation="v2",
+                shell_after_seq=opencode._v2_shell_cursor(db, sid, attempt_id),
+                shell_refresh_seqs=refresh)
+            opencode._attach_v2_shell_tasks(session, updated, db, sid)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(jobs["sh-fixture-fail"]["exit_code"], 3)
+            self.assertEqual(jobs["sh-fixture-fail"]["lifecycle_state"], "completed")
+            self.assertEqual(jobs["sh-fixture-fail"]["native_output_truncated"], False)
+
+            # A row can become a background task in place; an ordinary shell row above stays hidden.
+            terminal_time = int(time.time() * 1000)
+            promoted = shell_row("sh-promoted", "echo promoted", status="exited",
+                                 completed=terminal_time, exit_code=0,
+                                 output={"output": "", "cursor": 0, "size": 0,
+                                         "truncated": False})
+            promoted["metadata"]["background"] = True
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE session_message SET data=?, time_updated=? "
+                                   "WHERE session_id=? AND seq=4",
+                                   (json.dumps(promoted), terminal_time, sid))
+            refresh = opencode._v2_shell_refresh_seqs(db, sid, attempt_id)
+            updated = runtime.read_session_observation(
+                sid, db_path=db, generation="v2",
+                shell_after_seq=opencode._v2_shell_cursor(db, sid, attempt_id),
+                shell_refresh_seqs=refresh)
+            opencode._attach_v2_shell_tasks(session, updated, db, sid)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertIn("sh-promoted", jobs)
+            self.assertNotIn("sh-ordinary", jobs)
+            self.assertEqual(jobs["sh-promoted"]["exit_code"], 0)
+            self.assertNotIn("fixture-secret-output", json.dumps(session.to_dict()))
+
+    def test_opencode_native_id_namespace_collision_is_visible_and_not_merged(self):
+        runtime = opencode._opencode_v2_runtime()
+        db = self.root / "opencode-collision.db"
+        sid = "ses_collisionfixture123"
+        now_ms = int(time.time() * 1000)
+        with sqlite3.connect(db) as connection:
+            connection.executescript("""
+                CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER,
+                                         time_updated INTEGER);
+                CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                                              time_created INTEGER, time_updated INTEGER, data TEXT);
+            """)
+            connection.execute("INSERT INTO session_v2 VALUES(?,?,?,?)",
+                               (sid, str(self.root), now_ms, now_ms))
+            shell = {"metadata": {"background": True}, "time": {"created": now_ms},
+                     "shellID": "same-native-token", "command": "echo native",
+                     "status": "running"}
+            assistant = {"content": [{"type": "tool", "name": "shell",
+                                      "id": "same-native-token",
+                                      "state": {"status": "running", "input": {
+                                          "background": True, "command": "echo assistant"}}}]}
+            connection.executemany("INSERT INTO session_message VALUES(?,?,?,?,?,?,?)", [
+                ("shell", sid, "shell", 1, now_ms, now_ms, json.dumps(shell)),
+                ("assistant", sid, "assistant", 2, now_ms, now_ms, json.dumps(assistant)),
+            ])
+        observed = runtime.read_session_observation(
+            sid, db_path=db, generation="v2", shell_after_seq=0)
+        session = Session(harness="opencode", pid=0, attempt_id="attempt-collision")
+        session.session_id = sid
+        opencode._attach_v2_shell_tasks(session, observed, db, sid)
+        self.assertEqual(len(session.shell_jobs), 2)
+        self.assertEqual({job["native_id_kind"] for job in session.shell_jobs},
+                         {"session-message-shellID", "assistant-tool-part"})
+        self.assertTrue(all(job["identity_link_state"] == "ambiguous-cross-namespace-id"
+                            for job in session.shell_jobs))
+        self.assertEqual(session.shell_job_observation["state"], "partial")
+        rendered = "".join(part[0] for line in render._shell_job_rows(
+            session, term_width=140) for part in line)
+        self.assertIn("native id cross namespace ambiguous", rendered)
+
+    def test_opencode_database_identity_change_retires_running_and_keeps_terminal_result(self):
+        runtime = opencode._opencode_v2_runtime()
+        db = self.root / "opencode-generation.db"
+        sid = "ses_generationfixture123"
+        attempt_id = "attempt-generation"
+        now_ms = int(time.time() * 1000)
+        with sqlite3.connect(db) as connection:
+            connection.executescript("""
+                CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER,
+                                         time_updated INTEGER);
+                CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                                              time_created INTEGER, time_updated INTEGER, data TEXT);
+            """)
+            connection.execute("INSERT INTO session_v2 VALUES(?,?,?,?)",
+                               (sid, str(self.root), now_ms, now_ms))
+            rows = [
+                ("done", sid, "shell", 1, now_ms, now_ms, json.dumps({
+                    "metadata": {"background": True}, "time": {"created": now_ms - 2000,
+                                                                  "completed": now_ms},
+                    "shellID": "sh-generation-done", "command": "echo done",
+                    "status": "exited", "exit": 0,
+                })),
+                ("pending", sid, "shell", 2, now_ms, now_ms, json.dumps({
+                    "metadata": {"background": True}, "time": {"created": now_ms - 1000},
+                    "shellID": "sh-generation-pending", "command": "sleep 20",
+                    "status": "running",
+                })),
+            ]
+            connection.executemany("INSERT INTO session_message VALUES(?,?,?,?,?,?,?)", rows)
+        native_root = self.root / "generation-data"
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(native_root)}):
+            opencode._NATIVE_SHELL_OUTPUT_LOCATORS.clear()
+            observed = runtime.read_session_observation(
+                sid, db_path=db, generation="v2", shell_after_seq=0)
+            session = SimpleNamespace(pid=None, proc_start=None, attempt_id=attempt_id)
+            opencode._attach_v2_shell_tasks(session, observed, db, sid)
+            self.assertEqual(len(session.shell_jobs), 2)
+            replacement = dict(observed)
+            replacement["database_identity"] = {
+                "device": observed["database_identity"]["device"] + 1,
+                "inode": observed["database_identity"]["inode"] + 1,
+            }
+            replacement["shell_tasks"] = []
+            replacement["shell_cursor"] = {"state": "observed", "next_seq": 0,
+                                            "caught_up": True, "mutable_seqs": [],
+                                            "refreshed_seqs": []}
+            opencode._attach_v2_shell_tasks(session, replacement, db, sid)
+            jobs = {item["native_id"]: item for item in session.shell_jobs}
+            self.assertEqual(jobs["sh-generation-done"]["exit_code"], 0)
+            self.assertEqual(jobs["sh-generation-done"]["lifecycle_state"], "completed")
+            self.assertEqual(jobs["sh-generation-pending"]["process_state"], "unknown")
+            self.assertEqual(jobs["sh-generation-pending"]["observation_reason"],
+                             "database-generation-changed")
+            copied_source = dict(jobs["sh-generation-done"],
+                                 source_locator=str(self.root / "copied-snapshot.db"))
+            self.assertEqual(len(shell_jobs.merge_jobs(
+                [jobs["sh-generation-done"]], [copied_source])), 2)
+
+    def test_opencode_native_output_locator_reports_duplicate_and_scan_limit(self):
+        native_root = self.root / "native-locator-root"
+        shell_root = native_root / "shell"
+        (shell_root / "location-a").mkdir(parents=True)
+        (shell_root / "location-b").mkdir()
+        (shell_root / "location-a" / "sh-duplicate.out").write_text("a", encoding="utf-8")
+        (shell_root / "location-b" / "sh-duplicate.out").write_text("b", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(native_root)}):
+            opencode._NATIVE_SHELL_OUTPUT_LOCATORS.clear()
+            private_root = self.root / "attempt-original-data"
+            private_file = private_root / "shell" / "attempt-location" / "sh-explicit-root.out"
+            private_file.parent.mkdir(parents=True)
+            private_file.write_text("attempt output", encoding="utf-8")
+            explicit_root = opencode._native_shell_output_locator(
+                "sh-explicit-root", data_root=private_root)
+            self.assertEqual(explicit_root["path"], str(private_file))
+            ambiguous = opencode._native_shell_output_locator("sh-duplicate")
+            self.assertEqual(ambiguous["state"], "ambiguous")
+            self.assertEqual(ambiguous["reason"], "native-shell-output-id-ambiguous")
+
+            for index in range(opencode._NATIVE_SHELL_LOCATION_LIMIT + 1):
+                (shell_root / ("location-%03d" % index)).mkdir()
+            opencode._NATIVE_SHELL_OUTPUT_LOCATORS.clear()
+            limited = opencode._native_shell_output_locator("sh-absent")
+            self.assertEqual(limited["state"], "partial")
+            self.assertEqual(limited["reason"], "native-shell-location-scan-limit")
+
     def test_opencode_v1_does_not_inherit_v2_background_semantics(self):
         path = self.root / "opencode-v1.db"
         connection = sqlite3.connect(path)
