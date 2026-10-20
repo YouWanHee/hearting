@@ -1173,6 +1173,16 @@ If another normal carrier consumes that notice first, the same bound peer payloa
 is omitted from later sends and its existing message duty settles without a false
 peer-receipt claim.
 
+The registered runtime courier transports completion content; it is not its
+author. A completion transfer uses a runtime sender and retains the verified
+duty, attempt, delivery, and exact recipient binding from the existing pending
+record. The same binding is present in the immutable transfer, pending row, and
+any message duty created for that transfer. The immutable transfer and pending
+row carry it before any carrier can receive the content. The runtime trailer
+remains distinct from a peer trailer, while exact body and recipient checks,
+native receipt, retry, and ACK continue through the existing path. A later
+retry does not replace the original binding with the courier's session.
+
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
 ledger does not overturn those settled facts. Parent delivery facts remain

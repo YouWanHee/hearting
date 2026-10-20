@@ -230,7 +230,8 @@ def _resolve_target(target):
 
 def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
             receipt=None, status="sent", from_identity=None, to_session_id=None,
-            to_pane=None, transfer_ref=None, from_name=_UNSET_NAME, surface="herdr"):
+            to_pane=None, transfer_ref=None, from_name=_UNSET_NAME, surface="herdr",
+            producer_binding=None):
     """Write one peer_message_v1 row.
 
     `from_identity` exists for the detached watcher: `_current_session_identity`
@@ -269,6 +270,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
         body_file=body_file,
         body_stdin=False,
         transfer_ref=transfer_ref,
+        producer_binding=producer_binding,
     )
     try:
         peer_message.cmd_record(ns)
@@ -5222,6 +5224,8 @@ def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=Non
               "target": target, "from": sender, "to": recipient,
               "refs": list(row.get("refs") or []),
               "delay_notice_for": delay_notice_for or ""}
+    if row.get("producer_binding") is not None:
+        intent["producer_binding"] = dict(row["producer_binding"])
     if handoff_acceptance:
         intent["handoff_acceptance"] = True
     try:
@@ -6025,6 +6029,21 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                         recipient_kind=intent["carrier"])
         message = delivery_context([(jobs.parent, [{**record, **(
             {CONTINUED_KEY: continued} if continued else {})}])])
+        producer_binding = {
+            "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
+            "duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,
+            "carrier": intent["carrier"], "delivery_id": delivery_id,
+            "receipt_digest": record.get("receipt_digest"),
+            "recipient": {"harness": harness, "session_id": recipient_sid},
+            "route_id": str(row.metadata.get("route_id") or ""),
+            "route_node": str(row.metadata.get("route_node") or ""),
+        }
+        runtime_sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        transfer_refs = [duty["id"], row.attempt_id, delivery_id]
+        if not peer_message._valid_runtime_producer_binding(
+                producer_binding, runtime_sender, producer_binding["recipient"], transfer_refs):
+            pending.release_claim(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
+            return
         # The normal prompt command seals the body, checks the recipient again,
         # and retains it through forms, busy turns and sender/observer exit (#446).
         prepared = []
@@ -6035,14 +6054,17 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             peer_message.bind_dispatch_notice(ref, binding)
             store.update(duty["id"], observation={**observation, "transfer_ref": ref,
                 "delivery_id": delivery_id, "storage_recipient": storage_recipient,
-                "recipient_sid": recipient_sid, "claim_owner": owner})
+                "recipient_sid": recipient_sid, "claim_owner": owner,
+                "producer_binding": producer_binding})
             prepared.append(ref)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
             body.write(message)
             body.flush()
             args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
-                                              "--ref", duty["id"]])
-            code = cmd_prompt(args, expected_recipient=(harness, recipient_sid), on_prepared=bind_transfer)
+                                              "--ref", duty["id"], "--ref", row.attempt_id,
+                                              "--ref", delivery_id])
+            code = cmd_prompt(args, expected_recipient=(harness, recipient_sid),
+                              on_prepared=bind_transfer, producer_binding=producer_binding)
         current = pending.read(jobs.parent, storage_recipient, delivery_id)
         if current and current.get("state") == "acked":
             return
@@ -6382,7 +6404,7 @@ def receiver_idle(recipient, pane, *, peer=True):
             clear._continue(seat.key, req["nonce"], clear._run_continue)
 
 
-def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
+def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_binding=None):
     """Seal a peer message and route it through the recipient's native carrier.
 
     Codex uses its exact thread queue. Claude's hook context and OpenCode's
@@ -6402,10 +6424,17 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
         print("prompted=false reason=empty-body")
         return 1
 
-    from_sid, from_harness = _current_session_identity()
     body = body.rstrip("\n")
-    from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
-    from_name = _from_name(from_harness, from_sid)
+    if producer_binding is not None:
+        if args.no_trailer:
+            print("prompted=false reason=runtime-completion-requires-receipt-envelope")
+            return 5
+        from_sid, from_harness, from_name = None, "runtime", "Hearting runtime"
+        from_identity = (None, "runtime", "")
+    else:
+        from_sid, from_harness = _current_session_identity()
+        from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
+        from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, t_name = _resolve_target(args.target)
     target_state = None
     if t_harness == "codex" and not peer_message.usable_session_id(t_sid):
@@ -6443,7 +6472,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
             body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
             recipient, defer=True, refs=args.ref, receipt=input_reason or "native-pending",
             with_trailer=not args.no_trailer, reference_evidence=reference_evidence,
-            first_input_process=first_input_process)
+            first_input_process=first_input_process, producer_binding=producer_binding)
         if on_prepared is not None:
             on_prepared(transfer_ref)
         pending = peer_message._read_pending(transfer_ref)
@@ -6614,7 +6643,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
             summary_text=text, to_session_id=t_sid, to_pane=target_pane,
             ref=args.ref, status=_PROMPT_LEDGER_STATUS[outcome], receipt=receipt,
             from_identity=from_identity, from_name=from_name, transfer_ref=transfer_ref,
-            surface=surface)
+            surface=surface, producer_binding=producer_binding)
     line = (f"prompted={outcome} target={args.target} "
             f"to_harness={t_harness or '-'} to_alias={peer_message.peer_alias(t_harness, t_sid)} kind={kind} "
             f"state_before={state_before} verify={verify} ms={elapsed_ms}")

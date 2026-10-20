@@ -22,6 +22,52 @@ from fleet.model import DispatchJob
 
 
 class OpenCodeContextPluginTest(unittest.TestCase):
+    def test_runtime_completion_uses_the_existing_opencode_prompt_and_history_path(self):
+        if not NODE:
+            self.skipTest("node is unavailable")
+        with tempfile.TemporaryDirectory(prefix="opencode-runtime-origin-") as raw:
+            script = f'''import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import {{ syncBuiltinESMExports }} from "node:module";
+import {{ pathToFileURL }} from "node:url";
+const spawnSyncCalls = [], spawnCalls = [];
+childProcess.spawnSync = (command, args, options = {{}}) => {{
+  spawnSyncCalls.push({{ command, args, options }});
+  const isPeerPending = String(args?.[0] || "").endsWith("peer-message.py") && args?.[1] === "pending";
+  return {{ status: 0, stdout: isPeerPending ? "[]" : "", stderr: "" }};
+}};
+childProcess.spawn = (command, args, options = {{}}) => ({{
+  on() {{}}, unref() {{}}, stdin: {{ end(body) {{ spawnCalls.push({{ command, args, options, body }}); }} }}
+}});
+syncBuiltinESMExports();
+const {{ AgentHarnessGuards }} = await import(pathToFileURL(process.env.PLUGIN_PATH));
+const hooks = await AgentHarnessGuards({{ directory: process.env.HOME,
+  worktree: process.env.HOME, client: {{}} }}, {{ initialize: false }});
+const prompt = "[notice] task complete\\n\\n(runtime-from: runtime [?] Hearting runtime ; ref=" + "a".repeat(32) + ")";
+await hooks["chat.message"]({{ sessionID: "opencode-runtime", messageID: "native-runtime-message" }},
+  {{ parts: [{{ type: "text", text: prompt }}] }});
+const receive = spawnCalls.find((call) => call.args[0].endsWith("peer-message.py")
+  && call.args[1] === "receive");
+assert.ok(receive, "runtime-from is accepted by the OpenCode receiver prefilter");
+assert.equal(receive.body, prompt);
+const guidance = spawnSyncCalls.find((call) => call.args[0] === "-c"
+  && call.args[1].includes("receiver_guidance"));
+assert.ok(guidance, "the common reader checks the runtime envelope on this prompt");
+assert.equal(JSON.parse(guidance.options.input).prompt, prompt);
+assert.equal(guidance.options.input.includes("peer-from"), false);
+hooks.dispose?.({{ silent: true }});
+'''
+            env = {**os.environ, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+                   "HOME": raw, "XDG_CONFIG_HOME": str(Path(raw) / ".config"),
+                   "XDG_DATA_HOME": str(Path(raw) / ".data"), "XDG_STATE_HOME": str(Path(raw) / ".state"),
+                   "AGENT_HOME": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1",
+                   "AGENT_SESSION_ROLE": "", "AGENT_DISPATCH_CHILD": "",
+                   "AGENT_DISPATCH_DEPTH": "", "OPENCODE_DISPATCH_SLUG": "",
+                   "FLEET_TITLE_REFRESH": "", "HERDR_PANE_ID": ""}
+            result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
+                                    env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_idle_observer_is_detached_before_summary_checkpoint_and_peer_consumers(self):
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text(encoding="utf-8")
         helper_start = source.index("function spawnIdleObserver(")

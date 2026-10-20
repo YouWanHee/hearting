@@ -1971,15 +1971,31 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         duty, = store.list()
         sent = []
         real_prompt = steward.cmd_prompt
-        def prompt(args, *, expected_recipient, on_prepared=None):
+        def prompt(args, *, expected_recipient, on_prepared=None, producer_binding=None):
             self.assertEqual(expected_recipient, ("claude", recipient_sid))
+            self.assertIsInstance(producer_binding, dict)
+            delivery = json.loads(path.read_text())
+            self.assertEqual(producer_binding["schema"], steward.peer_message._RUNTIME_PRODUCER_SCHEMA)
+            self.assertEqual(producer_binding["duty_id"], duty["id"])
+            self.assertEqual(producer_binding["jobs"], str(self.jobs))
+            self.assertEqual(producer_binding["attempt_id"], duty["intent"]["identity"]["attempt_id"])
+            self.assertEqual(producer_binding["carrier"], duty["intent"]["carrier"])
+            self.assertEqual(producer_binding["delivery_id"], delivery["delivery_id"])
+            self.assertEqual(producer_binding["receipt_digest"], delivery["receipt_digest"])
+            self.assertEqual(producer_binding["recipient"], {
+                "harness": expected_recipient[0], "session_id": expected_recipient[1]})
+            self.assertEqual(producer_binding["route_id"], "rt-owner")
+            self.assertEqual(producer_binding["route_node"], "report")
+            self.assertEqual(args.ref, [duty["id"], duty["intent"]["identity"]["attempt_id"],
+                                        delivery["delivery_id"]])
             if changed_pane:
                 # The real courier must refuse before sealing any payload if
                 # its own target read no longer matches the retained identity.
                 with mock.patch.object(steward, "_herdr_missing", return_value=False), \
                         mock.patch.object(steward, "_resolve_target", return_value=("claude", "stranger", None)), \
                         mock.patch.object(steward.peer_message, "prepare_peer_message") as sealed:
-                    code = real_prompt(args, expected_recipient=expected_recipient, on_prepared=on_prepared)
+                    code = real_prompt(args, expected_recipient=expected_recipient,
+                                       on_prepared=on_prepared, producer_binding=producer_binding)
                     sealed.assert_not_called()
                     return code
             sent.append(Path(args.body_file).read_text())
