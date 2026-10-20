@@ -2070,7 +2070,7 @@ append-only ledger below is the only record of them (SD-122 §13.37.2-(1)).
 | Who receives the result now? | the single `effective_parent`: the registered parent, or the last confirmed same-seat successor after a handover. |
 | Who only observes? | a `watch` holder (Fleet ⚑ shows the steward relation); observation settles no stage result (S3). |
 | Who approves? | the person; the session that received the answer writes the release/approval record (S5). |
-| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor; a separate check from row 4. |
+| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor, a separate check from row 4; sending `correct` is not parent-only (§5.10a). |
 
 Six invariants govern the role:
 
