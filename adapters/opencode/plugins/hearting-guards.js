@@ -1545,7 +1545,7 @@ function appendContext(output, text) {
 // own `notice` peer_message_v1 under its exact session id (same record the Claude
 // hook and the Codex hook write). Detached, fail-soft, never blocks the turn.
 function spawnPeerNotice(sid, prompt, cwd) {
-  if (!sid || !prompt || !prompt.includes("peer-from:")) return
+  if (!sid || !prompt || (!prompt.includes("peer-from:") && !prompt.includes("runtime-from:"))) return
   const tool = path.join(root, "utilities", "peer-message.py")
   const args = [tool, "receive",
     "--from-project", path.basename(cwd || ""),
@@ -2249,7 +2249,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     if (prompt) promptBySession.set(sid, prompt)
     peerGuidanceBySession.delete(sid)
     // Actual peer receipt is observed after persistence, not callback rendering.
-    if (prompt && eventSid && prompt.includes("peer-from:")) {
+    if (prompt && eventSid && (prompt.includes("peer-from:") || prompt.includes("runtime-from:"))) {
       const guidance = spawnSync(
         "python3",
         ["-c", "import importlib.util, json, sys; s=importlib.util.spec_from_file_location('peer', 'utilities/peer-message.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); d=json.load(sys.stdin); print(m.receiver_guidance(d.get('prompt', ''), d.get('recipient'), cwd=d.get('cwd')))"],

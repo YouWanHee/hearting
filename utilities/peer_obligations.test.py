@@ -755,8 +755,8 @@ class ObligationStoreTest(unittest.TestCase):
                 duty, record, answers = self._parent_handover(harness)
                 sent = []
                 armed = []
-                def courier(args, expected_recipient, on_prepared):
-                    sent.append((expected_recipient, Path(args.body_file).read_text()))
+                def courier(args, expected_recipient, on_prepared, producer_binding=None):
+                    sent.append((expected_recipient, Path(args.body_file).read_text(), producer_binding))
                     on_prepared("a" * 32)
                     return 0
                 census = {"result": {"agents": [{"agent": harness, "pane_id": "w1:p5",
@@ -778,6 +778,8 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertEqual(len(sent), 1)
                     self.assertEqual(sent[0][0], (harness, "idle-parent"))
                     self.assertIn("scheduled the route's start under the parent's identity", sent[0][1])
+                    self.assertEqual(sent[0][2]["schema"], "registered-runtime-completion-v1")
+                    self.assertEqual(sent[0][2]["attempt_id"], "att-stopped-owner")
                     self.assertEqual(armed[0]["session_id"], "idle-parent")
                     exact = pending.read(self.root, "idle-parent", record["delivery_id"])
                     self.assertEqual(exact["state"], "sent-ambiguous")
