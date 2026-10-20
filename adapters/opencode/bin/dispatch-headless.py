@@ -522,6 +522,10 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     selected = _select_model_settings(args)
     if (selected.get("source") in {"profile", "role"}
             and opencode_runtime.is_v2()):
+        # The first automatically eligible candidate runs. Without one, an
+        # unverified primary still runs here (automatic placement has already
+        # left OpenCode out, so only an explicit harness choice reaches this),
+        # and only a confirmed rejection is refused.
         original = selected["model"]
         model, variant, evidence = opencode_runtime.select_automatic_model(
             original, selected["variant"])
@@ -534,7 +538,9 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             selected = {**selected, "model": model, "variant": variant,
                         "source": selected["source"] + "+provider-fallback",
                         "provider_fallback_from": original,
-                        "provider_fallback_reason": evidence.get("reason") or "primary-unavailable"}
+                        "provider_fallback_reason": (evidence.get("fallback_from_reason")
+                                                     or evidence.get("reason")
+                                                     or "primary-unavailable")}
     return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 

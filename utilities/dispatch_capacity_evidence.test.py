@@ -68,23 +68,56 @@ class QuotaEvidenceTests(unittest.TestCase):
         import model_profile
         import opencode_runtime
         selected = {"model": "opencode-go/model", "budget": "high"}
+
+        def state(candidates):
+            with mock.patch.object(model_profile, "resolve_runtime_profile",
+                                   return_value=(selected, object())), \
+                 mock.patch.object(opencode_runtime, "automatic_candidates",
+                                   return_value=candidates):
+                return Q._opencode_model_state("balanced", self.env)
+
+        held = state([
+            {"model": "opencode-go/model", "state": "unavailable"},
+            {"model": "opencode/beam-free", "state": "unavailable"},
+            {"model": "openai/gpt-6.1-sol", "state": "unavailable"},
+        ])
+        self.assertTrue(held.startswith("limited(provider-model-unavailable:"), held)
+        self.assertIn("opencode-go-unavailable", held)
+        # Go is probed before placement, so its unknown stays automatic.
+        self.assertIsNone(state([
+            {"model": "opencode-go/model", "state": "unknown"},
+            {"model": "openai/gpt-6.1-sol", "state": "unavailable"},
+        ]))
+        self.assertIsNone(state([
+            {"model": "opencode-go/model", "state": "unavailable"},
+            {"model": "openai/gpt-6.1-sol", "state": "usable"},
+        ]))
+
+    def test_opencode_unverified_provider_is_left_out_without_a_pause(self):
+        """The 2026-10-20 replacement owner: deep resolved to an OpenAI model on
+        OpenCode with no evidence at all, and automatic placement chose it."""
+        import model_profile
+        import opencode_runtime
+        selected = {"model": "openai/gpt-6.1-sol", "budget": "xhigh"}
+        candidates = [
+            {"model": "openai/gpt-6.1-sol", "state": "unknown",
+             "reason": "provider-model-unverified"},
+            {"model": "opencode-go/model", "state": "unavailable",
+             "reason": "subscription-missing"},
+        ]
         with mock.patch.object(model_profile, "resolve_runtime_profile",
                                return_value=(selected, object())), \
-             mock.patch.object(opencode_runtime, "automatic_candidates", return_value=[
-                 {"model": "opencode-go/model", "state": "unavailable"},
-                 {"model": "opencode/beam-free", "state": "unavailable"},
-                 {"model": "openai/gpt-6.1-sol", "state": "unavailable"},
-             ]):
-            state = Q._opencode_model_state("balanced", self.env)
-            self.assertTrue(state.startswith("limited(provider-model-unavailable:"), state)
-            self.assertIn("opencode-go-unavailable", state)
-        with mock.patch.object(model_profile, "resolve_runtime_profile",
-                               return_value=(selected, object())), \
-             mock.patch.object(opencode_runtime, "automatic_candidates", return_value=[
-                 {"model": "opencode-go/model", "state": "unavailable"},
-                 {"model": "opencode/beam-free", "state": "unknown"},
-             ]):
-            self.assertIsNone(Q._opencode_model_state("balanced", self.env))
+             mock.patch.object(opencode_runtime, "automatic_candidates",
+                               return_value=candidates):
+            held = Q._opencode_model_state("deep", self.env)
+            self.assertEqual(Q.model_hold("opencode", "deep", env=self.env), held)
+        self.assertEqual(held, "limited(provider-model-unverified:"
+                               "openai-provider-model-unverified+opencode-go-subscription-missing)")
+        # Every automatic consumer reads any `limited(...)` as "not this harness".
+        capacity = load("unverified_capacity", "harness-capacity.py")
+        self.assertTrue(capacity._limited(held))
+        self.assertIsNone(Q.model_hold("claude", "deep", env=self.env))
+        self.assertIsNone(Q.model_hold("opencode", None, env=self.env))
 
     def test_actual_usage_consumer_overrides_positive_gauge_without_mutating_evidence(self):
         before = (self.jobs.read_bytes(), self.log.read_bytes(), self.config.read_bytes())
