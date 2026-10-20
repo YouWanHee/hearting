@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import json
 import os
 import select
 import sys
@@ -35,6 +36,38 @@ class SharedReadinessTest(unittest.TestCase):
             self.identity, result or {"state": "ready", "children": []},
             producer_pid=pid, producer_start=start, incarnation="runner-test",
             generation=[1, 2, 3], now=now)
+
+    def generated_normal_authority(self, row_count=72):
+        rows = []
+        extensions = {f"extension_{index:03d}": f"generated-value-{index:03d}"
+                      for index in range(127)}
+        for index in range(row_count):
+            metadata = {
+                "attempt_id": f"att-generated-related-{index:03d}",
+                "attempt_schema_version": "2",
+                "dispatch_depth": "1",
+                "worker_type": "review",
+                "registered_worker": "1",
+                "execution_surface": "registered-headless",
+                "harness": "claude",
+                "parent_sid": "generated-parent-session",
+                "parent_harness": "claude",
+                "route_id": "rt-generated-normal-shape",
+                "route_hash": "sha256:" + "a" * 64,
+                "route_node": "review",
+                "note": "completed-marker",
+                "failure_class": "pass",
+                "receipt_state": "settled",
+                "cleanup_pending": "0",
+                "generated_extension_detail": "x" * 2400,
+                **extensions,
+            }
+            raw_metadata = ",".join(f"{key}={value}" for key, value in metadata.items())
+            fields = ["2026-10-20T00:00:00Z", "done", "/generated/repo",
+                      "/generated/worktree", f"review-{index:03d}", raw_metadata]
+            rows.append({"status": "done", "metadata": metadata,
+                         "completion_metadata": dict(metadata), "fields": fields})
+        return {"rows": rows, "handover_keys": []}
 
     def test_request_identity_separates_consumer_and_attempt_selection(self):
         other_consumer = READINESS.attempt_identity(
@@ -99,6 +132,78 @@ class SharedReadinessTest(unittest.TestCase):
         ]})
         self.assertEqual(large["result"]["state"], "unknown")
         self.assertEqual(large["result"]["reason"], "readiness-projection-too-large")
+
+    def test_realistic_selected_authority_round_trips_over_small_result_limit(self):
+        authority = self.generated_normal_authority()
+        sample = authority["rows"][0]
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode("ascii")
+        self.assertGreater(len(sample["metadata"]), 64)
+        self.assertGreater(len(sample["fields"][5]), 4096)
+        self.assertGreater(max(map(len, sample["metadata"].values())), 2048)
+        self.assertEqual(sample["metadata"], sample["completion_metadata"])
+        self.assertGreater(len(encoded), 65536)
+        self.assertLess(len(encoded), READINESS.MAX_WATCH_AUTHORITY_BYTES)
+        self.assertGreater(len(authority["rows"]), 64)
+        self.assertTrue(READINESS.valid_watch_authority(authority))
+
+        jobs = self.root / "jobs.log"
+        jobs.write_text("generated registry fixture\n", encoding="utf-8")
+        info = jobs.stat()
+        generation = {"path": str(jobs), "resolved": str(jobs.resolve()),
+                      "signature": [info.st_dev, info.st_ino, info.st_size,
+                                    info.st_mtime_ns, info.st_ctime_ns]}
+        identity = READINESS.target_identity(
+            server="fixture", endpoint="/tmp/fixture.sock", pane="w1:p1",
+            harness="claude", session_id="sid-generated", shell_pid=os.getpid(),
+            shell_start=self.start, native_state="idle")
+        root = self.root / "peer-steward" / "obligations"
+        changed = READINESS.publish_watch_transition(
+            root, "watch-generated-large-authority", identity, "generated-token",
+            {"state": "ready", "reason": "native-turn-ready"},
+            producer_pid=os.getpid(), producer_start=self.start,
+            incarnation="runner-test", generation=generation,
+            lineage={"shell_pid": os.getpid(), "shell_start": self.start},
+            authority=authority)
+        self.assertTrue(changed)
+        path = READINESS._watch_transition_path(root, "watch-generated-large-authority")
+        self.assertGreater(path.stat().st_size, 65536)
+        result = READINESS.watch_transition_result(
+            root, "watch-generated-large-authority", identity, "generated-token")
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["authority"], authority)
+
+    def test_authority_over_total_transport_bound_stays_unknown(self):
+        oversized = {"rows": [{
+            "status": "done",
+            "metadata": {"generated_extension_detail": "x" * READINESS.MAX_WATCH_AUTHORITY_BYTES},
+            "completion_metadata": {"generated_extension_detail": "x" * READINESS.MAX_WATCH_AUTHORITY_BYTES},
+            "fields": ["now", "done", "/repo", "/worktree", "review",
+                       "generated_extension_detail=" + "x" * READINESS.MAX_WATCH_AUTHORITY_BYTES],
+        }], "handover_keys": []}
+        self.assertFalse(READINESS.valid_watch_authority(oversized))
+        jobs = self.root / "jobs.log"
+        jobs.write_text("generated registry fixture\n", encoding="utf-8")
+        info = jobs.stat()
+        generation = {"path": str(jobs), "resolved": str(jobs.resolve()),
+                      "signature": [info.st_dev, info.st_ino, info.st_size,
+                                    info.st_mtime_ns, info.st_ctime_ns]}
+        identity = READINESS.target_identity(
+            server="fixture", endpoint="/tmp/fixture.sock", pane="w1:p1",
+            harness="claude", session_id="sid-generated", shell_pid=os.getpid(),
+            shell_start=self.start, native_state="idle")
+        root = self.root / "peer-steward" / "obligations"
+        READINESS.publish_watch_transition(
+            root, "watch-overlarge-authority", identity, "oversized-token",
+            {"state": "ready", "reason": "native-turn-ready"},
+            producer_pid=os.getpid(), producer_start=self.start,
+            incarnation="runner-test", generation=generation,
+            lineage={"shell_pid": os.getpid(), "shell_start": self.start},
+            authority=oversized)
+        result = READINESS.watch_transition_result(
+            root, "watch-overlarge-authority", identity, "oversized-token")
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["reason"], "shared-readiness-authority-unbounded")
+        self.assertNotIn("authority", result)
 
 
 if __name__ == "__main__":

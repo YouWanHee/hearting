@@ -1931,19 +1931,32 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             return (), "unknown"
     else:
         view = None
-        if (not isinstance(selected_rows, (list, tuple)) or len(selected_rows) > 64
-                or any(not isinstance(row, dict)
-                       or not isinstance(row.get("status"), str)
-                       or not isinstance(row.get("metadata"), dict)
-                       or not isinstance(row.get("completion_metadata"), dict)
-                       or not isinstance(row.get("fields"), (list, tuple))
-                       or len(row["fields"]) != 6
-                       or any(not isinstance(field, str) for field in row["fields"])
-                       or any(not isinstance(key, str) or not isinstance(value, str)
-                              for mapping in (row["metadata"], row["completion_metadata"])
-                              for key, value in mapping.items())
-                       for row in selected_rows)):
+        if not isinstance(selected_rows, (list, tuple)):
             return (), "unknown"
+        normalized_rows = []
+        for row in selected_rows:
+            if (not isinstance(row, dict)
+                    or not isinstance(row.get("status"), str)
+                    or not isinstance(row.get("metadata"), dict)
+                    or not isinstance(row.get("completion_metadata"), dict)
+                    or not isinstance(row.get("fields"), (list, tuple))):
+                return (), "unknown"
+            normalized_rows.append({
+                "status": row["status"],
+                "metadata": row["metadata"],
+                "completion_metadata": row["completion_metadata"],
+                "fields": list(row["fields"]),
+            })
+        try:
+            expected_keys = ([] if expected_handover_keys is None else
+                             [list(key) for key in expected_handover_keys])
+        except (TypeError, ValueError):
+            return (), "unknown"
+        import shared_readiness
+        if not shared_readiness.valid_watch_authority(
+                {"rows": normalized_rows, "handover_keys": expected_keys}):
+            return (), "unknown"
+        selected_rows = normalized_rows
 
     if read_context is None:
         from peer_read_context import PeerReadContext
@@ -2004,6 +2017,14 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
 
     selected_registry_rows = []
     authority_rows = []
+    authority_complete = authority_out is not None
+    authority_size = None
+    if authority_complete:
+        import shared_readiness
+        authority_size = shared_readiness.bounded_json_size(
+            {"handover_keys": authority_out.get("handover_keys", []), "rows": []},
+            shared_readiness.MAX_WATCH_AUTHORITY_BYTES)
+        authority_complete = authority_size is not None
     for status, record in (candidates[key] for key in sorted(candidates)):
         if isinstance(record, dict):
             metadata = dict(record["metadata"])
@@ -2014,11 +2035,21 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             metadata = parse_registry_metadata(record.fields[5])
             completion_metadata = record.completion_metadata()
         selected_registry_rows.append((fields, completion_metadata))
-        authority_rows.append({"status": status, "metadata": metadata,
-                               "completion_metadata": completion_metadata,
-                               "fields": fields})
+        if authority_complete:
+            row = {"status": status, "metadata": metadata,
+                   "completion_metadata": completion_metadata, "fields": fields}
+            separator_size = 1 if authority_rows else 0
+            row_size = shared_readiness.bounded_json_size(
+                row, shared_readiness.MAX_WATCH_AUTHORITY_BYTES - authority_size - separator_size)
+            if row_size is None:
+                # Do not publish a valid-looking prefix of the selected rows.
+                authority_complete = False
+                authority_rows.clear()
+            else:
+                authority_rows.append(row)
+                authority_size += separator_size + row_size
     if authority_out is not None:
-        authority_out["rows"] = authority_rows
+        authority_out["rows"] = authority_rows if authority_complete else None
 
     result: list[RegisteredWorkObservation] = []
     for status, record in (candidates[key] for key in sorted(candidates)):

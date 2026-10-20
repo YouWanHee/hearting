@@ -10036,6 +10036,74 @@ class SharedReadinessRunnerTest(unittest.TestCase):
             self.assertEqual((response["state"], response["reason"]),
                              ("pending", "claim-arrived-between-checks"))
 
+    def test_selected_authority_accepts_more_than_64_related_registry_rows(self):
+        from dispatch_contract import parse_registry_metadata
+        from dispatch_registry_cache import registry_view
+        from peer_read_context import PeerReadContext
+
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs.log"
+            extensions = {f"extension_{index:03d}": f"generated-value-{index:03d}"
+                          for index in range(127)}
+            lines = []
+            route_id, route_hash = "rt-generated-related-set", "sha256:" + "c" * 64
+            for index in range(70):
+                metadata = {
+                    "attempt_id": f"att-generated-related-{index:03d}",
+                    "attempt_schema_version": "2",
+                    "dispatch_depth": "1",
+                    "worker_type": "review",
+                    "registered_worker": "1",
+                    "execution_surface": "registered-headless",
+                    "harness": "claude",
+                    "parent_sid": "generated-parent-session",
+                    "parent_harness": "claude",
+                    "route_id": route_id,
+                    "route_hash": route_hash,
+                    "route_node": "review",
+                    "note": "completed-marker",
+                    "failure_class": "pass",
+                    "receipt_state": "settled",
+                    "cleanup_pending": "0",
+                    "generated_extension_detail": "x" * 2400,
+                    **extensions,
+                }
+                raw = ",".join(f"{key}={value}" for key, value in metadata.items())
+                lines.append("\t".join((
+                    "2026-10-20T00:00:00Z", "done", "/generated/repo",
+                    "/generated/worktree", f"review-{index:03d}", raw)))
+            jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            view = registry_view(jobs)
+            related = view.completion_related("att-generated-owner", route_id, route_hash)
+            self.assertEqual(len(related), 70)
+            selected = [{
+                "status": record.status,
+                "metadata": parse_registry_metadata(record.fields[5]),
+                "completion_metadata": record.completion_metadata(),
+                "fields": list(record.fields),
+            } for record in related]
+            self.assertEqual(selected[0]["metadata"], selected[0]["completion_metadata"])
+            self.assertGreater(len(selected[0]["metadata"]), 64)
+            self.assertGreater(len(selected[0]["fields"][5]), 4096)
+            self.assertGreater(max(map(len, selected[0]["metadata"].values())), 2048)
+
+            import dispatch_registry_cache
+            authority = {"rows": [], "handover_keys": []}
+            with mock.patch.object(dispatch_registry_cache, "registry_view",
+                                   side_effect=AssertionError(
+                                       "selected authority consumer rebuilt RegistryView")):
+                work, state = peer_steward.peer_obligations.bound_work_for_pane(
+                    "w1:p1", "claude", "sid-unrelated", jobs=jobs,
+                    execution_attempt_ids=(), include_parent=False,
+                    read_context=PeerReadContext(registry_append_only=True),
+                    authority_out=authority, selected_rows=selected,
+                    expected_handover_keys=[])
+            self.assertEqual(state, "observed")
+            self.assertEqual(work, ())
+            self.assertEqual(len(authority["rows"]), 70)
+            self.assertTrue(peer_steward.shared_readiness.valid_watch_authority(authority))
+
     def test_receipt_boundary_rechecks_published_authority_and_serializes_seat_writers(self):
         from dispatch_contract import process_start_ticks
         from peer_read_context import PeerReadContext
@@ -10105,14 +10173,62 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                         jobs, route["route_id"], owner)
                     goal_path = terminal.campaign_goal_path(request)
 
+                    # Generate sanitized writer-shaped related rows with an
+                    # extensible metadata set. These remain unrelated to the
+                    # watched session, but the selected route authority must
+                    # carry them intact through the runner and receipt reader.
+                    related_route, related_hash, related_node = (
+                        task_route, task_hash, task_node)
+                    extensions = {
+                        f"extension_{index:03d}": f"generated-value-{index:03d}"
+                        for index in range(127)
+                    }
+                    related_lines = []
+                    for index in range(6):
+                        metadata = {
+                            "attempt_id": f"att-generated-related-{index:03d}",
+                            "attempt_schema_version": "2",
+                            "dispatch_depth": "1",
+                            "worker_type": "owner",
+                            "registered_worker": "1",
+                            "harness": "claude",
+                            "parent_sid": "fixture-parent",
+                            "parent_harness": "claude",
+                            "route_id": related_route,
+                            "route_hash": related_hash,
+                            "route_node": related_node,
+                            "note": "completed-marker",
+                            "failure_class": "pass",
+                            "launch_outcome": "reaped-before-publish",
+                            "receipt_state": "settled",
+                            "cleanup_pending": "0",
+                            "generated_extension_detail": "x" * 2400,
+                            **extensions,
+                        }
+                        raw_metadata = ",".join(
+                            f"{key}={value}" for key, value in metadata.items())
+                        related_lines.append("\t".join((
+                            "2026-10-20T00:00:00Z", "done", str(base), str(base),
+                            f"generated-owner-{index:03d}", raw_metadata)))
+                    with jobs.open("a", encoding="utf-8") as stream:
+                        stream.write("\n".join(related_lines) + "\n")
+
                     start = str(process_start_ticks(os.getpid()))
                     server, socket_path = "server-watch-authority", "/tmp/watch-authority.sock"
                     watch_id = "watch-real-authority-boundary"
                     agent = {"pane": "w1:p7", "harness": "claude",
                              "session_id": "sid-a", "name": "agent-a"}
+                    import session_tidy
+                    steward_sid = "steward-large-envelope"
+                    steward_seat = session_tidy.Seat(
+                        "pane", "watch-authority-steward-seat", "w1:p8", "claude",
+                        sid=steward_sid, endpoint="fixture").as_dict()
                     arm = {
                         "watch_id": watch_id, "server": server, "target": "agent-a",
                         "agent": agent,
+                        "steward": {"harness": "claude", "session_id": steward_sid,
+                                    "project": str(base)},
+                        "steward_seat": steward_seat,
                         "pane_identity": {"shell_pid": os.getpid(), "shell_start": start},
                     }
                     paths = peer_steward._watch_paths(watch_id, watch_root)
@@ -10158,7 +10274,7 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                                 incarnation=incarnation)
                         response = peer_steward.shared_readiness.watch_transition_result(
                             store.root, watch_id, identity, token)
-                        self.assertEqual(response["state"], "ready", response)
+                        self.assertEqual(response["state"], "ready", response.get("reason"))
                         return response
 
                     # The first response is genuinely ready: this owner is still
@@ -10222,6 +10338,19 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     # publishes its exact selected row without reparsing per watch.
                     response = publish_ready_response()
                     self.assertGreaterEqual(len(response["authority"]["rows"]), 3)
+                    first_authority = response["authority"]
+                    self.assertGreater(len(first_authority["rows"]), 6)
+                    generated_row = next(
+                        row for row in first_authority["rows"]
+                        if row["metadata"].get("attempt_id") == "att-generated-related-000")
+                    self.assertGreater(len(generated_row["metadata"]), 64)
+                    self.assertGreater(len(generated_row["fields"][5]), 4096)
+                    self.assertGreater(max(map(len, generated_row["metadata"].values())), 2048)
+                    self.assertEqual(generated_row["metadata"],
+                                     generated_row["completion_metadata"])
+                    authority_wire_bytes = len(json.dumps(
+                        first_authority, sort_keys=True, separators=(",", ":")).encode("ascii"))
+                    self.assertGreater(authority_wire_bytes, 65536)
                     self.assertEqual(jobs.read_bytes(), jobs_before)
 
                     # Revoke the actual terminal claim after ready publication.
@@ -10386,8 +10515,35 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     self.assertTrue(claim_writer_entered.is_set())
                     self.assertEqual(peer_steward._read_json(paths.receipt)["state"], "idle")
                     self.assertEqual(jobs.read_bytes(), jobs_before)
+                    transfer_ref = peer_steward._prepare_watch_notice(watch_id, arm, receipt)
+                    self.assertTrue(transfer_ref)
+                    peer_steward._record(
+                        to_harness=agent["harness"], to_name=agent["name"],
+                        kind="notice", ref=[], receipt=watch_id, status="received",
+                        summary_text=f"[notice] watch {watch_id} state=idle target=agent-a",
+                        from_identity=(steward_sid, "claude", str(base)))
+                    notice_rows = []
+                    for ledger in (peer_steward.peer_message.peer_state_root()
+                                   / "peer-messages").rglob("*.jsonl"):
+                        for line in ledger.read_text(encoding="utf-8").splitlines():
+                            if line.strip():
+                                row = json.loads(line)
+                                if (row.get("kind") == "notice"
+                                        and (row.get("delivery") or {}).get("receipt") == watch_id):
+                                    notice_rows.append(row)
+                    self.assertEqual(len(notice_rows), 1)
+                    from dispatch_seat_handover import acknowledge_watch, watch_ack_valid
+                    self.assertEqual(acknowledge_watch(
+                        watch_id, "claude", steward_sid, "large-authority-test"), "created")
+                    self.assertTrue(watch_ack_valid(paths.ack, watch_id, "claude", steward_sid))
+                    print(f"watch_authority_rows={len(first_authority['rows'])} "
+                          f"watch_authority_wire_bytes={authority_wire_bytes} "
+                          f"generated_metadata_keys={len(generated_row['metadata'])} "
+                          f"generated_raw_field_chars={len(generated_row['fields'][5])} "
+                          f"generated_max_value_chars={max(map(len, generated_row['metadata'].values()))}")
                     print(f"watch_receipt_authority_check_seconds={transition_check_seconds:.6f} "
-                          "transport=fake target-observation=fake check=selected-authority")
+                          "transport=fake target-observation=fake check=selected-authority "
+                          "receipt=notice=ack=verified")
         finally:
             terminal_case.doCleanups()
 

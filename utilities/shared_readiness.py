@@ -18,6 +18,13 @@ DUTY_KIND = "readiness-observation"
 MAX_AGE_SECONDS = 15.0
 MAX_TARGET_PROJECTIONS = 256
 RUNNER_WAKE_NAME = "readiness-wake.fifo"
+# Normal selected authority already exceeds 64 KiB with a dozen rows. Keep a
+# bounded envelope large enough for extended selections while small projections
+# continue to use their existing 64 KiB limit.
+MAX_SMALL_JSON_BYTES = 65536
+MAX_WATCH_TRANSITION_BYTES = 4 * 1024 * 1024
+MAX_WATCH_AUTHORITY_BYTES = MAX_WATCH_TRANSITION_BYTES - MAX_SMALL_JSON_BYTES
+_JSON_CHUNK_CHARS = 65536
 _CHILD_FIELDS = ("attempt_id", "slug", "status", "readiness", "reason",
                  "required_action")
 _WATCH_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
@@ -84,12 +91,47 @@ def _target_path(root, identity):
     return Path(root) / "readiness-v1" / name
 
 
-def _read_json(path):
+def bounded_json_size(value, limit):
+    """Return the encoded JSON size up to limit without building a large copy."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return None
+    size = 0
+    try:
+        encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=True)
+        for fragment in encoder.iterencode(value):
+            for offset in range(0, len(fragment), _JSON_CHUNK_CHARS):
+                size += len(fragment[offset:offset + _JSON_CHUNK_CHARS].encode("ascii"))
+                if size > limit:
+                    return None
+        return size
+    except (TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _bounded_json_bytes(value, limit):
+    """Serialize JSON into a capped buffer; never retain more than the transport bound."""
+    size = 0
+    raw = bytearray()
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=True)
+    for fragment in encoder.iterencode(value):
+        for offset in range(0, len(fragment), _JSON_CHUNK_CHARS):
+            chunk = fragment[offset:offset + _JSON_CHUNK_CHARS].encode("ascii")
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("readiness-projection-too-large")
+            raw.extend(chunk)
+    return bytes(raw)
+
+
+def _read_json(path, *, max_bytes=MAX_SMALL_JSON_BYTES):
     try:
         if path.is_symlink() or not path.is_file():
             return None
-        raw = path.read_bytes()
-        if len(raw) > 65536:
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
             return None
         value = json.loads(raw.decode("utf-8"))
         return value if isinstance(value, dict) else None
@@ -97,13 +139,11 @@ def _read_json(path):
         return None
 
 
-def _atomic_json(path, value):
+def _atomic_json(path, value, *, max_bytes=MAX_SMALL_JSON_BYTES):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink():
         raise OSError("readiness-projection-path-symlink")
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if len(raw) > 65536:
-        raise ValueError("readiness-projection-too-large")
+    raw = _bounded_json_bytes(value, max_bytes)
     fd, temporary = tempfile.mkstemp(prefix=".readiness-", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
@@ -285,38 +325,30 @@ def _watch_transition_path(root, watch_id):
 
 
 def valid_watch_authority(authority):
-    """Accept only the bounded exact rows needed for a consumer freshness read."""
+    """Accept registry-shaped rows within the bounded watch transport envelope."""
     if not isinstance(authority, dict):
         return False
     rows = authority.get("rows")
     keys = authority.get("handover_keys")
-    if (not isinstance(rows, list) or len(rows) > 64
-            or not isinstance(keys, list) or len(keys) > 64):
+    if not isinstance(rows, list) or not isinstance(keys, list):
         return False
     for row in rows:
         if (not isinstance(row, dict) or not isinstance(row.get("status"), str)
-                or len(row["status"]) > 32 or not isinstance(row.get("metadata"), dict)
-                or len(row["metadata"]) > 64
+                or not isinstance(row.get("metadata"), dict)
                 or not isinstance(row.get("completion_metadata"), dict)
-                or len(row["completion_metadata"]) > 64
                 or not isinstance(row.get("fields"), list) or len(row["fields"]) != 6
-                or any(not isinstance(field, str) or len(field) > 4096
+                or any(not isinstance(field, str)
                        for field in row["fields"])):
             return False
         for mapping in (row["metadata"], row["completion_metadata"]):
-            if any(not isinstance(key, str) or len(key) > 128
-                   or not isinstance(value, str) or len(value) > 2048
+            if any(not isinstance(key, str) or not isinstance(value, str)
                    for key, value in mapping.items()):
                 return False
     for key in keys:
         if (not isinstance(key, list) or len(key) != 3
-                or any(not isinstance(value, str) or len(value) > 512 for value in key)):
+                or any(not isinstance(value, str) for value in key)):
             return False
-    try:
-        return len(json.dumps(authority, sort_keys=True, separators=(",", ":"),
-                              ensure_ascii=False).encode("utf-8")) <= 65536
-    except (TypeError, ValueError, UnicodeError):
-        return False
+    return bounded_json_size(authority, MAX_WATCH_AUTHORITY_BYTES) is not None
 
 
 def publish_watch_transition(root, watch_id, identity, request_token, result, *,
@@ -354,8 +386,12 @@ def publish_watch_transition(root, watch_id, identity, request_token, result, *,
             pass
     if authority is not None:
         value["authority"] = authority
+    if bounded_json_size(value, MAX_WATCH_TRANSITION_BYTES) is None:
+        value["result"] = {"state": "unknown",
+                           "reason": "shared-readiness-authority-unbounded"}
+        value.pop("authority", None)
     path = _watch_transition_path(root, watch_id)
-    previous = _read_json(path)
+    previous = _read_json(path, max_bytes=MAX_WATCH_TRANSITION_BYTES)
     previous_age = None
     if previous:
         try:
@@ -372,7 +408,7 @@ def publish_watch_transition(root, watch_id, identity, request_token, result, *,
                    and previous.get("lineage") == value.get("lineage")
                    and previous.get("result") == value["result"]
                    and previous.get("authority") == value.get("authority"))
-    _atomic_json(path, value)
+    _atomic_json(path, value, max_bytes=MAX_WATCH_TRANSITION_BYTES)
     return changed
 
 
@@ -380,7 +416,8 @@ def watch_transition_result(root, watch_id, identity, request_token, *,
                             now=None, max_age=MAX_AGE_SECONDS):
     """Read a current per-watch refresh response; mismatches remain unknown."""
     try:
-        value = _read_json(_watch_transition_path(root, watch_id))
+        value = _read_json(_watch_transition_path(root, watch_id),
+                           max_bytes=MAX_WATCH_TRANSITION_BYTES)
     except ValueError:
         return None
     if (not value or value.get("schema_version") != SCHEMA_VERSION
