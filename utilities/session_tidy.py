@@ -802,7 +802,20 @@ def _lineage_card_status(path: Path) -> str:
 def _lineage_transcript(harness: str, sid: str, hint: str) -> dict:
     try:
         import tidy_transcripts
-        path = tidy_transcripts.locate_transcript(harness, sid, hint or None)
+        path = None
+        if hint:
+            hinted = Path(hint).expanduser()
+            try:
+                info = hinted.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return {"path": str(hinted), "status": "unreadable"}
+            else:
+                if not stat.S_ISREG(info.st_mode):
+                    return {"path": str(hinted), "status": "unreadable"}
+                path = hinted
+        path = path or tidy_transcripts.locate_transcript(harness, sid, hint or None)
         if path is None:
             return {"path": None, "status": "missing"}
         info = Path(path).lstat()
