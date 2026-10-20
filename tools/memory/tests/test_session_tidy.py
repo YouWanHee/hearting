@@ -2882,6 +2882,24 @@ class ContinueHelperTest(TidyCase):
                 continuer=lambda *a: self.calls.append("continue") or {"continued": "true"}, sleep=late_start)
         self.assertEqual((outcome, self.calls), ("continued", ["continue"]))
 
+    def test_same_seat_clear_injection_never_requests_handoff_accept(self):
+        seat, req = self.booked()
+        shown = []
+        def late_start(_sec):
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "start", "sid-B", source="clear", cwd=str(self.cwd),
+                            emit=shown.append)
+        with self.iso.patched_environ(self.extra):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=lambda *_a: "idle",
+                steward=lambda *_a: {"cleared": "unverified", "reason": "new-session-not-observed"},
+                continuer=lambda *a: {"continued": "true"}, sleep=late_start)
+        self.assertEqual(outcome, "continued")
+        output = "".join(shown).lower()
+        self.assertNotIn("handoff accept", output)
+        self.assertNotIn("session-tidy accept", output)
+        self.assertNotIn("peer-message accept", output)
+
     def test_no_continue_and_no_card_clear_without_typing_after_it(self):
         for kwargs in ({"no_continue": True}, {"card": False}):
             with self.subTest(**kwargs):
