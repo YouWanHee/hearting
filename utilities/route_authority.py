@@ -1909,10 +1909,10 @@ def declared_subsession(args) -> bool:
 
 
 def new_owner_request(previous_row, *, jobs=None, task=None):
-    """A changed sealed assignment after a settled failure, without rewriting it."""
+    """A changed sealed assignment after a settled attempt, without rewriting it."""
     if (jobs is None or not isinstance(task, str) or not task.strip()
             or previous_row.get("_status") not in {"done", "closed"}
-            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+            or committed_outcome(previous_row["_status"], previous_row) not in {"failed", "succeeded"}):
         return False
     from dispatch_contract import (
         DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
