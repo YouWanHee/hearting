@@ -3296,6 +3296,20 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertTrue(replay["owner_started"])
         self.assertEqual(len(self.launches), launches_before_replay)
 
+    def test_confirmed_handover_refuses_live_start_for_old_parent_and_allows_successor(self):
+        owner_a = self._seed_initial_owner()
+        self._handover(owner_a, "successor")
+        launches_before = len(self.launches)
+        with mock.patch.object(W, "default_parent_session_id", return_value="parent"):
+            refused = self._cli_start()
+        self.assertEqual(refused.get("reason"), "work-parent-recovery-required", refused)
+        self.assertEqual(len(self.launches), launches_before)
+        with mock.patch.object(W, "default_parent_session_id", return_value="successor"):
+            admitted = self._cli_start()
+        self.assertEqual(admitted.get("owner_attempt_id"), owner_a, admitted)
+        self.assertIn(admitted.get("state"), {"running", "preparing"}, admitted)
+        self.assertEqual(len(self.launches), launches_before)
+
     def test_off_chair_start_retains_correction_without_launching(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
         self._store(owner_b, "off-chair retained correction", "input-off-chair")

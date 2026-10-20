@@ -978,6 +978,30 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(worker.wait(timeout=2), -signal.SIGTERM)
         self.assertEqual(CLOSE._rows(self.jobs)[self.aid("att-worker")][1]["failure_class"], "pass")
 
+    def test_confirmed_handover_refuses_old_parent_close_and_allows_successor(self):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        owner = self.process("att-owner")
+        meta = self.row("att-owner", process=owner)
+        seat = tidy.Seat("pane", "fixture-successor-seat", "w8:pSuccessor")
+        binding = handover.binding_of(self.jobs, meta)
+        tidy.atomic_write_json(handover._snapshot_path(seat.key), {
+            "schema": handover.SCHEMA,
+            "seat": {"kind": "pane", "key": seat.key, "pane": seat.pane},
+            "from": {"sid": meta["parent_sid"]}, "bindings": [binding],
+        })
+        ledger = tidy._ledger_path(seat)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({"event": "handover", "from": meta["parent_sid"],
+            "sid": "successor", "harness": "codex", "ts": time.time(),
+            "bindings": [binding]}) + "\n")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": meta["parent_sid"]}):
+            with self.assertRaisesRegex(ValueError, "parent-close-owner-not-owned"):
+                self.close()
+        self.assertIsNone(owner.poll())
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "successor"}):
+            self.assertEqual(self.close()["state"], "cancelled")
+
     def test_crash_after_journal_intent_fences_late_pass_and_launch(self):
         owner = self.process("att-owner")
         self.row("att-owner", process=owner)

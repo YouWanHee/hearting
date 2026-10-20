@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Hermetic registration and D-42 regression for the OpenCode V2 plugin API."""
 import os
+import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # A test run inside a registered worker must not lend the fixture its markers.
@@ -29,6 +31,35 @@ class OpenCodeV2PluginTest(unittest.TestCase):
         self.assertLess(root_recheck, begin_write)
         self.assertLess(begin_write, sdk_write)
         self.assertIn('noReply: true', delivery[sdk_write:])
+
+    def test_python_reserve_begin_write_failure_stays_pending_and_ambiguous_write_is_not_retried(self):
+        spec = importlib.util.spec_from_file_location("opencode_peer_message", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "HOME": tmp, "XDG_STATE_HOME": tmp + "/state",
+                "AGENT_PEER_LEDGER_ROOT": tmp + "/peer", "AGENT_DISPATCH_JOBS": tmp + "/jobs.log",
+                "AGENT_RUNTIME_ROOT": tmp + "/runtime"}):
+            sender = {"harness": "codex", "session_id": "sender"}
+            recipient = {"harness": "opencode", "session_id": "recipient"}
+            _text, ref = peer.prepare_peer_message("one original prompt", sender, recipient, defer=True)
+            claimant = {"pid": os.getpid(), "start": "123"}
+            reserved = peer.reserve_pending_herdr(ref, recipient, claimant=claimant)
+            self.assertEqual(peer._read_pending(ref)["state"], "pending")
+            # A begin-write transition that fails or times out has not crossed the SDK boundary.
+            with mock.patch("dispatch_contract.process_identity_disposition", return_value="unknown"):
+                self.assertIsNone(peer.begin_pending_write(reserved, recipient=recipient, claimant=claimant))
+            pending = peer._read_pending(ref)
+            self.assertEqual(pending["state"], "pending")
+            self.assertTrue(pending["text"].startswith("one original prompt"))
+            self.assertTrue(peer.release_unsent_herdr_claim(reserved))
+            retry = peer.reserve_pending_herdr(ref, recipient, claimant=claimant)
+            self.assertIsNotNone(retry)
+            with mock.patch("dispatch_contract.process_identity_disposition", return_value="live"):
+                writing = peer.begin_pending_write(retry, recipient=recipient, claimant=claimant)
+            self.assertEqual(writing["state"], "unverified")
+            self.assertIsNone(peer.reserve_pending_herdr(ref, recipient, claimant=claimant))
+            self.assertTrue(peer._read_pending(ref)["text"].startswith("one original prompt"))
 
     def test_v1_reinjects_contract_without_main_lifecycle_or_native_child_leak(self):
         node = shutil.which("node")
