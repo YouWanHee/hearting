@@ -1374,6 +1374,12 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(len(self.calls), before)
         owns.assert_called()
         self.assertIn("parent_sid=parent", self.jobs.read_text())          # the registered identity is untouched
+        W.default_parent_session_id.return_value = "parent"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+        W.default_parent_session_id.return_value = "successor"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["state"], "preparing")
         W.default_parent_session_id.return_value = "stranger"
         with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
             self.assertEqual(self.start()["reason"], "work-parent-recovery-required")

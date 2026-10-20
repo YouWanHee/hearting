@@ -1630,6 +1630,36 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(row["receipt"], "hook-context-inflight")
         self.assertTrue(row["rpc_claim"])
         self.assertEqual(row["text"], text)
+        before = stream.data
+        retry = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=retry,
+                                       native_delivery=True)
+        self.assertEqual(retry.getvalue(), "")
+        self.assertEqual(stream.data, before)
+
+    def test_claude_hook_recovers_a_dead_reservation_before_begin_write(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        with mock.patch.object(peer_message, "begin_pending_write",
+                               side_effect=SystemExit("fixture killed after reserve")):
+            with self.assertRaisesRegex(SystemExit, "killed after reserve"):
+                peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=io.StringIO(),
+                                               native_delivery=True)
+        reserved = peer_message._read_pending(ref)
+        self.assertEqual((reserved["state"], reserved["text"]), ("pending", text))
+        # Model process death after reservation; the normal hook sender must
+        # take over the still-pending claim and cross begin-write once.
+        peer_message._save_pending(dict(reserved, rpc_claim={**reserved["rpc_claim"],
+                                                              "pid": 99999999, "start": "1"}))
+        stream = io.StringIO()
+        with mock.patch("dispatch_contract.process_identity_disposition",
+                        side_effect=("dead", "live")):
+            peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream,
+                                           native_delivery=True)
+        self.assertEqual(json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"], text)
+        row = peer_message._read_pending(ref)
+        self.assertEqual((row["state"], row["receipt"], row["text"]),
+                         ("received", "exact-peer-ref", None))
 
     def test_claude_native_context_rejects_wrong_target_and_corrupt_body(self):
         recipient = dict(self.recipient, harness="claude")

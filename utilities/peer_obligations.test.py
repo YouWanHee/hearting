@@ -1297,6 +1297,25 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
             session_id="sid-current", pid_birth="pid:9@start:4", identity_verified=True,
             native_turn="idle", bound_work=work, bindings_state=state)
         self.assertEqual((ready.state, ready.outcome), ("ready", "succeeded"))
+        for delivery_state in ("pending", "claimed", "unverified"):
+            with self.subTest(delivery_state=delivery_state):
+                record["state"] = delivery_state
+                with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
+                                return_value=(("rt-parent-delivery", "sha256:" + "b" * 64, "execute"),)), \
+                     mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-current"), \
+                     mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
+                     mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                                ObservedAttemptLiveness("dead", "fixture", "quiescent", "fixture")), \
+                     mock.patch("dispatch_terminal_commit.owner_completion_state",
+                                side_effect=AssertionError("parent readiness must not inspect closure")), \
+                     mock.patch("dispatch_pending_delivery.read", return_value=record):
+                    open_work, open_state = obligations.bound_work_for_pane(
+                        "w3:p7", "codex", "sid-current", jobs=jobs)
+                open_ready = obligations.pane_readiness(server="fixture", pane="w3:p7", harness="codex",
+                    session_id="sid-current", pid_birth="pid:9@start:4", identity_verified=True,
+                    native_turn="idle", bound_work=open_work, bindings_state=open_state)
+                self.assertEqual((open_work[0].delivery_state, open_ready.state),
+                                 (delivery_state, "pending"))
 
 
 if __name__ == "__main__":

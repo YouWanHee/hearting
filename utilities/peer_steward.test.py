@@ -8550,6 +8550,7 @@ class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), self.SUCCESSOR)
         self.assertEqual(self.handover.effective_parent_harness(self.meta, self.jobs_path), "codex")
         self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertFalse(self.handover.owns(self.meta, self.PARENT, self.jobs_path))
         self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
         ledger = self.tidy._ledger_path(self.seat).read_bytes()
         row = json.loads(ledger)

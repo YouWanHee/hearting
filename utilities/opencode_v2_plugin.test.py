@@ -15,6 +15,21 @@ BASE_ENV = {key: value for key, value in os.environ.items() if key not in WORKER
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
+    def test_peer_prompt_write_boundary_orders_reserve_recheck_begin_and_no_reply(self):
+        source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
+        start = source.index('const reserveStarted = performance.now()',
+                             source.index('async function pendingPeerDelivery(ctx, sid)'))
+        end = source.index('pendingPeerTrace(ctx, sid, "noReply-save"', start)
+        delivery = source[start:end]
+        reserve = delivery.index('["--reserve", row.ref')
+        root_recheck = delivery.index('if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"')
+        begin_write = delivery.index('["--begin-write", row.ref')
+        sdk_write = delivery.index('client.prompt({ path: { id: sid }')
+        self.assertLess(reserve, root_recheck)
+        self.assertLess(root_recheck, begin_write)
+        self.assertLess(begin_write, sdk_write)
+        self.assertIn('noReply: true', delivery[sdk_write:])
+
     def test_v1_reinjects_contract_without_main_lifecycle_or_native_child_leak(self):
         node = shutil.which("node")
         if not node:
