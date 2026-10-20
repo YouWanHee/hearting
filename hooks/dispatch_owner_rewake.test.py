@@ -34,6 +34,12 @@ assert SPEC is not None and SPEC.loader is not None
 rewake = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rewake
 SPEC.loader.exec_module(rewake)
+FIXTURE_PROCESSES_SPEC = importlib.util.spec_from_file_location(
+    "dispatch_fixture_processes", ROOT / "tools/fixture_processes.py"
+)
+assert FIXTURE_PROCESSES_SPEC is not None and FIXTURE_PROCESSES_SPEC.loader is not None
+fixture_processes = importlib.util.module_from_spec(FIXTURE_PROCESSES_SPEC)
+FIXTURE_PROCESSES_SPEC.loader.exec_module(fixture_processes)
 
 _JOIN_PATH = Path(__file__).resolve().parents[1] / "utilities" / "dispatch_completion_join.py"
 _JOIN_SPEC = importlib.util.spec_from_file_location("dispatch_completion_join", _JOIN_PATH)
@@ -1572,7 +1578,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self._fixture_child_handles = []
         self.root = Path(self.temporary.name)
+        fixture_root = str(self.root)
+        child_handles = self._fixture_child_handles
+
+        def reap_fixture_processes():
+            fixture_processes.reap(fixture_root)
+            for child in child_handles:
+                child.wait(timeout=10)
+
+        self.addCleanup(reap_fixture_processes)
         self.jobs = self.root / "jobs.log"
         # This suite's env was previously ambient (only exercised correctly
         # because the invoking shell already had a real AGENT_HOME); under
@@ -1713,8 +1729,10 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 self._open_row(ancestry=restorable_parent)
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
                 path = self._close_and_materialize(close_note)
-                with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):
+                with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"), \
+                        mock.patch.object(steward.peer_obligations, "request_dispatch_reconciliation") as reconcile:
                     activate(self.root, carrier, "session-1")
+                    reconcile.assert_called_once_with(self.root)
                 store = rewake.peer_obligations.ObligationStore(self.root)
                 duty = next(d for d in store.list() if d["intent"]["identity"]["harness"] == harness)
                 self.assertEqual(json.loads(path.read_text())["attempts"], 0)
@@ -2251,6 +2269,77 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("state=timeout", stdout)
         self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
+
+
+class CarrierFixtureCleanupBoundaryTest(unittest.TestCase):
+    def _run_probe(self, fail_body):
+        observations = {}
+        original_cleanup = tempfile.TemporaryDirectory.cleanup
+        writer = (
+            "import os,time\n"
+            "d=os.environ['FIXTURE_DIR']\n"
+            "open(os.path.join(d,'writer-ready'),'w').write(str(os.getpid()))\n"
+            "i=0\n"
+            "while True:\n"
+            "    i+=1; open(os.path.join(d,'writer-%d'%i),'w').close(); time.sleep(0.005)\n"
+        )
+
+        class Probe(CarrierOneClaimGateTest):
+            def __init__(self):
+                super().__init__("runTest")
+
+            def setUp(self):
+                super().setUp()
+                env = dict(os.environ, FIXTURE_DIR=str(self.root))
+                child = subprocess.Popen([sys.executable, "-c", writer], env=env,
+                                         start_new_session=True, stdin=subprocess.DEVNULL)
+                self._fixture_child_handles.append(child)
+                deadline = time.monotonic() + 10
+                ready = self.root / "writer-ready"
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "fixture writer did not start")
+                pid = int(ready.read_text(encoding="utf-8"))
+                start = fixture_processes._start_ticks(pid)
+                self.assertIsNotNone(start)
+                observations.update(root=str(self.root), pid=pid, start=start)
+
+            def runTest(self):
+                self.assertIn(observations["pid"],
+                              fixture_processes.marked_processes(observations["root"]))
+                if fail_body:
+                    self.fail("intentional carrier fixture assertion failure")
+
+        def observe_before_delete(temporary_directory):
+            if temporary_directory.name == observations.get("root"):
+                pid, start = observations["pid"], observations["start"]
+                observations["remaining"] = fixture_processes.marked_processes(temporary_directory.name)
+                observations["gone_before_delete"] = fixture_processes._gone(pid, start)
+                observations["root_present_before_delete"] = Path(temporary_directory.name).is_dir()
+            return original_cleanup(temporary_directory)
+
+        result = unittest.TestResult()
+        with mock.patch.object(tempfile.TemporaryDirectory, "cleanup", observe_before_delete):
+            Probe().run(result)
+        return result, observations
+
+    def _assert_cleanup_evidence(self, observations):
+        self.assertTrue(observations["root_present_before_delete"])
+        self.assertTrue(observations["gone_before_delete"])
+        self.assertEqual(observations["remaining"], {})
+        self.assertFalse(Path(observations["root"]).exists())
+
+    def test_carrier_fixture_drains_writer_after_normal_body(self):
+        result, observations = self._run_probe(False)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self._assert_cleanup_evidence(observations)
+
+    def test_carrier_fixture_preserves_body_failure_and_drains_writer(self):
+        result, observations = self._run_probe(True)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("intentional carrier fixture assertion failure", result.failures[0][1])
+        self.assertEqual(result.errors, [])
+        self._assert_cleanup_evidence(observations)
 
 
 class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
