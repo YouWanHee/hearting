@@ -27,6 +27,8 @@ def module(name, path):
 
 
 pm = module("alias_peer_message", "utilities/peer-message.py")
+sys.path.insert(0, str(ROOT / "tools"))
+import fixture_processes  # noqa: E402
 
 
 def pinned_source(path):
@@ -40,6 +42,7 @@ class AliasReceive(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name)
+        self.addCleanup(fixture_processes.reap, str(self.state))
         for path in (self.state / "home", self.state / "xdg", self.state / "xdg-config",
                      self.state / "xdg-data", self.state / "artifacts", self.state / "runtime",
                      self.state / "peer-ledger"):
