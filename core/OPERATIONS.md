@@ -1166,9 +1166,10 @@ changes the settled result or grants another execution.
 An accepted Claude native wake is also retained as the existing outer manager's
 registered-batch duty. If its hook exits before delivery, that task runner checks
 the same current attempt and pending notice and hands it to the existing peer
-courier for the exact parent session. Native and recovery delivery share the
-notice claim; forms and busy turns use the courier's existing retained-message
-path. Codex and OpenCode keep their existing retained completion controllers.
+courier for the exact current `effective_parent` session. Native and recovery
+delivery share the notice claim; forms and busy turns use the courier's
+existing retained-message path. Codex and OpenCode keep their existing
+retained completion controllers.
 Confirmed session handover changes the recipient, while the signed notice stays
 under the registered parent's storage key. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
