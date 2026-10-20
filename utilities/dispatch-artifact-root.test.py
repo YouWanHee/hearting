@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 sys.dont_write_bytecode = True
 
@@ -21,7 +22,7 @@ def run(argv: list[str], cwd: Path, env: dict[str, str] | None = None):
     result = subprocess.run(
         argv,
         cwd=str(cwd),
-        env={**CLEAN_ENV, **(env or {})},
+        env={**CLEAN_ENV, "AGENT_HOME": str(ROOT), **(env or {})},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -172,21 +173,43 @@ class DispatchArtifactRootTests(unittest.TestCase):
         body = prompt.read_text(encoding="utf-8")
         self.assertIn(self.canonical, body)
         self.assertIn("read-only shadow state", body)
+        return result
 
     def test_claude_scopes_add_dir_and_metadata(self):
         self.assert_registered("claude", f"--add-dir {self.canonical}")
 
     def test_codex_scopes_add_dir_and_metadata(self):
-        self.assert_registered("codex", f"--writable-root {self.canonical}")
+        result = self.assert_registered("codex")
+        # The app-server supervisor and plain `codex exec` spell the same scope differently;
+        # which one launches depends on the Codex runtime available here.
+        command = next(line for line in result.stdout.splitlines() if line.startswith("command="))
+        flag = "--writable-root" if "codex-app-server-supervisor.py" in command else "--add-dir"
+        self.assertIn(f"{flag} {self.canonical}", command)
 
     def test_opencode_scopes_external_directory_and_preserves_config(self):
-        existing = {
+        v1_existing = {
             "permission": {
                 "bash": "deny",
                 "external_directory": {"*": "ask", "/keep/**": "deny"},
             },
             "theme": "system",
         }
+        v2_existing = {
+            "permissions": [
+                {"action": "shell", "resource": "*", "effect": "deny"},
+                {"action": "external_directory", "resource": "*", "effect": "ask"},
+                {"action": "external_directory", "resource": "/keep/**", "effect": "deny"},
+            ],
+            "agents": {},
+            "theme": "system",
+        }
+        module_path = ROOT / "adapters" / "opencode" / "bin" / "dispatch-headless.py"
+        spec = importlib.util.spec_from_file_location("opencode_dispatch", module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        actual_v2 = module.opencode_runtime.is_v2()
+        existing = v2_existing if actual_v2 else v1_existing
         env = {**CLEAN_ENV, "AGENT_ARTIFACT_ROOT":self.canonical,
                "AGENT_ROUTE_FILE":str(self.route_file),"AGENT_ROUTE_ID":self.route["route_id"],
                "AGENT_ROUTE_NODE":"one-shot","AGENT_DISPATCH_WORKTREE":str(self.worktree),
@@ -195,27 +218,42 @@ class DispatchArtifactRootTests(unittest.TestCase):
         self.assertIn(f"artifact_root={self.canonical}", result.stdout)
         self.assertIn("external_directory_permission=scoped-allow", result.stdout)
 
-        module_path = ROOT / "adapters" / "opencode" / "bin" / "dispatch-headless.py"
-        spec = importlib.util.spec_from_file_location("opencode_dispatch", module_path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        old = os.environ.get("OPENCODE_CONFIG_CONTENT")
-        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(existing)
+        import dispatch_replacement
+        original_version = os.environ.get("OPENCODE_RUNTIME_VERSION")
+        original_config = os.environ.get("OPENCODE_CONFIG_CONTENT")
         try:
-            merged = json.loads(module.scoped_external_directory_config(self.canonical))
+            for version, source in (("1.19.0", v1_existing), ("2.0.32", v2_existing)):
+                os.environ["OPENCODE_RUNTIME_VERSION"] = version
+                os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(source)
+                merged = json.loads(module.scoped_external_directory_config(self.canonical))
+                if version.startswith("2."):
+                    self.assertNotIn("permission", merged)
+                    self.assertNotIn("agent", merged)
+                    self.assertIn("permissions", merged)
+                    self.assertIn("agents", merged)
+                else:
+                    self.assertIn("permission", merged)
+                recorded = dispatch_replacement._applied_permissions(
+                    SimpleNamespace(opencode_config_content=json.dumps(merged)))
+                rules = recorded["opencode_permission"]
+                self.assertTrue(rules)
+                self.assertEqual(module.opencode_runtime.opencode_permission_rules_for_action(
+                    rules, "bash"), [("*", "deny")])
+                external = rules["external_directory"]
+                self.assertEqual(external["*"], "ask")
+                self.assertEqual(external["/keep/**"], "deny")
+                self.assertEqual(external[self.canonical], "allow")
+                self.assertEqual(external[f"{self.canonical}/**"], "allow")
+                self.assertEqual(merged["theme"], "system")
         finally:
-            if old is None:
+            if original_version is None:
+                os.environ.pop("OPENCODE_RUNTIME_VERSION", None)
+            else:
+                os.environ["OPENCODE_RUNTIME_VERSION"] = original_version
+            if original_config is None:
                 os.environ.pop("OPENCODE_CONFIG_CONTENT", None)
             else:
-                os.environ["OPENCODE_CONFIG_CONTENT"] = old
-        self.assertEqual(merged["theme"], "system")
-        self.assertEqual(merged["permission"]["bash"], "deny")
-        rules = merged["permission"]["external_directory"]
-        self.assertEqual(rules["*"], "ask")
-        self.assertEqual(rules["/keep/**"], "deny")
-        self.assertEqual(rules[self.canonical], "allow")
-        self.assertEqual(rules[f"{self.canonical}/**"], "allow")
+                os.environ["OPENCODE_CONFIG_CONTENT"] = original_config
 
 
 if __name__ == "__main__":

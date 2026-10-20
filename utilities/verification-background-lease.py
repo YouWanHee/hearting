@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""Run one bounded verification command with an exact attempt-owned lease."""
+"""Run one bounded verification command with an exact attempt-owned lease.
+
+Everything the command starts ends with it. The lease is the command's child
+subreaper, so a fixture that detaches (setsid, double fork) re-parents here
+instead of to init, and every process also carries this run's scope tag. When
+the command exits, times out, or the lease is told to stop, whatever is still
+in that scope is terminated. A test that left a runner or refresher behind
+used to keep it running on a shared host until something else killed it.
+
+The scope's resident memory has one ceiling, so a leak ends this command
+instead of the kernel's OOM killer ending other work on the host.
+"""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 import signal
 import subprocess
@@ -86,6 +99,140 @@ def lease_context(command: list[str], timeout: float) -> tuple[Path, dict[str, o
     }
 
 
+SCOPE_ENV = "HEARTING_VERIFICATION_SCOPE"
+_PR_SET_CHILD_SUBREAPER = 36
+MEMORY_POLL_SECONDS = 1.0
+MEMORY_EXCEEDED_EXIT = 125
+
+
+def memory_budget_bytes() -> int:
+    """16 GiB, or a quarter of this host's memory when that is smaller."""
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError):
+        total = 0
+    budget = 16 * 1024 ** 3
+    return min(budget, total // 4) if total > 0 else budget
+
+
+def become_subreaper() -> bool:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def process_table() -> dict[int, tuple[int, int]]:
+    """pid -> (ppid, resident bytes) for every live, non-zombie process."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    table: dict[int, tuple[int, int]] = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            fields = Path(f"/proc/{name}/stat").read_bytes().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[0] in (b"Z", b"X"):
+            continue
+        table[int(name)] = (int(fields[1]), int(fields[21]) * page)
+    return table
+
+
+def scope_pids(table: dict[int, tuple[int, int]], scope: str | None) -> set[int]:
+    """This lease's descendants, plus any process carrying its scope tag."""
+    own = os.getpid()
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _rss) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    found: set[int] = set()
+    stack = list(children.get(own, ()))
+    while stack:
+        pid = stack.pop()
+        if pid not in found:
+            found.add(pid)
+            stack.extend(children.get(pid, ()))
+    if scope:
+        marker = f"{SCOPE_ENV}={scope}".encode()
+        for pid in table:
+            if pid in found or pid == own:
+                continue
+            try:
+                if marker in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                    found.add(pid)
+            except OSError:
+                continue
+    found.discard(own)
+    return found
+
+
+def reap_zombies(keep: int | None = None) -> None:
+    """Collect exited adopted children; `keep` (the command) stays for its own wait."""
+    own = str(os.getpid()).encode()
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == keep:
+            continue
+        try:
+            fields = Path(f"/proc/{name}/stat").read_bytes().rsplit(b")", 1)[1].split()
+            if fields[0] == b"Z" and fields[1] == own:
+                os.waitpid(int(name), os.WNOHANG)
+        except (OSError, IndexError):
+            continue
+
+
+def end_scope(scope: str | None, *, grace: float = 2.0) -> list[int]:
+    """Terminate everything still in this run's scope; a killed parent can
+    re-parent its own children here, so repeat until nothing is left."""
+    ended: list[int] = []
+    for _round in range(5):
+        pids = scope_pids(process_table(), scope)
+        if not pids:
+            break
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                reap_zombies()
+                live = process_table()
+                if not any(pid in live for pid in pids):
+                    break
+                time.sleep(.05)
+            else:
+                continue
+            break
+        ended.extend(sorted(pids))
+        reap_zombies()
+    return ended
+
+
+def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: str) -> int | None:
+    """The command's exit status; None on expiry. Raises MemoryError past the budget."""
+    budget = memory_budget_bytes()
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return process.wait(timeout=min(MEMORY_POLL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+        table = process_table()
+        resident = sum(table[pid][1] for pid in scope_pids(table, scope) if pid in table)
+        if resident > budget:
+            raise MemoryError(f"verification-memory-budget-exceeded resident_bytes={resident} "
+                              f"budget_bytes={budget}")
+
+
+def _stop(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def terminate_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -107,7 +254,15 @@ def main(argv: list[str] | None = None) -> int:
         command = command[1:]
     if args.timeout <= 0 or not command:
         parser.error("a positive --timeout and command are required")
-    process = subprocess.Popen(command, start_new_session=True)
+    become_subreaper()
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, _stop)
+    scope = secrets.token_hex(8)
+    process = subprocess.Popen(command, start_new_session=True,
+                               env={**os.environ, SCOPE_ENV: scope})
+    # An adopted descendant that exits is collected at once, so a check that
+    # waits for a fixture to die never sees it lingering as this lease's zombie.
+    signal.signal(signal.SIGCHLD, lambda _signum, _frame: reap_zombies(keep=process.pid))
     lease = lease_context(command, args.timeout)
     lease_path: Path | None = None
     if lease is not None:
@@ -125,11 +280,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             lease_path = None
     try:
-        return process.wait(timeout=args.timeout)
-    except subprocess.TimeoutExpired:
+        status = wait_within_budget(process, args.timeout, scope)
+        if status is None:
+            terminate_group(process)
+            return 124
+        return status
+    except MemoryError as exc:
+        print(exc, file=sys.stderr)
         terminate_group(process)
-        return 124
+        return MEMORY_EXCEEDED_EXIT
     finally:
+        if process.poll() is None:
+            terminate_group(process)
+        left = end_scope(scope)
+        if left:
+            print(f"verification-scope-ended pids={','.join(map(str, left))}", file=sys.stderr)
         if lease_path is not None:
             try:
                 lease_path.unlink()

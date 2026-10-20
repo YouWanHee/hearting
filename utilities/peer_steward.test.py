@@ -4246,6 +4246,49 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(ticks, [duty["id"]] * 4)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 1.7, 1.0])
 
+    def test_runner_ends_when_its_state_root_is_removed_with_duties_still_pending(self):
+        # A test's temporary home removed under a runner left it spinning on duties
+        # nobody could reach; the next pass after removal now ends it.
+        store, duty = self.pending_message()
+        ticks = []
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+
+        def resume(row, current, *, read_context=None):
+            ticks.append(row["id"])
+            current.update(row["id"], observer_error="recipient-unavailable")
+
+        def remove_root(_delay):
+            if not store.root.exists():
+                raise AssertionError("runner kept going after its state root was removed")
+            shutil.rmtree(store.root)
+
+        with lock_path.open("w") as lock, \
+             mock.patch.object(peer_steward, "_resume_message_obligation", side_effect=resume), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=remove_root) as sleep:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(peer_steward.cmd_obligation_runner(
+                SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+        self.assertEqual(ticks, [duty["id"]])
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_runner_ends_when_its_lock_file_is_replaced(self):
+        store, duty = self.pending_message()
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+
+        def replace_lock(_delay):
+            if sleep.call_count > 1:
+                raise AssertionError("runner kept going after its lock file was replaced")
+            lock_path.unlink()
+            lock_path.write_text("")
+
+        with lock_path.open("w") as lock, \
+             mock.patch.object(peer_steward, "_resume_message_obligation"), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=replace_lock) as sleep:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(peer_steward.cmd_obligation_runner(
+                SimpleNamespace(state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+        self.assertEqual(sleep.call_count, 1)
+
     def test_work_accepted_at_unlock_is_reclaimed_before_runner_exit(self):
         store = peer_steward.peer_obligations.ObligationStore()
         store.root.mkdir(parents=True, exist_ok=True)

@@ -132,6 +132,11 @@ class CapacityResumeTest(unittest.TestCase):
         args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=str(self.root),
                                route_id="rt-cap", route_node="owner", model_profile="deep",
                                replacement_input_argv=["--start", "--attempt-id", aid, "--prompt-text", "the raw task"])
+        if harness == "opencode":
+            args.opencode_config_content = json.dumps({
+                "permissions": [{"action": "read", "resource": "*", "effect": "allow"}],
+                "agents": {},
+            })
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args, harness, "the raw task")))
         self.write(meta, stamp=datetime.fromtimestamp(time.time() - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         return meta
@@ -169,6 +174,11 @@ class CapacityResumeTest(unittest.TestCase):
         args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
                                route_id="rt-cap", route_node="owner", replacement_input_argv=list(argv),
                                **{"model_profile": source["model_profile"], **(self.candidate_args or {})})
+        if source.get("harness") == "opencode" and not hasattr(args, "opencode_config_content"):
+            args.opencode_config_content = json.dumps({
+                "permissions": [{"action": "read", "resource": "*", "effect": "allow"}],
+                "agents": {},
+            })
         meta = {k: v for k, v in source.items() if k not in {
             "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
             "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",
