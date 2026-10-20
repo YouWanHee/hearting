@@ -161,8 +161,10 @@ def legacy_resource_identity(run: dict) -> dict | None:
         pinned_view = (dispatch_registry_cache.current_registry_view(jobs_path)
                        if dispatch_registry_cache.registry_scope_active() else None)
         if pinned_view is not None:
+            # Strict read_text() refused damaged text; the pinned lines are its decode.
             if pinned_view.has_invalid_utf8:
                 return None
+            pinned_lines = dispatch_registry_cache.registry_text_lines(jobs_path)
             signature = (path, *pinned_view.signature)
         else:
             try:
@@ -175,7 +177,7 @@ def legacy_resource_identity(run: dict) -> dict | None:
             owners_by_attempt = cached[1]
         else:
             owners_by_attempt: dict[str, list[dict]] = {}
-            source = (pinned_view.lines if pinned_view is not None
+            source = (pinned_lines if pinned_view is not None
                       else jobs_path.read_text().splitlines())
             for line in source:
                 fields = line.split('\t')

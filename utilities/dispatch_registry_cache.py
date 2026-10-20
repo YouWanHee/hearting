@@ -483,12 +483,12 @@ def _stable_read(path: Path, path_identity: str, *, start: int = 0):
 
 @contextlib.contextmanager
 def registry_read_scope():
-    """Pin the first stable view of each registry for one passive Fleet pass."""
+    """Pin one stable generation of each registry for one passive Fleet pass."""
     current = _READ_SCOPE.get()
     if current is not None:
         yield
         return
-    token = _READ_SCOPE.set({"views": {}, "lines": {}})
+    token = _READ_SCOPE.set({})
     try:
         yield
     finally:
@@ -499,39 +499,70 @@ def registry_scope_active() -> bool:
     return _READ_SCOPE.get() is not None
 
 
-def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
-    """Return the Fleet-pinned view when a registry scope is active."""
-    scope = _READ_SCOPE.get()
-    if scope is None:
-        return registry_view(jobs, append_only=append_only)
+def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str, ...]]:
     path = Path(jobs)
-    lexical = str(path.absolute())
-    resolved = str(path.resolve(strict=False))
-    key = (lexical, resolved)
-    held = scope["views"].get(key)
+    key = (str(path.absolute()), str(path.resolve(strict=False)))
+    held = scope.get(key)
     if held is None:
         try:
-            held = _registry_view_fresh(path, append_only=append_only)
+            held = _observe_generation(path)
         except Exception as exc:
             held = exc
-        scope["views"][key] = held
+        scope[key] = held
     if isinstance(held, BaseException):
         raise held
     return held
 
 
-def registry_lines(jobs: Path, *, append_only: bool = False) -> tuple[str, ...]:
-    """Return lines from the active pinned view, memoizing its decoded tuple."""
+def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
+    """Read one full stable generation into its view and its plain text lines.
+
+    The lines equal ``read_text(errors="replace").splitlines()`` of the same bytes;
+    the view's LF-segmented lines do not promise that for other line separators.
+    The view is the cached one when that generation is already cached.
+    """
+    identity = str(path.absolute())
+    with _LOCK:
+        try:
+            path.resolve(strict=True)  # a missing path fails at once, as in registry_view
+            resolved, signature, raw = _stable_read(path, identity)
+        except OSError:
+            if _drop(identity) is not None:
+                _METRICS["invalidations"] += 1
+            raise
+        _METRICS["content_reads"] += 1
+        _METRICS["bytes_read"] += len(raw)
+        cached = _CACHE.get(identity)
+        if (cached is not None and cached.resolved_path == resolved
+                and cached.signature == signature):
+            _METRICS["cache_hits"] += 1
+            _CACHE.move_to_end(identity)
+            cached.last_observed_at = time.monotonic()
+            view = cached
+        else:
+            _drop(identity)
+            _METRICS["invalidations"] += 1
+            view = RegistryView(identity, resolved, signature, raw)
+            _METRICS["full_metadata_parses"] += 1
+            _METRICS["metadata_rows_parsed"] += view.record_count
+            _remember(identity, view)
+    return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
+
+
+def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
+    """Return the Fleet-pinned view when a registry scope is active."""
     scope = _READ_SCOPE.get()
     if scope is None:
-        return registry_view(jobs, append_only=append_only).lines
-    path = Path(jobs)
-    key = (str(path.absolute()), str(path.resolve(strict=False)))
-    lines = scope["lines"].get(key)
-    if lines is None:
-        lines = current_registry_view(path, append_only=append_only).lines
-        scope["lines"][key] = lines
-    return lines
+        return registry_view(jobs, append_only=append_only)
+    return _pinned_generation(scope, jobs)[0]
+
+
+def registry_text_lines(jobs: Path) -> tuple[str, ...] | None:
+    """Plain text lines of the pinned generation, or None outside a Fleet pass."""
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        return None
+    return _pinned_generation(scope, jobs)[1]
 
 
 def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
@@ -553,15 +584,12 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
     """
     path = Path(jobs)
     identity = str(path.absolute())
-    global _CACHE_BYTES
     with _LOCK:
         try:
             resolved = str(path.resolve(strict=True))
             signature = _stat_signature(path.stat())
         except OSError:
-            removed = _CACHE.pop(identity, None)
-            if removed is not None:
-                _CACHE_BYTES -= removed.signature[2]
+            if _drop(identity) is not None:
                 _METRICS["invalidations"] += 1
             raise
 
@@ -579,9 +607,7 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
             and signature[2] > cached.signature[2]
             and time.monotonic() - cached.last_observed_at <= _APPEND_OBSERVATION_GAP_SECONDS
         )
-        removed = _CACHE.pop(identity, None)
-        if removed is not None:
-            _CACHE_BYTES -= removed.signature[2]
+        _drop(identity)
         _METRICS["invalidations"] += 1
         previous = None
         if can_append:
@@ -610,14 +636,29 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
             _METRICS["metadata_rows_parsed"] += view.record_count
         else:
             _METRICS["metadata_rows_parsed"] += view.record_count - previous.record_count
-        if signature[2] <= _CACHE_MAX_BYTES:
-            _CACHE[identity] = view
-            _CACHE_BYTES += signature[2]
-        while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
-            _evicted_identity, evicted = _CACHE.popitem(last=False)
-            _CACHE_BYTES -= evicted.signature[2]
-            _METRICS["cache_evictions"] += 1
+        _remember(identity, view)
         return view
+
+
+def _drop(identity: str) -> "RegistryView | None":
+    """Forget one cached generation; the caller holds ``_LOCK``."""
+    global _CACHE_BYTES
+    removed = _CACHE.pop(identity, None)
+    if removed is not None:
+        _CACHE_BYTES -= removed.signature[2]
+    return removed
+
+
+def _remember(identity: str, view: RegistryView) -> None:
+    """Cache one generation within the existing bounds; the caller holds ``_LOCK``."""
+    global _CACHE_BYTES
+    if view.signature[2] <= _CACHE_MAX_BYTES:
+        _CACHE[identity] = view
+        _CACHE_BYTES += view.signature[2]
+    while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
+        _evicted_identity, evicted = _CACHE.popitem(last=False)
+        _CACHE_BYTES -= evicted.signature[2]
+        _METRICS["cache_evictions"] += 1
 
 
 def registry_lines(jobs: Path) -> tuple[str, ...]:

@@ -107,9 +107,17 @@ _DEGRADATION_REQUIRED = {"schema_version", "kind", "ts", "route_id", "route_node
 
 
 def _pinned_registry_lines(path):
-    if _dispatch_registry_cache.registry_scope_active():
-        return _dispatch_registry_cache.registry_lines(Path(path))
-    return None
+    """Text lines of the registry generation pinned for this Fleet pass.
+
+    None outside a pass or when the pinned read failed, so each reader keeps
+    its own missing/unreadable handling.
+    """
+    if not _dispatch_registry_cache.registry_scope_active():
+        return None
+    try:
+        return _dispatch_registry_cache.registry_text_lines(Path(path))
+    except OSError:
+        return None
 
 
 def _managed_parent_dir(sidecar_log):
@@ -868,11 +876,11 @@ def _parent_extinction_rows(paths):
         per_path = {}
         try:
             lines = _pinned_registry_lines(path)
-            content = ("\n".join(lines) if lines is not None else
-                       Path(path).read_text(encoding="utf-8", errors="replace"))
+            if lines is None:
+                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        for line in content.splitlines():
+        for line in lines:
             fields = line.split("\t")
             if len(fields) != 6:
                 continue
@@ -3206,20 +3214,15 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
             continue
         latest = {}
         try:
-            pinned = _pinned_registry_lines(raw_path)
-            if pinned is not None:
-                lines = pinned
-            else:
-                with open(raw_path, encoding="utf-8", errors="replace") as handle:
-                    lines = handle.read().splitlines()
-            for line in lines:
-                fields = line.rstrip("\n").split("\t")
-                if len(fields) != 6:
-                    continue
-                meta = _parse_pipe_meta(fields[5])
-                attempt = meta.get("attempt_id")
-                if attempt in attempts:
-                    latest[attempt] = meta
+            with open(raw_path, encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) != 6:
+                        continue
+                    meta = _parse_pipe_meta(fields[5])
+                    attempt = meta.get("attempt_id")
+                    if attempt in attempts:
+                        latest[attempt] = meta
         except FileNotFoundError:
             continue
         matched = {attempt for attempt, meta in latest.items()

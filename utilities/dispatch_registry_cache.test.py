@@ -97,6 +97,60 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertIsNot(first, fresh)
         self.assertEqual(fresh.records[0].slug, "two")
 
+    def test_scope_text_lines_equal_plain_text_decode_for_every_line_separator(self):
+        raw = (b"a\tb\r\nc\rd\x0be\x0cf\x1cg\x1dh\x1ei" + "\x85j k l".encode("utf-8")
+               + b"\n\nbad=\xff\nlast\rtail\x0cend")
+        self.jobs.write_bytes(raw)
+        expected = tuple(self.jobs.read_text(encoding="utf-8", errors="replace").splitlines())
+        self.assertEqual(expected, tuple(raw.decode("utf-8", errors="replace").splitlines()))
+        self.assertIsNone(CACHE.registry_text_lines(self.jobs))
+        with CACHE.registry_read_scope():
+            self.assertEqual(CACHE.registry_text_lines(self.jobs), expected)
+
+    def test_scope_reuses_an_append_built_view_but_not_its_lf_segmented_lines(self):
+        self.jobs.write_bytes(b"t\topen\t/repo\t/wt\tone\tattempt_id=one\n")
+        CACHE.registry_view(self.jobs, append_only=True)
+        with self.jobs.open("ab") as stream:
+            stream.write(b"t\tdone\t/repo\t/wt\ttwo\tattempt_id=two\x0cnote=x\n")
+        appended = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 1)
+        expected = tuple(self.jobs.read_bytes().decode("utf-8", errors="replace").splitlines())
+        CACHE.reset_metrics()
+        with CACHE.registry_read_scope():
+            self.assertIs(CACHE.registry_view(self.jobs), appended)
+            self.assertEqual(CACHE.registry_text_lines(self.jobs), expected)
+            self.assertNotEqual(appended.lines, expected)
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 0)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+
+    def test_scope_pins_view_and_text_lines_from_one_read(self):
+        first = "t\topen\t/repo\t/wt\tone\tattempt_id=one"
+        self.jobs.write_text(first + "\n", encoding="utf-8")
+        CACHE.reset_metrics()
+        with CACHE.registry_read_scope():
+            lines = CACHE.registry_text_lines(self.jobs)
+            with self.jobs.open("a", encoding="utf-8") as stream:
+                stream.write("t\tdone\t/repo\t/wt\ttwo\tattempt_id=two\n")
+            view = CACHE.registry_view(self.jobs, append_only=True)
+            self.assertEqual(lines, (first,))
+            self.assertEqual([record.slug for record in view.records], ["one"])
+            self.assertEqual(view.signature[2], len(first) + 1)
+            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+        self.assertIsNone(CACHE.registry_text_lines(self.jobs))
+        with CACHE.registry_read_scope():
+            self.assertEqual(len(CACHE.registry_text_lines(self.jobs)), 2)
+
+    def test_scope_keeps_a_failed_read_failed_for_that_pass_only(self):
+        missing = self.jobs.with_name("missing.log")
+        with CACHE.registry_read_scope():
+            with self.assertRaises(FileNotFoundError):
+                CACHE.registry_text_lines(missing)
+            missing.write_text("t\topen\t/repo\t/wt\tone\tattempt_id=one\n", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                CACHE.registry_view(missing)
+        with CACHE.registry_read_scope():
+            self.assertEqual(len(CACHE.registry_text_lines(missing)), 1)
+
     def test_unchanged_file_parses_only_once(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
         first = CACHE.registry_lines(self.jobs)

@@ -84,6 +84,51 @@ class InventoryCacheTest(unittest.TestCase):
         self.assertIsNone(dispatch.resolve_plan_qa_artifact(dict(job, route_id="rt-other")))
         self.assertIsNone(dispatch.resolve_plan_qa_artifact(dict(job, cycle_id="cyc_" + "f" * 32)))
 
+    def _write_cycle(self, route_id, cycle_id, campaign_id="camp_" + "e" * 32, qa="standard"):
+        producer = self.root / ".runtime" / "artifact-producer" / "v1"
+        (producer / "cycles").mkdir(parents=True, exist_ok=True)
+        (producer / "campaigns").mkdir(parents=True, exist_ok=True)
+        locator = "2026-10-20_" + cycle_id[-6:]
+        (producer / "cycles" / (cycle_id + ".json")).write_text(json.dumps({
+            "cycle_id": cycle_id, "campaign_id": campaign_id, "route_id": route_id,
+            "locator": locator,
+        }))
+        (producer / "campaigns" / (campaign_id + ".json")).write_text(json.dumps({
+            "campaign_id": campaign_id, "locator": "fleet-fixture",
+        }))
+        plan = (self.root / "campaigns" / "fleet-fixture" / locator / "artifacts" / "plans"
+                / "2026-10-20_hot-path")
+        (plan / "plan").mkdir(parents=True)
+        (plan / "pipeline_state.yaml").write_text("qa_level: %s\n" % qa)
+        return plan
+
+    def test_route_hint_selects_only_a_record_bound_to_that_route(self):
+        route_id, other_route = "rt-" + "c" * 16, "rt-" + "9" * 16
+        self._write_cycle(route_id, "cyc_" + "d" * 32)
+        self._write_cycle(other_route, "cyc_" + "a" * 32, qa="light")
+        job = {"slug": "hot-path", "artifact_root": str(self.root), "route_id": route_id}
+        with mock.patch.object(dispatch, "_read_cycle_hints",
+                               return_value={route_id: ["cyc_" + "d" * 32 + ".json"]}):
+            self.assertEqual(dispatch.resolve_plan_qa_artifact(job), "standard")
+        # A stale hint naming another route's record does not lend that route's QA.
+        with mock.patch.object(dispatch, "_read_cycle_hints",
+                               return_value={route_id: ["cyc_" + "a" * 32 + ".json"]}):
+            self.assertIsNone(dispatch.resolve_plan_qa_artifact(job))
+
+    def test_cycle_and_legacy_plan_together_are_not_one_exact_answer(self):
+        route_id, cycle_id = "rt-" + "c" * 16, "cyc_" + "d" * 32
+        self._write_cycle(route_id, cycle_id)
+        job = {"slug": "hot-path", "artifact_root": str(self.root),
+               "route_id": route_id, "cycle_id": cycle_id}
+        self.assertEqual(dispatch.resolve_plan_qa_artifact(job), "standard")
+        legacy = self.root / "plans" / "2026-09-08_hot-path"
+        (legacy / "plan").mkdir(parents=True)
+        (legacy / "pipeline_state.yaml").write_text("qa_level: light\n")
+        self.assertIsNone(dispatch.resolve_plan_qa_artifact(job))
+        # A row without route or cycle identity still reads the legacy plan alone.
+        self.assertEqual(dispatch.resolve_plan_qa_artifact(
+            {"slug": "hot-path", "artifact_root": str(self.root)}), "light")
+
     def test_cycle_and_campaign_rename_delete_and_recreate(self):
         first = self.query()[0]
         cycle = first.parents[2]
