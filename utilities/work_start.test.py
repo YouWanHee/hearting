@@ -1374,6 +1374,12 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(len(self.calls), before)
         owns.assert_called()
         self.assertIn("parent_sid=parent", self.jobs.read_text())          # the registered identity is untouched
+        W.default_parent_session_id.return_value = "parent"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+        W.default_parent_session_id.return_value = "successor"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["state"], "preparing")
         W.default_parent_session_id.return_value = "stranger"
         with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
             self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
@@ -3423,6 +3429,20 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(replay["owner_attempt_id"], owner_d)
         self.assertTrue(replay["owner_started"])
         self.assertEqual(len(self.launches), launches_before_replay)
+
+    def test_confirmed_handover_refuses_live_start_for_old_parent_and_allows_successor(self):
+        owner_a = self._seed_initial_owner()
+        self._handover(owner_a, "successor")
+        launches_before = len(self.launches)
+        with mock.patch.object(W, "default_parent_session_id", return_value="parent"):
+            refused = self._cli_start()
+        self.assertEqual(refused.get("reason"), "work-parent-recovery-required", refused)
+        self.assertEqual(len(self.launches), launches_before)
+        with mock.patch.object(W, "default_parent_session_id", return_value="successor"):
+            admitted = self._cli_start()
+        self.assertEqual(admitted.get("owner_attempt_id"), owner_a, admitted)
+        self.assertIn(admitted.get("state"), {"running", "preparing"}, admitted)
+        self.assertEqual(len(self.launches), launches_before)
 
     def test_off_chair_start_retains_correction_without_launching(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()

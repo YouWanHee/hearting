@@ -1073,6 +1073,10 @@ Interrupted-parent restart requires one exact pending Hearting item. Transport
 refusal preserves the delivery obligation independently of child completion.
 The native TUI owns subscriptions, questions, and approvals. Headless owners keep
 their separate supervisor. See ADAPTATION §7.1 for the carrier contract.
+Across adapters, the result record remains under the registered parent's key,
+while the current `effective_parent` receives it. Result recovery may repeat
+after interruption; peer input is reserved as pending and becomes unverified
+only at the external write boundary, so an ambiguous write is not repeated.
 
 **SD-110 runtime-owned deterministic stage advance.** At an eligible-linear
 boundary — completion gate proven, exactly one non-terminal runnable
@@ -1246,11 +1250,12 @@ absence of a failed check does not refuse the kept correction. Unresolved failed
 retain their closure-check ceiling, including refusal when that ceiling is spent.
 No check or extra verdict round is manufactured for an infrastructure correction.
 When the answer comes from a session
-that is not the route's parent, only the parent may launch that replacement: the
-answer stays kept and the parent receives one `answer-awaiting-parent` supervision
+that is not the route's current `effective_parent`, only that parent may launch that replacement: the
+answer stays kept and the current parent receives one `answer-awaiting-parent` supervision
 notice. The parent's carrier that delivers it (the shared prompt sweep or the
 Claude rewake) starts the route once under that session's identity
-(`dispatch_supervision.continue_for_parent`) and the notice says so; only when
+(`dispatch_supervision.continue_for_parent`) and the notice says so. If handover
+state is unreadable, the registered parent remains the existing safe fallback; only when
 nothing could be started does it name the route's start command. Other ended owners still report
 `owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
 follows the replacement lineage to the owner doing the work now.
@@ -2102,7 +2107,7 @@ append-only ledger below is the only record of them (SD-122 §13.37.2-(1)).
 | Who receives the result now? | the single `effective_parent`: the registered parent, or the last confirmed same-seat successor after a handover. |
 | Who only observes? | a `watch` holder (Fleet ⚑ shows the steward relation); observation settles no stage result (S3). |
 | Who approves? | the person; the session that received the answer writes the release/approval record (S5). |
-| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor, a separate check from row 4; sending `correct` is not parent-only (§5.10a). |
+| Who may perform parent-only route actions? | `route_authority.owns`: only the current `effective_parent` (the registered parent before handover); sending `correct` is not parent-only (§5.10a). |
 
 Six invariants govern the role:
 
@@ -2240,18 +2245,24 @@ depends on the harness. OpenCode's exact retained TUI selection can supply it;
 missing or disposed records and unsupported dead Claude/Codex identity remain
 unknown. Native source availability is not inferred from a label or saved SID.
 Replacement admission and lineage use that same parent judgment: a depth-1
-replacement may be launched by the registered parent or its ledger-confirmed
-successor. This parent judgment (`route_authority.owns`) is separate from result
+replacement may be launched only by the current `effective_parent`. If handover
+state is unreadable, the existing safe default temporarily resolves to the
+registered parent. This parent judgment (`route_authority.owns`) is separate from result
 delivery, which follows the single `effective_parent`. Parent attempt bindings remain exact, as do route, node, depth,
 sub-session and input digests. A changed parent label on a depth-1 node replay
 is accepted only for that same parent; depth-2 parent bindings stay exact.
 The launch input follows the confirmed parent's session, harness and ordinary
 completion carrier. A later handover preserves an already registered replacement
-edge and its one semantic round; it does not authorize an intermediate parent
-to launch new work.
+edge and its one semantic round; it does not authorize the former parent or an
+intermediate parent to launch new work while the handover chain is readable.
 An owner's terminal row and an acknowledged completion message do not close its
 route. Its verified open route still passes to the successor until the route's
 outcome is committed; an acknowledged message is never delivered again.
+For parent-related watch and retire readiness, a running attempt remains pending;
+a finished attempt remains pending while its exact result delivery is open.
+An exact ACK or explicit no-delivery decision makes the committed outcome ready
+without waiting for route closure. Missing or unreadable delivery evidence stays
+unknown, and executor readiness keeps its existing closure rules.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused

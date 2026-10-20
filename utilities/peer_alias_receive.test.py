@@ -1193,7 +1193,8 @@ globalThis.__fixturePendingRow = process.env.FIXTURE_PENDING_ROW
 globalThis.__fixtureSpawnSync = (exe, args, options) => {
   globalThis.__fixtureSyncCalls.push({exe, args, options});
   if (Array.isArray(args) && args.some(value => String(value).endsWith("peer-message.py"))) {
-    const intent = args.slice(6).find(value => ["--claim", "--queued", "--resuming", "--received"].includes(value));
+    const intent = args.slice(6).find(value => ["--claim", "--queued", "--resuming", "--received",
+      "--reserve", "--begin-write", "--release-reservation"].includes(value));
     if (args[1] === "pending" && !intent && globalThis.__fixturePendingRow) {
       const row = globalThis.__fixturePendingRow;
       return {status: 0, stdout: JSON.stringify(row.state === "received" ? [] : [row]), stderr: ""};
@@ -1209,6 +1210,13 @@ globalThis.__fixtureSpawnSync = (exe, args, options) => {
       if (intent === "--claim") {
         globalThis.__fixturePendingRow.state = "unverified";
         globalThis.__fixturePendingRow.receipt = "context-api-inflight";
+      } else if (intent === "--reserve" || intent === "--begin-write") {
+        // Keep the fixture's subsequent list calls in sync with the real
+        // helper's persisted transition and claimant token.
+        globalThis.__fixturePendingRow = JSON.parse(result.stdout);
+      } else if (intent === "--release-reservation") {
+        globalThis.__fixturePendingRow = {...globalThis.__fixturePendingRow,
+          rpc_claim: null, receipt: "opencode-prompt-reservation-released"};
       } else if (intent === "--queued") {
         globalThis.__fixturePendingRow.state = "queued";
         globalThis.__fixturePendingRow.actual_message_id = args[args.indexOf("--message-id") + 1];
@@ -1220,9 +1228,8 @@ globalThis.__fixtureSpawnSync = (exe, args, options) => {
         globalThis.__fixturePendingRow.text = null;
         globalThis.__fixturePendingRow.receipt = "exact-native-history";
       }
-      if (intent === "--claim" && result.status === 0) {
-        const claimResult = {status: 0, stdout: JSON.stringify(globalThis.__fixturePendingRow), stderr: ""};
-        return claimResult;
+      if (["--claim", "--reserve", "--begin-write"].includes(intent) && result.status === 0) {
+        return {status: 0, stdout: JSON.stringify(globalThis.__fixturePendingRow), stderr: ""};
       }
     }
     return result;

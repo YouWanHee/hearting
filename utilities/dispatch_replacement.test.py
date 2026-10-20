@@ -305,12 +305,13 @@ class ReplacementTest(unittest.TestCase):
         meta={**self.meta,'dispatch_depth':'1'}
         with mock.patch.object(work_start,'_current_parent_session_id',return_value='parent'):
             R._authorized(self.jobs,{},meta)
-        with mock.patch.object(work_start,'_current_parent_session_id',return_value='successor'):
+        self.handover(successor='successor', harness='codex')
+        with mock.patch.object(work_start,'_current_parent_session_id',return_value='parent'):
             with self.assertRaises(D.DispatchContractError) as refused:
                 R._authorized(self.jobs,{},meta)
             self.assertEqual(refused.exception.reason,'replacement-parent-identity-unproven')
-            with mock.patch('dispatch_seat_handover.owns',side_effect=lambda m,session,jobs=None:session=='successor'):
-                R._authorized(self.jobs,{},meta)
+        with mock.patch.object(work_start,'_current_parent_session_id',return_value='successor'):
+            R._authorized(self.jobs,{},meta)
 
     def test_concurrent_consumers_share_one_claim_and_original_failure(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

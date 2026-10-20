@@ -796,10 +796,13 @@ def correction_source_session(environ=None) -> str:
 
 
 def owns(meta, session, jobs, *, read_context=None) -> bool:
-    """The launching session, or the end of its same-seat handover lineage after a /clear."""
-    if session and meta.get("parent_sid") == session:
-        return True
-    if not session or jobs is None:
+    """Only the session that answers for the attempt now (``effective_parent``).
+
+    That is the registered parent before a confirmed handover and the end of its
+    lineage after one. Unreadable handover state retains the existing
+    registered-parent fallback.
+    """
+    if not session:
         return False
     from dispatch_seat_handover import owns as seat_owns
     if read_context is None:
@@ -838,7 +841,7 @@ def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> boo
         return True
     if lineage and candidate.get('dispatch_depth') == '1':
         # A registered A -> B edge survives a later B -> C handover. Admission
-        # still accepts only the registered parent or the current successor.
+        # still accepts only the source's current effective parent.
         from dispatch_seat_handover import effective_parent
         current = effective_parent(source, jobs)
         return bool(current) and effective_parent(candidate, jobs) == current
