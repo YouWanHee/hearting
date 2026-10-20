@@ -3630,6 +3630,29 @@ class SeatHandoverTest(TidyCase):
             self.handover.current_bindings("claude", "sid-A", self.jobs)
             self.assertLessEqual(counted.call_count, 2)                # a context of its own reads each once
 
+    def test_ownership_checks_never_resolve_a_project_key(self):
+        owner, _frame = self.chain(owner_status="running")
+        keys = mock.patch.object(st, "project_key_for", wraps=st.project_key_for)
+        with self.iso.patched_environ({"CLAUDE_CODE_SESSION_ID": "sid-C"}), keys as computed:
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-B", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-X", self.jobs))
+            self.handover.storage_recipients("sid-C")
+        computed.assert_not_called()                                   # no git calls, no project-keys.json
+
+    def test_ownership_resolves_only_the_callers_own_seat_once(self):
+        owner, frame = self.chain(owner_status="running")
+        seats = mock.patch.object(self.handover, "pane_seat", wraps=self.handover.pane_seat)
+        env = {"HERDR_PANE_ID": PANE, "CLAUDE_CODE_SESSION_ID": "sid-C"}
+        with mock.patch.dict(self.handover._OWN_SEATS, clear=True), \
+                self.iso.patched_environ(env), seats as resolved:
+            for _ in range(5):
+                for meta in (owner, frame):
+                    for sid in ("sid-B", "sid-C", "sid-X"):
+                        self.handover.owns(meta, sid, self.jobs)
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+        self.assertEqual([call.args[2] for call in resolved.call_args_list], ["sid-C"])
+
     def test_a_broken_state_answers_the_registered_parent(self):
         meta = self.row("att-1")
         with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):

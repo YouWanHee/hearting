@@ -511,7 +511,8 @@ def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
 
 
 def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
-                 source: str = "") -> Seat:
+                 source: str = "", *, project: bool = True) -> Seat:
+    """The pane, native or project seat; ``project=False`` skips the project key (an empty one)."""
     env = os.environ if env is None else env
     live_caller = env is os.environ
     pane = ((env.get("HERDR_PANE_ID") or "").strip()
@@ -536,8 +537,10 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     if native:
         return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
                     harness=harness or "", native=native)
-    project = seat_for_project(harness or "unknown", project_key_for(cwd))
-    return dataclasses.replace(project, sid=sid or "")
+    if not project:
+        return Seat("project", "", harness=harness or "", sid=sid or "")
+    found = seat_for_project(harness or "unknown", project_key_for(cwd))
+    return dataclasses.replace(found, sid=sid or "")
 
 
 # ---------------------------------------------------------------------------

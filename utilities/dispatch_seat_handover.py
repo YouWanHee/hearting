@@ -167,7 +167,7 @@ def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None
     st = _st()
     env = os.environ if env is None else env
     detected, own_sid = st.session_from_env(harness, env)
-    seat = st.resolve_seat(harness or detected, env=env, sid=sid or own_sid)
+    seat = st.resolve_seat(harness or detected, env=env, sid=sid or own_sid, project=False)
     return seat if seat.kind in ("pane", "native") else None
 
 
@@ -266,16 +266,28 @@ def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str
     return _effective(meta, jobs, read_context=read_context)[1]
 
 
+_OWN_SEATS: dict = {}
+
+
 def _own_seat(session: str):
+    """The caller's own seat, only when ``session`` is the caller; resolved once per process.
+
+    Another session's seats come from handover snapshots, so a check over many registry rows
+    never probes panes for sessions that cannot be proven from here."""
     try:
-        return pane_seat(None, None, session)
+        if _st().session_from_env(None, os.environ)[1] != session:
+            return None
+        key = (session, os.environ.get("HERDR_PANE_ID", ""), os.environ.get("HERDR_SOCKET_PATH", ""))
+        if key not in _OWN_SEATS:
+            _OWN_SEATS[key] = pane_seat(None, None, session)
+        return _OWN_SEATS[key]
     except Exception:  # noqa: BLE001
         return None
 
 
 def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
-    """True when ``session`` is the registered parent or the end of its handover lineage.  The
-    caller's own seat is read too: it runs in its own pane, like :func:`storage_recipients`."""
+    """True when ``session`` is the registered parent or the end of its handover lineage.  For
+    the caller's own session its own seat is read too, like :func:`storage_recipients`."""
     if not session:
         return False
     if meta.get("parent_sid") == session:
