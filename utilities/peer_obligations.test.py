@@ -479,10 +479,18 @@ class ObligationStoreTest(unittest.TestCase):
             self.store.update("batch-1", result="failed")
 
     def test_ordinary_pane_without_registry_row_is_valid_native_evidence(self):
+        from peer_read_context import PeerReadContext
+
         jobs = self.root / "dispatch" / "jobs.log"
         work, state = obligations.bound_work_for_pane(
             "w1:p4", "codex", "thread-1", jobs=jobs)
         self.assertEqual((work, state), ((), "observed"))
+        shared_work, shared_state = obligations.bound_work_for_pane(
+            "w1:p4", "codex", "thread-1", jobs=jobs,
+            read_context=PeerReadContext(registry_append_only=True),
+            registry_append_only=True)
+        self.assertEqual((shared_work, shared_state), ((), "observed"),
+                         "a shared read context preserves a freshly observed absence")
         ready = obligations.pane_readiness(
             server="fixture-server", pane="w1:p4", harness="codex",
             session_id="thread-1", pid_birth="pid:9@start:4",
@@ -913,10 +921,14 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertIsNone(self.store.claim_phase("retire-race", {"waiting"}, "exit-requested"))
 
     def test_unreadable_binding_source_is_unknown(self):
+        from peer_read_context import PeerReadContext
+
         jobs = self.root / "not-a-file"
         jobs.mkdir()
         work, state = obligations.bound_work_for_pane(
-            "w1:p4", "codex", "thread-1", jobs=jobs)
+            "w1:p4", "codex", "thread-1", jobs=jobs,
+            read_context=PeerReadContext(registry_append_only=True),
+            registry_append_only=True)
         self.assertEqual((work, state), ((), "unknown"))
         ready = obligations.pane_readiness(
             server="fixture-server", pane="w1:p4", harness="codex",

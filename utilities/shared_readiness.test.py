@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -113,6 +114,46 @@ class SharedReadinessTest(unittest.TestCase):
         jobs.write_text("registry changed\n", encoding="utf-8")
         self.assertIsNone(READINESS.target_result(
             self.root / "peer-steward" / "obligations", identity))
+
+    def test_registry_absence_is_explicit_and_invalidated_when_work_registry_appears(self):
+        jobs = self.root / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        identity = READINESS.target_identity(
+            server="server-a", endpoint="/tmp/herdr.sock", pane="w1:p1",
+            harness="claude", session_id="sid-a", shell_pid=os.getpid(),
+            shell_start=self.start, native_state="idle")
+        projection_root = self.root / "peer-steward" / "obligations"
+        with mock.patch.dict(os.environ, {
+                "AGENT_HOME": str(HERE.parent),
+                "AGENT_DISPATCH_JOBS": str(jobs)}):
+            self.assertFalse(READINESS._generation_current(None),
+                             "an unspecified generation is not a wildcard")
+            absent = READINESS.registry_generation(jobs, None, selected=True)
+            self.assertIsNotNone(absent, "a freshly observed absent registry is explicit")
+            self.assertTrue(READINESS._generation_current(absent))
+
+            READINESS.publish_target_projection(
+                projection_root, identity, {"state": "ready", "reason": "native-ready"},
+                producer_pid=os.getpid(), producer_start=self.start,
+                incarnation="runner-test", generation=absent,
+                lineage={"shell_pid": os.getpid(), "shell_start": self.start})
+            self.assertEqual(READINESS.target_result(projection_root, identity)["state"],
+                             "ready")
+
+            jobs.write_text("registry\n", encoding="utf-8")
+            self.assertIsNone(READINESS.target_result(projection_root, identity),
+                              "creating the selected registry invalidates observed absence")
+
+            self.assertIsNone(READINESS.registry_generation(jobs, None),
+                              "a present but unread registry is not observed absence")
+            directory = self.root / "dispatch" / "not-a-registry"
+            directory.mkdir()
+            self.assertIsNone(READINESS.registry_generation(directory, None),
+                              "a non-file registry path is unknown")
+            with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+                self.assertIsNone(READINESS.registry_generation(
+                    self.root / "dispatch" / "unreadable.log", None),
+                    "permission errors remain unknown")
 
     def test_runner_wake_is_an_event_on_the_existing_state_root(self):
         root = self.root / "peer-steward" / "obligations"

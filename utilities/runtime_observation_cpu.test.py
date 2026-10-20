@@ -81,9 +81,10 @@ print(json.dumps(payload))
 class FakeObservationEndpoint:
     """Small newline JSON server implementing the two observed protocol methods."""
 
-    def __init__(self, path: Path, panes: list[dict]):
+    def __init__(self, path: Path, panes: list[dict], agents: list[dict] | None = None):
         self.path = path
         self.panes = panes
+        self.agents = list(panes if agents is None else agents)
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(path))
         self.listener.listen(64)
@@ -132,7 +133,7 @@ class FakeObservationEndpoint:
                         continue
             elif method == "session.snapshot":
                 response["result"] = {"type": "session_snapshot", "snapshot": {
-                    "protocol": 22, "panes": self.panes, "agents": []}}
+                    "protocol": 22, "panes": self.panes, "agents": self.agents}}
                 self._send(connection, response)
             else:
                 response["error"] = {"code": "unknown_method"}
@@ -1156,9 +1157,13 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                 jobs_size = jobs_path.stat().st_size
 
                 panes = [{"pane_id": "w1:p9", "agent": "claude",
-                          "agent_session": {"value": "sid-fixture"}}]
+                          "agent_session": {"value": "sid-fixture"},
+                          "agent_status": "idle", "name": "fixture-target"}]
                 observation_server = FakeObservationEndpoint(
-                    Path(isolated["HERDR_SOCKET_PATH"]), panes)
+                    Path(isolated["HERDR_SOCKET_PATH"]), panes, agents=[{
+                        "pane_id": "w1:p9", "agent": "claude",
+                        "agent_session": {"value": "sid-fixture"},
+                        "agent_status": "idle", "name": "fixture-target"}])
                 control_server = FakeControlEndpoint(temp_root / "control.sock")
                 binding = peer_obligations.managed_service_binding(source)
                 if binding != str(current):
@@ -1176,12 +1181,12 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                     paths = steward._watch_paths(watch_id, watch_root)
                     arm = {
                         "schema_version": steward._WATCH_SCHEMA,
-                        "watch_id": watch_id, "target": f"fixture-target-{index}",
+                        "watch_id": watch_id, "target": "fixture-target",
                         "until": ["idle"], "timeout": 300_000,
                         "deadline": steward._watch_deadline(300_000),
                         "server": "default", "armed_ts": steward._utc_now(),
                         "agent": {"harness": "claude", "session_id": "sid-fixture",
-                                  "name": f"fixture-target-{index}", "pane": "w1:p9"},
+                                  "name": "fixture-target", "pane": "w1:p9"},
                         "steward": {"harness": "codex", "session_id": "sid-steward",
                                     "project": str(source)},
                         "observer_protocol": 2, "observer_generation": 1,
@@ -1304,8 +1309,32 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                             return None
                         observations.append(observation)
                     return observations
-                watch_readiness = _wait_for(pending_watch_readiness, 60,
-                    "all watchers pending on actual registered work after native idle")
+                try:
+                    watch_readiness = _wait_for(pending_watch_readiness, 60,
+                        "all watchers pending on actual registered work after native idle")
+                except AssertionError as exc:
+                    diagnostics = []
+                    for watch_id, process in watch_processes:
+                        paths = steward._watch_paths(watch_id, watch_root)
+                        try:
+                            observation = (json.loads(paths.observation.read_text())
+                                           if paths.observation.exists() else None)
+                        except (OSError, ValueError) as error:
+                            observation = {"read_error": f"{type(error).__name__}: {error}"}
+                        diagnostics.append({
+                            "watch_id": watch_id,
+                            "target": (steward._read_json(paths.arm) or {}).get("target"),
+                            "returncode": process.poll(),
+                            "state": observation.get("state") if isinstance(observation, dict) else None,
+                            "reason": observation.get("reason") if isinstance(observation, dict) else None,
+                            "native_wait": observation.get("native_wait")
+                                if isinstance(observation, dict) else None,
+                            "receipt_exists": paths.receipt.exists(),
+                            "log_tail": paths.log.read_text(errors="replace")[-1200:]
+                                if paths.log.exists() else "",
+                        })
+                    raise AssertionError(
+                        f"{exc}; current watcher readiness diagnostics={diagnostics}") from exc
                 runner_pids = {runner_process.pid}
                 owner_pids = {int(owner["pid"]) for owner in owners}
                 worker_pids = {process.pid for process in worker_processes}

@@ -48,7 +48,8 @@ peer_message = importlib.util.module_from_spec(_PM_SPEC)
 _PM_SPEC.loader.exec_module(peer_message)
 
 sys.path.insert(0, str(_UTILITIES_DIR))
-from dispatch_contract import process_start_ticks  # noqa: E402
+from dispatch_contract import (process_start_ticks, resolve_agent_home,
+                               resolve_dispatch_state_root)  # noqa: E402
 from parent_next_directive import steward_fields  # noqa: E402
 import peer_obligations  # noqa: E402
 import shared_readiness  # noqa: E402
@@ -5609,6 +5610,11 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
     return _watch_readiness_result(target, native_state, identity, result, server)
 
 
+def _watch_selected_jobs_path():
+    """Return the selected dispatch registry used by all readiness authority."""
+    return resolve_dispatch_state_root(resolve_agent_home()) / "jobs.log"
+
+
 @contextlib.contextmanager
 def _watch_transition_authority_lock(identity, server, *, deadline=None):
     """Join jobs then target-seat locks within one bounded receipt-edge budget."""
@@ -5620,9 +5626,11 @@ def _watch_transition_authority_lock(identity, server, *, deadline=None):
         transition_deadline = min(transition_deadline, float(deadline))
         if now >= deadline:
             raise _WatchDeadlineExpired("watch-deadline")
-    store = peer_obligations.ObligationStore()
-    jobs = store.root.parents[1] / "jobs.log"
+    jobs = _watch_selected_jobs_path()
     lock_path = Path(str(jobs) + ".lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if time.monotonic() >= transition_deadline:
+        raise _WatchTransitionLockBusy("jobs-lock-budget-expired")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     jobs_locked = False
     try:
@@ -7138,7 +7146,10 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                 transport.close()
             _RUNNER_READINESS_TRANSPORTS.pop(key, None)
     producer_start = process_start_ticks(os.getpid()) or ""
-    jobs = store.root.parents[1] / "jobs.log"
+    try:
+        jobs = _watch_selected_jobs_path()
+    except (OSError, ValueError, RuntimeError):
+        jobs = None
     views_by_server = {}
     for requests in groups.values():
         _watch_id, arm, identity, native_state, _transition = requests[0]
@@ -7152,6 +7163,8 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         transition_read_context = None
         transition_authority = None
         try:
+            if jobs is None:
+                raise ValueError("selected-dispatch-registry-unavailable")
             if server not in views_by_server:
                 transport = _runner_readiness_transport(server)
                 views_by_server[server] = transport.observe() if transport is not None else None
@@ -7235,11 +7248,10 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     readiness_state, reason = "unknown", "shared-readiness-identity-changed"
             generation_context = transition_read_context or read_context
             view = generation_context.registry_view(jobs, append_only=True)
-            if view is not None:
-                generation = {"path": str(jobs), "resolved": view.resolved_path,
-                              "signature": list(view.signature)}
-            else:
-                readiness_state, reason = "unknown", "registry-missing"
+            generation = shared_readiness.registry_generation(
+                jobs, view, selected=True)
+            if generation is None:
+                readiness_state, reason = "unknown", "registry-generation-unavailable"
         except (OSError, TypeError, ValueError):
             readiness_state, reason = "unknown", "shared-readiness-observation-failed"
 

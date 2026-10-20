@@ -261,19 +261,75 @@ def publish_target_projection(root, identity, result, *, producer_pid,
     return changed
 
 
+def registry_generation(path, view, *, selected=False):
+    """Capture a present registry or an explicit, recheckable absence.
+
+    ``None`` is deliberately not a generation: it can mean an unreadable,
+    malformed, or otherwise unobserved registry and must never act as a
+    wildcard for a ready projection.
+    """
+    candidate = Path(path)
+    try:
+        if view is not None:
+            signature = list(view.signature)
+            resolved = str(view.resolved_path)
+            if len(signature) != 5 or not resolved:
+                return None
+            current = candidate.stat()
+            current_signature = [current.st_dev, current.st_ino, current.st_size,
+                                 current.st_mtime_ns, current.st_ctime_ns]
+            if (str(candidate.resolve(strict=True)) != resolved
+                    or current_signature != signature):
+                return None
+            generation = {"path": str(candidate), "resolved": resolved,
+                          "signature": signature}
+        else:
+            resolved = str(candidate.resolve(strict=False))
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                generation = {"path": str(candidate), "resolved": resolved,
+                              "missing": True}
+            else:
+                return None
+        if selected:
+            generation["selection"] = "dispatch-registry"
+        return generation
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _generation_current(generation):
     if not isinstance(generation, dict):
-        return True
+        return False
     path = generation.get("path")
-    signature = generation.get("signature")
-    if not isinstance(path, str) or not isinstance(signature, list) or len(signature) != 5:
+    resolved = generation.get("resolved")
+    if not isinstance(path, str) or not isinstance(resolved, str):
         return False
     try:
         candidate = Path(path)
-        resolved = str(candidate.resolve(strict=True))
+        if generation.get("selection") is not None:
+            if generation.get("selection") != "dispatch-registry":
+                return False
+            from dispatch_contract import resolve_agent_home, resolve_dispatch_state_root
+            selected = resolve_dispatch_state_root(resolve_agent_home()) / "jobs.log"
+            if selected.resolve(strict=False) != candidate.resolve(strict=False):
+                return False
+        if generation.get("missing") is True:
+            if "signature" in generation or str(candidate.resolve(strict=False)) != resolved:
+                return False
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                return True
+            return False
+        signature = generation.get("signature")
+        if not isinstance(signature, list) or len(signature) != 5:
+            return False
+        current_resolved = str(candidate.resolve(strict=True))
         info = candidate.stat()
         current = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
-        return resolved == generation.get("resolved") and current == signature
+        return current_resolved == resolved and current == signature
     except (OSError, RuntimeError, ValueError):
         return False
 

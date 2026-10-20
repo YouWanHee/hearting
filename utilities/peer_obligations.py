@@ -1956,7 +1956,8 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             view = (context_view(jobs_path, append_only=registry_append_only)
                     if callable(context_view)
                     else registry_view(jobs_path, append_only=registry_append_only))
-            view.require_complete_text()
+            if view is not None:
+                view.require_complete_text()
         except FileNotFoundError:
             view = None
         except (OSError, UnicodeError):

@@ -145,11 +145,18 @@ class LifecycleProjectionTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.start = str(process_start_ticks(os.getpid()))
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("fixture registry\n", encoding="utf-8")
         self.identity = shared_readiness.legacy_target_identity(
             server="fixture", endpoint="/tmp/fixture.sock", pane="w1:p1",
             harness="claude", session_id="sid-a", native_state="idle")
         shared_readiness.publish_runner_incarnation(
             self.root, os.getpid(), self.start, "runner-old")
+
+    def registry_generation(self):
+        from dispatch_registry_cache import registry_view
+        return shared_readiness.registry_generation(
+            self.jobs, registry_view(self.jobs))
 
     def test_legacy_projection_needs_current_runner_and_verified_lineage(self):
         shared_readiness.publish_target_projection(
@@ -159,6 +166,7 @@ class LifecycleProjectionTest(unittest.TestCase):
         shared_readiness.publish_target_projection(
             self.root, self.identity, {"state": "pending", "reason": "bound-work"},
             producer_pid=os.getpid(), producer_start=self.start, incarnation="runner-old",
+            generation=self.registry_generation(),
             lineage={"shell_pid": os.getpid(), "shell_start": self.start})
         self.assertEqual(shared_readiness.target_result(self.root, self.identity)["state"],
                          "pending")
@@ -181,6 +189,7 @@ class LifecycleProjectionTest(unittest.TestCase):
         shared_readiness.publish_target_projection(
             self.root, self.identity, {"state": "ready", "reason": "native-ready"},
             producer_pid=os.getpid(), producer_start=self.start, incarnation="runner-old",
+            generation=self.registry_generation(),
             lineage={"shell_pid": os.getpid(), "shell_start": "not-current"})
         self.assertIsNone(shared_readiness.target_result(self.root, self.identity))
 

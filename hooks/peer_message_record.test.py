@@ -567,12 +567,20 @@ sys.exit(0)
 class SweepTest(_BaseTest):
     def setUp(self):
         super().setUp()
+        # The normal watch path has always supported a registry that has not
+        # been created yet. Keep this real runner fixture on that path; peer
+        # receipt delivery must not require an empty jobs.log setup file.
+        self.jobs_path.unlink()
         self.bin = self.tmp_root / "fakebin"
         self.bin.mkdir()
         fake = self.bin / "herdr"
         fake.write_text(_FAKE_HERDR)
         fake.chmod(0o755)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
+        # The readiness contract binds a shared result to its selected server
+        # endpoint. Give the fixture that endpoint identity while leaving the
+        # socket absent, so the production runner exercises its CLI fallback.
+        self.env["HERDR_SOCKET_PATH"] = str(self.tmp_root / "herdr-observation.sock")
         self.session = "sweep-session-1"
         # A pane census must report a live, fixture-owned foreground shell;
         # the hook/observer children must not borrow a caller's Herdr socket.
@@ -609,7 +617,29 @@ class SweepTest(_BaseTest):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not receipt.exists():
             time.sleep(0.02)
-        self.assertTrue(receipt.exists(), f"receipt never arrived for {watch_id}")
+        if not receipt.exists():
+            paths = self.tmp_root / "peer-steward" / "obligations"
+            observation_path = self._watch_root() / f"{watch_id}.observation.json"
+            arm_path = self._watch_root() / f"{watch_id}.json"
+            watcher_log = self._watch_root() / f"{watch_id}.log"
+            evidence = {
+                "arm": json.loads(arm_path.read_text()) if arm_path.exists() else None,
+                "observation": json.loads(observation_path.read_text())
+                    if observation_path.exists() else None,
+                "watcher_log": watcher_log.read_text(errors="replace")[-3000:]
+                    if watcher_log.exists() else "",
+                "obligation_files": sorted(path.name for path in paths.glob("*"))
+                    if paths.is_dir() else [],
+                "readiness_projections": [
+                    {key: value.get(key) for key in
+                     ("identity", "result", "lineage", "generation")}
+                    for projection_path in sorted((paths / "readiness-v1").glob("*.json"))
+                    for value in [json.loads(projection_path.read_text())]
+                ] if (paths / "readiness-v1").is_dir() else [],
+            }
+            self.fail(f"receipt never arrived for {watch_id}; diagnostics={evidence}")
+        self.assertFalse(self.jobs_path.exists(),
+                         "watch readiness must not create a dispatch registry")
         # The watcher renames its receipt into place *before* it appends its
         # `notice` row, and it holds `<watch_id>.lock` until process exit. Wait
         # for that lock, so a caller counting notice rows never races the

@@ -10739,12 +10739,15 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
         }
 
     def _publish_transition_response(self):
+        from dispatch_registry_cache import registry_view
+
         peer_steward.shared_readiness.publish_watch_transition(
             self.store.root, self.watch_id, self.identity, self.token,
             {"state": "ready", "reason": "native-turn-ready"},
             producer_pid=os.getpid(), producer_start=self.start,
             incarnation="receipt-lock-incarnation",
-            generation={"path": str(self.jobs_path), "signature": [1, 2, 3]},
+            generation=peer_steward.shared_readiness.registry_generation(
+                self.jobs_path, registry_view(self.jobs_path), selected=True),
             lineage={"shell_pid": os.getpid(), "shell_start": self.start},
             authority={"rows": [], "handover_keys": []})
 
@@ -10795,6 +10798,8 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
             os.close(fd)
 
     def _runner_pass(self, wake):
+        from peer_read_context import PeerReadContext
+
         readiness_identity = {
             "server": self.server, "pane": self.pane, "harness": "claude",
             "session_id": "target-session",
@@ -10822,8 +10827,49 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
                                   "publish_target_projection", return_value=False):
             return peer_steward._publish_watch_readiness(
                 self.store, snapshot,
-                read_context=SimpleNamespace(registry_view=lambda *_a, **_k: None),
+                read_context=PeerReadContext(registry_append_only=True),
                 incarnation="receipt-lock-incarnation")
+
+    def test_authority_lock_uses_selected_dispatch_root_when_peer_storage_differs(self):
+        dispatch_jobs = self.tmp_root / "dispatch" / "jobs.log"
+        dispatch_jobs.parent.mkdir()
+        peer_root = self.tmp_root / "peer-state"
+        peer_root.mkdir()
+        os.environ["AGENT_DISPATCH_JOBS"] = str(dispatch_jobs)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(peer_root)
+
+        peer_lock = peer_root / "jobs.log.lock"
+        peer_fd = os.open(peer_lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with mock.patch.object(peer_steward.herdr_observation,
+                                   "socket_path_for_endpoint", return_value=self.socket_path):
+                with peer_steward._watch_transition_authority_lock(self.identity, self.server):
+                    selected_lock = Path(str(dispatch_jobs) + ".lock")
+                    self.assertTrue(selected_lock.is_file())
+                    selected_probe = os.open(selected_lock, os.O_RDWR)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(selected_probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(selected_probe)
+                    peer_probe = os.open(peer_lock, os.O_RDWR)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(peer_probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(peer_probe)
+        finally:
+            fcntl.flock(peer_fd, fcntl.LOCK_UN)
+            os.close(peer_fd)
+
+        selected_fd = os.open(str(dispatch_jobs) + ".lock", os.O_RDWR)
+        try:
+            fcntl.flock(selected_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(selected_fd, fcntl.LOCK_UN)
+            os.close(selected_fd)
 
     def test_jobs_lock_contention_releases_to_writer_and_receipt_completes(self):
         with self._holder("jobs", hold_seconds=0.08):
@@ -11021,9 +11067,13 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(after_contention["native_wait"], self.native_wait)
 
     def test_runner_uses_bound_cli_observation_when_transport_is_unavailable(self):
+        from peer_read_context import PeerReadContext
+
         observation = dict(self.observation)
         observation.pop("readiness_transition", None)
         peer_steward._write_json_atomic(self.paths.observation, observation)
+        selected_jobs = self.tmp_root / "dispatch" / "jobs.log"
+        selected_jobs.parent.mkdir()
         readiness_identity = {
             "server": self.server, "pane": self.pane, "harness": "claude",
             "session_id": "target-session",
@@ -11036,9 +11086,11 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
             return SimpleNamespace(state="ready", reason="cli-observation-ready",
                                    identity=tuple(readiness_identity.items()))
 
-        read_context = SimpleNamespace(registry_view=lambda path, **_kwargs:
-            SimpleNamespace(signature=(1, 2, 3), resolved_path=str(path)))
-        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+        read_context = PeerReadContext(registry_append_only=True)
+        with mock.patch.dict(os.environ, {
+                    "AGENT_HOME": str(_HERE.parent),
+                    "AGENT_DISPATCH_JOBS": str(selected_jobs)}), \
+                mock.patch.object(peer_steward, "_watch_readiness_identity",
                                return_value=self.identity), \
                 mock.patch.object(peer_steward, "_runner_readiness_transport",
                                   return_value=None), \
@@ -11060,6 +11112,44 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
             peer_steward.shared_readiness._target_path(self.store.root, self.identity))
         self.assertEqual((projection["result"]["state"], projection["result"]["reason"]),
                          ("ready", "cli-observation-ready"))
+        self.assertEqual(projection["generation"].get("missing"), True)
+        self.assertEqual(Path(projection["generation"]["path"]), selected_jobs)
+        selected_jobs.write_text(
+            "2026-10-21T00:00:00Z\topen\t/repo\t/wt\tnew-bound-work\t"
+            "attempt_id=att-new-bound-work,attempt_schema_version=2,dispatch_depth=1,"
+            "worker_type=execute,registered_worker=1,harness=claude,"
+            "parent_sid=target-session,parent_harness=claude\n",
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {
+                "AGENT_HOME": str(_HERE.parent),
+                "AGENT_DISPATCH_JOBS": str(selected_jobs)}):
+            self.assertIsNone(peer_steward.shared_readiness.target_result(
+                self.store.root, self.identity),
+                "file creation invalidates the prior known-absence projection")
+            from peer_read_context import PeerReadContext
+            work, binding_state = peer_steward.peer_obligations.bound_work_for_pane(
+                self.pane, "claude", "target-session",
+                read_context=PeerReadContext(registry_append_only=True),
+                registry_append_only=True)
+            self.assertEqual(binding_state, "observed")
+            self.assertTrue(work, "the selected registry now contains exact-session work")
+
+            with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                                   return_value=self.identity), \
+                    mock.patch.object(peer_steward.herdr_observation,
+                                      "socket_path_for_endpoint", return_value=self.socket_path), \
+                    mock.patch.object(peer_steward.shared_readiness, "wake_runner",
+                                      return_value=True), \
+                    mock.patch.object(peer_steward.peer_obligations,
+                                      "ensure_normal_runner"):
+                result = peer_steward._watch_publish_ready_receipt(
+                    "target-agent", "idle", self.arm,
+                    {"pane": self.pane, "harness": "claude",
+                     "session_id": "target-session"},
+                    self.server, self.watch_id, self.paths, self.receipt)
+            self.assertFalse(result)
+            self.assertFalse(self.paths.receipt.exists(),
+                             "new work must block the receipt boundary")
 
     def test_complete_census_absence_does_not_get_overridden_by_cli(self):
         observation = dict(self.observation)
@@ -11243,11 +11333,14 @@ class SharedReadinessRunnerTest(unittest.TestCase):
 
     def test_runner_reads_once_for_five_stewards_and_separates_another_pane(self):
         from dispatch_contract import process_start_ticks
+        from dispatch_registry_cache import registry_view
         with tempfile.TemporaryDirectory() as temporary:
-            state_root = Path(temporary) / "state"
+            state_root = Path(temporary) / "peer-state"
+            dispatch_root = Path(temporary) / "dispatch"
+            dispatch_root.mkdir()
             watch_root = state_root / "peer-watches"
             watch_root.mkdir(parents=True)
-            jobs = state_root / "jobs.log"
+            jobs = dispatch_root / "jobs.log"
             jobs.write_text("fixture\n", encoding="utf-8")
             store = peer_steward.peer_obligations.ObligationStore(state_root)
             start = str(process_start_ticks(os.getpid()))
@@ -11273,11 +11366,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
             incarnation = "runner-projection-test"
             peer_steward.shared_readiness.publish_runner_incarnation(
                 store.root, os.getpid(), producer_start, incarnation)
-            jobs_info = jobs.stat()
-            read_context = SimpleNamespace(registry_view=mock.Mock(return_value=SimpleNamespace(
-                signature=(jobs_info.st_dev, jobs_info.st_ino, jobs_info.st_size,
-                           jobs_info.st_mtime_ns, jobs_info.st_ctime_ns),
-                resolved_path=str(jobs.resolve()))))
+            read_context = SimpleNamespace(registry_view=mock.Mock(side_effect=lambda path, **kwargs:
+                registry_view(path, append_only=kwargs.get("append_only", False))))
             agents = []
             for index in range(6):
                 pane = "w1:p1" if index < 5 else "w1:p2"
@@ -11295,7 +11385,11 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     identity=(("server", "server-a"), ("pane", pane), ("harness", "claude"),
                               ("session_id", sid), ("pid_birth", f"{os.getpid()}:{start}")))
             snapshot = {"watch_root": watch_root, "watches": tuple(arms)}
-            with mock.patch.object(peer_steward.herdr_observation,
+            selected_env = {"AGENT_HOME": str(_HERE.parent),
+                            "AGENT_DISPATCH_JOBS": str(jobs),
+                            "AGENT_PEER_LEDGER_ROOT": str(state_root)}
+            with mock.patch.dict(os.environ, selected_env), \
+                    mock.patch.object(peer_steward.herdr_observation,
                                    "socket_path_for_endpoint", return_value="/tmp/herdr.sock"), \
                     mock.patch.object(peer_steward, "_runner_readiness_transport",
                                       return_value=transport), \
@@ -11311,17 +11405,24 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                             "runner must not retain/build a RegistryView per watch")
             self.assertTrue(all(call.args == (jobs,) and call.kwargs == {"append_only": True}
                                 for call in read_context.registry_view.call_args_list))
+            self.assertNotEqual(store.root.parents[1], jobs.parent,
+                                "peer obligation storage stays separate from dispatch jobs")
             self.assertEqual(heavy_read.call_count, 2)
             self.assertEqual(wake.call_count, 6)
-            with mock.patch.object(peer_steward.herdr_observation,
+            with mock.patch.dict(os.environ, selected_env), \
+                    mock.patch.object(peer_steward.herdr_observation,
                                    "socket_path_for_endpoint", return_value="/tmp/herdr.sock"):
                 for _watch_id, arm in arms:
                     identity = peer_steward._watch_readiness_identity(arm, "idle")
+                    projection = peer_steward.shared_readiness._read_json(
+                        peer_steward.shared_readiness._target_path(store.root, identity))
+                    self.assertEqual(projection["generation"]["path"], str(jobs))
                     self.assertEqual(peer_steward.shared_readiness.target_result(
                         store.root, identity)["state"], "pending")
 
     def test_cached_ready_projection_revalidates_claim_handover_and_cleanup_gate(self):
         from dispatch_contract import process_start_ticks
+        from dispatch_registry_cache import registry_view
 
         for name, expected_state, changed_reason in (
                 ("claim-handover", "pending", "bound-registered-work-pending"),
@@ -11333,6 +11434,9 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 watch_root.mkdir()
                 jobs = state_root / "jobs.log"
                 jobs.write_text("", encoding="utf-8")
+                selected_env = {"AGENT_HOME": str(_HERE.parent),
+                                "AGENT_DISPATCH_JOBS": str(jobs),
+                                "AGENT_PEER_LEDGER_ROOT": str(state_root)}
                 jobs_before = jobs.read_bytes()
                 store = peer_steward.peer_obligations.ObligationStore(state_root)
                 start = str(process_start_ticks(os.getpid()))
@@ -11369,12 +11473,15 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 peer_steward.shared_readiness.publish_target_projection(
                     store.root, identity, {"state": "ready", "reason": "cached-ready"},
                     producer_pid=os.getpid(), producer_start=producer_start,
-                    incarnation=incarnation, lineage={
+                    incarnation=incarnation,
+                    generation=peer_steward.shared_readiness.registry_generation(
+                        jobs, registry_view(jobs), selected=True), lineage={
                         "shell_pid": os.getpid(), "shell_start": start})
 
                 with mock.patch.object(peer_steward.peer_obligations,
                                        "ObligationStore", return_value=store), \
-                        mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_root / "xdg")}), \
+                        mock.patch.dict(os.environ, {**selected_env,
+                                                     "XDG_STATE_HOME": str(state_root / "xdg")}), \
                         mock.patch.object(peer_steward.herdr_observation,
                                           "socket_path_for_endpoint", return_value=endpoint), \
                         mock.patch.object(peer_steward, "_retire_target", return_value=(
@@ -11414,7 +11521,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 transport = mock.Mock()
                 transport.observe.return_value = object()
                 snapshot = {"watch_root": watch_root, "watches": ((watch_id, arm),)}
-                with mock.patch.object(peer_steward.herdr_observation,
+                with mock.patch.dict(os.environ, selected_env), \
+                        mock.patch.object(peer_steward.herdr_observation,
                                        "socket_path_for_endpoint", return_value=endpoint), \
                         mock.patch.object(peer_steward, "_runner_readiness_transport",
                                           return_value=transport), \
@@ -11433,7 +11541,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                                  "one shared projection and one request-bound refresh classify the target")
                 with mock.patch.object(peer_steward.peer_obligations,
                                        "ObligationStore", return_value=store), \
-                        mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_root / "xdg")}), \
+                        mock.patch.dict(os.environ, {**selected_env,
+                                                     "XDG_STATE_HOME": str(state_root / "xdg")}), \
                         mock.patch.object(peer_steward.herdr_observation,
                                           "socket_path_for_endpoint", return_value=endpoint), \
                         mock.patch.object(peer_steward, "_retire_target", return_value=(
@@ -11449,6 +11558,7 @@ class SharedReadinessRunnerTest(unittest.TestCase):
 
     def test_mutation_between_runner_checks_cannot_publish_ready_transition(self):
         from dispatch_contract import process_start_ticks
+        from dispatch_registry_cache import registry_view
 
         with tempfile.TemporaryDirectory() as temporary:
             state_root = Path(temporary)
@@ -11456,6 +11566,9 @@ class SharedReadinessRunnerTest(unittest.TestCase):
             watch_root.mkdir()
             jobs = state_root / "jobs.log"
             jobs.write_text("", encoding="utf-8")
+            selected_env = {"AGENT_HOME": str(_HERE.parent),
+                            "AGENT_DISPATCH_JOBS": str(jobs),
+                            "AGENT_PEER_LEDGER_ROOT": str(state_root)}
             store = peer_steward.peer_obligations.ObligationStore(state_root)
             start = str(process_start_ticks(os.getpid()))
             watch_id = "watch-boundary-race"
@@ -11484,6 +11597,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 store.root, identity, {"state": "ready", "reason": "cached-ready"},
                 producer_pid=os.getpid(), producer_start=producer_start,
                 incarnation=incarnation,
+                generation=peer_steward.shared_readiness.registry_generation(
+                    jobs, registry_view(jobs), selected=True),
                 lineage={"shell_pid": os.getpid(), "shell_start": start})
             ready = SimpleNamespace(state="ready", reason="first-read-clear",
                 identity=(("server", "server-a"), ("pane", "w1:p1"),
@@ -11494,6 +11609,7 @@ class SharedReadinessRunnerTest(unittest.TestCase):
 
             with mock.patch.object(peer_steward.peer_obligations,
                                    "ObligationStore", return_value=store), \
+                    mock.patch.dict(os.environ, selected_env), \
                     mock.patch.object(peer_steward.herdr_observation,
                                       "socket_path_for_endpoint", return_value=endpoint), \
                     mock.patch.object(peer_steward, "_retire_target", return_value=(
@@ -11507,14 +11623,12 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 peer_steward._watch_transition_readiness(
                     "agent-a", "idle", arm, arm["agent"], "server-a", watch_id, paths)
 
-            jobs_info = jobs.stat()
-            read_context = SimpleNamespace(registry_view=mock.Mock(return_value=SimpleNamespace(
-                signature=(jobs_info.st_dev, jobs_info.st_ino, jobs_info.st_size,
-                           jobs_info.st_mtime_ns, jobs_info.st_ctime_ns),
-                resolved_path=str(jobs.resolve()))))
+            read_context = SimpleNamespace(registry_view=mock.Mock(side_effect=lambda path, **kwargs:
+                registry_view(path, append_only=kwargs.get("append_only", False))))
             transport = mock.Mock()
             transport.observe.return_value = object()
-            with mock.patch.object(peer_steward.herdr_observation,
+            with mock.patch.dict(os.environ, selected_env), \
+                    mock.patch.object(peer_steward.herdr_observation,
                                    "socket_path_for_endpoint", return_value=endpoint), \
                     mock.patch.object(peer_steward, "_runner_readiness_transport",
                                       return_value=transport), \
@@ -11531,10 +11645,11 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     read_context=read_context, incarnation=incarnation)
 
             self.assertEqual(check.call_count, 2)
-            response = peer_steward.shared_readiness.watch_transition_result(
-                store.root, watch_id, identity,
-                json.loads(paths.observation.read_text(encoding="utf-8"))[
-                    "readiness_transition"]["token"])
+            with mock.patch.dict(os.environ, selected_env):
+                response = peer_steward.shared_readiness.watch_transition_result(
+                    store.root, watch_id, identity,
+                    json.loads(paths.observation.read_text(encoding="utf-8"))[
+                        "readiness_transition"]["token"])
             self.assertEqual((response["state"], response["reason"]),
                              ("pending", "claim-arrived-between-checks"))
 
