@@ -14,11 +14,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 _HOOK = _HERE / "peer-steward-rewake.py"
 _PEER_STEWARD = _HERE.parent / "utilities" / "peer-steward.py"
 sys.path.insert(0, str(_HERE.parent / "tools"))
+sys.path.insert(0, str(_HERE.parent / "utilities"))
 import fixture_processes  # noqa: E402
 
 _FAKE_HERDR = r'''#!/usr/bin/env python3
@@ -80,6 +82,10 @@ class _HookMixin:
         # isolating only AGENT_DISPATCH_JOBS no longer keeps this fixture's watch
         # records out of the real per-user ledger root.
         env["AGENT_PEER_LEDGER_ROOT"] = str(self.root / "peer-state")
+        env["HOME"] = str(self.root / "home")
+        env["XDG_STATE_HOME"] = str(self.root / "state")
+        env["XDG_CONFIG_HOME"] = str(self.root / "config")
+        env["XDG_DATA_HOME"] = str(self.root / "data")
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_FIFO"] = str(self.fifo)
         env["CLAUDE_CODE_SESSION_ID"] = session_id or self.session
@@ -166,6 +172,63 @@ class ArmingTest(_HookMixin, unittest.TestCase):
         proc = self._run_hook(self._payload("state=timeout agent=- session_id=- name=x pane=-"))
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
+
+    def test_old_async_callback_does_not_arm_after_confirmed_same_seat_successor(self):
+        env = self._env("held", session_id=self.session)
+        with mock.patch.dict(os.environ, env):
+            import dispatch_seat_handover as handover
+            import session_tidy
+            peer_spec = importlib.util.spec_from_file_location("rewake_fixture_peer_steward", _PEER_STEWARD)
+            peer_steward = importlib.util.module_from_spec(peer_spec)
+            peer_spec.loader.exec_module(peer_steward)
+            armed = self._arm(mode="held")
+            fields = self._fields(armed)
+            arm_path = peer_steward._watch_paths(fields["watch_id"]).arm
+            arm = peer_steward._read_json(arm_path)
+            seat = session_tidy.Seat("pane", "fixture-continuity-seat", "w1:p9", "claude")
+            arm["steward_seat"] = seat.as_dict()
+            peer_steward._write_json_atomic(arm_path, arm)
+            steward = arm["steward"]
+            watch = {
+                "watch_id": fields["watch_id"],
+                "origin": {"harness": steward["harness"], "sid": steward["session_id"]},
+                "holder": {"harness": "claude", "sid": "successor-session"},
+                "seat_key": seat.key,
+                "storage_root": str(peer_steward.peer_message.peer_state_root()),
+                "server": arm.get("server") or "default", "target": arm.get("target"),
+                "agent": dict(arm.get("agent") or {}), "until": list(arm.get("until") or []),
+                "armed_ts": arm.get("armed_ts"), "deadline": arm.get("deadline"),
+                "lineage": [{"from": steward["session_id"], "to": "successor-session",
+                             "snapshot_id": "fixture"}],
+            }
+            with session_tidy.seat_lock(seat.key):
+                session_tidy._append_ledger_entry(seat, {
+                    "ts": session_tidy.now_epoch(), "harness": "claude",
+                    "sid": "successor-session", "event": "handover",
+                    "from": steward["session_id"], "seat_key": seat.key,
+                    "bindings": [], "steward": {"schema": 1, "roles": [], "watches": [watch]},
+                })
+            spec = importlib.util.spec_from_file_location("rewake_lineage_fixture", _HOOK)
+            hook = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hook)
+            old_payload = self._payload(armed, session_id=steward["session_id"])
+            self.assertIsNone(hook.parse_arm(old_payload))
+            successor_env = self._env("held", session_id="successor-session")
+            with mock.patch.dict(os.environ, successor_env):
+                resolved = handover.resolve_watch(fields["watch_id"], seat_key=seat.key)
+                status = subprocess.run(
+                    [sys.executable, str(_PEER_STEWARD), "status", "--watch",
+                     fields["watch_id"], "--json"], env=successor_env,
+                    capture_output=True, text=True, timeout=10)
+                parsed = hook.parse_arm(self._payload(armed, session_id="successor-session"))
+                self.assertEqual(parsed[0] if parsed else None, fields["watch_id"],
+                                 repr({"resolved": resolved, "status": status.stdout,
+                                       "stderr": status.stderr}))
+        self._release()
+        with mock.patch.dict(os.environ, env):
+            resolved = handover.resolve_watch(fields["watch_id"], seat_key=seat.key)
+        self.assertEqual((resolved["holder"]["harness"], resolved["holder"]["sid"]),
+                         ("claude", "successor-session"))
 
 
 class DeliveryTest(_HookMixin, unittest.TestCase):

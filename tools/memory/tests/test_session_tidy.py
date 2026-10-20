@@ -3008,7 +3008,7 @@ class SeatHandoverTest(TidyCase):
         out = []
         with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
             st.run_hook(harness, event, sid, source=source, cwd=str(self.cwd),
-                        env={"HERDR_PANE_ID": pane}, emit=out.append)
+                        env=os.environ, emit=out.append)
             seat = self.seat(pane)
             return out, self.handover.handover_rows(seat)
 
@@ -3463,6 +3463,236 @@ class SeatHandoverTest(TidyCase):
         meta = self.row("att-1")
         with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):
             self.assertEqual(self.handover.effective_parent(meta, self.jobs), "sid-A")
+
+    def test_markerless_role_only_clear_handoff_reaches_c_through_all_three_harnesses(self):
+        pm = self.handover._peer_message()
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                pane = f"test:{harness}-continuity"
+                a, b, c, d = (f"{harness}-{suffix}" for suffix in ("A", "B", "C", "D"))
+                target = {"harness": "codex", "session_id": f"target-{harness}", "name": "target"}
+                event = "prompt" if harness == "opencode" else "start"
+                source = "" if harness == "opencode" else "clear"
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertTrue(pm.mark_steward(harness, a, target, "watch", "1", source="watch"))
+                    self.assertEqual(self.snapshot(a, harness, pane=pane), 0)
+                    seat = self.seat(pane)
+                    a_snapshot = self.handover.read_snapshot(seat.key)
+                    self.assertEqual(a_snapshot["bindings"], [])
+                    self.assertEqual(a_snapshot["steward"]["roles"][0]["origin"],
+                                     {"harness": harness, "sid": a})
+
+                _out, rows = self.start(b, harness, event=event, source=source, pane=pane)
+                self.assertEqual([(row["from"], row["sid"]) for row in rows], [(a, b)])
+                self.assertEqual(rows[0]["bindings"], [])
+                self.assertEqual(rows[0]["steward"]["roles"][0]["targets"], [
+                    {**target, "kind": "watch", "ts": "1", "source": "watch"}])
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertFalse(pm.steward_marker_path(harness, b).exists())
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    active = self.handover.resolved_steward_relations(
+                        harness, b, seat_key=seat.key)
+                self.assertEqual(len(active), 1)
+                generation = active[0]["generation"]
+
+                self.assertEqual(self.snapshot(b, harness, pane=pane), 0)
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    b_snapshot = self.handover.read_snapshot(seat.key)
+                _out, rows = self.start(c, harness, event=event, source=source, pane=pane)
+                self.assertEqual([(row["from"], row["sid"]) for row in rows], [(a, b), (b, c)])
+                self.assertEqual(rows[-1]["steward"]["roles"][0]["generation"], generation)
+                self.assertEqual(rows[-1]["steward"]["roles"][0]["lineage"], [
+                    {"from": a, "to": b, "snapshot_id": a_snapshot["snapshot_id"]},
+                    {"from": b, "to": c,
+                     "snapshot_id": b_snapshot["snapshot_id"]},
+                ])
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertFalse(pm.steward_marker_path(harness, c).exists())
+
+                # Replaying A's saved snapshot after B→C cannot branch the lineage.
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    with st.seat_lock(seat.key):
+                        st.atomic_write_json(self.handover._snapshot_path(seat.key), a_snapshot)
+                _out, rows = self.start(d, harness, event=event, source=source, pane=pane)
+                self.assertEqual([(row["from"], row["sid"]) for row in rows], [(a, b), (b, c)])
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertEqual(self.handover.resolved_steward_relations(
+                        harness, d, seat_key=seat.key), [])
+
+    def test_release_before_confirmed_adoption_blocks_role_revival(self):
+        pm = self.handover._peer_message()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target", "name": "target"},
+                "watch", "1", source="watch"))
+            self.assertEqual(self.snapshot(), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pm.cmd_release(SimpleNamespace(harness="claude", session_id="sid-A")), 0)
+        _out, rows = self.start("sid-B")
+        self.assertEqual(rows, [])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-B", seat_key=self.seat().key), [])
+
+    def test_clear_and_compact_snapshot_callers_preserve_role_only_payload(self):
+        pm = self.handover._peer_message()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "unknown", "name": "-"}, "explicit", "1", source="explicit"))
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd))
+                st.write_card(seat, "claude", "sid-A", "work", cwd=str(self.cwd))
+            card = st.read_latest_card(seat)
+            request = {"schema": clear.SCHEMA, "seat": seat.as_dict(),
+                       "harness": "claude", "sid": "sid-A",
+                       "nonce": "fixture-nonce", "status": "reserved",
+                       "prompt_seq": st.read_prompt_seq(seat),
+                       "card_generation": card["generation"], "created": st.now_epoch(),
+                       "compact": {"identity": "fixture-compact"}}
+            clear._write_reservation(request)
+            self.assertTrue(clear._prepare_handover_snapshot(request))
+            prepared = self.handover.read_snapshot(seat.key)
+            self.assertEqual(prepared["bindings"], [])
+            self.assertEqual(prepared["steward"]["roles"][0]["origin"]["sid"], "sid-A")
+
+            with st.seat_lock(seat.key):
+                st.atomic_write_json(self.handover._snapshot_path(seat.key), {})
+            with mock.patch.object(st, "update_compact_card_locked", return_value=True):
+                clear._refresh_compact_card(request, {"recent": "summary", "source": "fixture"})
+            refreshed = self.handover.read_snapshot(seat.key)
+            self.assertEqual(refreshed["bindings"], [])
+            self.assertEqual(refreshed["steward"]["roles"][0]["generation"],
+                             prepared["steward"]["roles"][0]["generation"])
+
+    def test_watch_snapshot_keeps_exact_unresolved_watch_identity_across_handover(self):
+        pm = self.handover._peer_message()
+        watch_id = "watch-fixture-001"
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target", "name": "target"},
+                "watch", "1", source="watch"))
+            seat = self.seat()
+            watch_root = pm.peer_state_root() / "peer-watches"
+            watch_root.mkdir(parents=True, exist_ok=True)
+            arm = {"schema_version": 1, "watch_id": watch_id, "server": "server-fixture",
+                   "target": "target-name", "until": ["done"], "deadline": {"wall": 9999999999},
+                   "armed_ts": "fixture-time", "steward": {"harness": "claude", "session_id": "sid-A"},
+                   "steward_seat": seat.as_dict(),
+                   "agent": {"harness": "codex", "session_id": "target", "name": "target",
+                             "pane": "w1:p-target"}}
+            (watch_root / f"{watch_id}.json").write_text(json.dumps(arm), encoding="utf-8")
+            watches = self.handover.resolved_watch_references(
+                "claude", "sid-A", seat_key=seat.key)
+            self.assertEqual([row["watch_id"] for row in watches], [watch_id])
+            self.assertEqual(self.snapshot(), 0)
+        _out, rows = self.start("sid-B")
+        self.assertEqual(rows[0].get("steward", {}).get("watches", [{}])[0].get("watch_id"),
+                         watch_id, repr(rows))
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            ref = self.handover.resolve_watch(watch_id, seat_key=seat.key)
+        self.assertIsNotNone(ref, repr(self.handover._transition_rows(seat.key)))
+        self.assertEqual(ref["holder"], {"harness": "claude", "sid": "sid-B"})
+        self.assertEqual((ref["watch_id"], ref["server"], ref["target"], ref["until"]),
+                         (watch_id, "server-fixture", "target-name", ["done"]))
+        self.assertEqual(ref["deadline"], {"wall": 9999999999})
+        (watch_root / f"{watch_id}.ack.json").write_text(
+            json.dumps({"session_id": "sid-B", "harness": "claude"}), encoding="utf-8")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertIsNone(self.handover.resolve_watch(watch_id, seat_key=seat.key))
+
+    def test_stale_predecessor_release_revokes_only_its_generation(self):
+        pm = self.handover._peer_message()
+        pane = "test:stale-release"
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target-A", "name": "target-A"},
+                "watch", "1", source="watch"))
+            self.assertEqual(self.snapshot("sid-A", pane=pane), 0)
+            seat = self.seat(pane)
+        self.start("sid-B", pane=pane)
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": "sid-B"}):
+            self.assertTrue(pm.mark_steward("claude", "sid-B",
+                {"harness": "codex", "session_id": "target-B", "name": "target-B"},
+                "watch", "2", source="watch"))
+            current_b = pm.read_steward_markers([pm.peer_state_root()])[("claude", "sid-B")]
+            generation_b = current_b["generation"]
+
+        # A late off callback carries A's original session identity. It may
+        # revoke A's inherited generation, but cannot unlink B's new marker.
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": "sid-A"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pm.cmd_release(SimpleNamespace(harness="claude", session_id="sid-A")), 0)
+            active = self.handover.resolved_steward_relations(
+                "claude", "sid-B", seat_key=seat.key)
+        self.assertEqual([row["generation"] for row in active], [generation_b])
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertTrue(pm.steward_marker_path("claude", "sid-B").is_file())
+        self.assertEqual(active[0]["targets"][0]["session_id"], "target-B")
+
+    def test_current_holder_release_at_both_hops_prevents_role_resurrection(self):
+        pm = self.handover._peer_message()
+        for release_sid in ("sid-B", "sid-C"):
+            with self.subTest(release_sid=release_sid):
+                pane = f"test:release-{release_sid}"
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertTrue(pm.mark_steward("claude", "sid-A",
+                        {"harness": "codex", "session_id": "target", "name": "target"},
+                        "watch", "1", source="watch"))
+                    self.assertEqual(self.snapshot("sid-A", pane=pane), 0)
+                    seat = self.seat(pane)
+                self.start("sid-B", pane=pane)
+                if release_sid == "sid-C":
+                    self.assertEqual(self.snapshot("sid-B", pane=pane), 0)
+                    self.start("sid-C", pane=pane)
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane,
+                                               "CLAUDE_CODE_SESSION_ID": release_sid}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(pm.cmd_release(SimpleNamespace(
+                        harness="claude", session_id=release_sid)), 0)
+                if release_sid == "sid-B":
+                    self.assertEqual(self.snapshot("sid-B", pane=pane), 0)
+                    self.start("sid-C", pane=pane)
+                holder = "sid-B" if release_sid == "sid-B" else "sid-C"
+                with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+                    self.assertEqual(self.handover.resolved_steward_relations(
+                        "claude", holder, seat_key=seat.key), [])
+
+    def test_interrupted_durable_adoption_keeps_a_as_holder_and_retries_same_hop(self):
+        pm = self.handover._peer_message()
+        pane = "test:interrupted-adoption"
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target", "name": "target"},
+                "watch", "1", source="watch"))
+            self.assertEqual(self.snapshot("sid-A", pane=pane), 0)
+            seat = self.seat(pane)
+            with mock.patch.object(self.handover, "_append_transition_row",
+                                   side_effect=OSError("fixture-fsync-interrupted")):
+                _out, rows = self.start("sid-B", pane=pane)
+            self.assertEqual(rows, [])
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"], "sid-A")
+
+        _out, rows = self.start("sid-B", pane=pane)
+        self.assertEqual([(row["from"], row["sid"]) for row in rows], [("sid-A", "sid-B")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-B", seat_key=seat.key)[0]["holder"]["sid"], "sid-B")
+
+    def test_release_tombstone_survives_ledger_fold_without_advancing_session_activity(self):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd), now=100)
+                self.assertTrue(self.handover.record_steward_release(
+                    seat, "claude", "sid-A", "generation-A", now=200))
+                for index in range(st.LEDGER_FOLD_LINES + 5):
+                    st.record_event(seat, "claude", f"sid-fold-{index}", "start", cwd=str(self.cwd))
+            rows = st._read_ledger_lines(seat)
+            self.assertTrue(any(row.get("event") == "steward-release"
+                                and row.get("generation") == "generation-A" for row in rows))
+            self.assertEqual(st.session_summary(seat)[("claude", "sid-A")]["last_seen"], 100)
 
 
 if __name__ == "__main__":

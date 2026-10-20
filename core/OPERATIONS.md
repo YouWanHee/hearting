@@ -2037,6 +2037,17 @@ gate, write, or approval authority over the session it addresses — its peer me
 advisory context between two already-running sessions, and the append-only ledger below
 is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the role:
 
+An already valid steward relation follows a confirmed same-seat session handover through
+the existing seat ledger. The ledger preserves the original explicit/watch/start evidence,
+its generation and exact target, and any unresolved watch identity while resolving the
+current holder and recipient from the confirmed successor chain. Registered parent,
+receipt, signature and storage identities remain anchored to their original
+registration. Ordinary messages, cards, registered bindings and Fleet display
+aliases create no role. A release revokes only its recorded
+generation; an unresolved accepted watch remains a separate duty. Unknown or interrupted
+adoption stays pending. F-100c-2's existing evidence rule remains in force; SD-147 entry
+admission is a separate, dormant contract and is not part of same-seat continuity.
+
 Fleet and herdr may join pane-session IDs for display through the shared read-only
 session-tidy reader. Its bounded compatibility join uses the exact pane, harness,
 and repository. Confirmed predecessor expansion follows only same-harness clear

@@ -2412,6 +2412,37 @@ def _watch_paths(watch_id, root=None):
     )
 
 
+def _prepare_watch_notice(watch_id, arm, receipt):
+    """Queue one stable exact-ref notice under the original steward identity."""
+    steward = (arm or {}).get("steward") or {}
+    steward_seat = (arm or {}).get("steward_seat") or {}
+    harness, sid = steward.get("harness"), steward.get("session_id")
+    if (harness not in {"claude", "codex", "opencode"}
+            or not peer_message.usable_session_id(sid)
+            or steward_seat.get("kind") not in {"pane", "native"}
+            or not steward_seat.get("key")):
+        return None
+    agent = (receipt or {}).get("agent") or (arm or {}).get("agent") or {}
+    target = agent.get("name") or agent.get("session_id") or (arm or {}).get("target") or "unknown"
+    body = (f"[peer-steward] watch_id={watch_id} state={(receipt or {}).get('state', 'unknown')} "
+            f"target={target}; exact watch receipt is available")
+    sender = {"harness": harness, "session_id": sid}
+    if steward.get("project"):
+        sender["project"] = steward["project"]
+    recipient = {"harness": harness, "session_id": sid}
+    try:
+        _text, transfer_ref = peer_message.prepare_peer_message(
+            body, sender, recipient, defer=True, refs=[f"peer-watch:{watch_id}"],
+            receipt=f"peer-steward-watch:{watch_id}")
+        current = _read_json(_watch_paths(watch_id).arm) or dict(arm or {})
+        if current.get("notice_transfer_ref") != transfer_ref:
+            _write_json_atomic(_watch_paths(watch_id).arm,
+                               {**current, "notice_transfer_ref": transfer_ref})
+        return transfer_ref
+    except Exception:  # noqa: BLE001 - status/reconnect remains the ordinary fallback
+        return None
+
+
 def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
     """Settle one exact watch after its observer has the watch lock."""
     paths = _watch_paths(watch_id)
@@ -2442,6 +2473,7 @@ def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+    _prepare_watch_notice(watch_id, arm, receipt)
     return receipt
 
 
@@ -2911,13 +2943,43 @@ def _watch_arm_scope_matches(arm, server, steward_sid, until, agent):
         return False
     steward = arm.get("steward") or {}
     if steward.get("session_id") != steward_sid:
-        return False
+        if not _confirmed_watch_successor(arm.get("watch_id"), arm, steward_sid):
+            return False
     if tuple(sorted(arm.get("until") or [])) != tuple(sorted(until or [])):
         return False
     expected = arm.get("agent") or {}
     return all(expected.get(key) not in {None, "", "-"}
                and expected.get(key) == agent.get(key)
                for key in ("harness", "pane"))
+
+
+def _confirmed_watch_successor(watch_id, arm, requested_sid=None, *, include_acked=False):
+    """A watch follows only the exact successor stored by the common seat resolver."""
+    steward = (arm or {}).get("steward") or {}
+    seat_key = ((arm or {}).get("steward_seat") or {}).get("key")
+    if not watch_id or not seat_key:
+        return None
+    try:
+        import dispatch_seat_handover as handover
+        relation = handover.resolve_watch(str(watch_id), seat_key=seat_key,
+                                          include_acked=include_acked)
+    except Exception:
+        return None
+    if not isinstance(relation, dict):
+        return None
+    if any(relation.get(field) != (arm or {}).get(field) for field in
+           ("server", "target", "agent", "until", "deadline", "origin")):
+        # Arms predating the optional persisted `origin` compare against their
+        # original steward tuple below; no name or pane alias fills the gap.
+        if any(relation.get(field) != (arm or {}).get(field) for field in
+               ("server", "target", "agent", "until", "deadline")):
+            return None
+    holder = relation.get("holder") or {}
+    if holder.get("harness") != steward.get("harness"):
+        return None
+    if requested_sid is not None and holder.get("sid") != requested_sid:
+        return None
+    return relation
 
 
 def _watch_arm_matches(arm, server, steward_sid, until, agent):
@@ -3393,7 +3455,10 @@ def cmd_watch(args):
                 old_agent = old_arm.get("agent") or {}
                 if all(old_agent.get(key) == agent.get(key)
                        for key in ("pane", "harness", "session_id")):
-                    superseded.append((old_id, old_arm))
+                    # A role successor or an unconfirmed callback never retires
+                    # the predecessor's accepted duty. Same-seat transfer is
+                    # settled by the original watch and its shared resolver.
+                    continue
 
         foreground = _retire_foreground(agent["pane"], agent["harness"], strict=False)
         foreground_identity = ({key: foreground.get(key) for key in
@@ -3656,7 +3721,10 @@ def cmd_watch_run(args):
                 steward_reason = _watch_terminal_from_view(
                     initial_view, steward_agent, server, event_transport)
                 if steward_reason == "session-replaced":
-                    terminal_reason = "steward-replaced"
+                    # Session replacement can precede the ordinary confirmed
+                    # start callback. Keep this accepted duty pending until the
+                    # shared seat lineage resolves; unknown is not terminal.
+                    _confirmed_watch_successor(args.watch_id, arm)
                 elif steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                     terminal_reason = "steward-exited"
 
@@ -3672,7 +3740,7 @@ def cmd_watch_run(args):
                 elif native_record and native_record.get("sessionId") == (arm.get("steward") or {}).get("session_id"):
                     steward_pidfd = os.pidfd_open(native_pid, 0)
                 elif native_record and native_record.get("sessionId"):
-                    terminal_reason = "steward-replaced"
+                    _confirmed_watch_successor(args.watch_id, arm)
             except (AttributeError, OSError, TypeError, ValueError):
                 # Missing native proof stays unknown. A PID number or missing
                 # session record alone is never used as a death vote.
@@ -4040,8 +4108,7 @@ def cmd_watch_run(args):
                         steward_reason = _watch_terminal_from_view(
                             view, steward_agent, server, event_transport)
                         if steward_reason == "session-replaced":
-                            terminal_reason = "steward-replaced"
-                            break
+                            _confirmed_watch_successor(args.watch_id, arm)
                         if steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                             terminal_reason = "steward-exited"
                             break
@@ -4121,6 +4188,8 @@ def cmd_watch_run(args):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+
+    _prepare_watch_notice(args.watch_id, arm, receipt)
 
     _record(
         to_harness=agent.get("harness", "unknown"),
@@ -4488,7 +4557,19 @@ def _status_entry(watch_id, arm, root):
             "refs": receipt.get("refs") or [],
         }
     arm = arm or {"watch_id": watch_id}
-    if paths.ack.exists():
+    recipient = {"harness": (arm.get("steward") or {}).get("harness"),
+                 "session_id": (arm.get("steward") or {}).get("session_id")}
+    resolved = _confirmed_watch_successor(watch_id, arm, include_acked=True)
+    if resolved:
+        holder = resolved.get("holder") or {}
+        recipient = {"harness": holder.get("harness"), "session_id": holder.get("sid")}
+    try:
+        import dispatch_seat_handover as handover
+        acked = handover.watch_ack_valid(paths.ack, watch_id,
+                                         recipient.get("harness"), recipient.get("session_id"))
+    except Exception:
+        acked = False
+    if acked:
         state = "acked"
     elif receipt is not None:
         state = "receipt"
@@ -4506,6 +4587,7 @@ def _status_entry(watch_id, arm, root):
         "wake": arm.get("wake", "-"),
         "armed_ts": arm.get("armed_ts", "-"),
         "steward": arm.get("steward") or {},
+        "recipient": recipient,
         "watcher": {"pid": watcher.get("pid", "-"), "pid_start": watcher.get("pid_start", "-")},
         "receipt": str(paths.receipt),
         "ack": str(paths.ack),
@@ -4517,6 +4599,16 @@ def _status_entry(watch_id, arm, root):
     }
 
 
+def _watch_notice_pending(watch_id, recipient):
+    """A queued exact native notice owns the display/ACK path for this receipt."""
+    try:
+        ref = f"peer-watch:{watch_id}"
+        return any(ref in (row.get("refs") or ())
+                   for row in peer_message._pending_rows(recipient=recipient))
+    except Exception:
+        return False
+
+
 def cmd_status(args):
     root = _watch_root()
     entries = _watch_entries(root)
@@ -4524,10 +4616,13 @@ def cmd_status(args):
         entries = [(w, a) for w, a in entries if w == args.watch]
     rows = [_status_entry(w, a, root) for w, a in entries]
     if args.undelivered:
-        sid, _harness = _current_session_identity()
+        sid, harness = _current_session_identity()
         rows = [
             row for row in rows
-            if row["state"] == "receipt" and (row["steward"] or {}).get("session_id") == sid
+            if row["state"] == "receipt"
+            and (row.get("recipient") or {}).get("session_id") == sid
+            and (row.get("recipient") or {}).get("harness") == harness
+            and not _watch_notice_pending(row["watch_id"], row.get("recipient") or {})
         ]
     if args.json:
         print(json.dumps({"watch_root": str(root), "watches": rows}, ensure_ascii=False))
@@ -4582,21 +4677,30 @@ def cmd_ack(args):
     that lost the race would exit 0 where it must exit 2.
     """
     paths = _watch_paths(args.watch_id)
-    session_id, _harness = _current_session_identity()
-    try:
-        fd = os.open(str(paths.ack), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
+    session_id, harness = _current_session_identity()
+    import dispatch_seat_handover as handover
+    if paths.ack.exists():
+        ack = _read_json(paths.ack) or {}
+        if not handover.watch_ack_valid(paths.ack, args.watch_id,
+                                        ack.get("harness") or harness,
+                                        ack.get("session_id") or session_id):
+            print(f"watch_id={args.watch_id} ack=failed reason=invalid-existing", file=sys.stderr)
+            return 0
+        if ack.get("harness") == harness and ack.get("session_id") == session_id:
+            peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
         print(f"watch_id={args.watch_id} ack=already")
         return 0
-    except OSError as exc:
-        print(f"watch_id={args.watch_id} ack=failed reason=errno-{exc.errno}", file=sys.stderr)
-        return 0
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"carrier": args.carrier, "session_id": session_id, "ts": _utc_now()},
-            fh, ensure_ascii=False,
-        )
-    print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    outcome = handover.acknowledge_watch(args.watch_id, harness, session_id, args.carrier)
+    if outcome == "created":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
+        print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    elif outcome == "already":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
+        print(f"watch_id={args.watch_id} ack=already")
+    elif outcome == "not-recipient":
+        print(f"watch_id={args.watch_id} ack=not-recipient")
+    else:
+        print(f"watch_id={args.watch_id} ack=failed reason=unresolved-recipient", file=sys.stderr)
     return 0
 
 _PROMPT_VERIFY_TIMEOUT_MS = 8000      # bounded native /clear command invocation
