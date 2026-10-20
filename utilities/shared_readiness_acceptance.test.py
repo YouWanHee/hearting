@@ -29,6 +29,23 @@ def _read_json(path):
         return None
 
 
+def _rss_kib(record, field):
+    """Parse a retained-memory RSS field without substituting maxrss for rss_after."""
+    value = record.get(field) if isinstance(record, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split()
+    if len(parts) != 2 or parts[1] not in {"kB", "KiB"}:
+        return None
+    try:
+        amount = int(parts[0])
+    except ValueError:
+        return None
+    return amount if amount >= 0 else None
+
+
 def _write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,7 +289,7 @@ def _make_handoff(report, evidence_dir, measurement, lifecycle, cleanup):
         "",
         "## d2 — shared parsing and target observation",
         "",
-        f"Carrier helper launches: baseline={d2['baseline_carrier_helper_launches']}, candidate={d2['candidate_carrier_helper_launches']}. Candidate shared-runner peak is one process. The unchanged 29.36 MB registry retention fixture is reused because `dispatch_registry_cache.py` is unchanged from the sealed candidate commit: one full metadata parse of 86,471 rows on each side; retained traced allocation {d2['baseline_retained_bytes']:,} → {d2['candidate_retained_bytes']:,} bytes and post-parse RSS {d2['baseline_rss_kib']:,} → {d2['candidate_rss_kib']:,} KiB. This is central-cache evidence, not watcher-scaling evidence.",
+        f"Carrier helper launches: baseline={d2['baseline_carrier_helper_launches']}, candidate={d2['candidate_carrier_helper_launches']}. Candidate shared-runner peak is one process. The unchanged 29.36 MB registry retention fixture is reused because `dispatch_registry_cache.py` is unchanged from the sealed candidate commit: one full metadata parse of 86,471 rows on each side; retained traced allocation {d2['baseline_retained_bytes']:,} → {d2['candidate_retained_bytes']:,} bytes, post-parse RSS {d2['baseline_rss_kib']:,} → {d2['candidate_rss_kib']:,} KiB, and separate max RSS/high-water {d2['baseline_rss_high_water_kib']:,} → {d2['candidate_rss_high_water_kib']:,} KiB. This is central-cache evidence, not watcher-scaling evidence.",
         f"The final lifecycle fixture records {fixture.get('runner_session_snapshot_calls', 'unknown')} runner session snapshots for five same-target stewards plus one separate target; candidate runner and per-class costs are counted once in each measurement window. No per-watch parser/view claim is inferred from central-cache tracing alone.",
         "The four owner-review-focus observations were rechecked in current source: legacy pre-birth projections require fresh matching lineage; publisher reads stay inside the supplied pass context without global endpoint mutation; idle and done identities remain distinct; watcher waits consume projections without retaining a RegistryView.",
         "",
@@ -385,11 +402,26 @@ def _accept(baseline_root, evidence_dir):
         baseline_retained.get("cache_metrics", {}).get("full_metadata_parses"),
         candidate_retained.get("cache_metrics", {}).get("full_metadata_parses"),
     ]
+    retained_rss_after = [
+        _rss_kib(baseline_retained, "rss_after"),
+        _rss_kib(candidate_retained, "rss_after"),
+    ]
+    retained_rss_high_water = [
+        _rss_kib(baseline_retained, "rss_high_water"),
+        _rss_kib(candidate_retained, "rss_high_water"),
+    ]
+    if any(value is None for value in retained_rss_high_water):
+        retained_rss_high_water = [
+            _rss_kib(baseline_retained, "maxrss_kib"),
+            _rss_kib(candidate_retained, "maxrss_kib"),
+        ]
     d1_complete = True  # The owner currentness record is a required named input.
     d2_complete = (candidate_helpers == 0
                    and max(candidate_runner_peaks, default=0) == 1
                    and lifecycle_fixture.get("runner_session_snapshot_calls") == 2
-                   and retained_parse_counts == [1, 1])
+                   and retained_parse_counts == [1, 1]
+                   and all(value is not None for value in retained_rss_after)
+                   and all(value is not None for value in retained_rss_high_water))
     subcommands_pass = measurement["exit_code"] == 0 and lifecycle["exit_code"] == 0
     status = "PASS" if (subcommands_pass and d1_complete and d2_complete
                          and matrix_complete and lifecycle_complete
@@ -414,8 +446,10 @@ def _accept(baseline_root, evidence_dir):
                 "runner_session_snapshot_calls"),
             "baseline_retained_bytes": baseline_retained.get("retained_traced_bytes"),
             "candidate_retained_bytes": candidate_retained.get("retained_traced_bytes"),
-            "baseline_rss_kib": baseline_retained.get("maxrss_kib"),
-            "candidate_rss_kib": candidate_retained.get("maxrss_kib"),
+            "baseline_rss_kib": retained_rss_after[0],
+            "candidate_rss_kib": retained_rss_after[1],
+            "baseline_rss_high_water_kib": retained_rss_high_water[0],
+            "candidate_rss_high_water_kib": retained_rss_high_water[1],
             "retained_memory_evidence": str(retained_path),
             "registry_cache_source_sha256": hashlib.sha256(
                 (ROOT / "utilities" / "dispatch_registry_cache.py").read_bytes()).hexdigest(),

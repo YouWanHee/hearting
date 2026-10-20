@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import time
@@ -19,6 +20,7 @@ MAX_TARGET_PROJECTIONS = 256
 RUNNER_WAKE_NAME = "readiness-wake.fifo"
 _CHILD_FIELDS = ("attempt_id", "slug", "status", "readiness", "reason",
                  "required_action")
+_WATCH_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 def attempt_identity(jobs, attempt_id, *, parent="", slug="", consumer_pid,
@@ -274,6 +276,116 @@ def target_result(root, identity, *, now=None, max_age=MAX_AGE_SECONDS):
     except (ImportError, OSError, TypeError, ValueError):
         return None
     return {**result, **({"lineage": lineage} if isinstance(lineage, dict) else {})}
+
+
+def _watch_transition_path(root, watch_id):
+    if not isinstance(watch_id, str) or not _WATCH_ID.fullmatch(watch_id):
+        raise ValueError("readiness-watch-id-invalid")
+    return Path(root) / "readiness-v1" / "watch-transitions" / f"{watch_id}.json"
+
+
+def publish_watch_transition(root, watch_id, identity, request_token, result, *,
+                             producer_pid, producer_start, incarnation,
+                             generation=None, lineage=None, now=None):
+    """Publish the runner's fresh, request-bound authority check for one watch."""
+    if (not isinstance(identity, dict) or not isinstance(request_token, str)
+            or not request_token or len(request_token) > 128):
+        raise ValueError("readiness-watch-transition-invalid")
+    state = result.get("state", "unknown") if isinstance(result, dict) else "unknown"
+    reason = result.get("reason", "") if isinstance(result, dict) else "invalid-readiness"
+    if state not in {"ready", "pending", "unknown"}:
+        state = "unknown"
+    observed_at = time.time() if now is None else float(now)
+    value = {
+        "schema_version": SCHEMA_VERSION,
+        "watch_id": watch_id,
+        "request_token": request_token,
+        "identity": identity,
+        "producer": {"pid": int(producer_pid), "pid_start": str(producer_start),
+                     "incarnation": str(incarnation)},
+        "observed_at": observed_at,
+        "generation": generation,
+        "result": {"state": state, "reason": reason if isinstance(reason, str) else ""},
+    }
+    if isinstance(lineage, dict):
+        try:
+            pid = int(lineage.get("shell_pid"))
+            start = str(lineage.get("shell_start") or "")
+            if pid > 0 and start:
+                value["lineage"] = {"shell_pid": pid, "shell_start": start}
+        except (TypeError, ValueError):
+            pass
+    path = _watch_transition_path(root, watch_id)
+    previous = _read_json(path)
+    previous_age = None
+    if previous:
+        try:
+            previous_age = observed_at - float(previous.get("observed_at"))
+        except (TypeError, ValueError):
+            pass
+    changed = not (previous and previous_age is not None
+                   and -60 <= previous_age <= MAX_AGE_SECONDS
+                   and previous.get("watch_id") == watch_id
+                   and previous.get("request_token") == request_token
+                   and previous.get("identity") == identity
+                   and previous.get("producer") == value["producer"]
+                   and previous.get("generation") == generation
+                   and previous.get("lineage") == value.get("lineage")
+                   and previous.get("result") == value["result"])
+    _atomic_json(path, value)
+    return changed
+
+
+def watch_transition_result(root, watch_id, identity, request_token, *,
+                            now=None, max_age=MAX_AGE_SECONDS):
+    """Read a current per-watch refresh response; mismatches remain unknown."""
+    try:
+        value = _read_json(_watch_transition_path(root, watch_id))
+    except ValueError:
+        return None
+    if (not value or value.get("schema_version") != SCHEMA_VERSION
+            or value.get("watch_id") != watch_id
+            or value.get("request_token") != request_token
+            or value.get("identity") != identity):
+        return None
+    producer = value.get("producer")
+    if not isinstance(producer, dict) or not _runner_incarnation_current(root, producer):
+        return None
+    try:
+        from dispatch_contract import process_start_ticks
+        if str(process_start_ticks(int(producer.get("pid"))) or "") != str(producer.get("pid_start")):
+            return None
+        age = (time.time() if now is None else float(now)) - float(value.get("observed_at"))
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    if age < -60 or age > max_age or not _generation_current(value.get("generation")):
+        return None
+    result = value.get("result")
+    lineage = value.get("lineage")
+    if not isinstance(result, dict) or result.get("state") not in {"ready", "pending", "unknown"}:
+        return None
+    pid = identity.get("shell_pid")
+    start = identity.get("shell_start")
+    if pid is None:
+        if not isinstance(lineage, dict):
+            return None
+        pid, start = lineage.get("shell_pid"), lineage.get("shell_start")
+    try:
+        from dispatch_contract import process_start_ticks
+        if (int(pid) <= 0 or not start
+                or str(process_start_ticks(int(pid)) or "") != str(start)):
+            return None
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    return {**result, **({"lineage": lineage} if isinstance(lineage, dict) else {})}
+
+
+def clear_watch_transition(root, watch_id):
+    """Drop the bounded response when its exact watch has settled."""
+    try:
+        _watch_transition_path(root, watch_id).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def consumer_is_current(identity):

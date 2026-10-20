@@ -2456,6 +2456,9 @@ def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
     """Settle one exact watch after its observer has the watch lock."""
     paths = _watch_paths(watch_id)
     if paths.receipt.exists():
+        with contextlib.suppress(OSError, ValueError):
+            shared_readiness.clear_watch_transition(
+                peer_obligations.ObligationStore().root, watch_id)
         return _read_json(paths.receipt)
     agent = dict((arm or {}).get("agent") or {})
     terminal_state = {
@@ -2478,6 +2481,9 @@ def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
         "reason": reason,
     }
     _write_json_atomic(paths.receipt, receipt)
+    with contextlib.suppress(OSError, ValueError):
+        shared_readiness.clear_watch_transition(
+            peer_obligations.ObligationStore().root, watch_id)
     try:
         paths.observation.unlink()
     except FileNotFoundError:
@@ -4084,8 +4090,9 @@ def cmd_watch_run(args):
                         break
                     if result_state in {"idle", "done"}:
                         if not awaiting_readiness:
-                            readiness = _watch_shared_readiness(
-                                args.target, result_state, arm, expected, server)
+                            readiness = _watch_transition_readiness(
+                                args.target, result_state, arm, expected, server,
+                                args.watch_id, paths)
                             if readiness.state == "ready":
                                 state, agent = result_state, wait_record.get("agent") or expected_agent
                                 break
@@ -4116,8 +4123,9 @@ def cmd_watch_run(args):
                         break
                     if (wait_record or {}).get("state") == "result" and (
                             wait_record.get("agent_state") in {"idle", "done"}):
-                        readiness = _watch_shared_readiness(
-                            args.target, wait_record.get("agent_state"), arm, expected, server)
+                        readiness = _watch_transition_readiness(
+                            args.target, wait_record.get("agent_state"), arm, expected, server,
+                            args.watch_id, paths)
                         if readiness.state == "ready":
                             state, agent = (wait_record.get("agent_state"),
                                             wait_record.get("agent") or expected_agent)
@@ -4153,8 +4161,9 @@ def cmd_watch_run(args):
                     if (wait_record or {}).get("state") == "result":
                         result_state = wait_record.get("agent_state")
                         if result_state in {"idle", "done"}:
-                            readiness = _watch_shared_readiness(
-                                args.target, result_state, arm, expected, server)
+                            readiness = _watch_transition_readiness(
+                                args.target, result_state, arm, expected, server,
+                                args.watch_id, paths)
                             if readiness.state == "ready":
                                 state, agent = result_state, wait_record.get("agent") or expected_agent
                                 break
@@ -4214,6 +4223,9 @@ def cmd_watch_run(args):
         "observer_generation": getattr(args, "rearm_count", 0) + 1,
     }
     _write_json_atomic(paths.receipt, receipt)
+    with contextlib.suppress(OSError, ValueError):
+        shared_readiness.clear_watch_transition(
+            peer_obligations.ObligationStore().root, args.watch_id)
     try:
         paths.observation.unlink()
     except FileNotFoundError:
@@ -5139,7 +5151,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
 
 
 def _watch_shared_readiness(target, native_state, arm, expected, server):
-    """Consume the runner's small result and recheck only current target lineage."""
+    """Consume a cached runner result and recheck only current target lineage."""
     identity = _watch_readiness_identity(arm, native_state)
     if identity is None:
         return SimpleNamespace(state="unknown", reason="shared-readiness-identity-unavailable")
@@ -5150,6 +5162,11 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
         result = None
     if result is None:
         return SimpleNamespace(state="unknown", reason="shared-readiness-unavailable")
+    return _watch_readiness_result(target, native_state, identity, result, server)
+
+
+def _watch_readiness_result(target, native_state, identity, result, server):
+    """Bind any runner result to the exact live pane and its native result."""
     state = result.get("state", "unknown")
     reason = result.get("reason", "shared-readiness-pending")
     if state != "ready":
@@ -5185,6 +5202,61 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
     }
     return SimpleNamespace(state="ready", reason=reason,
                            identity=tuple(current_identity.items()))
+
+
+def _watch_transition_readiness(target, native_state, arm, expected, server,
+                                watch_id, paths):
+    """Require a fresh runner authority read before this watch can publish ready.
+
+    The long-lived target projection is only a trigger. The observer writes a
+    token into its existing observation, while still owning the watch lock;
+    the existing runner returns a separate small response after re-reading
+    bound work and its mutable completion evidence in the shared pass.
+    """
+    identity = _watch_readiness_identity(arm, native_state)
+    if identity is None:
+        return SimpleNamespace(state="unknown", reason="shared-readiness-identity-unavailable")
+    root = peer_obligations.ObligationStore().root
+    observation = _read_json(paths.observation) or {}
+    native = observation.get("native_wait") or {}
+    if (native.get("state") != "result"
+            or native.get("agent_state") != native_state):
+        return SimpleNamespace(state="unknown", reason="shared-readiness-native-result-changed")
+    request = observation.get("readiness_transition")
+    consumer_start = process_start_ticks(os.getpid())
+    consumer = {"pid": os.getpid(), "pid_start": str(consumer_start or "")}
+    if not consumer["pid_start"]:
+        return SimpleNamespace(state="unknown", reason="shared-readiness-consumer-unverified")
+    if (isinstance(request, dict) and request.get("identity") == identity
+            and request.get("consumer") == consumer
+            and isinstance(request.get("token"), str) and request.get("token")):
+        fresh = shared_readiness.watch_transition_result(
+            root, watch_id, identity, request["token"])
+        if fresh is None:
+            return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
+        return _watch_readiness_result(target, native_state, identity, fresh, server)
+
+    cached = _watch_shared_readiness(target, native_state, arm, expected, server)
+    if cached.state != "ready":
+        return cached
+
+    token = os.urandom(16).hex()
+    request = {"token": token, "identity": identity, "consumer": consumer,
+               "requested_at": time.time()}
+    observation = {**observation, "readiness_transition": request}
+    try:
+        shared_readiness.clear_watch_transition(root, watch_id)
+    except (OSError, ValueError):
+        return SimpleNamespace(state="unknown", reason="shared-readiness-refresh-unavailable")
+    _write_json_atomic(paths.observation, observation)
+    try:
+        shared_readiness.wake_runner(root)
+        peer_obligations.ensure_normal_runner(reconciliation_required=True)
+    except Exception:
+        # No transition response means no ready receipt; the same stored
+        # native result remains available to the existing recovery path.
+        pass
+    return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
 
 
 _FLUSH_MAX_ROWS = 4
@@ -6321,7 +6393,16 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         target_key = {key: value for key, value in identity.items()
                       if key not in {"shell_pid", "shell_start"}}
         key = json.dumps(target_key, sort_keys=True, separators=(",", ":"))
-        groups.setdefault(key, []).append((watch_id, arm, identity, native.get("agent_state")))
+        transition = observation.get("readiness_transition")
+        if (not isinstance(transition, dict)
+                or transition.get("identity") != identity
+                or not shared_readiness.consumer_is_current(
+                    {"consumer": transition.get("consumer")})
+                or not isinstance(transition.get("token"), str)
+                or not transition.get("token")):
+            transition = None
+        groups.setdefault(key, []).append((watch_id, arm, identity,
+                                            native.get("agent_state"), transition))
 
     if not groups:
         for transport in _RUNNER_READINESS_TRANSPORTS.values():
@@ -6339,7 +6420,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
     jobs = store.root.parents[1] / "jobs.log"
     views_by_server = {}
     for requests in groups.values():
-        _watch_id, arm, identity, native_state = requests[0]
+        _watch_id, arm, identity, native_state, _transition = requests[0]
         server = identity["server"]
         agent = arm.get("agent") or {}
         target = arm.get("target") or agent.get("name") or ""
@@ -6347,6 +6428,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         readiness_state = "unknown"
         generation = None
         lineage = None
+        transition_read_context = None
         try:
             if server not in views_by_server:
                 transport = _runner_readiness_transport(server)
@@ -6384,7 +6466,43 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     reason = "shared-readiness-identity-changed"
             else:
                 reason = "shared-readiness-identity-unverified"
-            view = read_context.registry_view(jobs, append_only=True)
+
+            # A cached ready projection only starts a per-watch transition.
+            # Re-read the mutable authority at that boundary in this shared
+            # runner pass. This is one extra bounded classification per exact
+            # target group, never one RegistryView or pane observation per
+            # waiting watch.
+            transition_requests = [
+                (watch_id, watch_arm, transition)
+                for watch_id, watch_arm, _watch_identity, _state, transition in requests
+                if (isinstance(transition, dict)
+                    and transition.get("identity") == _watch_identity
+                    and shared_readiness.consumer_is_current(
+                        {"consumer": transition.get("consumer")}))
+            ]
+            if transition_requests:
+                from peer_read_context import PeerReadContext
+                transition_read_context = PeerReadContext(registry_append_only=True)
+                readiness = _pane_readiness(
+                    target, native_state,
+                    expected_harness=identity["harness"],
+                    expected_sid=identity["session_id"] or "-",
+                    expected_pane=identity["pane"],
+                    target_observation=(observed_state, observed_ident),
+                    pane_info=pane_info, registry_append_only=True,
+                    read_context=transition_read_context, server=server)
+                readiness_identity = dict(readiness.identity)
+                if (readiness_identity.get("server") == identity["server"]
+                        and readiness_identity.get("pane") == identity["pane"]
+                        and readiness_identity.get("harness") == identity["harness"]
+                        and readiness_identity.get("session_id", "") == identity["session_id"]
+                        and readiness_identity.get("pid_birth") ==
+                            f"{shell_pid}:{shell_start}"):
+                    readiness_state, reason = readiness.state, readiness.reason
+                else:
+                    readiness_state, reason = "unknown", "shared-readiness-identity-changed"
+            generation_context = transition_read_context or read_context
+            view = generation_context.registry_view(jobs, append_only=True)
             if view is not None:
                 generation = {"path": str(jobs), "resolved": view.resolved_path,
                               "signature": list(view.signature)}
@@ -6394,9 +6512,10 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             readiness_state, reason = "unknown", "shared-readiness-observation-failed"
 
         by_identity = {}
-        for watch_id, watch_arm, watch_identity, _watch_state in requests:
+        for watch_id, watch_arm, watch_identity, _watch_state, transition in requests:
             key = json.dumps(watch_identity, sort_keys=True, separators=(",", ":"))
-            by_identity.setdefault(key, (watch_identity, []))[1].append((watch_id, watch_arm))
+            by_identity.setdefault(key, (watch_identity, []))[1].append(
+                (watch_id, watch_arm, transition))
         for watch_identity, consumers in by_identity.values():
             projection_state, projection_reason = readiness_state, reason
             expected_pid = watch_identity.get("shell_pid")
@@ -6404,13 +6523,72 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     and (lineage is None or int(expected_pid) != lineage["shell_pid"]
                          or str(watch_identity.get("shell_start")) != lineage["shell_start"])):
                 projection_state, projection_reason = "unknown", "shared-readiness-identity-changed"
+            transition_state, transition_reason = projection_state, projection_reason
+            transition_generation = generation
+            transition_consumers = [
+                item for item in consumers
+                if (isinstance(item[2], dict)
+                    and item[2].get("identity") == watch_identity
+                    and shared_readiness.consumer_is_current(
+                        {"consumer": item[2].get("consumer")}))
+            ]
+            if transition_consumers and transition_state == "ready":
+                # This last shared classification is immediately before the
+                # per-watch transition response. It catches authority changes
+                # that race the request-bound validation above without adding
+                # a heavy read to each watcher.
+                try:
+                    from peer_read_context import PeerReadContext
+                    boundary_context = PeerReadContext(registry_append_only=True)
+                    boundary = _pane_readiness(
+                        target, native_state,
+                        expected_harness=watch_identity["harness"],
+                        expected_sid=watch_identity["session_id"] or "-",
+                        expected_pane=watch_identity["pane"],
+                        target_observation=(observed_state, observed_ident),
+                        pane_info=pane_info, registry_append_only=True,
+                        read_context=boundary_context, server=server)
+                    boundary_identity = dict(getattr(boundary, "identity", ()) or ())
+                    if (boundary_identity.get("server") == watch_identity["server"]
+                            and boundary_identity.get("pane") == watch_identity["pane"]
+                            and boundary_identity.get("harness") == watch_identity["harness"]
+                            and boundary_identity.get("session_id", "") == watch_identity["session_id"]
+                            and boundary_identity.get("pid_birth") ==
+                                f"{lineage['shell_pid']}:{lineage['shell_start']}"):
+                        transition_state = boundary.state
+                        transition_reason = boundary.reason
+                    else:
+                        transition_state = "unknown"
+                        transition_reason = "shared-readiness-identity-changed"
+                    boundary_view = boundary_context.registry_view(jobs, append_only=True)
+                    if boundary_view is None:
+                        transition_state, transition_reason = "unknown", "registry-missing"
+                    else:
+                        transition_generation = {
+                            "path": str(jobs), "resolved": boundary_view.resolved_path,
+                            "signature": list(boundary_view.signature),
+                        }
+                except (OSError, TypeError, ValueError):
+                    transition_state = "unknown"
+                    transition_reason = "shared-readiness-transition-check-failed"
             changed = shared_readiness.publish_target_projection(
                 store.root, watch_identity,
                 {"state": projection_state, "reason": projection_reason},
                 producer_pid=os.getpid(), producer_start=producer_start,
                 incarnation=incarnation, generation=generation, lineage=lineage)
             if changed:
-                for _watch_id, watch_arm in consumers:
+                for _watch_id, watch_arm, _transition in consumers:
+                    _wake_watch_observer(watch_arm)
+            for watch_id, watch_arm, transition in transition_consumers:
+                if (not isinstance(transition, dict)
+                        or transition.get("identity") != watch_identity):
+                    continue
+                transition_changed = shared_readiness.publish_watch_transition(
+                    store.root, watch_id, watch_identity, transition.get("token"),
+                    {"state": transition_state, "reason": transition_reason},
+                    producer_pid=os.getpid(), producer_start=producer_start,
+                    incarnation=incarnation, generation=transition_generation, lineage=lineage)
+                if transition_changed:
                     _wake_watch_observer(watch_arm)
     return True
 
