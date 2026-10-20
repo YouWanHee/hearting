@@ -5,6 +5,7 @@ Exercises the real `utilities/peer-steward.py` with only `herdr` faked, so the
 hook's contract with the utility is tested rather than mocked.
 """
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -301,17 +303,25 @@ class DeliveryTest(_HookMixin, unittest.TestCase):
 
     def test_join_outlives_the_short_subprocess_cap(self):
         # B1 regression: the join must not be cut by the utility subprocess cap.
-        # Cap 1 s, release the target after 3 s, expect a real exit-2 wake.
+        # The deterministic contract test below keeps the 1 s boundary. This
+        # real utility case leaves room for cold-starting status and ACK calls.
         armed = self._arm(mode="held")
         env = self._env("held")
-        env["AGENT_PEER_STEWARD_REWAKE_SUBPROCESS_SECONDS"] = "1"
+        env["AGENT_PEER_STEWARD_REWAKE_SUBPROCESS_SECONDS"] = "3"
         import threading
-        threading.Timer(3.0, self._release).start()
+        threading.Timer(5.0, self._release).start()
+        started = time.monotonic()
         proc = self._run_hook(self._payload(armed), env=env, timeout=60)
+        elapsed = time.monotonic() - started
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("state=idle", proc.stderr)
+        self.assertGreater(elapsed, 3.0, "the real hook must outlive the ordinary utility cap")
         watch_id = self._fields(armed)["watch_id"]
-        self.assertTrue((self._watch_root() / f"{watch_id}.ack.json").exists())
+        ack_path = self._watch_root() / f"{watch_id}.ack.json"
+        self.assertTrue(ack_path.exists())
+        ack = json.loads(ack_path.read_text())
+        self.assertEqual(ack["carrier"], "claude-async-rewake")
+        self.assertEqual(ack["session_id"], self.session)
 
     def test_exhausted_budget_is_exit_two_hook_budget_expired(self):
         armed = self._arm(mode="held")
@@ -332,6 +342,83 @@ class BudgetArithmeticTest(unittest.TestCase):
         seconds = module.BUDGET_SECONDS - module.BUDGET_MARGIN_SECONDS
         self.assertEqual(module.BUDGET_SECONDS, 21_600)
         self.assertEqual(seconds * 1000, 21_540_000)
+
+
+class SubprocessTimeoutContractTest(unittest.TestCase):
+    def test_join_uses_its_budget_while_ack_keeps_the_short_cap(self):
+        spec = importlib.util.spec_from_file_location("peer_steward_rewake", str(_HOOK))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        watch_id = "0123456789abcdef"
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_root = Path(tmp)
+            receipt = watch_root / f"{watch_id}.receipt.json"
+            status = {
+                "watch_root": str(watch_root),
+                "watches": [{
+                    "recipient": {"harness": "claude", "session_id": "sid-fixture"},
+                    "receipt": str(receipt),
+                    "target": "peer-a",
+                }],
+            }
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "session_id": "sid-fixture",
+                "tool_input": {"command": "python3 peer-steward.py watch peer-a --wake hook"},
+                "tool_response": {
+                    "stdout": f"state=armed wake=hook watch_id={watch_id}"
+                },
+            }
+            calls = []
+
+            def fake_run(command, **kwargs):
+                args = command[2:]
+                calls.append((args, kwargs["timeout"]))
+                if args[0] == "status":
+                    return subprocess.CompletedProcess(command, 0, json.dumps(status), "")
+                if args[0] == "join":
+                    joined = (
+                        f"state=idle agent=claude session_id=sid-fixture name=peer-a "
+                        f"pane=w1:p9 receipt={receipt}"
+                    )
+                    return subprocess.CompletedProcess(command, 2, joined, "")
+                if args[0] == "ack":
+                    return subprocess.CompletedProcess(command, 0, "ack=created", "")
+                self.fail(f"unexpected hook utility command: {args!r}")
+
+            hook_sys = types.SimpleNamespace(
+                stdin=io.StringIO(json.dumps(payload)),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                executable=sys.executable,
+            )
+            with mock.patch.dict(os.environ, {
+                "AGENT_PEER_STEWARD_REWAKE_SUBPROCESS_SECONDS": "1",
+                "AGENT_PEER_STEWARD_REWAKE_MAX_SECONDS": str(module.BUDGET_SECONDS),
+            }), mock.patch.object(module, "sys", hook_sys), \
+                    mock.patch.object(module, "time", types.SimpleNamespace(
+                        monotonic=lambda: 100.0
+                    )), mock.patch.object(module, "subprocess", types.SimpleNamespace(
+                        run=fake_run
+                    )):
+                result = module.main()
+
+        self.assertEqual(result, 2)
+        short_cap = 1.0
+        remaining_seconds = module.BUDGET_SECONDS - module.BUDGET_MARGIN_SECONDS
+        self.assertEqual(calls[0][0][0], "status")
+        self.assertEqual(calls[0][1], short_cap)
+        self.assertEqual(calls[1][0], [
+            "join", watch_id, "--timeout", str(remaining_seconds * 1000)
+        ])
+        self.assertEqual(calls[1][1], remaining_seconds + module.BUDGET_MARGIN_SECONDS)
+        self.assertGreater(calls[1][1], short_cap)
+        self.assertEqual(calls[2][0], [
+            "ack", watch_id, "--carrier", "claude-async-rewake"
+        ])
+        self.assertEqual(calls[2][1], short_cap)
 
 
 if __name__ == "__main__":
