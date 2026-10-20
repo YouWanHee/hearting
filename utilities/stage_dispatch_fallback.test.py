@@ -3308,9 +3308,10 @@ class FallbackTest(unittest.TestCase):
   import signal
   receipt=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
            "worker_exit=-2\nworker_failure=interrupted\n")
+  incomplete_output=receipt+"INTERRUPTED_RAW_SENTINEL argv=INTERRUPTED_ARGV_SENTINEL\n"
   cases=(
    (dict(stdout=receipt,received_signal=signal.SIGINT),130,False),
-   (dict(stdout=receipt,received_signal=signal.SIGTERM,cleanup_incomplete=True,returncode=-9),143,True),
+   (dict(stdout=incomplete_output,received_signal=signal.SIGTERM,cleanup_incomplete=True,returncode=-9),143,True),
    # the wrapper alone was stopped (this call saw no signal)
    (dict(stdout=receipt),130,False),
   )
@@ -3329,12 +3330,16 @@ class FallbackTest(unittest.TestCase):
     self.assertEqual((own["check"],own["reason"],own["interrupted"]),("failed","interrupted","1"))
     self.assertEqual(own.get("cleanup"),"incomplete" if incomplete else None)
     self.assertIn("worker_failure=interrupted",out.splitlines())
+    if incomplete:
+     self.assertNotIn("INTERRUPTED_RAW_SENTINEL",out)
+     self.assertNotIn("INTERRUPTED_ARGV_SENTINEL",out)
     self.assertNotIn("selected_hop",out)
     self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
  def test_incomplete_forwarded_output_preserves_receipt_without_settling_or_retrying(self):
-  import json
   receipt=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
            "terminal_verdict=PASS\nterminal_note=completed\n")
+  raw_stdout=receipt+"PROMPT_RAW_SENTINEL argv=ARGV_RAW_SENTINEL env=ENV_RAW_SENTINEL\n"*2048
+  raw_stderr="STDERR_RAW_SENTINEL argv=STDERR_ARGV_SENTINEL env=STDERR_ENV_SENTINEL\n"*2048
   with self.dispatch_env():
    path,_route,_node=self.standard_route()
    calls=[]
@@ -3342,7 +3347,7 @@ class FallbackTest(unittest.TestCase):
    code,out,err=self.start(
     path,lifecycle=F.FOREGROUND_SCOPED,
     patches=(self.compiled_order(),self.forwarded(
-     calls,stdout=receipt,stderr="fixture-stderr\n",cleanup_incomplete=True),no_watch))
+     calls,stdout=raw_stdout,stderr=raw_stderr,cleanup_incomplete=True),no_watch))
   fields=self.cli_verdict(out)
   self.assertEqual(code,76,out+err)
   self.assertEqual(fields.get("reason"),"foreground-output-incomplete",out)
@@ -3352,14 +3357,17 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(fields.get("terminal_verdict"),"unknown",out)
   self.assertEqual(fields.get("cleanup"),"incomplete",out)
   self.assertEqual(fields.get("wrapper_returncode"),"0",out)
-  self.assertEqual(json.loads(fields["wrapper_stdout_json"]),receipt)
-  self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+  self.assertNotIn("wrapper_stdout_json",fields)
+  self.assertNotIn("wrapper_stderr_json",fields)
+  for sentinel in ("PROMPT_RAW_SENTINEL","ARGV_RAW_SENTINEL","ENV_RAW_SENTINEL",
+                   "STDERR_RAW_SENTINEL","STDERR_ARGV_SENTINEL","STDERR_ENV_SENTINEL"):
+   self.assertNotIn(sentinel,out)
+  self.assertLess(len(out),4096)
   self.assertNotIn("selected_hop=",out)
   self.assertEqual(len(calls),1)
   self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
 
  def test_incomplete_forwarded_output_retains_exact_terminal_pass_and_fail(self):
-  import json
   cases=(
    ("completed-marker","pass","PASS"),
    ("dead-worker-fail","fail","FAIL"),
@@ -3401,10 +3409,8 @@ class FallbackTest(unittest.TestCase):
     self.assertEqual(fields.get("terminal_note"),note,out)
     self.assertEqual(fields.get("attempt_id"),self.arg(calls[0][0],"--attempt-id"),out)
     self.assertEqual(fields.get("wrapper_returncode"),"0",out)
-    expected_receipt=(f"check=ok\nstatus=start\nattempt_id={fields['attempt_id']}\nregistered=1\nstarted=1\n"
-                      f"child_spawned=1\nterminal_verdict={verdict}\n")
-    self.assertEqual(json.loads(fields["wrapper_stdout_json"]),expected_receipt)
-    self.assertEqual(json.loads(fields["wrapper_stderr_json"]),"fixture-stderr\n")
+    self.assertNotIn("wrapper_stdout_json",fields)
+    self.assertNotIn("wrapper_stderr_json",fields)
     self.assertNotIn("selected_hop=",out)
     self.assertEqual(len(calls),1)
 
