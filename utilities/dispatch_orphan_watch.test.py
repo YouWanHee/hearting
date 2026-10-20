@@ -6,6 +6,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from route_identity import route_hash
 
@@ -275,6 +277,104 @@ class OrphanWatchTest(unittest.TestCase):
         self.assertIn("\tdone\t/r\t/w\towner\t", registry)
         self.assertIn("note=dead-protocol", registry)
         self.assertTrue(self.supervisor_lease.exists())
+
+
+def load_watch_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dispatch_orphan_watch_unit", WATCH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class IdleOwnerWatchTest(unittest.TestCase):
+    """A live owner is watched by PID; the registry is judged only on change."""
+
+    ROW = ("2026-07-19T00:00:00Z\topen\t/r\t/w\towner\t"
+           "attempt_schema_version=2,dispatch_depth=1,worker_type=owner,attempt_id=att-idle{extra}\n")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.jobs = Path(self.temp.name) / "jobs.log"
+        self.jobs.write_text("other\trow\n" * 50 + self.ROW.format(extra=""), encoding="utf-8")
+        self.watch = load_watch_module()
+        self.now = [100.0]
+        real_record = self.watch.attempt_record
+        self.records = mock.patch.object(self.watch, "attempt_record", side_effect=real_record)
+        self.reads = self.records.start()
+        self.addCleanup(self.records.stop)
+        self.close = mock.patch("route_parent_close.row_requested",
+                                side_effect=lambda meta, jobs: meta.get("parent_close_requested") == "1")
+        self.judged = self.close.start()
+        self.addCleanup(self.close.stop)
+        clock = mock.patch.object(self.watch.time, "monotonic", side_effect=lambda: self.now[0])
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def rewrite(self, text):
+        # A rewrite with a new inode, as the registry writer replaces it.
+        replacement = self.jobs.with_suffix(".next")
+        replacement.write_text(text, encoding="utf-8")
+        replacement.replace(self.jobs)
+
+    def test_unchanged_registry_is_not_reparsed_and_close_intent_has_a_backstop(self):
+        registry = self.watch.RegistryObservation(self.jobs, "att-idle")
+        for _ in range(10):
+            self.assertEqual(registry.refresh()[0], "open")
+            self.now[0] += 2.0
+        self.assertEqual(self.reads.call_count, 1)
+        # 20 s idle: only the first judgment.
+        self.assertEqual(self.judged.call_count, 1)
+        self.now[0] += self.watch.CLOSE_INTENT_BACKSTOP_SECONDS
+        registry.refresh()
+        self.assertEqual((self.reads.call_count, self.judged.call_count), (1, 2))
+
+        # Another row changed: the watched row is re-read, not re-judged.
+        self.rewrite("other\tchanged\n" + self.jobs.read_text(encoding="utf-8"))
+        registry.refresh()
+        self.assertEqual((self.reads.call_count, self.judged.call_count), (2, 2))
+
+        # The watched row itself carries a parent close: judged at once.
+        self.rewrite(self.ROW.format(extra=",parent_close_requested=1"))
+        status, _metadata, close_requested = registry.refresh()
+        self.assertEqual((status, close_requested), ("open", True))
+        self.assertEqual((self.reads.call_count, self.judged.call_count), (3, 3))
+
+    def test_watch_reacts_to_parent_close_and_owner_exit_without_polling_registry(self):
+        args = SimpleNamespace(jobs=self.jobs, attempt_id="att-idle", pid=4242,
+                               pid_start="1", interval=2.0)
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            self.now[0] += seconds
+            if len(sleeps) == 20:
+                self.rewrite(self.ROW.format(extra=",parent_close_requested=1"))
+
+        with mock.patch.object(self.watch, "process_start", return_value="1"), \
+             mock.patch.object(self.watch.time, "sleep", side_effect=sleep), \
+             mock.patch("route_parent_close.recover_attempt",
+                             return_value={"state": "cancelled"}) as recover, \
+             mock.patch.object(self.watch, "_remove_supervisor_state") as removed:
+            self.assertEqual(self.watch.watch(args), 0)
+        recover.assert_called_once()
+        removed.assert_called_once()
+        # 40 s with a live owner: one row read and one backstop judgment
+        # before the parent close arrived, instead of 20 of each.
+        self.assertEqual((self.reads.call_count, self.judged.call_count), (2, 3))
+
+        self.reads.reset_mock()
+        self.judged.reset_mock()
+        self.rewrite(self.ROW.format(extra=""))
+        with mock.patch.object(self.watch, "process_start", side_effect=["1"] * 5 + ["2"]), \
+             mock.patch.object(self.watch.time, "sleep", side_effect=sleep), \
+             mock.patch.object(self.watch, "observed_owner_lifecycle",
+                                    return_value=(None, "", {})), \
+             mock.patch.object(self.watch, "reconcile_exact_exit", return_value=0) as exited:
+            self.assertEqual(self.watch.watch(args), 0)
+        exited.assert_called_once_with(args)
+        self.assertEqual((self.reads.call_count, self.judged.call_count), (1, 1))
 
 
 if __name__ == "__main__":
