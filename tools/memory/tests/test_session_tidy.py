@@ -3534,6 +3534,27 @@ class SeatHandoverTest(TidyCase):
             self.assertEqual(self.handover.resolved_steward_relations(
                 "claude", "sid-B", seat_key=self.seat().key), [])
 
+    def test_role_only_handover_rejects_wrong_seat_and_harness_and_dedupes_callback(self):
+        pm = self.handover._peer_message()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target", "name": "target"},
+                "watch", "1", source="watch"))
+            self.assertEqual(self.snapshot(), 0)
+
+        _out, wrong_seat_rows = self.start("sid-wrong-seat", pane=PANE_BESIDE)
+        self.assertEqual(wrong_seat_rows, [])
+        _out, wrong_harness_rows = self.start("codex-B", harness="codex", pane=PANE)
+        self.assertEqual(wrong_harness_rows, [])
+
+        _out, rows = self.start("sid-B", pane=PANE)
+        self.assertEqual([(row["from"], row["sid"]) for row in rows], [("sid-A", "sid-B")])
+        _out, duplicate = self.start("sid-B", pane=PANE)
+        self.assertEqual([(row["from"], row["sid"]) for row in duplicate], [("sid-A", "sid-B")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertEqual(len(self.handover.resolved_steward_relations(
+                "claude", "sid-B", seat_key=self.seat().key)), 1)
+
     def test_clear_and_compact_snapshot_callers_preserve_role_only_payload(self):
         pm = self.handover._peer_message()
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
