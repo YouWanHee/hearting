@@ -610,6 +610,66 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
     return record
 
 
+def _source_generations(route: dict) -> list[dict]:
+    """Return the route and its verified continuation lineage."""
+    if route.get("continuation_contract_version") != 1:
+        return [route]
+    from route_lineage import RouteLineageError, verified_route_lineage
+    try:
+        return verified_route_lineage(route, artifact_root=route.get("artifact_root"))
+    except RouteLineageError as exc:
+        raise SourceSubjectError("review-source-lineage-unverifiable", exc.code) from exc
+
+
+def _canonical_head(generation: dict, generation_dir: Path, node_id: str, candidate: dict,
+                    *, verify_unknown: bool = True) -> dict | None:
+    """Return a canonical marker proven to equal its own numbered history.
+
+    An absent canonical marker is not an error, and a numbered history ahead of
+    the canonical head is a valid pending/crash-replay successor, so neither is
+    judged here. A present canonical must name this route/node/gate, carry a
+    sequence, and have exactly that sequence's immutable history; a missing,
+    unreadable or different history is refused rather than skipped. A legacy
+    marker without a source subject has no epoch to lose, so epoch callers may
+    leave it unverified; fresh evidence binding verifies it and keeps it unknown.
+    """
+    marker_path = generation_dir / f"{node_id}.json"
+    try:
+        info = marker_path.lstat()
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(info.st_mode):
+            raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not isinstance(marker, dict):
+            raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+        if not verify_unknown and not isinstance(marker.get("source_subject"), dict):
+            return marker
+        if (marker.get("route_id") != generation.get("route_id")
+                or marker.get("route_hash") != generation.get("route_hash")
+                or marker.get("node_id") != node_id
+                or marker.get("completion_gate") != candidate.get("completion_gate")):
+            raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+        sequence = marker.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise SourceSubjectError("review-source-marker-sequence-invalid", node_id)
+        history_path = generation_dir / f"{node_id}.{sequence}.json"
+        try:
+            history_info = history_path.lstat()
+        except FileNotFoundError as exc:
+            raise SourceSubjectError("review-source-marker-history-missing", node_id) from exc
+        if not stat.S_ISREG(history_info.st_mode):
+            raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+        if json.loads(history_path.read_text(encoding="utf-8")) != marker:
+            raise SourceSubjectError("review-source-marker-history-conflict", node_id)
+    except (OSError, ValueError, TypeError) as exc:
+        if isinstance(exc, SourceSubjectError):
+            raise
+        raise SourceSubjectError("review-source-marker-unreadable", node_id) from exc
+    return marker
+
+
 def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path) -> int:
     """Predict the route-wide source epoch from append-only marker history.
 
@@ -620,13 +680,7 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
     epoch across source-consuming markers carries across sibling branches too.
     """
     directory = Path(completion_dir)
-    generations = [route]
-    if route.get("continuation_contract_version") == 1:
-        from route_lineage import RouteLineageError, verified_route_lineage
-        try:
-            generations = verified_route_lineage(route, artifact_root=route.get("artifact_root"))
-        except RouteLineageError as exc:
-            raise SourceSubjectError("review-source-lineage-unverifiable", exc.code) from exc
+    generations = _source_generations(route)
     completion_root = directory.parent
     observations = []
     for generation in generations:
@@ -635,35 +689,20 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
             node_id = str(candidate.get("id", ""))
             if not node_id:
                 continue
-            marker_path = generation_dir / f"{node_id}.json"
             try:
-                info = marker_path.lstat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
-                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                marker = _canonical_head(generation, generation_dir, node_id, candidate,
+                                         verify_unknown=False)
+                if marker is None:
+                    continue
                 subject = marker.get("source_subject")
                 if not isinstance(subject, dict):
                     continue  # Legacy marker: preserve it as unknown history.
-                if (marker.get("route_id") != generation.get("route_id")
-                        or marker.get("route_hash") != generation.get("route_hash")
-                        or marker.get("node_id") != node_id
-                        or marker.get("completion_gate") != candidate.get("completion_gate")):
-                    raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
-                sequence = marker.get("sequence")
-                if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-                    raise SourceSubjectError("review-source-marker-sequence-invalid", node_id)
-                history_path = generation_dir / f"{node_id}.{sequence}.json"
-                history = json.loads(history_path.read_text(encoding="utf-8"))
-                if history != marker:
-                    raise SourceSubjectError("review-source-marker-history-conflict", node_id)
                 if (isinstance(subject.get("epoch"), int)
                         and not isinstance(subject.get("epoch"), bool)
                         and isinstance(subject.get("digest"), str)):
                     observations.append((int(subject["epoch"]), subject["digest"]))
                 else:
                     raise SourceSubjectError("review-source-marker-subject-invalid", node_id)
-            except FileNotFoundError:
-                continue
             except (OSError, ValueError, TypeError) as exc:
                 if isinstance(exc, SourceSubjectError):
                     raise
@@ -678,13 +717,113 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
     return maximum + (digest != latest)
 
 
+def _inline_evidence_subject_unchanged(route: dict, node: dict, evidence_sha256: str,
+                                       digest: str, epoch: int,
+                                       completion_dir: str | Path,
+                                       attempt_id: str) -> None:
+    """Refuse to give previously recorded review bytes a different source subject."""
+    completion_root = Path(completion_dir).parent
+    unknown = False
+    changed = False
+    for generation in _source_generations(route):
+        candidate = next((item for item in generation.get("nodes", [])
+                          if item.get("id") == node.get("id")
+                          and is_implementation_review(generation, item)), None)
+        if candidate is None:
+            continue
+        node_id = str(candidate["id"])
+        generation_dir = completion_root / str(generation.get("route_id", ""))
+        # Fresh evidence binding consumes the existing canonical head and its
+        # exact history together, so a missing history cannot hide old evidence.
+        _canonical_head(generation, generation_dir, node_id, candidate)
+        for history_path in sorted(generation_dir.glob(f"{node_id}.*.json")):
+            suffix = history_path.name[len(node_id) + 1:-5]
+            if not suffix.isdigit():
+                continue
+            sequence = int(suffix)
+            try:
+                info = history_path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+                marker = json.loads(history_path.read_text(encoding="utf-8"))
+                if (not isinstance(marker, dict)
+                        or marker.get("route_id") != generation.get("route_id")
+                        or marker.get("route_hash") != generation.get("route_hash")
+                        or marker.get("node_id") != node_id
+                        or marker.get("completion_gate") != candidate.get("completion_gate")
+                        or marker.get("sequence") != sequence):
+                    raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+                evidence = marker.get("evidence")
+                if not isinstance(evidence, dict) or not re.fullmatch(
+                        r"[0-9a-f]{64}", str(evidence.get("sha256", ""))):
+                    raise SourceSubjectError("review-source-marker-evidence-invalid", node_id)
+                if evidence["sha256"] != evidence_sha256:
+                    continue
+                subject = marker.get("source_subject")
+                if (not isinstance(subject, dict)
+                        or subject.get("schema_version") != SCHEMA_VERSION
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(subject.get("digest", "")))
+                        or not isinstance(subject.get("epoch"), int)
+                        or isinstance(subject.get("epoch"), bool)
+                        or subject["epoch"] < 0):
+                    unknown = True
+                elif (not isinstance(marker.get("attempt_id"), str)
+                      or not _SAFE_ID.fullmatch(marker["attempt_id"])):
+                    unknown = True
+                else:
+                    provenance_valid = True
+                    if "inline_provenance" in subject:
+                        provenance = subject["inline_provenance"]
+                        provenance_valid = not (
+                            not isinstance(provenance, dict)
+                            or set(provenance) != {"kind", "attempt_id", "manifest_sha256"}
+                            or provenance.get("kind") != "owner-inline"
+                            or provenance.get("attempt_id") != marker["attempt_id"]
+                            or not re.fullmatch(r"[0-9a-f]{64}", str(
+                                provenance.get("manifest_sha256", "")))
+                            or marker.get("reviewer_kind") != "owner-inline"
+                            or marker.get("review_independence") != "degraded"
+                            or marker.get("reviewer_identity") != marker["attempt_id"]
+                            or marker.get("registered_worker") is not False
+                            or marker.get("execution_surface") != "inline"
+                        )
+                    if not provenance_valid:
+                        unknown = True
+                    elif subject["digest"] != digest or subject["epoch"] != epoch:
+                        changed = True
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, TypeError) as exc:
+                if isinstance(exc, SourceSubjectError):
+                    raise
+                raise SourceSubjectError("review-source-marker-unreadable", node_id) from exc
+    if unknown:
+        raise SourceSubjectError("review-source-binding-missing", attempt_id)
+    if changed:
+        raise SourceSubjectError("review-source-subject-changed-before-completion", attempt_id)
+
+
 def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
                    attempt_metadata: dict | None = None, jobs: str | Path | None = None,
-                   worktree: str | Path | None = None, completion_dir: str | Path) -> dict | None:
+                   worktree: str | Path | None = None, completion_dir: str | Path,
+                   owner_inline: bool = False,
+                   evidence_sha256: str | None = None) -> dict | None:
     """Subject fields to put on a newly published completion marker."""
     if not has_source_subject(route, node):
         return None
     if is_implementation_review(route, node) or is_source_test(node):
+        if is_implementation_review(route, node) and owner_inline and attempt_id:
+            current = observe(route, node, worktree=worktree)
+            epoch = source_epoch(route, node, current["digest"], completion_dir)
+            if evidence_sha256 is not None:
+                _inline_evidence_subject_unchanged(
+                    route, node, evidence_sha256, current["digest"], epoch,
+                    completion_dir, attempt_id,
+                )
+            return {"schema_version": SCHEMA_VERSION, "digest": current["digest"],
+                    "epoch": epoch, "inline_provenance": {
+                        "kind": "owner-inline", "attempt_id": attempt_id,
+                        "manifest_sha256": _sha(_canonical(current["manifest"]))}}
         if not attempt_metadata:
             if is_source_test(node):
                 raise SourceSubjectError("review-source-binding-missing", str(attempt_id or ""))
@@ -770,6 +909,21 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
     if implementation_review or source_test:
         attempt_id = marker.get("attempt_id")
         binding_digest = subject.get("binding_digest")
+        if implementation_review and "inline_provenance" in subject:
+            inline = subject["inline_provenance"]
+            if (not isinstance(inline, dict)
+                    or set(inline) != {"kind", "attempt_id", "manifest_sha256"}
+                    or inline.get("kind") != "owner-inline"
+                    or not attempt_id or inline.get("attempt_id") != attempt_id
+                    or inline.get("manifest_sha256") != _sha(_canonical(current["manifest"]))
+                    or marker.get("reviewer_kind") != "owner-inline"
+                    or marker.get("review_independence") != "degraded"
+                    or marker.get("reviewer_identity") != attempt_id
+                    or marker.get("registered_worker") is not False
+                    or marker.get("execution_surface") != "inline"
+                    or binding_digest is not None):
+                return "integrity-broken:identity-mismatch", "completion-review-inline-provenance-invalid"
+            return None
         if source_test and not binding_digest:
             inline = (marker.get("registered_worker") is False
                       and marker.get("execution_surface") == "inline")
