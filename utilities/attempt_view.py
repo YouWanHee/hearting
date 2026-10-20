@@ -39,17 +39,27 @@ class Cursor:
         self.offset = 0
         self.pending = b""
         self.identity = None
+        self.head = b""
+        self.notices: list[str] = []
 
     def read_new(self, *, final: bool = False) -> list[str]:
         try:
             info = self.path.stat()
             identity = (info.st_dev, info.st_ino)
-            if identity != self.identity or info.st_size < self.offset:
+            rewrite = False
+            if self.identity == identity and self.head:
+                with self.path.open("rb") as probe:
+                    rewrite = probe.read(len(self.head)) != self.head
+            if identity != self.identity or info.st_size < self.offset or rewrite:
+                if self.identity is not None:
+                    self.notices.append("source truncated or replaced; reopened")
                 self.offset, self.pending, self.identity = 0, b"", identity
             with self.path.open("rb") as stream:
                 stream.seek(self.offset)
                 chunk = stream.read()
                 self.offset = stream.tell()
+            with self.path.open("rb") as probe:
+                self.head = probe.read(min(self.offset, 4096))
         except OSError:
             return []
         pieces = (self.pending + chunk).split(b"\n")
@@ -138,7 +148,9 @@ def format_record(harness: str, record: object) -> list[Line]:
             if isinstance(value, (dict, list)):
                 value = _compact(value)
             result.append(Line(category, sanitize(f"{label}: {value}")))
-    if harness == "claude":
+    if kind == "notice":
+        add("notice", record.get("text") or record.get("reason"), "notice")
+    elif harness == "claude":
         message = record.get("message") if isinstance(record.get("message"), dict) else record
         if kind in ("assistant", "user") or record.get("message"):
             content = message.get("content")
@@ -257,6 +269,19 @@ def _find_attempt(attempt):
     return None
 
 
+def _attempt_prefix_matches(attempt):
+    found = {}
+    for root in _dispatch_roots():
+        try: rows = (root / "jobs.log").read_text(errors="replace").splitlines()
+        except OSError: continue
+        for raw in rows:
+            parsed = _metadata(raw)
+            if parsed and parsed[1].get("attempt_id", "").startswith(attempt):
+                fields, meta = parsed
+                found[meta.get("attempt_id")] = (root, fields, meta)
+    return [found[key] for key in sorted(found) if key]
+
+
 def _owner_candidates(parent_sid=None):
     latest={}
     for root in _dispatch_roots():
@@ -330,6 +355,22 @@ def resolve_sources(attempt: str) -> tuple[list[Source], str | None]:
     return sources, None
 
 
+def _registry_sources_for_path(path: Path):
+    target = path.resolve()
+    matches = []
+    for root in _dispatch_roots():
+        try: rows = (root / "jobs.log").read_text(errors="replace").splitlines()
+        except OSError: continue
+        for raw in rows:
+            parsed = _metadata(raw)
+            if not parsed: continue
+            fields, meta = parsed
+            admitted = _log_path(root, fields, meta)
+            if admitted and Path(admitted).resolve() == target:
+                matches.append((root, fields, meta))
+    return matches
+
+
 def _find_children(parent_attempt):
     children=[]
     for root in _dispatch_roots():
@@ -350,47 +391,51 @@ def _find_children(parent_attempt):
 
 
 def _sqlite_records(path: Path, sid: str):
-    uri = "file:" + str(path.resolve()) + "?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=.5)
-    try:
-        connection.execute("PRAGMA query_only=ON")
-        tables = {r[0] for r in connection.execute("select name from sqlite_master where type='table'")}
-        has_v2 = ("session_message" in tables and connection.execute(
-            "select 1 from session_message where session_id=? limit 1", (sid,)).fetchone())
-        has_v1 = ("part" in tables and connection.execute(
-            "select 1 from part where session_id=? limit 1", (sid,)).fetchone())
-        if has_v1 and has_v2:
-            yield {"type":"unknown", "generation":"ambiguous", "session_id":sid}
-        elif has_v2:
-            for typ, raw in connection.execute("select type,data from session_message where session_id=? order by seq", (sid,)):
-                try: data = json.loads(raw)
-                except (ValueError, TypeError): yield {"type":"unknown", "raw":raw}; continue
-                if typ == "assistant" and isinstance(data, dict):
-                    for part in data.get("content", []):
-                        if not isinstance(part, dict): continue
-                        if part.get("type") == "text": yield {"type":"text", "text":part.get("text")}
-                        elif part.get("type") == "reasoning": yield {"type":"reasoning", "text":part.get("text")}
-                        elif part.get("type") == "tool":
-                            state = part.get("state") or {}
-                            output = state.get("content") or state.get("output") or state.get("error")
-                            yield {"type":"tool", "name":part.get("name"), "input":state.get("input"), "output":output}
-                elif typ == "user": yield {"type":"user", "text":data.get("text", "") if isinstance(data, dict) else data}
-        elif {"part", "message"}.issubset(tables):
-            query = "select m.data,p.data from part p left join message m on m.id=p.message_id where p.session_id=? order by p.rowid"
-            for message_raw, raw in connection.execute(query, (sid,)):
-                try: data = json.loads(raw)
-                except (ValueError, TypeError): yield {"type":"unknown", "raw":raw}; continue
-                try: role = json.loads(message_raw).get("role")
-                except (ValueError, TypeError, AttributeError): role = None
-                if isinstance(data, dict):
-                    if data.get("type") == "text": yield {"type":role or "text", "text":data.get("text")}
-                    elif data.get("type") == "tool":
-                        state=data.get("state") or {}; yield {"type":"tool", "name":data.get("tool") or data.get("name"), "input":state.get("input"), "output":state.get("output") or state.get("content")}
-                    elif data.get("type") == "reasoning": yield {"type":"reasoning", "text":data.get("text") or data.get("reason")}
-                    elif data.get("type") in ("step-start", "step-finish"): yield data
-                    else: yield {"type":"unknown", "part":data}
-    finally:
-        connection.close()
+    from opencode_runtime import read_session_parts
+    snapshot = read_session_parts(sid, db_path=path)
+    if snapshot.get("state") != "observed":
+        yield {"type": "notice", "text": snapshot.get("reason", "database unavailable")}
+        return
+    generation = snapshot["generation"]
+    for row in snapshot["parts"]:
+        data, role = row.get("data"), row.get("role")
+        if data is None:
+            yield {"type": "unknown", "raw": row.get("raw")}
+            continue
+        if generation == "v2":
+            if role == "user":
+                yield {"type": "user", "text": data.get("text", "") if isinstance(data, dict) else data}
+            elif role == "assistant" and isinstance(data, dict):
+                for part in data.get("content", []):
+                    if not isinstance(part, dict):
+                        yield {"type": "unknown", "part": part}; continue
+                    kind = part.get("type")
+                    if kind in ("text", "reasoning"):
+                        yield {"type": kind, "text": part.get("text")}
+                    elif kind == "tool":
+                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                        blocks = state.get("content")
+                        output = "\n".join(str(block.get("text", "")) for block in blocks
+                                            if isinstance(block, dict) and block.get("type") == "text") \
+                            if isinstance(blocks, list) else state.get("output") or state.get("error")
+                        yield {"type": "tool", "name": part.get("name"),
+                               "input": state.get("input"), "output": output,
+                               "status": state.get("status")}
+                    else:
+                        yield {"type": "unknown", "part": part}
+        elif isinstance(data, dict):
+            kind = data.get("type")
+            if kind == "text": yield {"type": role or "text", "text": data.get("text")}
+            elif kind == "tool":
+                state = data.get("state") if isinstance(data.get("state"), dict) else {}
+                yield {"type": "tool", "name": data.get("tool") or data.get("name"),
+                       "input": state.get("input"), "output": state.get("output") or state.get("content"),
+                       "status": state.get("status")}
+            elif kind == "reasoning": yield {"type": "reasoning", "text": data.get("text") or data.get("reason")}
+            elif kind in ("step-start", "step-finish"): yield data
+            else: yield {"type": "unknown", "part": data}
+        else:
+            yield {"type": "unknown", "part": data}
 
 
 def read_new(source: Source, *, final=True) -> list[Line]:
@@ -408,6 +453,75 @@ def read_new(source: Source, *, final=True) -> list[Line]:
     return output
 
 
+def _follow_db(source, state):
+    from opencode_runtime import read_session_parts
+    snapshot = read_session_parts(source.session_id or "", db_path=source.path,
+                                  after_cursor=state["cursor"], refresh_cursors=state["refresh"])
+    if snapshot.get("state") != "observed":
+        return [Line("notice", "OpenCode DB: " + str(snapshot.get("reason", "unavailable")))]
+    changed = []
+    entities = state.setdefault("entities", {})
+    pending = set()
+    for row in snapshot["parts"]:
+        key = row["cursor"]
+        if snapshot["generation"] == "v2" and row.get("role") == "assistant":
+            data = row.get("data") if isinstance(row.get("data"), dict) else {}
+            time_data = data.get("time") if isinstance(data.get("time"), dict) else {}
+            parts = data.get("content", []) if isinstance(data.get("content"), list) else []
+            if not time_data.get("completed") or any(
+                    isinstance(part, dict) and part.get("type") == "tool"
+                    and isinstance(part.get("state"), dict)
+                    and part["state"].get("status") in ("running", "streaming") for part in parts):
+                pending.add(key)
+        signature = _compact(row)
+        if state["rows"].get(key) == signature: continue
+        state["rows"][key] = signature
+        if snapshot["generation"] == "v2" and row.get("role") == "assistant":
+            data = row.get("data")
+            parts = data.get("content", []) if isinstance(data, dict) else []
+            for index, part in enumerate(parts):
+                if not isinstance(part, dict): continue
+                entity_key = (key, index)
+                typ = part.get("type")
+                if typ == "tool":
+                    toolstate = part.get("state") if isinstance(part.get("state"), dict) else {}
+                    blocks = toolstate.get("content")
+                    output = "\n".join(str(block.get("text", "")) for block in blocks
+                                        if isinstance(block, dict) and block.get("type") == "text") \
+                        if isinstance(blocks, list) else toolstate.get("output") or toolstate.get("error")
+                    previous = entities.get(entity_key)
+                    current = {"type": "tool", "name": part.get("name"),
+                               "input": toolstate.get("input"), "output": output,
+                               "status": toolstate.get("status")}
+                    entities[entity_key] = current
+                    record = current
+                    if previous:
+                        if previous.get("status") != current.get("status"):
+                            changed.append(Line("result", sanitize(f"tool {current['name']} status: {current['status']}")))
+                        old_output = previous.get("output") or ""
+                        new_output = current.get("output") or ""
+                        delta = new_output[len(old_output):] if isinstance(new_output, str) and new_output.startswith(old_output) else new_output
+                        if delta:
+                            changed.extend(format_record("opencode", {"type":"tool", "name":current["name"], "output":delta}))
+                        continue
+                elif typ in ("text", "reasoning"):
+                    value = part.get("text") or ""
+                    previous = entities.get(entity_key, "")
+                    entities[entity_key] = value
+                    delta = value[len(previous):] if isinstance(value, str) and value.startswith(previous) else value
+                    if not delta: continue
+                    record = {"type": typ, "text": delta}
+                else: continue
+                changed.extend(format_record("opencode", record))
+        else:
+            changed.extend(format_record("opencode", row.get("data") or {"type":"unknown", "raw":row.get("raw")}))
+    state["cursor"] = max(state["cursor"], snapshot.get("cursor", state["cursor"]))
+    if snapshot["generation"] == "v1" and state["cursor"]:
+        pending.add(state["cursor"])
+    state["refresh"] = sorted(pending)
+    return changed
+
+
 def _present(lines, full=False):
     for line in lines:
         text=line.text
@@ -421,27 +535,75 @@ def _present(lines, full=False):
         for chunk in chunks: print(sanitize(chunk))
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, clock=None, sleep=None) -> int:
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
     parser=argparse.ArgumentParser(prog="attempt-view", description="Show an attempt's recorded output.")
     parser.add_argument("attempt", nargs="?")
     parser.add_argument("--full", action="store_true", help="show the full initial prompt and tool output")
     parser.add_argument("--follow", action="store_true", help="follow new output until the owner finishes")
     parser.add_argument("--session", help="select an owner by its exact parent session")
+    parser.add_argument("--poll-interval", type=float, default=.5, help=argparse.SUPPRESS)
+    parser.add_argument("--grace", type=float, default=2.0, help=argparse.SUPPRESS)
     args=parser.parse_args(argv)
-    if args.session and not args.attempt or not args.attempt:
+    log_only = False
+    if args.attempt and os.path.isfile(args.attempt):
+        path = Path(args.attempt).resolve()
+        matches = _registry_sources_for_path(path)
+        if len(matches) == 1:
+            root, fields, meta = matches[0]
+            args.attempt = meta.get("attempt_id")
+            selected_path = path
+        else:
+            bind = re.search(r"\.att-([A-Za-z0-9_-]+)(?:\.|$)", path.name)
+            if not bind:
+                print("Log path must contain a registry-bound .att-<attempt> filename.", file=sys.stderr); return 2
+            attempts = _attempt_prefix_matches(bind.group(1))
+            exact = [item for item in attempts if item[2].get("attempt_id") == bind.group(1)]
+            if len(exact) == 1:
+                expected = _log_path(*exact[0])
+                if not expected or Path(expected).resolve() != path:
+                    print("Log path does not match its registered attempt row.", file=sys.stderr); return 2
+                args.attempt = bind.group(1); selected_path = path
+            elif len(attempts) > 1:
+                print("Ambiguous attempt prefix; candidates:", file=sys.stderr)
+                for _root, _fields, meta in attempts:
+                    print("  " + sanitize(meta.get("attempt_id", "")), file=sys.stderr)
+                return 2
+            else:
+                print("No registry row for log path; showing log only.")
+                harness = next((h for h in ("claude", "codex", "opencode") if path.name.endswith("."+h+".jsonl")), "unknown")
+                log_source = Source(path, harness)
+                log_only = True
+    if not args.attempt:
         candidates=_owner_candidates(args.session)
-        if len(candidates)==1:
-            args.attempt=candidates[0][2].get("attempt_id")
+        if args.session and len(candidates) == 1:
+            args.attempt = candidates[0][2].get("attempt_id")
         else:
             if not candidates: print("No owner attempts found.")
             for _root,fields,meta in candidates:
                 print(sanitize(f"{meta.get('attempt_id','')}  {meta.get('harness',fields[2])}  {fields[1]}  {fields[4]}"))
             return 0
-    sources, error=resolve_sources(args.attempt)
+    if not log_only and not os.path.isfile(args.attempt):
+        matches = _attempt_prefix_matches(args.attempt)
+        exact = [item for item in matches if item[2].get("attempt_id") == args.attempt]
+        if len(exact) > 1:
+            matches = exact
+        elif len(matches) > 1:
+            print("Ambiguous attempt prefix; candidates:", file=sys.stderr)
+            for _root, _fields, meta in matches: print("  " + sanitize(meta.get("attempt_id", "")), file=sys.stderr)
+            return 2
+        elif not matches:
+            print(f"Unknown attempt: {sanitize(args.attempt)}", file=sys.stderr); return 2
+        elif len(matches) == 1:
+            args.attempt = matches[0][2].get("attempt_id")
+    sources, error = ([log_source], None) if log_only else resolve_sources(args.attempt)
     if error:
         print(sanitize(error), file=sys.stderr); return 2
     cursors = {}
     owner_log_rows = []
+    db_states = {source: {"cursor": 0, "refresh": [], "rows": {}}
+                 for source in sources if source.kind == "opencode-db"}
     with ExitStack() as stack:
         for source in sources:
             if source.kind != "log":
@@ -463,7 +625,7 @@ def main(argv=None) -> int:
                     continue
             cursors[source] = Cursor(source.path)
             if source.kind == "opencode-db":
-                _present(read_new(source), args.full)
+                _present(_follow_db(source, db_states[source]), args.full)
             else:
                 initial_rows = cursors[source].read_new(final=True)
                 if source == sources[0]: owner_log_rows = initial_rows
@@ -471,35 +633,43 @@ def main(argv=None) -> int:
                           for line in format_record(source.harness, raw)], args.full)
         if len(sources) == 1 and any("supervisor.session" in raw for raw in owner_log_rows):
             print("감독 기록만 남음")
-        if args.follow:
+        if args.follow and not log_only:
             seen_children=set()
             terminal_seen=False
             closed_since=None
             while True:
-                for raw in Cursor(sources[0].path).read_new():
+                owner_cursor = cursors.get(sources[0])
+                for raw in owner_cursor.read_new() if owner_cursor else []:
                     try: kind=json.loads(raw).get("type")
                     except Exception: kind=None
                     terminal_seen = terminal_seen or kind in ("result", "dispatch.supervisor.terminal", "turn.completed")
                 for child_id, child in _find_children(args.attempt):
                     if child_id in seen_children: continue
                     seen_children.add(child_id); cursors[child]=Cursor(child.path)
-                    print(f"── {sanitize(child.label)} ({sanitize(child.harness)}) 시작 ──")
+                    print(f"[{sanitize(child.label)}] ── 시작 ({sanitize(child.harness)}) ──")
                 for source, cursor in cursors.items():
                     prefix = f"[{source.label}] " if source.label else ""
-                    _present([Line(line.kind, prefix + line.text) for raw in cursor.read_new()
-                              for line in format_record(source.harness, raw)], args.full)
+                    fresh = _follow_db(source, db_states[source]) if source.kind == "opencode-db" else [
+                        line for raw in cursor.read_new() for line in format_record(source.harness, raw)]
+                    for notice in cursor.notices:
+                        fresh.insert(0, Line("notice", notice))
+                    cursor.notices.clear()
+                    _present([Line(line.kind, prefix + line.text) for line in fresh], args.full)
                 current=_find_attempt(args.attempt)
                 status=current[1][1] if current else "unknown"
                 if status not in ("open", "running"):
-                    if closed_since is None: closed_since=time.monotonic()
-                    if terminal_seen or time.monotonic()-closed_since >= 2:
+                    if closed_since is None: closed_since=clock()
+                    if terminal_seen or clock()-closed_since >= args.grace:
                         failure=current[2].get("failure_class", "없음") if current else "없음"
                         ending=f"[끝] {status} failure_class={failure}"
                         if not terminal_seen: ending += " 종료 기록 없음"
                         print(sanitize(ending)); break
-                time.sleep(.5)
+                sleep(args.poll_interval)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, BrokenPipeError):
+        raise SystemExit(0)

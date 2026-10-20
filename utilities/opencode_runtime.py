@@ -1779,6 +1779,84 @@ def read_session_observation(session_id: str, *, db_path: str | Path | None = No
             connection.close()
 
 
+def read_session_parts(session_id: str, *, db_path: str | Path | None = None,
+                       after_cursor: int = 0, refresh_cursors=()) -> dict:
+    """Read complete native session parts after a generation-specific cursor.
+
+    This additive viewer API intentionally has no message-count or text-size
+    cap. ``refresh_cursors`` re-reads mutable rows which were previously
+    observed while streaming. V1 cursors are part rowids; V2 cursors are
+    session_message sequence numbers. The existing bounded observation API is
+    unchanged.
+    """
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return {"state": "unknown", "reason": "session-id-invalid", "parts": []}
+    path = Path(db_path) if db_path is not None else opencode_db_path()
+    if not path.is_file():
+        return {"state": "missing", "reason": "database-unavailable", "parts": []}
+    uri = "file:" + quote(str(path.resolve()), safe="/:\\") + "?mode=ro"
+    con = None
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=.5)
+        con.execute("PRAGMA query_only=ON")
+        con.execute("PRAGMA busy_timeout=500")
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        v2 = "session_message" in tables and con.execute(
+            "SELECT 1 FROM session_message WHERE session_id=? LIMIT 1", (session_id,)).fetchone()
+        v1 = "part" in tables and con.execute(
+            "SELECT 1 FROM part WHERE session_id=? LIMIT 1", (session_id,)).fetchone()
+        if v1 and v2:
+            return {"state": "unknown", "reason": "session-generation-ambiguous", "parts": []}
+        result = []
+        if v2:
+            columns = _table_columns(con, "session_message")
+            if not {"session_id", "type", "seq", "data"}.issubset(columns):
+                return {"state": "unknown", "reason": "session-message-schema-invalid", "parts": []}
+            refresh = sorted({int(v) for v in refresh_cursors if isinstance(v, int) and v >= 0})
+            where = "session_id=? AND (seq>?"
+            params = [session_id, max(0, int(after_cursor))]
+            if refresh:
+                where += " OR seq IN (" + ",".join("?" for _ in refresh) + ")"
+                params.extend(refresh)
+            where += ")"
+            rows = con.execute("SELECT type,seq,data FROM session_message WHERE " + where +
+                               " ORDER BY seq", params).fetchall()
+            for typ, cursor, raw in rows:
+                data = _decode_json(raw)
+                result.append({"cursor": cursor, "role": typ, "data": data,
+                               "raw": raw if data is None else None})
+            return {"state": "observed", "generation": "v2", "parts": result,
+                    "cursor": max((row[1] for row in rows), default=max(0, int(after_cursor)))}
+        if v1:
+            if not {"session_id", "message_id", "data"}.issubset(_table_columns(con, "part")):
+                return {"state": "unknown", "reason": "part-schema-invalid", "parts": []}
+            message_cols = _table_columns(con, "message") if "message" in tables else set()
+            role_expr = "m.role" if "role" in message_cols else "NULL"
+            join = " LEFT JOIN message m ON m.id=p.message_id" if "id" in message_cols else ""
+            refresh = sorted({int(v) for v in refresh_cursors if isinstance(v, int) and v >= 0})
+            where = "p.session_id=? AND (p.rowid>?"
+            params = [session_id, max(0, int(after_cursor))]
+            if refresh:
+                where += " OR p.rowid IN (" + ",".join("?" for _ in refresh) + ")"
+                params.extend(refresh)
+            where += ")"
+            rows = con.execute("SELECT p.rowid," + role_expr + ",p.data FROM part p" + join +
+                               " WHERE " + where + " ORDER BY p.rowid", params).fetchall()
+            for cursor, role, raw in rows:
+                data = _decode_json(raw)
+                result.append({"cursor": cursor, "role": role, "data": data,
+                               "raw": raw if data is None else None})
+            return {"state": "observed", "generation": "v1", "parts": result,
+                    "cursor": max((row[0] for row in rows), default=max(0, int(after_cursor)))}
+        return {"state": "missing", "reason": "exact-session-not-found", "parts": []}
+    except (OSError, sqlite3.Error) as exc:
+        return {"state": "unknown", "reason": "database-read-failed", "detail": str(exc), "parts": []}
+    finally:
+        if con is not None:
+            con.close()
+
+
 def list_session_candidates(directory: str, *, db_path: str | Path | None = None,
                             after_created: int | None = None,
                             before_created: int | None = None, limit=8) -> list[dict]:
