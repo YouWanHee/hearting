@@ -34,7 +34,8 @@ _RUNNER_CONTROL_SCHEMA = 1
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
-_DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
+_DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch",
+                         "readiness-observation"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
 _MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
@@ -1911,7 +1912,10 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         jobs_path = Path(jobs).expanduser().resolve()
         state_root = jobs_path.parent
     try:
-        view = registry_view(jobs_path, append_only=registry_append_only)
+        context_view = getattr(read_context, "registry_view", None)
+        view = (context_view(jobs_path, append_only=registry_append_only)
+                if callable(context_view)
+                else registry_view(jobs_path, append_only=registry_append_only))
         view.require_complete_text()
     except FileNotFoundError:
         view = None

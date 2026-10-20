@@ -185,6 +185,40 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(row.completion_metadata()["parent_sid"], "exact")
         self.assertEqual(row.handover_metadata()["parent_sid"], "trimmed")
 
+    def test_records_keep_one_row_backing_and_materialize_metadata_on_demand(self):
+        line = "job\topen\t/repo\ttime\towner\tattempt_id=one,attempt_schema_version=2,parent_sid=owner"
+        self.jobs.write_text(line + "\n", encoding="utf-8")
+        row = CACHE.registry_view(self.jobs).records[0]
+        self.assertFalse(hasattr(row, "__dict__"))
+        self.assertEqual(row.raw, line)
+        self.assertFalse(hasattr(row, "completion_items"))
+        self.assertFalse(hasattr(row, "handover_items"))
+        self.assertEqual(row.completion_metadata()["parent_sid"], "owner")
+        self.assertEqual(row.handover_metadata()["parent_sid"], "owner")
+
+    def test_selected_rows_use_generation_indexes_and_include_partial_tail(self):
+        self.jobs.write_text(
+            "job\topen\t/repo\ttime\towner\tparent=parent,attempt_id=one\n"
+            "job\tdone\t/repo\ttime\towner\tparent=parent,attempt_id=one\n"
+            "job\topen\t/repo\ttime\tother\tparent=other,attempt_id=two",
+            encoding="utf-8")
+        view = CACHE.registry_view(self.jobs)
+        selected = view.select_rows(parent="parent", slug="owner", attempt_id="one")
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][0][1], "done")
+        tail = view.select_rows(attempt_id="two")
+        self.assertEqual([(fields[4], meta["attempt_id"]) for fields, meta in tail],
+                         [("other", "two")])
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 1)
+
+        self.jobs.write_bytes(
+            b"job\trunning\t/repo\ttime\tworker\tattempt_id=three\n"
+            b"job\topen\t/repo\ttime\tworker\tattempt_id=three\v"
+            b"job\tdone\t/repo\ttime\tworker\tattempt_id=three")
+        split_tail = CACHE.registry_view(self.jobs).select_rows(attempt_id="three")
+        self.assertEqual([(fields[1], metadata["attempt_id"])
+                          for fields, metadata in split_tail], [("done", "three")])
+
     def test_duplicate_attempt_projection_is_generation_cached_across_segments(self):
         self.jobs.write_text(
             "a\topen\t/repo\t/wt\ta\tattempt_id=att-a,parent_attempt_id=\n",

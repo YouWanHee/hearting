@@ -10,11 +10,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import (  # noqa: E402
-    DispatchContractError,
-    parse_registry_metadata,
-)
+from dispatch_contract import DispatchContractError  # noqa: E402
 import dispatch_completion_join as JOIN  # noqa: E402
+import dispatch_registry_cache as REGISTRY  # noqa: E402
 
 
 def selected_rows(
@@ -23,30 +21,16 @@ def selected_rows(
     parent: str = "",
     slug: str = "",
     attempt_id: str = "",
+    read_context=None,
+    append_only: bool = False,
 ) -> list[tuple[list[str], dict[str, str]]]:
     try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        view = (read_context.registry_view(jobs, append_only=append_only)
+                if read_context is not None
+                else REGISTRY.registry_view(jobs, append_only=append_only))
     except FileNotFoundError:
         return []
-    latest: dict[tuple[str, ...], tuple[list[str], dict[str, str]]] = {}
-    for line in lines:
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        metadata = parse_registry_metadata(fields[5])
-        if parent and metadata.get("parent") != parent:
-            continue
-        if slug and fields[4] != slug:
-            continue
-        if attempt_id and metadata.get("attempt_id") != attempt_id:
-            continue
-        key = (
-            ("attempt", metadata["attempt_id"])
-            if metadata.get("attempt_id")
-            else ("legacy", fields[2], fields[3], fields[4])
-        )
-        latest[key] = (fields, metadata)
-    return list(latest.values())
+    return view.select_rows(parent=parent, slug=slug, attempt_id=attempt_id)
 
 
 def classify_legacy_rows(rows) -> dict[str, object]:
@@ -61,7 +45,8 @@ def classify_legacy_rows(rows) -> dict[str, object]:
     return {"schema_version": 1, "state": state, "children": children}
 
 
-def classify_selection(jobs: Path, rows, *, settle: bool = False) -> dict[str, object]:
+def classify_selection(jobs: Path, rows, *, settle: bool = False,
+                       observation_context=None, registry_append_only: bool = False) -> dict[str, object]:
     """Operational waits delegate registered decisions to the shared join."""
     registered = {metadata["attempt_id"] for _, metadata in rows
                   if metadata.get("attempt_schema_version") == "2"
@@ -71,7 +56,11 @@ def classify_selection(jobs: Path, rows, *, settle: bool = False) -> dict[str, o
     legacy = classify_legacy_rows([(fields, metadata) for fields, metadata in rows
                        if metadata.get("attempt_id") not in registered])
     children = list(legacy["children"])
-    joined = JOIN.join_selected_attempts(jobs=jobs, expected_attempts=registered, recover=settle)
+    joined = JOIN.join_selected_attempts(
+        jobs=jobs, expected_attempts=registered, recover=settle,
+        observation_context=observation_context,
+        registry_append_only=registry_append_only,
+    )
     for child in joined["children"]:
         current = dict(child)
         if child["readiness"] == "ready":

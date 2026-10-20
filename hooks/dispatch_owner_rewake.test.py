@@ -349,6 +349,25 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertEqual(command[-2:], ["--attempt-id", "att-owner-1"])
         self.assertIn(str(self.jobs), command)
 
+    def test_canonical_wait_consumes_runner_projection_without_helper_process(self) -> None:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        store = mock.Mock()
+        store.get.return_value = {"id": "readiness-request"}
+        source_root = MODULE_PATH.parents[1]
+        with mock.patch.object(rewake, "agent_home", return_value=source_root), \
+                mock.patch.object(rewake.peer_obligations, "ObligationStore", return_value=store), \
+                mock.patch.object(rewake.peer_obligations, "ensure_normal_runner", return_value=True), \
+                mock.patch.object(rewake.shared_readiness, "current_result",
+                                  return_value={"state": "ready", "children": []}) as result, \
+                mock.patch.object(rewake.subprocess, "run", side_effect=AssertionError("helper spawned")):
+            outcome = rewake.wait_for_attempt(
+                launch, source_root / "utilities" / "dispatch-attempt-ready.py")
+        self.assertEqual(outcome, ("ready", "terminal-quiescent"))
+        result.assert_called_once()
+        store.create.assert_called_once()
+        self.assertEqual(store.update.call_args.kwargs["state"], "complete")
+
     def test_probe_timeout_keeps_the_exact_owner_wait_armed(self) -> None:
         launch = rewake.parse_launch(self.payload())
         assert launch is not None

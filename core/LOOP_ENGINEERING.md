@@ -141,6 +141,13 @@ under the duty's existing update lock before that successor can claim it.
 The inherited descriptor and that record carry the transfer without another
 CLI input or a second recovery owner.
 
+When several consumers need the same expensive read, the existing runner may
+publish one narrow, identity-bound observation for them to reuse. Each detached
+watch still owns its native result, watch id, deadline, receipt, and ack; a
+shared projection only answers readiness and never settles another watch. A
+consumer with a missing or stale projection reconnects to its existing duty
+and observes again without replaying work already owned by its live runner.
+
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the
 session's own notices. The runner retains observation state across requests.
