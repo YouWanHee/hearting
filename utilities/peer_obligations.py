@@ -68,7 +68,8 @@ def _message_intent_matches_transfer(record, message):
                     body.rstrip("\n").encode("utf-8")).hexdigest()
                 and message.get("refs") == ["delay-notice:" + original_ref, original_ref])
     return (intent.get("body_digest") == message.get("body_sha256")
-            and intent.get("refs", []) == message.get("refs", []))
+            and intent.get("refs", []) == message.get("refs", [])
+            and intent.get("producer_binding") == message.get("producer_binding"))
 
 
 def _with_current_message_watch_binding(message, binding, action, failure):
@@ -852,6 +853,26 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
                 or row.metadata.get("parent_sid") != storage
                 or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
             return
+        producer = message.get("producer_binding")
+        sender = message.get("from") or {}
+        if sender.get("harness") == "runtime":
+            expected = {
+                "schema": "registered-runtime-completion-v1",
+                "duty_id": duty["id"], "jobs": str(jobs),
+                "attempt_id": row.attempt_id, "carrier": binding["carrier"],
+                "delivery_id": delivery_id, "receipt_digest": record.get("receipt_digest"),
+                "recipient": {"harness": recipient.get("harness"),
+                              "session_id": recipient.get("session_id")},
+                "route_id": str(row.metadata.get("route_id") or ""),
+                "route_node": str(row.metadata.get("route_node") or ""),
+            }
+            if (producer != expected or sender.get("session_id") not in (None, "")
+                    or sender.get("name") != "Hearting runtime"
+                    or not {duty["id"], row.attempt_id, delivery_id}.issubset(
+                        set(message.get("refs") or []))):
+                return
+        elif producer is not None:
+            return
         if intent.get("notice_delivery_id") and record.get("receipt_digest") != intent.get("notice_digest"):
             return
         from dispatch_seat_handover import effective_parent, effective_parent_harness
@@ -1385,10 +1406,13 @@ class ObligationStore:
                 observation = record.get("observation") or {}
                 expected_sender = intent.get("from") or {}
                 saved_sender = message.get("from") or {}
+                sender_keys = ("harness", "session_id", "name") if "name" in expected_sender \
+                    else ("harness", "session_id")
                 if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
                         or not _message_intent_matches_transfer(record, message)
                         or (expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
-                                                    for key in ("harness", "session_id")))):
+                                                    for key in sender_keys))
+                        or intent.get("producer_binding") != message.get("producer_binding")):
                     return False
                 if proof.get("receipt_type") == "exact-native-history":
                     native_id = proof.get("actual_message_id")
@@ -1493,8 +1517,12 @@ class ObligationStore:
                         or not _message_intent_matches_transfer(record, message)):
                     return False
                 expected_sender, saved_sender = intent.get("from") or {}, message.get("from") or {}
+                sender_keys = ("harness", "session_id", "name") if "name" in expected_sender \
+                    else ("harness", "session_id")
                 if expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
-                                           for key in ("harness", "session_id")):
+                                           for key in sender_keys):
+                    return False
+                if intent.get("producer_binding") != message.get("producer_binding"):
                     return False
                 original, saved_target = intent.get("to") or {}, message.get("to") or {}
                 if any(original.get(key) != saved_target.get(key)

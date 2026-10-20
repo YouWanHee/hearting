@@ -62,18 +62,29 @@ selected route changes source prepares its execution cwd before eligibility
 evidence, sealing, publication, or launch. This applies to `compose --start`,
 framed first legs, successors, printed next-leg commands, and `direct` routes;
 an explicit primary cwd or supplied dispatch evidence is not an exemption.
-From a primary checkout, preparation fetches the remote default branch and
-creates the worktree from the commit SHA observed after that successful fetch.
+A framed start also prepares the cwd that its frame will read, even when its
+route does not itself change source. From a primary checkout,
+preparation fetches the remote default branch and creates the worktree from the
+commit SHA observed after that successful fetch.
 When the repository has no remotes, preparation uses the primary worktree's
 current `HEAD` commit without a fetch; if `HEAD` does not resolve to a commit,
 preparation fails before publication.
 An explicitly approved task linked worktree is kept with its existing changes
-and HEAD. Exact saved snapshots, cursors, receipts, and official continuations
+and HEAD. For a framed start whose cwd is an implicit linked worktree, dirty or
+unmerged state is retained as the frame's read cwd, but that retention does
+not approve a source-changing leg to work there; that still takes the existing
+approved `cwd` proposal. A clean, merged implicit linked worktree can receive a
+new allocation from the fetched remote default. Only a newly allocated frame
+worktree is carried directly into its first source-changing leg. Exact saved
+snapshots, cursors, receipts, and official continuations
 are resumed before new preparation, so resuming an existing task does not
 require another network fetch. Occupied worktree names are skipped with an
-automatically chosen suffix; preparation failure prevents route publication
-and launch and can be retried through the same start with its existing
-decision and approval. Candidate allocation checks the full Git ref namespace,
+automatically chosen suffix. Source-changing start preparation failure
+prevents route publication and launch and can be retried through the same
+start with its existing decision and approval. If framed-start preparation
+fails, framed start instead records a one-line reason and proceeds from its
+original cwd; this fallback does not change source-changing start failure
+handling. Candidate allocation checks the full Git ref namespace,
 including pseudo-refs, packed and symbolic refs, remote/tag names, branch
 prefix conflicts, and occupied paths before asking Git to resolve a short
 revision. If worktree creation fails after this invocation created its new
@@ -1176,6 +1187,16 @@ the owner's later completion notice.
 If another normal carrier consumes that notice first, the same bound peer payload
 is omitted from later sends and its existing message duty settles without a false
 peer-receipt claim.
+
+The registered runtime courier transports completion content; it is not its
+author. A completion transfer uses a runtime sender and retains the verified
+duty, attempt, delivery, and exact recipient binding from the existing pending
+record. The same binding is present in the immutable transfer, pending row, and
+any message duty created for that transfer. The immutable transfer and pending
+row carry it before any carrier can receive the content. The runtime trailer
+remains distinct from a peer trailer, while exact body and recipient checks,
+native receipt, retry, and ACK continue through the existing path. A later
+retry does not replace the original binding with the courier's session.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress

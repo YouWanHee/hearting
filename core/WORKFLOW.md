@@ -428,19 +428,26 @@ stages are not mandatory. The sealed result shows the realized stages and omitte
 defaults before execution. Input/output, explicit human gates, and terminal proof
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
-to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
-source-changing `--start` from a primary checkout, the worktree
+to obtain a complete recipe. `compose` fills omitted flags from the checkout:
+cwd (for a source-changing `--start` from a primary checkout, the worktree
 `<repo>-wt/<slug>` on a collision-free branch and path, based on the commit SHA
 resolved by a successful fetch of the current remote default. If the repository
 has no remotes, preparation uses the primary worktree's current `HEAD` commit
 without fetching; an unresolved `HEAD` fails before publication. This applies
 regardless of shape, explicit cwd, or supplied dispatch evidence. An explicitly
-approved task linked worktree is reused with its changes, and exact saved route
+approved task linked worktree is reused with its changes. A framed start
+prepares the frame's read cwd too: an implicit linked cwd with dirty or unmerged
+work is retained for reading, but a source-changing leg still needs the existing
+proposed `cwd` approval to work there; clean, merged linked worktrees can be
+allocated afresh. A newly allocated frame worktree is carried into its first
+source-changing leg, while retained or explicitly approved linked worktrees
+keep their established approval behavior. Exact saved route
 snapshots/cursors/receipts and official continuations resume before any new
-preparation. A framed first leg and each new successor use the same preparation
-contract; an existing plan cursor wins over allocation. A preparation failure
-leaves the start unpublished and retryable through the same request. Preview,
-explain, non-start `compose`, and low-level `compile` remain read-only), artifact root
+preparation; an existing plan cursor wins over allocation. Source-changing
+preparation failure leaves that start unpublished and retryable through the
+same request. If framed-start preparation fails, frame start records a one-line
+reason and continues from the original cwd. Preview, explain, non-start
+`compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
@@ -570,7 +577,12 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 `compose` prints (capability · shape · route id · human gates) plus one clause
 of scope and proceeds in the same turn; a steward cannot approve for the user.
 Compose's notice and receipt name this confirmation method from the current
-turn's existing peer-receive observation. Unknown origin uses the card method;
+turn's existing peer-receive observation. Peer origin is known only when the
+current prompt boundary is bound to the exact validated transfer or native
+Claude envelope it contains. A previous receipt or a later notice cannot
+classify this prompt. Runtime completion transfers retain their producer
+binding and runtime source independently of the courier. Unknown or mixed
+origin uses the card method;
 the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,

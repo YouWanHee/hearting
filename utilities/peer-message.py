@@ -62,8 +62,10 @@ _STEWARD_TARGETS_MAX = 32
 # Native Claude SendMessage already wraps its delivery in <cross-session-message from=…>;
 # a herdr prompt has no envelope, so the trailer is the envelope.
 _PEER_TRAILER_RE = re.compile(
-    r"\(peer-from:\s*(?P<harness>[A-Za-z0-9_-]+)\s+(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
+    r"\((?P<tag>peer|runtime)-from:\s*(?P<harness>[A-Za-z0-9_-]+)\s+"
+    r"(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
 _EXACT_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
+_RUNTIME_PRODUCER_SCHEMA = "registered-runtime-completion-v1"
 
 
 def _session_handle():
@@ -111,7 +113,8 @@ def peer_trailer(harness, session_id, name=None, *, transfer_ref=None):
     if clean:
         parts.append(clean)
     suffix = f" ; ref={transfer_ref}" if transfer_ref else ""
-    return "(peer-from: %s%s)" % (" ".join(parts), suffix)
+    tag = "runtime-from" if harness == "runtime" else "peer-from"
+    return "(%s: %s%s)" % (tag, " ".join(parts), suffix)
 
 
 def _transfer_path(ref):
@@ -187,9 +190,52 @@ def _unknown_sender(endpoint):
             and (endpoint.get("name") is None or isinstance(endpoint.get("name"), str)))
 
 
-def _valid_transfer_sender(endpoint):
+def _valid_runtime_producer_binding(binding, sender, recipient=None, refs=None):
+    """Validate the existing registered completion lineage carried by a runtime sender."""
+    keys = {"schema", "duty_id", "jobs", "attempt_id", "carrier", "delivery_id",
+            "receipt_digest", "recipient", "route_id", "route_node"}
+    if (not isinstance(binding, dict) or set(binding) != keys
+            or binding.get("schema") != _RUNTIME_PRODUCER_SCHEMA
+            or not isinstance(sender, dict) or sender.get("harness") != "runtime"
+            or sender.get("session_id") not in (None, "")
+            or sender.get("name") != "Hearting runtime"):
+        return False
+    duty_id, jobs = binding.get("duty_id"), binding.get("jobs")
+    attempt, delivery, carrier = (binding.get("attempt_id"), binding.get("delivery_id"),
+                                  binding.get("carrier"))
+    target = binding.get("recipient")
+    if (not isinstance(duty_id, str) or not re.fullmatch(r"registered-batch-[0-9a-f]{32}", duty_id)
+            or not isinstance(jobs, str) or not jobs or not Path(jobs).is_absolute()
+            or not isinstance(attempt, str) or not attempt or len(attempt) > 256
+            or not isinstance(delivery, str) or not delivery or len(delivery) > 256
+            or not isinstance(carrier, str) or not carrier or len(carrier) > 128
+            or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}",
+                                str(binding.get("receipt_digest") or ""))
+            or not isinstance(target, dict) or not _valid_transfer_endpoint(target)
+            or not all(isinstance(binding.get(key), str) and len(binding[key]) <= 256
+                       for key in ("route_id", "route_node"))):
+        return False
+    if recipient is not None and any(target.get(key) != recipient.get(key)
+                                     for key in ("harness", "session_id")):
+        return False
+    if refs is not None and (not isinstance(refs, (list, tuple))
+                             or duty_id not in refs or attempt not in refs or delivery not in refs):
+        return False
+    return True
+
+
+def _valid_transfer_sender(endpoint, producer_binding=None, recipient=None, refs=None):
     # An external shell has no session to attribute; the recipient remains exact.
+    if isinstance(endpoint, dict) and endpoint.get("harness") == "runtime":
+        return _valid_runtime_producer_binding(producer_binding, endpoint, recipient, refs)
+    if producer_binding is not None:
+        return False
     return _valid_transfer_endpoint(endpoint) or _unknown_sender(endpoint)
+
+
+def _trailer_tag_matches_sender(match, sender):
+    expected = "runtime" if isinstance(sender, dict) and sender.get("harness") == "runtime" else "peer"
+    return bool(match and match.group("tag") == expected)
 
 
 def _codex_model_read_access(recipient):
@@ -258,13 +304,20 @@ def _reference_access_evidence_valid(evidence, recipient):
 
 
 def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
-                          reference_evidence=None, refs=()):
+                          reference_evidence=None, refs=(), producer_binding=None):
     """Seal a transmission intent before delivery (the receiver may run immediately).
 
     This immutable record shares the ledger's local write trust boundary; it is
     not an authorization token. The final ledger row refers to this message_id.
     Full identities live here, never in the generated display trailer.
     """
+    if producer_binding is not None and not _valid_runtime_producer_binding(
+            producer_binding, sender, recipient, list(refs)):
+        raise ValueError("peer-runtime-producer-binding-invalid")
+    if sender.get("harness") == "runtime" and producer_binding is None:
+        raise ValueError("peer-runtime-producer-binding-required")
+    if producer_binding is not None and not include_trailer:
+        raise ValueError("peer-runtime-producer-requires-receipt-envelope")
     ref = secrets.token_hex(16)
     normalized = body.rstrip("\n")
     source_sha256 = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -292,6 +345,8 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
     record = {"schema_version": 1, "message_id": ref, "from": dict(sender),
               "to": dict(recipient), "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
               "refs": list(refs)}
+    if producer_binding is not None:
+        record["producer_binding"] = dict(producer_binding)
     if body_ref is not None:
         record["body_ref"] = body_ref
     path = _transfer_path(ref)
@@ -626,8 +681,9 @@ def _pending_path(ref):
     return _pending_dir() / (ref + ".json")
 
 
-def _pending_endpoint(endpoint, state, *, sender=False):
-    if _valid_transfer_endpoint(endpoint) or (sender and _valid_transfer_sender(endpoint)):
+def _pending_endpoint(endpoint, state, *, sender=False, producer_binding=None, recipient=None, refs=None):
+    if (_valid_transfer_endpoint(endpoint)
+            or (sender and _valid_transfer_sender(endpoint, producer_binding, recipient, refs))):
         return True
     if not sender and state in ("pending", "unverified", "queued", "received") \
             and _valid_pane_bound_endpoint(endpoint):
@@ -873,7 +929,10 @@ def _read_pending(ref, *, roots=None, state_root=None):
             or row.get("ref") != ref or row.get("from") != transfer.get("from")
             or row.get("to") != transfer.get("to") or row.get("body_sha256") != transfer.get("body_sha256")
             or row.get("body_ref") != transfer.get("body_ref")
-            or not _pending_endpoint(row.get("from"), row.get("state"), sender=True)
+            or row.get("producer_binding") != transfer.get("producer_binding")
+            or not _pending_endpoint(row.get("from"), row.get("state"), sender=True,
+                                     producer_binding=row.get("producer_binding"),
+                                     recipient=row.get("to"), refs=row.get("refs"))
             or not _pending_endpoint(row.get("to"), row.get("state"))
             or row.get("state") not in ("pending", "queued", "unverified", "received")
             or type(row.get("created")) not in (int, float) or not math.isfinite(row["created"])):
@@ -919,7 +978,9 @@ def _read_pending(ref, *, roots=None, state_root=None):
         if no_trailer:
             source = text
         else:
-            source, sep, _trailer = text.rpartition("\n\n(peer-from:")
+            marker = ("\n\n(runtime-from:" if (row.get("from") or {}).get("harness") == "runtime"
+                      else "\n\n(peer-from:")
+            source, sep, _trailer = text.rpartition(marker)
             if not sep:
                 raise ValueError("peer-pending-source-invalid")
         if hashlib.sha256(source.encode("utf-8")).hexdigest() != row.get("source_sha256"):
@@ -1092,9 +1153,10 @@ def pending_messages(recipient):
 
 
 def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open",
-                         with_trailer=True, reference_evidence=None, first_input_process=None):
+                         with_trailer=True, reference_evidence=None, first_input_process=None,
+                         producer_binding=None):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
-    endpoints_verified = (_valid_transfer_sender(sender)
+    endpoints_verified = (_valid_transfer_sender(sender, producer_binding, recipient, list(refs))
                           and (_valid_transfer_endpoint(recipient)
                                or _valid_pane_bound_endpoint(recipient)))
     body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
@@ -1113,7 +1175,8 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
                     and (recipient.get("session_id") is not None or row["to"].get("name") == recipient.get("name"))
                     and (sender.get("session_id") is not None or row["from"].get("name") == sender.get("name"))
                     and row.get("source_sha256") == body_hash
-                    and row.get("refs", []) == list(refs)):
+                    and row.get("refs", []) == list(refs)
+                    and row.get("producer_binding") == producer_binding):
                 return row["text"], row["ref"]
         return None
 
@@ -1124,16 +1187,24 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
         except (OSError, ValueError):
             found = None
         return found or _prepare_peer_message(body, sender, recipient, include_trailer=with_trailer,
-                                              reference_evidence=reference_evidence, refs=refs)
-    key = json.dumps([[e.get("harness"), e.get("session_id"),
-                       e.get("name") if e.get("session_id") is None else None, e.get("pane_id")]
-                      for e in (sender, recipient)] + [body_hash], ensure_ascii=False)
+                                              reference_evidence=reference_evidence, refs=refs,
+                                              producer_binding=producer_binding)
+    key_parts = [[e.get("harness"), e.get("session_id"),
+                  e.get("name") if e.get("session_id") is None else None, e.get("pane_id")]
+                 for e in (sender, recipient)]
+    if producer_binding is None:
+        key_parts.append(body_hash)
+        key = json.dumps(key_parts, ensure_ascii=False)
+    else:
+        key_parts.extend((body_hash, producer_binding))
+        key = json.dumps(key_parts, ensure_ascii=False, sort_keys=True)
     with pending_lock("prepare-" + hashlib.sha256(key.encode()).hexdigest()):
         found = existing()
         if found:
             return found
         text, ref = _prepare_peer_message(body, sender, recipient, include_trailer=with_trailer,
-                                          reference_evidence=reference_evidence, refs=refs)
+                                          reference_evidence=reference_evidence, refs=refs,
+                                          producer_binding=producer_binding)
         if len(text.encode("utf-8")) > _PENDING_BYTES:
             raise ValueError("peer-pending-body-oversized")
         pending = {"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
@@ -1142,6 +1213,8 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
             "state": "pending" if endpoints_verified else "unverified", "text": text,
             "no_trailer": not with_trailer,
             "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"}
+        if producer_binding is not None:
+            pending["producer_binding"] = dict(producer_binding)
         if (_valid_pane_bound_endpoint(recipient)
                 and _valid_first_input_process(first_input_process, recipient)):
             pending["first_input_process"] = dict(first_input_process)
@@ -1378,7 +1451,8 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "received", "reason": "exact-peer-ref"}
         if _registered_delivery_settled(row):
             return {"status": "not-required", "reason": "dispatch-notice-consumed"}
-        if not _valid_transfer_sender(row["from"]) or not recipient:
+        if not _valid_transfer_sender(row["from"], row.get("producer_binding"),
+                                      recipient, row.get("refs")) or not recipient:
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
         if recipient["harness"] != "codex":
             return {"status": "unsupported", "reason": "peer-native-queue-unavailable"}
@@ -1439,7 +1513,8 @@ def deliver_pending_codex(ref, *, timeout=1.0):
                 from_name=row["from"].get("name"), from_project="", to_harness="codex",
                 to_session_id=recipient["session_id"], to_name=None, kind="notice", surface="codex-queue",
                 status="received", receipt="exact-native-history", ref=[ref, *row["refs"]],
-                transfer_ref=ref, body_file=None, body_stdin=False))
+                transfer_ref=ref, body_file=None, body_stdin=False,
+                producer_binding=row.get("producer_binding")))
             if rc:
                 _save_pending(dict(current, rpc_claim=None))
                 return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
@@ -1512,7 +1587,7 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
     missing/mismatched record yields session_id=None. Legacy full-id trailers
     retain the existing receive semantics, never a fallback for a bad alias.
     """
-    if not isinstance(text, str) or "peer-from:" not in text:
+    if not isinstance(text, str) or not _PEER_TRAILER_RE.search(text):
         return None
     match = None
     for match in _PEER_TRAILER_RE.finditer(text):
@@ -1536,6 +1611,7 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
             record = _read_transfer_record(ref)
             sender, target = record["from"], record["to"]
             transfer_refs = record.get("refs")
+            producer_binding = record.get("producer_binding")
             pending = _read_pending(ref)
             target_matches = False
             if _valid_transfer_endpoint(target):
@@ -1556,7 +1632,10 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
                 target_matches = bool(bound and bound.get("harness") == recipient.get("harness")
                                       and bound.get("session_id") == recipient.get("session_id")
                                       and bound.get("pane_id") == target.get("pane_id"))
-            if (not _valid_transfer_sender(sender) or not _valid_transfer_target(target)
+            expected_tag = "runtime" if sender.get("harness") == "runtime" else "peer"
+            if (match.group("tag") != expected_tag
+                    or not _valid_transfer_sender(sender, producer_binding, target, transfer_refs)
+                    or not _valid_transfer_target(target)
                     or type(record.get("schema_version")) is not int or record["schema_version"] != 1
                     or record.get("message_id") != ref
                     or record.get("body_sha256") not in _arrived_body_digests(text, ref)
@@ -1566,11 +1645,104 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
             result.update(session_id=sender.get("session_id") or None, name=sender.get("name"))
             if include_ref:
                 result["transfer_ref"] = ref
+            if producer_binding is not None:
+                result["source"] = "runtime-completion"
+                result["producer_binding"] = dict(producer_binding)
         except UnsupportedPendingSchema:
             raise
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
     return result
+
+
+def _legacy_registered_producer_binding(pending, recipient):
+    if not isinstance(pending, dict):
+        return None
+    try:
+        import peer_obligations
+        matches = list(peer_obligations._registered_delivery_bindings(pending, received_only=False))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+    if len(matches) != 1:
+        return None
+    _store, duty, row, exact, _root, _storage, delivery_id = matches[0]
+    identity = (duty.get("intent") or {}).get("identity") or {}
+    return {"schema": "legacy-registered-runtime-completion-v1",
+        "duty_id": duty.get("id"), "jobs": identity.get("jobs"),
+        "attempt_id": row.attempt_id,
+        "carrier": (duty.get("intent") or {}).get("carrier"),
+        "delivery_id": delivery_id, "receipt_digest": exact.get("receipt_digest"),
+        "recipient": dict(recipient),
+        "route_id": row.metadata.get("route_id", ""),
+        "route_node": row.metadata.get("route_node", "")}
+
+
+def prompt_origin(text, harness, session_id):
+    """Return provenance only when this complete prompt carries a verified envelope."""
+    if not isinstance(text, str) or not text or harness not in {"claude", "codex", "opencode"} \
+            or not usable_session_id(session_id):
+        return None
+    recipient = {"harness": harness, "session_id": session_id}
+    parsed = parse_peer_trailer(text, recipient, include_ref=True)
+    if isinstance(parsed, dict) and parsed.get("transfer_ref"):
+        ref = parsed["transfer_ref"]
+        try:
+            transfer = _read_transfer_record(ref)
+            pending = _read_pending(ref)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return None
+        if not isinstance(transfer, dict):
+            return None
+        sender = transfer.get("from") or {}
+        producer = transfer.get("producer_binding")
+        request_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        transfer_digest = transfer.get("body_sha256")
+        base = {"harness": harness, "session_id": session_id,
+                "request_digest": request_digest, "transfer_ref": ref,
+                "transfer_body_sha256": transfer_digest}
+        if parsed.get("source") == "runtime-completion":
+            if (not _valid_runtime_producer_binding(producer, sender, recipient,
+                                                    transfer.get("refs"))
+                    or pending is None
+                    or pending.get("producer_binding") != producer):
+                return None
+            return {**base, "kind": "runtime-completion", "name": "Hearting runtime",
+                    "producer_binding": dict(producer)}
+
+        refs = transfer.get("refs") or []
+        legacy_runtime = bool(pending and pending.get("dispatch_notice")) or any(
+            isinstance(ref_value, str) and ref_value.startswith("registered-batch-")
+            for ref_value in refs)
+        if legacy_runtime:
+            if not pending or pending.get("producer_binding") is not None:
+                return None
+            legacy_binding = _legacy_registered_producer_binding(pending, recipient)
+            if legacy_binding is None:
+                return None
+            return {**base, "kind": "runtime-completion", "name": "Hearting runtime",
+                    "producer_binding": legacy_binding, "legacy": True}
+        if (producer is not None or sender.get("harness") not in {"claude", "codex", "opencode"}
+                or not sender.get("session_id")):
+            return None
+        return {**base, "kind": "peer", "name": sender.get("name") or sender["session_id"],
+                "sender_harness": sender["harness"], "sender_session_id": sender["session_id"]}
+
+    if harness != "claude":
+        return None
+    native = re.fullmatch(
+        r'\s*<cross-session-message\s+from="(?P<address>[^"]*)"(?P<attrs>[^>]*)>'
+        r'(?P<body>.*?)</cross-session-message>\s*', text, re.DOTALL)
+    if not native:
+        return None
+    sender_sid = claude_session_id_for_address(native.group("address"))
+    if not usable_session_id(sender_sid):
+        return None
+    named = re.search(r'\bfrom-name="([^"]*)"', native.group("attrs"))
+    sender_name = named.group(1) if named else native.group("address")
+    return {"kind": "peer", "harness": harness, "session_id": session_id,
+            "request_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "transfer_ref": "native-envelope", "transfer_body_sha256": None,
+            "name": sender_name, "sender_harness": "claude", "sender_session_id": sender_sid}
 
 
 def _exact_alias_body_is_unreadable(text, recipient):
@@ -1593,9 +1765,11 @@ def _exact_alias_body_is_unreadable(text, recipient):
     if (not isinstance(transfer, dict) or transfer.get("message_id") != ref
             or type(transfer.get("schema_version")) is not int
             or transfer.get("schema_version") != 1
-            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_sender(transfer.get("from"), transfer.get("producer_binding"),
+                                          transfer.get("to"), transfer.get("refs"))
             or not _valid_transfer_target(transfer.get("to"))
-            or (transfer.get("from") or {}).get("harness") != match.group("harness").lower()):
+            or (transfer.get("from") or {}).get("harness") != match.group("harness").lower()
+            or not _trailer_tag_matches_sender(match, transfer.get("from"))):
         return False
     target = transfer.get("to") or {}
     target_matches = (_valid_transfer_endpoint(target)
@@ -1699,7 +1873,9 @@ def _validated_pending_transfer(ref, row):
             or row.get("from") != transfer.get("from")
             or row.get("to") != transfer.get("to")
             or row.get("body_ref") != transfer.get("body_ref")
-            or not _valid_transfer_sender(transfer.get("from"))
+            or row.get("producer_binding") != transfer.get("producer_binding")
+            or not _valid_transfer_sender(transfer.get("from"), transfer.get("producer_binding"),
+                                          transfer.get("to"), transfer.get("refs"))
             or not _valid_transfer_target(transfer.get("to"))):
         return None, None
     return transfer, list(pending_refs)
@@ -1754,9 +1930,11 @@ def recover_missing_pending_receipt(ref, intent, *, roots=None, read_context=Non
     if (not isinstance(transfer, dict) or type(transfer.get("schema_version")) is not int
             or transfer.get("schema_version") != 1 or transfer.get("message_id") != ref
             or transfer.get("body_sha256") != intent.get("body_digest")
+            or transfer.get("producer_binding") != intent.get("producer_binding")
             or not isinstance(refs, list) or not all(isinstance(item, str) for item in refs)
             or not isinstance(intent_refs, list) or refs != intent_refs
-            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_sender(transfer.get("from"), transfer.get("producer_binding"),
+                                          transfer.get("to"), refs)
             or not _valid_transfer_target(transfer.get("to"))
             or (transfer.get("body_ref") is not None
                 and not _body_reference_descriptor_valid(transfer.get("body_ref"), ref))):
@@ -1788,6 +1966,7 @@ def recover_missing_pending_receipt(ref, intent, *, roots=None, read_context=Non
             or type(notice.get("schema_version")) is not int
             or notice.get("schema_version") != 1
             or notice.get("refs") != [ref, *refs]
+            or notice.get("producer_binding") != transfer.get("producer_binding")
             or any(notice_sender.get(key) != transfer_sender.get(key)
             for key in ("harness", "session_id"))
             or any(notice_recipient.get(key) != effective.get(key)
@@ -1893,7 +2072,9 @@ def _validated_missing_pending_receiver_proof(message):
             or transfer.get("from") != message.get("from")
             or transfer.get("to") != message.get("to")
             or refs != message.get("refs")
-            or not _valid_transfer_sender(transfer.get("from"))
+            or message.get("producer_binding") != transfer.get("producer_binding")
+            or not _valid_transfer_sender(transfer.get("from"), transfer.get("producer_binding"),
+                                          transfer.get("to"), refs)
             or not _valid_transfer_target(transfer.get("to"))):
         return None
     recipient = saved.get("effective_recipient")
@@ -2116,7 +2297,8 @@ def _exact_receiver_evidence(ref, transfer, pending, recipient):
             or transfer.get("schema_version") != 1
             or not isinstance(transfer.get("body_sha256"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", transfer["body_sha256"])
-            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_sender(transfer.get("from"), transfer.get("producer_binding"),
+                                          transfer.get("to"), transfer.get("refs"))
             or not _valid_transfer_target(transfer.get("to"))):
         return None
     if pending is not None:
@@ -2146,6 +2328,7 @@ def _exact_receiver_evidence(ref, transfer, pending, recipient):
             "provenance": _EXACT_RECEIVER_PROVENANCE,
             "transfer_ref": ref,
             "transfer_body_sha256": transfer["body_sha256"],
+            "producer_binding": transfer.get("producer_binding"),
             "effective_recipient": dict(effective),
             "recipient_binding": binding,
             "received_at": time.time()}
@@ -2170,11 +2353,13 @@ def _reference_transfer_from_text(text):
         return None
     sender, target = record.get("from"), record.get("to")
     if (type(record.get("schema_version")) is not int or record["schema_version"] != 1
-            or record.get("message_id") != ref or not _valid_transfer_sender(sender)
+            or record.get("message_id") != ref
+            or not _valid_transfer_sender(sender, record.get("producer_binding"), target, record.get("refs"))
             or not _valid_transfer_target(target)
             or not _body_reference_descriptor_valid(record.get("body_ref"), ref)
             or record.get("body_sha256") not in _arrived_body_digests(text, ref)
-            or (sender.get("harness") or "unknown") != match.group("harness").lower()):
+            or (sender.get("harness") or "unknown") != match.group("harness").lower()
+            or not _trailer_tag_matches_sender(match, sender)):
         return None
     return ref, record
 
@@ -2253,6 +2438,9 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
     This is a read-only hint. ``accept_handoff`` repeats the same receiver check
     while holding its existing pending lock before it records any acceptance.
     """
+    current_origin = parse_peer_trailer(text, recipient, include_ref=True)
+    if isinstance(current_origin, dict) and current_origin.get("source") == "runtime-completion":
+        return ""
     ordinary = _ordinary_receiver_guidance()
     body_reference_guidance = _body_reference_guidance(text, recipient)
     guidance = ordinary + ("\n\n" + body_reference_guidance if body_reference_guidance else "")
@@ -2766,7 +2954,8 @@ def cmd_pending(args):
                     to_name=None, kind="notice", surface="opencode-native",
                     status="received", receipt="exact-native-history",
                     ref=[ref, *row.get("refs", [])], transfer_ref=ref,
-                    body_file=None, body_stdin=False))
+                    body_file=None, body_stdin=False,
+                    producer_binding=row.get("producer_binding")))
                 if rc:
                     return rc
             received = dict(row, state="received", text=None, rpc_claim=None,
@@ -3126,6 +3315,16 @@ def _record(args, *, exact_receiver_evidence=None):
         from_name = getattr(args, "from_name", None)
         if from_name:
             from_block["name"] = str(from_name)
+        producer_binding = getattr(args, "producer_binding", None)
+        if producer_binding is not None:
+            sender_endpoint = {"harness": args.from_harness,
+                               "session_id": args.from_session_id or None,
+                               "name": from_name}
+            recipient_endpoint = {"harness": args.to_harness,
+                                  "session_id": to.get("session_id")}
+            if not _valid_runtime_producer_binding(
+                    producer_binding, sender_endpoint, recipient_endpoint, list(args.ref or [])):
+                raise ValueError("peer-runtime-producer-binding-invalid")
         kind = args.kind
         rec = {
             "schema_version": 1,
@@ -3143,6 +3342,8 @@ def _record(args, *, exact_receiver_evidence=None):
             },
             "refs": list(args.ref or []),
         }
+        if producer_binding is not None:
+            rec["producer_binding"] = dict(producer_binding)
         transfer_ref = getattr(args, "transfer_ref", None)
         if transfer_ref:
             _transfer_path(transfer_ref)
@@ -3153,6 +3354,8 @@ def _record(args, *, exact_receiver_evidence=None):
                     or exact_receiver_evidence.get("receipt_type") != "exact-peer-ref"
                     or exact_receiver_evidence.get("provenance") != _EXACT_RECEIVER_PROVENANCE
                     or exact_receiver_evidence.get("transfer_ref") != transfer_ref
+                    or exact_receiver_evidence.get("producer_binding")
+                       != getattr(args, "producer_binding", None)
                     or not re.fullmatch(r"[0-9a-f]{64}", str(
                         exact_receiver_evidence.get("transfer_body_sha256") or ""))
                     or not isinstance(exact_receiver_evidence.get("effective_recipient"), dict)
@@ -3200,6 +3403,7 @@ def _record_validated_receiver_notice(trailer, recipient, project, summary, refs
         to_name=None, kind="notice", surface="herdr", status="received",
         receipt="exact-peer-ref", ref=[proof["transfer_ref"], *refs],
         transfer_ref=proof["transfer_ref"], body_file=None, body_stdin=False,
+        producer_binding=proof.get("producer_binding"),
         body_text=summary)
     return _record(args, exact_receiver_evidence=proof)
 

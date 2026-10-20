@@ -303,7 +303,9 @@ def main():
                     + [_typed_watch_line(row) for row in rows]
                 )
         mod = _peer_message_module()
-        if mod and ("peer-from:" in (payload.get("prompt") or "") or "cross-session-message" in (payload.get("prompt") or "")):
+        if mod and ("peer-from:" in (payload.get("prompt") or "")
+                    or "runtime-from:" in (payload.get("prompt") or "")
+                    or "cross-session-message" in (payload.get("prompt") or "")):
             extra = "\n".join(filter(None, [extra, mod.receiver_guidance(
                 payload.get("prompt") or "",
                 {"harness": "claude", "session_id": payload.get("session_id")},

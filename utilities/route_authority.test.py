@@ -398,21 +398,46 @@ class OwnerPinChangeTest(unittest.TestCase):
         self.assertEqual(RA.pin_changes(self.route)[-1]["by"],
                          {"harness": "codex", "session_id": "successor"})
 
-    def test_a_peer_message_at_this_turn_is_the_recorded_source(self):
+    def test_only_the_exact_current_prompt_transfer_sets_peer_source(self):
         router = _load("route_authority_capability_route_source", "utilities/capability-route.py")
         peer = _load("route_authority_peer_message", "utilities/peer-message.py")
         import argparse, session_tidy, time
         with mock.patch.dict(os.environ, self.isolated_env(), clear=True):
             self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
+            sender = {"harness": "claude", "session_id": "peer-sid", "name": "hearting-4d"}
+            recipient = {"harness": "codex", "session_id": "codex-sid"}
+            body = "[steer] exact current request"
+            text, ref = peer.prepare_peer_message(body, sender, recipient, defer=True, refs=["route-current"])
+            origin = peer.prompt_origin(text, "codex", "codex-sid")
+            self.assertEqual((origin["kind"], origin["transfer_ref"]), ("peer", ref))
+            session_tidy.run_hook("codex", "prompt", "codex-sid", cwd="/w", prompt_text=text)
             seat = session_tidy.resolve_seat("codex", "/w", os.environ, "codex-sid", "")
-            session_tidy.bump_prompt_seq(seat, "codex", "codex-sid", time.time())
+            seq = session_tidy.read_prompt_seq(seat)
+            marker = session_tidy.prompt_state(seat)
+            self.assertEqual(marker["request_origin"]["transfer_ref"], ref)
+            self.assertNotIn(body, json.dumps(marker))
+            expected = "peer:hearting-4d·" + ref
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), expected)
+            with mock.patch.object(peer.time, "gmtime", return_value=time.gmtime(marker["at"])):
+                peer.cmd_record(argparse.Namespace(
+                    from_harness="opencode", from_session_id="unrelated-sid", from_name="unrelated", from_project="p",
+                    to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
+                    status="received", receipt="exact-peer-ref", ref=["f" * 32], transfer_ref=None,
+                    body_file=None, body_stdin=False, body_text="herdr steer received"))
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), expected)
+            session_tidy.run_hook("codex", "prompt", "codex-sid", cwd="/w",
+                                  prompt_text="separate user request")
+            next_seq = session_tidy.read_prompt_seq(seat)
+            self.assertGreater(next_seq, seq)
             self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
-            peer.cmd_record(argparse.Namespace(
-                from_harness="claude", from_session_id="sup-sid", from_name="hearting-4d", from_project="p",
-                to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
-                status="received", receipt="exact-peer-ref", ref=["0123456789abcdef0123456789abcdef"], transfer_ref="0123456789abcdef0123456789abcdef",
-                body_file=None, body_stdin=False, body_text="herdr steer received"))
-            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "peer:hearting-4d·0123456789abcdef0123456789abcdef")
+            future = time.gmtime(time.time() + 900)
+            with mock.patch.object(peer.time, "gmtime", return_value=future):
+                peer.cmd_record(argparse.Namespace(
+                    from_harness="claude", from_session_id="late-peer", from_name="late", from_project="p",
+                    to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
+                    status="received", receipt="exact-peer-ref", ref=["e" * 32], transfer_ref=None,
+                    body_file=None, body_stdin=False, body_text="late notice"))
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
             self.assertEqual(router._turn_peer_source("codex", "other-sid", "/w"), "unattributed")
 
     def test_only_pin_targets_change_and_other_routes_rows_are_ignored(self):

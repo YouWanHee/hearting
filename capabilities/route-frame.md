@@ -27,10 +27,17 @@ Two legs never read each other's brief. The terminal depends on every frame leg 
 
 ## What the runtime does
 
-1. `start` launches the frame legs as separate registrations and joins them.
-2. The existing single frame interview (`needs-interview`, then `needs-question`) asks the person once.
-3. On `proceed` the runtime fixes one `route_decision_v1` record, completes the terminal with that record as its evidence, closes the route and finalizes the producer cycle.
-4. `revise` and `stop` behave as they do for every other frame route.
+1. Before `start` launches the frame legs as separate registrations, it prepares
+   the cwd the frame will read. A failed preparation records a one-line reason
+   and continues from the original cwd. Dirty or unmerged implicit linked
+   worktrees may be retained for reading; this does not approve a source leg to
+   work there, which still needs the existing proposed `cwd` approval. The
+   frame's newly allocated worktree is carried into its first source-changing
+   leg. The frame prompt names the basis it reads in one line.
+2. `start` joins the frame legs.
+3. The existing single frame interview (`needs-interview`, then `needs-question`) asks the person once.
+4. On `proceed` the runtime fixes one `route_decision_v1` record, completes the terminal with that record as its evidence, closes the route and finalizes the producer cycle.
+5. `revise` and `stop` behave as they do for every other frame route.
 
 The record has an immutable `decision` part with its canonical digest and a separate, monotonic `first_leg` part. The record is the terminal's completion evidence; it adds no approval, no required input and no recovery command.
 

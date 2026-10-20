@@ -97,6 +97,126 @@ class _FakeStdin:
 
 
 class PeerMessageTest(_TmpRootMixin, unittest.TestCase):
+    def test_runtime_completion_uses_registered_binding_and_the_exact_receive_path(self):
+        recipient = {"harness": "codex", "session_id": "runtime-recipient"}
+        sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        duty_id = "registered-batch-" + "a" * 32
+        attempt_id = "att-runtime-completion"
+        delivery_id = "delivery-runtime-completion"
+        refs = [duty_id, attempt_id, delivery_id]
+        producer = {
+            "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
+            "duty_id": duty_id, "jobs": str(self.jobs_path),
+            "attempt_id": attempt_id, "carrier": "codex-native-queue",
+            "delivery_id": delivery_id, "receipt_digest": "b" * 64,
+            "recipient": recipient, "route_id": "rt-runtime", "route_node": "execute",
+        }
+        body = "[notice] registered task completed"
+        text, ref = peer_message.prepare_peer_message(
+            body, sender, recipient, defer=True, refs=refs,
+            producer_binding=producer, receipt="native-pending")
+        replay = peer_message.prepare_peer_message(
+            body, sender, recipient, defer=True, refs=refs,
+            producer_binding=producer, receipt="native-pending")
+        self.assertEqual(replay, (text, ref))
+        self.assertIn("(runtime-from: runtime [?] Hearting runtime ; ref=" + ref + ")", text)
+        transfer = peer_message._read_transfer_record(ref)
+        pending = peer_message._read_pending(ref)
+        self.assertEqual(transfer["from"], sender)
+        self.assertEqual(transfer["producer_binding"], producer)
+        self.assertEqual(pending["producer_binding"], producer)
+        self.assertEqual(peer_message.parse_peer_trailer(
+            text, recipient, include_ref=True)["source"], "runtime-completion")
+        self.assertIsNone(peer_message.parse_peer_trailer(
+            text, {"harness": "codex", "session_id": "another-recipient"}, include_ref=True
+        ).get("transfer_ref"))
+        self.assertIsNone(peer_message.prompt_origin(
+            text.replace(body, body + " tampered"), "codex", recipient["session_id"]))
+        self.assertEqual(peer_message.receive_peer_message(
+            text, {"harness": "codex", "session_id": "another-recipient"}), 0)
+        self.assertEqual(peer_message.receive_peer_message(
+            text.replace(body, body + " tampered"), recipient), 1)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual((received["state"], received["receipt"]), ("received", "exact-peer-ref"))
+        self.assertEqual(received["producer_binding"], producer)
+        origin = peer_message.prompt_origin(text, "codex", recipient["session_id"])
+        self.assertEqual((origin["kind"], origin["transfer_ref"], origin["producer_binding"]),
+                         ("runtime-completion", ref, producer))
+        self.assertEqual(peer_message.receiver_guidance(text, recipient), "")
+        notices = [row for row in peer_message._iter_records()
+                   if row.get("transfer_ref") == ref and row.get("delivery", {}).get("status") == "received"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["from"]["harness"], "runtime")
+        self.assertEqual(notices[0]["producer_binding"], producer)
+
+    def test_runtime_sender_without_a_registered_producer_binding_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "runtime-producer-binding-required"):
+            peer_message.prepare_peer_message(
+                "runtime body", {"harness": "runtime", "session_id": None,
+                                 "name": "Hearting runtime"},
+                {"harness": "codex", "session_id": "recipient"}, defer=True)
+        with self.assertRaisesRegex(ValueError, "runtime-producer-requires-receipt-envelope"):
+            peer_message.prepare_peer_message(
+                "runtime body", {"harness": "runtime", "session_id": None,
+                                 "name": "Hearting runtime"},
+                {"harness": "codex", "session_id": "recipient"}, defer=True,
+                refs=["registered-batch-" + "a" * 32, "att-runtime", "delivery-runtime"],
+                producer_binding={
+                    "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
+                    "duty_id": "registered-batch-" + "a" * 32, "jobs": str(self.jobs_path),
+                    "attempt_id": "att-runtime", "carrier": "codex-native-queue",
+                    "delivery_id": "delivery-runtime", "receipt_digest": "d" * 64,
+                    "recipient": {"harness": "codex", "session_id": "recipient"},
+                    "route_id": "rt", "route_node": "execute",
+                }, with_trailer=False)
+
+    def test_claude_native_prompt_origin_requires_a_whole_resolvable_envelope(self):
+        envelope = ('<cross-session-message from="uds:/run/user/1000/peer.sock" '
+                    'from-name="peer-a">exact peer request</cross-session-message>')
+        with mock.patch.object(peer_message, "claude_session_id_for_address", return_value="claude-peer"):
+            origin = peer_message.prompt_origin(envelope, "claude", "claude-recipient")
+            mixed = peer_message.prompt_origin(envelope + "\nseparate user instruction",
+                                               "claude", "claude-recipient")
+        self.assertEqual((origin["kind"], origin["sender_harness"], origin["sender_session_id"]),
+                         ("peer", "claude", "claude-peer"))
+        self.assertIsNone(mixed)
+
+    def test_runtime_completion_keeps_producer_binding_through_opencode_native_history(self):
+        recipient = {"harness": "opencode", "session_id": "opencode-runtime-recipient"}
+        sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        duty_id = "registered-batch-" + "f" * 32
+        attempt_id, delivery_id = "att-opencode-runtime", "delivery-opencode-runtime"
+        refs = [duty_id, attempt_id, delivery_id]
+        producer = {
+            "schema": peer_message._RUNTIME_PRODUCER_SCHEMA, "duty_id": duty_id,
+            "jobs": str(self.jobs_path), "attempt_id": attempt_id,
+            "carrier": "opencode-native", "delivery_id": delivery_id,
+            "receipt_digest": "c" * 64, "recipient": recipient,
+            "route_id": "rt-opencode", "route_node": "execute",
+        }
+        text, ref = peer_message.prepare_peer_message(
+            "[notice] runtime completion", sender, recipient, defer=True,
+            refs=refs, producer_binding=producer)
+        native_id = "opencode-message-runtime"
+        with peer_message.pending_lock(ref):
+            row = peer_message._read_pending(ref)
+            peer_message._save_pending(dict(row, state="queued", actual_message_id=native_id,
+                                            receipt="native-queue-accepted"))
+        args = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id=recipient["session_id"],
+            received=ref, claim=None, queued=None, resuming=None, message_id=native_id)
+        self.assertEqual(peer_message.cmd_pending(args), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual((received["state"], received["receipt"], received["from"]),
+                         ("received", "exact-native-history", sender))
+        self.assertEqual(received["producer_binding"], producer)
+        notice = next(row for row in peer_message._iter_records()
+                      if row.get("transfer_ref") == ref)
+        self.assertEqual(notice["producer_binding"], producer)
+        self.assertEqual(notice["from"]["harness"], "runtime")
+
     def test_record_writes_exactly_one_line(self):
         rc = self._record()
         self.assertEqual(rc, 0)

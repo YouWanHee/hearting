@@ -1448,7 +1448,7 @@ def build_continuation_route(
         # live inside `selection`, inherited above.)
         "composed","composed_recipe",
         # An approved route plan's leg keeps pointing at its plan when it resumes.
-        "route_plan",
+        "route_plan", "framed_worktree",
     )
     inheritance=ROUTE_AUTHORITY.route_in_force(source_route)
     route={key:json.loads(json.dumps(inheritance[key]))
@@ -3658,37 +3658,65 @@ def _parse_selection_pins(values, owner=None):
 
 
 def _turn_peer_source(harness, session, cwd):
-    """Where the current turn's instruction came from, as far as the runtime knows.
-
-    A peer message received at this session's latest prompt is `peer:<sender>·<ref>`.
-    Anything else is `unattributed`: a typed prompt is not recorded anywhere a launcher
-    can read, so it is never guessed to be the user's."""
+    """Return only provenance bound to this exact prompt marker and transfer."""
     try:
-        import calendar
-        import time
         import session_tidy
-        turn = session_tidy.read_json(session_tidy._prompt_seq_path(
-            session_tidy.resolve_seat(harness, cwd or None, os.environ, session, "")))
-        if not isinstance(turn, dict) or turn.get("sid") != session:
+        seat = session_tidy.resolve_seat(harness, cwd or None, os.environ, session, "")
+        turn = session_tidy.read_json(session_tidy._prompt_seq_path(seat))
+        if (not isinstance(turn, dict) or turn.get("sid") != session
+                or turn.get("harness") != harness or type(turn.get("seq")) is not int):
             return "unattributed"
-        started = float(turn["at"]) - 5.0
+        origin = turn.get("request_origin")
+        if (not isinstance(origin, dict) or origin.get("harness") != harness
+                or origin.get("session_id") != session
+                or origin.get("request_digest") is None
+                or not re.fullmatch(r"[0-9a-f]{64}", str(origin.get("request_digest")))
+                or not isinstance(origin.get("transfer_ref"), str)
+                or not isinstance(origin.get("name"), str)):
+            return "unattributed"
+        if origin.get("kind") == "peer" and origin.get("transfer_ref") == "native-envelope":
+            if (origin.get("sender_harness") != "claude"
+                    or not isinstance(origin.get("sender_session_id"), str)
+                    or not origin["sender_session_id"]):
+                return "unattributed"
+            return f"peer:{origin['name']}·native-envelope"
+        if origin.get("kind") not in {"peer", "runtime-completion"}:
+            return "unattributed"
+        ref = origin["transfer_ref"]
         spec = importlib.util.spec_from_file_location("pin_change_peer_message", ROOT / "utilities/peer-message.py")
         peer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(peer)
-        latest = None
-        for row in peer._iter_records(since_hours=24):
-            to = row.get("to") or {}
-            if (row.get("kind") != "notice" or (row.get("delivery") or {}).get("status") != "received"
-                    or (to.get("harness"), to.get("session_id")) != (harness, session)):
-                continue
-            stamp = calendar.timegm(time.strptime(row.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ"))
-            if stamp >= started and (latest is None or stamp >= latest[0]):
-                latest = (stamp, row)
-        if latest is None:
+        transfer = peer._read_transfer_record(ref)
+        if (not isinstance(transfer, dict)
+                or transfer.get("body_sha256") != origin.get("transfer_body_sha256")
+                or not peer._reference_target_matches(transfer, {"harness": harness,
+                                                                  "session_id": session}, ref)):
             return "unattributed"
-        sender = latest[1].get("from") or {}
+        sender = transfer.get("from") or {}
+        producer = transfer.get("producer_binding")
+        if origin.get("kind") == "runtime-completion":
+            if origin.get("legacy") is True:
+                pending = peer._read_pending(ref)
+                legacy = peer._legacy_registered_producer_binding(
+                    pending, {"harness": harness, "session_id": session})
+                if (legacy is None or legacy != origin.get("producer_binding")
+                        or producer is not None):
+                    return "unattributed"
+                producer = legacy
+            elif (sender.get("harness") != "runtime"
+                  or producer != origin.get("producer_binding")
+                  or not peer._valid_runtime_producer_binding(
+                      producer, sender, {"harness": harness, "session_id": session},
+                      transfer.get("refs"))):
+                return "unattributed"
+            return f"runtime:completion·{producer['attempt_id']}/{producer['delivery_id']}"
+        if (producer is not None or sender.get("harness") != origin.get("sender_harness")
+                or sender.get("session_id") != origin.get("sender_session_id")
+                or not peer._valid_transfer_sender(sender, producer, transfer.get("to"),
+                                                   transfer.get("refs"))):
+            return "unattributed"
         name = sender.get("name") or sender.get("session_id") or sender.get("harness") or "?"
-        return f"peer:{name}·{latest[1].get('transfer_ref') or latest[1].get('message_id') or '-'}"
+        return f"peer:{name}·{ref}"
     except Exception:  # noqa: BLE001 -- an unknown source is recorded as unknown
         return "unattributed"
 
@@ -4336,6 +4364,36 @@ def _dispatch_evidence_matches_cwd(evidence, cwd):
                and os.path.realpath(row["checked_worktree"]) == expected for row in rows)
 
 
+def _seal_framed_worktree(route, worktree):
+    """Seal how a framed start prepared its read cwd into the route identity."""
+    route["framed_worktree"] = dict(worktree)
+    route["route_hash"] = route_hash(route)
+    route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    return route
+
+
+def _inherits_frame_worktree(frame_route, leg, index, cwd):
+    """Whether the first leg runs in the allocation its frame's own start made, without preparing again.
+
+    Only that allocation qualifies, and only while it is still the same checkout on the same branch.
+    An explicitly approved or retained linked checkout keeps the proposed-`cwd` approval path.
+    """
+    prepared = frame_route.get("framed_worktree") or {}
+    frame_cwd = frame_route.get("cwd") or ""
+    path, branch = prepared.get("path"), prepared.get("branch")
+    if not (index == 0 and not leg.get("cwd")
+            and prepared.get("state") in {"created", "reused"}
+            and prepared.get("reason") != "approved-linked-task"
+            and path and branch
+            and os.path.realpath(cwd) == os.path.realpath(frame_cwd)
+            and os.path.realpath(prepared.get("cwd") or "") == os.path.realpath(frame_cwd)
+            and os.path.isdir(path)):
+        return False
+    top = _git(path, "rev-parse", "--show-toplevel")
+    return (bool(top) and os.path.realpath(top) == os.path.realpath(path)
+            and _git(path, "symbolic-ref", "-q", "HEAD") == f"refs/heads/{branch}")
+
+
 def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness, index=0):
     """An approved leg, compiled in memory with its route-plan reference sealed.
 
@@ -4352,7 +4410,9 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
     selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
                               parent_harness=owner or "claude", selection_only=True)
-    if _isolates_worktree(selection):
+    frame_preparation = frame_route.get("framed_worktree") or {}
+    inherit_frame_allocation = _inherits_frame_worktree(frame_route, leg, index, kwargs["cwd"])
+    if _isolates_worktree(selection) and not inherit_frame_allocation:
         worktree = prepare_isolated_worktree(
             kwargs["cwd"], frame_route.get("slug"), artifact_root=frame_route["artifact_root"],
             preparation_key=_route_plan_preparation_key(binding), explicitly_approved=bool(leg.get("cwd")))
@@ -4364,6 +4424,9 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     # The probe is collected only after preparation, against the exact cwd that will be sealed.
     route = compose_route(**kwargs, **_leg_evidence(leg, lambda: readiness(kwargs["cwd"])),
                           work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
+    if inherit_frame_allocation:
+        route = _seal_framed_worktree(route, {**frame_preparation, "state": "inherited",
+                                              "from_route_id": frame_route["route_id"]})
     scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
@@ -10704,7 +10767,7 @@ def _worktree_collision(result):
 
 
 def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=None,
-                              explicitly_approved=False):
+                              explicitly_approved=False, framed_start=False):
     """Prepare or resume a source-start allocation without changing the primary checkout.
 
     New work starts from a fetched remote-default SHA. Explicit approved linked tasks and a
@@ -10800,6 +10863,32 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                     return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
                 return {"state": "reused", **reused, "preparation_key": key}
 
+        framed_base = None
+        if framed_start and topology == "linked":
+            framed_base, reason, detail = _remote_default_base(primary)
+            if reason:
+                return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
+            status = _worktree_git(source_top, "status", "--porcelain", "--untracked-files=all")
+            if status.returncode != 0:
+                return {"state": "failed", "reason": "linked-worktree-status-unresolved",
+                        "detail": (status.stderr or status.stdout).strip(), "cwd": original}
+            if status.stdout.strip():
+                return {"state": "retained-linked", "reason": "linked-worktree-dirty",
+                        "cwd": original, "path": str(Path(source_top).resolve()),
+                        "branch": _git(source_top, "symbolic-ref", "-q", "--short", "HEAD"),
+                        "base": framed_base["sha"], "base_sha": framed_base["sha"],
+                        "preparation_key": key}
+            ancestry = _worktree_git(source_top, "merge-base", "--is-ancestor", "HEAD", framed_base["sha"])
+            if ancestry.returncode == 1:
+                return {"state": "retained-linked", "reason": "linked-worktree-unmerged",
+                        "cwd": original, "path": str(Path(source_top).resolve()),
+                        "branch": _git(source_top, "symbolic-ref", "-q", "--short", "HEAD"),
+                        "base": framed_base["sha"], "base_sha": framed_base["sha"],
+                        "preparation_key": key}
+            if ancestry.returncode != 0:
+                return {"state": "failed", "reason": "linked-worktree-ancestry-unresolved",
+                        "detail": (ancestry.stderr or ancestry.stdout).strip(), "cwd": original}
+
         worktree_root = Path(primary).parent / f"{Path(primary).name}-wt"
         try:
             worktree_root.mkdir(parents=True, exist_ok=True)
@@ -10844,7 +10933,11 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         base = retry_base or ({"branch": record.get("remote_default"), "sha": reserved[2]}
                               if reserved is not None else {"branch": None, "sha": None})
         if reserved is None and retry_base is None:
-            base, reason, detail = _remote_default_base(primary)
+            base = framed_base
+            if base is None:
+                base, reason, detail = _remote_default_base(primary)
+            else:
+                reason = detail = None
             if reason:
                 return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
         candidates = []
@@ -11739,19 +11832,32 @@ def main():
         worktree=None
         if a.start and not a.explain:
             selection = compose_route(**compose_args, selection_only=True)
-            if _isolates_worktree(selection):
+            is_framed = selection.get("shape") == "framed"
+            if _isolates_worktree(selection) or is_framed:
                 approved_leg_cwd = bool((route_plan_binding or {}).get("leg", {}).get("cwd"))
                 prep_key = _compose_preparation_key(compose_args, route_plan_binding, a.prompt_file)
-                worktree = prepare_isolated_worktree(
-                    cwd, a.slug, artifact_root=artifact_root, preparation_key=prep_key,
-                    explicitly_approved=cwd_was_explicit or approved_leg_cwd)
-                print("worktree_prepared=" + worktree["state"] + "".join(
-                    f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason") if worktree.get(key)),
-                    file=sys.stderr)
+                prepare_kwargs = {
+                    "cwd": cwd, "slug": a.slug, "artifact_root": artifact_root,
+                    "preparation_key": prep_key,
+                    "explicitly_approved": cwd_was_explicit or approved_leg_cwd,
+                }
+                if is_framed:
+                    prepare_kwargs["framed_start"] = True
+                worktree = prepare_isolated_worktree(**prepare_kwargs)
+                if not (is_framed and worktree.get("state") == "failed"):
+                    print("worktree_prepared=" + worktree["state"] + "".join(
+                        f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason")
+                        if worktree.get(key)), file=sys.stderr)
                 if worktree.get("state") == "failed":
-                    raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
-                                     + (":" + worktree["detail"] if worktree.get("detail") else "")
-                                     + "; retry the same compose --start request; its identity is retained")
+                    if is_framed:
+                        detail = " ".join(str(worktree.get("detail") or "").split())
+                        reason = " ".join(str(worktree.get("reason") or "unknown").split())
+                        print(f"framed_worktree_fallback={reason}" + (f" detail={detail}" if detail else ""),
+                              file=sys.stderr)
+                    else:
+                        raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
+                                         + (":" + worktree["detail"] if worktree.get("detail") else "")
+                                         + "; retry the same compose --start request; its identity is retained")
                 if worktree.get("cwd") and os.path.realpath(worktree["cwd"]) != os.path.realpath(cwd):
                     final_cwd = worktree["cwd"]
                     compose_args["cwd"] = final_cwd
@@ -11762,6 +11868,8 @@ def main():
                     compose_args["registered_headless_evidence"] = None
                     DISPATCH_DEFAULTS_WARNINGS.clear()
         route=compose_route(**compose_args)
+        if worktree is not None and selection.get("shape") == "framed":
+            route = _seal_framed_worktree(route, worktree)
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan

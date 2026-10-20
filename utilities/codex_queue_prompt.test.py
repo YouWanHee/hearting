@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import importlib.machinery
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -21,6 +22,39 @@ sys.modules[spec.name] = hook
 spec.loader.exec_module(hook)
 
 class PromptReceiptTest(unittest.TestCase):
+    def test_runtime_completion_trailer_is_received_as_runtime_by_the_codex_hook(self):
+        peer_spec = importlib.util.spec_from_file_location(
+            "codex_runtime_prompt_peer", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(peer_spec)
+        peer_spec.loader.exec_module(peer)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            recipient = {"harness": "codex", "session_id": "codex-runtime-recipient"}
+            duty = "registered-batch-" + "d" * 32
+            attempt = "att-codex-runtime"
+            delivery = "delivery-codex-runtime"
+            refs = [duty, attempt, delivery]
+            producer = {
+                "schema": peer._RUNTIME_PRODUCER_SCHEMA, "duty_id": duty,
+                "jobs": str(jobs), "attempt_id": attempt, "carrier": "codex-native-queue",
+                "delivery_id": delivery, "receipt_digest": "e" * 64,
+                "recipient": recipient, "route_id": "rt-codex", "route_node": "execute",
+            }
+            env = {"AGENT_PEER_LEDGER_ROOT": str(root), "AGENT_DISPATCH_JOBS": str(jobs),
+                   "HOME": str(root / "home"), "XDG_STATE_HOME": str(root / "state")}
+            with mock.patch.dict(os.environ, env, clear=True):
+                text, ref = peer.prepare_peer_message(
+                    "[notice] runtime completion", {"harness": "runtime", "session_id": None,
+                    "name": "Hearting runtime"}, recipient, defer=True, refs=refs,
+                    producer_binding=producer)
+                hook.peer_notice({"session_id": recipient["session_id"]}, text, str(root))
+                received = peer._read_pending(ref)
+                self.assertEqual(received["state"], "received")
+                self.assertEqual(received["from"]["harness"], "runtime")
+                self.assertEqual(received["producer_binding"], producer)
+
     def test_failed_send_is_visible_only_to_exact_parent_and_acked_after_render(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -141,7 +175,7 @@ class PromptReceiptTest(unittest.TestCase):
 
     def test_prompt_guidance_receives_exact_codex_payload_identity(self):
         import types
-        prompt = "actual Codex prompt (peer-from: claude [0a] peer ; ref=abc)"
+        prompt = "actual Codex prompt (runtime-from: runtime [?] Hearting runtime ; ref=abc)"
         sid = "codex-payload-session"
         calls = []
 
