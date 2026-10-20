@@ -65,6 +65,40 @@ class PaneOwnershipTest(unittest.TestCase):
                          ("w:p1", expected_endpoint, binding["socket_path"]))
         self.assertNotEqual(seat.key, st._pane_seat_of("w:p1").key)
 
+    def test_daemon_enqueue_and_start_hook_share_bound_endpoint(self):
+        import session_tidy_clear as clear
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        successor = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+        bindings = {
+            current: {"pid": 1234, "pid_start": "77", "session_id": current,
+                      "pane": "w:p1", "socket_path": "/run/herdr/actual.sock"},
+            successor: {"pid": 1234, "pid_start": "77", "session_id": successor,
+                        "pane": "w:p1", "socket_path": "/run/herdr/actual.sock"},
+        }
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(temp) / "state"),
+                                             "XDG_CONFIG_HOME": str(Path(temp) / "config"),
+                                             "CODEX_THREAD_ID": current, "HERDR_PANE_ID": "foreign-pane",
+                                             "HERDR_SOCKET_PATH": "/run/herdr/foreign.sock"}, clear=True), \
+                mock.patch.object(po, "_caller_runtime",
+                                  return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_caller_binding", side_effect=lambda sid, **_kw: bindings.get(sid)), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("codex", temp, sid=current)
+            self.assertEqual((seat.kind, seat.pane, seat.socket_path),
+                             ("pane", "w:p1", "/run/herdr/actual.sock"))
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "codex", current, "앞 세대 카드", cwd=temp)
+            self.assertEqual(clear.schedule_for_enqueue(seat, "codex", current, temp), "clear=scheduled")
+            request = clear.read_reservation(seat.key)
+            self.assertEqual(request["herdr_transport"], {"socket_path": "/run/herdr/actual.sock"})
+            os.environ["CODEX_THREAD_ID"] = successor
+            shown = []
+            text = st.run_hook("codex", "start", successor, source="clear", cwd=temp, emit=shown.append)
+            self.assertIn("앞 세대 카드", text)
+            self.assertEqual(st.resolve_seat("codex", temp, sid=successor).key, seat.key)
+
     def test_import_adds_tools_path_for_isolated_utilities_entrypoint(self):
         utilities = str(ROOT / "utilities")
         script = (
