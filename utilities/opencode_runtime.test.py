@@ -57,6 +57,131 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                          "opencode/model#high")
 
 
+class OpenCodePermissionCodecTest(unittest.TestCase):
+    @staticmethod
+    def reference_effect(rows, action, resource):
+        """Independent V2 last-match oracle for the simple documented wildcard grammar."""
+        import fnmatch
+        effect = None
+        for row in rows:
+            if fnmatch.fnmatchcase(action, row["action"]) and fnmatch.fnmatchcase(
+                    resource, row["resource"]):
+                effect = row["effect"]
+        return effect
+
+    def check_projection(self, rows, actions, resources):
+        config = {"permissions": rows}
+        projected = runtime.opencode_v2_to_legacy_config(config)
+        for action in actions:
+            for resource in resources:
+                expected = self.reference_effect(rows, action, resource)
+                actual = None
+                for pattern, effect in runtime.opencode_permission_rules_for_action(
+                        projected["permission"], action) or ():
+                    import fnmatch
+                    if fnmatch.fnmatchcase(resource, pattern):
+                        actual = effect
+                self.assertEqual(actual, expected, (action, resource, rows, projected))
+
+    def test_scalar_object_and_action_aliases_share_the_legacy_comparison_view(self):
+        self.assertEqual(runtime.opencode_permission_ordered_view("allow"),
+                         runtime.opencode_permission_ordered_view({"*": "allow"}))
+        self.assertEqual(runtime.opencode_permission_ordered_view({"bash": "allow"}),
+                         runtime.opencode_permission_ordered_view(
+                             {"bash": {"*": "allow"}}))
+        rows = runtime.opencode_legacy_to_v2_config({"permission": {
+            "write": {"/approved/**": "allow"},
+            "patch": {"/approved/**": "deny"},
+            "edit": {"*": "deny"},
+            "bash": "allow", "task": {"agent/*": "deny"},
+        }})["permissions"]
+        self.assertEqual([row["action"] for row in rows],
+                         ["edit", "edit", "edit", "shell", "subagent"])
+        self.assertEqual(self.reference_effect(rows, "edit", "/approved/file"), "deny")
+        self.assertEqual(self.reference_effect(rows, "shell", "git status"), "allow")
+        self.assertEqual(self.reference_effect(rows, "subagent", "agent/build"), "deny")
+
+    def test_legacy_bash_command_shorthand_overlap_stays_order_sensitive(self):
+        first = runtime.opencode_permission_ordered_view({
+            "bash *": {"*": "deny"}, "bash": {"*": "allow"},
+        })
+        second = runtime.opencode_permission_ordered_view({
+            "bash": {"*": "allow"}, "bash *": {"*": "deny"},
+        })
+        self.assertNotEqual(first, second)
+
+    def test_interleaved_action_wildcards_and_repeated_resources_keep_last_match(self):
+        rows = [
+            {"action": "edit", "resource": "*", "effect": "deny"},
+            {"action": "*", "resource": "/approved/**", "effect": "allow"},
+            {"action": "e*", "resource": "/approved/**", "effect": "deny"},
+            {"action": "edit", "resource": "*", "effect": "allow"},
+        ]
+        self.check_projection(rows, ("edit", "read", "execute"),
+                              ("/approved/file", "/other/file", "*"))
+        repeated = [
+            {"action": "edit", "resource": "*", "effect": "deny"},
+            {"action": "edit", "resource": "/approved/**", "effect": "allow"},
+            {"action": "edit", "resource": "*", "effect": "deny"},
+        ]
+        projected = runtime.opencode_v2_to_legacy_config({"permissions": repeated})
+        self.assertEqual(runtime.opencode_permission_rules_for_action(
+            projected["permission"], "edit"),
+            [("/approved/**", "allow"), ("*", "deny")])
+        self.check_projection(repeated, ("edit",), ("/approved/file", "/other/file"))
+
+    def test_resource_overlaps_selected_agent_and_native_v2_shape(self):
+        source = {
+            "theme": "system",
+            "permissions": [
+                {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "/approved/**", "effect": "allow"},
+                {"action": "edit", "resource": "/approved/private/**", "effect": "deny"},
+            ],
+            "agents": {"build": {"description": "kept", "permissions": [
+                {"action": "edit", "resource": "*", "effect": "allow"},
+                {"action": "edit", "resource": "/approved/private/**", "effect": "deny"},
+            ]}, "research": {"mode": "subagent", "permissions": []}},
+        }
+        original = json.loads(json.dumps(source))
+        legacy = runtime.opencode_v2_to_legacy_config(source)
+        self.assertEqual(source, original)
+        self.assertEqual(legacy["agent"]["build"]["description"], "kept")
+        self.assertEqual(legacy["agent"]["research"]["mode"], "subagent")
+        self.assertEqual(runtime.opencode_permission_ordered_view(
+            legacy["permission"]), runtime.opencode_permission_ordered_view(
+                runtime.opencode_permission_from_config(source)))
+        encoded = runtime.opencode_legacy_to_v2_config(legacy, original_v2=source)
+        self.assertIn("permissions", encoded)
+        self.assertIn("agents", encoded)
+        self.assertNotIn("permission", encoded)
+        self.assertNotIn("agent", encoded)
+        self.assertEqual(encoded["theme"], "system")
+        self.assertEqual(runtime.opencode_permission_ordered_view(
+            runtime.opencode_permission_from_config(encoded)),
+            runtime.opencode_permission_ordered_view(legacy["permission"]))
+        self.check_projection(source["permissions"], ("edit",),
+                              ("/approved/file", "/approved/private/file", "/other"))
+
+    def test_malformed_or_empty_v2_permissions_do_not_become_allow_rows(self):
+        for malformed in (None, {}, [{"action": "edit", "resource": "*", "effect": True}],
+                          [{"action": "edit", "resource": "*", "effect": "allow",
+                            "extra": "discarded"}]):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                runtime.opencode_v2_to_legacy_config({"permissions": malformed})
+        for missing in (None, {}):
+            self.assertEqual(runtime.opencode_permission_ordered_view(missing), [])
+        with self.assertRaises(ValueError):
+            runtime.opencode_permission_ordered_view([])
+
+    def test_v2_action_pattern_that_collides_with_a_legacy_alias_fails_clearly(self):
+        config = {"permissions": [
+            {"action": "b*", "resource": "*", "effect": "allow"},
+        ]}
+        with self.assertRaisesRegex(ValueError, "conflicts with the V1 'bash' alias"):
+            runtime.opencode_v2_to_legacy_config(config)
+
+
 class OpenCodeCredentialReadTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
