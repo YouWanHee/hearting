@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -112,6 +113,47 @@ class _TmpRootMixin:
                     if line.strip():
                         recs.append(json.loads(line))
         return recs
+
+
+def _hold_receipt_transition_locks(mode, jobs_lock, pane, server, socket_path,
+                                   ready, jobs_released, release, hold_seconds):
+    """Hold the cooperating writer locks in a real process for receipt tests."""
+    import dispatch_seat_handover
+
+    fd = None
+    jobs_locked = False
+    seat_lock = None
+    try:
+        if mode in {"jobs", "both"}:
+            fd = os.open(jobs_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            jobs_locked = True
+        if mode in {"seat", "both"}:
+            seat_lock = dispatch_seat_handover.readiness_transition_lock(
+                pane, server, socket_path)
+            seat_lock.__enter__()
+        ready.set()
+        if mode == "both":
+            time.sleep(hold_seconds)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            jobs_locked = False
+            jobs_released.set()
+            release.wait(5)
+        elif mode == "jobs":
+            time.sleep(hold_seconds)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            jobs_locked = False
+            jobs_released.set()
+        else:
+            release.wait(5)
+    finally:
+        if seat_lock is not None:
+            seat_lock.__exit__(None, None, None)
+        if jobs_locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        if fd is not None:
+            os.close(fd)
+        jobs_released.set()
 
 
 def _herdr_json(payload):
@@ -1523,6 +1565,15 @@ class _WatchMixin(_TmpRootMixin):
 
 
 class WatchDeadlineTest(unittest.TestCase):
+    def test_receipt_transition_reuses_the_arm_monotonic_deadline(self):
+        absolute = peer_steward._watch_deadline(
+            60_000, wall=1_000, monotonic=100, boot_id="boot-a")
+        arm = {"timeout": 60_000, "deadline": absolute}
+        self.assertEqual(peer_steward._watch_monotonic_deadline(
+            arm, wall=1_001, monotonic=101, boot_id="boot-a"), 160)
+        self.assertEqual(peer_steward._watch_monotonic_deadline(
+            arm, wall=1_050, monotonic=150, boot_id="boot-a"), 160)
+
     def test_same_boot_deadline_uses_monotonic_time_after_wall_clock_reversal(self):
         deadline = peer_steward._watch_deadline(
             60_000, wall=1_000, monotonic=100, boot_id="boot-a")
@@ -10619,6 +10670,272 @@ class NativeReceivingTurnSettlementTests(unittest.TestCase):
             self.assertEqual(send.call_args.kwargs["client_message_id"], continuation_id)
             self.assertEqual(duty["state"], "pending")
             self.assertEqual(duty["observation"]["continuation_source_turn"], "turn-exact")
+
+
+class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        from dispatch_contract import process_start_ticks
+        import session_tidy
+
+        self.server = "receipt-lock-server"
+        self.socket_path = str(self.tmp_root / "herdr.sock")
+        self.pane = "w1:p55"
+        self.watch_id = "a1b2c3d4e5f60718"
+        self.watch_root = Path(peer_steward._watch_root())
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        self.paths = peer_steward._watch_paths(self.watch_id, self.watch_root)
+        self.start = str(process_start_ticks(os.getpid()))
+        self.identity = {
+            "server": self.server, "endpoint": self.socket_path,
+            "pane": self.pane, "harness": "claude", "session_id": "target-session",
+            "shell_pid": os.getpid(), "shell_start": self.start,
+            "native_state": "idle", "purpose": "completion",
+        }
+        self.steward_sid = "receipt-lock-steward"
+        steward_seat = session_tidy.Seat(
+            "pane", "receipt-lock-steward-seat", "w1:p56", "claude",
+            sid=self.steward_sid, endpoint=self.socket_path).as_dict()
+        self.arm = {
+            "watch_id": self.watch_id, "target": "target-agent", "server": self.server,
+            "armed_ts": "2026-10-21T00:00:00Z", "agent": {
+                "pane": self.pane, "harness": "claude", "session_id": "target-session",
+                "name": "target-agent",
+            },
+            "pane_identity": {"shell_pid": os.getpid(), "shell_start": self.start},
+            "steward": {"harness": "claude", "session_id": self.steward_sid,
+                        "project": str(self.tmp_root)},
+            "steward_seat": steward_seat,
+            "watcher": {"pid": os.getpid(), "pid_start": self.start},
+            "refs": [],
+        }
+        self.native_wait = {
+            "state": "result", "agent_state": "idle", "agent": self.arm["agent"],
+            "reason": "native-idle", "done_ts": "2026-10-21T00:00:01Z",
+        }
+        self.token = "receipt-lock-request-token"
+        self.observation = {
+            "watch_id": self.watch_id, "state": "pending",
+            "native_wait": self.native_wait,
+            "readiness_transition": {
+                "token": self.token, "identity": self.identity,
+                "consumer": {"pid": os.getpid(), "pid_start": self.start},
+                "requested_at": time.time(),
+            },
+        }
+        peer_steward._write_json_atomic(self.paths.arm, self.arm)
+        peer_steward._write_json_atomic(self.paths.observation, self.observation)
+        self.store = peer_steward.peer_obligations.ObligationStore()
+        peer_steward.shared_readiness.publish_runner_incarnation(
+            self.store.root, os.getpid(), self.start, "receipt-lock-incarnation")
+        self._publish_transition_response()
+        self.receipt = {
+            "schema_version": 1, "watch_id": self.watch_id,
+            "target": "target-agent", "server": self.server,
+            "steward": self.arm["steward"], "armed_ts": self.arm["armed_ts"],
+            "done_ts": "2026-10-21T00:00:02Z", "state": "idle",
+            "agent": self.arm["agent"], "herdr_exit": 0,
+            "watcher": self.arm["watcher"], "rearmed_from": None, "refs": [],
+        }
+
+    def _publish_transition_response(self):
+        peer_steward.shared_readiness.publish_watch_transition(
+            self.store.root, self.watch_id, self.identity, self.token,
+            {"state": "ready", "reason": "native-turn-ready"},
+            producer_pid=os.getpid(), producer_start=self.start,
+            incarnation="receipt-lock-incarnation",
+            generation={"path": str(self.jobs_path), "signature": [1, 2, 3]},
+            lineage={"shell_pid": os.getpid(), "shell_start": self.start},
+            authority={"rows": [], "handover_keys": []})
+
+    @contextlib.contextmanager
+    def _holder(self, mode, *, hold_seconds=0.08):
+        ctx = multiprocessing.get_context("fork")
+        ready, jobs_released, release = ctx.Event(), ctx.Event(), ctx.Event()
+        process = ctx.Process(
+            target=_hold_receipt_transition_locks,
+            args=(mode, str(self.jobs_path) + ".lock", self.pane, self.server,
+                  self.socket_path, ready, jobs_released, release, hold_seconds))
+        process.start()
+        try:
+            self.assertTrue(ready.wait(3), f"{mode} writer did not acquire its lock")
+            yield jobs_released
+        finally:
+            release.set()
+            process.join(3)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+            self.assertEqual(process.exitcode, 0, f"{mode} writer exit={process.exitcode}")
+
+    def _publish_receipt(self, *, deadline=None, readiness=None):
+        readiness = readiness or SimpleNamespace(state="ready", reason="native-turn-ready")
+        readiness_patch = ({"side_effect": readiness} if callable(readiness)
+                           else {"return_value": readiness})
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward.herdr_observation,
+                                  "socket_path_for_endpoint", return_value=self.socket_path), \
+                mock.patch.object(peer_steward, "_watch_transition_readiness",
+                                  **readiness_patch):
+            return peer_steward._watch_publish_ready_receipt(
+                "target-agent", "idle", self.arm,
+                {"pane": self.pane, "harness": "claude", "session_id": "target-session"},
+                self.server, self.watch_id, self.paths, self.receipt, deadline=deadline)
+
+    def _probe_jobs_writer_progress(self):
+        fd = os.open(str(self.jobs_path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.fail("jobs writer remained blocked after the seat acquisition failed")
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _runner_pass(self, wake):
+        readiness_identity = {
+            "server": self.server, "pane": self.pane, "harness": "claude",
+            "session_id": "target-session",
+            "pid_birth": f"{os.getpid()}:{self.start}",
+        }
+        def ready(*_args, authority_out=None, **_kwargs):
+            if authority_out is not None:
+                authority_out.update(rows=[], handover_keys=[])
+            return SimpleNamespace(state="ready", reason="native-turn-ready",
+                                   identity=tuple(readiness_identity.items()))
+        transport = SimpleNamespace(observe=lambda: object(), close=lambda: None)
+        snapshot = {"watch_root": self.watch_root, "watches": ((self.watch_id, self.arm),)}
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward, "_runner_readiness_transport",
+                                  return_value=transport), \
+                mock.patch.object(peer_steward, "_target_from_readiness_view",
+                                  return_value=("idle", self.arm["agent"], 0, "")), \
+                mock.patch.object(peer_steward, "_retire_pane_info",
+                                  return_value={"shell_pid": os.getpid(),
+                                                "foreground_processes": []}), \
+                mock.patch.object(peer_steward, "_pane_readiness", side_effect=ready), \
+                mock.patch.object(peer_steward, "_wake_watch_observer", wake), \
+                mock.patch.object(peer_steward.shared_readiness,
+                                  "publish_target_projection", return_value=False):
+            return peer_steward._publish_watch_readiness(
+                self.store, snapshot,
+                read_context=SimpleNamespace(registry_view=lambda *_a, **_k: None),
+                incarnation="receipt-lock-incarnation")
+
+    def test_jobs_lock_contention_releases_to_writer_and_receipt_completes(self):
+        with self._holder("jobs", hold_seconds=0.08):
+            started = time.monotonic()
+            result = self._publish_receipt()
+            elapsed = time.monotonic() - started
+        self.assertTrue(result)
+        self.assertLess(elapsed, peer_steward._WATCH_TRANSITION_LOCK_BUDGET_SEC + 0.15)
+        self.assertEqual(peer_steward._read_json(self.paths.receipt)["state"], "idle")
+
+    def test_seat_contention_is_bounded_and_releases_partial_jobs_ownership(self):
+        with self._holder("seat"):
+            started = time.monotonic()
+            result = self._publish_receipt()
+            elapsed = time.monotonic() - started
+            self.assertEqual(result, peer_steward._WATCH_RECEIPT_CONTENDED)
+            self.assertLess(elapsed, 0.34)
+            self._probe_jobs_writer_progress()
+        self.assertFalse(self.paths.receipt.exists())
+
+    def test_jobs_then_seat_share_one_remaining_budget(self):
+        with self._holder("both", hold_seconds=0.14) as jobs_released:
+            started = time.monotonic()
+            result = self._publish_receipt()
+            elapsed = time.monotonic() - started
+            self.assertEqual(result, peer_steward._WATCH_RECEIPT_CONTENDED)
+            self.assertTrue(jobs_released.is_set())
+            self.assertLess(elapsed, 0.30, f"two independent lock budgets took {elapsed:.3f}s")
+            self._probe_jobs_writer_progress()
+        self.assertFalse(self.paths.receipt.exists())
+
+    def test_watch_deadline_during_lock_acquisition_uses_terminal_timeout_receipt(self):
+        with self._holder("jobs", hold_seconds=0.4):
+            deadline = time.monotonic() + 0.07
+            started = time.monotonic()
+            result = self._publish_receipt(deadline=deadline)
+            elapsed = time.monotonic() - started
+        self.assertEqual(result, peer_steward._WATCH_RECEIPT_EXPIRED)
+        self.assertLess(elapsed, 0.18)
+        self.assertFalse(self.paths.receipt.exists())
+        terminal = peer_steward._write_terminal_watch_receipt(
+            self.watch_id, self.arm, "watch-deadline")
+        self.assertEqual((terminal["state"], terminal["reason"]),
+                         ("timeout", "watch-deadline"))
+
+    def test_watch_deadline_during_fresh_authority_blocks_late_receipt(self):
+        deadline = time.monotonic() + 0.04
+        def late_ready(*_args, **_kwargs):
+            time.sleep(0.07)
+            return SimpleNamespace(state="ready", reason="native-turn-ready")
+        result = self._publish_receipt(deadline=deadline, readiness=late_ready)
+        self.assertEqual(result, peer_steward._WATCH_RECEIPT_EXPIRED)
+        self.assertFalse(self.paths.receipt.exists())
+        terminal = peer_steward._write_terminal_watch_receipt(
+            self.watch_id, self.arm, "watch-deadline")
+        self.assertEqual((terminal["state"], terminal["reason"]),
+                         ("timeout", "watch-deadline"))
+
+    def test_unchanged_runner_response_recovers_once_after_lock_contention(self):
+        jobs_before = self.jobs_path.read_bytes()
+        runner_wake_fd = peer_steward.shared_readiness.open_runner_wake(self.store.root)
+        try:
+            with self._holder("seat"):
+                result = self._publish_receipt()
+            self.assertEqual(result, peer_steward._WATCH_RECEIPT_CONTENDED)
+            self.assertEqual(os.read(runner_wake_fd, 32), b"\0")
+        finally:
+            os.close(runner_wake_fd)
+        pending = peer_steward._read_json(self.paths.observation)
+        self.assertEqual(pending.get("native_wait"), self.native_wait)
+        self.assertEqual(pending.get("readiness_transition", {}).get("token"), self.token)
+        self.assertIsNone(peer_steward.shared_readiness.watch_transition_result(
+            self.store.root, self.watch_id, self.identity, self.token))
+
+        wake = mock.Mock(return_value=True)
+        self.assertTrue(self._runner_pass(wake))
+        self.assertEqual(wake.call_count, 1)
+        response = peer_steward.shared_readiness.watch_transition_result(
+            self.store.root, self.watch_id, self.identity, self.token)
+        self.assertEqual(response["state"], "ready")
+        self.assertTrue(self._runner_pass(wake))
+        self.assertEqual(wake.call_count, 1, "steady ready response woke the watcher again")
+        self.assertEqual(self.jobs_path.read_bytes(), jobs_before)
+
+        result = self._publish_receipt()
+        self.assertTrue(result)
+        self.assertEqual(peer_steward._read_json(self.paths.receipt)["watch_id"], self.watch_id)
+        peer_steward._prepare_watch_notice(self.watch_id, self.arm, self.receipt)
+        peer_steward._record(
+            to_harness="claude", to_name="target-agent", kind="notice", ref=[],
+            receipt=self.watch_id, status="received",
+            summary_text=f"[notice] watch {self.watch_id} state=idle target=target-agent",
+            from_identity=(self.steward_sid, "claude", str(self.tmp_root)))
+        notices = [row for row in self._all_records()
+                   if row.get("kind") == "notice"
+                   and (row.get("delivery") or {}).get("receipt") == self.watch_id]
+        self.assertEqual(len(notices), 1)
+
+        from dispatch_seat_handover import acknowledge_watch, watch_ack_valid
+        self.assertEqual(acknowledge_watch(
+            self.watch_id, "claude", self.steward_sid, "receipt-lock-recovery"), "created")
+        self.assertTrue(watch_ack_valid(
+            self.paths.ack, self.watch_id, "claude", self.steward_sid))
+        receipt_bytes = self.paths.receipt.read_bytes()
+        self.assertFalse(self._runner_pass(wake))
+        self.assertEqual(self.paths.receipt.read_bytes(), receipt_bytes)
+        self.assertEqual(acknowledge_watch(
+            self.watch_id, "claude", self.steward_sid, "receipt-lock-reconnect"), "already")
+        self.assertEqual(len([row for row in self._all_records()
+                             if row.get("kind") == "notice"
+                             and (row.get("delivery") or {}).get("receipt") == self.watch_id]), 1)
+        self.assertEqual(wake.call_count, 1)
 
 
 class SharedReadinessRunnerTest(unittest.TestCase):

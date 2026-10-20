@@ -463,7 +463,7 @@ def watch_transition_result(root, watch_id, identity, request_token, *,
 
 
 def clear_watch_transition(root, watch_id):
-    """Drop the bounded response when its exact watch has settled."""
+    """Drop one watch's bounded response; its observation keeps the request token for refresh."""
     try:
         _watch_transition_path(root, watch_id).unlink()
     except FileNotFoundError:

@@ -2627,6 +2627,17 @@ _WATCH_STATES = _AGENT_STATES + (
 _JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4,
               "pane-exited": 2, "steward-exited": 0, "superseded": 0}
 _WATCH_WAKE_FD = None
+_WATCH_TRANSITION_LOCK_BUDGET_SEC = 0.2
+_WATCH_RECEIPT_CONTENDED = "contended"
+_WATCH_RECEIPT_EXPIRED = "watch-deadline"
+
+
+class _WatchTransitionLockBusy(RuntimeError):
+    """The shared receipt lock budget expired before both locks were held."""
+
+
+class _WatchDeadlineExpired(RuntimeError):
+    """The watch's original monotonic deadline expired at the receipt edge."""
 
 
 def _watch_wakeup_signal(_signum, _frame):
@@ -3024,6 +3035,43 @@ def _watch_timeout_remaining_ms(arm, *, wall=None, monotonic=None, boot_id=None)
     except (TypeError, ValueError, OverflowError):
         return None, "unknown"
     return value, "expired" if value <= 0 else "active"
+
+
+def _watch_monotonic_deadline(arm, *, wall=None, monotonic=None, boot_id=None):
+    """Resolve the arm's one absolute deadline into this process's monotonic clock."""
+    timeout = (arm or {}).get("timeout")
+    if timeout is None:
+        return None
+    try:
+        requested = int(timeout)
+    except (TypeError, ValueError):
+        return None
+    if requested <= 0:
+        return time.monotonic() if monotonic is None else float(monotonic)
+    now_wall = time.time() if wall is None else float(wall)
+    now_mono = time.monotonic() if monotonic is None else float(monotonic)
+    current_boot = _boot_id() if boot_id is None else boot_id
+    deadline = (arm or {}).get("deadline")
+    if not isinstance(deadline, dict):
+        armed_ts = (arm or {}).get("armed_ts")
+        try:
+            armed_wall = datetime.datetime.strptime(
+                armed_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            return None
+        deadline = {"wall_deadline": armed_wall + requested / 1000.0,
+                    "requested_ms": requested}
+    try:
+        original = min(requested, max(0, int(deadline.get("requested_ms", requested))))
+        cap = now_mono + original / 1000.0
+        if (deadline.get("boot_id") and current_boot
+                and deadline.get("boot_id") == current_boot
+                and isinstance(deadline.get("monotonic_deadline"), (int, float))):
+            return min(cap, float(deadline["monotonic_deadline"]))
+        return min(cap, now_mono + float(deadline["wall_deadline"]) - now_wall)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def _steward_seat(harness, sid):
@@ -3973,6 +4021,7 @@ def cmd_watch_run(args):
     observation = _read_json(paths.observation) or {}
     wait_record = observation.get("native_wait") if isinstance(observation, dict) else None
     remaining_ms, deadline_state = _watch_timeout_remaining_ms(arm)
+    deadline = _watch_monotonic_deadline(arm)
     if deadline_state == "unknown":
         wait_record = {"state": "unknown", "reason": "watch-timeout-deadline-unverifiable"}
         _write_watch_observation(paths, {
@@ -4285,9 +4334,55 @@ def cmd_watch_run(args):
                     os._exit(0)
 
         if not terminal_reason:
-            deadline = (None if remaining_ms is None else
-                        time.monotonic() + max(0, remaining_ms) / 1000.0)
             awaiting_readiness = False
+            receipt = None
+            receipt_published = False
+            receipt_rejected = False
+            readiness_transition_pending = False
+
+            def publish_ready_result(result_state, result_agent):
+                nonlocal state, agent, receipt, receipt_published
+                nonlocal receipt_rejected, readiness_transition_pending, terminal_reason
+                nonlocal awaiting_readiness
+                state, agent = result_state, result_agent
+                pid = os.getpid()
+                receipt = {
+                    "schema_version": _WATCH_SCHEMA,
+                    "watch_id": args.watch_id,
+                    "target": args.target,
+                    "server": server,
+                    "steward": {
+                        "harness": args.steward_harness,
+                        "session_id": args.steward_session_id,
+                        "project": args.steward_project,
+                    },
+                    "armed_ts": args.armed_ts,
+                    "done_ts": _utc_now(),
+                    "state": state,
+                    "agent": agent,
+                    "herdr_exit": _LAST_HERDR_EXIT if _LAST_HERDR_EXIT is not None else -1,
+                    "watcher": {"pid": pid, "pid_start": process_start_ticks(pid) or ""},
+                    "rearmed_from": args.rearmed_from or None,
+                    "refs": list(args.ref or []),
+                    "observer_generation": getattr(args, "rearm_count", 0) + 1,
+                }
+                result = _watch_publish_ready_receipt(
+                    args.target, state, arm, expected, server, args.watch_id,
+                    paths, receipt, deadline=deadline)
+                if result is True:
+                    receipt_published = True
+                    return "published"
+                if result == _WATCH_RECEIPT_EXPIRED:
+                    terminal_reason = "watch-deadline"
+                    state, agent = "timeout", expected_agent
+                    return "expired"
+                readiness_transition_pending = True
+                if result == _WATCH_RECEIPT_CONTENDED:
+                    awaiting_readiness = True
+                    return "retry"
+                receipt_rejected = True
+                return "rejected"
+
             while True:
                 terminal_reason = _terminal_watch_request(paths, expected, server)
                 if terminal_reason:
@@ -4379,7 +4474,10 @@ def cmd_watch_run(args):
                                 args.target, result_state, arm, expected, server,
                                 args.watch_id, paths)
                             if readiness.state == "ready":
-                                state, agent = result_state, wait_record.get("agent") or expected_agent
+                                action = publish_ready_result(
+                                    result_state, wait_record.get("agent") or expected_agent)
+                                if action == "retry":
+                                    continue
                                 break
                             observation = {**observation, "state": "pending",
                                            "reason": readiness.reason or result_state,
@@ -4412,8 +4510,11 @@ def cmd_watch_run(args):
                             args.target, wait_record.get("agent_state"), arm, expected, server,
                             args.watch_id, paths)
                         if readiness.state == "ready":
-                            state, agent = (wait_record.get("agent_state"),
-                                            wait_record.get("agent") or expected_agent)
+                            action = publish_ready_result(
+                                wait_record.get("agent_state"),
+                                wait_record.get("agent") or expected_agent)
+                            if action == "retry":
+                                continue
                             break
                         observation = {**observation, "state": "pending",
                                        "reason": readiness.reason or "shared-readiness-pending",
@@ -4450,8 +4551,10 @@ def cmd_watch_run(args):
                                 args.target, result_state, arm, expected, server,
                                 args.watch_id, paths)
                             if readiness.state == "ready":
-                                state, agent = result_state, wait_record.get("agent") or expected_agent
-                                break
+                                action = publish_ready_result(
+                                    result_state, wait_record.get("agent") or expected_agent)
+                                if action != "retry":
+                                    break
 
         if terminal_reason:
             _stop_watch_wait(wait_proc, wait_pid, wait_start)
@@ -4460,7 +4563,8 @@ def cmd_watch_run(args):
                                                    "pid_start": process_start_ticks(os.getpid()) or ""})
             os._exit(0)
 
-        if (wait_record or {}).get("state") == "result":
+        if ((wait_record or {}).get("state") == "result"
+                and not receipt_published and not readiness_transition_pending):
             _write_watch_observation(paths, {
                 **observation, "state": "settled", "reason": "native-wait-result-consumed",
                 "native_wait": wait_record, "observed_ts": _utc_now(),
@@ -4489,31 +4593,33 @@ def cmd_watch_run(args):
             with contextlib.suppress(ValueError):
                 signal.signal(signal.SIGUSR1, previous_usr1)
 
-    pid = os.getpid()
-    receipt = {
-        "schema_version": _WATCH_SCHEMA,
-        "watch_id": args.watch_id,
-        "target": args.target,
-        "server": server,
-        "steward": {
-            "harness": args.steward_harness,
-            "session_id": args.steward_session_id,
-            "project": args.steward_project,
-        },
-        "armed_ts": args.armed_ts,
-        "done_ts": _utc_now(),
-        "state": state,
-        "agent": agent,
-        "herdr_exit": _LAST_HERDR_EXIT if _LAST_HERDR_EXIT is not None else -1,
-        "watcher": {"pid": pid, "pid_start": process_start_ticks(pid) or ""},
-        "rearmed_from": args.rearmed_from or None,
-        "refs": list(args.ref or []),
-        "observer_generation": getattr(args, "rearm_count", 0) + 1,
-    }
+    if receipt_rejected:
+        os._exit(0)
+
+    if receipt is None:
+        pid = os.getpid()
+        receipt = {
+            "schema_version": _WATCH_SCHEMA,
+            "watch_id": args.watch_id,
+            "target": args.target,
+            "server": server,
+            "steward": {
+                "harness": args.steward_harness,
+                "session_id": args.steward_session_id,
+                "project": args.steward_project,
+            },
+            "armed_ts": args.armed_ts,
+            "done_ts": _utc_now(),
+            "state": state,
+            "agent": agent,
+            "herdr_exit": _LAST_HERDR_EXIT if _LAST_HERDR_EXIT is not None else -1,
+            "watcher": {"pid": pid, "pid_start": process_start_ticks(pid) or ""},
+            "rearmed_from": args.rearmed_from or None,
+            "refs": list(args.ref or []),
+            "observer_generation": getattr(args, "rearm_count", 0) + 1,
+        }
     if state in {"idle", "done"}:
-        if not _watch_publish_ready_receipt(
-                args.target, state, arm, expected, server,
-                args.watch_id, paths, receipt):
+        if not receipt_published:
             os._exit(0)
     else:
         _write_json_atomic(paths.receipt, receipt)
@@ -5474,23 +5580,68 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
 
 
 @contextlib.contextmanager
-def _watch_transition_authority_lock(identity, server):
-    """Join the existing jobs and target-seat writer locks for one receipt edge."""
+def _watch_transition_authority_lock(identity, server, *, deadline=None):
+    """Join jobs then target-seat locks within one bounded receipt-edge budget."""
     import dispatch_seat_handover
 
+    now = time.monotonic()
+    transition_deadline = now + _WATCH_TRANSITION_LOCK_BUDGET_SEC
+    if deadline is not None:
+        transition_deadline = min(transition_deadline, float(deadline))
+        if now >= deadline:
+            raise _WatchDeadlineExpired("watch-deadline")
     store = peer_obligations.ObligationStore()
     jobs = store.root.parents[1] / "jobs.log"
     lock_path = Path(str(jobs) + ".lock")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    jobs_locked = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                jobs_locked = True
+                break
+            except BlockingIOError as exc:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    raise _WatchDeadlineExpired("watch-deadline") from exc
+                remaining = transition_deadline - now
+                if remaining <= 0:
+                    raise _WatchTransitionLockBusy("jobs-lock-busy") from exc
+                time.sleep(min(0.05, remaining))
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            raise _WatchDeadlineExpired("watch-deadline")
+        if now >= transition_deadline:
+            raise _WatchTransitionLockBusy("jobs-lock-budget-expired")
         socket_path = herdr_observation.socket_path_for_endpoint(server)
-        with dispatch_seat_handover.readiness_transition_lock(
-                identity.get("pane"), server, socket_path):
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            raise _WatchDeadlineExpired("watch-deadline")
+        remaining = transition_deadline - now
+        if remaining <= 0:
+            raise _WatchTransitionLockBusy("seat-lock-budget-expired")
+        seat_lock = dispatch_seat_handover.readiness_transition_lock(
+            identity.get("pane"), server, socket_path, wait=remaining)
+        try:
+            seat_lock.__enter__()
+        except BlockingIOError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _WatchDeadlineExpired("watch-deadline") from exc
+            raise _WatchTransitionLockBusy("seat-lock-busy") from exc
+        try:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                raise _WatchDeadlineExpired("watch-deadline")
+            if now >= transition_deadline:
+                raise _WatchTransitionLockBusy("seat-lock-budget-expired")
             yield
+        finally:
+            seat_lock.__exit__(None, None, None)
     finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        if jobs_locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -5626,30 +5777,56 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
 
 
 def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
-                                 watch_id, paths, receipt):
+                                 watch_id, paths, receipt, *, deadline=None):
     """Refresh mutable authority and publish the receipt under its writer locks."""
-    latest = _read_json(paths.observation) or {}
-    wait_record = latest.get("native_wait") or {}
     reason = "shared-readiness-authority-lock-unavailable"
+    if deadline is not None and time.monotonic() >= deadline:
+        return _WATCH_RECEIPT_EXPIRED
     try:
         identity = _watch_readiness_identity(arm, native_state)
         if identity is None:
             reason = "shared-readiness-identity-unavailable"
             raise ValueError(reason)
-        with _watch_transition_authority_lock(identity, server):
+        with _watch_transition_authority_lock(identity, server, deadline=deadline):
+            if deadline is not None and time.monotonic() >= deadline:
+                return _WATCH_RECEIPT_EXPIRED
             readiness = _watch_transition_readiness(
                 target, native_state, arm, expected, server,
                 watch_id, paths, authority_lock_held=True)
+            if deadline is not None and time.monotonic() >= deadline:
+                return _WATCH_RECEIPT_EXPIRED
             if readiness.state != "ready":
                 reason = readiness.reason or "shared-readiness-pending"
             else:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return _WATCH_RECEIPT_EXPIRED
                 _write_json_atomic(paths.receipt, receipt)
                 return True
+    except _WatchDeadlineExpired:
+        return _WATCH_RECEIPT_EXPIRED
+    except _WatchTransitionLockBusy:
+        if deadline is not None and time.monotonic() >= deadline:
+            return _WATCH_RECEIPT_EXPIRED
+        latest = _read_json(paths.observation) or {}
+        _write_watch_observation(paths, {
+            **latest, "state": "pending",
+            "reason": "shared-readiness-authority-lock-busy",
+            "observed_ts": _utc_now(),
+        })
+        try:
+            root = peer_obligations.ObligationStore().root
+            shared_readiness.clear_watch_transition(root, watch_id)
+            shared_readiness.wake_runner(root)
+            peer_obligations.ensure_normal_runner(reconciliation_required=True)
+        except Exception:
+            pass
+        return _WATCH_RECEIPT_CONTENDED
     except (OSError, ValueError, RuntimeError):
-        pass
+        if deadline is not None and time.monotonic() >= deadline:
+            return _WATCH_RECEIPT_EXPIRED
     _write_watch_observation(paths, {
-        **latest, "state": "pending", "reason": reason,
-        "native_wait": wait_record, "observed_ts": _utc_now(),
+        **(_read_json(paths.observation) or {}),
+        "state": "pending", "reason": reason, "observed_ts": _utc_now(),
     })
     return False
 
