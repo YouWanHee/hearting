@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
@@ -21,7 +22,10 @@ FIX = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = FIX
 spec.loader.exec_module(FIX)
 SUP, WS = FIX.SUP, FIX.WS
+ROOT = FIX.ROOT
 import dispatch_resource_wait as WAIT
+import dispatch_contract as DC
+import route_authority as RA
 
 
 class ResourceSequenceTest(FIX.WorkflowFixture):
@@ -41,6 +45,51 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         arm.write_text(json.dumps(armed))
         (output / 'run.json').unlink()
         return route, path, jobs, registry, output, ledger
+
+    def live_owner(self, route, jobs, registry):
+        import dispatch_owner_input as INPUT
+        identity = SUP.RR.proc_identity(os.getpid())
+        attempt = 'att-owner'
+        lease = DC.supervisor_lease_path(jobs, attempt)
+        nonce = 'd' * 64
+        metadata = {
+            'attempt_schema_version': '2', 'dispatch_depth': '1',
+            'transport': 'headless', 'execution_surface': 'registered-headless',
+            'registered_worker': '1', 'fallback_hop': 'same-harness-headless',
+            'worker_type': 'owner', 'unit': '_kernel/owner', 'harness': 'codex',
+            'runtime_sandbox': 'workspace-write', 'completion_delivery': 'app-server-supervised',
+            'supervisor_lease': DC.SUPERVISOR_LEASE_KIND,
+            'supervisor_lease_file': str(lease), 'supervisor_lease_nonce': nonce,
+            'attempt_id': attempt, 'pid': str(identity['pid']), 'pid_start': identity['starttime'],
+            'owner_route_id': route['route_id'], 'owner_route_hash': route['route_hash'],
+            'route_id': route['route_id'], 'route_hash': route['route_hash'],
+            'parent_sid': 'fixture-parent-session',
+            'capability': route['capability'], 'capability_mode': route['capability_mode'],
+            'intensity': route['effective_intensity'],
+        }
+        row = '\t'.join(['2026-10-20T00:00:00Z', 'open', str(self.base), str(self.base),
+                         'fixture-owner', ','.join(f'{key}={value}' for key, value in metadata.items())])
+        with Path(jobs).open('a', encoding='utf-8') as stream:
+            stream.write(row + '\n')
+        lease_context = DC.hold_supervisor_lease(jobs, attempt, lease)
+        lease_context.__enter__()
+        self.addCleanup(lease_context.__exit__, None, None, None)
+        owner_input = INPUT.OwnerInput(jobs, attempt, 'same-native', 'codex-active-turn', lambda _: None)
+        self.addCleanup(owner_input.close)
+        resource_data = json.loads(registry.read_text())
+        armed_path = SUP.ledger_for(route, jobs).root / 'armed/full-run.json'
+        armed = json.loads(armed_path.read_text())
+        resource_row = resource_data['runs'][armed['predecessor_id']]
+        resource_row['parent_attempt_id'] = attempt
+        resource_row['owner_wait'].update(
+            parent_attempt_id=attempt, session_id='same-native', route_id=route['route_id'],
+            route_hash=route['route_hash'], jobs=str(Path(jobs).resolve()),
+            owner_pid=str(identity['pid']), owner_start=identity['starttime'],
+        )
+        registry.write_text(json.dumps(resource_data))
+        armed['resource_binding'] = WAIT.resource_body_digest(resource_row)
+        armed_path.write_text(json.dumps(armed))
+        return attempt, owner_input
 
     def next_body(self, registry, name, output, *, final=False):
         old = json.loads(registry.read_text())['runs']['fixture-run']
@@ -103,8 +152,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             self.assertEqual(proc.wait(timeout=5), exit_code)
         return payloads, json.loads(out.getvalue().splitlines()[-1])
 
-    def test_guard_exit_same_route_resume_preserves_checkpoint_and_advances_to_run_verify(self):
-        import dispatch_owner_input as INPUT
+    def test_guard_exit_same_route_resume_preserves_checkpoint_until_owner_successor_start(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         registry.write_text(json.dumps({'schema_version': 1, 'runs': {}}))
         (ledger.root / 'armed/full-run.json').unlink()
@@ -136,31 +184,15 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'resumed')
         self.assertTrue(any((entry.get('evidence') or {}).get('previous_resource') == old_arm
                             for entry in ledger.journal()))
-        @contextlib.contextmanager
-        def locked(*a):
-            yield None, {'target': 'same', 'thread_id': 'same-native', 'requests': []}
-        verifier = self.base / 'verifier-starts'
-        def start_verifier(armed, successor, key):
-            self.assertEqual(successor, 'run-verify')
-            subprocess.run([sys.executable, '-c',
-                f'from pathlib import Path; assert Path({str(output / "run.json")!r}).read_text() == {json.dumps({"phase":"resumed"})!r}; '
-                f'Path({str(verifier)!r}).open("a").write("run-verify\\n")'], check=True)
-            ledger.record(successor, 'RUNNING', evidence={'claim': key}, actor='fixture-verifier')
-            return {'started': True, 'surface': 'fixture-external-verifier'}
-        with mock.patch.object(INPUT, '_locked', locked), \
-                mock.patch.object(INPUT, '_target', return_value=(None, 'same')), \
-                mock.patch.object(SUP, '_start_successor', side_effect=start_verifier):
-            advanced = SUP.poll_once(route, ledger)[0]
-            self.assertEqual(advanced['action'], 'advanced')
-            self.assertEqual([item['successor'] for item in advanced['successors']], ['run-verify'])
-            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
-        self.assertEqual(len(ledger.claims()), 1)
-        self.assertEqual(verifier.read_text(), 'run-verify\n')
-        self.assertEqual(ledger.state()['nodes']['run-verify']['state'], 'RUNNING')
+        result = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(result['action'], 'wait-next-resource')
+        self.assertTrue(result['evidence']['succeeded'])
+        self.assertEqual(len(ledger.claims()), 0)
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+        self.assertFalse((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').exists())
         self.assertEqual(json.loads(registry.read_text())['runs']['paused'], old)
         self.assertEqual((Path(old['sentinel']).read_bytes(), Path(old['log']).read_bytes()), old_bytes)
         self.assertEqual(json.loads((output / 'run.json').read_text()), {"phase":"resumed"})
-        self.assertTrue((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').is_file())
 
     def test_rebooted_running_resource_without_sentinel_is_settled_before_real_successor(self):
         route, path, jobs, registry, output, ledger = self.fixture()
@@ -618,6 +650,202 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, 'completed')
         self.assertTrue(ledger.journal_path.read_bytes().startswith(journal))
 
+    def test_prepared_owner_manifest_stays_provisional_until_existing_successor_start(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        producer = output / 'run.json'
+        prepared = b'{"state":"prepared","runs":[{"status":"prepared"}]}\n'
+        producer.write_bytes(prepared)
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        attempt = 'att-verify'
+        args = SimpleNamespace(
+            route_file=str(path), route_node='run-verify', attempt_id=attempt,
+            jobs=str(jobs), agent_home=ROOT, worktree=str(self.base), dispatch_depth=2,
+            parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
+            parent_harness='codex', parent_transport='headless',
+            parent_sandbox='workspace-write', subsession_id=None,
+        )
+        marker_path = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+        before = ledger.journal_path.read_bytes()
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+             mock.patch('subprocess.check_output', return_value=str(self.base)):
+            self.assertIsNone(RA.completion_gate(
+                args, 'register', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(ledger.journal_path.read_bytes(), before)
+            refused = RA.completion_gate(
+                args, 'dry-run', ROOT, jobs, gate=DC.completion_marker_gate,
+            )
+            self.assertIsNotNone(refused)
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(ledger.journal_path.read_bytes(), before)
+            import dispatch_owner_input as INPUT
+            queued = INPUT.submit(jobs, owner_attempt, 'apply the pending correction first', 'pending')
+            self.assertEqual(queued['requests'][0]['state'], 'queued')
+            blocked = RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            )
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked[0], 'resource-owner-stage-admission-blocked')
+            self.assertFalse(marker_path.exists())
+            owner_state = INPUT._path(jobs, owner_attempt)
+            correction_state = json.loads(owner_state.read_text())
+            correction_state['requests'][0]['state'] = 'delivered'
+            owner_state.write_text(json.dumps(correction_state))
+            self.assertIsNone(RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
+            marker_bytes = marker_path.read_bytes()
+            self.assertIsNone(RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
+        self.assertEqual(producer.read_bytes(), prepared)
+        self.assertEqual(json.loads(marker_bytes)['resource_execution_identity'],
+                         ledger.state()['nodes']['full-run']['evidence']['identity'])
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+        self.assertEqual(len(ledger.claims()), 1)
+        self.assertEqual(marker_path.read_bytes(), marker_bytes)
+
+    def test_old_poll_false_success_and_unstarted_claim_recover_on_same_route(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        producer = output / 'run.json'
+        producer.write_bytes(b'{"state":"prepared","runs":[{"status":"prepared"}]}\n')
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        polled = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(polled['action'], 'wait-next-resource')
+        armed = SUP.read_armed(ledger)['full-run']
+        evidence = dict(polled['evidence'])
+        evidence.pop('awaiting_next_resource', None)
+        evidence.pop('runtime_only_output', None)
+        marker_path = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+        marker = SUP.route_module().write_completion_marker(
+            route, WS.route_node(route, 'full-run'), 'full-run', producer, jobs=jobs,
+        )
+        ledger.record('full-run', 'STAGE_SUCCEEDED', evidence=evidence, actor='poll')
+        old_claims = SUP._claim_successors(route, ledger, armed, 'full-run',
+                                           armed['successors'], evidence)
+        self.assertTrue(old_claims[0]['created'])
+        old_marker_bytes = marker_path.read_bytes()
+        old_claim_key = old_claims[0]['claim']
+        old_claim_bytes = ledger.claim_path(old_claim_key).read_bytes()
+
+        failed_next = self.next_body(registry, 'validation__a2', output)
+        prior_row = json.loads(registry.read_text())['runs']['fixture-run']
+        failed_next.update(
+            parent_attempt_id=owner_attempt, owner_wait=dict(prior_row['owner_wait']),
+            started_at=float(prior_row['ended_at']) + 1.0, status='failed',
+            workflow_state='FAILED_RETRYABLE', failure_class='resource-launch-incomplete',
+            launch_state='not-started', exit_code=None, ended_at=time.time(),
+        )
+        data = json.loads(registry.read_text())
+        data['runs'][failed_next['run_id']] = failed_next
+        registry.write_text(json.dumps(data))
+
+        with ledger.lock():
+            self.assertTrue(SUP.reconcile_legacy_supervised_resource_success(route, ledger, armed))
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+        self.assertEqual(ledger.claims(), {})
+        self.assertEqual(ledger.claim_history()[old_claim_key]['successor'], 'run-verify')
+        self.assertEqual(ledger.claim_path(old_claim_key).read_bytes(), old_claim_bytes)
+        self.assertEqual(marker_path.read_bytes(), old_marker_bytes)
+        self.assertFalse(DC.completion_marker_is_current(
+            route, WS.route_node(route, 'full-run'), marker_path, marker, jobs=jobs,
+        ))
+
+        actual = self.next_body(registry, 'full-run__a3', output)
+        processes, receipt = self.launch(route, path, jobs, registry, output, actual)
+        self.assertEqual(len(processes), 1)
+        self.assertTrue(receipt['payload_spawned'])
+        self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], prior_row)
+        self.assertEqual(producer.read_bytes(), b'{"state":"prepared","runs":[{"status":"prepared"}]}\n')
+        self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-next-resource')
+        args = SimpleNamespace(
+            route_file=str(path), route_node='run-verify', attempt_id='att-verify',
+            jobs=str(jobs), agent_home=ROOT, worktree=str(self.base), dispatch_depth=2,
+            parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
+            parent_harness='codex', parent_transport='headless',
+            parent_sandbox='workspace-write', subsession_id=None,
+        )
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+             mock.patch('subprocess.check_output', return_value=str(self.base)):
+            self.assertIsNone(RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
+        current_marker = json.loads(marker_path.read_text())
+        self.assertGreater(current_marker['sequence'], marker['sequence'])
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+        self.assertEqual(len(ledger.claims()), 1)
+        self.assertEqual(ledger.claim_path(old_claim_key).read_bytes(), old_claim_bytes)
+        self.assertEqual(len(ledger.claim_history()), 2)
+        self.assertTrue(DC.completion_marker_is_current(
+            route, WS.route_node(route, 'full-run'), marker_path, current_marker, jobs=jobs,
+        ))
+
+    def test_owner_successor_start_retries_marker_journal_and_claim_crash_boundaries(self):
+        for crash_after in ('marker', 'journal', 'claim'):
+            with self.subTest(crash_after=crash_after):
+                case = ResourceSequenceTest()
+                case.setUp()
+                try:
+                    route, path, jobs, registry, output, ledger = case.fixture()
+                    (output / 'run.json').write_bytes(b'{"state":"done"}\n')
+                    case.live_owner(route, jobs, registry)
+                    args = SimpleNamespace(
+                        route_file=str(path), route_node='run-verify', attempt_id='att-verify',
+                        jobs=str(jobs), agent_home=ROOT, worktree=str(case.base), dispatch_depth=2,
+                        parent_slug='fixture-owner', parent_attempt_id='att-owner',
+                        parent_harness='codex', parent_transport='headless',
+                        parent_sandbox='workspace-write', subsession_id=None,
+                    )
+                    marker_path = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+                    record = WS.WorkflowLedger.record
+                    claim = WS.WorkflowLedger.claim
+                    def interrupted_record(instance, node, state, **kwargs):
+                        if crash_after == 'marker' and node == 'full-run' and state == 'STAGE_SUCCEEDED':
+                            raise OSError('crash after marker before journal')
+                        result = record(instance, node, state, **kwargs)
+                        if crash_after == 'journal' and node == 'full-run' and state == 'STAGE_SUCCEEDED':
+                            raise OSError('crash after stage journal')
+                        return result
+                    def interrupted_claim(instance, key, payload):
+                        result = claim(instance, key, payload)
+                        if crash_after == 'claim' and payload.get('predecessor') == 'full-run':
+                            raise OSError('crash after exclusive successor claim')
+                        return result
+                    with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                         mock.patch('subprocess.check_output', return_value=str(case.base)), \
+                         mock.patch.object(WS.WorkflowLedger, 'record', interrupted_record), \
+                         mock.patch.object(WS.WorkflowLedger, 'claim', interrupted_claim):
+                        refused = RA.completion_gate(
+                            args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+                        )
+                        self.assertIsNotNone(refused)
+                        self.assertEqual(refused[0], 'resource-owner-start-authority-unavailable')
+                    self.assertTrue(marker_path.is_file())
+                    marker_bytes = marker_path.read_bytes()
+                    claim_files = {item.name: item.read_bytes() for item in ledger.claims_dir.glob('*.claim')}
+                    if crash_after == 'claim':
+                        self.assertEqual(len(claim_files), 1)
+                    else:
+                        self.assertEqual(claim_files, {})
+                    with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                         mock.patch('subprocess.check_output', return_value=str(case.base)):
+                        self.assertIsNone(RA.completion_gate(
+                            args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+                        ))
+                    self.assertEqual(marker_path.read_bytes(), marker_bytes)
+                    claim_files_after = {
+                        item.name: item.read_bytes() for item in ledger.claims_dir.glob('*.claim')
+                    }
+                    self.assertEqual(len(claim_files_after), 1)
+                    if crash_after == 'claim':
+                        self.assertEqual(claim_files_after, claim_files)
+                    self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+                    self.assertEqual(len(ledger.claim_history()), 1)
+                    self.assertEqual(ledger.state()['workflow_state'], 'NEXT_REGISTERED')
+                finally:
+                    case.doCleanups()
+
     def test_three_sequential_runs_and_old_replay_preserve_history_then_advance_once(self):
         import dispatch_owner_input as INPUT
         route, path, jobs, registry, output, ledger = self.fixture()
@@ -639,16 +867,29 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(len(procs), 1)
         self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
         self.assertEqual(Path(old['sentinel']).read_bytes(), old_sentinel)
-        @contextlib.contextmanager
-        def locked(*a):
-            yield None, {'target': 'same', 'thread_id': 'same-native', 'requests': []}
-        with mock.patch.object(INPUT, '_locked', locked), \
-                mock.patch.object(INPUT, '_target', return_value=(None, 'same')), \
-                mock.patch.object(SUP, '_start_successor', return_value={'started': False, 'surface': 'external'}) as start:
-            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'advanced')
-            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
-            self.assertEqual(start.call_count, 1)
+        self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-next-resource')
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+        self.assertEqual(ledger.claims(), {})
+        owner_attempt, _owner_input = self.live_owner(route, jobs, registry)
+        args = SimpleNamespace(
+            route_file=str(path), route_node='run-verify', attempt_id='att-verify',
+            jobs=str(jobs), agent_home=ROOT, worktree=str(self.base), dispatch_depth=2,
+            parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
+            parent_harness='codex', parent_transport='headless',
+            parent_sandbox='workspace-write', subsession_id=None,
+        )
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+             mock.patch('subprocess.check_output', return_value=str(self.base)):
+            self.assertIsNone(RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
+            marker_bytes = (jobs.parent / 'completion' / route['route_id'] / 'full-run.json').read_bytes()
+            self.assertIsNone(RA.completion_gate(
+                args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+            ))
         self.assertEqual(len(ledger.claims()), 1)
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+        self.assertEqual((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').read_bytes(), marker_bytes)
         self.assertEqual(json.loads((output / 'run.json').read_text()), {"phase":"final"})
         self.assertNotEqual(ledger.state()['workflow_state'], 'COMPLETE')
         final_armed = SUP.read_armed(ledger)['full-run']
