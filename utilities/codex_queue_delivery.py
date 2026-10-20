@@ -573,7 +573,7 @@ def _observe_peer_message(path, thread_id, client_message_id, *, timeout,
 
         rows = history_db.execute(
             "SELECT ti.turn_id, ti.item_id, ti.item_type, ti.item_json, "
-            "tt.turn_id AS confirmed_turn_id "
+            "tt.turn_id AS confirmed_turn_id, tt.status AS confirmed_turn_status "
             "FROM thread_items AS ti "
             "LEFT JOIN thread_turns AS tt "
             "ON tt.thread_id = ti.thread_id AND tt.turn_id = ti.turn_id "
@@ -602,7 +602,12 @@ def _observe_peer_message(path, thread_id, client_message_id, *, timeout,
                 return _PeerObservation("conflict", reason="candidate-content-conflict")
             if not projection_complete:
                 return unknown("native-projection-incomplete")
-            return _PeerObservation("matched", {"id": turn_id, "items": [item]})
+            # The confirmed turn's own status is the receiving-turn evidence a
+            # consumed completion is retained with; without it, proven
+            # consumption could never be accepted.
+            return _PeerObservation("matched", {"id": turn_id,
+                                                "status": row["confirmed_turn_status"],
+                                                "items": [item]})
         if not projection_complete:
             return unknown("native-projection-incomplete")
         return _PeerObservation("not_observed")

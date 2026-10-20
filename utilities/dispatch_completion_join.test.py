@@ -5473,5 +5473,105 @@ class AcknowledgedCompletionRecoveryTest(unittest.TestCase):
                     parent_completion_delivery="codex-native-queue"))
 
 
+class CachedBatchDeliveryStateTest(unittest.TestCase):
+    """A cached outcome is judged by the exact per-child ledger it owes."""
+
+    ATTEMPT = "att-cached"
+    REVISION = "row-revision-1"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("fixture\n")
+        self.meta = {"delivery_intent": "1", "parent_sid": "thread-parent",
+            "parent_completion_delivery": "codex-native-queue",
+            "delivery_id": "delivery-" + "c" * 32, "delivery_receipt_digest": "sha256:exact",
+            "delivery_row_revision": self.REVISION, "attempt_id": self.ATTEMPT}
+        self.row = SimpleNamespace(status="done", metadata=self.meta)
+        child = {"attempt_id": self.ATTEMPT, "status": "done", "readiness": "ready",
+                 "reason": "registry-closed", "required_action": "advance-completed",
+                 "harness": "codex"}
+        self.cached = {"schema_version": 2, "state": "ready",
+            "parent_attempt_id": "parent-session-digest", "job_registry": str(self.jobs),
+            "children": [child], "delivery_timing": {"join_completed_ns": 1}}
+        # The legacy terminal writer kept scope out of the body and omitted
+        # the child reason the observer's normalized outcome carries.
+        legacy_child = {key: value for key, value in child.items() if key != "reason"}
+        self.record = {"state": "pending", "recipient_kind": "codex-native-queue",
+            "attempt_ids": [self.ATTEMPT], "receipt_digest": "sha256:exact",
+            "row_revisions": {self.ATTEMPT: self.REVISION}, "acked_by": None,
+            "receipt": {"schema_version": 2, "state": "delivered", "job_registry": "",
+                        "parent_attempt_id": "", "children": [legacy_child]}}
+        identity = {"delivery_id": self.meta["delivery_id"], "route_id": "rt-exact",
+            "route_node": "execute", "parent_attempt_id": "parent-attempt",
+            "row_revisions": {self.ATTEMPT: self.REVISION}}
+        import dispatch_pending_delivery as pending
+        self.pending = pending
+        for patcher in (
+                mock.patch.object(JOIN, "current_attempt_row", side_effect=lambda *a, **k: self.row),
+                mock.patch.object(JOIN, "pending_record_identity",
+                                  return_value=("rt-exact", "execute", "parent-attempt")),
+                mock.patch("dispatch_seat_handover.effective_parent", return_value="thread-parent"),
+                mock.patch("dispatch_contract.terminal_conflict_pending", return_value=False),
+                mock.patch.object(pending, "read", side_effect=lambda *a, **k: self.record),
+                mock.patch.object(pending, "received_ack_identity", return_value=identity)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def state(self, cached=None):
+        return JOIN.cached_batch_delivery_state(
+            self.jobs, {self.ATTEMPT}, recipient_sid="thread-parent",
+            parent_attempt_id="parent-session-digest",
+            parent_completion_delivery="codex-native-queue",
+            cached=self.cached if cached is None else cached)
+
+    def test_shape_only_difference_is_the_same_open_delivery(self):
+        current = JOIN.current_batch_receipt_projection(
+            self.jobs, {self.ATTEMPT}, recipient_sid="thread-parent",
+            parent_attempt_id="parent-session-digest",
+            parent_completion_delivery="codex-native-queue")
+        # The whole-body digest never matched this legacy record.
+        self.assertNotEqual(JOIN.canonical_receipt_digest(current),
+                            JOIN.canonical_receipt_digest(self.cached))
+        self.assertEqual(self.state(), "current")
+
+    def test_conflicting_shared_field_is_a_different_delivery(self):
+        changed = json.loads(json.dumps(self.cached))
+        changed["children"][0]["required_action"] = "inspect-done-failure"
+        self.assertEqual(self.state(changed), "changed")
+        changed = json.loads(json.dumps(self.cached))
+        changed["children"][0]["attempt_id"] = "att-other"
+        self.assertEqual(self.state(changed), "changed")
+
+    def test_terminal_or_pruned_ledger_resolves_the_cached_outcome(self):
+        for terminal in ("rejected", "expired", "acked"):
+            with self.subTest(terminal=terminal):
+                self.record = {**self.record, "state": terminal}
+                self.assertEqual(self.state(), "resolved")
+        self.record = None
+        record_file = self.pending.record_path(self.root, "thread-parent", self.meta["delivery_id"])
+        record_file.parent.mkdir(parents=True)
+        self.pending.tombstone_path(record_file).write_text("{}")
+        self.assertEqual(self.state(), "resolved")
+
+    def test_missing_record_without_tombstone_is_not_resolution(self):
+        # Materialization belongs to the terminal close or reconcile backstop
+        # (for example while a runtime-v1 owner completion is still pending).
+        self.record = None
+        self.assertEqual(self.state(), "unmaterialized")
+
+    def test_row_or_record_identity_drift_is_changed(self):
+        self.row = SimpleNamespace(status="open", metadata=self.meta)
+        self.assertEqual(self.state(), "changed")
+        self.row = SimpleNamespace(status="done", metadata=self.meta)
+        self.record = {**self.record, "row_revisions": {self.ATTEMPT: "stale-revision"}}
+        self.assertEqual(self.state(), "changed")
+        self.record = {**self.record, "row_revisions": {self.ATTEMPT: self.REVISION},
+                       "state": "rejected", "receipt_digest": "sha256:other"}
+        self.assertEqual(self.state(), "changed")
+
+
 if __name__ == "__main__":
     unittest.main()
