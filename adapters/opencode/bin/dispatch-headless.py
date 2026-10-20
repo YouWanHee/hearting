@@ -1211,8 +1211,15 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     # in the caller's directory edits there and sees the worktree as an outside path.
     enter = (f"cd -- {shlex.quote(args.worktree)} && "
              if args.worktree and "--dir" not in cmd else "")
-    return (enter + " ".join(shlex.quote(x) for x in cmd)
-            + f" {prompt_arg} >> {shlex.quote(os.path.abspath(log_path))} 2>&1")
+    log = shlex.quote(os.path.abspath(log_path))
+    run = enter + " ".join(shlex.quote(x) for x in cmd) + f" {prompt_arg} >> {log} 2>&1"
+    if not opencode_runtime.is_v2():
+        return run
+    # V2 ends its stream at the final text with no stop event; close the run with the
+    # owner runtime's rule (exact session, error-free final text, exit 0), same exit code.
+    terminal = " ".join(shlex.quote(x) for x in (
+        sys.executable, str(ROOT / "utilities" / "opencode-run-terminal.py"), "--log"))
+    return f'{run}; rc=$?; {terminal} {log} --exit-code "$rc"; exit "$rc"'
 
 
 def _effective_parent_cwd(args):
