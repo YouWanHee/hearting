@@ -509,6 +509,22 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(second.lines[0].split("\t", 1)[0], "x")
         self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 1)
 
+    def test_symlink_resolution_failure_invalidates_alias_and_recovers(self):
+        alias = Path(self.tmp.name) / "jobs-loop.log"
+        self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
+        alias.symlink_to(self.jobs)
+        first = CACHE.registry_view(alias)
+        alias.unlink()
+        alias.symlink_to(alias)
+        with self.assertRaises(OSError):
+            CACHE.registry_view(alias)
+        self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
+        alias.unlink()
+        alias.symlink_to(self.jobs)
+        recovered = CACHE.registry_view(alias)
+        self.assertIsNot(first, recovered)
+        self.assertEqual(recovered.lines[0].split("\t", 1)[0], "a")
+
     def test_genuine_append_keeps_prior_segment_identity(self):
         self.jobs.write_text("a\topen\t/repo\t/wt\tworker\tf=1\n", encoding="utf-8")
         first = CACHE.registry_view(self.jobs, append_only=True)
