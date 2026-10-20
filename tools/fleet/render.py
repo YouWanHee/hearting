@@ -4178,7 +4178,7 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
     width = max(1, term_width - indent_width) if term_width else None
     lines = []
     for job in jobs:
-        command = job.get("command")
+        command = job.get("command_display") or job.get("command")
         command = str(command) if isinstance(command, str) and command else "command unavailable"
         started = job.get("started_at")
         if (isinstance(started, (int, float)) and not isinstance(started, bool)
@@ -4211,10 +4211,14 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
         else:
             native_label = "native ?"
         process_label = {"alive": "proc alive", "dead": "proc dead"}.get(process, "proc ?")
+        background_label = ("background confirmed"
+                            if job.get("background_state") == "confirmed"
+                            else "background unknown")
         if job.get("quiet_suspected") and job.get("lifecycle_state") != "completed":
             output_label = "quiet ≥10m?"
         elif job.get("last_output_at") is not None:
-            output_label = "out " + _text_age(job.get("last_output_at"), now)
+            output_label = ("out sampled " if job.get("output_coverage") == "sampled"
+                            else "out ") + _text_age(job.get("last_output_at"), now)
         elif job.get("output_coverage") == "sampled":
             output_label = "out sampled"
         elif job.get("output_coverage") == "unavailable":
@@ -4222,36 +4226,44 @@ def _shell_job_rows(entity, depth=0, in_card=False, term_width=None):
         else:
             output_label = "out unknown"
         prefix = "⚙ "
-        if width is not None and width < 68:
-            native_short = {"native exit": "N:exit", "native complete": "N:done",
-                            "native running": "N:run", "native ack": "N:ack",
-                            "native ?": "N:?"}.get(native_label, "N:?")
-            if job.get("exit_code") is not None:
-                native_short = "N:" + str(job.get("exit_code"))
-            process_short = {"proc alive": "P:live", "proc dead": "P:dead"}.get(process_label, "P:?")
-            out_short = ("Q:10m?" if job.get("quiet_suspected") and job.get("lifecycle_state") != "completed"
-                         else "O:" + _text_age(job.get("last_output_at"), now).replace(" ago", "")
-                         if job.get("last_output_at") is not None
-                         else "O:sampled" if job.get("output_coverage") == "sampled" else "O:?")
-            suffix = " S%s E%s%s %s %s %s" % (start_label, elapsed_label,
-                                             " C:?" if completion_unknown else "", native_short,
-                                             process_short, out_short)
-        else:
-            suffix = " · start %s · %s · %s · %s" % (
-                start_label, elapsed_label, native_label, process_label)
-            if completion_unknown:
-                suffix += " · completion ?"
-            if output_label:
-                suffix += " · " + output_label
-        if width is not None:
-            suffix = _clip_w(suffix, max(0, width - _dw(prefix)))
-            room = max(0, width - _dw(prefix + suffix))
-            command = _clip_w(command, room)
-            text = prefix + command + suffix
-        else:
-            text = prefix + command + suffix
         key = "g_work_off" if process == "alive" else "dim"
-        lines.append([(indent, None), (text, key)])
+        metadata = ["start " + start_label, elapsed_label, background_label,
+                    native_label, process_label]
+        if completion_unknown:
+            metadata.append("completion ?")
+        metadata.append(output_label)
+        suffix = " · " + " · ".join(metadata)
+        if width is None:
+            lines.append([(indent, None), (prefix + command + suffix, key)])
+            continue
+
+        # At wide widths keep the familiar single-line row when it can retain
+        # a useful command prefix. At common widths give the command its own
+        # line and wrap metadata below it instead of letting metadata erase it.
+        command_room = width - _dw(prefix) - _dw(suffix)
+        if width >= 120 and command_room >= 32:
+            lines.append([(indent, None),
+                          (prefix + _clip_w(command, command_room) + suffix, key)])
+            continue
+
+        lines.append([(indent, None), (prefix + _clip_w(
+            command, max(1, width - _dw(prefix))), key)])
+        continuation = "  · "
+        continuation_width = max(1, width - _dw(continuation))
+        groups = []
+        current = []
+        for part in metadata:
+            candidate = " · ".join(current + [part])
+            if current and _dw(candidate) > continuation_width:
+                groups.append(current)
+                current = [part]
+            else:
+                current.append(part)
+        if current:
+            groups.append(current)
+        for group in groups:
+            detail = continuation + " · ".join(group)
+            lines.append([(indent, None), (_clip_w(detail, width), key)])
     observation = getattr(entity, "shell_job_observation", None)
     if isinstance(observation, dict):
         state = str(observation.get("state") or "unknown")

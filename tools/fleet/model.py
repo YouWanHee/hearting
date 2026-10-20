@@ -113,7 +113,20 @@ def display_shell_jobs(jobs, *, now=None):
             continue
         if now - completed <= max_age:
             keep.append(job)
-    return keep
+    def display_rank(job):
+        if not isinstance(job, dict):
+            return 1
+        state = job.get("lifecycle_state")
+        if state == "running":
+            return 0
+        if state == "completed":
+            return 2
+        return 1
+
+    # Keep each semantic group's source order stable while ensuring retained
+    # unknown-time history cannot push current or unresolved work below it.
+    return [job for _index, job in sorted(
+        enumerate(keep), key=lambda pair: (display_rank(pair[1]), pair[0]))]
 
 # Stable public name consumed by Fleet, the progress watchdog, liveness and
 # registry reconciliation.  Keeping the exact-attempt verdict here prevents
@@ -132,11 +145,16 @@ class ShellJob(TypedDict, total=False):
     native_id: str
     native_id_kind: Optional[str]
     native_record_kind: Optional[str]
+    background_state: Optional[str]
+    background_source: Optional[str]
+    background_reason: Optional[str]
     identity_link_state: Optional[str]
     native_call_id: Optional[str]
     native_task_id: Optional[str]
     continuation_handle: Optional[str]
     command: Optional[str]
+    command_display: Optional[str]
+    command_display_source: Optional[str]
     command_source: Optional[str]
     command_reason: Optional[str]
     started_at: Optional[float]

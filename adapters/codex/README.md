@@ -465,13 +465,18 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Fleet background shell rows
 
-Fleet uses exact native Codex App Server `command_execution` items and
-structured direct `exec_command`/`write_stdin` results. Continuation handles
-remain native handles, never PIDs; polling output is sampled and cannot
-establish continuous quiet or process exit by itself. JSON-looking text from an
-outer `functions.exec`/`functions.write_stdin` result is arbitrary stdout and
-cannot create or complete a job. When the native result or its provenance is
-unavailable, Fleet reports partial coverage and leaves the task unobserved.
+Fleet preserves exact Codex App Server `command_execution` lifecycle and exit
+records, but those retained items do not establish background mode; their rows
+show `background unknown`. A structured direct `exec_command` result with its
+exact integer continuation handle and no terminal result can establish a
+persistent background task. A `write_stdin` result can confirm or retain that
+classification only for the exact matching handle and an ongoing response.
+Continuation handles remain native handles, never PIDs; polling output is
+sampled and cannot establish process liveness or continuous quiet by itself.
+JSON-looking text from an outer `functions.exec`/`functions.write_stdin` result
+is arbitrary stdout and cannot create or complete a job. When the native result
+or its provenance is unavailable, Fleet reports partial coverage and leaves
+the task unobserved.
 See the [Codex shell command guide](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide#shell_command).
 
 ## Runtime compaction tidy

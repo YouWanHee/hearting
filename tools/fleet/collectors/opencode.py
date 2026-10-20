@@ -288,6 +288,10 @@ def _attach_v2_shell_tasks(sess, observed, db, session_id, *, tree=None, kids=No
             "source_locator": os.path.realpath(db), "native_id": native_id,
             "native_id_kind": native_id_kind,
             "native_record_kind": native_record_kind,
+            "background_state": "confirmed",
+            "background_source": "opencode.v2.session-message.background-true"
+            if is_native_shell else "opencode.v2.assistant-shell.input-background-true",
+            "background_reason": None,
             "identity_link_state": "ambiguous-cross-namespace-id"
             if native_id in ambiguous_ids else "native-id-unlinked",
             "native_call_id": native.get("call_id"), "command": (native.get("input") or {}).get("command"),

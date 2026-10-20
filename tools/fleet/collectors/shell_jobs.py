@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import shlex
 import stat
 import time
 from collections import OrderedDict
@@ -75,6 +76,45 @@ def command_summary(value):
     value = _SECRET.sub(r"\1[redacted]", value)
     value = _SECRET_FLAG.sub(r"\1[redacted]", value)
     return value[:MAX_COMMAND] + ("…" if len(value) > MAX_COMMAND else "") if value else None
+
+
+def _codex_shell_command_display(value):
+    """Remove only a literal native shell ``-c`` wrapper from a Codex command.
+
+    The inner text must parse as argv without unquoted shell operators,
+    expansions, or globs.
+    This is a presentation hint from a trusted native command field, never a
+    process or background inference. Arbitrary tool-script source is not read.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        wrapper = shlex.split(value)
+    except ValueError:
+        return None
+    if (len(wrapper) != 3 or os.path.basename(wrapper[0]) not in {"sh", "bash", "zsh"}
+            or wrapper[1] not in {"-c", "-lc"}):
+        return None
+    try:
+        lexer = shlex.shlex(wrapper[2], posix=True,
+                            punctuation_chars=";&|<>(){}*?~")
+        lexer.whitespace_split = True
+        command_argv = list(lexer)
+    except (ValueError, TypeError):
+        return None
+    if (not command_argv
+            or any(token and all(char in ";&|<>(){}*?~" for char in token)
+                   for token in command_argv)
+            or any("$" in token or "`" in token for token in command_argv)):
+        return None
+    # This exact project helper forwards its argv after the required --. Keep
+    # the original wrapper in `command`; summarize only its explicit payload.
+    if (len(command_argv) >= 6 and command_argv[0] in {"python", "python3"}
+            and command_argv[1] == "utilities/verification-background-lease.py"
+            and command_argv[2] == "--timeout" and command_argv[3].replace(".", "", 1).isdigit()
+            and command_argv[4] == "--"):
+        command_argv = command_argv[5:]
+    return command_summary(shlex.join(command_argv))
 
 
 def _bounded(cache, key, value, limit):
@@ -475,6 +515,10 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         "harness": "claude", "session_id": session_id,
                         "attempt_id": attempt_id, "source_generation": str(delta.get("generation")),
                         "source_locator": os.path.abspath(path), "native_id": task_id,
+                        "native_record_kind": "claude.background-bash-task-ack",
+                        "background_state": "confirmed",
+                        "background_source": "claude.bash.background-ack",
+                        "background_reason": None,
                         "native_call_id": call_id, "native_task_id": task_id,
                         "command": call.get("command"),
                         "command_source": "Bash.input.command" if call.get("command") else None,
@@ -571,6 +615,7 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
             job_key = "item:" + item_id
             prior = state["jobs"].get(job_key, {})
             completed = event_type == "item.completed"
+            command_display = _codex_shell_command_display(item.get("command"))
             output_seen = isinstance(item.get("aggregated_output"), str) and bool(
                 item.get("aggregated_output"))
             exit_code = item.get("exit_code")
@@ -580,7 +625,13 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 "source_generation": str(delta.get("generation")),
                 "source_locator": os.path.abspath(path), "native_id": job_key,
                 "native_item_id": item_id,
+                "native_record_kind": "codex.command_execution",
                 "command": command_summary(item.get("command")) or prior.get("command"),
+                "command_display": command_display or prior.get("command_display"),
+                "command_display_source": (
+                    "codex.native-shell-command.argv"
+                    if command_display
+                    else prior.get("command_display_source")),
                 "command_source": "codex.command_execution.command" if item.get("command")
                 else prior.get("command_source"),
                 "command_reason": None if item.get("command") or prior.get("command")
@@ -591,11 +642,16 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                     "codex.item.started.timestamp" if not completed and stamp is not None else None),
                 "observed_at": stamp,
                 "native_status": "completed" if completed else "running",
+                "native_status_source": "codex.item.completed" if completed
+                else "codex.item.started",
                 "completed_at": stamp if completed else prior.get("completed_at"),
                 "exit_code": exit_code if isinstance(exit_code, int)
                 and not isinstance(exit_code, bool) else prior.get("exit_code"),
                 "process_state": "unknown",
                 "process_reason": "native-command-event-has-no-process-identity",
+                "background_state": "unknown",
+                "background_source": None,
+                "background_reason": "native-command-event-does-not-expose-background-mode",
                 "output_coverage": "sampled",
                 "output_reason": "native-command-output-is-sampled" if output_seen
                 else "native-output-not-present",
@@ -678,6 +734,30 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                            if isinstance(args, dict) else None)
                 if not command:
                     command = prior.get("command")
+                returned_handle = (str(handle_value) if isinstance(handle_value, int)
+                                   and not isinstance(handle_value, bool) else None)
+                ongoing_status = status_value in {"", "running", "in_progress", "ongoing"}
+                request_handle = args.get("session_id") if isinstance(args, dict) else None
+                continuation_matches = bool(
+                    returned_handle and not terminal and ongoing_status
+                    and (call.get("name") == "exec_command"
+                         or (call.get("name") == "write_stdin"
+                             and isinstance(request_handle, int)
+                             and not isinstance(request_handle, bool)
+                             and str(request_handle) == returned_handle
+                             and call.get("handle") == returned_handle)))
+                background_state = "confirmed" if continuation_matches else (
+                    "confirmed" if prior.get("background_state") == "confirmed" else "unknown")
+                background_source = (
+                    "codex.exec_command.native-continuation-handle"
+                    if continuation_matches and call.get("name") == "exec_command"
+                    else "codex.write_stdin.native-continuation-handle"
+                    if continuation_matches and call.get("name") == "write_stdin"
+                    else prior.get("background_source"))
+                background_reason = (None if background_state == "confirmed" else
+                                    "native-result-has-no-exact-ongoing-continuation-handle")
+                command_display = _codex_shell_command_display(command) or prior.get(
+                    "command_display")
                 nested_output = detail.get("output")
                 output_seen = isinstance(nested_output, str) and bool(nested_output)
                 if not objects or detail == {}:
@@ -689,8 +769,15 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                     "harness": "codex", "session_id": session_id, "attempt_id": attempt_id,
                     "source_generation": str(delta.get("generation")),
                     "source_locator": os.path.abspath(path), "native_id": job_key,
+                    "native_record_kind": prior.get("native_record_kind") or
+                    "codex." + str(call.get("name") or "command-result"),
                     "native_call_id": call_id, "continuation_handle": handle,
                     "command": command_summary(command),
+                    "command_display": command_display,
+                    "command_display_source": (
+                        "codex.native-shell-command.argv" if command_display
+                        and _codex_shell_command_display(command) else
+                        prior.get("command_display_source")),
                     "command_source": prior.get("command_source") or (
                         ("exec_command.arguments.cmd" if args.get("cmd") is not None
                          else "exec_command.arguments.command") if command else None),
@@ -698,6 +785,10 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                     "started_at": started, "start_source": "native-call.timestamp",
                     "observed_at": stamp,
                     "native_status": "completed" if terminal else "running" if handle is not None else "unknown",
+                    "native_status_source": "codex." + str(call.get("name")) + ".structured-result",
+                    "background_state": background_state,
+                    "background_source": background_source,
+                    "background_reason": background_reason,
                     "completed_at": stamp if terminal else prior.get("completed_at"),
                     "exit_code": exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool)
                     else prior.get("exit_code"),
@@ -739,6 +830,21 @@ def normalize_job(job, *, now=None):
         return None
     result = dict(job)
     result["command"] = command_summary(result.get("command"))
+    result["command_display"] = command_summary(result.get("command_display"))
+    record_kind = result.get("native_record_kind")
+    result["native_record_kind"] = (record_kind if isinstance(record_kind, str)
+                                    and record_kind else None)
+    background_source = result.get("background_source")
+    if (result.get("background_state") == "confirmed"
+            and isinstance(background_source, str) and background_source):
+        result["background_state"] = "confirmed"
+        result["background_reason"] = None
+    else:
+        result["background_state"] = "unknown"
+        result["background_source"] = None
+        reason = result.get("background_reason")
+        result["background_reason"] = (reason if isinstance(reason, str) and reason
+                                       else "native-background-evidence-unavailable")
     result["started_at"] = valid_epoch(result.get("started_at"))
     observed_at = valid_epoch(result.get("observed_at"))
     result["observed_at"] = observed_at if observed_at is not None else now
@@ -1098,13 +1204,14 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
 
 def shell_job_strip_label(job):
     """Compact, safe display text shared by interactive and dispatch rows."""
-    command = job.get("command") or "command unavailable"
+    command = job.get("command_display") or job.get("command") or "command unavailable"
     status = ("exit %s" % job["exit_code"] if job.get("exit_code") is not None
               else "complete" if job.get("lifecycle_state") == "completed"
               else "alive" if job.get("process_state") == "alive"
               else "process dead" if job.get("process_state") == "dead"
               else "live ?")
-    parts = [command]
+    background = ("confirmed" if job.get("background_state") == "confirmed" else "unknown")
+    parts = [command, "background " + background]
     started = valid_epoch(job.get("started_at"))
     if started is not None:
         try:
@@ -1124,6 +1231,6 @@ def shell_job_strip_label(job):
     elif job.get("output_coverage") == "unavailable":
         parts.append("output ?")
     elif job.get("last_output_at") is not None:
-        age = job.get("last_output_observed_at")
-        parts.append("output observed")
+        parts.append("output sampled" if job.get("output_coverage") == "sampled"
+                     else "output observed")
     return " · ".join(parts)

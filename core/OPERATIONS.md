@@ -2567,6 +2567,11 @@ task's elapsed time uses its start and current observation time. A completed
 task's duration uses its observed native completion timestamp and stops there;
 missing, invalid, future, or pre-start completion time leaves duration unknown.
 The row never substitutes a refreshed observation timestamp for completion.
+Every shared job also carries its native record kind and a separate background
+classification: `background_state=confirmed` only with exact native evidence,
+otherwise `unknown`, with its evidence source or reason. This classification is
+independent of native lifecycle, process liveness, and output coverage; a
+continuation handle or completed command never becomes a PID or process claim.
 Completed rows use the existing 15-minute dispatch afterglow in JSON and child
 rows. Only a known completion age can expire a row; live, pending, unknown, or
 untimed terminal work stays visible. Display expiry does not remove reader cache
@@ -2607,7 +2612,22 @@ lifecycle. Output text from an outer `functions.exec`/`functions.write_stdin`
 script is arbitrary stdout and cannot create or complete a job from JSON-looking
 text; that path is reported as unobserved with partial source coverage. Pending
 call correlation is bounded; eviction that may lose a pair also makes coverage
-partial.
+partial. The retained App Server command record proves native command lifecycle
+and retains its ID, command, aggregated output, exit code, and status; it has no
+authoritative background-mode or PID field. Keep it useful as
+`native_record_kind=codex.command_execution`, preserve its observed lifecycle,
+and report `background_state=unknown` with the missing-mode reason. Do not
+promote an unrecognized raw field or infer mode from command, duration, cwd, or
+process guesses. A structured direct `exec_command` response may confirm a
+persistent background task when its exact call/output pair returns an integer
+native continuation handle and no terminal result. A `write_stdin` continuation
+may confirm or preserve that state only for the exact matching handle and an
+ongoing structured response. This handle proves a native continuation, never
+OS process liveness. A readable command summary may unwrap an exact native
+shell `-c`/`-lc` argv shape and the exact verification-lease argv delimiter
+`utilities/verification-background-lease.py --timeout N -- <argv>`, while
+retaining the original command. It does not inspect outer `functions.exec`
+source or infer an inner command from arbitrary script text.
 
 OpenCode V2 exposes two distinct native record forms: assistant `shell` tool
 parts and `session_message` rows whose type is `shell` and whose native
