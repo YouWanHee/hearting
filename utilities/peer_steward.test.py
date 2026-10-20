@@ -3682,6 +3682,169 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         return run
 
     @staticmethod
+    def _codex_process_info(pids, pane="w1:pX"):
+        return {"pane_id": pane, "shell_pid": os.getpid(),
+                "foreground_process_group_id": pids[0],
+                "foreground_processes": [{"pid": pid, "argv": ["codex"]} for pid in pids]}
+
+    def _run_immediate_codex_restart(self, scenario):
+        self._readiness_patch.stop()
+        peer_steward._HERDR_SESSION = "selected"
+        sid = "codex-thread-original"
+        replacement_sid = "codex-thread-replacement"
+        payload = _agent_json("codex", sid, "child", status="idle")
+        calls, proofs, submissions = [], [], []
+        starts = {41001: "birth-before-restart", 41002: "birth-after-restart",
+                  41003: "birth-unproven"}
+        info_rows = [self._codex_process_info([41001]),
+                     self._codex_process_info([41002]),
+                     self._codex_process_info([41002])]
+        info_rows.append(self._codex_process_info(
+            [41002, 41003] if scenario == "conflicting-proof"
+            else [41003] if scenario == "unknown-proof" else [41002]))
+        info_index = 0
+        target_calls = 0
+        native_calls = 0
+
+        def pane_info(_pane):
+            nonlocal info_index
+            info = info_rows[min(info_index, len(info_rows) - 1)]
+            info_index += 1
+            return info
+
+        def target(pane):
+            nonlocal target_calls
+            target_calls += 1
+            current_pane = ("w1:pReplacement" if scenario == "changed-pane"
+                            and target_calls >= 3 else pane)
+            return "idle", {"harness": "codex", "session_id": sid,
+                             "name": "child", "pane": current_pane}, 0, None
+
+        def native_thread(_pane, pid=None, **_kwargs):
+            nonlocal native_calls
+            native_calls += 1
+            proofs.append((pid, starts.get(pid)))
+            if scenario == "changed-sid" and native_calls >= 3:
+                return replacement_sid
+            if scenario == "unknown-proof" and native_calls >= 3:
+                return ""
+            if scenario == "conflicting-proof" and pid == 41003:
+                return replacement_sid
+            return sid
+
+        def foreground(_pane, harness, *, strict=True, info=None):
+            pid = info["foreground_processes"][0]["pid"]
+            return {"pid": pid, "start": starts[pid], "argv": [harness]}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(peer_steward.subprocess, "run",
+                                                   side_effect=self._fake_run(payload, calls)))
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_target", side_effect=target))
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_pane_info", side_effect=pane_info))
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_foreground", side_effect=foreground))
+            stack.enter_context(mock.patch.object(peer_steward, "_current_session_identity",
+                                                   return_value=("sender-session", "claude")))
+            stack.enter_context(mock.patch.object(peer_steward, "_from_name", return_value="sender"))
+            stack.enter_context(mock.patch.object(peer_steward.peer_obligations,
+                                                   "bound_work_for_pane", return_value=((), "observed")))
+            import pane_ownership
+            stack.enter_context(mock.patch.object(pane_ownership, "current_codex_thread",
+                                                   side_effect=native_thread))
+            stack.enter_context(mock.patch("codex_queue_dispatch.resolve_queue_socket",
+                                           return_value="fixture-socket"))
+            stack.enter_context(mock.patch(
+                "codex_queue_delivery.send_at_least_once",
+                side_effect=lambda _socket, **kwargs:
+                (submissions.append(kwargs) or {"status": "queued"})))
+            stack.enter_context(mock.patch("builtins.print"))
+            rc = peer_steward.main([
+                "prompt", "child", "[steer] same Codex thread through a process restart"])
+
+        record = self._all_records()[-1]
+        ref = record["transfer_ref"]
+        return rc, proofs, submissions, ref, peer_steward.peer_message._read_pending(ref)
+
+    def _run_deferred_codex_restart(self, scenario):
+        self._readiness_patch.stop()
+        peer_steward._HERDR_SESSION = "selected"
+        sid = "codex-thread-original"
+        replacement_sid = "codex-thread-replacement"
+        pane = "w1:pDeferred"
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": sid,
+                     "name": "child", "pane_id": pane}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] same Codex thread through deferred resume", sender, recipient, defer=True)
+        row = peer_steward.peer_message._read_pending(ref)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "selected", "pane": pane, "harness": "codex", "session_id": sid},
+            {"ref": ref, "body_digest": row["body_sha256"], "target": pane,
+             "from": sender, "to": row["to"]})
+        starts = {42001: "birth-before-restart", 42002: "birth-after-restart",
+                  42003: "birth-unproven"}
+        info_rows = [self._codex_process_info([42001], pane),
+                     self._codex_process_info([42002], pane)]
+        info_rows.append(self._codex_process_info(
+            [42002, 42003] if scenario == "conflicting-proof"
+            else [42003] if scenario == "unknown-proof" else [42002], pane))
+        info_index = 0
+        target_calls = 0
+        native_calls = 0
+        proofs, submissions = [], []
+
+        def pane_info(_pane):
+            nonlocal info_index
+            info = info_rows[min(info_index, len(info_rows) - 1)]
+            info_index += 1
+            return info
+
+        def target(_target):
+            nonlocal target_calls
+            target_calls += 1
+            current_pane = ("w1:pReplacement" if scenario == "changed-pane"
+                            and target_calls >= 2 else pane)
+            current_sid = (replacement_sid if scenario == "changed-sid"
+                           and target_calls >= 2 else sid)
+            return "idle", {"harness": "codex", "session_id": current_sid,
+                             "name": "child", "pane": current_pane}, 0, None
+
+        def native_thread(_pane, pid=None, **_kwargs):
+            nonlocal native_calls
+            native_calls += 1
+            proofs.append((pid, starts.get(pid)))
+            if scenario == "changed-sid" and native_calls >= 2:
+                return replacement_sid
+            if scenario == "unknown-proof" and native_calls >= 2:
+                return ""
+            if scenario == "conflicting-proof" and pid == 42003:
+                return replacement_sid
+            return sid
+
+        def foreground(_pane, harness, *, strict=True, info=None):
+            pid = info["foreground_processes"][0]["pid"]
+            return {"pid": pid, "start": starts[pid], "argv": [harness]}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_target", side_effect=target))
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_pane_info", side_effect=pane_info))
+            stack.enter_context(mock.patch.object(peer_steward, "_retire_foreground", side_effect=foreground))
+            stack.enter_context(mock.patch.object(peer_steward.peer_obligations,
+                                                   "bound_work_for_pane", return_value=((), "observed")))
+            import pane_ownership
+            stack.enter_context(mock.patch.object(pane_ownership, "current_codex_thread",
+                                                   side_effect=native_thread))
+            stack.enter_context(mock.patch("codex_queue_dispatch.resolve_queue_socket",
+                                           return_value="fixture-socket"))
+            stack.enter_context(mock.patch(
+                "codex_queue_delivery.send_at_least_once",
+                side_effect=lambda _socket, **kwargs:
+                (submissions.append(kwargs) or {"status": "queued"})))
+            peer_steward._resume_message_obligation(duty, store)
+
+        return store, duty, proofs, submissions, ref, peer_steward.peer_message._read_pending(ref)
+
+    @staticmethod
     def _pane_io_calls(calls):
         return [argv for argv in calls if argv[:3] in (
             ["herdr", "agent", "prompt"], ["herdr", "pane", "send-text"],
@@ -4195,6 +4358,49 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         record = self._all_records()[-1]
         self.assertEqual(record["delivery"]["status"], "unknown")
         self.assertIn("verify=native-queue-queued", record["delivery"]["receipt"])
+
+    def test_immediate_codex_restart_queues_the_original_sealed_thread_and_ref(self):
+        rc, proofs, submissions, ref, pending = self._run_immediate_codex_restart("same-thread")
+        self.assertEqual(rc, 3)
+        self.assertEqual({proof for proof in proofs if proof[0] in {41001, 41002}}, {
+            (41001, "birth-before-restart"), (41002, "birth-after-restart")})
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0]["thread_id"], "codex-thread-original")
+        self.assertEqual(submissions[0]["client_message_id"], "delivery-peer-" + ref)
+        self.assertEqual(submissions[0]["message"], pending["text"])
+        self.assertEqual((pending["ref"], pending["state"], pending["to"]["session_id"],
+                          pending["to"]["pane_id"]),
+                         (ref, "queued", "codex-thread-original", "w1:pX"))
+
+    def test_immediate_codex_restart_still_rejects_changed_or_unknown_current_proof(self):
+        for scenario in ("changed-sid", "changed-pane", "conflicting-proof", "unknown-proof"):
+            with self.subTest(scenario=scenario):
+                _rc, _proofs, submissions, _ref, _pending = \
+                    self._run_immediate_codex_restart(scenario)
+                self.assertEqual(submissions, [])
+
+    def test_deferred_codex_restart_queues_the_original_sealed_thread_and_ref(self):
+        store, duty, proofs, submissions, ref, pending = \
+            self._run_deferred_codex_restart("same-thread")
+        self.assertEqual({proof for proof in proofs}, {
+            (42001, "birth-before-restart"), (42002, "birth-after-restart")})
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0]["thread_id"], "codex-thread-original")
+        self.assertEqual(submissions[0]["client_message_id"], "delivery-peer-" + ref)
+        self.assertEqual(submissions[0]["message"], pending["text"])
+        self.assertEqual((pending["ref"], pending["state"], pending["to"]["session_id"],
+                          pending["to"]["pane_id"]),
+                         (ref, "queued", "codex-thread-original", "w1:pDeferred"))
+        self.assertEqual(store.get(duty["id"])["state"], "pending")
+
+    def test_deferred_codex_restart_still_rejects_changed_or_unknown_current_proof(self):
+        for scenario in ("changed-sid", "changed-pane", "conflicting-proof", "unknown-proof"):
+            with self.subTest(scenario=scenario):
+                store, duty, _proofs, submissions, _ref, pending = \
+                    self._run_deferred_codex_restart(scenario)
+                self.assertEqual(submissions, [])
+                self.assertEqual(pending["state"], "pending")
+                self.assertEqual(store.get(duty["id"])["state"], "unknown")
 
     def test_codex_exact_history_receipt_is_the_only_prompted_true(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
