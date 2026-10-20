@@ -317,12 +317,10 @@ class HerdrCollectorTest(unittest.TestCase):
     def test_absent_herdr_falls_back_to_lineage_and_only_ever_promotes(self):
         sessions = self._sessions()[:4]
         lineage = {1: "herdr", 2: "terminal", 3: None, 4: "vscode"}.get
-        real_list = herdr.list_agents
-        herdr.list_agents = lambda *a, **k: None
-        try:
+        with mock.patch.object(herdr, "observation_view", return_value=None), \
+                mock.patch.object(herdr._observation_module(), "socket_path_for_endpoint", return_value=""), \
+                mock.patch.object(herdr, "list_agents", return_value=None):
             herdr.enrich(sessions, lineage=lineage)
-        finally:
-            herdr.list_agents = real_list
         self.assertEqual([s.herdr_attached for s in sessions], [True, None, None, None])
 
 

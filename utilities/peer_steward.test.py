@@ -8525,6 +8525,21 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
                     entry = marker["targets"]["observed-sid"]
                     self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))
 
+    def test_a_refused_start_names_why_the_observed_agent_was_not_adopted(self):
+        for cwd, miss in (("", "cwd-empty"), ("/elsewhere", "cwd-mismatch")):
+            with self.subTest(cwd=cwd):
+                world = self.world("claude", error="agent_pane_busy")
+                world.cwd = cwd
+                rc, line = self.invoke("claude", world)
+                self.assertIn("started=false", line)
+                self.assertIn("reason=agent_pane_busy", line)
+                self.assertIn(f"observed={miss}", line)
+                self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 0)
+        world = self.world("claude", error="agent_pane_busy")
+        rc, line = self.invoke("claude", world)
+        self.assertIn("started=true", line)
+        self.assertNotIn("observed=", line)
+
     def test_reuse_observes_existing_pane_without_another_launch_or_keyboard_input(self):
         for kind in ("claude", "codex", "opencode"):
             with self.subTest(kind=kind):

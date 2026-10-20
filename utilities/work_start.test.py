@@ -550,14 +550,25 @@ class WorkStartTest(unittest.TestCase):
         run = self.make_run(refuse_node="frame-alternative", refuse_times=99,
                              receipt=self.refusal_receipt(retry_after_seconds=3))
         sleeps = []
-        result = W.start_work(self.route, self.path, self.jobs, run=run, wait=True,
-                               sleep=sleeps.append, clock=lambda: 1_800_000_000.0)
+        armed = []
+        with mock.patch("capacity_auto_resume.arm", side_effect=lambda result, *a, **k: armed.append(result)):
+            result = W.start_work(self.route, self.path, self.jobs, run=run, wait=True,
+                                   sleep=sleeps.append, clock=lambda: 1_800_000_000.0)
         self.assertEqual(sleeps, [3])  # exactly one wait, never a retry loop
         self.assertEqual(result["state"], "waiting-capacity", result)
         self.assertNotIn("parent_next", result)
         self.assertNotIn("parent_next_command", result)
         self.assertEqual(result["required_action"], "report-capacity-wait")
         self.assertEqual(result["capacity_waited_seconds"], 3)
+        # The bounded automatic resume, not the parent, takes the next attempt at retry_at.
+        self.assertEqual([(r["reason"], r["required_action"], r["retry_at"]) for r in armed],
+                         [("launch-capacity-wait", "report-capacity-wait", result["retry_at"])])
+        resumed = {"record": "/x.json", "resume_at": result["retry_at"], "state": "armed", "cause": "launch-capacity"}
+        with mock.patch("capacity_auto_resume.arm", return_value=resumed):
+            result = W.start_work(self.route, self.path, self.jobs, run=run, wait=True,
+                                   sleep=sleeps.append, clock=lambda: 1_800_000_000.0)
+        self.assertEqual((result["required_action"], result["parent_next"], result["auto_resume"]),
+                         ("wait-for-auto-resume", "end-turn", resumed))
 
     def test_owner_budget_refusal_is_waiting_capacity(self):
         run = self.make_run(refuse_node="owner", refuse_times=99,

@@ -781,8 +781,9 @@ def _capacity_wait(result, aid, node, refusal, resume, clock):
 
     This attempt was never created and never failed -- the registry holds no
     row for it -- so it must never be reported or treated as a failed launch.
-    A second refusal after the one bounded wait hands back without arming
-    another automatic wait (no infinite retry loop).
+    A second refusal after the one bounded wait does not wait again here; the
+    bounded automatic resume (`capacity_auto_resume`, at most three in a row)
+    runs `start` at retry_at instead of leaving that to the parent.
     """
     frees_at = refusal.get("frees_at")
     retry_epoch = frees_at if frees_at is not None else (
@@ -2301,6 +2302,12 @@ def _arm_capacity_resume(result, path, jobs):
                 "next_step": f"The owner did not start and nothing ran. The runtime runs resume_command once "
                     f"at {armed['resume_at']} and then leaves this session one notice of the result. "
                     "resume_command stays valid to try earlier."}
+    if armed.get("cause") == "launch-capacity":
+        return {**result, "auto_resume": armed, "required_action": "wait-for-auto-resume",
+                "parent_next": "end-turn", "parent_next_reason": "launch-capacity-auto-resume",
+                "next_step": f"No attempt was created or failed: the worker start budget is full. The runtime "
+                    f"runs resume_command once at {armed['resume_at']} and then leaves this session one notice "
+                    "of the result. resume_command stays valid to try earlier."}
     return {**result, "auto_resume": armed, "required_action": "wait-for-auto-resume",
             "parent_next": "end-turn", "parent_next_reason": "capacity-auto-resume",
             "next_step": f"The runtime runs resume_command once at {armed['resume_at']} and then leaves "

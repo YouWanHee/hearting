@@ -1090,6 +1090,9 @@ def _observed_start_agent(args, deadline=None, wait=False):
                 return None
             cwd = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
             if cwd and os.path.realpath(str(agent.get("cwd") or "")) != cwd:
+                # Not this start. Name the miss so a refused start receipt explains
+                # why the pane's agent was not adopted (herdr may report no cwd).
+                args.observed_miss = "cwd-mismatch" if agent.get("cwd") else "cwd-empty"
                 return None
             name = agent.get("name")
             if name and name != args.name:
@@ -1572,6 +1575,7 @@ def _start_in_pane(args):
         f"managed={managed}"
         + (f" ready=false reason={trust_wait}" if trust_wait else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
+        + (f" observed={args.observed_miss}" if not started and getattr(args, "observed_miss", None) else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
