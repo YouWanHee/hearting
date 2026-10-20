@@ -209,6 +209,20 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertNotIn("opencode_runtime_dir=", rows[0])
 
+    def test_v2_worker_command_runs_in_the_worktree_not_the_caller_directory(self):
+        # V2 has no `--dir`: a worker left in the caller's cwd works there and its
+        # external_directory boundary is measured from the wrong Location.
+        result, receipt, _calls, _spawn, worker_commands = self._invoke()
+        self.assertEqual(result, 0, receipt)
+        self.assertNotIn("--dir", worker_commands[0])
+        seen = self.root / "worker-cwd"
+        (self.bin / "opencode").write_text(f'#!/bin/sh\npwd -P > "{seen}"\n', encoding="utf-8")
+        caller = self.root / "caller"
+        caller.mkdir()
+        subprocess.run(["sh", "-c", worker_commands[0]], cwd=caller, check=True,
+                       env={**os.environ, "PATH": self.environment["PATH"]})
+        self.assertEqual(seen.read_text(encoding="utf-8").strip(), str(self.worktree.resolve()))
+
     def test_v2_wrong_location_fails_before_spawn_and_closes_attempt(self):
         result, receipt, calls, spawn, worker_commands = self._invoke(wrong_location=True)
         self.assertEqual(result, 69, receipt)

@@ -1340,6 +1340,10 @@ waiting for its declared outputs. The current launch retains its normal live
 owner/session binding. The ledger lock serializes the binding change, preserves
 the prior execution evidence, and refuses active or unobservable identities,
 completed stages, existing successor claims, unrelated failures, and parent close.
+An ended predecessor's terminal status, recorded exit code and matching sentinel
+remain exit evidence across PID namespaces. A namespace mismatch alone does not
+invalidate that recorded exit; missing or contradictory exit evidence still
+refuses replacement, and an observed live or reaping identity remains protected.
 All prior bindings protect their log, sentinel and progress paths across registries
 and path aliases. Existing active workflow progress is preserved. The final payload
 release checks parent close under the same ledger lock before publishing identity
