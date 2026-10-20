@@ -7370,12 +7370,13 @@ def write_completion_marker(
         and axes.get("registered_worker") is False
         and axes.get("execution_surface") == "inline"
     )
-    # An exact attempt replay is historical even after source drift. Check its
-    # immutable evidence/axes/history before asking for a new source binding.
-    replay_candidate = (_completion_marker_replay(
+    # An exact attempt replay is historical even after source drift. Every
+    # writer path checks its immutable evidence/axes/history before asking for
+    # a fresh source binding, so callers share the same replay decision.
+    replay_candidate = _completion_marker_replay(
         route, node, node_id, evidence, axes, directory, repair=False,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
-    ) if inline_review_write else None)
+    )
     if replay_candidate is not None:
         source_subject = None
     else:

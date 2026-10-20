@@ -964,6 +964,24 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(terminal["passed"], terminal)
 
+    def test_common_writer_checks_exact_replay_before_fresh_source_epoch(self):
+        attempt = "att-execute-common-replay-before-source"
+        marker = self.complete_node("execute", attempt, "execute evidence")
+        directory = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        history = directory / f"execute.{marker['sequence']}.json"
+        self.assertTrue(history.is_file())
+        history.unlink()
+
+        node = self.get_node("execute")
+        evidence = self.artifact_root / f"{attempt}.md"
+        metadata = self._metadata(node, attempt, "stage")
+        with self.assertRaisesRegex(
+                ValueError, "^canonical completion marker history conflict$"):
+            ROUTE_WRITER.write_completion_marker(
+                self.route, node, node["id"], evidence,
+                attempt_id=attempt, attempt_metadata=metadata, jobs=self.jobs,
+            )
+
     def test_gates_off_does_not_reuse_a_stale_review_pass(self):
         self.current_smoke_markers("A")
         _meta, a_pass = self.complete_review("att-review-gate-off-A")
