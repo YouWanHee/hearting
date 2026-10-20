@@ -595,8 +595,6 @@ class AttemptViewTests(unittest.TestCase):
         self.assertEqual(types.most_common(1), [("dispatch.supervisor.future-a", 2)])
 
 
-@unittest.skipUnless(os.environ.get("HEARTING_ATTEMPT_VIEW_LOCAL") == "1",
-                     "set HEARTING_ATTEMPT_VIEW_LOCAL=1 for local log checks")
 class BoundedReadTests(unittest.TestCase):
     """The optional read budget: tail, forward, earlier, oversize, truncation, database rows."""
 
@@ -618,14 +616,14 @@ class BoundedReadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write(directory, [{"n": i} for i in range(500)])
             cursor = view.Cursor(path)
-            rows = cursor.read_new(max_records=200, tail=True)
+            rows = cursor.read_new(max_bytes=1_000_000, max_records=200, tail=True)
             self.assertEqual([json.loads(r)["n"] for r in rows], list(range(300, 500)))
-            self.assertEqual(cursor.read_new(max_records=200), [])
+            self.assertEqual(cursor.read_new(max_bytes=1_000_000, max_records=200), [])
             with path.open("a") as handle:
                 handle.write("".join(json.dumps({"n": i}) + "\n" for i in range(500, 530)))
-            more = cursor.read_new(max_records=10)
+            more = cursor.read_new(max_bytes=1_000_000, max_records=10)
             self.assertEqual([json.loads(r)["n"] for r in more], list(range(500, 510)))
-            rest = cursor.read_new(max_records=200)
+            rest = cursor.read_new(max_bytes=1_000_000, max_records=200)
             self.assertEqual([json.loads(r)["n"] for r in rest], list(range(510, 530)))
 
     def test_byte_budget_cuts_on_a_record_boundary(self):
@@ -650,12 +648,60 @@ class BoundedReadTests(unittest.TestCase):
             self.assertEqual([json.loads(text)["n"] for _, text in before], [1])
             self.assertEqual(cursor.read_before(max_bytes=100), [])
 
+    def test_a_record_over_the_limit_never_leaks_its_tail_across_reads(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"a" * (view.MAX_RECORD_BYTES + 200_000) + b"\nGOOD\n")
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(400):
+                rows += cursor.read_new(max_bytes=65536)
+                if cursor.offset >= path.stat().st_size and not cursor.pending:
+                    break
+            self.assertEqual(rows, ["GOOD"])
+            self.assertEqual(sum("size limit" in note for note in cursor.notices), 1)
+            self.assertFalse(cursor.discarding)
+
+    def test_a_tail_cut_by_end_of_file_stays_dropped_after_the_next_append(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"a" * (view.MAX_RECORD_BYTES + 10))
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(200):
+                rows += cursor.read_new(max_bytes=65536)
+            self.assertEqual(rows, [])
+            self.assertTrue(cursor.discarding)
+            with path.open("ab") as handle:
+                handle.write(b"tail of the same record")
+            self.assertEqual(cursor.read_new(max_bytes=65536), [])
+            self.assertEqual(cursor.read_new(max_bytes=65536, final=True), [])
+            with path.open("ab") as handle:
+                handle.write(b" end\nGOOD\n")
+            self.assertEqual(cursor.read_new(max_bytes=65536), ["GOOD"])
+            self.assertFalse(cursor.discarding)
+
+    def test_final_does_not_emit_a_tail_that_is_being_dropped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"ok\n" + b"a" * (view.MAX_RECORD_BYTES + 10))
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(200):
+                rows += cursor.read_new(max_bytes=65536)
+            self.assertTrue(cursor.discarding)
+            rows += cursor.read_new(max_bytes=65536, final=True)
+            self.assertEqual(rows, ["ok"])
+
     def test_earlier_records_are_read_only_when_asked_and_in_order(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
             path = self.write(directory, [{"n": i} for i in range(100)])
             cursor = view.Cursor(path)
-            cursor.read_new(max_records=10, tail=True)
+            cursor.read_new(max_bytes=1_000_000, max_records=10, tail=True)
             first = cursor.read_before(max_bytes=10_000, max_records=30)
             self.assertEqual([json.loads(text)["n"] for _, text in first], list(range(60, 90)))
             second = cursor.read_before(max_bytes=10_000, max_records=1000)
@@ -743,6 +789,8 @@ class BoundedReadTests(unittest.TestCase):
             self.assertEqual((result.state, result.reason), ("unreadable", "database-read-failed"))
 
 
+@unittest.skipUnless(os.environ.get("HEARTING_ATTEMPT_VIEW_LOCAL") == "1",
+                     "set HEARTING_ATTEMPT_VIEW_LOCAL=1 for local log checks")
 class LocalSamples(unittest.TestCase):
     def test_all_local_dispatch_logs_format_without_stopping(self):
         files=set()

@@ -45,6 +45,7 @@ class Cursor:
         self.path = Path(path)
         self.offset = 0
         self.pending = b""
+        self.discarding = False        # inside the tail of a record over the size limit: drop to the newline
         self.identity = None
         self.head = b""
         self.notices: list[str] = []
@@ -111,6 +112,7 @@ class Cursor:
                     self.notices.append("source truncated or replaced; reopened")
                     self.epoch += 1
                 self.offset, self.pending, self.identity = 0, b"", identity
+                self.discarding = False
                 self.start, self.tailed = 0, False
             if tail and max_bytes and not self.tailed and self.offset == 0:
                 self.offset = self.start = self._tail_offset(info.st_size, max_bytes, max_records)
@@ -119,7 +121,7 @@ class Cursor:
                 stream.seek(self.offset)
                 chunk = stream.read() if max_bytes is None else stream.read(max(1, int(max_bytes)))
                 if max_bytes is not None and len(chunk) >= int(max_bytes) and b"\n" not in chunk \
-                        and b"\n" not in self.pending:
+                        and b"\n" not in self.pending and not self.discarding:
                     while len(self.pending) + len(chunk) < MAX_RECORD_BYTES:
                         more = stream.read(65536)
                         if not more:
@@ -127,8 +129,15 @@ class Cursor:
                         chunk += more
                         if b"\n" in more:
                             break
-                base = self.offset - len(self.pending)
                 self.offset += len(chunk)
+                if self.discarding:
+                    # The rest of a record already dropped for its size: nothing of it becomes a row.
+                    cut = chunk.find(b"\n")
+                    if cut < 0:
+                        chunk = b""
+                    else:
+                        chunk, self.discarding = chunk[cut + 1:], False
+                base = self.offset - len(chunk) - len(self.pending)
             with self.path.open("rb") as probe:
                 self.head = probe.read(min(self.offset, 4096))
         except OSError as exc:
@@ -146,7 +155,7 @@ class Cursor:
             entries = entries[:max_records]
         elif max_bytes is not None and len(self.pending) > MAX_RECORD_BYTES:
             self.notices.append("record over the size limit skipped")
-            self.pending = b""
+            self.pending, self.discarding = b"", True
         if final and self.pending:
             entries.append((position, self.pending.decode("utf-8", "replace")))
             self.pending = b""
