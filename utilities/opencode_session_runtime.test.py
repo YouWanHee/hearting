@@ -35,7 +35,7 @@ class NativeSessionTest(unittest.TestCase):
                  if not k.startswith(("AGENT_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_", "XDG_"))}
         clean.update(HOME=str(self.root / "home"), XDG_STATE_HOME=str(self.root / "state"),
                      XDG_CONFIG_HOME=str(self.root / "config"), XDG_DATA_HOME=str(self.root / "data"),
-                     XDG_CACHE_HOME=str(self.root / "cache"))
+                     XDG_CACHE_HOME=str(self.root / "cache"), OPENCODE_RUNTIME_VERSION="1.19.0")
         environment = unittest.mock.patch.dict(os.environ, clean, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
@@ -53,6 +53,55 @@ class NativeSessionTest(unittest.TestCase):
             "def event(kind, **values):\n"
             " print(json.dumps(dict(type=kind, sessionID='ses_native', **values)), flush=True)\n"
             + body)
+
+    def test_v2_command_uses_cwd_and_provider_model_variant_syntax(self):
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            argv = runtime.command(self.args, "ses_native")
+        self.assertNotIn("--standalone", argv)
+        self.assertIn("--session", argv)
+        self.assertIn("ses_native", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash")
+        self.assertNotIn("--dir", argv)
+        self.assertNotIn("--variant", argv)
+        self.args.variant = "high"
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            argv = runtime.command(self.args, "")
+        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash#high")
+        self.args.opencode_standalone = True
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            argv = runtime.command(self.args, "")
+        self.assertIn("--standalone", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5.3-flash#high")
+
+    def test_supervisor_accepts_the_internal_standalone_worker_mode(self):
+        args = fixture.supervisor.parser().parse_args([
+            "--runtime-harness", "opencode", "--opencode-standalone",
+            "--worktree", str(self.root), "--jobs", str(self.root / "jobs.log"),
+            "--parent-attempt-id", "att-native",
+        ])
+        self.assertTrue(args.opencode_standalone)
+
+    def test_v2_stream_without_terminal_event_uses_native_wait_and_exact_session(self):
+        self.program("event('step_start', part={})\n"
+                     "event('text', part={'text':'answer'})\n")
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            result, code = runtime.run_turn(self.args, "question", emit=self.events.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["session_id"], "ses_native")
+        self.assertEqual(result["result"], "answer")
+        self.assertEqual(result["subtype"], "success")
+
+    def test_v2_identityless_provider_rejection_is_preserved_without_secret(self):
+        self.program("print(json.dumps({'type':'error','sessionID':'','error':{"
+                     "'type':'provider.auth','code':'api_key_expired','status':401,"
+                     "'message':'api_key_expired Bearer secret-token'}}), flush=True)\n"
+                     "sys.exit(1)\n")
+        with unittest.mock.patch.object(runtime.opencode_runtime, "is_v2", return_value=True):
+            result, code = runtime.run_turn(self.args, "question", emit=self.events.append)
+        self.assertEqual(code, 1)
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["error"]["code"], "api_key_expired")
+        self.assertNotIn("secret-token", json.dumps(result))
 
     def test_exact_session_resume_and_only_final_step_is_returned(self):
         self.program("""
@@ -595,9 +644,13 @@ route_file = Path.cwd() / 'resource-route.json'
 route = dict(route_id='rt-native-resource', route_hash='sha256:native-resource')
 binding = SimpleNamespace(route_file=str(route_file), **route)
 args = SimpleNamespace(jobs=str(jobs), parent_attempt_id=attempt)
-env = dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt,
+completion_state = os.environ.get('AGENT_DISPATCH_COMPLETION_STATE_FILE', '')
+env = {key:value for key,value in os.environ.items()
+       if not key.startswith('AGENT_DISPATCH_')}
+env.update(AGENT_DISPATCH_ATTEMPT_ID=attempt,
            AGENT_OWNER_ROUTE_FILE=str(route_file),
-           AGENT_DISPATCH_COMPLETION_MODE='supervised')
+           AGENT_DISPATCH_COMPLETION_MODE='supervised',
+           AGENT_DISPATCH_COMPLETION_STATE_FILE=completion_state)
 with mock.patch.object(OWNER, 'resolve_owner_route_lifecycle', return_value=(binding, 'bound')), \\
      mock.patch.object(CONTRACT, 'resolve_live_parent_attempt',
                        return_value=SimpleNamespace(pid=os.getppid(), pid_start='200')):
@@ -614,6 +667,7 @@ event('step_finish', part={'reason':'stop'})
                                 env=f.child_env(FAKE_TRACE=str(f.trace),
                                                 AGENT_DISPATCH_JOBS=str(f.jobs),
                                                 AGENT_DISPATCH_COMPLETION_STATE_FILE=str(f.state),
+                                                OPENCODE_RUNTIME_VERSION='2.0.32',
                                                 FAKE_UTILITIES=str(ROOT / 'utilities')))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         owner = json.loads((f.base / 'resource-owner.json').read_text())

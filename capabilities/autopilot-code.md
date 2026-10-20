@@ -247,6 +247,14 @@ Do not remove the lock or rerun Git automatically.
 
 When no spec exists, infer mode lightly from project files, report the inference, and keep the stricter spec-only gates disabled.
 
+Model-role/profile mapping selects the requested execution candidate; runtime
+availability is a separate provider/account/model-scoped decision. Automatic
+fallback keeps the task within existing provider and billing policy, and every
+candidate ordering consumes confirmed unavailability before headroom or
+preference. Explicit pins stay exact and surface the selected provider's error.
+Unknown credential or entitlement evidence remains unknown; model inventory
+and saved credential presence alone do not establish that a request can run.
+
 ## Adapter Realization
 
 | Adapter | Realization |

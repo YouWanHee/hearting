@@ -253,6 +253,12 @@ class HerdrCollectorTest(unittest.TestCase):
             herdr._ppid_of = real
         self.assertEqual([s.herdr_attached for s in sessions], [True, True, False])
 
+    def test_exact_foreground_pid_still_attaches_without_session_id_match(self):
+        session = Session(harness="codex", pid=7312, session_id="thread-current")
+        live_pid = (set(), {7312})
+        herdr.enrich([session], agents=[], pids=live_pid)
+        self.assertIs(session.herdr_attached, True)
+
     def test_pane_pids_parses_the_measured_process_info_shape(self):
         panes = [{"pane_id": "w2:p4", "agent": "opencode"}, {"pane_id": "w5:p1", "agent": None}]
         calls = []
@@ -311,12 +317,10 @@ class HerdrCollectorTest(unittest.TestCase):
     def test_absent_herdr_falls_back_to_lineage_and_only_ever_promotes(self):
         sessions = self._sessions()[:4]
         lineage = {1: "herdr", 2: "terminal", 3: None, 4: "vscode"}.get
-        real_list = herdr.list_agents
-        herdr.list_agents = lambda *a, **k: None
-        try:
+        with mock.patch.object(herdr, "observation_view", return_value=None), \
+                mock.patch.object(herdr._observation_module(), "socket_path_for_endpoint", return_value=""), \
+                mock.patch.object(herdr, "list_agents", return_value=None):
             herdr.enrich(sessions, lineage=lineage)
-        finally:
-            herdr.list_agents = real_list
         self.assertEqual([s.herdr_attached for s in sessions], [True, None, None, None])
 
 

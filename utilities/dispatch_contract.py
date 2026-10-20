@@ -3095,9 +3095,24 @@ def _forked_across_uid_boundary(entry: Path, tail) -> bool:
     return real_uid != os.getuid() and parent_start <= start
 
 
+def _in_user_manager_scope(entry: Path) -> bool:
+    """Whether this process lives in the user's service manager scope.
+
+    systemd starts `systemd --user` and its `(sd-pam)` helper from PID 1 straight into
+    `user@<uid>.service/init.scope`, and both are non-dumpable. A fork inherits its parent's
+    cgroup, so an attempt's descendant sits in its session or app scope, never there; the
+    birth rule cannot help because the manager restarts on a later login."""
+    try:
+        cgroups = (entry / "cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    scope = f"/user@{os.getuid()}.service/init.scope"
+    return any(line.rpartition(":")[2].endswith(scope) for line in cgroups.splitlines())
+
+
 def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
-    """Only another UID, a fork across a UID boundary, or an adjacent stable birth observation
-    may exclude denial."""
+    """Only another UID, a fork across a UID boundary, the user's service manager scope, or an
+    adjacent stable birth observation may exclude denial."""
     try:
         if entry.stat().st_uid != os.getuid():
             return "", ""
@@ -3120,6 +3135,8 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     except (OSError, IndexError, ValueError):
         stable, tail = "", None
     if tail is not None and _forked_across_uid_boundary(entry, tail):
+        return "", ""
+    if _in_user_manager_scope(entry):
         return "", ""
     return stable, f"procfs-environ:{entry.name}:same-uid-unobservable"
 

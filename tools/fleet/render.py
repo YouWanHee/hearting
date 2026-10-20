@@ -41,7 +41,7 @@ from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
-                    session_parent_visible)
+                    current_background_shell_jobs, session_parent_visible)
 from . import gitinfo, titles
 from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
@@ -5265,6 +5265,34 @@ def _context_content_width(term_width):
     return max(1, term_width - inset - 1)
 
 
+def _background_shell_tail(entity, *, now, width):
+    jobs = current_background_shell_jobs(
+        getattr(entity, "shell_jobs", None) or (), now=now)
+    if not jobs or width <= 0:
+        return None
+    count = len(jobs)
+    count_only = "⚙ %d" % count
+    if _dw(count_only) > width:
+        return None
+    latest = jobs[0]
+    elapsed_s = latest.get("elapsed_s")
+    elapsed = ("%ds" % elapsed_s if isinstance(elapsed_s, int)
+               and not isinstance(elapsed_s, bool) and 0 <= elapsed_s < 60 else
+               fmt_min(elapsed_s // 60) if isinstance(elapsed_s, int)
+               and not isinstance(elapsed_s, bool) and elapsed_s >= 60 else "?")
+    count_suffix = " (+%d)" % (count - 1) if count > 1 else ""
+    command = latest.get("command_display") or latest.get("command")
+    if isinstance(command, str) and command:
+        fixed = "⚙  " + elapsed + count_suffix
+        command_width = width - _dw(fixed)
+        if command_width > 0:
+            clipped = _clip_w(command, command_width)
+            candidate = "⚙ " + clipped + " " + elapsed + count_suffix
+            if clipped and _dw(candidate) <= width:
+                return candidate
+    return count_only
+
+
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
                         indent_width=None, muted=False, now_key="now_sub"):
     """One ``<herdr|tty> <gauge> <value>   NOW`` row for every live card.
@@ -5360,6 +5388,18 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
+    collection_now = time.time()
+    base_width = sum(_dw(text) for text, _key in segs)
+    shell_column = (max(base_width, _NAME_COL)
+                    if not now_text and not exec_segs else base_width)
+    separator = "  " if now_text or exec_segs else ""
+    shell_start = shell_column + _dw(separator)
+    total_width = term_width or _SUMMARY_FALLBACK_W
+    shell_text = _background_shell_tail(
+        entity, now=collection_now, width=max(0, total_width - shell_start))
+    if shell_text:
+        segs.append((" " * max(0, shell_start - base_width), None))
+        segs.append((shell_text, "g_work_off"))
     if muted:
         # A dispatch detail row is supporting telemetry. Keep its full information density,
         # but collapse every colored segment to the same dim weight as the dispatch identity.
@@ -7372,13 +7412,57 @@ def live_harnesses(sessions):
             and not getattr(s, "mem_worker", False)}
 
 
+def _opencode_availability_text(snapshot):
+    rows = snapshot.get("providers") if isinstance(snapshot, dict) else None
+    rows = list(rows) if isinstance(rows, list) else []
+    payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
+    extra = payload.get("provider_availability") if isinstance(payload, dict) else None
+    if isinstance(extra, dict):
+        rows.extend({"provider": key, **value} for key, value in extra.items()
+                    if isinstance(value, dict))
+    latest = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("provider")
+        state = row.get("state")
+        reason = row.get("reason")
+        stamp = row.get("observed_at") or 0
+        if provider and (provider not in latest or stamp >= (latest[provider].get("observed_at") or 0)):
+            latest[provider] = row
+    labels = {}
+    for provider, row in latest.items():
+        state, reason = row.get("state"), row.get("reason")
+        if provider == "opencode-go":
+            label = ("Go subscription missing" if reason == "subscription-missing" else
+                     "Go credential expired" if reason == "credential-expired" else
+                     "Go key rejected" if state == "unavailable" else
+                     "Go credential valid" if state == "usable" else "Go unknown")
+            labels["go"] = label
+        elif provider == "opencode-go-entitlement":
+            label = ("Go subscription missing" if reason == "subscription-missing" else
+                     "Go entitlement valid" if state == "usable" else
+                     "Go entitlement rejected" if state == "unavailable" else
+                     "Go entitlement unknown")
+            labels["entitlement"] = label
+        elif provider in {"opencode", "openai"}:
+            family = "Zen" if provider == "opencode" else "OpenAI"
+            suffix = ("valid" if state == "usable" else
+                      "unavailable" if state == "unavailable" else "unknown")
+            labels[provider] = f"{family} {suffix}"
+    for key, value in (("go", "Go unknown"), ("entitlement", "Go entitlement unknown"),
+                       ("opencode", "Zen unknown"), ("openai", "OpenAI unknown")):
+        labels.setdefault(key, value)
+    return "; ".join(labels[key] for key in ("go", "entitlement", "opencode", "openai"))
+
+
 def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                        usage_snapshots=None, term_width=None):
     """Build account usage rows independently of the main line builder.
 
     F-51c: `api_disabled` (user opted out via FLEET_DISABLE=usage-api / --no-usage-api) is
-    "the user turned it off" — distinct from a harness with no usage source (opencode without
-    an opencode-go key). A claude/codex harness with no passive-tap value while opted out
+    "the user turned it off" — distinct from unknown provider/account availability. A
+    claude/codex harness with no passive-tap value while opted out
     renders as an unknown gauge (blank track + `—`), never the source-absence sentence.
     """
     rl = {}
@@ -7391,7 +7475,7 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             if cur is None or (s.mtime or 0) > (cur[3] or 0):
                 rl[s.harness] = (s.rl_5h, s.rl_7d, s.rl_ms, s.mtime, s.rl_rs,
                                  getattr(s, "rl_windows", None), freshness,
-                                 getattr(s, "_usage_error", None))
+                                 getattr(s, "_usage_error", None), None, None)
     # A quota snapshot is account-scoped.  It must remain visible when there is no current
     # process row for that harness (for example immediately after session cleanup).
     for harness, snapshot in (usage_snapshots or {}).items():
@@ -7399,7 +7483,10 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             continue
         payload = snapshot.get("payload")
         if not isinstance(payload, dict):
-            continue
+            if harness == "opencode" and snapshot.get("providers"):
+                payload = {}
+            else:
+                continue
         r5 = payload.get("rl_5h")
         r7 = payload.get("rl_7d")
         rms = payload.get("rl_ms")
@@ -7407,13 +7494,14 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
         rwins = payload.get("rl_windows")
         if rwins is None:
             rwins = payload.get("windows")
-        if r5 is None and r7 is None and not rms and not rwins and not err:
+        providers = snapshot.get("providers") or []
+        if r5 is None and r7 is None and not rms and not rwins and not err and not providers:
             continue
         observed_at = snapshot.get("observed_at")
         rl[harness] = (
             r5, r7, rms, observed_at,
             (payload.get("rs_5h"), payload.get("rs_7d")), rwins,
-            snapshot.get("freshness"), err,
+            snapshot.get("freshness"), err, providers, payload.get("reason"),
         )
     live = live_harnesses(sessions)
     if not rl and not live:
@@ -7433,15 +7521,26 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                 row += [("·" * _GAUGE_W, "dim"), ("   —", "dim")]
                 row.append(("]", "dim"))
             else:
-                row.append(("no usage api — opencode-go key not found" if h == "opencode"
+                row.append(("Go usage unavailable" if h == "opencode"
                             else "no usage api — plan quota is console-only", "dim"))
             rows.append((row, None))
             continue
-        r5, r7, rms, _mt, rrs, rwins, freshness, err = rl[h]
-        if err == "auth":
-            # 401/403 from the provider: the key is present but rejected (rotated,
-            # expired, wrong scope). Say so instead of a silently blank gauge.
-            row.append(("usage api — key rejected (401/403)", "dim"))
+        r5, r7, rms, _mt, rrs, rwins, freshness, err, provider_rows, error_reason = rl[h]
+        if err in {"auth", "subscription-missing", "missing-credential", "unknown"}:
+            if h == "opencode":
+                row.append(("Go usage unavailable", "dim"))
+                rows.append((row, None))
+                continue
+            detail = _opencode_availability_text({"providers": provider_rows})
+            if err == "auth" and error_reason == "credential-expired" and "Go key expired" not in detail:
+                detail = "Go key expired; " + detail
+            elif err == "auth" and "Go key expired" not in detail and "Go key rejected" not in detail:
+                detail = "Go key rejected; " + detail
+            elif err == "subscription-missing" and "Go subscription missing" not in detail:
+                detail = "Go subscription missing; " + detail
+            elif err == "missing-credential":
+                detail = "Go credential not found; " + detail
+            row.append(("usage api — " + detail, "dim"))
             rows.append((row, None))
             continue
         rs5, rs7 = (rrs or (None, None))[0], (rrs or (None, None))[1]
@@ -7450,6 +7549,14 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
         if not rwins and h == "codex" and r5 is None:
             gauges = gauges[1:]
         gauges += [(lbl, v, None) for lbl, v in (rms or [])]
+        if h == "opencode":
+            gauges = [(lbl, value, reset) for lbl, value, reset in gauges
+                      if {"7d": "week", "wk": "week", "mo": "month"}.get(
+                          str(lbl).strip(), str(lbl).strip()) in {"5h", "week", "month"}]
+            if not any(value is not None for _lbl, value, _reset in gauges):
+                row.append(("Go usage unavailable", "dim"))
+                rows.append((row, None))
+                continue
         cells = [[], [], []]
         for lbl, value, reset in gauges:
             lbl = str(lbl).strip()

@@ -46,6 +46,19 @@ def read_markers():
         return {}
 
 
+def read_relations():
+    """Read confirmed current holders without projecting a marker onto a successor SID."""
+    try:
+        import sys
+        utilities = Path(__file__).resolve().parents[2] / "utilities"
+        if str(utilities) not in sys.path:
+            sys.path.insert(0, str(utilities))
+        import dispatch_seat_handover
+        return dispatch_seat_handover.resolved_steward_relations(include_released=True)
+    except Exception:
+        return []
+
+
 def _session_keys(sess):
     """The shared join-key rule — a marker written before a resume still names the id the
     session used to have, so an exact-only join silently drops the relation."""
@@ -121,7 +134,7 @@ def _projection_sessions():
                        getattr(row, "session_id", None)) not in projected_keys]
 
 
-def _native_role_sessions(markers, rows):
+def _native_role_sessions(markers, rows, relations=()):
     """Exact native directory metadata for evidenced actors/targets absent from the snapshot.
 
     An OpenCode pane can omit its SID, and old process registry files can be
@@ -139,6 +152,14 @@ def _native_role_sessions(markers, rows):
         except Exception:
             continue
         for target in targets:
+            harness = str(target.get("harness") or "").lower()
+            sid = target.get("session_id")
+            if sid:
+                wanted.add((harness, sid))
+    for relation in relations:
+        if relation.get("released") is True:
+            continue
+        for target in relation.get("targets") or ():
             harness = str(target.get("harness") or "").lower()
             sid = target.get("session_id")
             if sid:
@@ -164,7 +185,7 @@ def _native_role_sessions(markers, rows):
     return out
 
 
-def _role_winners(markers, rows, evidence):
+def _role_winners(markers, rows, evidence, relations=()):
     """Newest evidenced same-repo supervisor per canonical target; no marker mutation."""
     from .peer_messages import _parse_ts
     by_key, by_name, repos = {}, {}, {}
@@ -185,7 +206,24 @@ def _role_winners(markers, rows, evidence):
         return next(iter(identities)), next(iter(repositories))
 
     resolved = []
+    try:
+        import sys
+        utilities = Path(__file__).resolve().parents[2] / "utilities"
+        if str(utilities) not in sys.path:
+            sys.path.insert(0, str(utilities))
+        import dispatch_seat_handover as handover
+        known_generations = {str(relation.get("generation")) for relation in relations
+                             if relation.get("generation")}
+    except Exception:
+        handover = None
+        known_generations = set()
     for parent_key, marker in markers.items():
+        if handover is not None:
+            try:
+                if handover.steward_marker_generation(marker) in known_generations:
+                    continue
+            except Exception:
+                pass
         parent = one(by_key.get(parent_key, ()))
         if parent is None:
             continue
@@ -194,6 +232,22 @@ def _role_winners(markers, rows, evidence):
         except Exception:
             continue
         for target in targets:
+            harness = str(target.get("harness") or "").lower()
+            sid = target.get("session_id")
+            candidates = by_key.get((harness, sid), ()) if sid else by_name.get((harness, target.get("name")), ())
+            child = one(candidates)
+            if child is None or child[1] != parent[1]:
+                continue
+            resolved.append((parent[0], child[0], target))
+    for relation in relations:
+        if relation.get("released") is True:
+            continue
+        holder = relation.get("holder") or {}
+        parent_key = (str(holder.get("harness") or "").lower(), holder.get("sid"))
+        parent = one(by_key.get(parent_key, ()))
+        if parent is None:
+            continue
+        for target in relation.get("targets") or ():
             harness = str(target.get("harness") or "").lower()
             sid = target.get("session_id")
             candidates = by_key.get((harness, sid), ()) if sid else by_name.get((harness, target.get("name")), ())
@@ -237,7 +291,7 @@ def _owner_targets(winners, harness, session_id):
 
 
 def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
-                 _winners=None, include_native=False):
+                 _winners=None, include_native=False, _relations=None):
     """One same-repository role lookup for Fleet and herdr, with proven prior ids.
 
     Current snapshot rows override registry history for their exact join keys.
@@ -246,12 +300,20 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
     """
     if markers is None:
         markers = read_markers()
+    # ``enrich`` supplies one relation snapshot for the whole refresh; direct
+    # helper callers still get a fresh read by default.
+    relations = read_relations() if _relations is None else _relations
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
         return []
     harness = str(harness or "").lower()
-    if not any(markers.get((harness, sid)) for sid in [session_id, *aliases] if sid):
+    has_marker = any(markers.get((harness, sid)) for sid in [session_id, *aliases] if sid)
+    has_relation = any(relation.get("released") is not True
+                       and (relation.get("holder") or {}).get("harness") == harness
+                       and (relation.get("holder") or {}).get("sid") in {session_id, *aliases}
+                       for relation in relations)
+    if not has_marker and not has_relation:
         return []
     if _winners is not None:
         return _owner_targets(_winners, harness, session_id)
@@ -272,13 +334,13 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
                           runtime_name=next(iter(runtime_names)) if len(runtime_names) == 1 else None)
     rows = [own] + [row for row in rows if not own_keys.intersection(_session_keys(row))]
     if sessions is None or include_native:
-        rows += _native_role_sessions(markers, rows)
-    winners = _role_winners(markers, rows, evidence)
+        rows += _native_role_sessions(markers, rows, relations)
+    winners = _role_winners(markers, rows, evidence, relations)
     return _owner_targets(winners, harness, session_id)
 
 
 def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
-              _targets=None):
+              _targets=None, _relations=None):
     """One display decision: exact self-role evidence or same-repository targets.
 
     The CLI's unknown/- sentinel is a flag on the current session, never a
@@ -289,6 +351,7 @@ def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessio
         return False
     if markers is None:
         markers = read_markers()
+    relations = read_relations() if _relations is None else _relations
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
@@ -304,8 +367,19 @@ def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessio
                and target.get("session_id") is None and not target.get("pane")
                for target in evidence(marker)):
             return True
+    for relation in relations:
+        if relation.get("released") is True:
+            continue
+        holder = relation.get("holder") or {}
+        if (holder.get("harness") == harness and holder.get("sid") in {session_id, *aliases}
+                and any(target.get("source") == "explicit" and target.get("kind") == "explicit"
+                        and target.get("harness") == "unknown" and target.get("name") == "-"
+                        and target.get("session_id") is None and not target.get("pane")
+                        for target in relation.get("targets") or ())):
+            return True
     targets = _targets if _targets is not None else role_targets(
-        harness, session_id, aliases=aliases, markers=markers, cwd=cwd, sessions=sessions)
+        harness, session_id, aliases=aliases, markers=markers, cwd=cwd, sessions=sessions,
+        _relations=relations)
     return bool(targets)
 
 
@@ -315,18 +389,19 @@ def enrich(sessions, markers=None):
         s.steward_targets = s.steward_parents = None
     if markers is None:
         markers = read_markers()
-    if not markers:
+    relations = read_relations()
+    if not markers and not relations:
         return
     # Reuse registry history for ended targets, but never overrule current rows.
     current_keys = {key for s in sessions for key in _session_keys(s)}
     context = list(sessions) + [s for s in _registry_sessions()
                                 if not current_keys.intersection(_session_keys(s))]
-    context += _native_role_sessions(markers, context)
+    context += _native_role_sessions(markers, context, relations)
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
         return
-    winners = _role_winners(markers, context, evidence)
+    winners = _role_winners(markers, context, evidence, relations)
     # target key → the stewards that named it. Built from the SAME evidence entries the
     # forward projection uses, so "who watches me" can never claim a relation that the
     # steward's own row does not also show.
@@ -335,9 +410,11 @@ def enrich(sessions, markers=None):
         keys = _session_keys(s)
         targets = role_targets(s.harness, s.session_id, markers=markers,
                                aliases=[sid for _harness, sid in keys[1:]],
-                               cwd=getattr(s, "cwd", None), sessions=context, _winners=winners)
+                               cwd=getattr(s, "cwd", None), sessions=context, _winners=winners,
+                               _relations=relations)
         s.steward = role_flag(s.harness, s.session_id, markers=markers,
-                              aliases=[sid for _harness, sid in keys[1:]], _targets=targets)
+                              aliases=[sid for _harness, sid in keys[1:]], _targets=targets,
+                              _relations=relations)
         if not targets:
             continue
         # `steward_evidence_targets` returns oldest-first — the stable order the

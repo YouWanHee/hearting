@@ -637,9 +637,28 @@ def _pending_endpoint(endpoint, state, *, sender=False):
 
 
 def pending_delivery_recipient(row):
-    """The exact session bound after a pane-only pending target becomes observable."""
+    """The exact session bound by a pane proof or a confirmed steward-watch handover."""
     if not isinstance(row, dict):
         return None
+    watch_refs = [str(ref)[len("peer-watch:"):]
+                  for ref in row.get("refs") or ()
+                  if isinstance(ref, str) and ref.startswith("peer-watch:")]
+    if watch_refs:
+        try:
+            import dispatch_seat_handover as handover
+            recipients = [handover.resolve_watch(watch_id) for watch_id in watch_refs]
+        except Exception:
+            return None
+        if any(not isinstance(value, dict) for value in recipients):
+            return None
+        holders = [{"harness": (value.get("holder") or {}).get("harness"),
+                    "session_id": (value.get("holder") or {}).get("sid")}
+                   for value in recipients]
+        if any(not _valid_transfer_endpoint(holder) for holder in holders):
+            return None
+        identity = (holders[0].get("harness"), holders[0].get("session_id"))
+        return holders[0] if all((holder.get("harness"), holder.get("session_id")) == identity
+                                for holder in holders) else None
     bound = row.get("bound_to")
     if _valid_transfer_endpoint(bound):
         original = row.get("to") or {}
@@ -987,7 +1006,8 @@ def _pending_rows(*, recipient=None, sender=None, read_context=None):
             continue
         if not row or row["state"] == "received":
             continue
-        receiver_match = recipient is not None and _same_transfer_session(row.get("to"), recipient)
+        current_recipient = pending_delivery_recipient(row)
+        receiver_match = recipient is not None and _same_transfer_session(current_recipient, recipient)
         sender_match = sender is not None and _same_transfer_session(row.get("from"), sender)
         if (recipient is not None or sender is not None) and not (receiver_match or sender_match):
             continue
@@ -1029,12 +1049,13 @@ def _registered_delivery_settled(row, *, read_context=None):
 
 
 def pending_messages(recipient):
-    """Read exact SID-bound payloads. No alias/pane retargeting or rendering ack."""
+    """Read exact SID-bound payloads through the recorded recipient lineage."""
     if not _valid_transfer_endpoint(recipient):
         return []
     rows = []
     for row in _pending_rows(recipient=recipient):
-        if all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id")):
+        current = pending_delivery_recipient(row)
+        if _same_transfer_session(current, recipient):
             rows.append(row)
     return rows
 
@@ -1397,6 +1418,12 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
             if _valid_transfer_endpoint(target):
                 target_matches = all(target.get(key) == recipient.get(key)
                                      for key in ("harness", "session_id"))
+                if not target_matches:
+                    pending = _read_pending(ref)
+                    if any(isinstance(item, str) and item.startswith("peer-watch:")
+                           for item in (pending or {}).get("refs") or ()):
+                        current = pending_delivery_recipient(pending)
+                        target_matches = _same_transfer_session(current, recipient)
             elif _valid_pane_bound_endpoint(target):
                 pending = _read_pending(ref)
                 bound = pending_delivery_recipient(pending)
@@ -1617,6 +1644,55 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
         return guidance
 
 
+def _ack_watch_refs(pending, recipient, carrier):
+    for watch_ref in (pending or {}).get("refs") or ():
+        if not isinstance(watch_ref, str) or not watch_ref.startswith("peer-watch:"):
+            continue
+        try:
+            import dispatch_seat_handover as handover
+            handover.acknowledge_watch(
+                watch_ref[len("peer-watch:"):], recipient.get("harness"),
+                recipient.get("session_id"), carrier)
+        except Exception:  # noqa: BLE001 - the same watch remains visible for its carrier
+            pass
+
+
+def settle_watch_transfers(watch_id, harness, sid):
+    """Settle a queued watch notice only when its durable exact recipient ACK exists."""
+    try:
+        import dispatch_seat_handover as handover
+        pm = handover._peer_message()
+        roots = handover._watch_roots(pm)
+        ack = None
+        for root in roots:
+            candidate = Path(root) / "peer-watches" / f"{watch_id}.ack.json"
+            data = _read_json(candidate)
+            if (isinstance(data, dict) and data.get("watch_id") == watch_id
+                    and data.get("harness") == harness and data.get("session_id") == sid):
+                ack = data
+                break
+        if ack is None:
+            return False
+        ref = f"peer-watch:{watch_id}"
+        settled = False
+        for row in list(_pending_rows()):
+            if ref not in (row.get("refs") or ()):
+                continue
+            with pending_lock(row["ref"]):
+                current = _read_pending(row["ref"])
+                if (not current or current.get("state") == "received"
+                        or ref not in (current.get("refs") or ())):
+                    continue
+                received = dict(current, state="received", text=None, rpc_claim=None,
+                                receipt="watch-receipt-displayed", received_at=time.time())
+                _save_pending(received)
+                _ack_registered_delivery(received)
+                settled = True
+        return settled
+    except Exception:  # noqa: BLE001 - unresolved transfers remain visible to their normal carrier
+        return False
+
+
 def receive_peer_message(text, recipient, project="", *, summary_text=""):
     """Actual receiver observation; rendering a callback is never this boundary."""
     # A SID-less first-turn message is bound only after the native callback can
@@ -1668,6 +1744,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
         pending = _read_pending(ref) if ref else None
         if pending and pending["state"] == "received":
             _ack_registered_delivery(pending)
+            _ack_watch_refs(pending, recipient, "peer-message-exact-ref")
             return 0
         already_received = ref and _peer_notice_exists(ref, recipient)
         rc = 0 if already_received else cmd_record(argparse.Namespace(
@@ -1682,6 +1759,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
                             receipt="exact-peer-ref", received_at=time.time())
             _save_pending(received)
             _ack_registered_delivery(received)
+            _ack_watch_refs(received, recipient, "peer-message-exact-ref")
         return rc
 
 
@@ -1752,7 +1830,7 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
         for row in rows:
             if len(claims) >= 3:
                 break
-            if any(row["to"].get(k) != recipient[k] for k in ("harness", "session_id")):
+            if not _same_transfer_session(pending_delivery_recipient(row), recipient):
                 continue
             # The sole no-trailer context is the booked session-tidy continue;
             # ordinary peer bodies still require their exact sealed trailer.
@@ -1851,7 +1929,7 @@ def cmd_pending(args):
     ref = claim_ref or queued_ref or resuming_ref or received_ref
     with pending_lock(ref):
         row = _read_pending(ref)
-        if not row or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id")):
+        if not row or not _same_transfer_session(pending_delivery_recipient(row), recipient):
             return 1
         if queued_ref:
             if not isinstance(args.message_id, str) or not args.message_id.strip():
@@ -2006,7 +2084,7 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
     if not session_id or source not in _STEWARD_SOURCES:
         return False
     path = steward_marker_path(harness, session_id)
-    try:
+    def write_locked():
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(path, encoding="utf-8") as fh:
@@ -2015,7 +2093,10 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
             data = None
         if not isinstance(data, dict):
             data = {"schema_version": 1, "harness": harness, "session_id": session_id,
-                    "since": ts, "targets": {}}
+                    "since": ts, "generation": os.urandom(16).hex(), "targets": {}}
+        data.setdefault("generation", os.urandom(16).hex())
+        if seat is not None:
+            data["seat_key"] = seat.key
         targets = data.get("targets")
         if not isinstance(targets, dict):
             targets = {}
@@ -2067,6 +2148,15 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         # destructive-ok: reason=atomic publish of the rewritten steward marker (tmp → final); boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
         os.replace(tmp, path)
         return True
+    try:
+        # Serialize role creation with same-seat clear adoption and release.
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        seat = handover.pane_seat(os.environ, harness, session_id)
+        if seat is None:
+            return write_locked()
+        with tidy.seat_lock(seat.key):
+            return write_locked()
     except Exception:
         return False
 
@@ -2275,12 +2365,47 @@ def cmd_record(args):
 
 
 def cmd_release(args):
-    """Clear the steward flag for one session (the ledger itself is append-only)."""
+    """Release this session's role generations before removing its marker projection."""
     path = steward_marker_path(args.harness, args.session_id)
     try:
-        # destructive-ok: reason=caller-requested release of its own steward flag (steward off); boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
-        path.unlink()
-        print("released")
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+
+        seat = handover.pane_seat(os.environ, args.harness, args.session_id)
+
+        generations_by_seat = {}
+        def add_generation(key, generation):
+            if key and generation:
+                generations_by_seat.setdefault(str(key), set()).add(str(generation))
+
+        marker = tidy.read_json(path)
+        if isinstance(marker, dict) and is_steward_marker(marker):
+            encoded = json.dumps(marker, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8")
+            add_generation(getattr(seat, "key", None),
+                           marker.get("generation") or hashlib.sha256(encoded).hexdigest())
+        for relation in handover.resolved_steward_relations(include_released=True):
+            origin = relation.get("origin") or {}
+            holder = relation.get("holder") or {}
+            if ((origin.get("harness") == args.harness and origin.get("sid") == args.session_id)
+                    or (holder.get("harness") == args.harness and holder.get("sid") == args.session_id)):
+                add_generation(relation.get("seat_key") or getattr(seat, "key", None),
+                               relation.get("generation"))
+
+        for key, generations in sorted(generations_by_seat.items()):
+            with tidy.seat_lock(key):
+                ledger_seat = tidy.Seat("pane", key)
+                for generation in sorted(generations):
+                    handover.record_steward_release(
+                        ledger_seat, args.harness, args.session_id, generation)
+
+        try:
+            # destructive-ok: reason=caller-requested release after exact generation tombstone; boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
+            path.unlink()
+            result = "released"
+        except FileNotFoundError:
+            result = "released" if generations_by_seat else "not-marked"
+        print(result)
     except FileNotFoundError:
         print("not-marked")
     except Exception as exc:

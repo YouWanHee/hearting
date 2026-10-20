@@ -8,6 +8,8 @@ import importlib
 import copy
 from dataclasses import replace
 import os
+from pathlib import Path
+import sys
 import time as _time
 
 from . import procscan
@@ -260,6 +262,19 @@ def _adopt_child_titles(sessions, jobs):
             job.summary_ts = getattr(source, 'summary_ts', None)
         if getattr(job, 'subagents', None) is None:
             job.subagents = getattr(source, 'subagents', None)
+        source_attempt = getattr(source, "attempt_id", None)
+        job_attempt = getattr(job, "attempt_id", None)
+        source_sid = getattr(source, "session_id", None)
+        runtime_sid = getattr(job, "_runtime_session_id", None)
+        if (source_sid and (runtime_sid is None or runtime_sid == source_sid)
+                and source_attempt == job_attempt):
+            from . import shell_jobs
+            job.shell_jobs = shell_jobs.merge_jobs(
+                getattr(job, "shell_jobs", None), getattr(source, "shell_jobs", None))
+            current_observation = getattr(job, "shell_job_observation", None)
+            if (not isinstance(current_observation, dict)
+                    or current_observation.get("state") == "unavailable"):
+                job.shell_job_observation = getattr(source, "shell_job_observation", None)
         if not getattr(job, '_dispatch_context_owned', False):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
@@ -367,7 +382,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     try:
         prepare = getattr(modules.get("codex"), "prepare_tick", None)
         if prepare and any(s.harness == "codex" for s in sessions):
-            codex_tick = prepare(sessions)
+            codex_tick = prepare(sessions, wait_timeout=0.0 if fast_first else 0.2)
     except Exception:
         pass
     opencode_tick = None
@@ -378,6 +393,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
     for s in sessions:
+        s._fast_first = bool(fast_first)
         fn = enrichers.get(s.harness)
         if s.harness == "claude":
             continue  # resolve once after the existing foreground pane observation
@@ -515,6 +531,71 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
             snap = usage_cache.account_usage(harness, usage=usage if usage == "refresh" else "cache-only")
             usage_snapshots[harness] = snap
             usage_meta[harness] = {k: snap.get(k) for k in ("freshness", "observed_at")}
+            if harness == "opencode":
+                try:
+                    utilities = Path(__file__).resolve().parents[3] / "utilities"
+                    if str(utilities) not in sys.path:
+                        sys.path.insert(0, str(utilities))
+                    import opencode_runtime
+                    opencode_v2 = opencode_runtime.is_v2()
+                    if opencode_v2:
+                        selected = opencode_runtime.selected_go_usage_observation()
+                        if selected.state == "unavailable":
+                            go_scope = opencode_scope = entitlement_scope = None
+                        else:
+                            go_scope = selected.provider_scope or "unscoped"
+                            opencode_scope = selected.opencode_scope or "unscoped"
+                            entitlement_scope = selected.entitlement_scope
+                    else:
+                        go_observation = opencode_runtime.account_scope_observation("opencode-go")
+                        opencode_observation = opencode_runtime.account_scope_observation("opencode")
+                        go_scope = go_observation.scope
+                        opencode_scope = opencode_observation.scope
+                        entitlement_scope = opencode_scope
+                    openai_observation = opencode_runtime.account_scope_observation("openai")
+                    openai_scope = openai_observation.scope
+                    scopes = {scope for scope in (go_scope, opencode_scope, openai_scope)
+                              if scope is not None}
+                    providers = usage_cache.provider_records("opencode", account_scopes=scopes)
+                    snap["providers"] = providers
+                    usage_meta[harness]["providers"] = providers
+                    payload = snap.get("payload")
+                    availability = payload.get("provider_availability") if isinstance(payload, dict) else None
+                    if isinstance(availability, dict):
+                        current_scope = {
+                            "opencode-go": go_scope,
+                            "opencode-go-entitlement": entitlement_scope,
+                            "opencode": opencode_scope,
+                            "openai": openai_scope,
+                        }
+                        payload["provider_availability"] = {
+                            provider: row for provider, row in availability.items()
+                            if isinstance(row, dict)
+                            and row.get("account_scope") == current_scope.get(provider)
+                        }
+                    payload_scope = payload.get("account_scope") if isinstance(payload, dict) else None
+                    if opencode_v2 and isinstance(payload, dict):
+                        if not isinstance(payload_scope, str):
+                            prior_scopes = {
+                                row.get("account_scope")
+                                for provider, row in (availability or {}).items()
+                                if provider in {"opencode-go", "opencode-go-entitlement"}
+                                and isinstance(row, dict)
+                                and isinstance(row.get("account_scope"), str)
+                            }
+                            payload_scope = next(iter(prior_scopes)) if len(prior_scopes) == 1 else None
+                    if (opencode_v2 and isinstance(payload, dict)
+                            and (go_scope is None or payload_scope != go_scope)):
+                        # The account can switch while the usage request is in
+                        # flight. Keep its observation tagged to its source, but
+                        # do not render its quota or denial as the new account's.
+                        for key in ("rl_5h", "rl_7d", "rl_ms", "rs_5h", "rs_7d",
+                                    "rl_windows", "windows", "error", "detail", "reason",
+                                    "credential_integration_id", "credential_source",
+                                    "credential_type"):
+                            payload.pop(key, None)
+                except Exception:
+                    usage_meta[harness]["providers"] = []
             payload = snap.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
