@@ -10959,6 +10959,169 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
         wake.assert_called_once_with(self.store.root)
         ensure.assert_called_once_with(reconciliation_required=True)
 
+    def test_stale_pending_write_keeps_new_consumer_and_contention_reset(self):
+        previous = dict(self.observation)
+        previous["readiness_transition"] = {
+            "token": "dead-previous-consumer-token", "identity": self.identity,
+            "consumer": {"pid": 2147483000, "pid_start": "1"},
+            "requested_at": time.time() - 30,
+        }
+        previous["readiness_contention"] = {
+            "request_token": "dead-previous-consumer-token"}
+        peer_steward._write_json_atomic(self.paths.observation, previous)
+
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "ObligationStore", return_value=self.store), \
+                mock.patch.object(peer_steward, "_watch_shared_readiness",
+                                  return_value=SimpleNamespace(state="ready", reason="fixture-ready")), \
+                mock.patch.object(peer_steward.shared_readiness, "clear_watch_transition"), \
+                mock.patch.object(peer_steward.shared_readiness, "wake_runner"), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "ensure_normal_runner"):
+            result = peer_steward._watch_transition_readiness(
+                "target-agent", "idle", self.arm,
+                {"pane": self.pane, "harness": "claude", "session_id": "target-session"},
+                self.server, self.watch_id, self.paths)
+
+        self.assertEqual((result.state, result.reason),
+                         ("pending", "shared-readiness-revalidating"))
+        replaced = peer_steward._read_json(self.paths.observation)
+        fresh = replaced["readiness_transition"]
+        self.assertNotEqual(fresh["token"], "dead-previous-consumer-token")
+        self.assertEqual(fresh["consumer"], {"pid": os.getpid(), "pid_start": self.start})
+        self.assertNotIn("readiness_contention", replaced)
+
+        # This is the exact stale local snapshot write immediately following
+        # _watch_transition_readiness() in cmd_watch_run.
+        stale_pending = {**previous, "state": "pending",
+                         "reason": result.reason, "native_wait": self.native_wait,
+                         "observed_ts": peer_steward._utc_now()}
+        peer_steward._write_watch_observation(self.paths, stale_pending)
+        after = peer_steward._read_json(self.paths.observation)
+        self.assertEqual(after["readiness_transition"], fresh)
+        self.assertNotIn("readiness_contention", after)
+        self.assertEqual(after["native_wait"], self.native_wait)
+
+        # Explicit contention updates still own their marker, and an ordinary
+        # write carrying the old marker cannot roll it back.
+        with mock.patch.object(peer_steward.shared_readiness, "clear_watch_transition"), \
+                mock.patch.object(peer_steward.shared_readiness, "wake_runner"), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "ensure_normal_runner"):
+            peer_steward._watch_note_transition_lock_contention(
+                self.store.root, self.watch_id, self.paths)
+        contention = peer_steward._read_json(self.paths.observation)["readiness_contention"]
+        self.assertEqual(contention, {"request_token": fresh["token"]})
+        peer_steward._write_watch_observation(self.paths, stale_pending)
+        after_contention = peer_steward._read_json(self.paths.observation)
+        self.assertEqual(after_contention["readiness_transition"], fresh)
+        self.assertEqual(after_contention["readiness_contention"], contention)
+        self.assertEqual(after_contention["native_wait"], self.native_wait)
+
+    def test_runner_uses_bound_cli_observation_when_transport_is_unavailable(self):
+        observation = dict(self.observation)
+        observation.pop("readiness_transition", None)
+        peer_steward._write_json_atomic(self.paths.observation, observation)
+        readiness_identity = {
+            "server": self.server, "pane": self.pane, "harness": "claude",
+            "session_id": "target-session",
+            "pid_birth": f"{os.getpid()}:{self.start}",
+        }
+
+        def ready(*_args, authority_out=None, **_kwargs):
+            if authority_out is not None:
+                authority_out.update(rows=[], handover_keys=[])
+            return SimpleNamespace(state="ready", reason="cli-observation-ready",
+                                   identity=tuple(readiness_identity.items()))
+
+        read_context = SimpleNamespace(registry_view=lambda path, **_kwargs:
+            SimpleNamespace(signature=(1, 2, 3), resolved_path=str(path)))
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward, "_runner_readiness_transport",
+                                  return_value=None), \
+                mock.patch.object(peer_steward, "_retire_target",
+                                  return_value=("idle", self.arm["agent"], 0, None)) as cli_read, \
+                mock.patch.object(peer_steward, "_retire_pane_info", return_value={
+                    "shell_pid": os.getpid(), "foreground_processes": []}), \
+                mock.patch.object(peer_steward, "_pane_readiness", side_effect=ready) as classify, \
+                mock.patch.object(peer_steward, "_wake_watch_observer", return_value=True):
+            result = peer_steward._publish_watch_readiness(
+                self.store, {"watch_root": self.watch_root,
+                             "watches": ((self.watch_id, self.arm),)},
+                read_context=read_context, incarnation="receipt-lock-incarnation")
+
+        self.assertTrue(result)
+        cli_read.assert_called_once_with("target-agent", server=self.server)
+        self.assertEqual(classify.call_count, 1)
+        projection = peer_steward.shared_readiness._read_json(
+            peer_steward.shared_readiness._target_path(self.store.root, self.identity))
+        self.assertEqual((projection["result"]["state"], projection["result"]["reason"]),
+                         ("ready", "cli-observation-ready"))
+
+    def test_complete_census_absence_does_not_get_overridden_by_cli(self):
+        observation = dict(self.observation)
+        observation.pop("readiness_transition", None)
+        peer_steward._write_json_atomic(self.paths.observation, observation)
+        transport = SimpleNamespace(observe=lambda: SimpleNamespace(
+            complete=True, agents=()))
+        read_context = SimpleNamespace(registry_view=lambda path, **_kwargs:
+            SimpleNamespace(signature=(1, 2, 3), resolved_path=str(path)))
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward, "_runner_readiness_transport",
+                                  return_value=transport), \
+                mock.patch.object(peer_steward, "_retire_target") as cli_read, \
+                mock.patch.object(peer_steward, "_retire_pane_info", return_value=None), \
+                mock.patch.object(peer_steward, "_wake_watch_observer", return_value=True):
+            peer_steward._publish_watch_readiness(
+                self.store, {"watch_root": self.watch_root,
+                             "watches": ((self.watch_id, self.arm),)},
+                read_context=read_context, incarnation="receipt-lock-incarnation")
+        cli_read.assert_not_called()
+
+    def test_unavailable_cli_observation_stays_unknown(self):
+        observation = dict(self.observation)
+        observation.pop("readiness_transition", None)
+        peer_steward._write_json_atomic(self.paths.observation, observation)
+        read_context = SimpleNamespace(registry_view=lambda path, **_kwargs:
+            SimpleNamespace(signature=(1, 2, 3), resolved_path=str(path)))
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward, "_runner_readiness_transport",
+                                  return_value=None), \
+                mock.patch.object(peer_steward, "_retire_target", return_value=(
+                    "herdr-unavailable", {"harness": "-", "session_id": "-",
+                                          "name": "target-agent", "pane": "-"},
+                    4, "herdr-protocol-error")), \
+                mock.patch.object(peer_steward, "_retire_pane_info", return_value=None), \
+                mock.patch.object(peer_steward, "_pane_readiness") as classify, \
+                mock.patch.object(peer_steward, "_wake_watch_observer", return_value=True):
+            peer_steward._publish_watch_readiness(
+                self.store, {"watch_root": self.watch_root,
+                             "watches": ((self.watch_id, self.arm),)},
+                read_context=read_context, incarnation="receipt-lock-incarnation")
+        classify.assert_not_called()
+        projection = peer_steward.shared_readiness._read_json(
+            peer_steward.shared_readiness._target_path(self.store.root, self.identity))
+        self.assertEqual(projection["result"]["state"], "unknown")
+
+    def test_server_specific_cli_observation_does_not_change_global_binding(self):
+        selected = "another-herdr-server"
+        before = peer_steward._HERDR_SESSION
+        process = subprocess.CompletedProcess(
+            ["herdr"], 0, json.dumps({"result": {"agent": {"agent_status": "idle"}}}), "")
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=process) as run:
+            payload = peer_steward._run_herdr_get("target-agent", server=selected)
+        self.assertEqual(payload["result"]["agent"]["agent_status"], "idle")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["herdr", "--session", selected,
+                                "agent", "get", "target-agent"])
+        self.assertEqual(run.call_args.kwargs["env"]["AGENT_HERDR_SESSION"], selected)
+        self.assertEqual(peer_steward._HERDR_SESSION, before)
+
     def test_repeated_same_transition_contention_coalesces_runner_wake(self):
         wake_fd = peer_steward.shared_readiness.open_runner_wake(self.store.root)
         try:

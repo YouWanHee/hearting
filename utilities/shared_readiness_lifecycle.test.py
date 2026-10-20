@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import signal
@@ -40,6 +41,10 @@ peer_steward = _load("lifecycle_peer_steward", HERE / "peer-steward.py")
 _FAKE_HERDR = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
+log = os.environ.get("LIFECYCLE_HERDR_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(argv) + "\n")
 if argv[:1] == ["--session"]:
     argv = argv[2:]
 if argv[:2] == ["agent", "get"]:
@@ -58,10 +63,12 @@ if argv[:2] == ["agent", "get"]:
 if argv[:2] == ["pane", "process-info"]:
     pane = argv[-1]
     pid = int(os.environ["LIFECYCLE_SHELL_PID"])
+    pgid = int(os.environ["LIFECYCLE_SHELL_PGID"])
+    process_argv = json.loads(os.environ["LIFECYCLE_SHELL_ARGV"])
     print(json.dumps({"result": {"process_info": {
         "pane_id": pane, "shell_pid": pid,
-        "foreground_process_group_id": pid,
-        "foreground_processes": [{"pid": pid, "argv": ["zsh"]}]}}}))
+        "foreground_process_group_id": pgid,
+        "foreground_processes": [{"pid": pid, "argv": process_argv}]}}}))
     raise SystemExit(0)
 print(json.dumps({"result": {}}))
 '''
@@ -73,6 +80,11 @@ class FakeReadinessTransport:
     def __init__(self, state_file, count_path):
         self.state_file = Path(state_file)
         self.count_path = Path(count_path)
+        context = multiprocessing.get_context("fork")
+        self.observe_count = context.Value("i", 0)
+        self.pause_after = context.Value("i", 2**31 - 1)
+        self.pause_entered = context.Event()
+        self.resume = context.Event()
         self.read_fd, self.write_fd = os.pipe()
         os.set_blocking(self.read_fd, False)
         os.set_blocking(self.write_fd, False)
@@ -81,6 +93,13 @@ class FakeReadinessTransport:
         return self.read_fd if self.read_fd >= 0 else None
 
     def observe(self):
+        with self.observe_count.get_lock():
+            self.observe_count.value += 1
+            sequence = self.observe_count.value
+        if sequence > self.pause_after.value:
+            self.pause_entered.set()
+            if not self.resume.wait(20):
+                raise TimeoutError("lifecycle observation gate was not released")
         while self.read_fd >= 0:
             try:
                 if not os.read(self.read_fd, 4096):
@@ -181,12 +200,18 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         self.home = self.base / "home"
         self.bin = self.base / "bin"
         self.bin.mkdir()
+        self.target_shell = subprocess.Popen(
+            ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(self._stop_target_shell)
         fake = self.bin / "herdr"
         fake.write_text(_FAKE_HERDR, encoding="utf-8")
         fake.chmod(0o755)
         self.state_file = self.base / "target-state.json"
         self.state_file.write_text(json.dumps({"status": "working"}), encoding="utf-8")
         self.snapshot_count_path = self.base / "runner-snapshots.log"
+        self.herdr_log_path = self.base / "herdr-argv.jsonl"
         self.api_path = self.base / "herdr.sock"
         self.endpoint = FakeReadinessTransport(self.state_file, self.snapshot_count_path)
         self.old_env = dict(os.environ)
@@ -204,7 +229,13 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_DATA_HOME": str(self.home / ".local/share"),
             "LIFECYCLE_STATE_FILE": str(self.state_file),
-            "LIFECYCLE_SHELL_PID": str(os.getpid()),
+            "LIFECYCLE_SHELL_PID": str(self.target_shell.pid),
+            "LIFECYCLE_SHELL_PGID": str(os.getpgid(self.target_shell.pid)),
+            "LIFECYCLE_SHELL_ARGV": json.dumps([
+                part.decode("utf-8", errors="replace") for part in
+                Path(f"/proc/{self.target_shell.pid}/cmdline").read_bytes().split(b"\0")
+                if part]),
+            "LIFECYCLE_HERDR_LOG": str(self.herdr_log_path),
             "PATH": str(self.bin) + os.pathsep + self.old_env.get("PATH", ""),
         })
         self.addCleanup(self._restore_env)
@@ -221,7 +252,17 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
 
+    def _stop_target_shell(self):
+        if self.target_shell.poll() is None:
+            self.target_shell.terminate()
+        try:
+            self.target_shell.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.target_shell.kill()
+            self.target_shell.wait(timeout=2)
+
     def _cleanup_processes(self):
+        self.endpoint.resume.set()
         for process in self.watchers:
             if process.poll() is None:
                 process.terminate()
@@ -335,7 +376,7 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         os.close(self.runner_lock_fd)
         self.runner_lock_fd = None
 
-    def _arm(self, index, *, legacy=False, separate=False):
+    def _arm(self, index, *, legacy=False, separate=False, previous_consumer=None):
         import session_tidy
 
         watch_id = hashlib.sha256(f"lifecycle-{index}".encode()).hexdigest()[:16]
@@ -365,15 +406,15 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         }
         if not legacy:
             arm["pane_identity"] = {
-                "shell_pid": os.getpid(),
-                "shell_start": str(process_start_ticks(os.getpid())),
+                "shell_pid": self.target_shell.pid,
+                "shell_start": str(process_start_ticks(self.target_shell.pid)),
             }
         paths = peer_steward._watch_paths(watch_id, self.watch_root)
         peer_steward._write_json_atomic(paths.arm, arm)
         native_state = "done" if index == 1 else "idle"
         native_agent = {"harness": "claude", "session_id": sid,
                         "name": target, "pane": pane}
-        peer_steward._write_json_atomic(paths.observation, {
+        observation = {
             "schema_version": peer_steward._WATCH_SCHEMA,
             "watch_id": watch_id,
             "state": "waiting",
@@ -381,7 +422,18 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             "native_wait": {"state": "result", "agent_state": native_state,
                             "agent": native_agent, "reason": native_state,
                             "done_ts": peer_steward._utc_now()},
-        })
+        }
+        if previous_consumer is not None:
+            identity = peer_steward._watch_readiness_identity(arm, native_state)
+            if identity is None:
+                raise AssertionError("stale-consumer fixture identity was not bindable")
+            token = "dead-previous-consumer-token"
+            observation["readiness_transition"] = {
+                "token": token, "identity": identity,
+                "consumer": previous_consumer, "requested_at": time.time() - 30,
+            }
+            observation["readiness_contention"] = {"request_token": token}
+        peer_steward._write_json_atomic(paths.observation, observation)
         self.arms.append((watch_id, arm, paths))
 
     def _wait_until(self, predicate, message, timeout=25):
@@ -431,8 +483,22 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         return records
 
     def test_runner_recovers_independent_watches_and_refreshes_without_jobs_change(self):
+        previous_process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        previous_consumer = {
+            "pid": previous_process.pid,
+            "pid_start": str(process_start_ticks(previous_process.pid) or ""),
+        }
+        self.assertTrue(previous_consumer["pid_start"], "previous consumer identity must be valid")
+        previous_process.terminate()
+        previous_process.wait(timeout=2)
+        self.assertFalse(Path(f"/proc/{previous_consumer['pid']}/stat").exists(),
+                         "preseeded previous consumer must be dead and reaped")
         for index in range(5):
-            self._arm(index, legacy=(index == 0))
+            self._arm(index, legacy=(index == 0),
+                      previous_consumer=previous_consumer if index == 0 else None)
         self._arm(5, separate=True)
         original_deadlines = {watch_id: arm["deadline"]
                               for watch_id, arm, _paths in self.arms}
@@ -457,7 +523,43 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         self._wait_until(pending_projection_exists,
                          "real runner did not publish pending projections for recovered native results")
         self.assertFalse(any(paths.receipt.exists() for _watch, _arm, paths in self.arms))
+        self.endpoint.pause_after.value = self.endpoint.observe_count.value + 1
         self.endpoint.set_idle()
+        self.assertTrue(self.endpoint.pause_entered.wait(10),
+                        "real runner did not pause after publishing ready projections")
+
+        recovered = {}
+        watch_id, arm, paths = self.arms[0]
+
+        def fresh_request_survived_outer_pending_write():
+            current = peer_steward._read_json(paths.observation) or {}
+            request = current.get("readiness_transition")
+            if not isinstance(request, dict):
+                return False
+            if (request.get("token") == "dead-previous-consumer-token"
+                    or request.get("consumer") != arm.get("watcher")
+                    or "readiness_contention" in current
+                    or current.get("state") != "pending"
+                    or current.get("reason") != "shared-readiness-revalidating"):
+                return False
+            recovered.update(observation=current, request=request)
+            return True
+
+        self._wait_until(
+            fresh_request_survived_outer_pending_write,
+            "fresh current-consumer request did not survive the stale cmd_watch_run pending write",
+            timeout=10)
+        self.assertTrue(shared_readiness.consumer_is_current(
+            {"consumer": recovered["request"]["consumer"]}))
+        self.assertEqual(recovered["observation"]["native_wait"],
+                         peer_steward._read_json(paths.observation)["native_wait"])
+        runner_marker = peer_steward._read_json(
+            store.root / "readiness-v1" / "runner.json") or {}
+        self.assertEqual(
+            str(process_start_ticks(runner_marker.get("pid", -1)) or ""),
+            runner_marker.get("pid_start"),
+            "the existing normal runner must own the recovery pass")
+        self.endpoint.resume.set()
 
         self._wait_until(
             lambda: all(paths.receipt.exists() for _watch, _arm, paths in self.arms),
@@ -508,6 +610,10 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             self.assertEqual(acknowledge_watch(
                 watch_id, "claude", f"steward-{index}", "lifecycle-test"), "created")
         self.assertTrue(all(paths.ack.exists() for _id, _arm, paths in self.arms))
+        herdr_calls = [json.loads(line) for line in
+                       self.herdr_log_path.read_text(encoding="utf-8").splitlines()]
+        self.assertFalse(any(call[:2] == ["agent", "wait"] for call in herdr_calls),
+                         "recovery must consume the durable native result without replaying wait")
         self.assertEqual(hashlib.sha256(self.jobs.read_bytes()).hexdigest(), self.jobs_before,
                          "target readiness changed while jobs.log stayed byte-identical")
         runner_snapshots = len(self.snapshot_count_path.read_text().splitlines())
@@ -545,6 +651,21 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             },
             "remaining_independent_receipts": sum(paths.receipt.exists()
                                                    for _id, _arm, paths in self.arms),
+            "dead_previous_consumer_recovery": {
+                "previous_pid": previous_consumer["pid"],
+                "previous_pid_start": previous_consumer["pid_start"],
+                "old_token_replaced": recovered["request"]["token"] !=
+                    "dead-previous-consumer-token",
+                "fresh_consumer_matches_watch": recovered["request"]["consumer"] ==
+                    arm["watcher"],
+                "stale_pending_write_survived": recovered["observation"].get("reason") ==
+                    "shared-readiness-revalidating",
+                "old_contention_marker_absent": "readiness_contention" not in
+                    recovered["observation"],
+                "native_wait_replayed": False,
+            },
+            "herdr_wait_calls_during_recovery": sum(
+                call[:2] == ["agent", "wait"] for call in herdr_calls),
             "fixture_target_pid": os.getpid(),
             "host_production_pid_claim": False,
         })

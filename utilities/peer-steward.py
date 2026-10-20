@@ -1952,9 +1952,11 @@ def _retire_shell_returned(info, identity):
     return start is not None and start != identity["start"]
 
 
-def _retire_target(target):
+def _retire_target(target, *, server=None):
     try:
-        state, ident, rc, reason = _interpret_payload(_run_herdr_get(target), target)
+        payload = (_run_herdr_get(target) if server is None
+                   else _run_herdr_get(target, server=server))
+        state, ident, rc, reason = _interpret_payload(payload, target)
         if any(not isinstance(value, str) or not value for value in ident.values()):
             raise ValueError("malformed target")
         return state, ident, rc, reason
@@ -3251,10 +3253,19 @@ def _herdr_get_timeout():
     return min(600.0, max(0.5, value))
 
 
-def _run_herdr_get(target):
+def _run_herdr_get(target, *, server=None):
+    if server is None:
+        argv = _herdr_argv("agent", "get", target)
+        env = None
+    else:
+        selected = server or "default"
+        argv = (["herdr"] + ([] if selected == "default"
+                              else ["--session", selected])
+                + ["agent", "get", target])
+        env = _herdr_env_for_server(selected)
     try:
         proc = subprocess.run(
-            _herdr_argv("agent", "get", target), capture_output=True, text=True,
+            argv, capture_output=True, text=True, env=env,
             timeout=_herdr_get_timeout(),   # a wedged socket is `herdr-unavailable`, not a hang (M3)
         )
     except (OSError, subprocess.SubprocessError):
@@ -3520,7 +3531,7 @@ def _record_watch_native_result(paths, arm, result):
     return True
 
 
-def _write_watch_observation(paths, observation):
+def _write_watch_observation(paths, observation, *, control_updates=()):
     """Keep a transition request beside its exact durable native result."""
     current = _read_json(paths.observation) or {}
     current_native = current.get("native_wait") or {}
@@ -3530,12 +3541,16 @@ def _write_watch_observation(paths, observation):
             and next_native.get("state") == "result"
             and next_native.get("agent_state") == current_native.get("agent_state")
             and next_native.get("agent") == current_native.get("agent")):
-        request = current.get("readiness_transition")
-        if isinstance(request, dict) and "readiness_transition" not in observation:
-            observation = {**observation, "readiness_transition": request}
-        contention = current.get("readiness_contention")
-        if isinstance(contention, dict) and "readiness_contention" not in observation:
-            observation = {**observation, "readiness_contention": contention}
+        control_fields = {"readiness_transition", "readiness_contention"}
+        updates = set(control_updates)
+        if not updates.issubset(control_fields):
+            raise ValueError("unknown watch observation control update")
+        observation = dict(observation)
+        for field in control_fields - updates:
+            if field in current:
+                observation[field] = current[field]
+            else:
+                observation.pop(field, None)
     _write_json_atomic(paths.observation, observation)
     return observation
 
@@ -5754,7 +5769,8 @@ def _watch_note_transition_lock_contention(root, watch_id, paths):
         })
         if request_token:
             latest["readiness_contention"] = {"request_token": request_token}
-        _write_watch_observation(paths, latest)
+        _write_watch_observation(
+            paths, latest, control_updates={"readiness_contention"})
     try:
         shared_readiness.clear_watch_transition(root, watch_id)
         if not same_request:
@@ -7139,8 +7155,16 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             if server not in views_by_server:
                 transport = _runner_readiness_transport(server)
                 views_by_server[server] = transport.observe() if transport is not None else None
-            observed_state, observed_ident, _code, _reason = _target_from_readiness_view(
-                views_by_server[server], target)
+            view = views_by_server[server]
+            if view is None or getattr(view, "complete", True) is not True:
+                # Preserve the legacy positive CLI observation when the optional
+                # transport has no usable census. The group key already limits
+                # this to one read per endpoint/target/pass.
+                observed_state, observed_ident, _code, _reason = _retire_target(
+                    target, server=server)
+            else:
+                observed_state, observed_ident, _code, _reason = _target_from_readiness_view(
+                    view, target)
             pane_info = _retire_pane_info(identity["pane"], server=server)
             shell_pid = (int(pane_info.get("shell_pid", 0))
                          if isinstance(pane_info, dict) else 0)
