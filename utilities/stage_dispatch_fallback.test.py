@@ -27,6 +27,14 @@ def dispatch_defaults_config_text(text):
 
 
 class FallbackTest(unittest.TestCase):
+ def test_spawn_wait_default_does_not_extend_launch_receipt_observation(self):
+  self.assertEqual(F.DIRECT_TIMEOUT_DEFAULT,300.0)
+  args=SimpleNamespace(direct_timeout=300.0,progress_window_seconds=300.0,
+                       watchdog_max_windows=12)
+  self.assertEqual(F.launch_confirm_deadline_seconds(args),45.0)
+  args.direct_timeout=10.0
+  self.assertEqual(F.launch_confirm_deadline_seconds(args),10.0)
+
  def test_wrapper_stderr_cannot_replace_typed_stdout_receipt(self):
   result=SimpleNamespace(stdout='check=failed\nreason=unsafe-git-operation\ndetail=cherry-pick\n',
                          stderr='check=ok\nreason=launched\nstarted=1\n')
@@ -75,7 +83,7 @@ class FallbackTest(unittest.TestCase):
    out=io.StringIO()
    with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
         mock.patch.object(F,"run_wrapper",side_effect=subprocess.TimeoutExpired(["fixture"],1)), \
-        mock.patch.object(F,"registry_has_attempt",return_value=True), contextlib.redirect_stdout(out):
+        mock.patch.object(F,"settle_direct_timeout_attempt",return_value="unknown"), contextlib.redirect_stdout(out):
     code,_=self.run_inline(path)
    receipt=self.cli_verdict(out.getvalue())
    rows=json.loads(receipt["candidate_outcomes"])
@@ -87,6 +95,51 @@ class FallbackTest(unittest.TestCase):
    saved=self.degradation_rows(path)[-1]
    self.assertEqual(saved["candidate_outcomes"],rows)
    self.assertEqual(saved["last_direct_failure"],"direct-timeout:exit-timeout")
+
+ def test_timeout_settlement_closes_only_the_exact_proven_unstarted_row(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   attempt="att-timeout-proven-never-started"
+   metadata=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+             "execution_surface=registered-headless,registered_worker=1,"
+             "fallback_hop=same-harness-headless,"
+             f"route_id={route['route_id']},"
+             f"route_hash={route['route_hash']},route_node={node['id']},"
+             f"attempt_id={attempt},launch_claimed=0")
+   self.jobs.write_text(
+    f"now\topen\t{self.repo}\t{self.repo}\tstage\t{metadata}\n",encoding="utf-8")
+   state=F.settle_direct_timeout_attempt(self.jobs,route,node,attempt)
+   self.assertEqual(state,"unstarted")
+   fields=self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")
+   closed=F.parse_registry_metadata(fields[5])
+   self.assertEqual(fields[1],"done")
+   self.assertEqual(closed["note"],"never-launched")
+   self.assertEqual(closed["launch_outcome"],"never-launched")
+   self.assertEqual(closed["reconcile_reason"],F.DIRECT_TIMEOUT_UNSTARTED_REASON)
+   self.assertEqual(F.retry_proven_unstarted_identity(
+    self.jobs,route["route_id"],node["id"],attempt),F.retry_attempt_identity(attempt))
+
+   protected=(
+    {"launch_claimed":"1"},
+    {"launch_claimed":"0","pid":"123"},
+    {"launch_claimed":"0","launch_started":"1"},
+    {},
+   )
+   for index,extra in enumerate(protected,1):
+    with self.subTest(extra=extra):
+     candidate=f"att-timeout-protected-{index}"
+     row_meta=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+               "execution_surface=registered-headless,registered_worker=1,"
+               "fallback_hop=same-harness-headless,"
+               f"route_id={route['route_id']},"
+               f"route_hash={route['route_hash']},route_node={node['id']},"
+               f"attempt_id={candidate},"+
+               ",".join(f"{key}={value}" for key,value in extra.items()))
+     self.jobs.write_text(
+      f"now\topen\t{self.repo}\t{self.repo}\tstage\t{row_meta}\n",encoding="utf-8")
+     self.assertEqual(F.settle_direct_timeout_attempt(
+      self.jobs,route,node,candidate),"unknown")
+     self.assertIn("\topen\t",self.jobs.read_text(encoding="utf-8"))
 
  def test_watchdog_fallback_and_fail_closed_preserve_current_attempt(self):
   real_load=F.load_node
@@ -1963,7 +2016,7 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.launch_confirm_deadline_seconds(disabled),2.0)
   absent=SimpleNamespace(progress_window_seconds=300.0,watchdog_max_windows=12)
   self.assertEqual(F.launch_confirm_deadline_seconds(absent),
-                   F.DIRECT_TIMEOUT_DEFAULT)
+                   F.LAUNCH_CONFIRM_DEFAULT)
 
  def _live_row(self,attempt="att-live",route_id="rt-fixture",node="plan"):
   proc=subprocess.Popen(["sleep","30"],start_new_session=True)
@@ -2220,11 +2273,144 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.own_registered_attempt(args("start"),route,node),"att-registered")
   for other in (args("register"),args("dry-run"),args("start",slug="other"),args("start",parent="att-other")):
    self.assertIsNone(F.own_registered_attempt(other,route,node))
-  for line in (row("att-registered",launch_claimed="1"),row("att-registered",pid="12"),row("att-registered","done")):
+  for line in (row("att-registered",launch_claimed="1"),row("att-registered",pid="12"),
+               row("att-registered",launch_started="1"),row("att-registered","done")):
    self.jobs.write_text(line+"\n")
    self.assertIsNone(F.own_registered_attempt(args("start"),route,node))
   self.jobs.write_text(row("att-a")+"\n"+row("att-b")+"\n")
   self.assertIsNone(F.own_registered_attempt(args("start"),route,node))
+
+ def test_start_reuses_one_of_multiple_unstarted_registrations_once(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   selected="att-stale-selected"
+   metadata_base=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                 "execution_surface=registered-headless,registered_worker=1,"
+                 "fallback_hop=same-harness-headless,")
+   rows=[]
+   for attempt in (selected,"att-stale-other"):
+    metadata=(f"{metadata_base}route_id={route['route_id']},route_hash={route['route_hash']},"
+              f"route_node={node['id']},attempt_id={attempt},launch_claimed=0,"
+              "parent_attempt_id=att-fallback-parent")
+    rows.append(f"now\topen\t{self.repo}\t{self.repo}\tfallback-plan\t{metadata}")
+   self.jobs.write_text("\n".join(rows)+"\n",encoding="utf-8")
+   hop={"ordinal":1,"fallback_hop":"same-harness-headless",
+        "candidates":[self.tuple("codex","supported")]}
+   launched=[]
+   result=SimpleNamespace(returncode=0,stdout="check=ok\nworker_failure=-\n",stderr="")
+   code,stdout,stderr=self.start(path,patches=(
+    mock.patch.object(F,"ordered_fallback_hops",return_value=([hop],None)),
+    mock.patch.object(F,"attempt_identity",return_value=selected),
+    mock.patch.object(F,"run_wrapper",side_effect=lambda _args,command:(launched.append(command) or result)),
+   ))
+   self.assertEqual(code,0,stdout+stderr)
+   self.assertEqual(len(launched),1)
+   self.assertEqual(self.arg(launched[0],"--attempt-id"),selected)
+
+ def test_start_timeout_closes_proven_unstarted_row_before_continuing(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   hop={"ordinal":1,"fallback_hop":"same-harness-headless",
+        "candidates":[self.tuple("codex","supported")]}
+   launched=[]
+   def timeout(_args,command):
+    launched.append(command)
+    attempt=self.arg(command,"--attempt-id")
+    metadata=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+              "execution_surface=registered-headless,registered_worker=1,"
+              f"fallback_hop=same-harness-headless,route_id={route['route_id']},"
+              f"route_hash={route['route_hash']},route_node={node['id']},"
+              f"attempt_id={attempt},launch_claimed=0,parent_attempt_id=att-fallback-parent")
+    with self.jobs.open("a",encoding="utf-8") as handle:
+     handle.write(f"now\topen\t{self.repo}\t{self.repo}\tfallback-plan\t{metadata}\n")
+    raise subprocess.TimeoutExpired(command,1)
+   code,stdout,stderr=self.start(path,patches=(
+    mock.patch.object(F,"ordered_fallback_hops",return_value=([hop],None)),
+    mock.patch.object(F,"run_wrapper",side_effect=timeout),
+   ))
+   self.assertEqual(len(launched),1)
+   self.assertNotIn("reason=direct-launch-outcome-unknown",stdout)
+   self.assertNotIn("reason=direct-launch-outcome-unknown",stderr)
+   fields=next(line.split("\t") for line in self.jobs.read_text().splitlines()
+               if self.arg(launched[0],"--attempt-id") in line)
+   metadata=F.parse_registry_metadata(fields[5])
+   self.assertEqual((fields[1],metadata.get("note")),("done","never-launched"))
+   self.assertEqual(metadata.get("reconcile_reason"),F.DIRECT_TIMEOUT_UNSTARTED_REASON)
+
+ def test_capped_test_timeout_settlement_restarts_same_payload_once(self):
+  import dispatch_contract as DC
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text());node=next(n for n in route["nodes"] if n["id"]=="test")
+   self.seed_predecessor_markers(path,"test");self.seed_parent()
+   self.seed_review_rounds(route,"test",1)
+   payload=self.art/"payload-count.txt"
+   calls=[]
+   first_hop=node["fallback_hops"][0]
+   only_first_hop=mock.patch.object(F,"ordered_fallback_hops",
+    return_value=([first_hop],None))
+   def timeout_then_run(_args,command):
+    calls.append(command)
+    attempt=self.arg(command,"--attempt-id")
+    if len(calls)==1:
+     metadata={
+      "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+      "execution_surface":"registered-headless","registered_worker":"1",
+      "fallback_hop":"same-harness-headless","worker_type":"test","unit":"qa/test",
+      "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+      "route_file":str(path),"completion_gate":node.get("completion_gate",""),
+      "parent_attempt_id":"att-fallback-parent","attempt_id":attempt,"launch_claimed":"0",
+      "launch_outcome":"never-launched",
+     }
+     metadata.update(SUBJECT.seal_attempt(self.jobs,route,node,attempt,worktree=self.repo))
+     with self.jobs.open("a",encoding="utf-8") as handle:
+      handle.write(f"now\topen\t{self.repo}\t{self.repo}\tfallback-test\t"+
+                   ",".join(f"{key}={value}" for key,value in metadata.items())+"\n")
+     raise subprocess.TimeoutExpired(command,1)
+    metadata={
+     "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+     "execution_surface":"registered-headless","registered_worker":"1",
+     "fallback_hop":"same-harness-headless","worker_type":"test","unit":"qa/test",
+     "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+     "route_file":str(path),"completion_gate":node.get("completion_gate",""),
+     "parent_attempt_id":"att-fallback-parent","attempt_id":attempt,"launch_claimed":"0",
+     "launch_outcome":"never-launched",
+    }
+    metadata.update(SUBJECT.seal_attempt(self.jobs,route,node,attempt,worktree=self.repo))
+    row=(f"now\topen\t{self.repo}\t{self.repo}\tfallback-test\t"+
+         ",".join(f"{key}={value}" for key,value in metadata.items()))
+    if not DC.claim_attempt_row(self.jobs,attempt,row,launch=True):
+     raise AssertionError("second payload did not acquire its exact launch claim")
+    with payload.open("a",encoding="utf-8") as handle:
+     handle.write("payload\n")
+    return SimpleNamespace(returncode=0,
+     stdout="check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n",stderr="")
+
+   first_code,first_output=self.closure_action(path,"start",patches=(
+    only_first_hop,
+    mock.patch.object(F,"run_wrapper",side_effect=timeout_then_run),))
+   self.assertNotEqual(first_code,0,first_output)
+   first_attempt=self.arg(calls[0],"--attempt-id")
+   first_row=next(line.split("\t") for line in self.jobs.read_text().splitlines()
+                  if first_attempt in line)
+   first_meta=F.parse_registry_metadata(first_row[5])
+   self.assertEqual((first_row[1],first_meta.get("note"),first_meta.get("failure_class")),
+                    ("done","never-launched","cancelled"))
+   self.assertFalse(payload.exists())
+
+   second_code,second_output=self.closure_action(path,"start",patches=(
+    only_first_hop,
+    mock.patch.object(F,"run_wrapper",side_effect=timeout_then_run),))
+   self.assertEqual(second_code,0,second_output)
+   self.assertEqual(len(calls),2)
+   self.assertNotEqual(self.arg(calls[0],"--attempt-id"),self.arg(calls[1],"--attempt-id"))
+   self.assertEqual(payload.read_text(encoding="utf-8").splitlines(),["payload"])
+   self.assertNotIn("review-round-budget-exhausted",second_output)
+   self.assertNotIn("review-verdictless-bound",second_output)
+   self.assertNotIn("attempt-identity",second_output)
+   rows=F.registry_rows(self.jobs,route["route_id"],"test")
+   self.assertEqual(sum(row.get("attempt_id")==self.arg(calls[0],"--attempt-id") for row in rows),1)
+   self.assertEqual(sum(row.get("attempt_id")==self.arg(calls[1],"--attempt-id") for row in rows),1)
  def test_legacy_parent_generation_conflict_is_typed_without_reusing_identity(self):
   route={"route_id":"rt-parent-generation"};node={"id":"plan"};row={"child_harness":"codex"}
   old=SimpleNamespace(slug="stage",parent="owner",parent_attempt_id="att-parent-old")

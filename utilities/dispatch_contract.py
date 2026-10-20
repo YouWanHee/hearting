@@ -11540,49 +11540,56 @@ def close_attempt_row_if(
     with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        matches = []
         for index, line in enumerate(lines):
             fields = line.split("\t")
-            if len(fields) != 6 or fields[1] not in {"open", "running"}:
+            if len(fields) != 6:
                 continue
             metadata = parse_registry_metadata(fields[5])
             if metadata.get("attempt_id") != attempt_id:
                 continue
-            validate_attempt_metadata(metadata)
-            import route_parent_close
-            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+            matches.append((index, fields, metadata))
+        if len(matches) != 1:
+            return False
+        index, fields, metadata = matches[0]
+        if fields[1] not in {"open", "running"}:
+            return False
+        validate_attempt_metadata(metadata)
+        import route_parent_close
+        if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+            return False
+        recorded_claim = metadata.get("teardown_claim", "")
+        if recorded_claim:
+            if not teardown_claim or recorded_claim != teardown_claim:
                 return False
-            recorded_claim = metadata.get("teardown_claim", "")
-            if recorded_claim:
-                if not teardown_claim or recorded_claim != teardown_claim:
-                    return False
-            elif teardown_claim:
-                return False
-            if not predicate(fields.copy()):
-                continue
-            fields[1] = "done"
-            values = {"note": note}
-            if teardown_claim:
-                values.update(
-                    teardown_claim="",
-                    teardown_claimed_at="",
-                    teardown_claim_pid="",
-                    teardown_claim_pid_start="",
-                )
-            values.update({
-                key: value for key, value in (evidence or {}).items()
-                if value not in (None, "")
-            })
-            values.update(_terminal_cleanup_values({**metadata, **values}))
-            values.update(_delivery_intent_values(fields, {**metadata, **values}))
-            try:
-                fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
-                )
-            except DispatchContractError:
-                return False
-            lines[index] = "\t".join(fields)
-            _atomic_registry_replace(jobs, lines)
-            return True
+        elif teardown_claim:
+            return False
+        if not predicate(fields.copy()):
+            return False
+        fields[1] = "done"
+        values = {"note": note}
+        if teardown_claim:
+            values.update(
+                teardown_claim="",
+                teardown_claimed_at="",
+                teardown_claim_pid="",
+                teardown_claim_pid_start="",
+            )
+        values.update({
+            key: value for key, value in (evidence or {}).items()
+            if value not in (None, "")
+        })
+        values.update(_terminal_cleanup_values({**metadata, **values}))
+        values.update(_delivery_intent_values(fields, {**metadata, **values}))
+        try:
+            fields[5] = _updated_attempt_metadata(
+                fields[5], values, terminal=True
+            )
+        except DispatchContractError:
+            return False
+        lines[index] = "\t".join(fields)
+        _atomic_registry_replace(jobs, lines)
+        return True
     return False
 
 
@@ -11610,6 +11617,20 @@ def attempt_row_never_started(fields: list[str]) -> bool:
         and not metadata.get("pid")
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
+    """Identify a never-started registration withdrawn under the jobs lock.
+
+    An unclaimed open row may still be launched. Only a terminal row explicitly
+    closed as cancelled has lost that launch authority and can leave the round
+    census without hiding a real pre-launch failure.
+    """
+
+    if len(fields) != 6 or not attempt_row_never_started(fields):
+        return False
+    metadata = parse_registry_metadata(fields[5])
+    return fields[1] in {"done", "cancelled", "killed"} and metadata.get("failure_class") == "cancelled"
 
 
 def close_refused_chain_rows(
