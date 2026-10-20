@@ -45,6 +45,50 @@ class DegradationWriterTest(unittest.TestCase):
             self.assertEqual(row['candidate_outcomes'][0]['ordinal'], 0)
             self.assertEqual(row['candidate_outcomes_omitted'], 0)
 
+    def test_direct_detail_is_finite_with_absent_empty_and_normal_candidates(self):
+        raw_detail = ("PROMPT_FIXTURE_SENTINEL argv=ARGV_FIXTURE_SENTINEL "
+                      "env=ENV_FIXTURE_SENTINEL \x1b[31mCONTROL_FIXTURE_SENTINEL\n"
+                      "reason=FORGED_DETAIL_REASON")
+        cases = (
+            ("absent", {"reason": {"raw": "REASON_OBJECT_SENTINEL"}}),
+            ("empty", {"reason": "unsafe-git-operation\nreason=CONTROL_REASON_SENTINEL",
+                       "candidate_outcomes": []}),
+            ("normal", {"reason": "unsafe-git-operation",
+                        "candidate_outcomes": [{"ordinal": 1, "tuple": "codex/headless",
+                                                "attempted": True, "attempt_id": "att-finite",
+                                                "exit": "65", "reason": "unsafe-git-operation",
+                                                "detail": "merge"}]}),
+        )
+        for label, fields in cases:
+            with self.subTest(candidates=label), tempfile.TemporaryDirectory() as home:
+                path = record_degradation(
+                    agent_home=home, jobs=os.path.join(home, "dispatch/jobs.log"),
+                    route_id=f"rt-direct-{label}", route_node="execute",
+                    route_hash="sha256:fixture", dispatch_depth=2,
+                    writer="stage-dispatch-fallback.py", detail=raw_detail, **fields)
+                raw = Path(path).read_text()
+                row = json.loads(raw)
+                for sentinel in ("PROMPT_FIXTURE_SENTINEL", "ARGV_FIXTURE_SENTINEL",
+                                 "ENV_FIXTURE_SENTINEL", "CONTROL_FIXTURE_SENTINEL",
+                                 "FORGED_DETAIL_REASON", "REASON_OBJECT_SENTINEL",
+                                 "CONTROL_REASON_SENTINEL"):
+                    self.assertNotIn(sentinel, raw)
+                self.assertEqual(row.get("detail"), "[detail omitted]")
+                self.assertEqual(row.get("reason"), "" if label in {"absent", "empty"}
+                                 else "unsafe-git-operation")
+                if label == "normal":
+                    self.assertEqual(row["candidate_outcomes"][0]["detail"], "merge")
+
+        with tempfile.TemporaryDirectory() as home:
+            path = record_degradation(
+                agent_home=home, jobs=os.path.join(home, "dispatch/jobs.log"),
+                route_id="rt-direct-finite", route_node="execute",
+                route_hash="sha256:fixture", dispatch_depth=2,
+                writer="stage-dispatch-fallback.py", reason="unsafe-git-operation",
+                detail="merge")
+            row = json.loads(Path(path).read_text())
+            self.assertEqual(row["detail"], "merge")
+
     def test_direct_writer_normalizes_invalid_and_oversized_candidate_input(self):
         from dispatch_contract import CANDIDATE_PAYLOAD_BYTES
         with tempfile.TemporaryDirectory() as home:
@@ -140,7 +184,7 @@ class DegradationWriterTest(unittest.TestCase):
             self.assertLessEqual(len(row["attempt_trace"]), 2048)
             self.assertTrue(row["event_id"].startswith("dg-"))
             self.assertTrue(row["reason"].endswith("…"))
-            self.assertTrue(row["detail"].endswith("…"))
+            self.assertEqual(row["detail"], "[detail omitted]")
             self.assertTrue(row["attempt_trace"].endswith("…"))
 
     def test_failures_are_fail_open_and_return_none(self):

@@ -255,6 +255,7 @@ def report_forwarding_cleanup_incomplete(
         code = 128 + int(signum) if signum else 130
         interrupted_fields = {
             "interrupted": "1",
+            "worker_failure": "interrupted",
             "detail": "the call was stopped, so the worker was stopped with it",
         }
     else:
@@ -281,14 +282,10 @@ def report_forwarding_cleanup_incomplete(
         terminal_note=terminal_note,
         cleanup="incomplete",
         wrapper_returncode=str(result.returncode),
-        wrapper_stdout_json=json.dumps(result.stdout or "", ensure_ascii=False),
-        wrapper_stderr_json=json.dumps(result.stderr or "", ensure_ascii=False),
         attempt_trace="|".join(attempts),
         candidate_outcomes=candidate_outcomes,
         **_last_failure_fields(direct_failures),
     )
-    if interrupted and output:
-        print(output)
     return exit_code
 
 

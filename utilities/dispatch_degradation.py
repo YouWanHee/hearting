@@ -95,14 +95,20 @@ def record_degradation(*, route_id=None, route_node=None, route_hash=None, dispa
         for key in _OPTIONAL:
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
-        for key, limit in (("reason", 160), ("detail", 512), ("attempt_trace", 2048)):
-            if key in row:
-                row[key] = _clip(row[key], limit)
+        if "reason" in row:
+            reason = row["reason"]
+            if isinstance(reason, str) and len(reason) > 160:
+                token = diagnostic_token(reason, 159)
+                row["reason"] = token + "…" if len(token) == 159 else ""
+            else:
+                row["reason"] = diagnostic_token(reason)
+        if "detail" in row:
+            row["detail"] = candidate_detail(row.get("reason", ""), row["detail"])
+        if "attempt_trace" in row:
+            row["attempt_trace"] = _clip(row["attempt_trace"], 2048)
         if "candidate_outcomes" in row:
             row["candidate_outcomes"], row["candidate_outcomes_omitted"] = bounded_candidate_outcomes(
                 row["candidate_outcomes"], row.get("candidate_outcomes_omitted", 0))
-            if "detail" in row:
-                row["detail"] = candidate_detail(row.get("reason", ""), row["detail"])
         if "last_direct_failure" in row:
             if not isinstance(row["last_direct_failure"], str):
                 return None
