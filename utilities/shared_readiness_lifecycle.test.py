@@ -657,7 +657,7 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
                 "old_token_replaced": recovered["request"]["token"] !=
                     "dead-previous-consumer-token",
                 "fresh_consumer_matches_watch": recovered["request"]["consumer"] ==
-                    arm["watcher"],
+                    self.arms[0][1]["watcher"],
                 "stale_pending_write_survived": recovered["observation"].get("reason") ==
                     "shared-readiness-revalidating",
                 "old_contention_marker_absent": "readiness_contention" not in
