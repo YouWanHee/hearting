@@ -4472,7 +4472,11 @@ def cmd_watch_run(args):
                         if not awaiting_readiness:
                             readiness = _watch_transition_readiness(
                                 args.target, result_state, arm, expected, server,
-                                args.watch_id, paths)
+                                args.watch_id, paths, deadline=deadline)
+                            if readiness.state == _WATCH_RECEIPT_EXPIRED:
+                                terminal_reason = "watch-deadline"
+                                state, agent = "timeout", expected_agent
+                                break
                             if readiness.state == "ready":
                                 action = publish_ready_result(
                                     result_state, wait_record.get("agent") or expected_agent)
@@ -4508,7 +4512,11 @@ def cmd_watch_run(args):
                             wait_record.get("agent_state") in {"idle", "done"}):
                         readiness = _watch_transition_readiness(
                             args.target, wait_record.get("agent_state"), arm, expected, server,
-                            args.watch_id, paths)
+                            args.watch_id, paths, deadline=deadline)
+                        if readiness.state == _WATCH_RECEIPT_EXPIRED:
+                            terminal_reason = "watch-deadline"
+                            state, agent = "timeout", expected_agent
+                            break
                         if readiness.state == "ready":
                             action = publish_ready_result(
                                 wait_record.get("agent_state"),
@@ -4549,7 +4557,11 @@ def cmd_watch_run(args):
                         if result_state in {"idle", "done"}:
                             readiness = _watch_transition_readiness(
                                 args.target, result_state, arm, expected, server,
-                                args.watch_id, paths)
+                                args.watch_id, paths, deadline=deadline)
+                            if readiness.state == _WATCH_RECEIPT_EXPIRED:
+                                terminal_reason = "watch-deadline"
+                                state, agent = "timeout", expected_agent
+                                break
                             if readiness.state == "ready":
                                 action = publish_ready_result(
                                     result_state, wait_record.get("agent") or expected_agent)
@@ -5646,7 +5658,8 @@ def _watch_transition_authority_lock(identity, server, *, deadline=None):
 
 
 def _watch_readiness_result(target, native_state, identity, result, server, *,
-                            require_authority=False, authority_lock_held=False):
+                            require_authority=False, authority_lock_held=False,
+                            deadline=None):
     """Bind any runner result to the exact live pane and its native result."""
     state = result.get("state", "unknown")
     reason = result.get("reason", "shared-readiness-pending")
@@ -5710,8 +5723,10 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
         if authority_lock_held:
             return fresh_authority()
         try:
-            with _watch_transition_authority_lock(identity, server):
+            with _watch_transition_authority_lock(identity, server, deadline=deadline):
                 return fresh_authority()
+        except (_WatchDeadlineExpired, _WatchTransitionLockBusy):
+            raise
         except (OSError, ValueError, RuntimeError):
             return SimpleNamespace(state="unknown",
                                    reason="shared-readiness-authority-lock-unavailable")
@@ -5719,8 +5734,25 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
                            identity=tuple(current_identity.items()))
 
 
+def _watch_note_transition_lock_contention(root, watch_id, paths):
+    """Keep this watch pending, invalidate only its response, and wake its runner."""
+    latest = _read_json(paths.observation) or {}
+    _write_watch_observation(paths, {
+        **latest, "state": "pending",
+        "reason": "shared-readiness-authority-lock-busy",
+        "observed_ts": _utc_now(),
+    })
+    try:
+        shared_readiness.clear_watch_transition(root, watch_id)
+        shared_readiness.wake_runner(root)
+        peer_obligations.ensure_normal_runner(reconciliation_required=True)
+    except Exception:
+        pass
+
+
 def _watch_transition_readiness(target, native_state, arm, expected, server,
-                                watch_id, paths, *, authority_lock_held=False):
+                                watch_id, paths, *, authority_lock_held=False,
+                                deadline=None):
     """Require a fresh runner authority read before this watch can publish ready.
 
     The long-lived target projection is only a trigger. The observer writes a
@@ -5749,9 +5781,25 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
             root, watch_id, identity, request["token"])
         if fresh is None:
             return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
-        return _watch_readiness_result(
-            target, native_state, identity, fresh, server,
-            require_authority=True, authority_lock_held=authority_lock_held)
+        try:
+            result = _watch_readiness_result(
+                target, native_state, identity, fresh, server,
+                require_authority=True, authority_lock_held=authority_lock_held,
+                deadline=deadline)
+        except _WatchDeadlineExpired:
+            return SimpleNamespace(state=_WATCH_RECEIPT_EXPIRED,
+                                   reason="watch-deadline")
+        except _WatchTransitionLockBusy:
+            if deadline is not None and time.monotonic() >= deadline:
+                return SimpleNamespace(state=_WATCH_RECEIPT_EXPIRED,
+                                       reason="watch-deadline")
+            _watch_note_transition_lock_contention(root, watch_id, paths)
+            return SimpleNamespace(state="pending",
+                                   reason="shared-readiness-authority-lock-busy")
+        if deadline is not None and time.monotonic() >= deadline:
+            return SimpleNamespace(state=_WATCH_RECEIPT_EXPIRED,
+                                   reason="watch-deadline")
+        return result
 
     cached = _watch_shared_readiness(target, native_state, arm, expected, server)
     if cached.state != "ready":
@@ -5792,7 +5840,7 @@ def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
                 return _WATCH_RECEIPT_EXPIRED
             readiness = _watch_transition_readiness(
                 target, native_state, arm, expected, server,
-                watch_id, paths, authority_lock_held=True)
+                watch_id, paths, authority_lock_held=True, deadline=deadline)
             if deadline is not None and time.monotonic() >= deadline:
                 return _WATCH_RECEIPT_EXPIRED
             if readiness.state != "ready":
@@ -5807,19 +5855,8 @@ def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
     except _WatchTransitionLockBusy:
         if deadline is not None and time.monotonic() >= deadline:
             return _WATCH_RECEIPT_EXPIRED
-        latest = _read_json(paths.observation) or {}
-        _write_watch_observation(paths, {
-            **latest, "state": "pending",
-            "reason": "shared-readiness-authority-lock-busy",
-            "observed_ts": _utc_now(),
-        })
-        try:
-            root = peer_obligations.ObligationStore().root
-            shared_readiness.clear_watch_transition(root, watch_id)
-            shared_readiness.wake_runner(root)
-            peer_obligations.ensure_normal_runner(reconciliation_required=True)
-        except Exception:
-            pass
+        _watch_note_transition_lock_contention(
+            peer_obligations.ObligationStore().root, watch_id, paths)
         return _WATCH_RECEIPT_CONTENDED
     except (OSError, ValueError, RuntimeError):
         if deadline is not None and time.monotonic() >= deadline:
