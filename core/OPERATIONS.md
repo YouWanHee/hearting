@@ -562,6 +562,9 @@ Dispatch state stays outside every release, so pruning a release cannot delete
 it and the path that sealed `launch_compatibility_tuple` values and open rows
 depend on stays the same.
 
+`hearting run attempt-view <attempt>` reads an owner's raw output without Fleet.
+It is read-only; a cleaned native source may leave only the supervisor record.
+
 A bounded, versioned migration (`run_dispatch_state_migration()`, M0 preflight
 through M6 delta sweep, `tools/install/distribution.py`) promotes the stable
 root without rewriting any sealed `launch_compatibility_tuple` or open row: it
