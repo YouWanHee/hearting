@@ -1898,6 +1898,35 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.step()["interview_template"]["brief"]["problem"], "")
         self.assertEqual(self.calls, [])                     # a draft registers nothing
 
+    def test_generated_draft_registers_unchanged_and_explicit_supervisor_answer_releases_first_time(self):
+        import frame_interview as FI
+        brief = self.output / "shards/frame/direction-brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("## 1. Problem\n\nThe report loses the second result.\n\n"
+                         "## 4. Verdict\n\nKeep both results in one report.\n\n"
+                         "## 5. Boundary\n\nPreserve the measured exit codes.\n\n"
+                         "## 6. Risks\n\nNone known.\n", encoding="utf-8")
+        self.route["work_request"] = {"text": "Run the two commands and keep both results."}
+        draft = self.step()
+        self.assertIn('"actor_kind": "supervisor"', draft["next_step"])
+        self.assertIn('"actor_kind": "user"', draft["next_step"])
+        self.assertEqual(draft["interview_template"]["brief"]["affected"], "")
+        self.question_file.write_text(json.dumps(draft["interview_template"]))
+        asked = self.step(interview=self.question_file)
+        self.assertEqual(asked["state"], "needs-question")
+        self.assertIn(FI.ANSWER_SOURCE_GUIDANCE, asked["next_step"])
+        response = asked["answers_template"]
+        self.assertEqual(response["actor_kind"], "unknown")
+        response.update(actor_kind="supervisor", understanding_confirmed=True)
+        answer = self.base / "supervisor-answer.json"
+        answer.write_text(json.dumps(response))
+        released = self.step(answers=answer)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(self.resolution()["answers"]["actor_kind"], "supervisor")
+        self.assertIn("status: agreed-on-behalf\nactor_kind: supervisor",
+                      Path(released["intent_file"]).read_text())
+        self.assertEqual(self.calls, ["gate", "release"])
+
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
         asked = self.step(interview=self.question_file)

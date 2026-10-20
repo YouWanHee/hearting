@@ -661,7 +661,20 @@ gate. The gate record names its exact cycle-local interview: a one-sentence
 restatement of what the user wants, a plain-language brief, and the few
 decisions the frame legs could not settle without the user. The depth-0
 session builds that record from the joined frame legs and does the interview
-itself, in this order, and never leaves it to a helper:
+itself, and never leaves it to a helper.
+
+The interview brief may leave `affected` empty when the direction brief does
+not identify affected users or systems; unspecified scope stays unspecified.
+For answers, set `actor_kind: user` only for the person's actual reply, or
+`actor_kind: supervisor` when the depth-0 supervisor answers on the person's
+behalf (including adopting a recommendation). The answer template keeps
+`actor_kind: unknown` until its source is explicitly recorded. Unmarked answers
+remain unknown, and registered workers cannot claim either release authority.
+A supervisor answer releases frame-review with its source preserved in intent;
+person-only start approvals keep their existing gates. This meaning is shared
+by Claude, Codex and OpenCode.
+
+The interview proceeds in this order:
 
 1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.

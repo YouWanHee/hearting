@@ -350,9 +350,8 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
                     "When the native question tool returns the reply, the runtime keeps it beside the question "
                     "(answers.native.json, recorded by the harness hook): then just rerun resume_command. Otherwise "
-                    "preserve only the person's actual structured or typed reply in answers_template and set "
-                    "actor_kind=user for that reply. Keep supervisor/automatic/unknown sources as such; "
-                    "an acknowledgement or template is never a user decision. Then rerun "
+                    "record the answer in answers_template with its explicit source. " + FI.ANSWER_SOURCE_GUIDANCE + " "
+                    "An acknowledgement or template is never a decision. Then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
                     "For a revise/stop decision also pass --decision revise|stop. " + FI.PENDING_ANSWER_RULE}
     if resolution["status"] in {"proceed", "revise", "stop"}:
