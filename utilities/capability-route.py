@@ -1448,7 +1448,7 @@ def build_continuation_route(
         # live inside `selection`, inherited above.)
         "composed","composed_recipe",
         # An approved route plan's leg keeps pointing at its plan when it resumes.
-        "route_plan",
+        "route_plan", "framed_worktree",
     )
     inheritance=ROUTE_AUTHORITY.route_in_force(source_route)
     route={key:json.loads(json.dumps(inheritance[key]))
@@ -4336,6 +4336,36 @@ def _dispatch_evidence_matches_cwd(evidence, cwd):
                and os.path.realpath(row["checked_worktree"]) == expected for row in rows)
 
 
+def _seal_framed_worktree(route, worktree):
+    """Seal how a framed start prepared its read cwd into the route identity."""
+    route["framed_worktree"] = dict(worktree)
+    route["route_hash"] = route_hash(route)
+    route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    return route
+
+
+def _inherits_frame_worktree(frame_route, leg, index, cwd):
+    """Whether the first leg runs in the allocation its frame's own start made, without preparing again.
+
+    Only that allocation qualifies, and only while it is still the same checkout on the same branch.
+    An explicitly approved or retained linked checkout keeps the proposed-`cwd` approval path.
+    """
+    prepared = frame_route.get("framed_worktree") or {}
+    frame_cwd = frame_route.get("cwd") or ""
+    path, branch = prepared.get("path"), prepared.get("branch")
+    if not (index == 0 and not leg.get("cwd")
+            and prepared.get("state") in {"created", "reused"}
+            and prepared.get("reason") != "approved-linked-task"
+            and path and branch
+            and os.path.realpath(cwd) == os.path.realpath(frame_cwd)
+            and os.path.realpath(prepared.get("cwd") or "") == os.path.realpath(frame_cwd)
+            and os.path.isdir(path)):
+        return False
+    top = _git(path, "rev-parse", "--show-toplevel")
+    return (bool(top) and os.path.realpath(top) == os.path.realpath(path)
+            and _git(path, "symbolic-ref", "-q", "HEAD") == f"refs/heads/{branch}")
+
+
 def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness, index=0):
     """An approved leg, compiled in memory with its route-plan reference sealed.
 
@@ -4352,7 +4382,9 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
     selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
                               parent_harness=owner or "claude", selection_only=True)
-    if _isolates_worktree(selection):
+    frame_preparation = frame_route.get("framed_worktree") or {}
+    inherit_frame_allocation = _inherits_frame_worktree(frame_route, leg, index, kwargs["cwd"])
+    if _isolates_worktree(selection) and not inherit_frame_allocation:
         worktree = prepare_isolated_worktree(
             kwargs["cwd"], frame_route.get("slug"), artifact_root=frame_route["artifact_root"],
             preparation_key=_route_plan_preparation_key(binding), explicitly_approved=bool(leg.get("cwd")))
@@ -4364,6 +4396,9 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     # The probe is collected only after preparation, against the exact cwd that will be sealed.
     route = compose_route(**kwargs, **_leg_evidence(leg, lambda: readiness(kwargs["cwd"])),
                           work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
+    if inherit_frame_allocation:
+        route = _seal_framed_worktree(route, {**frame_preparation, "state": "inherited",
+                                              "from_route_id": frame_route["route_id"]})
     scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
@@ -10696,7 +10731,7 @@ def _worktree_collision(result):
 
 
 def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=None,
-                              explicitly_approved=False):
+                              explicitly_approved=False, framed_start=False):
     """Prepare or resume a source-start allocation without changing the primary checkout.
 
     New work starts from a fetched remote-default SHA. Explicit approved linked tasks and a
@@ -10792,6 +10827,32 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
                     return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
                 return {"state": "reused", **reused, "preparation_key": key}
 
+        framed_base = None
+        if framed_start and topology == "linked":
+            framed_base, reason, detail = _remote_default_base(primary)
+            if reason:
+                return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
+            status = _worktree_git(source_top, "status", "--porcelain", "--untracked-files=all")
+            if status.returncode != 0:
+                return {"state": "failed", "reason": "linked-worktree-status-unresolved",
+                        "detail": (status.stderr or status.stdout).strip(), "cwd": original}
+            if status.stdout.strip():
+                return {"state": "retained-linked", "reason": "linked-worktree-dirty",
+                        "cwd": original, "path": str(Path(source_top).resolve()),
+                        "branch": _git(source_top, "symbolic-ref", "-q", "--short", "HEAD"),
+                        "base": framed_base["sha"], "base_sha": framed_base["sha"],
+                        "preparation_key": key}
+            ancestry = _worktree_git(source_top, "merge-base", "--is-ancestor", "HEAD", framed_base["sha"])
+            if ancestry.returncode == 1:
+                return {"state": "retained-linked", "reason": "linked-worktree-unmerged",
+                        "cwd": original, "path": str(Path(source_top).resolve()),
+                        "branch": _git(source_top, "symbolic-ref", "-q", "--short", "HEAD"),
+                        "base": framed_base["sha"], "base_sha": framed_base["sha"],
+                        "preparation_key": key}
+            if ancestry.returncode != 0:
+                return {"state": "failed", "reason": "linked-worktree-ancestry-unresolved",
+                        "detail": (ancestry.stderr or ancestry.stdout).strip(), "cwd": original}
+
         worktree_root = Path(primary).parent / f"{Path(primary).name}-wt"
         try:
             worktree_root.mkdir(parents=True, exist_ok=True)
@@ -10836,7 +10897,11 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         base = retry_base or ({"branch": record.get("remote_default"), "sha": reserved[2]}
                               if reserved is not None else {"branch": None, "sha": None})
         if reserved is None and retry_base is None:
-            base, reason, detail = _remote_default_base(primary)
+            base = framed_base
+            if base is None:
+                base, reason, detail = _remote_default_base(primary)
+            else:
+                reason = detail = None
             if reason:
                 return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
         candidates = []
@@ -11731,19 +11796,32 @@ def main():
         worktree=None
         if a.start and not a.explain:
             selection = compose_route(**compose_args, selection_only=True)
-            if _isolates_worktree(selection):
+            is_framed = selection.get("shape") == "framed"
+            if _isolates_worktree(selection) or is_framed:
                 approved_leg_cwd = bool((route_plan_binding or {}).get("leg", {}).get("cwd"))
                 prep_key = _compose_preparation_key(compose_args, route_plan_binding, a.prompt_file)
-                worktree = prepare_isolated_worktree(
-                    cwd, a.slug, artifact_root=artifact_root, preparation_key=prep_key,
-                    explicitly_approved=cwd_was_explicit or approved_leg_cwd)
-                print("worktree_prepared=" + worktree["state"] + "".join(
-                    f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason") if worktree.get(key)),
-                    file=sys.stderr)
+                prepare_kwargs = {
+                    "cwd": cwd, "slug": a.slug, "artifact_root": artifact_root,
+                    "preparation_key": prep_key,
+                    "explicitly_approved": cwd_was_explicit or approved_leg_cwd,
+                }
+                if is_framed:
+                    prepare_kwargs["framed_start"] = True
+                worktree = prepare_isolated_worktree(**prepare_kwargs)
+                if not (is_framed and worktree.get("state") == "failed"):
+                    print("worktree_prepared=" + worktree["state"] + "".join(
+                        f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason")
+                        if worktree.get(key)), file=sys.stderr)
                 if worktree.get("state") == "failed":
-                    raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
-                                     + (":" + worktree["detail"] if worktree.get("detail") else "")
-                                     + "; retry the same compose --start request; its identity is retained")
+                    if is_framed:
+                        detail = " ".join(str(worktree.get("detail") or "").split())
+                        reason = " ".join(str(worktree.get("reason") or "unknown").split())
+                        print(f"framed_worktree_fallback={reason}" + (f" detail={detail}" if detail else ""),
+                              file=sys.stderr)
+                    else:
+                        raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
+                                         + (":" + worktree["detail"] if worktree.get("detail") else "")
+                                         + "; retry the same compose --start request; its identity is retained")
                 if worktree.get("cwd") and os.path.realpath(worktree["cwd"]) != os.path.realpath(cwd):
                     final_cwd = worktree["cwd"]
                     compose_args["cwd"] = final_cwd
@@ -11754,6 +11832,8 @@ def main():
                     compose_args["registered_headless_evidence"] = None
                     DISPATCH_DEFAULTS_WARNINGS.clear()
         route=compose_route(**compose_args)
+        if worktree is not None and selection.get("shape") == "framed":
+            route = _seal_framed_worktree(route, worktree)
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan

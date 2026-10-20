@@ -741,8 +741,8 @@ class LegWorktreeTest(StartBase):
             self.assertIn(str(worktree), probed)                 # the worktree was probed, not the frame's checkout
 
 
-class FirstLegPreparationFailureRetryTest(StartBase):
-    """Preparation failures cross the real framed decision/first-leg boundary and retry in place."""
+class SourceRepoStartBase(StartBase):
+    """A framed route over a real primary checkout with a bare origin that moved ahead of it."""
 
     def setUp(self):
         self.source_tmp = tempfile.TemporaryDirectory()
@@ -777,6 +777,7 @@ class FirstLegPreparationFailureRetryTest(StartBase):
         (self.primary / "base.txt").write_text("unstaged\n", encoding="utf-8")
         (self.primary / "untracked.txt").write_text("preserve\n", encoding="utf-8")
         self.probe_cwds = []
+        self.primary_before = self.primary_fingerprint()
         super().setUp()
         self.set_briefs(CODE_STAGED, CODE_STAGED)
         self.set_interview({"legs": [CODE_STAGED]})
@@ -799,6 +800,10 @@ class FirstLegPreparationFailureRetryTest(StartBase):
         return (git("rev-parse", "HEAD"), git("branch", "--show-current"), git("write-tree"),
                 git("diff", "--binary"), git("diff", "--cached", "--binary"), git("status", "--porcelain"),
                 (self.primary / "base.txt").read_bytes(), (self.primary / "untracked.txt").read_bytes())
+
+
+class FirstLegPreparationFailureRetryTest(SourceRepoStartBase):
+    """Preparation failures cross the real framed decision/first-leg boundary and retry in place."""
 
     def fail_then_retry(self, failure):
         before = self.primary_fingerprint()
@@ -929,6 +934,72 @@ class FirstLegPreparationFailureRetryTest(StartBase):
         records = list((self.root / ".runtime" / "worktree-preparation").glob("*.json"))
         self.assertEqual(len(records), 1)
         self.assertEqual(json.loads(records[0].read_text(encoding="utf-8"))["path"], first["cwd"])
+
+
+class FrameAllocationInheritanceTest(SourceRepoStartBase):
+    """The frame's own start allocation is its first source leg's checkout: one fetch, one worktree."""
+
+    def compose(self, **kwargs):
+        if not hasattr(self, "frame_prepared"):
+            self.frame_prepared = R.prepare_isolated_worktree(
+                self.primary, "framed-fixture", artifact_root=self.root,
+                preparation_key={"fixture": "framed-start"}, framed_start=True)
+        cwd = self.frame_prepared["cwd"]
+        kwargs["cwd"] = Path(cwd)
+        kwargs["dispatch_evidence"] = {"tuples": [{**T.nested("claude", "codex"), "checked_worktree": cwd}]}
+        return R._seal_framed_worktree(super(SourceRepoStartBase, self).compose(**kwargs), self.frame_prepared)
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def test_the_frame_reads_the_fetched_remote_default_and_its_first_source_leg_stays_there(self):
+        expected = (self.primary.parent / "repo-wt" / "framed-fixture").resolve()
+        self.assertEqual(self.frame_prepared["state"], "created")
+        self.assertEqual((self.route["cwd"], self.route["source_commit"]), (str(expected), self.remote_sha))
+        worktrees = self.git(self.primary, "worktree", "list", "--porcelain")
+        real = R._worktree_git
+
+        def no_new_allocation(cwd, *args):
+            self.assertNotIn(args[:1], (("ls-remote",), ("fetch",)))
+            self.assertNotEqual(args[:2], ("worktree", "add"))
+            return real(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=no_new_allocation):
+            result = self.settle()
+        self.assertTrue(result["owner_started"], result)
+        self.assertEqual(R.prepare_isolated_worktree.call_count, 0)
+        leg_path, = self.leg_routes()
+        leg = json.loads(leg_path.read_text(encoding="utf-8"))
+        self.assertEqual((leg["cwd"], leg["source_commit"]), (str(expected), self.remote_sha))
+        self.assertEqual((leg["framed_worktree"]["state"], leg["framed_worktree"]["from_route_id"]),
+                         ("inherited", self.route["route_id"]))
+        self.assertEqual(R.verify_route(copy.deepcopy(leg), expected)["cwd"], str(expected))
+        self.assertEqual(self.git(expected, "branch", "--show-current"), "framed-fixture")
+        self.assertEqual(self.git(self.primary, "worktree", "list", "--porcelain"), worktrees)
+        self.assertEqual(self.primary_fingerprint(), self.primary_before)
+
+    def test_only_the_frames_own_live_allocation_is_inherited(self):
+        frame, cwd = self.route, self.route["cwd"]
+        self.assertTrue(R._inherits_frame_worktree(frame, CODE_STAGED, 0, cwd))
+        for changed in ({"reason": "approved-linked-task"}, {"state": "retained-linked"}, {"state": "failed"}):
+            other = {**frame, "framed_worktree": {**frame["framed_worktree"], **changed}}
+            self.assertFalse(R._inherits_frame_worktree(other, CODE_STAGED, 0, cwd), changed)
+        self.assertFalse(R._inherits_frame_worktree(frame, {**CODE_STAGED, "cwd": cwd}, 0, cwd))
+        self.assertFalse(R._inherits_frame_worktree(frame, CODE_STAGED, 1, cwd))
+        self.assertFalse(R._inherits_frame_worktree(frame, CODE_STAGED, 0, str(self.primary)))
+        self.assertFalse(R._inherits_frame_worktree({**frame, "framed_worktree": {}}, CODE_STAGED, 0, cwd))
+
+    def test_an_allocation_moved_to_another_branch_is_not_taken_and_the_leg_prepares_as_before(self):
+        self.git(self.route["cwd"], "switch", "-q", "-c", "elsewhere")
+        result = self.settle()
+        self.assertTrue(result["owner_started"], result)
+        self.assertEqual(R.prepare_isolated_worktree.call_count, 1)
+        leg_path, = self.leg_routes()
+        leg = json.loads(leg_path.read_text(encoding="utf-8"))
+        self.assertEqual(leg["cwd"], str((self.primary.parent / "repo-wt" / "framed-fixture-2").resolve()))
+        self.assertNotIn("framed_worktree", leg)
+        self.assertEqual(self.git(self.route["cwd"], "branch", "--show-current"), "elsewhere")
 
 
 class OneLegFramedTest(StartBase):
