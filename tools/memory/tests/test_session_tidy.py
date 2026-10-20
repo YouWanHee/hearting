@@ -3224,7 +3224,7 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.effective(meta), "sid-B")
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
-            self.assertTrue(self.handover.owns(meta, "sid-A", self.jobs))     # the registered parent keeps its name
+            self.assertFalse(self.handover.owns(meta, "sid-A", self.jobs))    # the registered parent no longer owns after handover
             self.assertFalse(self.handover.owns(meta, "sid-Z", self.jobs))
         self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
         again, rows2 = self.start("sid-B", event="prompt", source="")
