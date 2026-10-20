@@ -93,12 +93,12 @@ class F51OptOutTest(unittest.TestCase):
         data = json.loads(out)
         self.assertTrue(data["usage"]["api_disabled"])
 
-    def test_disabled_state_still_shows_passive_tap_values_and_unknown_opencode_availability(self):
+    def test_disabled_state_shows_passive_tap_and_short_opencode_status(self):
         """A15: opt-out disables the live REFRESH, not the passive tap values already on the
         session (rl_5h/rl_7d from the statusline) — the usage header must still render them,
         and "no usage api" must appear zero times for a harness that HAS tap data. With
-        no OpenCode provider/account observation, that row truthfully says availability
-        is unknown rather than implying a missing API key."""
+        no OpenCode provider/account observation, its row uses the short unavailable
+        status without exposing account or credential diagnostics."""
         from fleet import render
         from fleet.model import Session
         claude = Session(harness="claude", pid=1, cwd="/x", liveness="idle",
@@ -111,14 +111,15 @@ class F51OptOutTest(unittest.TestCase):
         rows2 = render._usage_header_rows([claude, opencode], layout="wide")
         joined2 = "\n".join("".join(v for v, _k in row) for row in rows2)
         self.assertEqual(joined2.count("no usage api"), 0)
-        self.assertEqual(joined2.count("provider availability unknown"), 1)
+        self.assertEqual(joined2.count("Go usage unavailable"), 1)
 
-    def test_opt_out_with_no_passive_tap_shows_unknown_gauge_and_opencode_availability_end_to_end(self):
+    def test_opt_out_with_no_passive_tap_shows_unknown_gauge_and_short_opencode_status(self):
         """A15 blocking-2: opt-out (--no-usage-api / FLEET_DISABLE=usage-api) + a live
         claude/codex session with NO passive-tap value (no rl_5h/rl_7d/rl_windows/rl_ms) is
         "the user turned it off" (F-51c), not opencode's structural absence — end-to-end
         through `fleet.main`, provider availability is unknown for OpenCode without an
-        account observation, and --json's `usage.api_disabled` must be true."""
+        account observation is represented by one short usage status, and --json's
+        `usage.api_disabled` must be true."""
         from fleet import fleet as fleet_mod
         from fleet.model import Session
 
@@ -130,7 +131,7 @@ class F51OptOutTest(unittest.TestCase):
         with mock.patch.object(fleet_mod, "collect_all", fake_collect_all):
             out = self._run(["--once", "--no-usage-api"])
             self.assertEqual(out.count("no usage api"), 0)
-            self.assertEqual(out.count("provider availability unknown"), 1)
+            self.assertEqual(out.count("Go usage unavailable"), 1)
 
             json_out = self._run(["--json", "--no-usage-api"])
         data = json.loads(json_out)

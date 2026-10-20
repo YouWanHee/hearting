@@ -80,6 +80,7 @@ INTERACTION_KINDS = ("decision", "approval", "permission", "elicitation")
 # Fleet's existing completed dispatch-row afterglow, shared with native shell
 # task rows so readers and consumers use the same display lifetime.
 DONE_AFTERGLOW_MIN = 15
+CURRENT_SHELL_EVIDENCE_MAX_AGE_S = 120
 
 
 def display_shell_jobs(jobs, *, now=None):
@@ -128,6 +129,96 @@ def display_shell_jobs(jobs, *, now=None):
     return [job for _index, job in sorted(
         enumerate(keep), key=lambda pair: (display_rank(pair[1]), pair[0]))]
 
+
+def current_background_shell_jobs(jobs, *, now=None):
+    """Select exact, currently evidenced background jobs without changing history.
+
+    The 120-second window applies to native-event evidence, not task age. Exact
+    process and native-query evidence is stamped when observed and therefore
+    remains usable for quiet long-running tasks while observations continue.
+    """
+    def finite_epoch(value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+
+    now = finite_epoch(time.time() if now is None else now)
+    if now is None:
+        return []
+
+    terminal_statuses = {
+        "completed", "complete", "exited", "failed", "error", "cancelled",
+        "canceled", "stopped", "timed_out", "timeout",
+    }
+    grouped = {}
+    terminal_ids = set()
+    for job in jobs or ():
+        if not isinstance(job, dict):
+            continue
+        harness = job.get("harness")
+        session_id = job.get("session_id")
+        source_generation = job.get("source_generation")
+        source_locator = job.get("source_locator")
+        native_id = job.get("native_id")
+        attempt_id = job.get("attempt_id")
+        native_id_kind = job.get("native_id_kind")
+        if not all(isinstance(value, str) and value for value in (
+                harness, session_id, source_generation, source_locator, native_id)):
+            continue
+        if ((attempt_id is not None and not isinstance(attempt_id, str))
+                or (native_id_kind is not None and not isinstance(native_id_kind, str))):
+            continue
+        identity = (harness, session_id, attempt_id or "",
+                    source_generation, source_locator,
+                    native_id_kind or "", native_id)
+        status = str(job.get("native_status") or "unknown").lower()
+        terminal = (job.get("lifecycle_state") == "completed"
+                    or status in terminal_statuses
+                    or job.get("completed_at") is not None
+                    or (isinstance(job.get("exit_code"), int)
+                        and not isinstance(job.get("exit_code"), bool)))
+        if terminal:
+            terminal_ids.add(identity)
+            continue
+        if (job.get("background_state") != "confirmed"
+                or not isinstance(job.get("background_source"), str)
+                or not job.get("background_source")
+                or job.get("current_generation_valid") is not True
+                or job.get("current_execution_state") != "running"
+                or job.get("process_state") == "dead"):
+            continue
+        source = job.get("current_execution_source")
+        evidence_at = finite_epoch(job.get("current_execution_at"))
+        if not isinstance(source, str) or not source:
+            continue
+        if (evidence_at is None or evidence_at > now
+                or now - evidence_at > CURRENT_SHELL_EVIDENCE_MAX_AGE_S):
+            continue
+        candidate = dict(job)
+        started = finite_epoch(candidate.get("started_at"))
+        if started is not None and started <= now:
+            candidate["elapsed_s"] = max(0, int(now - started))
+            rank_time = float(started)
+        else:
+            candidate["elapsed_s"] = None
+            rank_time = float(evidence_at)
+        candidate["current_execution_at"] = float(evidence_at)
+        previous = grouped.get(identity)
+        if previous is None or candidate["current_execution_at"] > previous[0]:
+            grouped[identity] = (candidate["current_execution_at"], rank_time, candidate)
+
+    eligible = [entry for identity, entry in grouped.items() if identity not in terminal_ids]
+    eligible.sort(key=lambda entry: (-entry[1], tuple(str(part) for part in (
+        entry[2].get("harness"), entry[2].get("session_id"),
+        entry[2].get("attempt_id") or "", entry[2].get("source_generation"),
+        entry[2].get("source_locator"), entry[2].get("native_id_kind") or "",
+        entry[2].get("native_id")))))
+    return [entry[2] for entry in eligible]
+
 # Stable public name consumed by Fleet, the progress watchdog, liveness and
 # registry reconciliation.  Keeping the exact-attempt verdict here prevents
 # each surface from growing a subtly different PID/start-time classifier.
@@ -162,7 +253,13 @@ class ShellJob(TypedDict, total=False):
     command_reason: Optional[str]
     started_at: Optional[float]
     start_source: Optional[str]
+    native_event_at: Optional[float]
     observed_at: Optional[float]
+    current_execution_state: Optional[str]
+    current_execution_source: Optional[str]
+    current_execution_reason: Optional[str]
+    current_execution_at: Optional[float]
+    current_generation_valid: Optional[bool]
     completed_at: Optional[float]
     completion_time_source: Optional[str]
     completion_time_state: Optional[str]

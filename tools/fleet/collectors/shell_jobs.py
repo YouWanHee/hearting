@@ -16,7 +16,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from ..model import display_shell_jobs
+from ..model import CURRENT_SHELL_EVIDENCE_MAX_AGE_S, display_shell_jobs
 
 
 MAX_COMMAND = 120
@@ -280,7 +280,14 @@ def merge_jobs(*groups):
             key = tuple(str(item.get(field) or "") for field in (
                 "harness", "session_id", "attempt_id", "source_generation",
                 "source_locator", "native_id_kind", "native_id"))
-            merged[key] = {**merged.get(key, {}), **item}
+            previous = merged.get(key, {})
+            combined = {**previous, **item}
+            if (previous.get("current_generation_valid") is False
+                    or item.get("current_generation_valid") is False):
+                combined.update(current_generation_valid=False,
+                                current_execution_state="unknown",
+                                current_execution_reason="source-generation-retired")
+            merged[key] = combined
     return list(merged.values())
 
 
@@ -291,6 +298,42 @@ def _row_time(row):
     parsed = parse_time(value)
     return parsed if parsed is not None else valid_epoch(
         value, milliseconds=isinstance(value, (int, float)) and value > 100_000_000_000)
+
+
+def _row_time_problem(row):
+    for key in ("timestamp", "created_at", "time_created"):
+        if key in row:
+            return "missing" if row[key] in (None, "") else "invalid"
+    return "missing"
+
+
+def _set_current_event(item, *, row, source, terminal=False):
+    """Record event-based execution evidence without substituting collection time."""
+    stamp = _row_time(row)
+    item["native_event_at"] = stamp
+    if item.get("current_generation_valid") is not False:
+        item["current_generation_valid"] = True
+    if terminal:
+        item.update(current_execution_state="terminal",
+                    current_execution_source=source,
+                    current_execution_reason="native-terminal-event",
+                    current_execution_at=None)
+        return
+    if stamp is None:
+        item.update(current_execution_state="unknown",
+                    current_execution_source=source,
+                    current_execution_reason="native-event-time-" + _row_time_problem(row),
+                    current_execution_at=None)
+        return
+    previous = valid_epoch(item.get("current_execution_at"))
+    if previous is not None and stamp < previous:
+        item.update(current_execution_state="unknown",
+                    current_execution_source=source,
+                    current_execution_reason="native-evidence-time-went-backwards",
+                    current_execution_at=None)
+        return
+    item.update(current_execution_state="running", current_execution_source=source,
+                current_execution_reason=None, current_execution_at=stamp)
 
 
 def _task_cache(cache_key):
@@ -327,6 +370,12 @@ def _remember_call(state, call_id, call):
 
 
 def _store_task(state, key, item):
+    previous = state["jobs"].get(key)
+    if isinstance(previous, dict) and previous.get("current_generation_valid") is False:
+        item = dict(item)
+        item.update(current_generation_valid=False,
+                    current_execution_state="unknown",
+                    current_execution_reason="source-generation-retired")
     state["jobs"].pop(key, None)
     state["jobs"][key] = item
     while len(state["jobs"]) > MAX_RETAINED_TASKS:
@@ -446,7 +495,12 @@ def _apply_claude_notification(state, notification, *, path, session_id,
                     "native_status_source": "claude-task-notification",
                     "completed_at": stamp if stamp is not None else prior.get("completed_at"),
                     "completion_time_source": "claude-task-notification.timestamp"
-                    if stamp is not None else prior.get("completion_time_source")})
+                    if stamp is not None else prior.get("completion_time_source"),
+                    "native_event_at": stamp,
+                    "current_execution_state": "terminal",
+                    "current_execution_source": "claude.task-notification",
+                    "current_execution_reason": "native-terminal-event",
+                    "current_execution_at": None})
     if notification.get("exit_code") is not None:
         updated["exit_code"] = notification["exit_code"]
         updated["exit_code_source"] = "claude-task-notification.summary"
@@ -541,6 +595,13 @@ def _claude_native_start(state, row, *, path, session_id, attempt_id, generation
         "output_coverage": item.get("output_coverage") or "unavailable",
         "observation_state": "observed", "observation_reason": None,
     })
+    item["native_event_at"] = _row_time(row)
+    if item.get("current_generation_valid") is not False:
+        item["current_generation_valid"] = True
+    if item.get("current_execution_state") not in {"running", "terminal"}:
+        item.update(current_execution_state="unknown",
+                    current_execution_source=source,
+                    current_execution_reason="native-task-start-is-not-execution-proof")
     _store_task(state, task_id, item)
 
 
@@ -614,6 +675,7 @@ def _apply_claude_native_update(state, row, *, path, session_id, attempt_id, gen
                         "claude.system.task_updated.patch.end_time"))
                 item.pop("completion_time_state", None)
                 item.pop("completion_time_reason", None)
+    _set_current_event(item, row=row, source=source, terminal=terminal)
     _store_task(state, row["task_id"], item)
 
 
@@ -636,6 +698,7 @@ def _apply_claude_native_notification(state, row, *, path, session_id,
         "native_status_source": source,
         "native_record_kinds": _claude_record_kinds(item, source),
     })
+    _set_current_event(item, row=row, source=source, terminal=True)
     if valid_epoch(item.get("completed_at")) is None and not item.get("completion_time_state"):
         item.update(completion_time_state="missing",
                     completion_time_reason="task-notification-has-no-timestamp")
@@ -673,7 +736,10 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                 item.update(observation_state="unknown",
                             observation_reason="source-generation-changed",
                             process_state="unknown",
-                            process_reason="source-generation-changed")
+                            process_reason="source-generation-changed",
+                            current_generation_valid=False,
+                            current_execution_state="unknown",
+                            current_execution_reason="source-generation-retired")
                 retired.append(item)
             state["overflow"] = state.get("overflow", False) or len(retired) > 256
             state["retired_jobs"] = retired[-256:]
@@ -800,7 +866,7 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         "command_source": ((prior or {}).get("command_source")
                                            or ("Bash.input.command" if call.get("command") else None)),
                         "started_at": started_at, "start_source": start_source,
-                        "observed_at": stamp,
+                        "native_event_at": stamp, "observed_at": stamp,
                         "native_status": ((prior or {}).get("native_status")
                                           if terminal or prior_status == "running"
                                           else "acknowledged"),
@@ -817,6 +883,12 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         "observation_state": delta.get("state"),
                         "observation_reason": delta.get("reason"),
                     })
+                    if item.get("current_generation_valid") is not False:
+                        item["current_generation_valid"] = True
+                    if item.get("current_execution_state") not in {"running", "terminal"}:
+                        item.update(current_execution_state="unknown",
+                                    current_execution_source="claude.tool_result.acknowledgement",
+                                    current_execution_reason="background-acknowledgement-is-not-execution-proof")
                     _store_task(state, task_id, item)
         notification = _claude_task_notification(row)
         if (notification is not None and row.get("sessionId") == session_id):
@@ -824,9 +896,11 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                 state, notification, path=path, session_id=session_id,
                 attempt_id=attempt_id, generation=delta.get("generation"))
     result = []
+    collection_at = valid_epoch(now) if now is not None else None
+    collection_at = time.time() if collection_at is None else collection_at
     for item in list(state.get("retired_jobs", ())) + list(state["jobs"].values()):
         current = dict(item)
-        current["observed_at"] = time.time() if now is None else now
+        current["observed_at"] = collection_at
         if delta.get("state") != "observed":
             current["observation_state"] = delta.get("state")
             current["observation_reason"] = delta.get("reason")
@@ -841,6 +915,17 @@ def _codex_payload(row):
         return None
     payload = row.get("payload")
     return payload if isinstance(payload, dict) else row
+
+
+def _terminal_job(item):
+    if not isinstance(item, dict):
+        return False
+    status = str(item.get("native_status") or "").lower()
+    return (status in {"completed", "complete", "exited", "failed", "error",
+                       "cancelled", "canceled", "stopped", "timed_out", "timeout"}
+            or item.get("completed_at") is not None
+            or (isinstance(item.get("exit_code"), int)
+                and not isinstance(item.get("exit_code"), bool)))
 
 
 def _json_object(value):
@@ -874,7 +959,10 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 item.update(observation_state="unknown",
                             observation_reason="source-generation-changed",
                             process_state="unknown",
-                            process_reason="source-generation-changed")
+                            process_reason="source-generation-changed",
+                            current_generation_valid=False,
+                            current_execution_state="unknown",
+                            current_execution_reason="source-generation-retired")
                 retired.append(item)
             state["overflow"] = state.get("overflow", False) or len(retired) > 256
             state["retired_jobs"] = retired[-256:]
@@ -925,7 +1013,7 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 else prior.get("started_at"),
                 "start_source": prior.get("start_source") or (
                     "codex.item.started.timestamp" if not completed and stamp is not None else None),
-                "observed_at": stamp,
+                "native_event_at": stamp, "observed_at": stamp,
                 "native_status": "completed" if completed else "running",
                 "native_status_source": "codex.item.completed" if completed
                 else "codex.item.started",
@@ -945,6 +1033,19 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 "observation_state": delta.get("state"),
                 "observation_reason": delta.get("reason"),
             })
+            if _terminal_job(prior):
+                for field in ("native_status", "native_status_source", "completed_at",
+                              "exit_code", "process_state", "process_reason"):
+                    if field in prior:
+                        job[field] = prior[field]
+                job.update(current_execution_state="terminal",
+                           current_execution_reason="native-terminal-cache-prevents-resurrection")
+            if job.get("current_generation_valid") is not False:
+                job["current_generation_valid"] = True
+            job.setdefault("current_execution_state", "unknown")
+            job.setdefault("current_execution_source", "codex.command_execution")
+            job.setdefault("current_execution_reason",
+                           "app-server-command-record-does-not-confirm-background-execution")
             _store_task(state, job_key, job)
             continue
         payload = _codex_payload(row)
@@ -1068,7 +1169,7 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                          else "exec_command.arguments.command") if command else None),
                     "command_reason": None if command else "nested-command-unavailable",
                     "started_at": started, "start_source": "native-call.timestamp",
-                    "observed_at": stamp,
+                    "native_event_at": stamp, "observed_at": stamp,
                     "native_status": "completed" if terminal else "running" if handle is not None else "unknown",
                     "native_status_source": "codex." + str(call.get("name")) + ".structured-result",
                     "background_state": background_state,
@@ -1084,13 +1185,38 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                     "observation_state": delta.get("state"),
                     "observation_reason": delta.get("reason"),
                 })
+                if job.get("current_generation_valid") is not False:
+                    job["current_generation_valid"] = True
+                event_time_row = row if _row_time(row) is not None else payload
+                if _terminal_job(prior):
+                    for field in ("native_status", "native_status_source", "completed_at",
+                                  "exit_code", "process_state", "process_reason"):
+                        if field in prior:
+                            job[field] = prior[field]
+                    job.update(current_execution_state="terminal",
+                               current_execution_source=prior.get("current_execution_source"),
+                               current_execution_reason="native-terminal-cache-prevents-resurrection",
+                               current_execution_at=None)
+                elif terminal:
+                    _set_current_event(job, row=event_time_row,
+                                       source=job["native_status_source"],
+                                       terminal=True)
+                elif continuation_matches:
+                    _set_current_event(job, row=event_time_row, source=background_source)
+                elif job.get("current_execution_state") not in {"running", "terminal"}:
+                    job.update(current_execution_state="unknown",
+                               current_execution_source=background_source,
+                               current_execution_reason=(
+                                   "native-result-has-no-exact-ongoing-continuation"))
                 _store_task(state, job_key, job)
                 if handle is not None:
                     state["handles"][handle] = job_key
     result = []
+    collection_at = valid_epoch(now) if now is not None else None
+    collection_at = time.time() if collection_at is None else collection_at
     for item in list(state.get("retired_jobs", ())) + list(state["jobs"].values()):
         current = dict(item)
-        current["observed_at"] = time.time() if now is None else now
+        current["observed_at"] = collection_at
         if state.get("overflow"):
             current["observation_state"] = "partial"
             current["observation_reason"] = "task-retention-limit"
@@ -1139,6 +1265,54 @@ def normalize_job(job, *, now=None):
     result["observation_time_reason"] = (
         "future-observation-time" if observed_at is not None and observed_at > now
         else "missing-or-invalid-observation-time" if observed_at is None else None)
+    raw_event_at = result.get("native_event_at")
+    native_event_at = valid_epoch(raw_event_at)
+    result["native_event_at"] = native_event_at
+    result["native_event_time_state"] = (
+        "missing" if raw_event_at is None else
+        "invalid" if native_event_at is None else
+        "future" if native_event_at > now else "valid")
+    result["native_event_time_reason"] = (
+        "native-event-time-missing" if raw_event_at is None else
+        "native-event-time-invalid" if native_event_at is None else
+        "native-event-time-future" if native_event_at > now else None)
+    generation_valid = result.get("current_generation_valid")
+    if not isinstance(generation_valid, bool):
+        generation_valid = None
+    result["current_generation_valid"] = generation_valid
+    execution_state = result.get("current_execution_state")
+    execution_source = result.get("current_execution_source")
+    raw_execution_at = result.get("current_execution_at")
+    execution_at = valid_epoch(raw_execution_at)
+    result["current_execution_at"] = execution_at
+    if generation_valid is False:
+        result.update(current_execution_state="unknown",
+                      current_execution_reason="source-generation-retired")
+    elif execution_state == "running":
+        if not isinstance(execution_source, str) or not execution_source:
+            result.update(current_execution_state="unknown",
+                          current_execution_reason="current-evidence-source-missing")
+        elif execution_at is None:
+            result.update(current_execution_state="unknown",
+                          current_execution_reason=("current-evidence-time-missing"
+                              if raw_execution_at is None else "current-evidence-time-invalid"))
+        elif execution_at > now:
+            result.update(current_execution_state="unknown",
+                          current_execution_reason="current-evidence-time-future")
+        elif now - execution_at > CURRENT_SHELL_EVIDENCE_MAX_AGE_S:
+            result.update(current_execution_state="unknown",
+                          current_execution_reason="current-execution-evidence-stale")
+        else:
+            result.update(current_execution_state="running", current_execution_reason=None)
+    elif execution_state == "terminal":
+        result.update(current_execution_state="terminal",
+                      current_execution_reason=(result.get("current_execution_reason")
+                                                or "native-terminal-event"))
+    else:
+        result["current_execution_state"] = "unknown"
+        reason = result.get("current_execution_reason")
+        result["current_execution_reason"] = (
+            reason if isinstance(reason, str) and reason else "current-execution-evidence-unavailable")
     raw_completed_at = result.get("completed_at")
     completed_at = valid_epoch(raw_completed_at)
     started = result["started_at"]
@@ -1457,11 +1631,21 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
                  tree=None, kids=None):
     """Normalize jobs and add only targeted exact output-writer process evidence."""
     jobs = list(jobs or ())
+    now = valid_epoch(now) if now is not None else None
     now = time.time() if now is None else now
     normalized = []
     for raw in jobs:
         item = normalize_job(raw, now=now)
         if item is not None:
+            if item.get("lifecycle_state") != "completed":
+                # A prior alive sample is not current evidence. Each collection
+                # must repeat the exact writer correlation before keeping it.
+                item["process_state"] = "unknown"
+                item["process_reason"] = "process-not-observed-this-collection"
+                if item.get("current_execution_source") == (
+                        "process.exact-descendant-writable-output-fd"):
+                    item.update(current_execution_state="unknown",
+                                current_execution_reason="exact-writer-not-observed-this-collection")
             normalized.append(item)
     visible = display_shell_jobs(normalized, now=now)
     candidates = []
@@ -1480,10 +1664,21 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
             candidates = []
             parent_namespace = ProcObservation("unavailable", reason=type(exc).__name__)
     for item in visible:
-        if (item.get("output_path") and item.get("lifecycle_state") != "completed"
+        if item.get("current_generation_valid") is False:
+            item.update(process_state="unknown",
+                        process_reason="source-generation-retired")
+        elif (item.get("output_path") and item.get("lifecycle_state") != "completed"
                 and item.get("process_state") != "dead"):
-            item.update(correlate_output_writers(
-                item, candidates, namespace=parent_namespace, root_pid=parent_pid))
+            process_evidence = correlate_output_writers(
+                item, candidates, namespace=parent_namespace, root_pid=parent_pid)
+            item.update(process_evidence)
+            if (process_evidence.get("process_state") == "alive"
+                    and process_evidence.get("process_reason") ==
+                    "exact-descendant-writable-output-fd"):
+                item.update(current_execution_state="running",
+                            current_execution_source="process.exact-descendant-writable-output-fd",
+                            current_execution_reason=None,
+                            current_execution_at=now)
     return visible
 
 
