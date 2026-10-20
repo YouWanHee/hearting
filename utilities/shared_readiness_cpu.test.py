@@ -100,6 +100,21 @@ def _snapshot(root_pid, *, state_root=None):
         rows[item["pid"]] = item
     seed_pids = {int(root_pid)}
     if state_root is not None:
+        runner_path = (Path(state_root) / "peer-steward" / "obligations"
+                       / "readiness-v1" / "runner.json")
+        try:
+            runner = json.loads(runner_path.read_text(encoding="utf-8"))
+            runner_pid = int(runner.get("pid"))
+            runner_start = str(runner.get("pid_start") or "")
+            runner_row = rows.get(runner_pid)
+            if runner_row is not None and runner_row["start"] == runner_start:
+                # The production fixture forks the existing runner in-process;
+                # its inherited command line is the fixture's. Its durable
+                # PID/start marker is the exact identity used by the runtime.
+                runner_row["role"] = "shared-runner"
+                seed_pids.add(runner_pid)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
         marker = ("AGENT_PEER_LEDGER_ROOT=" + str(Path(state_root).resolve())).encode()
         for pid, item in rows.items():
             argv = item["argv"]
@@ -259,11 +274,21 @@ def _measure(seed_pid, *, seconds=None, ready=None, prepare=None, timeout=None,
                                               else "unknown-short-lived-child",
                 })
 
-    all_roles = set(start_totals) | set(final_totals) | set(role_peaks)
+    # Every measurement window has the same four production classes. A class
+    # with no matching PID in any sample has zero boundary counts/counters and
+    # an empty identity list; that records sampled absence without claiming
+    # that a process shorter than the sampling interval never existed.
+    all_roles = PRODUCTION_CLASSES | set(start_totals) | set(final_totals) | set(role_peaks)
     classes = {}
     for role in sorted(all_roles):
         start = start_totals.get(role, {})
         end = final_totals.get(role, {})
+        identities = sorted(seen.get(role, set()))
+        presence = (
+            "observed-at-sampled-boundaries" if identities else
+            "unknown-proc-visibility" if unreadable else
+            "no-process-observed-at-sampled-boundaries"
+        )
         classes[role] = {
             "start_processes": start.get("processes", 0),
             "end_processes": end.get("processes", 0),
@@ -275,7 +300,14 @@ def _measure(seed_pid, *, seconds=None, ready=None, prepare=None, timeout=None,
             "sampled_own_cpu_delta_seconds": own_deltas.get(role, 0) / hz,
             "reaped_child_counter_delta_ticks": reaped_deltas.get(role, 0),
             "reaped_child_counter_delta_seconds": reaped_deltas.get(role, 0) / hz,
-            "pid_start_identities": [list(identity) for identity in sorted(seen.get(role, set()))],
+            "pid_start_identities": [list(identity) for identity in identities],
+            "presence_observation": presence,
+            "unobserved_short_lived_processes": "unknown",
+            "counter_semantics": (
+                "self CPU belongs to sampled PIDs in this class; reaped-child CPU is "
+                "the sampled parent PIDs' cumulative child counter and is not attributed "
+                "to the child class"
+            ),
         }
     driver_identity = next((identity for identity in start_snapshot
                             if identity[0] == int(seed_pid)), None)
@@ -341,7 +373,7 @@ def _measure(seed_pid, *, seconds=None, ready=None, prepare=None, timeout=None,
 
 
 def sampler_self_checks():
-    """Prove short reaps and live-to-parent CPU transfer with real processes."""
+    """Prove CPU transfer accounting and explicit classes with real processes."""
     root = os.getpid()
     before = _proc_stat(root)
     if before is None:
@@ -388,6 +420,35 @@ def sampler_self_checks():
         raise AssertionError("live child CPU did not transfer into its parent's reaped counters")
     if boundary_delta != driver_own_delta + parent_transfer:
         raise AssertionError("inclusive boundary accounting did not count child transfer exactly once")
+
+    carrier = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.8)", "--carrier-child"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    try:
+        sampled = _measure(root, seconds=0.2)
+    finally:
+        carrier.wait(timeout=5)
+    if set(PRODUCTION_CLASSES) - set(sampled["classes"]):
+        raise AssertionError("sampler omitted a production class with no observed process")
+    carrier_class = sampled["classes"]["carrier"]
+    if (carrier_class["peak_processes"] != 1
+            or carrier_class["presence_observation"] != "observed-at-sampled-boundaries"
+            or not carrier_class["pid_start_identities"]):
+        raise AssertionError("real carrier fixture identity was not sampled")
+    for role in PRODUCTION_CLASSES - {"carrier"}:
+        row = sampled["classes"][role]
+        numeric_fields = (
+            "start_processes", "end_processes", "peak_processes",
+            "start_rss_bytes", "end_rss_bytes", "peak_simultaneous_rss_bytes",
+            "sampled_own_cpu_delta_ticks", "sampled_own_cpu_delta_seconds",
+            "reaped_child_counter_delta_ticks", "reaped_child_counter_delta_seconds",
+        )
+        if (any(row[field] != 0 for field in numeric_fields)
+                or row["pid_start_identities"]
+                or row["presence_observation"] != "no-process-observed-at-sampled-boundaries"
+                or row["unobserved_short_lived_processes"] != "unknown"):
+            raise AssertionError(f"absent {role} class was not represented as sampled zero/unknown")
     return {
         "short_helper_reaped_between_samples": {
             "pid_start": ([short.pid, short_identity["start"]] if short_identity else None),
@@ -403,6 +464,11 @@ def sampler_self_checks():
             "transfer_counted_once": boundary_delta == driver_own_delta + parent_transfer,
             "inclusive_cpu_at_live_boundary": live_total,
             "inclusive_cpu_after_reap": after_total,
+        },
+        "sampled_production_classes": {
+            "class_names": sorted(sampled["classes"]),
+            "observed_carrier_identity": carrier_class["pid_start_identities"],
+            "absent_classes_have_sampled_zero_and_unknown_short_lived_identity": True,
         },
     }
 
