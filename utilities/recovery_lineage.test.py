@@ -207,6 +207,86 @@ class RecoveryAuthorityTest(unittest.TestCase):
             AUTHORITY.require_recovery_work(
                 outside, legacy, route=route, worker_type="owner")
 
+        # The absent optional record does not invent an old selected policy,
+        # but candidate non-file allows remain bounded by the sealed global
+        # policy. Equivalent asks and bounded file grants remain recoverable.
+        equivalent = candidate_for("build", {"permission": {"bash": "ask"}})
+        AUTHORITY.require_recovery_work(
+            equivalent, legacy, route=route, worker_type="owner")
+        bounded_file = candidate_for("build", {"permission": {
+            "edit": {self.route["cwd"] + "/**": "allow"}}})
+        AUTHORITY.require_recovery_work(
+            bounded_file, legacy, route=route, worker_type="owner")
+
+        widened = candidate_for("build", {"permission": {"bash": "allow"}})
+        self.assertFalse(AUTHORITY.same_sealed_work(legacy, widened))
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(
+                widened, legacy, route=route, worker_type="owner")
+
+        ordered_global = {"permission": {"bash": {"*": "ask", "git *": "allow"}}}
+        ordered_legacy = {
+            **copy.deepcopy(self.history), "harness": "opencode",
+            "applied_permissions": REPLACEMENT._applied_permissions(Namespace(
+                opencode_config_content=json.dumps(ordered_global), agent="build")),
+        }
+        ordered_legacy["applied_permissions"].pop("opencode_selected_agent_permission")
+
+        def ordered_candidate(selected_policy):
+            config = {
+                **copy.deepcopy(ordered_global),
+                "agent": {"build": {"permission": selected_policy}},
+            }
+            return {
+                **copy.deepcopy(self.history), "harness": "opencode",
+                "applied_permissions": REPLACEMENT._applied_permissions(Namespace(
+                    opencode_config_content=json.dumps(config), agent="build")),
+            }
+
+        # A later global wildcard allow bounds this exact selected resource;
+        # the earlier ask remains authoritative outside its resource pattern.
+        ordered_equivalent = ordered_candidate({"bash": {"git status": "allow"}})
+        AUTHORITY.require_recovery_work(
+            ordered_equivalent, ordered_legacy, route=route, worker_type="owner")
+        resource_widened = ordered_candidate({"bash": {"*": "allow"}})
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(
+                resource_widened, ordered_legacy, route=route, worker_type="owner")
+        action_widened = ordered_candidate({"*": {"git status": "allow"}})
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(
+                action_widened, ordered_legacy, route=route, worker_type="owner")
+
+    def test_recovery_work_scopes_agent_argv_exception_to_opencode(self):
+        claude_history = copy.deepcopy(self.history)
+        claude_history.update(
+            harness="claude",
+            argv=["--unit", "dev/refactor", "--agent", "security-reviewer"],
+        )
+        claude_candidate = copy.deepcopy(claude_history)
+        claude_candidate["argv"][-1] = "general-purpose"
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(
+                claude_candidate, claude_history, route=self.route, worker_type="stage")
+
+        def opencode(agent):
+            config = {
+                "permission": {"read": "allow", "bash": "ask"},
+                "agent": {agent: {"permission": {"bash": "ask"}}},
+            }
+            return {
+                **copy.deepcopy(self.history),
+                "harness": "opencode",
+                "argv": ["--unit", "dev/refactor", "--agent", agent],
+                "applied_permissions": REPLACEMENT._applied_permissions(Namespace(
+                    opencode_config_content=json.dumps(config), agent=agent)),
+            }
+
+        selected_history = opencode("build")
+        selected_candidate = opencode("builder")
+        AUTHORITY.require_recovery_work(
+            selected_candidate, selected_history, route=self.route, worker_type="stage")
+
     def test_cross_harness_uses_real_claude_and_codex_owner_permissions(self):
         wrappers = {}
         for harness in ("claude", "codex"):

@@ -1161,7 +1161,7 @@ RECOVERY_SELECTION_OPTIONS = frozenset({
     "--parent-session-id", "--parent-harness", "--parent-completion-delivery",
     "--route-file", "--route-id", "--route-hash", "--owner-route-file",
     "--owner-route-id", "--owner-route-hash", "--model", "--reasoning",
-    "--model-profile", "--execution-access-file", "--reviewed-evidence", "--agent",
+    "--model-profile", "--execution-access-file", "--reviewed-evidence",
 })
 RECOVERY_SELECTION_VALUES = frozenset({
     "parent_completion_delivery",
@@ -1332,7 +1332,7 @@ def recovery_node_task(record, source, history, *, attempt_id, route, node, harn
     return recovery_task(record, source, history)
 
 
-def _work_options(argv):
+def _work_options(argv, *, harness=None):
     """Read stored semantic options, without synthesizing a new original argv."""
     values = []; index = 0
     while index < len(argv):
@@ -1340,7 +1340,8 @@ def _work_options(argv):
         group = token.split("=", 1) if "=" in token else [token]
         if "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
             index += 1; group.append(argv[index])
-        if key not in RECOVERY_SELECTION_OPTIONS:
+        if (key not in RECOVERY_SELECTION_OPTIONS
+                and not (harness == "opencode" and key == "--agent")):
             values.append(group)
         index += 1
     return sorted(values, key=lambda value: value[0])
@@ -1394,7 +1395,9 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     if route:
         current.update({"--route-id": route["route_id"], "--route-hash": route["route_hash"]})
     for flag, expected in current.items():
-        if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
+        if ((flag in RECOVERY_SELECTION_OPTIONS
+             or (candidate.get("harness") == "opencode" and flag == "--agent"))
+                and flag in options and options[flag] != [str(expected)]):
             raise _contract_error("replacement-argv-mismatch", flag)
     sealed, granted = _granted_permission_pair(history, candidate)
     cross_owner = owner and candidate.get("harness") != history.get("harness")
@@ -1420,7 +1423,8 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     if not cross_owner and granted != sealed:
         detail = permission_mismatch_detail(history, candidate)
         raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
-    if not owner and _work_options(candidate.get("argv", [])) != _work_options(history.get("argv", [])):
+    if (not owner and _work_options(candidate.get("argv", []), harness=candidate.get("harness"))
+            != _work_options(history.get("argv", []), harness=history.get("harness"))):
         raise _contract_error("replacement-argv-mismatch")
 
 
@@ -1874,6 +1878,48 @@ def _same_verified_workspace_write_parent(previous, current) -> bool:
     return True
 
 
+def _legacy_selected_nonfile_grants_bounded(old_applied, new_applied) -> bool:
+    """Prove candidate selected non-file allows were already granted globally."""
+    import opencode_runtime
+    try:
+        selected = _opencode_selected_permission_view(new_applied).get("rules", [])
+        global_policy = _opencode_policy_view((old_applied or {}).get("opencode_permission"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not isinstance(global_policy, dict):
+        global_policy = {"rules": [], "precedence": []}
+    global_rows = [tuple(row) for row in global_policy.get("rules", [])]
+    precedence = {
+        (tuple(edge[0]), tuple(edge[1]))
+        for edge in global_policy.get("precedence", [])
+    }
+
+    def covers(cover, pattern):
+        # OpenCode's legacy `tool *` action spelling also matches bare `tool`.
+        if cover.endswith(" *") and pattern == cover[:-2]:
+            return True
+        return opencode_runtime._opencode_pattern_covers(cover, pattern)
+
+    def overlaps(left, right):
+        return (opencode_runtime._opencode_patterns_overlap(left[0], right[0])
+                and opencode_runtime._opencode_patterns_overlap(left[1], right[1]))
+
+    for row in selected:
+        action, resource, effect = tuple(row)
+        if effect != "allow" or action in {"edit", "external_directory"}:
+            continue
+        covers_all = [global_row for global_row in global_rows
+                      if global_row[2] == "allow"
+                      and covers(global_row[0], action)
+                      and covers(global_row[1], resource)]
+        blockers = [global_row for global_row in global_rows
+                    if global_row[2] != "allow" and overlaps(global_row, row)]
+        if not any(all((blocker, global_row) in precedence for blocker in blockers)
+                   for global_row in covers_all):
+            return False
+    return True
+
+
 def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
     """Compare effective grants, collapsing only a proven nested Codex sandbox layer."""
     old_applied = previous.get("applied_permissions") or {}
@@ -1881,9 +1927,19 @@ def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
     old = granted_permissions(old_applied, previous.get("launch_home"), previous.get("worktree"))
     new = granted_permissions(new_applied, current.get("launch_home"), current.get("worktree"))
     selected_key = "opencode_selected_agent_permission"
-    if selected_key not in old_applied or selected_key not in new_applied:
-        # The optional field did not exist in an immutable legacy record. Its
-        # absence carries no inferred policy and does not differ by itself.
+    if selected_key not in old_applied and selected_key in new_applied:
+        same_opencode_history = (previous.get("harness") == "opencode"
+                                 and current.get("harness") == "opencode")
+        if (not same_opencode_history
+                or _legacy_selected_nonfile_grants_bounded(old_applied, new_applied)):
+            # The immutable legacy input did not record this field. Omit only
+            # non-file grants already covered by its global policy; file grants
+            # retain their separate approved-address check.
+            old.pop(selected_key, None)
+            new.pop(selected_key, None)
+    elif selected_key not in new_applied:
+        # Preserve compatibility when the current launch omits the optional
+        # record; that absence supplies no candidate selected policy to compare.
         old.pop(selected_key, None)
         new.pop(selected_key, None)
     if previous.get("harness") == "opencode" and not _opencode_permission_view(old_applied):
