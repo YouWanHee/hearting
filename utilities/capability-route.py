@@ -3658,37 +3658,65 @@ def _parse_selection_pins(values, owner=None):
 
 
 def _turn_peer_source(harness, session, cwd):
-    """Where the current turn's instruction came from, as far as the runtime knows.
-
-    A peer message received at this session's latest prompt is `peer:<sender>·<ref>`.
-    Anything else is `unattributed`: a typed prompt is not recorded anywhere a launcher
-    can read, so it is never guessed to be the user's."""
+    """Return only provenance bound to this exact prompt marker and transfer."""
     try:
-        import calendar
-        import time
         import session_tidy
-        turn = session_tidy.read_json(session_tidy._prompt_seq_path(
-            session_tidy.resolve_seat(harness, cwd or None, os.environ, session, "")))
-        if not isinstance(turn, dict) or turn.get("sid") != session:
+        seat = session_tidy.resolve_seat(harness, cwd or None, os.environ, session, "")
+        turn = session_tidy.read_json(session_tidy._prompt_seq_path(seat))
+        if (not isinstance(turn, dict) or turn.get("sid") != session
+                or turn.get("harness") != harness or type(turn.get("seq")) is not int):
             return "unattributed"
-        started = float(turn["at"]) - 5.0
+        origin = turn.get("request_origin")
+        if (not isinstance(origin, dict) or origin.get("harness") != harness
+                or origin.get("session_id") != session
+                or origin.get("request_digest") is None
+                or not re.fullmatch(r"[0-9a-f]{64}", str(origin.get("request_digest")))
+                or not isinstance(origin.get("transfer_ref"), str)
+                or not isinstance(origin.get("name"), str)):
+            return "unattributed"
+        if origin.get("kind") == "peer" and origin.get("transfer_ref") == "native-envelope":
+            if (origin.get("sender_harness") != "claude"
+                    or not isinstance(origin.get("sender_session_id"), str)
+                    or not origin["sender_session_id"]):
+                return "unattributed"
+            return f"peer:{origin['name']}·native-envelope"
+        if origin.get("kind") not in {"peer", "runtime-completion"}:
+            return "unattributed"
+        ref = origin["transfer_ref"]
         spec = importlib.util.spec_from_file_location("pin_change_peer_message", ROOT / "utilities/peer-message.py")
         peer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(peer)
-        latest = None
-        for row in peer._iter_records(since_hours=24):
-            to = row.get("to") or {}
-            if (row.get("kind") != "notice" or (row.get("delivery") or {}).get("status") != "received"
-                    or (to.get("harness"), to.get("session_id")) != (harness, session)):
-                continue
-            stamp = calendar.timegm(time.strptime(row.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ"))
-            if stamp >= started and (latest is None or stamp >= latest[0]):
-                latest = (stamp, row)
-        if latest is None:
+        transfer = peer._read_transfer_record(ref)
+        if (not isinstance(transfer, dict)
+                or transfer.get("body_sha256") != origin.get("transfer_body_sha256")
+                or not peer._reference_target_matches(transfer, {"harness": harness,
+                                                                  "session_id": session}, ref)):
             return "unattributed"
-        sender = latest[1].get("from") or {}
+        sender = transfer.get("from") or {}
+        producer = transfer.get("producer_binding")
+        if origin.get("kind") == "runtime-completion":
+            if origin.get("legacy") is True:
+                pending = peer._read_pending(ref)
+                legacy = peer._legacy_registered_producer_binding(
+                    pending, {"harness": harness, "session_id": session})
+                if (legacy is None or legacy != origin.get("producer_binding")
+                        or producer is not None):
+                    return "unattributed"
+                producer = legacy
+            elif (sender.get("harness") != "runtime"
+                  or producer != origin.get("producer_binding")
+                  or not peer._valid_runtime_producer_binding(
+                      producer, sender, {"harness": harness, "session_id": session},
+                      transfer.get("refs"))):
+                return "unattributed"
+            return f"runtime:completion·{producer['attempt_id']}/{producer['delivery_id']}"
+        if (producer is not None or sender.get("harness") != origin.get("sender_harness")
+                or sender.get("session_id") != origin.get("sender_session_id")
+                or not peer._valid_transfer_sender(sender, producer, transfer.get("to"),
+                                                   transfer.get("refs"))):
+            return "unattributed"
         name = sender.get("name") or sender.get("session_id") or sender.get("harness") or "?"
-        return f"peer:{name}·{latest[1].get('transfer_ref') or latest[1].get('message_id') or '-'}"
+        return f"peer:{name}·{ref}"
     except Exception:  # noqa: BLE001 -- an unknown source is recorded as unknown
         return "unattributed"
 
@@ -7153,7 +7181,7 @@ def _next_marker_sequence(directory, node_id):
     return maximum+1
 
 def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *, repair=True,
-                              evidence_sha256=None):
+                              evidence_sha256=None, resource_execution_identity=None):
     """The one answer to "is this call a replay of the marker already on disk?".
 
     N2: this used to live only inside `write_completion_marker`, and the
@@ -7180,10 +7208,12 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
     existing=json.loads(candidate.read_text(encoding="utf-8"))
     identity={
         "evidence_sha256":evidence_sha256 if evidence_sha256 is not None else evidence_digest(evidence),
+        "resource_execution_identity":resource_execution_identity,
         **axes,
     }
     existing_identity={
         "evidence_sha256":existing.get("evidence",{}).get("sha256"),
+        "resource_execution_identity":existing.get("resource_execution_identity"),
         **{key:existing.get(key) for key in axes},
     }
     if existing_identity!=identity:
@@ -7345,7 +7375,7 @@ def write_completion_marker(
     route, node, node_id, evidence, *,
     attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
     owner_override=False, owner_chain=False, expected_evidence_sha256=None,
-    _lock_held=False,
+    resource_execution_identity=None, _lock_held=False,
 ):
     if not _lock_held:
         with _exclusive_lock(completion_dir(route["route_id"]) / f".{node_id}.completion.lock"):
@@ -7354,7 +7384,8 @@ def write_completion_marker(
                 return write_completion_marker(
                     route, node, node_id, evidence, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
                     review_claim=review_claim, jobs=jobs, owner_override=owner_override,
-                    owner_chain=owner_chain, expected_evidence_sha256=expected_evidence_sha256, _lock_held=True)
+                    owner_chain=owner_chain, expected_evidence_sha256=expected_evidence_sha256,
+                    resource_execution_identity=resource_execution_identity, _lock_held=True)
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
     if expected_evidence_sha256 is None:
@@ -7383,6 +7414,7 @@ def write_completion_marker(
     replay_candidate = _completion_marker_replay(
         route, node, node_id, evidence, axes, directory, repair=False,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+        resource_execution_identity=resource_execution_identity,
     )
     if replay_candidate is not None:
         source_subject = None
@@ -7407,6 +7439,7 @@ def write_completion_marker(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+        resource_execution_identity=resource_execution_identity,
     )
     if replayed is None and canonical_path.is_file():
         prior = json.loads(canonical_path.read_text(encoding="utf-8"))
@@ -7423,6 +7456,7 @@ def write_completion_marker(
             replayed=_completion_marker_replay(
                 route,node,node_id,evidence,axes,directory,
                 evidence_sha256=sha,
+                resource_execution_identity=resource_execution_identity,
             )
     if replayed is not None:
         replayed = _review_self_disposition_locked(
@@ -7532,6 +7566,8 @@ def write_completion_marker(
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
+        **({"resource_execution_identity":resource_execution_identity}
+           if resource_execution_identity is not None else {}),
     }
     if source_subject is not None:
         marker["source_subject"] = source_subject

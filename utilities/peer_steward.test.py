@@ -4059,7 +4059,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def _run_claude_prompt(self, *, state="idle", screen=None,
                            consume=False, readiness=None, foregrounds=None,
-                           send_result=(0, {})):
+                           send_result=(0, {}), producer_binding=None):
         if screen is None:
             screen = CLAUDE_SUGGESTION
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -4106,14 +4106,50 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
                                return_value=False), \
              mock.patch("builtins.print") as printed:
-            args = peer_steward.build_parser().parse_args(
-                ["prompt", "child", "[steer] exact private recipient ref"])
-            rc = peer_steward.cmd_prompt(args)
+            prompt_args = ["prompt", "child", "[steer] exact private recipient ref"]
+            if producer_binding is not None:
+                for value in (producer_binding["duty_id"], producer_binding["attempt_id"],
+                              producer_binding["delivery_id"]):
+                    prompt_args.extend(("--ref", value))
+            args = peer_steward.build_parser().parse_args(prompt_args)
+            rc = peer_steward.cmd_prompt(args, producer_binding=producer_binding)
             if state != "idle":
                 self.assertEqual(screen_reader.call_count, 0)
         record = self._all_records()[-1]
         row = peer_steward.peer_message._read_pending(record["transfer_ref"])
         return rc, printed.call_args[0][0], row, sent, schedule
+
+    def test_registered_runtime_prompt_preserves_producer_through_sender_duty_and_receipt(self):
+        producer = {
+            "schema": peer_steward.peer_message._RUNTIME_PRODUCER_SCHEMA,
+            "duty_id": "registered-batch-" + "a" * 32,
+            "jobs": str(Path(self._tmp.name) / "jobs.log"),
+            "attempt_id": "att-runtime-completion",
+            "carrier": "claude-async-rewake",
+            "delivery_id": "delivery-runtime-completion",
+            "receipt_digest": "b" * 64,
+            "recipient": {"harness": "claude", "session_id": "sid-child"},
+            "route_id": "rt-runtime", "route_node": "execute",
+        }
+        Path(producer["jobs"]).touch()
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            consume=True, producer_binding=producer)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("verify=exact-peer-ref", line)
+        self.assertIn("runtime-from:", sent[0][1])
+        self.assertEqual(row["state"], "received")
+        self.assertEqual(row["from"], {"harness": "runtime", "session_id": None,
+                                        "name": "Hearting runtime"})
+        self.assertEqual(row["producer_binding"], producer)
+        schedule.assert_not_called()
+        rows = [item for item in self._all_records()
+                if item.get("transfer_ref") == row["ref"]]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(item["from"]["harness"] == "runtime"
+                            and item.get("producer_binding") == producer for item in rows))
+        duty = peer_steward._schedule_message_obligation(row, "child")
+        self.assertEqual(duty["intent"]["from"], row["from"])
+        self.assertEqual(duty["intent"]["producer_binding"], producer)
 
     def _run_sidless_prompt(self, guard_results, *, send_result=(0, {}), text="[steer] first Codex turn"):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"

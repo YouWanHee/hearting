@@ -398,7 +398,8 @@ def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) 
     carries the `(peer-from: <harness> <sid> <name>)` trailer a steward appended, write
     one `notice` peer_message_v1 under THIS session's exact id (the same record the
     Claude hook and the OpenCode plugin write). Fail-soft, bounded, never prints."""
-    if not current_prompt or "peer-from:" not in current_prompt:
+    if not current_prompt or ("peer-from:" not in current_prompt
+                              and "runtime-from:" not in current_prompt):
         return
     sid = interaction_session_id(payload)
     if not sid:
@@ -497,7 +498,8 @@ def main() -> int:
         )
     except Exception:
         parts = []
-    if "peer-from:" in current_prompt or "cross-session-message" in current_prompt:
+    if ("peer-from:" in current_prompt or "runtime-from:" in current_prompt
+            or "cross-session-message" in current_prompt):
         import importlib.util
         spec = importlib.util.spec_from_file_location("peer_receiver_guidance", ROOT / "utilities/peer-message.py")
         peer = importlib.util.module_from_spec(spec)

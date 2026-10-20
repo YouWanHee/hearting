@@ -57,6 +57,54 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                          "opencode/model#high")
 
 
+class OpenCodeFullPartsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db = Path(self.temp.name) / "opencode.db"
+
+    def test_v1_rowid_cursor_and_mutable_refresh(self):
+        sid = "ses_fullv1"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE message (id TEXT, session_id TEXT, role TEXT)")
+            con.execute("CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT)")
+            con.execute("INSERT INTO message VALUES ('m1', ?, 'assistant')", (sid,))
+            con.execute("INSERT INTO part VALUES (?, 'm1', ?)", (sid, json.dumps({"type":"text","text":"x"*3000})))
+        row = runtime.read_session_parts(sid, db_path=self.db)
+        self.assertEqual(row["generation"], "v1")
+        self.assertEqual(len(row["parts"][0]["data"]["text"]), 3000)
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE part SET data=? WHERE rowid=1", (json.dumps({"type":"text","text":"complete"}),))
+        updated = runtime.read_session_parts(sid, db_path=self.db, after_cursor=row["cursor"],
+                                             refresh_cursors=[row["cursor"]])
+        self.assertEqual(updated["parts"][0]["data"]["text"], "complete")
+
+    def test_v2_seq_cursor_and_bad_json_are_preserved(self):
+        sid = "ses_fullv2"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER, data TEXT)")
+            con.execute("INSERT INTO session_message VALUES (?, 'assistant', 1, ?)",
+                        (sid, json.dumps({"content":[{"type":"text","text":"y"*3000}]})))
+            con.execute("INSERT INTO session_message VALUES (?, 'assistant', 2, 'bad-json')", (sid,))
+        row = runtime.read_session_parts(sid, db_path=self.db)
+        self.assertEqual(row["generation"], "v2")
+        self.assertEqual(len(row["parts"][0]["data"]["content"][0]["text"]), 3000)
+        self.assertEqual(row["parts"][1]["raw"], "bad-json")
+
+    def test_generation_ambiguity_and_missing_database_are_not_guessed(self):
+        sid = "ses_ambiguous"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE message (id TEXT, session_id TEXT, role TEXT)")
+            con.execute("CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT)")
+            con.execute("CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER, data TEXT)")
+            con.execute("INSERT INTO part VALUES (?, 'm', '{}')", (sid,))
+            con.execute("INSERT INTO session_message VALUES (?, 'user', 1, '{}')", (sid,))
+        self.assertEqual(runtime.read_session_parts(sid, db_path=self.db)["reason"],
+                         "session-generation-ambiguous")
+        self.assertEqual(runtime.read_session_parts("ses_missing", db_path=self.db.with_name("missing.db"))["state"],
+                         "missing")
+
+
 class OpenCodePermissionCodecTest(unittest.TestCase):
     @staticmethod
     def reference_effect(rows, action, resource):

@@ -570,7 +570,12 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 `compose` prints (capability · shape · route id · human gates) plus one clause
 of scope and proceeds in the same turn; a steward cannot approve for the user.
 Compose's notice and receipt name this confirmation method from the current
-turn's existing peer-receive observation. Unknown origin uses the card method;
+turn's existing peer-receive observation. Peer origin is known only when the
+current prompt boundary is bound to the exact validated transfer or native
+Claude envelope it contains. A previous receipt or a later notice cannot
+classify this prompt. Runtime completion transfers retain their producer
+binding and runtime source independently of the courier. Unknown or mixed
+origin uses the card method;
 the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,
@@ -931,8 +936,8 @@ finishes. Delivery does not restrict the owner's tools or prove stage success;
 launch dependencies, write authorization and terminal cleanup scopes own those
 decisions. Repeating a notification cannot declare the owner abandoned.
 
-A steward's idle-notify subscription is observation, not a continuation; it never
-satisfies the registered-continuation obligation below (`core/OPERATIONS.md §5.14`).
+A steward's idle-notify subscription is observation, not a continuation; the
+registered-continuation obligation below still applies (`core/OPERATIONS.md §5.14`).
 
 This section is capability-independent. `autopilot-lab`, `autopilot-code`,
 `autopilot-ship`, spec/research, CI and GitHub check cycles, external-state
@@ -1012,9 +1017,18 @@ watch is ready before the once-only payload release. The owner yields the model
 turn with `runtime_wait: registered-children`; the existing controller waits for
 the exact resource outside that turn and resumes the same native owner from a
 bounded receipt. Resource receipts are separate from registered model children.
-After pending user corrections, the watch writes the resource completion marker
-from the original producer artifact before recording stage success and claiming
-next work. Exit and this marker are neither verification PASS nor workflow completion.
+After pending user corrections, the watch records the exact resource result and
+returns it to the same owner. For a `supervised-owner` resource, even exit 0 with
+all declared files present is only resource success: polling does not write the
+stage completion marker or claim a successor. The owner can continue with another
+approved resource in the same node. When the owner finishes that node's approved
+scope, its ordinary `start` of the declared immediate successor passes through
+the existing shared admission gate; that gate rechecks the live owner, resource,
+pending corrections, and output evidence, then records stage success and claims
+the successor once. This uses the existing start path and adds no close command
+or required proof. Owner terminal settlement can reconcile an already-finished
+node, without starting a successor. Exit and the stage marker are neither
+verification PASS nor workflow completion.
 
 A resource watch lasts while its recorded PID/start/command identity is alive,
 without a fixed elapsed-time ceiling. The existing start/resume can reattach a
@@ -1022,16 +1036,18 @@ lost or expired watch to the same run without releasing a payload again. Explici
 parent cancellation still suppresses the preserved resource's successors.
 
 One supervised owner stage may use resources sequentially through the existing
-runner. An exact successful resource exit with stage outputs still absent waits
-for the next resource; it does not fail or complete the stage. The same owner
-receives that execution result and may register the next run after the previous
-identity is gone and its exit sentinel proves success. Historical run records
-remain intact, including their evidence paths and unacknowledged receipts.
-Receipt recovery follows the preserved binding after the next run is registered;
-acknowledgement remains with the returning owner turn, without a lifetime run-count
-ceiling. Stage success and successor admission still require the declared
-outputs; failed, unverifiable, active, or explicitly cancelled resources cannot
-be replaced by another run.
+runner. Every exact successful `supervised-owner` resource exit waits for the
+same owner to decide the next approved work, whether its output files are absent,
+runtime-authored, or already present. Polling does not infer logical-stage
+completion from those files or claim the successor. The owner may register the
+next resource after the previous identity is gone and its exit sentinel proves
+success. Historical run records remain intact, including their evidence paths
+and unacknowledged receipts. Receipt recovery follows the preserved binding
+after the next run is registered; acknowledgement remains with the returning
+owner turn, without a lifetime run-count ceiling. The existing successor `start`
+admits the completed node after rechecking its declared outputs. Failed,
+unverifiable, active, or explicitly cancelled resources cannot be replaced by
+another run.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
