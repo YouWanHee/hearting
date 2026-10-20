@@ -69,7 +69,7 @@ KEY_RE = re.compile(r"[0-9a-f]{32}")
 ATTEMPT_RE = attempt_reference.ATTEMPT_RE
 NOTICE_RE = re.compile(r"notice-[0-9a-f]{32}")
 ATTEMPT_ID_RE = re.compile(r"(?:^|,)attempt_id=([^,]+)")
-LEAF_RE = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})")
+LEAF_RE = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})(?:\.([0-9]{1,5}))?")
 DELIVERY_ID_RE = re.compile(r"delivery-(?:[0-9a-f]{32}|[0-9a-f]{64})")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 from dispatch_retention import (MAX_INTENT_CHILDREN, OPEN_STATUSES as OPEN,
@@ -339,6 +339,52 @@ def _ended_ns(row: _Row) -> int | None:
             if stat.S_ISREG(st.st_mode):
                 registry_ns = max(registry_ns, st.st_mtime_ns)
     return registry_ns
+
+
+RAW_UNKNOWN_CAP_NS = 7 * 24 * 60 * 60 * 10**9
+
+
+def _main_runtime_state(row: _Row) -> str:
+    """live/dead/unknown for the exact interactive root recorded at launch."""
+    meta = row.meta
+    harness = meta.get("main_runtime_harness", "")
+    pid = meta.get("main_runtime_pid", "")
+    start = meta.get("main_runtime_pid_start", "")
+    namespace = meta.get("main_runtime_ns", "")
+    if not (harness and pid and start and namespace):
+        # Legacy Claude rows used the same all-or-none fields for completion.
+        harness = "claude" if all(meta.get(key) for key in (
+            "parent_runtime_pid", "parent_runtime_pid_start", "parent_runtime_ns")) else ""
+        pid, start, namespace = (meta.get("parent_runtime_pid", ""),
+                                 meta.get("parent_runtime_pid_start", ""),
+                                 meta.get("parent_runtime_ns", ""))
+    if harness not in {"claude", "codex", "opencode"} or not pid.isdigit() or not start or not namespace:
+        return "unknown"
+    current_namespace = ""
+    try:
+        from dispatch_contract import process_namespace_identity
+        current_namespace = process_namespace_identity()
+        if not current_namespace or current_namespace != namespace:
+            return "unknown"
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2:].split()
+        if len(fields) <= 19:
+            return "unknown"
+        if fields[0] in {"Z", "X"} or fields[19] != start:
+            return "dead"
+        return "live"
+    except FileNotFoundError:
+        return "dead" if current_namespace == namespace else "unknown"
+    except (OSError, ValueError, IndexError):
+        return "unknown"
+
+
+def _retain_raw_for_main(row: _Row, first_ns: int, now_ns: int) -> bool:
+    harness = row.meta.get("harness", "")
+    if harness not in {"claude", "opencode"}:
+        return False
+    state = _main_runtime_state(row)
+    return state == "live" or (state == "unknown" and now_ns - first_ns < RAW_UNKNOWN_CAP_NS)
 
 
 class _Snapshot:
@@ -2086,7 +2132,19 @@ def _remove_leaf(layout: _Layout, name: str, expected: list[int], deadline: floa
     except FileNotFoundError:
         return "removed"
     except OSError:
-        return "unproven"
+        try:
+            info = os.stat(name, dir_fd=layout.retiring_fd, follow_symlinks=False)
+            if (_identity(info) != expected or info.st_uid != os.geteuid()
+                    or info.st_dev != os.fstat(layout.retiring_fd).st_dev):
+                return "unproven"
+            os.unlink(name, dir_fd=layout.retiring_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return "partial"
+        with contextlib.suppress(OSError):
+            os.unlink(name + ".journal", dir_fd=layout.retiring_fd)
+        return "removed"
     try:
         opened = os.fstat(leaf)
         if _identity(opened) != expected or opened.st_uid != os.geteuid():
@@ -2112,6 +2170,163 @@ def _remove_leaf(layout: _Layout, name: str, expected: list[int], deadline: floa
     return "removed"
 
 
+def _partial_keep_paths(harness: str) -> tuple[set[str], set[str]] | None:
+    if harness == "claude":
+        return {"projects", "worker-home.json"}, {"projects"}
+    if harness == "opencode":
+        base = "runtime/data/opencode"
+        keep = {"worker-home.json", *(f"{base}/opencode.db{suffix}" for suffix in ("", "-wal", "-shm"))}
+        return keep, set()
+    return None
+
+
+def _partial_raw_state(home_fd: int, harness: str) -> bool | None:
+    """True when raw data is safely present, False when absent, None if ambiguous."""
+    if harness == "claude":
+        try:
+            info = os.stat("projects", dir_fd=home_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                return None
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+    parent = home_fd
+    owned = []
+    try:
+        for name in ("runtime", "data", "opencode"):
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                return None
+            child = os.open(name, _DIR_FLAGS, dir_fd=parent)
+            owned.append(child)
+            parent = child
+        try:
+            info = os.stat("opencode.db", dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            return None
+        return True
+    except OSError:
+        return None
+    finally:
+        for fd in reversed(owned):
+            os.close(fd)
+
+
+def _journal_and_retire(layout: _Layout, source_fd: int, name: str, source_relative: str, key: str,
+                        now_ns: int, serial: int, deadline: float) -> str:
+    """Detach one fd-relative home entry through the existing retiring journal."""
+    try:
+        before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+    except OSError:
+        return "deferred"
+    if before.st_dev != os.fstat(source_fd).st_dev:
+        return "deferred"
+    target = f"{key}.{now_ns}.{serial}"
+    journal = json.dumps({"schema": SCHEMA, "key": key, "name": target,
+                          "identity": _identity(before), "operation": "partial-entry",
+                          "source": source_relative}, sort_keys=True).encode()
+    try:
+        fd = os.open(target + ".journal", os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=layout.retiring_fd)
+    except OSError:
+        return "deferred"
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(journal)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if _identity(current) != _identity(before):
+            os.unlink(target + ".journal", dir_fd=layout.retiring_fd)
+            return "deferred"
+        if stat.S_ISDIR(current.st_mode):
+            child = os.open(name, _DIR_FLAGS, dir_fd=source_fd)
+            try:
+                same_mount = _mount_id(child) == _mount_id(source_fd)
+            finally:
+                os.close(child)
+            if not same_mount:
+                os.unlink(target + ".journal", dir_fd=layout.retiring_fd)
+                return "deferred"
+        os.rename(name, target, src_dir_fd=source_fd, dst_dir_fd=layout.retiring_fd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(target + ".journal", dir_fd=layout.retiring_fd)
+        return "deferred"
+    result = _remove_leaf(layout, target, _identity(before), deadline)
+    return "removed" if result == "removed" else "retired"
+
+
+def _prune_home_entries(layout: _Layout, home_fd: int, key: str, harness: str,
+                        now_ns: int, deadline: float) -> str:
+    """Keep only the transcript allowlist and detach each other entry separately."""
+    allow = _partial_keep_paths(harness)
+    if allow is None or _partial_raw_state(home_fd, harness) is not True:
+        return "deferred"
+    keep, opaque = allow
+    serial = 0
+
+    def visit(parent_fd, prefix="", depth=0):
+        nonlocal serial
+        if depth > MAX_TREE_DEPTH or time.monotonic() > deadline:
+            return False
+        try:
+            with os.scandir(parent_fd) as listing:
+                names = [entry.name for entry in listing]
+        except OSError:
+            return False
+        for name in names:
+            path = f"{prefix}/{name}" if prefix else name
+            if path in keep:
+                try:
+                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    return False
+                if (path == "projects" and not stat.S_ISDIR(info.st_mode)
+                        or path != "projects" and not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()):
+                    return False
+                continue
+            if any(path.startswith(item + "/") for item in opaque):
+                continue
+            descendants = any(item.startswith(path + "/") for item in keep)
+            try:
+                info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                return False
+            if descendants:
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                    return False
+                try:
+                    child = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+                except OSError:
+                    return False
+                try:
+                    opened = os.fstat(child)
+                    if (_identity(opened) != _identity(info)
+                            or _mount_id(child) != _mount_id(parent_fd)
+                            or not visit(child, path, depth + 1)):
+                        return False
+                finally:
+                    os.close(child)
+                continue
+            serial += 1
+            outcome = _journal_and_retire(layout, parent_fd, name, path, key, now_ns,
+                                          serial, deadline)
+            if outcome not in {"removed", "retired"}:
+                return False
+        return True
+
+    return "partial-retained" if visit(home_fd) else "partial-deferred"
+
+
 def _journal(layout: _Layout, name: str):
     """The identity this leaf was detached with, or None if unproven."""
     try:
@@ -2125,6 +2340,11 @@ def _journal(layout: _Layout, name: str):
     match = LEAF_RE.fullmatch(name)
     if (value.get("name") != name or not match or key != match.group(1) or not isinstance(ident, list)
             or len(ident) != 3 or not all(isinstance(item, int) for item in ident)):
+        return None
+    operation, source = value.get("operation"), value.get("source")
+    if operation is not None and (
+            operation != "partial-entry" or not isinstance(source, str) or not source
+            or source.startswith("/") or ".." in Path(source).parts or "\\" in source):
         return None
     return ident
 
@@ -2401,6 +2621,18 @@ def _detach(ctx: _Context, key: str, ident: list[int], attempt: str | None, raw:
                     if late_delivery is not None:
                         return ("late-evidence-unreadable" if late_delivery == "unknown"
                                 else "late-evidence-changed")
+                    row = fresh.rows.get(attempt) if attempt else None
+                    if (row is not None and binding.harness in {"claude", "opencode"}
+                            and _retain_raw_for_main(row, first_ns, ctx.now_ns)):
+                        raw_state = _partial_raw_state(leaf, binding.harness)
+                        if raw_state is None:
+                            return "defer:partial-retention-unsafe"
+                        if raw_state:
+                            pruned = _prune_home_entries(
+                                layout, leaf, key, binding.harness, ctx.now_ns, deadline)
+                            if pruned == "partial-retained":
+                                return "partial-retained"
+                            return "defer:partial-retention-unsafe"
                     name = f"{key}.{ctx.now_ns}"
                     journal = json.dumps({"schema": SCHEMA, "key": key, "name": name,
                                           "identity": ident}, sort_keys=True).encode()
@@ -2590,6 +2822,13 @@ def _pass(jobs: Path, root: Path, layout: _Layout, state: dict, now_ns: int, sta
             budget -= 1
             outcome = _detach(ctx, key, ident, verdict.attempt, verdict.raw, start,
                               deadline, binding=binding)
+            if outcome == "partial-retained":
+                result["partial"] += 1
+                _count(result["kept"], "transcript-retained")
+                continue
+            if outcome == "defer:partial-retention-unsafe":
+                _count(result["unknown"], "partial-retention-unsafe")
+                continue
             if not outcome.startswith("detached:"):
                 if (outcome.startswith("protected:") or outcome in ("home-gone", "identity-changed")
                         or (outcome == "late-evidence-changed" and

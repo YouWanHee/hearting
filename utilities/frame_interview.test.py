@@ -427,6 +427,37 @@ class NativeAnswerNormalizationTest(unittest.TestCase):
         answers = FI.answers_from_native(interview, asked)
         self.assertEqual(answers["answers"][question["id"]]["choice"], 0)
 
+    def test_native_slots_and_answers_from_native_agree_with_the_single_call_rules(self):
+        interview = good_interview()
+        first, second = interview["questions"][0], interview["questions"][1]
+        restate = lambda answer: {"question": interview["understanding"], "options": ["yes", "no"], "answer": answer}
+        row = lambda question, answer: {"question": question["question"], "options": ["Yes", "No"], "answer": answer}
+        cases = {
+            "confirmed": [restate("yes"), row(first, "Yes"), row(second, "No")],
+            "corrected": [restate("Only the approval step."), row(first, "Yes"), row(second, "No")],
+            "off-menu": [restate("yes"), row(first, "Something else entirely"), row(second, "No")],
+            "missing question": [restate("yes"), row(first, "Yes")],
+            "missing restatement": [row(first, "Yes"), row(second, "No")],
+            "no without a correction": [restate("no"), row(first, "Yes"), row(second, "No")],
+            "empty answer": [restate("yes"), row(first, ""), row(second, "No")],
+            "unrelated": [{"question": "unrelated", "answer": "x"}],
+        }
+        for name, asked in cases.items():
+            with self.subTest(name):
+                slots = FI.native_slots(interview, asked)
+                expected = None if slots is None else FI.answers_from_native_slots(interview, slots)
+                self.assertEqual(FI.answers_from_native(interview, asked), expected)
+        self.assertIsNotNone(FI.answers_from_native(interview, cases["confirmed"]))
+        for rejected in ("no without a correction", "empty answer"):
+            self.assertIsNone(FI.native_slots(interview, cases[rejected]), rejected)
+        self.assertEqual(sorted(FI.native_slots(interview, cases["missing question"])),
+                         sorted([FI.UNDERSTANDING_SLOT, first["id"]]))
+        self.assertEqual(FI.missing_native_slots(interview, FI.native_slots(interview, cases["missing question"])),
+                         [second["id"]])
+        merged = {**FI.native_slots(interview, cases["missing question"]),
+                  **FI.native_slots(interview, [row(second, "No")])}
+        self.assertEqual(FI.answers_from_native_slots(interview, merged), FI.answers_from_native(interview, cases["confirmed"]))
+
 
 class IntentTest(unittest.TestCase):
     def test_nonuser_intent_and_approvals_keep_the_declared_source(self):
