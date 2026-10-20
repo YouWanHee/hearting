@@ -297,6 +297,15 @@ class Expiry(Fixture):
         with R.worker_home_read_admission(
                 self.jobs, home, transcript, attempt, "claude") as admitted:
             self.assertTrue(admitted)
+        rebuild_env = {"HOME": str(self.root / "runtime-user"),
+                       "XDG_CONFIG_HOME": str(self.root / "runtime-config"),
+                       "XDG_DATA_HOME": str(self.root / "runtime-data"),
+                       "XDG_CACHE_HOME": str(self.root / "runtime-cache"),
+                       "AGENT_DISPATCH_JOBS": str(self.jobs)}
+        _builder.build_worker_home(SOURCE, "claude", "stage", attempt,
+                                   env=rebuild_env, destination=home)
+        self.assertEqual(transcript.stat().st_ino, raw_inode)
+        self.assertEqual(transcript.read_text(), '{"type":"message"}\n')
 
     def test_terminal_opencode_prunes_cache_preserving_database_wal_and_shm(self):
         attempt = "att-opencode-live-main-retention"
