@@ -2936,27 +2936,29 @@ def bounded_candidate_outcomes(values: object, omitted: object = 0) -> tuple[lis
 
 
 def route_state_next_action(reason: str, detail: str, route_file: str | None,
-                             node) -> str:
+                             node, *, evidence: str | None = None) -> str:
     """The supported next action a route-state refusal carries (13.59.3 rule 6).
 
     ``node`` may be a node dict or a bare node id string; only its id is used.
     ``detail`` is the raiser's detail string (often the dependency node id for
     `completion-marker-missing`/`completion-evidence-revised-unrecorded`).
+    ``evidence``, when the caller holds the marker, fills the evidence path.
     """
     node_id = node.get("id") if isinstance(node, Mapping) else node
     target = detail or node_id or "<node>"
     route_arg = f"--route {route_file}" if route_file else "--route <route-file>"
+    evidence_arg = shlex.quote(evidence) if evidence else "<evidence-path>"
     if reason == "completion-evidence-revised-unrecorded":
         return (
             f"capability-route.py revise {route_arg} --node {target} "
-            "--evidence <evidence-path> "
+            f"--evidence {evidence_arg} "
             "--basis review-findings|user-direction|owner-correction"
         )
     if reason == "completion-marker-missing":
         return (
             f"wait for node {target} to publish a completion marker, or if its "
             f"gate evidence already changed run: capability-route.py revise {route_arg} "
-            f"--node {target} --evidence <evidence-path> "
+            f"--node {target} --evidence {evidence_arg} "
             "--basis review-findings|user-direction|owner-correction"
         )
     if reason == "completion-evidence-superseded":

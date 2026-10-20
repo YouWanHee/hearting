@@ -2122,7 +2122,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                      "next_action": replacement.get("next_action", "same-command"),
                      "retry_when": replacement.get("retry_when", ""),
                      "next_step": replacement.get("retry_when") or replacement.get("next_step", "Retry resume_command after the exact launch settles.")}
-        if replacement["reason"] == "replacement-parent-identity-unproven":
+        # A refusal with its own next_step and no retry condition is not
+        # cleared by running the same command again.
+        if (replacement["reason"] == "replacement-parent-identity-unproven"
+                or (replacement.get("next_step") and not replacement.get("retry_when"))):
             attention.pop("next_action", None)
             attention.pop("retry_when", None)
         return attention
