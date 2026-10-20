@@ -2034,6 +2034,30 @@ class DispatchContractTest(unittest.TestCase):
     if proc.poll() is None:proc.kill()
     proc.wait()
 
+ def test_completion_readiness_ignores_only_proven_unstarted_siblings(self):
+  route={"route_id":"rt-ready-fence"};node={"id":"plan","kind":"pipeline-stage"}
+  marker={"attempt_id":"att-ready-main","registered_worker":True}
+  exact=attempt_row({"route_id":route["route_id"],"route_node":node["id"],
+                     "attempt_id":marker["attempt_id"],"note":"completed-marker",
+                     "failure_class":"pass"},status="done")
+  residue={"route_id":route["route_id"],"route_node":node["id"],
+           "attempt_id":"att-ready-residue","launch_claimed":"0"}
+  cases=(
+   ({**residue},"ready"),
+   ({**residue,"launch_claimed":"1"},"draining"),
+   ({**residue,"pid":"123"},"draining"),
+   ({**residue,"launch_started":"1"},"draining"),
+   ({key:value for key,value in residue.items() if key!="launch_claimed"},"draining"),
+  )
+  with mock.patch.object(D,"attempt_process_quiescence",
+                         return_value=D.ProcessQuiescence("quiescent","fixture")):
+   for sibling,expected in cases:
+    with self.subTest(sibling=sibling):
+     result=D.completion_attempt_readiness(
+      route,node,marker,Path("unused"),
+      registry_lines=[exact,attempt_row(sibling,status="open")])
+     self.assertEqual(result.state,expected)
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
@@ -2884,6 +2908,55 @@ class DispatchContractTest(unittest.TestCase):
    self.assertIn("\topen\t",jobs.read_text())
    self.assertTrue(D.close_attempt_row_if(jobs,attempt,"dead-test",lambda _fields:True))
    self.assertIn("note=dead-test",jobs.read_text())
+
+ def test_conditional_close_refuses_claimed_rows_and_duplicate_identity(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-close-claim-race"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_node=n,attempt_id={attempt},launch_claimed=0")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row))
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=True))
+   self.assertFalse(D.close_attempt_row_if(
+    jobs,attempt,"never-launched",D.attempt_row_never_started))
+   fields=jobs.read_text().strip().split("\t")
+   metadata=D.parse_registry_metadata(fields[5])
+   self.assertEqual((metadata["launch_claimed"],fields[1]),("1","open"))
+   jobs.write_text("\n".join((row,row))+"\n",encoding="utf-8")
+   self.assertFalse(D.close_attempt_row_if(
+    jobs,attempt,"never-launched",D.attempt_row_never_started))
+   self.assertEqual([line.split("\t")[1] for line in jobs.read_text().splitlines()],
+                    ["open","open"])
+
+ def test_timeout_close_and_launch_claim_race_has_one_winner(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-close-launch-race"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_node=n,attempt_id={attempt},launch_claimed=0")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row))
+   gate=threading.Barrier(3);results={}
+   def close():
+    gate.wait(timeout=5)
+    results["close"]=D.close_attempt_row_if(
+     jobs,attempt,"never-launched",D.attempt_row_never_started)
+   def claim():
+    gate.wait(timeout=5)
+    results["claim"]=D.claim_attempt_row(jobs,attempt,row,launch=True)
+   workers=[threading.Thread(target=close),threading.Thread(target=claim)]
+   for worker in workers:worker.start()
+   gate.wait(timeout=5)
+   for worker in workers:worker.join(timeout=5)
+   self.assertTrue(all(not worker.is_alive() for worker in workers))
+   self.assertEqual(sum(bool(results.get(key)) for key in ("close","claim")),1,results)
+   fields=jobs.read_text(encoding="utf-8").strip().split("\t")
+   metadata=D.parse_registry_metadata(fields[5])
+   if results["close"]:
+    self.assertEqual(fields[1],"done")
+    self.assertEqual(metadata.get("launch_claimed"),"0")
+   else:
+    self.assertEqual(fields[1],"open")
+    self.assertEqual(metadata.get("launch_claimed"),"1")
+    self.assertFalse(D.close_attempt_row_if(
+     jobs,attempt,"never-launched",D.attempt_row_never_started))
 
  def test_teardown_claim_excludes_ordinary_close_and_owner_closes_atomically(self):
   with tempfile.TemporaryDirectory() as td:
