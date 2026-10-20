@@ -605,6 +605,21 @@ def handoff_observer(jobs: str | Path, duty_id: str, fd: int, *, service_current
         return False
 
 
+def request_runner(jobs: str | Path) -> bool:
+    """Return a pending duty to the existing obligation runner.
+
+    The carrier uses the common detached recovery request; the runner's
+    ``ensure_observers`` pass relaunches the duty under its bounded backoff.
+    A request made while that runner is alive changes nothing.
+    """
+    try:
+        import peer_obligations
+        return peer_obligations.request_dispatch_reconciliation(
+            Path(jobs).resolve(strict=True).parent)
+    except Exception:
+        return False
+
+
 def _registry_stamp(path: Path):
     try:
         info = path.stat()
@@ -860,11 +875,12 @@ def pending_observer_snapshot(jobs: str | Path | None = None, *,
             if not record or record.get("state") not in _PENDING:
                 continue
             pending_paths.append(path)
-            observer = record.get("observer") or {}
+            # No observer identity here: each pass relaunches an unowned duty
+            # anyway, and a relaunch (a new PID, alive or already gone) is
+            # not new work that may reset the runner's bounded backoff.
             signature.append((
                 str(jobs_path), record.get("id", path.stem), record.get("state"),
-                record.get("delivery"), observer.get("pid"),
-                observer.get("pid_start"),
+                record.get("delivery"),
             ))
         paths_by_jobs[key] = tuple(pending_paths)
     return {
