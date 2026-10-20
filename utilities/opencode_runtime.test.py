@@ -91,6 +91,37 @@ class OpenCodeFullPartsTest(unittest.TestCase):
         self.assertEqual(len(row["parts"][0]["data"]["content"][0]["text"]), 3000)
         self.assertEqual(row["parts"][1]["raw"], "bad-json")
 
+    def test_budget_arguments_bound_one_read_and_leave_the_default_unbounded(self):
+        sid = "ses_budget"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE message (id TEXT, session_id TEXT, role TEXT)")
+            con.execute("CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT)")
+            con.execute("INSERT INTO message VALUES ('m1', ?, 'assistant')", (sid,))
+            for index in range(1, 11):
+                con.execute("INSERT INTO part VALUES (?, 'm1', ?)", (sid, json.dumps({"type": "text", "text": f"t{index}"})))
+        everything = runtime.read_session_parts(sid, db_path=self.db)
+        self.assertEqual([part["cursor"] for part in everything["parts"]], list(range(1, 11)))
+        self.assertNotIn("first_cursor", everything)
+        newest = runtime.read_session_parts(sid, db_path=self.db, limit=3, newest=True)
+        self.assertEqual([part["cursor"] for part in newest["parts"]], [8, 9, 10])
+        self.assertEqual((newest["cursor"], newest["first_cursor"]), (10, 8))
+        forward = runtime.read_session_parts(sid, db_path=self.db, after_cursor=2, limit=3)
+        self.assertEqual([part["cursor"] for part in forward["parts"]], [3, 4, 5])
+        before = runtime.read_session_parts(sid, db_path=self.db, before_cursor=8, limit=3)
+        self.assertEqual([part["cursor"] for part in before["parts"]], [5, 6, 7])
+        self.assertEqual(before["first_cursor"], 5)
+        refreshed = runtime.read_session_parts(sid, db_path=self.db, after_cursor=8, limit=1, refresh_cursors=[2])
+        self.assertEqual([part["cursor"] for part in refreshed["parts"]], [2, 9])
+
+    def test_budget_arguments_work_on_the_v2_generation_too(self):
+        sid = "ses_budgetv2"
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER, data TEXT)")
+            for seq in range(1, 6):
+                con.execute("INSERT INTO session_message VALUES (?, 'user', ?, '{}')", (sid, seq))
+        self.assertEqual([p["cursor"] for p in runtime.read_session_parts(sid, db_path=self.db, limit=2, newest=True)["parts"]], [4, 5])
+        self.assertEqual([p["cursor"] for p in runtime.read_session_parts(sid, db_path=self.db, before_cursor=4, limit=2)["parts"]], [2, 3])
+
     def test_generation_ambiguity_and_missing_database_are_not_guessed(self):
         sid = "ses_ambiguous"
         with sqlite3.connect(self.db) as con:

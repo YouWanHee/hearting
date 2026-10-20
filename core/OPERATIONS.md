@@ -2538,6 +2538,11 @@ changes to resource liveness. Runtime maintenance in a private snapshot
 repository is plumbing, not a user tool call.
 After a resource exits, an owner without a current model summary or tool shows
 the last resource result and log age in NOW.
+
+Fleet's live default and the default `--once` snapshot use the B explorer compose: a work ledger
+and output view with navigation. The legacy group and process renderers remain available through
+`--once --view group|process` and `FLEET_VIEW=group|process` with `--once`; the existing group
+description above specifies that view.
 For a live local resource, bounded reads of its exact process and descendants
 show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
 Observed GPU use takes precedence; selection alone creates no GPU usage

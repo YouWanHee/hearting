@@ -349,6 +349,26 @@ class AttemptViewTests(unittest.TestCase):
             self.assertTrue(any(row.kind == "prompt" for row in view.format_record(
                 "claude", {"type":"user", "message":{"content":content}})))
 
+    def test_a_completed_command_without_a_shown_start_keeps_its_command(self):
+        state = {}
+        completed = {"type": "item.completed", "item": {"id": "c9", "type": "command_execution",
+                                                       "command": "ls -la", "aggregated_output": "total 0", "exit_code": 0}}
+        lines = view.format_stream("codex", [json.dumps(completed)], state)
+        self.assertEqual([line.text for line in lines], ["command: ls -la", "output: total 0", "exit: 0"])
+        started = {"type": "item.started", "item": {"id": "c10", "type": "command_execution", "command": "pwd"}}
+        done = {"type": "item.completed", "item": {"id": "c10", "type": "command_execution", "command": "pwd",
+                                                  "aggregated_output": "/", "exit_code": 0}}
+        lines = view.format_stream("codex", [json.dumps(started), json.dumps(done)], state)
+        self.assertEqual([line.text for line in lines], ["command: pwd", "output: /", "exit: 0"])
+
+    def test_sanitize_is_linear_on_one_very_long_run_of_letters(self):
+        import time
+        started = time.monotonic()
+        clean = view.sanitize("z" * 400_000 + " https://u:p@host/x")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(clean.endswith("https://[redacted]@host/x"))
+        self.assertEqual(view.sanitize("see https://u:p@host/x"), "see https://[redacted]@host/x")
+
     def test_public_read_new_reuses_cursor_incrementally(self):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:
@@ -573,6 +593,200 @@ class AttemptViewTests(unittest.TestCase):
             lines = view.format_record("codex", {"type":name, "payload":"hidden from short line"})
             types[name] += len(lines)
         self.assertEqual(types.most_common(1), [("dispatch.supervisor.future-a", 2)])
+
+
+class BoundedReadTests(unittest.TestCase):
+    """The optional read budget: tail, forward, earlier, oversize, truncation, database rows."""
+
+    def write(self, directory, rows, name="log.jsonl"):
+        path = Path(directory) / name
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return path
+
+    def test_default_read_new_is_unbounded_and_unchanged(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": i} for i in range(500)])
+            cursor = view.Cursor(path)
+            self.assertEqual(len(cursor.read_new()), 500)
+            self.assertEqual(cursor.read_new(), [])
+
+    def test_tail_starts_at_the_last_whole_records_and_follows_by_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": i} for i in range(500)])
+            cursor = view.Cursor(path)
+            rows = cursor.read_new(max_bytes=1_000_000, max_records=200, tail=True)
+            self.assertEqual([json.loads(r)["n"] for r in rows], list(range(300, 500)))
+            self.assertEqual(cursor.read_new(max_bytes=1_000_000, max_records=200), [])
+            with path.open("a") as handle:
+                handle.write("".join(json.dumps({"n": i}) + "\n" for i in range(500, 530)))
+            more = cursor.read_new(max_bytes=1_000_000, max_records=10)
+            self.assertEqual([json.loads(r)["n"] for r in more], list(range(500, 510)))
+            rest = cursor.read_new(max_bytes=1_000_000, max_records=200)
+            self.assertEqual([json.loads(r)["n"] for r in rest], list(range(510, 530)))
+
+    def test_byte_budget_cuts_on_a_record_boundary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": i, "pad": "x" * 100} for i in range(100)])
+            cursor = view.Cursor(path)
+            rows = cursor.read_new(max_bytes=1000, tail=True)
+            self.assertTrue(0 < len(rows) <= 9)
+            self.assertEqual(json.loads(rows[-1])["n"], 99)
+            self.assertTrue(all(json.loads(r)["pad"] == "x" * 100 for r in rows))
+
+    def test_one_record_larger_than_the_budget_is_read_whole(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": 1}, {"n": 2, "big": "y" * 5000}])
+            cursor = view.Cursor(path)
+            rows = cursor.read_new(max_bytes=100, tail=True)
+            self.assertEqual([json.loads(r)["n"] for r in rows], [2])
+            self.assertEqual(len(json.loads(rows[0])["big"]), 5000)
+            before = cursor.read_before(max_bytes=100)
+            self.assertEqual([json.loads(text)["n"] for _, text in before], [1])
+            self.assertEqual(cursor.read_before(max_bytes=100), [])
+
+    def test_a_record_over_the_limit_never_leaks_its_tail_across_reads(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"a" * (view.MAX_RECORD_BYTES + 200_000) + b"\nGOOD\n")
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(400):
+                rows += cursor.read_new(max_bytes=65536)
+                if cursor.offset >= path.stat().st_size and not cursor.pending:
+                    break
+            self.assertEqual(rows, ["GOOD"])
+            self.assertEqual(sum("size limit" in note for note in cursor.notices), 1)
+            self.assertFalse(cursor.discarding)
+
+    def test_a_tail_cut_by_end_of_file_stays_dropped_after_the_next_append(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"a" * (view.MAX_RECORD_BYTES + 10))
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(200):
+                rows += cursor.read_new(max_bytes=65536)
+            self.assertEqual(rows, [])
+            self.assertTrue(cursor.discarding)
+            with path.open("ab") as handle:
+                handle.write(b"tail of the same record")
+            self.assertEqual(cursor.read_new(max_bytes=65536), [])
+            self.assertEqual(cursor.read_new(max_bytes=65536, final=True), [])
+            with path.open("ab") as handle:
+                handle.write(b" end\nGOOD\n")
+            self.assertEqual(cursor.read_new(max_bytes=65536), ["GOOD"])
+            self.assertFalse(cursor.discarding)
+
+    def test_final_does_not_emit_a_tail_that_is_being_dropped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.jsonl"
+            path.write_bytes(b"ok\n" + b"a" * (view.MAX_RECORD_BYTES + 10))
+            cursor = view.Cursor(path)
+            rows = []
+            for _ in range(200):
+                rows += cursor.read_new(max_bytes=65536)
+            self.assertTrue(cursor.discarding)
+            rows += cursor.read_new(max_bytes=65536, final=True)
+            self.assertEqual(rows, ["ok"])
+
+    def test_earlier_records_are_read_only_when_asked_and_in_order(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": i} for i in range(100)])
+            cursor = view.Cursor(path)
+            cursor.read_new(max_bytes=1_000_000, max_records=10, tail=True)
+            first = cursor.read_before(max_bytes=10_000, max_records=30)
+            self.assertEqual([json.loads(text)["n"] for _, text in first], list(range(60, 90)))
+            second = cursor.read_before(max_bytes=10_000, max_records=1000)
+            self.assertEqual([json.loads(text)["n"] for _, text in second], list(range(0, 60)))
+            self.assertEqual(cursor.read_before(max_bytes=10_000), [])
+            self.assertEqual(cursor.start, 0)
+
+    def test_truncation_bumps_the_epoch_and_a_missing_file_reports_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [{"n": i} for i in range(5)])
+            source = view.Source(path, "codex")
+            cursor = view.Cursor(path)
+            self.assertEqual(len(view.read_entries(source, cursor, max_records=200, tail=True).entries), 5)
+            path.write_text(json.dumps({"n": "new"}) + "\n")
+            result = view.read_entries(source, cursor, max_records=200)
+            self.assertTrue(result.reset)
+            self.assertEqual([json.loads(e.record)["n"] for e in result.entries], ["new"])
+            path.unlink()
+            gone = view.read_entries(source, cursor, max_records=200)
+            self.assertEqual((gone.entries, gone.state), ([], "missing"))
+
+    def make_db(self, directory, generation, count=6):
+        import sqlite3
+        db = Path(directory) / "opencode.db"
+        sid = "ses_boundedview"
+        with sqlite3.connect(db) as con:
+            if generation == "v1":
+                con.execute("CREATE TABLE message (id TEXT, session_id TEXT, role TEXT)")
+                con.execute("CREATE TABLE part (session_id TEXT, message_id TEXT, data TEXT)")
+                con.execute("INSERT INTO message VALUES ('m', ?, 'assistant')", (sid,))
+                for index in range(1, count + 1):
+                    con.execute("INSERT INTO part VALUES (?, 'm', ?)", (sid, json.dumps({"type": "text", "text": f"row{index}"})))
+            else:
+                con.execute("CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER, data TEXT)")
+                for index in range(1, count + 1):
+                    con.execute("INSERT INTO session_message VALUES (?, 'assistant', ?, ?)",
+                                (sid, index, json.dumps({"time": {"completed": 1}, "content": [{"type": "text", "text": f"row{index}"}]})))
+        return view.Source(db, "opencode", "opencode-db", sid)
+
+    def texts(self, entries):
+        return [e.record["part"]["text"] for e in entries]
+
+    def test_database_tail_follow_and_earlier_for_both_generations(self):
+        import tempfile
+        for generation in ("v1", "v2"):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as directory:
+                source = self.make_db(directory, generation)
+                cursor = view.Cursor(source.path)
+                tail = view.read_entries(source, cursor, max_records=3, tail=True)
+                self.assertEqual(self.texts(tail.entries), ["row4", "row5", "row6"])
+                self.assertEqual(view.read_entries(source, cursor, max_records=3).entries
+                                 if generation == "v2" else [], [])
+                self.assertTrue(view.has_earlier(source, cursor))
+                earlier = view.read_earlier(source, cursor, max_records=2)
+                self.assertEqual(self.texts(earlier.entries), ["row2", "row3"])
+                everything = view.read_earlier(source, cursor, max_records=10)
+                self.assertEqual(self.texts(everything.entries), ["row1"])
+                self.assertFalse(view.has_earlier(source, cursor))
+
+    def test_database_streaming_row_keeps_its_key_when_it_changes(self):
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.make_db(directory, "v1", count=2)
+            cursor = view.Cursor(source.path)
+            first = view.read_entries(source, cursor, max_records=200, tail=True)
+            self.assertEqual([e.key for e in first.entries], [(1, 0), (2, 0)])
+            with sqlite3.connect(source.path) as con:
+                con.execute("UPDATE part SET data=? WHERE rowid=2", (json.dumps({"type": "text", "text": "row2 grown"}),))
+            second = view.read_entries(source, cursor, max_records=200)
+            self.assertEqual([(e.key, e.record["part"]["text"]) for e in second.entries], [((2, 0), "row2 grown")])
+            self.assertEqual(view.read_entries(source, cursor, max_records=200).entries, [])
+
+    def test_database_failures_are_missing_or_unreadable_not_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = view.Source(Path(directory) / "gone.db", "opencode", "opencode-db", "ses_boundedview")
+            result = view.read_entries(source, view.Cursor(source.path), max_records=5, tail=True)
+            self.assertEqual((result.state, result.reason), ("missing", "database-unavailable"))
+            broken = Path(directory) / "broken.db"
+            broken.write_bytes(b"not a database" * 100)
+            source = view.Source(broken, "opencode", "opencode-db", "ses_boundedview")
+            result = view.read_entries(source, view.Cursor(broken), max_records=5, tail=True)
+            self.assertEqual((result.state, result.reason), ("unreadable", "database-read-failed"))
 
 
 @unittest.skipUnless(os.environ.get("HEARTING_ATTEMPT_VIEW_LOCAL") == "1",
