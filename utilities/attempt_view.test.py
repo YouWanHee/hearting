@@ -4,6 +4,7 @@ import unittest
 import os
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -150,6 +151,211 @@ class AttemptViewTests(unittest.TestCase):
             self.assertNotIn('cmd', joined)
             self.assertEqual(view._follow_db(source,state), [])
 
+    def test_codex_stateful_commands_messages_envelopes_and_prompts(self):
+        state = {}
+        rows = [json.dumps({"type":"item.started", "item":{"id":"c1", "type":"command_execution", "command":"echo hi"}}),
+                json.dumps({"type":"item.completed", "item":{"id":"c1", "type":"command_execution", "command":"echo hi", "aggregated_output":"hi", "exit_code":0}}),
+                json.dumps({"type":"item.started", "item":{"id":"c2", "type":"command_execution", "command":"still running"}}),
+                json.dumps({"type":"item.completed", "item":{"id":"m1", "type":"agent_message", "text":"said once"}}),
+                json.dumps({"type":"item.completed", "item":{"id":"m1", "type":"agent_message", "text":"said once"}})]
+        import contextlib, io
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): view._format_present("codex", rows, state)
+        displayed = output.getvalue()
+        self.assertEqual(displayed.count("echo hi"), 1)
+        self.assertEqual(displayed.count("still running"), 1)
+        self.assertEqual(displayed.count("said once"), 1)
+        self.assertIn("hi", displayed)
+        for typ in ("dispatch.supervisor.turn-started", "supervisor.turn.started",
+                    "dispatch.supervisor.session-announced", "dispatch.supervisor.parked",
+                    "dispatch.supervisor.resumed", "dispatch.supervisor.join", "dispatch.supervisor.terminal",
+                    "dispatch.supervisor.future-event"):
+            result = view.format_record("codex", {"type": typ, "private":"payload"})
+            self.assertEqual(len(result), 1)
+            self.assertNotIn("payload", result[0].text)
+            self.assertEqual(result[0].kind, "supervisor")
+        self.assertEqual(view.format_record("codex", {"type":"dispatch.supervisor.token_usage", "x":1}), [])
+        for content in ("user prompt", [{"type":"text", "text":"user prompt"}]):
+            self.assertTrue(any(row.kind == "prompt" for row in view.format_record(
+                "claude", {"type":"user", "message":{"content":content}})))
+
+    def test_public_read_new_reuses_cursor_incrementally(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "att.log"
+            path.write_text('{"type":"first"}\n')
+            source, cursor = view.Source(path, "codex"), view.Cursor(path)
+            first, cursor = view.read_new(source, cursor)
+            self.assertEqual(first, ['{"type":"first"}'])
+            with path.open("a") as stream: stream.write('{"type":"second"}\n')
+            second, cursor = view.read_new(source, cursor)
+            self.assertEqual(second, ['{"type":"second"}'])
+
+    def test_registry_reader_substring_filters_and_throttles_changed_snapshot(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "jobs.log"
+            path.write_text("attempt_id=one\nattempt_id=two\n")
+            reader = view.RegistryReader(path)
+            self.assertEqual(reader.read("two", now=2), ["attempt_id=two"])
+            path.write_text("attempt_id=one\nattempt_id=two\nattempt_id=three\n")
+            # A detected change inside the one-second budget keeps the last snapshot.
+            self.assertEqual(reader.read("three", now=2.5), [])
+            self.assertEqual(reader.read("three", now=3.1), ["attempt_id=three"])
+
+    def test_registry_cli_selection_validation_and_read_only(self):
+        import tempfile, contextlib, io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dispatch"
+            logs = root / "logs"; logs.mkdir(parents=True)
+            attempt = "att-sample"
+            log = logs / f"x.{attempt}.codex.jsonl"
+            log.write_text('{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"hello"}}\n')
+            registry = root / "jobs.log"
+            def row(identifier, path, status="done", extra=""):
+                return f"2026\t{status}\trepo\t/tmp\towner\tattempt_id={identifier},harness=codex,worker_type=owner,log_file={path}{extra}\n"
+            registry.write_text(row(attempt, log))
+            with mock.patch.object(view, "_dispatch_roots", return_value=(root,)):
+                snapshot = {str(p.relative_to(folder)): p.read_bytes() for p in Path(folder).rglob("*") if p.is_file()}
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out): self.assertEqual(view.main([attempt]), 0)
+                self.assertIn("hello", out.getvalue())
+                self.assertEqual(snapshot, {str(p.relative_to(folder)): p.read_bytes() for p in Path(folder).rglob("*") if p.is_file()})
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err): self.assertEqual(view.main(["att-absent"]), 2)
+                self.assertIn("Unknown attempt", err.getvalue())
+                # Exact path carrying a registered attempt ID but different cwd/path is refused.
+                mismatched = Path(folder) / f"other.att-{attempt}.codex.jsonl"
+                mismatched.write_text("{}\n")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err): self.assertEqual(view.main([str(mismatched)]), 2)
+                self.assertIn("does not match", err.getvalue())
+                registry.write_text(row("att-sample-one", log) + row("att-sample-two", log))
+                view._REGISTRY_READERS.clear()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err): self.assertEqual(view.main(["att-sample"]), 2)
+                self.assertIn("Ambiguous", err.getvalue())
+                registry.write_text(row(attempt, log))
+                view._REGISTRY_READERS.clear()
+                # Exact registry-bound log path is accepted; a same-name symlink elsewhere is refused.
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out): self.assertEqual(view.main([str(log)]), 0)
+                outside = Path(folder) / log.name; outside.symlink_to(log)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err): self.assertEqual(view.main([str(outside)]), 2)
+                self.assertIn("does not match", err.getvalue())
+
+    def test_cleaned_native_source_leaves_supervisor_record_notice(self):
+        import tempfile, contextlib, io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dispatch"; logs = root / "logs"; logs.mkdir(parents=True)
+            attempt = "att-cleaned"
+            log = logs / f"x.{attempt}.claude.jsonl"
+            log.write_text(json.dumps({"type":"dispatch.supervisor.session-announced", "session_id":"sid"})+"\n")
+            (root / "jobs.log").write_text(
+                f"2026\tdone\trepo\t/tmp\towner\tattempt_id={attempt},harness=claude,worker_type=owner,log_file={log}\n")
+            output = io.StringIO()
+            with mock.patch.object(view, "_dispatch_roots", return_value=(root,)), contextlib.redirect_stdout(output):
+                self.assertEqual(view.main([attempt]), 0)
+            self.assertIn("감독 기록만 남음", output.getvalue())
+
+    def test_announced_source_deduplicates_sid_and_resolves_multiple_sessions(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); log = root / "owner.jsonl"
+            log.write_text("\n".join(json.dumps({"type":"dispatch.supervisor.session-announced",
+                "parent_attempt_id":"att-owner", "session_id":sid, "cwd":"/work"})
+                for sid in ("sid-one", "sid-one", "sid-two")) + "\n")
+            self.assertEqual(view._announced(str(log), "att-owner"),
+                             [("sid-one", "/work"), ("sid-two", "/work")])
+            paths = {sid: root / f"{sid}.jsonl" for sid in ("sid-one", "sid-two")}
+            for path in paths.values(): path.touch()
+            row = (root, ["2026", "done", "repo", "/work", "owner", ""],
+                   {"attempt_id":"att-owner", "harness":"claude", "log_file":str(log),
+                    "runtime_home":str(root), "cwd":"/work"})
+            with mock.patch.object(view, "_find_attempt", return_value=row), \
+                 mock.patch.object(view, "_log_path", return_value=str(log)), \
+                 mock.patch("claude_project_dir.resolve_session_transcript",
+                            side_effect=lambda sid, cwd, **kw: (paths[sid], None)) as resolver:
+                sources, error = view.resolve_sources("att-owner")
+            self.assertIsNone(error)
+            self.assertEqual([s.session_id for s in sources[1:]], ["sid-one", "sid-two"])
+            self.assertTrue(all(call.kwargs["expected_cwd"] == "/work" for call in resolver.call_args_list))
+
+    def test_follow_owner_lines_children_final_drain_and_single_end_marker(self):
+        import tempfile, contextlib, io, time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dispatch"; logs = root / "logs"; logs.mkdir(parents=True)
+            owner_id, child_id = "att-owner", "att-child"
+            owner = logs / f"x.{owner_id}.codex.jsonl"
+            child = logs / f"x.{child_id}.codex.jsonl"
+            owner.write_text('{"type":"session-start"}\n')
+            child.write_text('{"type":"item.completed","item":{"id":"c","type":"agent_message","text":"child tail"}}\n')
+            registry = root / "jobs.log"
+            def line(attempt, status, path, extra=""):
+                return f"2026\t{status}\trepo\t/tmp\towner\tattempt_id={attempt},harness=codex,worker_type={'owner' if attempt == owner_id else 'stage'},log_file={path}{extra}\n"
+            def save(status):
+                registry.write_text(line(owner_id, status, owner) +
+                    line(child_id, "done", child, f",parent_attempt_id={owner_id},route_node=execute"))
+            save("open")
+            sleeps = []
+            def tick(_):
+                if sleeps: return
+                sleeps.append(1)
+                with owner.open("a") as stream:
+                    stream.write(json.dumps({"type":"item.completed", "item":{"id":"m","type":"agent_message","text":"owner follow line"}})+"\n")
+                    stream.write('{"type":"result","subtype":"success"}\n')
+                save("done")
+                time.sleep(1.01) # permit the changed registry snapshot's one-second refresh budget
+            output = io.StringIO()
+            with mock.patch.object(view, "_dispatch_roots", return_value=(root,)), \
+                 contextlib.redirect_stdout(output):
+                result = view.main([owner_id, "--follow", "--poll-interval", "0"] , clock=lambda:0, sleep=tick)
+            text = output.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("owner follow line", text)
+            self.assertIn("[execute]", text)
+            self.assertIn("child tail", text)
+            self.assertEqual(text.count("[끝]"), 1)
+            self.assertNotIn("종료 기록 없음", text)
+
+    def test_follow_grace_marks_missing_terminal_but_turn_completed_is_not_terminal(self):
+        import tempfile, contextlib, io, time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dispatch"; logs = root / "logs"; logs.mkdir(parents=True)
+            attempt = "att-grace"
+            owner = logs / f"x.{attempt}.codex.jsonl"
+            owner.write_text('{"type":"turn.completed"}\n')
+            registry = root / "jobs.log"
+            def save(status):
+                registry.write_text(f"2026\t{status}\trepo\t/tmp\towner\tattempt_id={attempt},harness=codex,worker_type=owner,log_file={owner}\n")
+            save("open")
+            elapsed, closed = [0.0], [False]
+            def tick(_):
+                if not closed[0]:
+                    save("done"); closed[0] = True
+                elapsed[0] += 1.1
+                time.sleep(1.01)
+            output = io.StringIO()
+            with mock.patch.object(view, "_dispatch_roots", return_value=(root,)), contextlib.redirect_stdout(output):
+                self.assertEqual(view.main([attempt, "--follow", "--grace", "1", "--poll-interval", "0"],
+                                           clock=lambda:elapsed[0], sleep=tick), 0)
+            self.assertEqual(output.getvalue().count("[끝]"), 1)
+            self.assertIn("종료 기록 없음", output.getvalue())
+
+    def test_supervisor_unknown_inventory_counts_type_names(self):
+        types = Counter()
+        for name in ("dispatch.supervisor.future-a", "dispatch.supervisor.future-a",
+                     "dispatch.supervisor.future-b"):
+            lines = view.format_record("codex", {"type":name, "payload":"hidden from short line"})
+            types[name] += len(lines)
+        self.assertEqual(types.most_common(1), [("dispatch.supervisor.future-a", 2)])
+
 
 @unittest.skipUnless(os.environ.get("HEARTING_ATTEMPT_VIEW_LOCAL") == "1",
                      "set HEARTING_ATTEMPT_VIEW_LOCAL=1 for local log checks")
@@ -169,6 +375,7 @@ class LocalSamples(unittest.TestCase):
                     admitted=view._log_path(root,fields,meta)
                     if admitted: files.add(Path(admitted).resolve())
         total=non_json=unknown=formatter_errors=unsafe=0
+        unknown_types=Counter()
         unreadable=[]
         for index,path in enumerate(sorted(files),1):
             if index == 1 or index % 100 == 0:
@@ -194,7 +401,10 @@ class LocalSamples(unittest.TestCase):
                                 if reasons:
                                     unsafe+=len(reasons)
                                     print(f"sanitizer: {','.join(reasons)}: {path}:{number}")
-                                if line.kind == "unknown": unknown+=1
+                                if line.kind == "unknown":
+                                    unknown+=1
+                                    name = (record.get("type") or record.get("kind") or record.get("method") or "unknown") if isinstance(record, dict) else "non-object"
+                                    unknown_types[str(name)] += 1
                         except Exception:
                             formatter_errors+=1
                             print(f"formatter: exception: {path}:{number}")
@@ -203,6 +413,7 @@ class LocalSamples(unittest.TestCase):
                 print(f"unreadable: disappeared or unreadable path: {path}:1")
         print(f"LocalSamples files={len(files)} lines={total} non_json={non_json} unknown={unknown} "
               f"unreadable={len(unreadable)} formatter_exceptions={formatter_errors} sanitizer_findings={unsafe}")
+        print("LocalSamples top_unknown=" + ", ".join(f"{name}:{count}" for name, count in unknown_types.most_common(10)))
         self.assertGreater(len(files), 0)
         self.assertEqual(formatter_errors, 0)
         self.assertEqual(unsafe, 0)

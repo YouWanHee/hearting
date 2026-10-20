@@ -16,6 +16,7 @@ import re
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 
@@ -41,6 +42,7 @@ class Cursor:
         self.identity = None
         self.head = b""
         self.notices: list[str] = []
+        self.reader_state = {"cursor": 0, "refresh": [], "rows": {}, "entities": {}}
 
     def read_new(self, *, final: bool = False) -> list[str]:
         try:
@@ -69,6 +71,40 @@ class Cursor:
             rows.append(self.pending.decode("utf-8", "replace"))
             self.pending = b""
         return rows
+
+
+@dataclass
+class RegistryReader:
+    """One in-memory snapshot per registry, refreshed on change and at most 1/s."""
+    path: Path
+    lines: list[str] = field(default_factory=list)
+    stamp: tuple[int, int] | None = None
+    checked: float = 0.0
+
+    def read(self, contains: str | None = None, *, now=None, force=False):
+        now = time.monotonic() if now is None else now
+        try:
+            stat = self.path.stat()
+            stamp = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return []
+        if force or self.stamp != stamp and now - self.checked >= 1 or self.stamp is None:
+            try:
+                self.lines = self.path.read_text(errors="replace").splitlines()
+                self.stamp = stamp
+                self.checked = now
+            except OSError:
+                return []
+        return [line for line in self.lines if contains is None or contains in line]
+
+
+_REGISTRY_READERS: dict[str, RegistryReader] = {}
+
+
+def _registry_rows(root, contains=None, *, force=False):
+    path = (Path(root) / "jobs.log").resolve()
+    reader = _REGISTRY_READERS.setdefault(str(path), RegistryReader(path))
+    return reader.read(contains, force=force)
 
 
 _URL_AUTH = re.compile(r"(https?://)[^\s/@]+:[^\s/@]+@", re.I)
@@ -127,7 +163,16 @@ def _compact(value: object) -> str:
 
 
 _HIDDEN_TYPES = {"token_usage", "thinking_tokens", "tool_progress", "api-request-blob",
-                 "cost-state", "queue-operation"}
+                 "cost-state", "queue-operation", "dispatch.supervisor.token_usage",
+                 "supervisor.token_usage"}
+
+
+def _supervisor_type(kind):
+    if kind.startswith("dispatch.supervisor."):
+        kind = kind[len("dispatch.supervisor."):]
+    elif kind.startswith("supervisor."):
+        kind = kind[len("supervisor."):]
+    return kind.replace("-", ".")
 
 
 def format_record(harness: str, record: object) -> list[Line]:
@@ -140,8 +185,14 @@ def format_record(harness: str, record: object) -> list[Line]:
     if not isinstance(record, dict):
         return [Line("raw", sanitize(_compact(record)))]
     kind = str(record.get("type") or record.get("kind") or record.get("method") or "unknown")
-    if kind in _HIDDEN_TYPES:
+    if kind in _HIDDEN_TYPES or _supervisor_type(kind) == "token.usage":
         return []
+    if kind.startswith(("dispatch.supervisor.", "supervisor.")):
+        event = _supervisor_type(kind)
+        known = {"turn.started", "turn.completed", "session", "session.announced", "parked", "resumed",
+                 "join", "terminal"}
+        label = event if event in known else f"event {event}"
+        return [Line("supervisor", sanitize(f"supervisor: {label}"))]
     result: list[Line] = []
     def add(label, value, category):
         if value is not None and value != "":
@@ -155,7 +206,7 @@ def format_record(harness: str, record: object) -> list[Line]:
         if kind in ("assistant", "user") or record.get("message"):
             content = message.get("content")
             if isinstance(content, str):
-                add("assistant" if kind == "assistant" else "user", content, "message")
+                add("assistant" if kind == "assistant" else "user", content, "message" if kind == "assistant" else "prompt")
             elif isinstance(content, list):
                 for part in content:
                     if not isinstance(part, dict):
@@ -204,17 +255,22 @@ def owned_attempt_log_path(job, *, fallback_home=None):
     registry_path = getattr(job, "_registry_path", None)
     if registry_path:
         registry_dir = os.path.dirname(os.path.realpath(registry_path))
+        # Registry sibling logs are the canonical local dispatch log owner.
         roots.append(os.path.join(registry_dir, "logs"))
         if os.path.basename(registry_dir) == "dispatch":
+            # Installed registries live under <home>/.dispatch; their log sibling is shared.
             roots.append(os.path.join(os.path.dirname(registry_dir), ".dispatch", "logs"))
     artifact_root = getattr(job, "artifact_root", None)
     if artifact_root:
         ar = os.path.realpath(artifact_root)
         roots.extend((ar, os.path.join(os.path.dirname(ar), ".dispatch", "logs")))
+        # Managed gateway artifacts are nested below the canonical .dispatch/logs root.
     launch_home = getattr(job, "_launch_home", None)
     if launch_home:
+        # SD-49 seals launch_home for isolated worker dispatches.
         roots.append(os.path.join(os.path.realpath(launch_home), ".dispatch", "logs"))
     if not roots and fallback_home:
+        # Legacy fallback applies only to rows with no owning root.
         roots.append(os.path.realpath(os.path.join(fallback_home, ".dispatch", "logs")))
     if not any(_within(root, path) for root in roots):
         return None
@@ -226,7 +282,7 @@ def owned_attempt_log_path(job, *, fallback_home=None):
 
 def _within(root, path):
     try:
-        return os.path.commonpath((os.path.realpath(root), path)) == os.path.realpath(root)
+        return os.path.commonpath((root, path)) == root
     except (TypeError, ValueError):
         return False
 
@@ -253,8 +309,7 @@ def _find_attempt(attempt):
     prefix_matches=[]
     for root in _dispatch_roots():
         jobs = root / "jobs.log"
-        try: lines = jobs.read_text(errors="replace").splitlines()
-        except OSError: continue
+        lines = _registry_rows(root, attempt)
         rows = [_metadata(line) for line in lines]
         matches = [(f, m) for item in rows if item and (f := item[0]) and (m := item[1])
                    if m.get("attempt_id") == attempt]
@@ -272,8 +327,7 @@ def _find_attempt(attempt):
 def _attempt_prefix_matches(attempt):
     found = {}
     for root in _dispatch_roots():
-        try: rows = (root / "jobs.log").read_text(errors="replace").splitlines()
-        except OSError: continue
+        rows = _registry_rows(root, attempt)
         for raw in rows:
             parsed = _metadata(raw)
             if parsed and parsed[1].get("attempt_id", "").startswith(attempt):
@@ -285,8 +339,8 @@ def _attempt_prefix_matches(attempt):
 def _owner_candidates(parent_sid=None):
     latest={}
     for root in _dispatch_roots():
-        try: rows=(root / "jobs.log").read_text(errors="replace").splitlines()
-        except OSError: continue
+        rows=_registry_rows(root, '"worker_type":"owner"')
+        if not rows: rows=_registry_rows(root, "worker_type=owner")
         for raw in rows:
             parsed=_metadata(raw)
             if not parsed: continue
@@ -301,7 +355,7 @@ def _owner_candidates(parent_sid=None):
 def _log_path(root, fields, meta):
     raw = meta.get("log_file") or meta.get("log")
     attempt = meta.get("attempt_id")
-    harness = meta.get("harness") or fields[2]
+    harness = meta.get("harness")
     if not raw: return None
     class Job: pass
     job = Job(); job._log_file = raw; job.attempt_id = attempt; job.harness = harness
@@ -336,12 +390,13 @@ def resolve_sources(attempt: str) -> tuple[list[Source], str | None]:
     root, fields, meta = found
     log = _log_path(root, fields, meta)
     if not log: return [], "attempt log is missing or outside its allowed directory"
-    harness = meta.get("harness") or fields[2]
+    harness = meta.get("harness")
     sources = [Source(Path(log), harness, "log")]
     sid_list = _announced(log, attempt)
     runtime_home = meta.get("runtime_home") or meta.get("worker_home")
+    opencode_runtime_dir = meta.get("opencode_runtime_dir") or meta.get("runtime_dir")
     cwd = meta.get("cwd") or fields[3]
-    if runtime_home:
+    if runtime_home or opencode_runtime_dir:
         for sid, event_cwd in sid_list:
             if harness == "claude":
                 from claude_project_dir import resolve_session_transcript
@@ -349,8 +404,10 @@ def resolve_sources(attempt: str) -> tuple[list[Source], str | None]:
                                                            expected_cwd=cwd, runtime_home=runtime_home)
                 if transcript: sources.append(Source(transcript, harness, "claude", sid))
             elif harness == "opencode":
-                db = Path(runtime_home) / "runtime" / "data" / "opencode" / "opencode.db"
-                if not db.is_file(): db = Path(runtime_home) / "data" / "opencode" / "opencode.db"
+                from opencode_runtime import opencode_db_path
+                if not opencode_runtime_dir:
+                    continue
+                db = opencode_db_path({"OPENCODE_DATA_DIR": str(Path(opencode_runtime_dir) / "data" / "opencode")})
                 if db.is_file(): sources.append(Source(db, harness, "opencode-db", sid))
     return sources, None
 
@@ -359,8 +416,7 @@ def _registry_sources_for_path(path: Path):
     target = path.resolve()
     matches = []
     for root in _dispatch_roots():
-        try: rows = (root / "jobs.log").read_text(errors="replace").splitlines()
-        except OSError: continue
+        rows = _registry_rows(root, path.name)
         for raw in rows:
             parsed = _metadata(raw)
             if not parsed: continue
@@ -374,8 +430,7 @@ def _registry_sources_for_path(path: Path):
 def _find_children(parent_attempt):
     children=[]
     for root in _dispatch_roots():
-        try: rows=(root / "jobs.log").read_text(errors="replace").splitlines()
-        except OSError: continue
+        rows=_registry_rows(root, parent_attempt)
         for raw in rows:
             parsed=_metadata(raw)
             if not parsed: continue
@@ -385,7 +440,7 @@ def _find_children(parent_attempt):
             path=_log_path(root, fields, meta)
             if path:
                 node=meta.get("route_node") or fields[4] or "stage"
-                children.append((attempt, Source(Path(path), meta.get("harness") or fields[2], "log", None, node)))
+                children.append((attempt, Source(Path(path), meta.get("harness"), "log", None, node)))
         if children: break
     return children
 
@@ -438,19 +493,13 @@ def _sqlite_records(path: Path, sid: str):
             yield {"type": "unknown", "part": data}
 
 
-def read_new(source: Source, *, final=True) -> list[Line]:
+def read_new(source: Source, cursor: Cursor) -> tuple[list[object], Cursor]:
     if source.kind == "opencode-db":
-        lines=[]
         try:
-            for record in _sqlite_records(source.path, source.session_id or ""):
-                lines.extend(format_record("opencode", record))
-        except Exception as exc: return [Line("notice", sanitize(f"source unavailable: {exc}"))]
-        return lines
-    cursor=Cursor(source.path)
-    output=[]
-    for raw in cursor.read_new(final=final):
-        for line in format_record(source.harness, raw): output.append(line)
-    return output
+            return _follow_db(source, cursor.reader_state), cursor
+        except Exception as exc:
+            return [Line("notice", sanitize(f"source unavailable: {exc}"))], cursor
+    return cursor.read_new(), cursor
 
 
 def _follow_db(source, state):
@@ -535,6 +584,41 @@ def _present(lines, full=False):
         for chunk in chunks: print(sanitize(chunk))
 
 
+def _format_present(harness, raw_rows, state, full=False, prefix=""):
+    """Stateful Codex event presentation, preserving live command starts."""
+    lines = []
+    state.setdefault("started", set())
+    state.setdefault("messages", set())
+    for raw in raw_rows:
+        if isinstance(raw, Line):
+            lines.append(raw); continue
+        try:
+            record = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            lines.extend(format_record(harness, raw)); continue
+        if harness == "codex" and isinstance(record, dict):
+            event = str(record.get("type", ""))
+            item = record.get("item") if isinstance(record.get("item"), dict) else record
+            ident = item.get("id") or record.get("id")
+            item_type = str(item.get("type", ""))
+            if item_type in ("command_execution", "commandExecution"):
+                if event.endswith("started"):
+                    if ident is not None: state["started"].add(ident)
+                    lines.extend(format_record(harness, item)); continue
+                if event.endswith("completed"):
+                    subset = {k: v for k, v in item.items()
+                              if k in ("aggregated_output", "aggregatedOutput", "output", "exit_code", "exitCode")}
+                    if subset: lines.extend(format_record(harness, {"type": item_type, **subset}))
+                    elif ident not in state["started"]: lines.extend(format_record(harness, item))
+                    continue
+            if item_type in ("agent_message", "user_message", "userMessage"):
+                if ident is not None and ident in state["messages"]: continue
+                if ident is not None: state["messages"].add(ident)
+                lines.extend(format_record(harness, item)); continue
+        lines.extend(format_record(harness, record))
+    _present([Line(line.kind, prefix + line.text) for line in lines], full)
+
+
 def main(argv=None, *, clock=None, sleep=None) -> int:
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
@@ -548,6 +632,8 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
     args=parser.parse_args(argv)
     log_only = False
     if args.attempt and os.path.isfile(args.attempt):
+        if Path(args.attempt).is_symlink():
+            print("Log path symlink does not match its registry-bound source.", file=sys.stderr); return 2
         path = Path(args.attempt).resolve()
         matches = _registry_sources_for_path(path)
         if len(matches) == 1:
@@ -558,8 +644,12 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
             bind = re.search(r"\.att-([A-Za-z0-9_-]+)(?:\.|$)", path.name)
             if not bind:
                 print("Log path must contain a registry-bound .att-<attempt> filename.", file=sys.stderr); return 2
-            attempts = _attempt_prefix_matches(bind.group(1))
-            exact = [item for item in attempts if item[2].get("attempt_id") == bind.group(1)]
+            bound = bind.group(1)
+            attempts = _attempt_prefix_matches(bound)
+            if bound and not bound.startswith("att-"):
+                attempts.extend(_attempt_prefix_matches("att-" + bound))
+            attempts = list({item[2].get("attempt_id"): item for item in attempts}.values())
+            exact = [item for item in attempts if item[2].get("attempt_id") in (bound, "att-" + bound)]
             if len(exact) == 1:
                 expected = _log_path(*exact[0])
                 if not expected or Path(expected).resolve() != path:
@@ -582,7 +672,7 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
         else:
             if not candidates: print("No owner attempts found.")
             for _root,fields,meta in candidates:
-                print(sanitize(f"{meta.get('attempt_id','')}  {meta.get('harness',fields[2])}  {fields[1]}  {fields[4]}"))
+                print(sanitize(f"{meta.get('attempt_id','')}  {meta.get('harness','unknown')}  {fields[1]}  {fields[4]}"))
             return 0
     if not log_only and not os.path.isfile(args.attempt):
         matches = _attempt_prefix_matches(args.attempt)
@@ -602,8 +692,6 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
         print(sanitize(error), file=sys.stderr); return 2
     cursors = {}
     owner_log_rows = []
-    db_states = {source: {"cursor": 0, "refresh": [], "rows": {}}
-                 for source in sources if source.kind == "opencode-db"}
     with ExitStack() as stack:
         for source in sources:
             if source.kind != "log":
@@ -625,41 +713,70 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
                     continue
             cursors[source] = Cursor(source.path)
             if source.kind == "opencode-db":
-                _present(_follow_db(source, db_states[source]), args.full)
+                fresh, cursors[source] = read_new(source, cursors[source])
+                _present(fresh, args.full)
             else:
-                initial_rows = cursors[source].read_new(final=True)
+                initial_rows, cursors[source] = read_new(source, cursors[source])
                 if source == sources[0]: owner_log_rows = initial_rows
-                _present([line for raw in initial_rows
-                          for line in format_record(source.harness, raw)], args.full)
+                if "present_state" not in locals(): present_state = {"started": set(), "messages": set()}
+                _format_present(source.harness, initial_rows, present_state, args.full)
         if len(sources) == 1 and any("supervisor.session" in raw for raw in owner_log_rows):
             print("감독 기록만 남음")
         if args.follow and not log_only:
             seen_children=set()
             terminal_seen=False
             closed_since=None
+            present_state = locals().get("present_state", {"started": set(), "messages": set()})
             while True:
                 owner_cursor = cursors.get(sources[0])
-                for raw in owner_cursor.read_new() if owner_cursor else []:
+                owner_rows = []
+                if owner_cursor:
+                    owner_rows, owner_cursor = read_new(sources[0], owner_cursor)
+                    cursors[sources[0]] = owner_cursor
+                for raw in owner_rows:
                     try: kind=json.loads(raw).get("type")
                     except Exception: kind=None
-                    terminal_seen = terminal_seen or kind in ("result", "dispatch.supervisor.terminal", "turn.completed")
+                    terminal_seen = terminal_seen or kind == "result" or _supervisor_type(str(kind or "")) == "terminal"
                 for child_id, child in _find_children(args.attempt):
                     if child_id in seen_children: continue
                     seen_children.add(child_id); cursors[child]=Cursor(child.path)
                     print(f"[{sanitize(child.label)}] ── 시작 ({sanitize(child.harness)}) ──")
-                for source, cursor in cursors.items():
+                for source, cursor in list(cursors.items()):
                     prefix = f"[{source.label}] " if source.label else ""
-                    fresh = _follow_db(source, db_states[source]) if source.kind == "opencode-db" else [
-                        line for raw in cursor.read_new() for line in format_record(source.harness, raw)]
+                    if source.kind == "opencode-db":
+                        fresh, cursor = read_new(source, cursor)
+                        cursors[source] = cursor
+                        _present([Line(line.kind, prefix + line.text) for line in fresh], args.full)
+                        continue
+                    if source == sources[0]:
+                        fresh = owner_rows
+                    else:
+                        fresh, cursor = read_new(source, cursor)
+                        cursors[source] = cursor
                     for notice in cursor.notices:
                         fresh.insert(0, Line("notice", notice))
                     cursor.notices.clear()
-                    _present([Line(line.kind, prefix + line.text) for line in fresh], args.full)
+                    _format_present(source.harness, fresh, present_state, args.full, prefix=prefix)
                 current=_find_attempt(args.attempt)
                 status=current[1][1] if current else "unknown"
                 if status not in ("open", "running"):
                     if closed_since is None: closed_since=clock()
                     if terminal_seen or clock()-closed_since >= args.grace:
+                        # Drain every source after closure so the last write is visible.
+                        for source, cursor in list(cursors.items()):
+                            if source.kind == "opencode-db":
+                                drain, cursor = read_new(source, cursor)
+                                cursors[source] = cursor
+                                _present(drain, args.full)
+                            else:
+                                drain, cursor = read_new(source, cursor)
+                                cursors[source] = cursor
+                                for raw in drain:
+                                    try: kind=json.loads(raw).get("type")
+                                    except Exception: kind=None
+                                    terminal_seen = terminal_seen or kind == "result" or _supervisor_type(str(kind or "")) == "terminal"
+                                _format_present(source.harness, drain, present_state, args.full,
+                                                prefix=f"[{source.label}] " if source.label else "")
                         failure=current[2].get("failure_class", "없음") if current else "없음"
                         ending=f"[끝] {status} failure_class={failure}"
                         if not terminal_seen: ending += " 종료 기록 없음"
