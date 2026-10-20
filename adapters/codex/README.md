@@ -465,12 +465,14 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Fleet background shell rows
 
-Fleet reads only exact Codex rollout call/output envelopes for supported shell
-calls. `exec_command`/`write_stdin` continuation handles remain native handles,
-never PIDs; polling output is sampled and cannot establish continuous quiet or
-process exit by itself. If the rollout does not expose a safe command/handle
-pair, Fleet keeps the task unattributed or unknown. See the [Codex shell command
-guide](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide#shell_command).
+Fleet uses exact native Codex App Server `command_execution` items and
+structured direct `exec_command`/`write_stdin` results. Continuation handles
+remain native handles, never PIDs; polling output is sampled and cannot
+establish continuous quiet or process exit by itself. JSON-looking text from an
+outer `functions.exec`/`functions.write_stdin` result is arbitrary stdout and
+cannot create or complete a job. When the native result or its provenance is
+unavailable, Fleet reports partial coverage and leaves the task unobserved.
+See the [Codex shell command guide](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide#shell_command).
 
 ## Runtime compaction tidy
 

@@ -5,6 +5,7 @@ keeps those lifecycle facts separate from targeted process and output evidence.
 """
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -12,12 +13,14 @@ import re
 import stat
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 
 MAX_COMMAND = 120
 MAX_READ_PER_TICK = 64 * 1024
 MAX_PARTIAL_JSON_LINE = 1024 * 1024
 MAX_RETAINED_TASKS = 1024
+MAX_PENDING_CALLS = 512
 _JSONL_LIMIT = 4096
 _STREAMS = OrderedDict()
 _OUTPUTS = OrderedDict()
@@ -25,6 +28,15 @@ _VERIFIED_PROCESSES = OrderedDict()
 _TASKS = OrderedDict()
 _SECRET = re.compile(r"""(?i)(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\b\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)""")
 _SECRET_FLAG = re.compile(r"""(?i)(--?(?:password|passwd|token|secret|api[-_]?key|authorization)(?:=|\s+))(?:"[^"]*"|'[^']*'|[^\s,;]+)""")
+
+
+@dataclass(frozen=True)
+class ProcObservation:
+    """One typed /proc read; missing and inaccessible are different facts."""
+
+    state: str
+    value: object = None
+    reason: str | None = None
 
 
 def valid_epoch(value, *, milliseconds=False):
@@ -178,12 +190,22 @@ def source_status(path, cache_key):
                 "coverage": "partial", "offset": cursor.get("offset", 0),
                 "size": st.st_size, "source": os.path.abspath(path)}
     task_state = _TASKS.get(cache_key)
+    if isinstance(task_state, dict) and task_state.get("coverage_reasons"):
+        reasons = list(task_state["coverage_reasons"])
+        return {"state": "partial", "reason": reasons[0] if len(reasons) == 1
+                else "multiple-observation-gaps", "reasons": reasons,
+                "coverage": "partial", "offset": cursor.get("offset", 0),
+                "size": st.st_size, "source": os.path.abspath(path)}
     if isinstance(task_state, dict) and task_state.get("overflow"):
         return {"state": "partial", "reason": "task-retention-limit",
                 "coverage": "partial", "offset": cursor.get("offset", 0),
                 "size": st.st_size, "source": os.path.abspath(path)}
     offset = cursor.get("offset", 0)
     complete = offset >= st.st_size and not cursor.get("carry")
+    if complete and isinstance(task_state, dict) and task_state.get("calls"):
+        return {"state": "partial", "reason": "native-call-result-pending",
+                "coverage": "partial", "offset": offset, "size": st.st_size,
+                "source": os.path.abspath(path)}
     return {"state": "observed" if complete else "catching-up",
             "reason": None if complete else "bounded-source-scan-in-progress",
             "coverage": "complete" if complete else "partial",
@@ -221,12 +243,34 @@ def _row_time(row):
 def _task_cache(cache_key):
     state = _TASKS.get(cache_key)
     if not isinstance(state, dict):
-        state = {"calls": {}, "jobs": {}, "handles": {}}
+        state = {"calls": OrderedDict(), "jobs": {}, "handles": {},
+                 "coverage_reasons": OrderedDict()}
+    if not isinstance(state.get("calls"), OrderedDict):
+        state["calls"] = OrderedDict(state.get("calls") or {})
+    if not isinstance(state.get("coverage_reasons"), OrderedDict):
+        state["coverage_reasons"] = OrderedDict(
+            (reason, None) for reason in (state.get("coverage_reasons") or ()))
     _TASKS[cache_key] = state
     _TASKS.move_to_end(cache_key)
     while len(_TASKS) > _JSONL_LIMIT:
         _TASKS.popitem(last=False)
     return state
+
+
+def _mark_partial(state, reason):
+    reasons = state.setdefault("coverage_reasons", OrderedDict())
+    reasons.setdefault(reason, None)
+    while len(reasons) > 8:
+        reasons.popitem(last=False)
+
+
+def _remember_call(state, call_id, call):
+    calls = state["calls"]
+    calls.pop(call_id, None)
+    calls[call_id] = call
+    while len(calls) > MAX_PENDING_CALLS:
+        calls.popitem(last=False)
+        _mark_partial(state, "pending-call-correlation-limit")
 
 
 def _store_task(state, key, item):
@@ -281,6 +325,7 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
             state["overflow"] = state.get("overflow", False) or len(retired) > 256
             state["retired_jobs"] = retired[-256:]
         state["calls"].clear()
+        state["coverage_reasons"].clear()
         state["jobs"].clear()
     for row in delta.get("lines", ()):
         declared_sid = row.get("session_id") or row.get("sessionId")
@@ -298,14 +343,14 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                     call_id = part.get("id")
                     inputs = part.get("input") if isinstance(part.get("input"), dict) else {}
                     if isinstance(call_id, str) and call_id:
-                        state["calls"][call_id] = {
+                        _remember_call(state, call_id, {
                             "command": command_summary(inputs.get("command")),
                             "started_at": stamp,
                             "run_in_background": inputs.get("run_in_background") is True,
-                        }
+                        })
                 elif row_type == "user" and part.get("type") == "tool_result":
                     call_id = part.get("tool_use_id")
-                    call = state["calls"].get(call_id)
+                    call = state["calls"].pop(call_id, None)
                     if not isinstance(call, dict):
                         continue
                     task_id, output_path = _claude_task_ack(
@@ -363,24 +408,13 @@ def _json_object(value):
 
 
 def _codex_output_objects(value):
-    result = []
-    if isinstance(value, dict):
-        result.append(value)
-    elif isinstance(value, str):
-        parsed = _json_object(value)
-        if parsed is not None:
-            result.append(parsed)
-    elif isinstance(value, list):
-        for part in value:
-            if isinstance(part, dict):
-                candidate = _json_object(part.get("text"))
-                if candidate is not None:
-                    result.append(candidate)
-    return result
+    # Only a structured native result object carries tool metadata provenance.
+    # Text and input_text blocks may be arbitrary command/script stdout.
+    return [value] if isinstance(value, dict) else []
 
 
 def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
-    """Project exact exec_command/write_stdin lifecycle envelopes from a Codex rollout."""
+    """Project native command_execution events and structured direct Codex results."""
     source_key = ("codex", os.path.abspath(path), session_id, attempt_id)
     state = _task_cache(source_key)
     delta = jsonl_delta(path, source_key)
@@ -397,9 +431,62 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
             state["overflow"] = state.get("overflow", False) or len(retired) > 256
             state["retired_jobs"] = retired[-256:]
         state["calls"].clear()
+        state["coverage_reasons"].clear()
         state["jobs"].clear()
         state["handles"].clear()
     for row in delta.get("lines", ()):
+        event = _codex_payload(row)
+        event_type = event.get("type") if isinstance(event, dict) else None
+        item = event.get("item") if isinstance(event, dict) else None
+        if (event_type in {"item.started", "item.completed"}
+                and isinstance(item, dict) and item.get("type") == "command_execution"):
+            declared_sid = (row.get("thread_id") or row.get("session_id")
+                            or event.get("thread_id") or event.get("session_id"))
+            if isinstance(declared_sid, str) and declared_sid != session_id:
+                continue
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                _mark_partial(state, "native-command-event-missing-item-id")
+                continue
+            stamp = _row_time(row) or _row_time(event)
+            job_key = "item:" + item_id
+            prior = state["jobs"].get(job_key, {})
+            completed = event_type == "item.completed"
+            output_seen = isinstance(item.get("aggregated_output"), str) and bool(
+                item.get("aggregated_output"))
+            exit_code = item.get("exit_code")
+            job = dict(prior)
+            job.update({
+                "harness": "codex", "session_id": session_id, "attempt_id": attempt_id,
+                "source_generation": str(delta.get("generation")),
+                "source_locator": os.path.abspath(path), "native_id": job_key,
+                "native_item_id": item_id,
+                "command": command_summary(item.get("command")) or prior.get("command"),
+                "command_source": "codex.command_execution.command" if item.get("command")
+                else prior.get("command_source"),
+                "command_reason": None if item.get("command") or prior.get("command")
+                else "native-command-unavailable",
+                "started_at": (prior.get("started_at") or stamp) if not completed
+                else prior.get("started_at"),
+                "start_source": prior.get("start_source") or (
+                    "codex.item.started.timestamp" if not completed and stamp is not None else None),
+                "observed_at": stamp,
+                "native_status": "completed" if completed else "running",
+                "completed_at": stamp if completed else prior.get("completed_at"),
+                "exit_code": exit_code if isinstance(exit_code, int)
+                and not isinstance(exit_code, bool) else prior.get("exit_code"),
+                "process_state": "unknown",
+                "process_reason": "native-command-event-has-no-process-identity",
+                "output_coverage": "sampled",
+                "output_reason": "native-command-output-is-sampled" if output_seen
+                else "native-output-not-present",
+                "last_output_at": stamp if output_seen else prior.get("last_output_at"),
+                "last_output_observed_at": stamp,
+                "observation_state": delta.get("state"),
+                "observation_reason": delta.get("reason"),
+            })
+            _store_task(state, job_key, job)
+            continue
         payload = _codex_payload(row)
         if not isinstance(payload, dict):
             continue
@@ -417,20 +504,38 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                         "functions.exec", "functions.write_stdin"}:
                 handle = args.get("session_id") if isinstance(args, dict) else None
                 target = state["handles"].get(str(handle)) if handle is not None else None
-                state["calls"][call_id] = {
+                _remember_call(state, call_id, {
                     "call_id": call_id, "name": name, "args": args,
                     "started_at": stamp,
                     "handle": str(handle) if handle is not None else None,
                     "job_key": target,
-                }
+                })
+                if name in {"functions.exec", "functions.write_stdin"}:
+                    _mark_partial(state, "outer-functions-exec-output-untrusted" if
+                                  name == "functions.exec" else
+                                  "outer-functions-write-stdin-output-untrusted")
         elif kind in {"custom_tool_call_output", "function_call_output"}:
-            call = state["calls"].get(call_id)
+            if not isinstance(call_id, str) or not call_id:
+                _mark_partial(state, "native-call-result-missing-call-id")
+                continue
+            call = state["calls"].pop(call_id, None)
             if not isinstance(call, dict):
+                if not state.get("coverage_reasons"):
+                    _mark_partial(state, "native-call-result-without-retained-call")
+                continue
+            if call.get("name") in {"functions.exec", "functions.write_stdin"}:
+                _mark_partial(state, "outer-functions-exec-output-untrusted" if
+                              call.get("name") == "functions.exec" else
+                              "outer-functions-write-stdin-output-untrusted")
+                continue
+            if call.get("name") not in {"exec_command", "write_stdin"}:
+                _mark_partial(state, "codex-command-result-provenance-unavailable")
                 continue
             raw_output = payload.get("output")
             objects = _codex_output_objects(raw_output)
             if not objects:
-                objects = [{}]
+                _mark_partial(state, "codex-native-result-not-structured")
+                continue
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
             for detail in objects:
                 exit_code = detail.get("exit_code")
@@ -445,6 +550,7 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 handle = (str(handle_value) if isinstance(handle_value, int)
                           and not isinstance(handle_value, bool) else call.get("handle"))
                 if handle is None and not terminal:
+                    _mark_partial(state, "codex-native-result-lifecycle-unavailable")
                     continue
                 job_key = ("handle:" + handle if handle is not None
                            else call.get("job_key") or "call:" + str(call_id))
@@ -453,19 +559,10 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                            if isinstance(args, dict) else None)
                 if not command:
                     command = prior.get("command")
-                # An outer functions.exec script may contain arbitrary code that
-                # starts several commands. Its source is not a safe command parser.
-                if call.get("name") in {"functions.exec", "functions.write_stdin"}:
-                    command = prior.get("command")
                 nested_output = detail.get("output")
                 output_seen = isinstance(nested_output, str) and bool(nested_output)
-                if (detail == {} and call.get("name") in {"write_stdin", "functions.write_stdin"}
-                        and isinstance(raw_output, list)):
-                    output_seen = any(isinstance(part, dict)
-                                      and isinstance(part.get("text"), str)
-                                      and bool(part.get("text")) for part in raw_output)
                 if not objects or detail == {}:
-                    if call.get("name") not in {"write_stdin", "functions.write_stdin"}:
+                    if call.get("name") != "write_stdin":
                         output_seen = False
                 started = prior.get("started_at") or call.get("started_at")
                 job = dict(prior)
@@ -495,8 +592,6 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
                 _store_task(state, job_key, job)
                 if handle is not None:
                     state["handles"][handle] = job_key
-                call["job_key"] = job_key
-                call["handle"] = handle
     result = []
     for item in list(state.get("retired_jobs", ())) + list(state["jobs"].values()):
         current = dict(item)
@@ -504,6 +599,9 @@ def read_codex_jobs(path, *, session_id, attempt_id=None, now=None):
         if state.get("overflow"):
             current["observation_state"] = "partial"
             current["observation_reason"] = "task-retention-limit"
+        if state.get("coverage_reasons"):
+            current["observation_state"] = "partial"
+            current["observation_reason"] = next(iter(state["coverage_reasons"]))
         if delta.get("state") != "observed":
             current["observation_state"] = delta.get("state")
             current["observation_reason"] = delta.get("reason")
@@ -581,30 +679,41 @@ def normalize_job(job, *, now=None):
             changed = not previous or previous[0] != sequence
             observed = now
             mtime = valid_epoch(st.st_mtime)
-            if st.st_size == 0:
-                last_output = None
-            elif mtime is not None and mtime <= now:
-                last_output = mtime
-            elif previous:
-                last_output = previous[1]
+            previous_time_valid = bool(previous and len(previous) > 4 and previous[4])
+            previous_mtime = previous[5] if previous and len(previous) > 5 else None
+            clock_went_back = bool(previous and len(previous) > 3 and observed < previous[3])
+            mtime_went_back = bool(previous_time_valid and previous_mtime is not None
+                                   and mtime is not None and mtime < previous_mtime)
+            if clock_went_back:
+                output_time_state, output_time_reason = "invalid", "observer-clock-went-backwards"
+            elif mtime_went_back:
+                output_time_state, output_time_reason = "invalid", "output-mtime-went-backwards"
+            elif mtime is None:
+                output_time_state, output_time_reason = "invalid", "invalid-output-mtime"
+            elif mtime > now:
+                output_time_state, output_time_reason = "future", "future-output-mtime"
             else:
-                last_output = None
-            if changed and (not previous or previous[0][:2] != sequence[:2]
-                            or st.st_size < previous[0][2]):
+                output_time_state, output_time_reason = "valid", None
+            valid_output_time = output_time_state == "valid"
+            last_output = mtime if valid_output_time and st.st_size > 0 else None
+            reset_quiet_window = (not valid_output_time or not previous_time_valid
+                                  or not previous or previous[0][:2] != sequence[:2]
+                                  or st.st_size < previous[0][2])
+            if reset_quiet_window:
                 quiet_since = max(started or observed, observed)
             else:
                 quiet_since = previous[2] if previous and continuous else observed
-            _bounded(_OUTPUTS, output_id, (sequence, last_output, quiet_since), _JSONL_LIMIT * 8)
+            _bounded(_OUTPUTS, output_id,
+                     (sequence, last_output, quiet_since, observed, valid_output_time, mtime),
+                     _JSONL_LIMIT * 8)
             result.update(output_coverage="continuous-file" if continuous else "sampled",
                           output_state="observed", output_size=st.st_size,
                           output_identity={"device": st.st_dev, "inode": st.st_ino},
                           last_output_at=last_output,
                           last_output_observed_at=observed,
                           quiet_since=quiet_since,
-                          output_time_state=("future" if mtime is not None and mtime > now
-                                             else "invalid" if mtime is None else "valid"),
-                          output_time_reason=("future-output-mtime" if mtime is not None and mtime > now
-                                              else "invalid-output-mtime" if mtime is None else None),
+                          output_time_state=output_time_state,
+                          output_time_reason=output_time_reason,
                           output_reason=None)
         except OSError as exc:
             result.update(output_coverage="unavailable", output_state="unavailable",
@@ -627,6 +736,8 @@ def normalize_job(job, *, now=None):
     result["quiet_suspected"] = bool(
         result["lifecycle_state"] != "completed"
         and result.get("output_coverage") == "continuous-file"
+        and result.get("output_time_state") == "valid"
+        and result.get("output_size", 0) > 0 and last_output is not None
         and (result.get("process_state") == "alive"
              or result.get("lifecycle_state") == "running")
         and quiet_age is not None and quiet_age >= 600
@@ -637,21 +748,52 @@ def normalize_job(job, *, now=None):
     return result
 
 
-def _pid_namespace(pid):
+def _observe_proc_value(pid, kind):
+    """Read one process identity fact without collapsing absence and access failure."""
     try:
-        return os.readlink(f"/proc/{int(pid)}/ns/pid")
-    except (OSError, TypeError, ValueError):
-        return None
+        root = "/proc/self" if pid == "self" else f"/proc/{int(pid)}"
+        if kind == "start":
+            with open(root + "/stat", encoding="ascii") as stream:
+                raw = stream.read()
+            tail = raw[raw.rfind(")") + 2:].split()
+            if len(tail) <= 19:
+                return ProcObservation("unavailable", reason="malformed-proc-stat")
+            value = tail[19]
+        elif kind == "pid_namespace":
+            value = os.readlink(root + "/ns/pid")
+        elif kind == "mount_namespace":
+            value = os.readlink(root + "/ns/mnt")
+        else:
+            return ProcObservation("unavailable", reason="unsupported-proc-identity-kind")
+        return ProcObservation("observed", str(value))
+    except OSError as exc:
+        state = "missing" if exc.errno in {errno.ENOENT, errno.ESRCH} else "unavailable"
+        return ProcObservation(state, reason=type(exc).__name__)
+    except (TypeError, ValueError, IndexError):
+        return ProcObservation("unavailable", reason="invalid-proc-identity")
+
+
+def _observer_context():
+    self_start = _observe_proc_value("self", "start")
+    pid_ns = _observe_proc_value("self", "pid_namespace")
+    mount_ns = _observe_proc_value("self", "mount_namespace")
+    if any(value.state != "observed" for value in (self_start, pid_ns, mount_ns)):
+        failed = next(value for value in (self_start, pid_ns, mount_ns)
+                      if value.state != "observed")
+        return ProcObservation("unavailable", reason=failed.reason
+                               or "observer-identity-unavailable")
+    return ProcObservation("observed", (os.getpid(), self_start.value,
+                                        pid_ns.value, mount_ns.value))
+
+
+def _pid_namespace(pid):
+    observation = _observe_proc_value(pid, "pid_namespace")
+    return observation.value if observation.state == "observed" else None
 
 
 def _proc_start(pid):
-    try:
-        with open(f"/proc/{int(pid)}/stat", encoding="ascii") as stream:
-            raw = stream.read()
-        tail = raw[raw.rfind(")") + 2:].split()
-        return tail[19]
-    except (OSError, IndexError, TypeError, ValueError):
-        return None
+    observation = _observe_proc_value(pid, "start")
+    return observation.value if observation.state == "observed" else None
 
 
 def _fd_is_writer(pid, output_path):
@@ -680,27 +822,59 @@ def correlate_output_writers(job, candidates, *, namespace=None, root_pid=None):
     path = job.get("output_path") if isinstance(job, dict) else None
     if not isinstance(path, str) or not path:
         return {"process_state": "unknown", "process_reason": "no-exact-output-writer-locator"}
+    if isinstance(namespace, ProcObservation):
+        if namespace.state != "observed":
+            return {"process_state": "unknown",
+                    "process_reason": "parent-pid-namespace-unavailable:" +
+                    str(namespace.reason)}
+        namespace = namespace.value
     if not isinstance(namespace, str) or not namespace:
         return {"process_state": "unknown", "process_reason": "parent-pid-namespace-unavailable"}
     matched = []
+    observation_gaps = []
     for candidate in candidates or ():
         if not isinstance(candidate, dict) or candidate.get("ownership_verified") is not True:
             continue
         ancestry = candidate.get("ancestry") if isinstance(candidate.get("ancestry"), list) else []
-        if (not ancestry or ancestry[0].get("pid") != root_pid
+        if (not ancestry or not all(isinstance(item, dict) for item in ancestry)
+                or ancestry[0].get("pid") != root_pid
                 or ancestry[-1].get("pid") != candidate.get("pid")
                 or candidate.get("root_pid") != root_pid):
             continue
         pid, start = candidate.get("pid"), candidate.get("proc_start")
-        current_ns = _pid_namespace(pid) if pid else None
-        if not pid or not start or _proc_start(pid) != str(start):
+        current_start = _observe_proc_value(pid, "start") if pid else ProcObservation(
+            "unavailable", reason="candidate-pid-unavailable")
+        current_namespace = _observe_proc_value(pid, "pid_namespace") if pid else ProcObservation(
+            "unavailable", reason="candidate-pid-unavailable")
+        if not pid or not start:
             continue
-        ancestry_namespaces = [_pid_namespace(item.get("pid")) for item in ancestry
+        if current_start.state != "observed":
+            observation_gaps.append("candidate-start-" + current_start.state + ":" +
+                                    str(current_start.reason))
+            continue
+        if current_start.value != str(start):
+            observation_gaps.append("candidate-generation-mismatch")
+            continue
+        if current_namespace.state != "observed":
+            observation_gaps.append("candidate-namespace-" + current_namespace.state + ":" +
+                                    str(current_namespace.reason))
+            continue
+        ancestry_namespaces = [_observe_proc_value(item.get("pid"), "pid_namespace")
+                               for item in ancestry
                                if isinstance(item, dict) and item.get("pid")]
-        if current_ns != namespace or any(value != namespace for value in ancestry_namespaces):
+        if any(value.state != "observed" for value in ancestry_namespaces):
+            failed = next(value for value in ancestry_namespaces if value.state != "observed")
+            observation_gaps.append("ancestry-namespace-" + failed.state + ":" +
+                                    str(failed.reason))
+            continue
+        if current_namespace.value != namespace or any(
+                value.value != namespace for value in ancestry_namespaces):
+            observation_gaps.append("candidate-namespace-mismatch")
             continue
         if _fd_is_writer(pid, path):
-            matched.append({"pid": pid, "start": str(start), "namespace": current_ns,
+            matched.append({"pid": pid, "start": str(start),
+                            "namespace": current_namespace.value,
+                            "observer_context": _observer_context().value,
                             "ancestry": candidate.get("ancestry")})
     if len(matched) == 1:
         identity = matched[0]
@@ -710,10 +884,43 @@ def correlate_output_writers(job, candidates, *, namespace=None, root_pid=None):
     if len(matched) > 1:
         return {"process_state": "unknown", "process_reason": "multiple-output-writers"}
     previous = _VERIFIED_PROCESSES.get(_job_key(job))
-    if previous and (_proc_start(previous["pid"]) != previous["start"]
-                     or _pid_namespace(previous["pid"]) != previous["namespace"]):
-        return {"process_state": "dead", "process_reason": "verified-process-generation-gone",
-                "process_identity": previous}
+    if previous:
+        observer = _observer_context()
+        saved_observer = previous.get("observer_context")
+        if observer.state != "observed":
+            return {"process_state": "unknown",
+                    "process_reason": "observer-identity-unavailable:" + str(observer.reason),
+                    "process_identity": previous}
+        if not saved_observer or observer.value != tuple(saved_observer):
+            return {"process_state": "unknown", "process_reason": "observer-context-changed",
+                    "process_identity": previous}
+        current_start = _observe_proc_value(previous.get("pid"), "start")
+        if current_start.state == "missing":
+            return {"process_state": "dead", "process_reason": "verified-process-disappeared",
+                    "process_identity": previous}
+        if current_start.state != "observed":
+            return {"process_state": "unknown",
+                    "process_reason": "verified-process-start-unavailable:" +
+                    str(current_start.reason), "process_identity": previous}
+        if current_start.value != str(previous.get("start")):
+            return {"process_state": "dead",
+                    "process_reason": "verified-process-generation-replaced",
+                    "process_identity": previous}
+        current_namespace = _observe_proc_value(previous.get("pid"), "pid_namespace")
+        if current_namespace.state != "observed":
+            return {"process_state": "unknown",
+                    "process_reason": "verified-process-namespace-unavailable:" +
+                    str(current_namespace.reason), "process_identity": previous}
+        if current_namespace.value != previous.get("namespace"):
+            return {"process_state": "unknown", "process_reason": "verified-process-namespace-changed",
+                    "process_identity": previous}
+        if observation_gaps:
+            return {"process_state": "unknown",
+                    "process_reason": "proc-identity-unavailable:" + observation_gaps[0],
+                    "process_identity": previous}
+    if observation_gaps:
+        return {"process_state": "unknown",
+                "process_reason": "proc-identity-unavailable:" + observation_gaps[0]}
     return {"process_state": "unknown", "process_reason": "exact-writer-not-observed"}
 
 
@@ -724,16 +931,17 @@ def observe_jobs(jobs, *, now=None, parent_pid=None, parent_start=None, attempt_
     now = time.time() if now is None else now
     candidates = []
     needs_candidates = any(isinstance(job, dict) and job.get("output_path") for job in jobs)
-    parent_namespace = None
+    parent_namespace = ProcObservation("unavailable", reason="parent-identity-not-observed")
     if needs_candidates and parent_pid and parent_start and tree is not None and kids is not None:
         try:
-            parent_namespace = _pid_namespace(parent_pid)
+            parent_namespace = _observe_proc_value(parent_pid, "pid_namespace")
             from . import procscan
             candidates = procscan.exec_children(
                 parent_pid, tree=tree, kids=kids, min_age=0, expected_start=parent_start,
                 attempt_id=attempt_id)
-        except Exception:
+        except Exception as exc:
             candidates = []
+            parent_namespace = ProcObservation("unavailable", reason=type(exc).__name__)
     result = []
     for raw in jobs or ():
         item = normalize_job(raw, now=now)

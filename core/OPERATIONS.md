@@ -2562,19 +2562,32 @@ The shared row is advisory and passive. It does not alter parent session
 liveness, pulse, route state, gate, or controls. It carries a bounded sanitized
 command, start/elapsed when its timestamp is valid, native completion/exit when
 explicit, and process alive/dead only when the exact process generation and
-namespace or an exact writable output-file descriptor is verified. Stale output
-files, native handles, similar commands/cwd, poll timestamps, and model-turn
-completion do not prove process liveness or task exit. Output age is shown with
-its coverage; a ten-minute quiet hint requires a valid continuous file window
-and is suppressed after completion. Missing clocks and failed or partial reads
-remain visible as gaps.
+namespace or an exact writable output-file descriptor is verified. A previously
+verified writer becomes dead only after same-observer proof of disappearance or
+PID-generation replacement; permission failures, namespace visibility changes,
+and other unreadable identity checks remain unknown. Stale output files, native
+handles, similar commands/cwd, poll timestamps, and model-turn completion do not
+prove process liveness or task exit. Output age is shown with its coverage; a
+ten-minute quiet hint requires a continuous file window with valid, non-future,
+non-backward output time. Invalid time evidence resets the quiet interval until
+a later valid observation establishes a new one, and completion suppresses the
+hint. Missing clocks and failed or partial reads remain visible as gaps.
 
-Readers stay on the existing Claude transcript, Codex rollout, OpenCode native
-reader, and exact attempt/companion paths. Reads are bounded and catch up by
-source generation; rendering performs no observation I/O. JSON keeps the
+Readers stay on the existing Claude transcript, Codex rollout/App Server
+command-event stream, OpenCode native reader, and exact attempt/companion paths.
+Reads are bounded and catch up by source generation; rendering performs no
+observation I/O. JSON keeps the
 legacy `exec_child` and `exec_tool` fields and adds the same per-task evidence.
 Rows use the existing child layout and never borrow another session or attempt.
 No process is started, stopped, or restarted by this observation.
+
+For Codex, trusted App Server `command_execution` events and exact native
+`exec_command`/`write_stdin` call/output pairs may establish task identity and
+lifecycle. Output text from an outer `functions.exec`/`functions.write_stdin`
+script is arbitrary stdout and cannot create or complete a job from JSON-looking
+text; that path is reported as unobserved with partial source coverage. Pending
+call correlation is bounded; eviction that may lose a pair also makes coverage
+partial.
 
 **Accepted PRD delta (2026-10-20):** the current shared Fleet PRD v86 F-47 still
 describes one session badge and hides calls younger than 60 seconds. The
