@@ -340,6 +340,7 @@ class ForegroundActivityMonitor:
         try:
             files = self._files()
             session_state = self._opencode_session_state()
+            session_uncertain = self.context.opencode_db is not None and session_state is None
             table = self._processes()
             members = self._members(table)
             runtime_lineage = self._runtime_lineage(table, members)
@@ -351,7 +352,7 @@ class ForegroundActivityMonitor:
                 self._process_baseline = cpu
                 self._lease_baseline = lease
                 self._session_baseline = session_state
-                return ActivityObservation(False, False, ("baseline",))
+                return ActivityObservation(False, session_uncertain, ("baseline",))
             if files != self._file_baseline:
                 reasons.append("attempt-file-change")
             if (session_state is not None and self._session_baseline is not None
@@ -376,6 +377,10 @@ class ForegroundActivityMonitor:
             self._process_baseline = cpu
             self._lease_baseline = lease
             self._session_baseline = session_state
-            return ActivityObservation(bool(reasons), False, tuple(dict.fromkeys(reasons)))
+            if session_uncertain:
+                reasons.append("opencode-session-unobserved")
+            return ActivityObservation(
+                any(reason != "opencode-session-unobserved" for reason in reasons),
+                session_uncertain, tuple(dict.fromkeys(reasons)))
         except Exception as exc:
             return ActivityObservation(True, True, (f"observation-uncertain: {type(exc).__name__}: {exc}",))

@@ -151,7 +151,9 @@ class ForegroundActivityTests(unittest.TestCase):
                 self.assertIn("exact-opencode-session-change", own.reasons)
                 db.close()
                 context.opencode_db.unlink()
-                self.assertFalse(monitor.sample().active, "lost access was treated as progress")
+                missing = monitor.sample()
+                self.assertFalse(missing.active, "lost access was treated as progress")
+                self.assertTrue(missing.uncertain, "lost access could incorrectly expire the no-progress window")
                 context.log_path.write_text(context.log_path.read_text() + "attempt-owned progress\n")
                 self.assertIn("attempt-file-change", monitor.sample().reasons)
 
