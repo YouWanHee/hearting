@@ -3533,6 +3533,9 @@ def _write_watch_observation(paths, observation):
         request = current.get("readiness_transition")
         if isinstance(request, dict) and "readiness_transition" not in observation:
             observation = {**observation, "readiness_transition": request}
+        contention = current.get("readiness_contention")
+        if isinstance(contention, dict) and "readiness_contention" not in observation:
+            observation = {**observation, "readiness_contention": contention}
     _write_json_atomic(paths.observation, observation)
     return observation
 
@@ -5735,17 +5738,41 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
 
 
 def _watch_note_transition_lock_contention(root, watch_id, paths):
-    """Keep this watch pending, invalidate only its response, and wake its runner."""
+    """Keep this watch pending and coalesce unchanged runner refresh requests."""
     latest = _read_json(paths.observation) or {}
-    _write_watch_observation(paths, {
-        **latest, "state": "pending",
-        "reason": "shared-readiness-authority-lock-busy",
-        "observed_ts": _utc_now(),
-    })
+    request = latest.get("readiness_transition")
+    request_token = request.get("token") if isinstance(request, dict) else None
+    contention = latest.get("readiness_contention")
+    same_request = (isinstance(request_token, str) and request_token
+                    and isinstance(contention, dict)
+                    and contention.get("request_token") == request_token)
+    if not same_request:
+        latest.update({
+            "state": "pending",
+            "reason": "shared-readiness-authority-lock-busy",
+            "observed_ts": _utc_now(),
+        })
+        if request_token:
+            latest["readiness_contention"] = {"request_token": request_token}
+        _write_watch_observation(paths, latest)
     try:
         shared_readiness.clear_watch_transition(root, watch_id)
-        shared_readiness.wake_runner(root)
-        peer_obligations.ensure_normal_runner(reconciliation_required=True)
+        if not same_request:
+            shared_readiness.wake_runner(root)
+            peer_obligations.ensure_normal_runner(reconciliation_required=True)
+        else:
+            marker = _read_json(Path(root) / "readiness-v1" / "runner.json") or {}
+            try:
+                runner_pid = int(marker.get("pid"))
+                runner_start = str(marker.get("pid_start") or "")
+                runner_live = bool(runner_start and
+                                   str(process_start_ticks(runner_pid) or "") == runner_start)
+            except (TypeError, ValueError):
+                runner_live = False
+            if not runner_live:
+                # Preserve the existing crash/restart path without waking a
+                # current runner for an identical response and unchanged input.
+                peer_obligations.ensure_normal_runner(reconciliation_required=True)
     except Exception:
         pass
 
@@ -5809,6 +5836,7 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
     request = {"token": token, "identity": identity, "consumer": consumer,
                "requested_at": time.time()}
     observation = {**observation, "readiness_transition": request}
+    observation.pop("readiness_contention", None)
     try:
         shared_readiness.clear_watch_transition(root, watch_id)
     except (OSError, ValueError):

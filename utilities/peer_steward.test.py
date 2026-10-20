@@ -10937,6 +10937,40 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
                              and (row.get("delivery") or {}).get("receipt") == self.watch_id]), 1)
         self.assertEqual(wake.call_count, 1)
 
+    def test_repeated_same_transition_contention_coalesces_runner_wake(self):
+        wake_fd = peer_steward.shared_readiness.open_runner_wake(self.store.root)
+        try:
+            with self._holder("both", hold_seconds=0.8):
+                first = self._publish_receipt()
+                self.assertEqual(first, peer_steward._WATCH_RECEIPT_CONTENDED)
+                self.assertEqual(os.read(wake_fd, 32), b"\0")
+                first_observation = peer_steward._read_json(self.paths.observation)
+                request = first_observation.get("readiness_transition")
+                self.assertEqual(
+                    first_observation.get("readiness_contention", {}).get("request_token"),
+                    request.get("token"))
+
+                # Simulate the same unchanged runner response arriving again
+                # while the writer locks remain owned.
+                self._publish_transition_response()
+                second = self._publish_receipt()
+                self.assertEqual(second, peer_steward._WATCH_RECEIPT_CONTENDED)
+                self.assertEqual(peer_steward._read_json(self.paths.observation).get("native_wait"),
+                                 self.native_wait)
+                with self.assertRaises(BlockingIOError):
+                    os.read(wake_fd, 32)
+        finally:
+            os.close(wake_fd)
+
+        wake = mock.Mock(return_value=True)
+        self.assertTrue(self._runner_pass(wake), "the existing runner pass can refresh the token")
+        response = peer_steward.shared_readiness.watch_transition_result(
+            self.store.root, self.watch_id, self.identity, self.token)
+        self.assertEqual(response["state"], "ready")
+        self.assertTrue(self._publish_receipt(),
+                        "same watch recovers after the writer releases its locks")
+        self.assertEqual(peer_steward._read_json(self.paths.receipt)["watch_id"], self.watch_id)
+
 
 class SharedReadinessRunnerTest(unittest.TestCase):
     def test_one_selection_observation_fans_out_to_live_consumer_duties(self):
