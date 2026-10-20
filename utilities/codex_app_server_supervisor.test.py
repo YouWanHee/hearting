@@ -575,6 +575,30 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         args.native_permission_profile=profile
         command,_=module.resource_sandbox_command(args,row)
         self.assertIn('"'+str(self.base/".git/config")+'"="read"',command[5])
+        args.owner_runtime_permission_state={"observation_only":True,"may_commit":False}
+        args.owner_turn_permission_profiles={
+            "observation":"hearting_owner_observe",
+            "commit":"hearting_linked_commit",
+            "commit_no_network":"hearting_linked_commit_no_network",
+        }
+        args.native_permission_profile={"default_permissions":"hearting_owner_observe",
+            "permissions":{"hearting_owner_observe":{"extends":":read-only","filesystem":{},
+                "network":{"enabled":False}},
+                "hearting_linked_commit":profile["permissions"]["hearting_linked_commit"],
+                "hearting_linked_commit_no_network":profile["permissions"]["hearting_linked_commit"]}}
+        args.sandbox="read-only"
+        command,_=module.resource_sandbox_command(args,row)
+        self.assertEqual(command[command.index("-P")+1],"hearting_owner_observe")
+        args.owner_runtime_permission_state={"observation_only":False,"may_commit":True}
+        args.network_access=False
+        command,_=module.resource_sandbox_command(args,row)
+        self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit_no_network")
+        args.owner_turn_permission_profiles=None
+        args.native_permission_profile=profile
+        args.sandbox="read-only"
+        command,_=module.resource_sandbox_command(args,row)
+        self.assertEqual(command[command.index("-P")+1],":read-only")
+        args.owner_runtime_permission_state=None
         args.native_permission_profile=None
         args.sandbox="read-only"
         command,selection=module.resource_sandbox_command(args,row)
@@ -1965,6 +1989,94 @@ class OneTurnStageTransportTest(unittest.TestCase):
         self.assertNotIn("approvalPolicy", turn)
         self.assertTrue(captured["closed"])
         self.assertIn('"type":"turn.completed"', output.getvalue())
+
+    def test_owner_turn_negotiates_named_profile_or_keeps_legacy_overlay(self):
+        profile = {"default_permissions": "hearting_owner_observe", "permissions": {
+            "hearting_owner_observe": {"extends": ":read-only", "filesystem": {},
+                                        "network": {"enabled": False}},
+            "hearting_linked_commit": {"extends": ":workspace", "filesystem": {},
+                                        "network": {"enabled": True}},
+            "hearting_linked_commit_no_network": {
+                "extends": ":workspace", "filesystem": {}, "network": {"enabled": False}},
+        }}
+
+        for supports_selector in (True, False):
+            with self.subTest(supports_selector=supports_selector):
+                captured = {}
+
+                class FakeServer:
+                    def __init__(self, command, cwd, env):
+                        captured["command"] = command
+                        captured["cwd"] = cwd
+                        self.events = [
+                            {"method": "item/completed", "params": {"turnId": "turn-owner",
+                             "item": {"type": "agentMessage", "id": "final",
+                                      "text": "artifact: -\\nverdict: PASS\\nblocker: none"}}},
+                            {"method": "turn/completed", "params": {
+                             "turn": {"id": "turn-owner", "status": "completed"}}},
+                        ]
+
+                    def request(self, method, params):
+                        captured.setdefault("requests", []).append((method, params))
+                        if method == "thread/start":
+                            return {"thread": {"id": "thread-owner"}}
+                        if method == "turn/start":
+                            return {"turn": {"id": "turn-owner"}}
+                        return {}
+
+                    def notification(self, method):
+                        captured.setdefault("notifications", []).append(method)
+
+                    def next_event(self):
+                        return self.events.pop(0)
+
+                    def close(self):
+                        captured["closed"] = True
+
+                args = self.supervisor.parser().parse_args([
+                    "--one-turn", "--worktree", str(self.root), "--sandbox", "workspace-write",
+                    "--network-access", "--app-server-command", "codex app-server --listen stdio://",
+                ])
+                output = io.StringIO()
+
+                def bind_owner_state(target):
+                    target.owner_runtime_permission_state = {
+                        "observation_only": False, "may_commit": True,
+                    }
+                    target.owner_runtime_base_sandbox = "workspace-write"
+
+                with mock.patch.object(self.supervisor, "apply_owner_runtime_permissions",
+                                       side_effect=bind_owner_state), \
+                     mock.patch.object(self.supervisor, "turn_permissions_available",
+                                       return_value=supports_selector), \
+                     mock.patch.object(self.supervisor.commit_policy, "worktree_git_dirs",
+                                       return_value=(None, None)), \
+                     mock.patch.object(self.supervisor, "owner_turn_profile_config",
+                                       return_value=profile) as build_owner, \
+                     mock.patch.object(self.supervisor, "commit_profile_config",
+                                       return_value=None) as build_legacy, \
+                     mock.patch.object(self.supervisor, "config_arguments",
+                                       return_value=["--owner-profiles"]), \
+                     mock.patch.object(self.supervisor, "AppServer", FakeServer), \
+                     mock.patch.object(self.supervisor.sys, "stdin", io.StringIO("owner prompt")), \
+                     mock.patch.object(self.supervisor.sys, "stdout", output):
+                    result = self.supervisor.run_one_turn(args)
+
+                self.assertEqual(result, 0)
+                requests = dict(captured["requests"])
+                init = requests["initialize"]
+                turn = requests["turn/start"]
+                if supports_selector:
+                    self.assertEqual(init["capabilities"], {"experimentalApi": True})
+                    self.assertEqual(turn["permissions"], "hearting_linked_commit")
+                    self.assertNotIn("sandboxPolicy", turn)
+                else:
+                    self.assertIsNone(init["capabilities"])
+                    self.assertEqual(turn["sandboxPolicy"]["type"], "workspaceWrite")
+                    self.assertNotIn("permissions", turn)
+                self.assertIn("--owner-profiles", captured["command"])
+                build_owner.assert_called_once()
+                build_legacy.assert_not_called()
 
 
 class ActiveTurnDeadlineParityTest(unittest.TestCase):

@@ -85,9 +85,18 @@ def read(harness, now=None, stale_max=None):
 def _write(harness, payload, fetched_at, attempted_at):
     directory = state_dir()
     os.makedirs(directory, exist_ok=True)
+    providers = {}
+    try:
+        with open(_path(harness), encoding="utf-8") as fh:
+            existing = json.load(fh)
+        if (isinstance(existing, dict) and existing.get("schema_version") == SCHEMA_VERSION
+                and existing.get("harness") == harness and isinstance(existing.get("providers"), dict)):
+            providers = existing["providers"]
+    except (OSError, ValueError, TypeError):
+        pass
     item = {"schema_version": SCHEMA_VERSION, "harness": harness,
             "fetched_at": fetched_at, "attempted_at": attempted_at,
-            "payload": payload if isinstance(payload, dict) else {}}
+            "payload": payload if isinstance(payload, dict) else {}, "providers": providers}
     fd, temp = tempfile.mkstemp(prefix=".%s." % harness, dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -127,14 +136,119 @@ def record_attempt(harness, now=None):
         return False
 
 
+def record_provider(harness, provider, model, account_scope, state, reason=None,
+                    now=None, source=None):
+    """Persist exact provider eligibility beside usage without refreshing quota age."""
+    if (harness != "opencode" or not isinstance(provider, str) or not provider
+            or not isinstance(model, str) or not model
+            or state not in ("usable", "unavailable")):
+        return False
+    now = time.time() if now is None else float(now)
+    try:
+        directory = state_dir()
+        os.makedirs(directory, exist_ok=True)
+        path = _path(harness)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                item = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            item = {"schema_version": SCHEMA_VERSION, "harness": harness,
+                    "fetched_at": 0.0, "attempted_at": now, "payload": {}}
+        if (not isinstance(item, dict) or item.get("schema_version") != SCHEMA_VERSION
+                or item.get("harness") != harness):
+            item = {"schema_version": SCHEMA_VERSION, "harness": harness,
+                    "fetched_at": 0.0, "attempted_at": now, "payload": {}}
+        providers = item.get("providers") if isinstance(item.get("providers"), dict) else {}
+        key = json.dumps([provider, model, account_scope or "unscoped"], separators=(",", ":"))
+        providers[key] = {"provider": provider, "model": model,
+                          "account_scope": account_scope or "unscoped", "state": state,
+                          "reason": reason, "observed_at": now, "source": source}
+        item["providers"] = providers
+        item["attempted_at"] = now
+        fd, temp = tempfile.mkstemp(prefix=".%s." % harness, dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(item, fh, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                fh.flush(); os.fsync(fh.fileno())
+            os.replace(temp, path)
+        finally:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def read_provider(harness, provider, model, account_scope, *, now=None,
+                  usable_max_age=STALE_MAX):
+    """Read provider state independently of the quota window's freshness."""
+    now = time.time() if now is None else float(now)
+    try:
+        with open(_path(harness), encoding="utf-8") as fh:
+            item = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {"state": "unknown", "reason": "no-observation", "observed_at": None}
+    if (not isinstance(item, dict) or item.get("schema_version") != SCHEMA_VERSION
+            or item.get("harness") != harness):
+        return {"state": "unknown", "reason": "cache-invalid", "observed_at": None}
+    providers = item.get("providers")
+    key = json.dumps([provider, model, account_scope or "unscoped"], separators=(",", ":"))
+    row = providers.get(key) if isinstance(providers, dict) else None
+    if not isinstance(row, dict) or row.get("state") not in ("usable", "unavailable"):
+        return {"state": "unknown", "reason": "no-observation", "observed_at": None}
+    observed = row.get("observed_at")
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)) or observed > now:
+        return {"state": "unknown", "reason": "observation-invalid", "observed_at": None}
+    if row["state"] == "usable" and now - observed > usable_max_age:
+        return {"state": "unknown", "reason": "observation-stale", "observed_at": observed}
+    return dict(row)
+
+
+def provider_records(harness, account_scopes=None):
+    """Bounded, redacted provider observations for Fleet's usage/status view."""
+    try:
+        with open(_path(harness), encoding="utf-8") as fh:
+            item = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return []
+    if (not isinstance(item, dict) or item.get("schema_version") != SCHEMA_VERSION
+            or item.get("harness") != harness or not isinstance(item.get("providers"), dict)):
+        return []
+    rows = []
+    for row in item["providers"].values():
+        if (not isinstance(row, dict) or row.get("state") not in ("usable", "unavailable")
+                or not isinstance(row.get("provider"), str)
+                or not isinstance(row.get("model"), str)):
+            continue
+        if account_scopes is not None and row.get("account_scope") not in account_scopes:
+            continue
+        rows.append({key: row.get(key) for key in
+                     ("provider", "model", "state", "reason", "observed_at", "source")})
+    return sorted(rows, key=lambda row: (row["provider"], row["model"], row["observed_at"] or 0))[-32:]
+
+
 def _worker(harness):
     try:
         fetcher = _fetcher(harness)
         payload = fetcher() if fetcher else None
         now = time.time()
         previous = read(harness, now=now)
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and payload.get("error") in ("auth", "subscription-missing"):
+            previous = read(harness, now=now, stale_max=float("inf"))
+            old_payload = previous.get("payload") or {}
+            quota = {key: value for key, value in old_payload.items()
+                     if key in {"rl_5h", "rl_7d", "rl_ms", "rs_5h", "rs_7d", "rl_windows"}}
+            _write(harness, {**quota, **payload}, previous.get("observed_at") or 0.0, now)
+        elif isinstance(payload, dict) and "error" not in payload:
             _write(harness, payload, now, now)
+        elif isinstance(payload, dict):
+            previous = read(harness, now=now)
+            if previous.get("payload") is not None:
+                _write(harness, previous["payload"], previous.get("observed_at"), now)
+            else:
+                _write(harness, payload, 0.0, now)
         elif previous.get("payload") is not None:
             _write(harness, previous["payload"], previous.get("observed_at"), now)
         else:

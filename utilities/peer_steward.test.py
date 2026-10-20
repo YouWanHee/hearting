@@ -2508,7 +2508,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
     def test_different_steward_seats_stay_independent_and_successor_retirement_is_separate(self):
         import contextlib
         import io
-
+        import session_tidy
         seat_by_steward = {
             "steward-1": "seat-A",
             "steward-2": "seat-B",
@@ -2542,52 +2542,50 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             return fields, watcher
 
         first, first_watcher = register("steward-1", "peer-a")
-        first_observation = self._wait_for_observation(first["watch_id"])
-        first_deadline = time.monotonic() + 10
-        while (first_observation.get("native_wait", {}).get("state") != "started"
-               and time.monotonic() < first_deadline):
-            time.sleep(0.02)
-            first_observation = json.loads((self.watch_root /
-                f"{first['watch_id']}.observation.json").read_text())
-        first_wait = first_observation["native_wait"]
-        self.assertTrue(peer_steward._pid_identity_ok(
-            first_wait["pid"], first_wait["pid_start"]))
-
         second, second_watcher = register("steward-2", "w1:p9")
         self.assertEqual((first["state"], second["state"]), ("armed", "armed"))
         self.assertNotEqual(first["watch_id"], second["watch_id"])
         self._wait_for_wait_calls(2)
 
-        # This old observer and its waiter are exact private fixture processes;
-        # freeing its lock lets the successor path settle it synchronously.
-        self.assertTrue(peer_steward._pid_identity_ok(
-            first_watcher.pid, first["pid_start"]))
-        os.kill(first_watcher.pid, signal.SIGKILL)
-        first_watcher.wait(timeout=10)
-        self.assertTrue(peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"]))
-        os.kill(first_wait["pid"], signal.SIGKILL)
-        wait_deadline = time.monotonic() + 10
-        while (time.monotonic() < wait_deadline
-               and peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"])):
-            time.sleep(0.02)
-
+        # A durable same-seat handover transfers the original watch identity.
+        # A different seat stays independent even when Herdr reports the same pane.
+        first_arm_path = self.watch_root / f"{first['watch_id']}.json"
+        first_arm = json.loads(first_arm_path.read_text())
+        seat = session_tidy.Seat("pane", "seat-A", "w1:p9", "claude")
+        first_arm["steward_seat"] = seat.as_dict()
+        peer_steward._write_json_atomic(first_arm_path, first_arm)
+        steward = first_arm["steward"]
+        carried_watch = {
+            "watch_id": first["watch_id"],
+            "origin": {"harness": steward["harness"], "sid": steward["session_id"]},
+            "holder": {"harness": "claude", "sid": "steward-3"},
+            "seat_key": seat.key, "storage_root": str(peer_steward.peer_message.peer_state_root()),
+            "server": first_arm["server"], "target": first_arm["target"],
+            "agent": dict(first_arm["agent"]), "until": list(first_arm["until"]),
+            "armed_ts": first_arm["armed_ts"], "deadline": first_arm["deadline"],
+            "lineage": [{"from": "steward-1", "to": "steward-3", "snapshot_id": "fixture"}],
+        }
+        with mock.patch.dict(os.environ, self._env("held", session_id="steward-1")):
+            with session_tidy.seat_lock(seat.key):
+                session_tidy._append_ledger_entry(seat, {
+                    "ts": session_tidy.now_epoch(), "harness": "claude", "sid": "steward-3",
+                    "event": "handover", "from": "steward-1", "seat_key": seat.key,
+                    "bindings": [], "steward": {"schema": 1, "roles": [],
+                                                   "watches": [carried_watch]},
+                })
         successor, successor_watcher = register("steward-3", "sid-fake")
-        self.assertEqual(successor["state"], "armed")
-        self.assertNotEqual(successor["watch_id"], first["watch_id"])
-        self.assertNotEqual(successor["watch_id"], second["watch_id"])
-        retired = self._wait_for_receipt(first["watch_id"])
-        self.assertEqual((retired["state"], retired["reason"]),
-                         ("superseded", "steward-replaced"))
+        self.assertEqual(successor["state"], "already-armed")
+        self.assertEqual(successor["watch_id"], first["watch_id"])
         self.assertFalse((self.watch_root / f"{second['watch_id']}.receipt.json").exists())
-        self.assertFalse((self.watch_root / f"{successor['watch_id']}.receipt.json").exists())
-        self.assertEqual(len(self._arm_records()), 3)
+        self.assertEqual(len(self._arm_records()), 2)
 
-        self._wait_for_wait_calls(3)
+        self._wait_for_wait_calls(2)
         self._release()
         self._release()
+        self._wait_for_receipt(first["watch_id"])
         self._wait_for_receipt(second["watch_id"])
-        self._wait_for_receipt(successor["watch_id"])
-        for process in (second_watcher, successor_watcher):
+        self.assertIs(first_watcher, successor_watcher)
+        for process in (first_watcher, second_watcher):
             process.wait(timeout=10)
         for process in spawned:
             if process.poll() is None:
@@ -3091,14 +3089,54 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
     def test_ack_is_created_once_then_silently_skipped(self):
         fields = self._arm(mode="idle")
         self._wait_for_receipt(fields["watch_id"])
+        with mock.patch.dict(os.environ, self._env("idle")):
+            import dispatch_seat_handover as handover
+            self.assertIsNotNone(handover.resolve_watch(fields["watch_id"]),
+                                 repr({"roots": handover._watch_roots(handover._peer_message()),
+                                       "arm": peer_steward._read_json(
+                                           peer_steward._watch_paths(fields["watch_id"]).arm),
+                                       "refs": handover.resolved_watch_references()}))
+        # Exercise cmd_ack's ordinary recovery of a canonical path left torn by
+        # an interrupted writer; the callback itself must revalidate the holder.
+        torn_ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        torn_ack.write_bytes(b'{"watch_id":')
         first = self._run("ack", fields["watch_id"], "--carrier", "claude-async-rewake")
         second = self._run("ack", fields["watch_id"], "--carrier", "userprompt-sweep")
-        self.assertEqual((first.returncode, second.returncode), (0, 0))
-        self.assertIn("ack=created", first.stdout)
-        self.assertIn("ack=already", second.stdout)
+        self.assertEqual((first.returncode, second.returncode), (0, 0),
+                         first.stdout + first.stderr + second.stdout + second.stderr)
+        self.assertIn("ack=created", first.stdout, first.stdout + first.stderr)
+        self.assertIn("ack=already", second.stdout, second.stdout + second.stderr)
         ack = json.loads((self.watch_root / f"{fields['watch_id']}.ack.json").read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], "steward-1")
+
+    def test_ack_fsync_failure_does_not_settle_original_watch_ref_until_retry(self):
+        import contextlib
+        import io
+        import dispatch_seat_handover as handover
+
+        fields = self._arm(mode="idle")
+        self._wait_for_receipt(fields["watch_id"])
+        ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        with mock.patch.dict(os.environ, self._env("idle")), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("steward-1", "claude")), \
+             mock.patch.object(peer_steward.peer_message, "settle_watch_transfers",
+                               return_value=False) as settle, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(handover.os, "fsync",
+                                   side_effect=OSError("fixture ACK fsync failure")):
+                self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                    watch_id=fields["watch_id"], carrier="fixture-carrier")), 0)
+            settle.assert_not_called()
+            self.assertFalse(ack.exists())
+
+            self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                watch_id=fields["watch_id"], carrier="retry-carrier")), 0)
+            settle.assert_called_once_with(fields["watch_id"], "claude", "steward-1")
+            ack_data = json.loads(ack.read_text(encoding="utf-8"))
+            self.assertEqual((ack_data["watch_id"], ack_data["harness"], ack_data["session_id"]),
+                             (fields["watch_id"], "claude", "steward-1"))
 
     def test_a_restarted_watch_line_does_not_claim_the_hook_either(self):
         """`state=rearmed` — the branch B1-a was originally raised about.
@@ -5710,6 +5748,27 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
                                    return_value=type("Ready", (), {"state": "ready", "reason": ""})()), \
                  mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
                 self.assertEqual(peer_steward._continue_look(self.seat_obj.pane, req), expected)
+
+    def test_continue_is_not_held_back_by_the_sessions_own_dispatched_work(self):
+        self.cleared()
+        req = self.booking()
+        info = {"pane_id": self.seat_obj.pane, "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        ident = {"harness": "claude", "session_id": "sid-B", "pane": self.seat_obj.pane, "name": "sup"}
+
+        def readiness(*_a, purpose="completion", **_k):
+            # A supervisor whose owners still run: pending for completion, ready for input.
+            state, reason = (("ready", "native-turn-ready") if purpose == "input"
+                             else ("pending", "bound-registered-work-pending"))
+            return type("Readiness", (), {"state": state, "reason": reason})()
+
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+             mock.patch.object(peer_steward, "_continue_native_session", return_value="sid-B"), \
+             mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
+            self.assertIsNone(peer_steward._continue_look(self.seat_obj.pane, req))
 
     def test_user_prompt_card_handoff_and_expiry_still_stop_continue(self):
         def bump(seat):
@@ -8466,6 +8525,21 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
                     entry = marker["targets"]["observed-sid"]
                     self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))
 
+    def test_a_refused_start_names_why_the_observed_agent_was_not_adopted(self):
+        for cwd, miss in (("", "cwd-empty"), ("/elsewhere", "cwd-mismatch")):
+            with self.subTest(cwd=cwd):
+                world = self.world("claude", error="agent_pane_busy")
+                world.cwd = cwd
+                rc, line = self.invoke("claude", world)
+                self.assertIn("started=false", line)
+                self.assertIn("reason=agent_pane_busy", line)
+                self.assertIn(f"observed={miss}", line)
+                self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 0)
+        world = self.world("claude", error="agent_pane_busy")
+        rc, line = self.invoke("claude", world)
+        self.assertIn("started=true", line)
+        self.assertNotIn("observed=", line)
+
     def test_reuse_observes_existing_pane_without_another_launch_or_keyboard_input(self):
         for kind in ("claude", "codex", "opencode"):
             with self.subTest(kind=kind):
@@ -8547,48 +8621,152 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
         duty = store.update(duty_id, observation={"native_receiving_turn": binding})
         return store, duty, aid, sid
 
-    def test_sessionstart_runner_resumes_only_the_exact_interrupted_latest_turn_once(self):
+    def _run_empty_native_recovery(self, request_context, native_items=()):
         import codex_queue_delivery
         import codex_queue_dispatch
         import dispatch_completion_join as join
+        import dispatch_pending_delivery as pending
         store, duty, aid, sid = self._duty()
-        sent = []
+        if request_context is not None:
+            binding = store.get(duty["id"])["observation"]["native_receiving_turn"]
+            store.retain_native_receiving_turn(
+                duty["id"], binding, request_context=request_context)
+        # Codex 0.163 captured this full-turn shape in the recorded replay
+        # fixture; only the post-crash status transition is reflected here.
+        native_turn = {
+            "completedAt": None, "durationMs": None, "error": None,
+            "id": "turn-exact", "items": list(native_items), "itemsView": "full",
+            "rootTurnId": "turn-exact", "startedAt": 1792389273,
+            "status": "interrupted",
+        }
+        row = SimpleNamespace(attempt_id=aid, status="done", metadata={
+            "attempt_id": aid, "parent_sid": sid, "delivery_id": "delivery-native-crash",
+            "delivery_receipt_digest": store.get(duty["id"])["observation"][
+                "native_receiving_turn"]["receipt_digest"],
+            "delivery_row_revision": "rev-1", "route_id": "rt-native",
+            "route_node": "execute", "parent_attempt_id": "att-owner",
+        })
+        exact = pending.read(self.tmp_root, sid, "delivery-native-crash")
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty = store.get(duty["id"])
         with mock.patch.object(join, "materialize_after_terminal_close", return_value=None), \
+             mock.patch.object(join, "current_attempt_row", return_value=row), \
              mock.patch.object(join, "pending_record_identity",
                                return_value=("rt-native", "execute", "att-owner")), \
              mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch("dispatch_contract.terminal_conflict_pending", return_value=False), \
              mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
-             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={
-                 "id": "turn-exact", "status": "interrupted"}), \
+             mock.patch.object(codex_queue_delivery, "read_exact_turn",
+                               side_effect=[native_turn, native_turn]) as read_turn, \
              mock.patch.object(codex_queue_delivery, "_latest_turn", return_value={"id": "turn-exact",
                                                                                   "status": "interrupted"}), \
-             mock.patch.object(codex_queue_delivery, "send_at_least_once",
-                 side_effect=lambda *a, **kw: sent.append(kw) or {"status": "queued"}), \
-             mock.patch("dispatch_completion_join.completion_followup_text", return_value="follow-through"), \
-             mock.patch.object(peer_steward, "_resolve_target", return_value=("codex", sid, "pane")):
-            peer_steward._reconcile_obligations(store, [duty])
-        self.assertEqual(len(sent), 1, store.get(duty["id"]))
-        self.assertTrue(sent[0]["client_message_id"].startswith("delivery-"))
-        self.assertIn("turn-exact", sent[0]["message"])
+             mock.patch.object(codex_queue_delivery, "_known_consumed", return_value=None), \
+             mock.patch.object(codex_queue_delivery, "list_queue", return_value=[]), \
+             mock.patch.object(codex_queue_delivery, "_latest_turn_status",
+                               return_value="interrupted"), \
+             mock.patch.object(codex_queue_delivery, "_rpc",
+                               return_value={"queuedSubmission": {"id": "queue-item"}}) as rpc, \
+             mock.patch.object(codex_queue_delivery, "_start_interrupted_owned_item",
+                               return_value=False), \
+             mock.patch("dispatch_completion_join.completion_followup_text", return_value="follow-through"):
+            peer_steward._resume_native_receiving_turn(
+                duty, store, row, exact, sid, sid)
+        self.assertEqual(read_turn.call_count, 2, "the real sender must invoke before_add")
+        self.assertEqual([call.args[1] for call in rpc.call_args_list], ["thread/queue/add"])
+        message = rpc.call_args.args[2]["input"][0]["text"]
+        client_id = rpc.call_args.args[2]["clientUserMessageId"]
+        self.assertTrue(client_id.startswith("delivery-"))
+        self.assertIn("turn-exact", message)
         current = store.get(duty["id"])
         self.assertEqual(current["state"], "pending")
         self.assertEqual(current["delivery"], "native-continuation-accepted")
         self.assertEqual(current["observation"]["continuation_source_turn"], "turn-exact")
+        return current, message
 
-        with mock.patch.object(join, "materialize_after_terminal_close", return_value=None), \
-             mock.patch.object(join, "pending_record_identity", return_value=("rt-native", "execute", "att-owner")), \
-             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
-             mock.patch.object(codex_queue_dispatch, "resolve_queue_socket", return_value=Path("/tmp/fixture.sock")), \
-             mock.patch.object(codex_queue_delivery, "read_exact_turn", return_value={"id": "turn-exact", "status": "interrupted"}), \
-             mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id", side_effect=[
-                 {"id": "continuation-turn", "status": "inProgress"},
-                 {"id": "continuation-turn", "status": "completed"}]), \
-             mock.patch.object(codex_queue_delivery, "send_at_least_once") as again:
-            peer_steward._reconcile_obligations(store, [current])
-            self.assertEqual(store.get(duty["id"])["state"], "pending")
-            peer_steward._reconcile_obligations(store, [store.get(duty["id"])])
-            self.assertEqual(store.get(duty["id"])["state"], "complete")
-        again.assert_not_called()
+    def test_empty_native_turn_resumes_with_exact_hook_request_through_real_sender(self):
+        prompt = "Original task with exact requested format\nOUTPUT_FORMAT_CANARY: exact JSON"
+        current, message = self._run_empty_native_recovery(prompt)
+        self.assertIn("Original user request received by Codex UserPromptSubmit", message)
+        self.assertIn(prompt, message)
+        context = current["observation"]["native_request_context"]
+        self.assertEqual(context["source"], "codex-userprompt-submit")
+        self.assertEqual(context["status"], "available")
+        self.assertEqual(context["text"], prompt)
+        self.assertEqual(current["observation"]["continuation_source"]["source"],
+                         "codex-userprompt-submit")
+        self.assertIn(prompt, current["observation"]["continuation_prepared"]["message"])
+
+    def test_empty_native_turn_resumes_and_records_unavailable_original_request(self):
+        current, message = self._run_empty_native_recovery("")
+        self.assertIn("original user request could not be recovered", message)
+        self.assertNotIn("original task and requested format", message)
+        self.assertEqual(current["observation"]["native_request_context"]["status"],
+                         "unavailable")
+        self.assertEqual(current["observation"]["continuation_source"], {
+            "source": "unavailable", "status": "unavailable",
+            "reason": "hook-prompt-empty-or-invalid",
+        })
+        self.assertEqual(current["delivery"], "native-continuation-accepted")
+
+    def test_exact_native_user_message_remains_a_fallback_without_hook_context(self):
+        items = [{"id": "user-item-exact", "type": "userMessage",
+                  "content": [{"type": "text", "text": "legacy exact request"}]}]
+        current, message = self._run_empty_native_recovery(None, native_items=items)
+        self.assertIn("original userMessage item user-item-exact", message)
+        self.assertIn("legacy exact request", message)
+        self.assertEqual(current["observation"]["continuation_source"], {
+            "source": "codex-native-userMessage", "status": "available",
+            "item_ids": ["user-item-exact"],
+        })
+
+    def test_long_hook_request_uses_the_bound_durable_obligation_field(self):
+        prompt = "x" * (peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT + 1024)
+        current, message = self._run_empty_native_recovery(prompt)
+        self.assertLessEqual(len(message.encode("utf-8")),
+                             peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT)
+        self.assertNotIn("x" * 256, message)
+        self.assertIn("observation.native_request_context.text", message)
+        self.assertIn(str(self.tmp_root), message)
+        self.assertEqual(current["observation"]["native_request_context"]["text"], prompt)
+
+    def test_original_request_is_verbatim_at_utf8_limit_and_referenced_above_it(self):
+        marker = "\nOUTPUT_FORMAT_CANARY: exact JSON object\n"
+        item_id = "user-item-final-format"
+        source = [{"item_id": item_id, "text": ""}]
+        empty = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        budget = peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT - len(empty.encode("utf-8"))
+        marker_size = len(marker.encode("utf-8"))
+        fill_bytes = budget - marker_size
+        text = "한" * (fill_bytes // 3) + "x" * (fill_bytes % 3) + marker
+        source[0]["text"] = text
+        exact = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        self.assertEqual(len(exact.encode("utf-8")), peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT)
+        self.assertTrue(exact.endswith(text))
+        self.assertIn("OUTPUT_FORMAT_CANARY: exact JSON object", exact)
+
+        source[0]["text"] = text + "한"
+        bounded = peer_steward._native_continuation_message(
+            thread_id="thread-exact", turn_id="turn-exact",
+            source_turn_id="turn-exact", receipt_text="{}",
+            followup="approved follow-through", source_messages=source)
+        self.assertLessEqual(len(bounded.encode("utf-8")),
+                             peer_steward._NATIVE_QUEUE_MESSAGE_LIMIT)
+        self.assertNotIn(text, bounded)
+        self.assertIn(item_id, bounded)
+        self.assertIn("exact userMessage item(s)", bounded)
+        self.assertIn("every requested content and output-format requirement", bounded)
+
+    def test_unreadable_original_user_message_remains_unresolved(self):
+        # Captured Codex 0.163 turns can be full-view while having no items.
+        self.assertEqual(peer_steward._native_user_message_sources({
+            "id": "turn-exact", "status": "interrupted", "items": [],
+            "itemsView": "full"}), [])
 
     def test_queued_continuation_keeps_same_duty_and_does_not_resend(self):
         import codex_queue_delivery
@@ -8751,6 +8929,18 @@ class NativeReceivingTurnSettlementTests(unittest.TestCase):
                     duty.update(changes)
                     return duty
 
+                def prepare_native_continuation(_self, _duty_id, *, continuation_id,
+                                                source_turn_id, source, message):
+                    prepared = {"id": continuation_id, "source_turn_id": source_turn_id,
+                                "message": message}
+                    duty["observation"].update({
+                        "continuation_id": continuation_id,
+                        "continuation_source_turn": source_turn_id,
+                        "continuation_source": source,
+                        "continuation_prepared": prepared,
+                    })
+                    return duty, prepared
+
             send = mock.Mock(return_value={"status": "queued"})
             with mock.patch.object(fixture_pending, "read", return_value=exact), \
                  mock.patch.object(join, "pending_record_identity",
@@ -8761,7 +8951,10 @@ class NativeReceivingTurnSettlementTests(unittest.TestCase):
                  mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
                                    return_value=Path(temporary) / "queue.sock"), \
                  mock.patch.object(codex_queue_delivery, "read_exact_turn",
-                                   return_value={"id": "turn-exact", "status": "interrupted"}), \
+                                   return_value={"id": "turn-exact", "status": "interrupted",
+                                                 "items": [{"id": "user-item-exact", "type": "userMessage",
+                                                            "content": [{"type": "text",
+                                                                         "text": "original exact request"}]}]}), \
                  mock.patch.object(codex_queue_delivery, "_latest_turn",
                                    return_value={"id": "turn-exact", "status": "interrupted"}), \
                  mock.patch.object(codex_queue_delivery, "find_turn_by_client_message_id",

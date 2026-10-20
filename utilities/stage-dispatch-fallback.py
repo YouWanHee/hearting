@@ -64,6 +64,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_live_parent_attempt,
     route_state_next_action,
     validate_attempt_metadata,
+    bounded_candidate_outcomes, candidate_detail, diagnostic_line, diagnostic_token,
 )
 
 _NODE_SPEC = importlib.util.spec_from_file_location(
@@ -170,6 +171,13 @@ def wrapper_interrupted(result, fields: dict[str, str]) -> bool:
     )
 
 
+def relay_wrapper_stderr(result) -> None:
+    """Keep child diagnostics off the stdout channel that carries our receipt."""
+    stderr = getattr(result, "stderr", "")
+    if isinstance(stderr, str) and stderr:
+        print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr)
+
+
 def report_interrupted(result, output: str, attempt_id: str, attempts: list[str],
                        candidate_outcomes: "CandidateOutcomes", direct_failures: list[dict],
                        route: dict, node: dict, hop: dict) -> int:
@@ -199,6 +207,7 @@ def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]
 def report_forwarding_cleanup_incomplete(
     result, attempt_id: str, attempts: list[str], *, args, route, node,
     output: str = "", interrupted: bool = False,
+    candidate_outcomes=None, direct_failures=None, hop=None,
 ) -> int:
     """Preserve unresolved pipe cleanup plus exact route-bound launch evidence.
 
@@ -252,6 +261,13 @@ def report_forwarding_cleanup_incomplete(
         reason = "foreground-output-incomplete"
         code = 76
         interrupted_fields = {}
+    if candidate_outcomes is None:
+        candidate_outcomes = CandidateOutcomes()
+    if direct_failures is None:
+        direct_failures = []
+    _record_leg_failure(route, node, hop or {"fallback_hop": "same-harness-headless"},
+                        reason, "wrapper output cleanup incomplete",
+                        candidate_outcomes, direct_failures)
     exit_code = fail(
         reason, code,
         **interrupted_fields,
@@ -268,6 +284,8 @@ def report_forwarding_cleanup_incomplete(
         wrapper_stdout_json=json.dumps(result.stdout or "", ensure_ascii=False),
         wrapper_stderr_json=json.dumps(result.stderr or "", ensure_ascii=False),
         attempt_trace="|".join(attempts),
+        candidate_outcomes=candidate_outcomes,
+        **_last_failure_fields(direct_failures),
     )
     if interrupted and output:
         print(output)
@@ -279,6 +297,7 @@ def fail(reason: str, code: int, **fields: str) -> int:
     print(f"reason={reason}")
     outcomes = fields.pop("candidate_outcomes", None)
     if isinstance(outcomes, CandidateOutcomes):
+        outcomes.normalize()
         fields["candidate_outcomes"] = json.dumps(outcomes, separators=(",", ":"))
         fields["candidate_outcomes_omitted"] = str(outcomes.omitted)
     for key, value in fields.items():
@@ -290,6 +309,17 @@ def output_fields(output: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
 
 
+def wrapper_fields(result) -> dict[str, str]:
+    """The adapter receipt is stdout; stderr is never its control channel."""
+    fields = output_fields(result.stdout or "")
+    reason = fields.get("reason")
+    if reason is not None and not re.fullmatch(r"[a-z][a-z0-9-]{0,159}", reason):
+        fields.pop("reason")
+    if "detail" in fields:
+        fields["detail"] = diagnostic_line(fields["detail"])
+    return fields
+
+
 class CandidateOutcomes(list):
     """Bounded receipt rows with an explicit count of omitted candidates."""
 
@@ -297,8 +327,13 @@ class CandidateOutcomes(list):
         super().__init__()
         self.omitted = 0
 
+    def normalize(self):
+        rows, self.omitted = bounded_candidate_outcomes(self, self.omitted)
+        self[:] = rows
+
 
 def _print_candidate_outcomes(rows: CandidateOutcomes) -> None:
+    rows.normalize()
     print("candidate_outcomes=" + json.dumps(rows, separators=(",", ":")))
     print(f"candidate_outcomes_omitted={rows.omitted}")
 
@@ -308,10 +343,11 @@ def _candidate_outcome(rows: CandidateOutcomes, ordinal: int, key: str, *, attem
                       reason: str, detail: str = "") -> None:
     """Record bounded candidate evidence without turning a skip into a failure."""
     if len(rows) < 32:
-        rows.append({"ordinal": ordinal, "tuple": key[:160], "attempted": attempted,
-                     "attempt_id": attempt_id[:120] if attempted else "",
-                     "exit": str(exit_code)[:16] if attempted else "",
-                     "reason": reason[:160], "detail": detail[:512]})
+        normalized, _ = bounded_candidate_outcomes([
+            {"ordinal": ordinal, "tuple": key, "attempted": attempted,
+             "attempt_id": attempt_id, "exit": exit_code,
+             "reason": reason, "detail": detail}])
+        rows.extend(normalized)
     else:
         rows.omitted += 1
 
@@ -333,8 +369,10 @@ def _failed_attempt(rows: CandidateOutcomes, failures: list[dict], ordinal: int,
                     reason: str, detail: str) -> None:
     _candidate_outcome(rows, ordinal, key, attempted=True, attempt_id=attempt_id,
                        exit_code=exit_code, reason=reason, detail=detail)
-    failures.append({"attempt_id": attempt_id, "exit": str(exit_code),
-                     "reason": reason, "detail": detail})
+    reason = diagnostic_token(reason)
+    failures.append({"attempt_id": diagnostic_token(attempt_id, 120),
+                     "exit": diagnostic_token(str(exit_code), 16),
+                     "reason": reason, "detail": candidate_detail(reason, detail)})
 
 
 def _record_leg_failure(route: dict, node: dict, hop: dict, reason: str,
@@ -1830,11 +1868,17 @@ def capacity_retry(
         _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
                            reason="capacity-launch-error", detail=type(exc).__name__)
         return "descend", {}, "capacity-launch-error"
-    retry_output = (retry.stdout + retry.stderr).strip()
-    retry_fields = output_fields(retry_output)
+    relay_wrapper_stderr(retry)
+    retry_output = (retry.stdout or "").strip()
+    retry_fields = wrapper_fields(retry)
     attempts.append(
         f"{ordinal}:{tuple_key(row)}:capacity-retry:exit-{retry.returncode}:attempt-{retry_id}"
     )
+    if getattr(retry, "cleanup_incomplete", False):
+        reason = "interrupted" if wrapper_interrupted(retry, retry_fields) else "foreground-output-incomplete"
+        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
+                        retry.returncode, reason, "wrapper output cleanup incomplete")
+        return "cleanup-incomplete", {"attempt_id": retry_id, "_run": retry}, retry_output
     if wrapper_interrupted(retry, retry_fields):
         _failed_attempt(candidate_outcomes, direct_failures, ordinal, key, retry_id,
                         retry.returncode, "interrupted", "capacity retry was stopped")
@@ -1895,6 +1939,12 @@ def report_capacity_stop(state: str, fields: dict, output: str, attempts: list[s
                          rows: CandidateOutcomes, failures: list[dict],
                          route: dict, node: dict, hop: dict, args: argparse.Namespace) -> int:
     """Report either terminal retry result with the same bounded evidence."""
+    if state == "cleanup-incomplete":
+        result = fields["_run"]
+        return report_forwarding_cleanup_incomplete(
+            result, fields["attempt_id"], attempts, args=args, route=route, node=node,
+            output=output, interrupted=wrapper_interrupted(result, wrapper_fields(result)),
+            candidate_outcomes=rows, direct_failures=failures, hop=hop)
     if state == "interrupted":
         return report_interrupted(fields["_run"], output, fields["attempt_id"],
                                   attempts, rows, failures, route, node, hop)
@@ -2281,8 +2331,14 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     continue
                 parent_failure = parent_runtime_failure(args, route, row, parent_identity)
                 if parent_failure and parent_failure not in CANDIDATE_SCOPED_PARENT_FAILURES:
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                       reason=parent_failure)
+                    _record_leg_failure(route, node, hop, parent_failure, "",
+                                        candidate_outcomes, direct_failures)
                     return fail(parent_failure, 73, child_spawned="0",
-                                attempt_trace="|".join(attempts))
+                                attempt_trace="|".join(attempts),
+                                candidate_outcomes=candidate_outcomes,
+                                **_last_failure_fields(direct_failures))
                 if parent_failure:
                     attempts.append(f"{ordinal}:{key}:skipped-{parent_failure}")
                     _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
@@ -2309,7 +2365,13 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     if candidate is not None:
                         args.reviewed_evidence = candidate["path"]
                 except DispatchContractError as exc:
-                    return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
+                    _candidate_outcome(candidate_outcomes, ordinal, key, attempted=False,
+                                       reason=exc.reason, detail=exc.detail)
+                    _record_leg_failure(route, node, hop, exc.reason, exc.detail,
+                                        candidate_outcomes, direct_failures)
+                    return fail(exc.reason, 65, detail=diagnostic_line(exc.detail), child_spawned="0",
+                                candidate_outcomes=candidate_outcomes,
+                                **_last_failure_fields(direct_failures))
 
                 pending_capacity = [
                     item for item in capacity_context(
@@ -2343,7 +2405,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         if retry_output:
                             print(retry_output)
                         return 0
-                    if retry_state in {"interrupted", "fail-closed", "typed-stop"}:
+                    if retry_state in {"interrupted", "fail-closed", "typed-stop", "cleanup-incomplete"}:
                         return report_capacity_stop(
                             retry_state, retry_fields, retry_output, attempts,
                             candidate_outcomes, direct_failures, route, node, hop, args)
@@ -2370,16 +2432,23 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 try:
                     command = wrapper_command(args, route, node, row, ordinal, attempt_id)
                     result = run_wrapper(args, command)
-                    output = (result.stdout + result.stderr).strip()
-                    fields = output_fields(output)
+                    relay_wrapper_stderr(result)
+                    output = (result.stdout or "").strip()
+                    fields = wrapper_fields(result)
                     early = fields.get("early_death", "-")
                     worker_failure = fields.get("worker_failure", "-")
                     attempts.append(f"{ordinal}:{key}:direct:exit-{result.returncode}:attempt-{attempt_id}")
                     interrupted = wrapper_interrupted(result, fields)
                     if getattr(result, "cleanup_incomplete", False):
+                        _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
+                                        attempt_id, result.returncode,
+                                        "interrupted" if interrupted else "foreground-output-incomplete",
+                                        "wrapper output cleanup incomplete")
                         return report_forwarding_cleanup_incomplete(
                             result, attempt_id, attempts, args=args, route=route,
                             node=node, output=output, interrupted=interrupted,
+                            candidate_outcomes=candidate_outcomes,
+                            direct_failures=direct_failures, hop=hop,
                         )
                     if interrupted:
                         _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
@@ -2539,7 +2608,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         if retry_output:
                             print(retry_output)
                         return 0
-                    if retry_state in {"interrupted", "fail-closed", "typed-stop"}:
+                    if retry_state in {"interrupted", "fail-closed", "typed-stop", "cleanup-incomplete"}:
                         return report_capacity_stop(
                             retry_state, retry_fields, retry_output, attempts,
                             candidate_outcomes, direct_failures, route, node, hop, args)
@@ -2554,7 +2623,11 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     print("selected_hop=native-subagent")
                     surface={"codex":"codex-native-subagent","claude":"claude-subagent"}.get(candidate["harness"])
                     if not surface:
-                        return fail("unsupported-native-execution-surface",76,child_spawned="0")
+                        _record_leg_failure(route, node, hop, "unsupported-native-execution-surface", "",
+                                            candidate_outcomes, direct_failures)
+                        return fail("unsupported-native-execution-surface",76,child_spawned="0",
+                                    candidate_outcomes=candidate_outcomes,
+                                    **_last_failure_fields(direct_failures))
                     print(f"execution_surface={surface}")
                     print("registered_worker=0")
                     print("fallback_hop=native-subagent")
@@ -2563,6 +2636,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     print(f"child_proof={proof}")
                     print("attempt_trace=" + "|".join(attempts))
                     _print_candidate_outcomes(candidate_outcomes)
+                    _print_last_failure(direct_failures)
                     print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
                     ledger = record_degradation(
                         route_id=route.get("route_id"), route_node=node.get("id"),
@@ -2572,6 +2646,10 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         detail=proof, attempt_trace="|".join(attempts),
                         candidate_outcomes=candidate_outcomes,
                         candidate_outcomes_omitted=candidate_outcomes.omitted,
+                        last_direct_failure=(
+                            f"{direct_failures[-1]['reason']}:exit-{direct_failures[-1]['exit']}"
+                            if direct_failures else None
+                        ),
                         fallback_ordinal=ordinal, fleet_visibility="degraded",
                         registered_worker=0, route_file=str(args.route),
                         completion_gate=node.get("completion_gate"),

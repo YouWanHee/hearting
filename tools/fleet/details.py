@@ -43,7 +43,9 @@ def _activity(row):
     evidence = getattr(row, "_context_evidence", None)
     return (getattr(row, "_detail_activity_key", None), getattr(row, "updated_at", None),
             getattr(row, "summary_ts", None), getattr(evidence, "sequence", None),
-            json.dumps((getattr(row, "exec_child", None), getattr(row, "exec_tool", None)),
+            json.dumps((getattr(row, "exec_child", None), getattr(row, "exec_tool", None),
+                        getattr(row, "shell_jobs", None),
+                        getattr(row, "shell_job_observation", None)),
                        sort_keys=True, default=str))
 
 
@@ -281,6 +283,11 @@ def merge(basic, detail):
                 # to an unchanged observation, but cannot erase current evidence.
                 if not isinstance(row, Session) and current.exec_tool is None:
                     current.exec_tool = getattr(previous, "exec_tool", None)
+                if not getattr(row, "shell_jobs", None):
+                    current.shell_jobs = list(getattr(previous, "shell_jobs", None) or [])
+                if (not getattr(row, "shell_job_observation", None)
+                        and getattr(previous, "shell_job_observation", None)):
+                    current.shell_job_observation = previous.shell_job_observation
             # Empty success means no summary is available yet, not detail failure.
             # Route-neighbourhood changes gate projections separately from NOW.
             current._details_pending = not same_activity

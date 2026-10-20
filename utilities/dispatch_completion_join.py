@@ -835,6 +835,8 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
         notes = [f"The approved route plan names a next leg (index {child['next_leg']['index']}): "
                  f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
         return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+                "Continue and complete the original user task itself, preserving every explicit content and output-format "
+                "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
                 "Read the exact result and perform the already approved parent review/follow-through in this turn, "
                 "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
                 "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "

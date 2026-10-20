@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -216,6 +217,51 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def _native_queue_fixture(self, thread_id):
+        home = self.root / "native-codex-home"
+        control = home / "app-server-control"
+        sessions = home / "sessions"
+        home.mkdir(mode=0o700)
+        control.mkdir(mode=0o700)
+        sessions.mkdir(mode=0o700)
+        rollout = sessions / "fixture.jsonl"
+        rollout.write_bytes(b"")
+        rollout.chmod(0o600)
+
+        state_path = home / "state_5.sqlite"
+        state = sqlite3.connect(state_path)
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)")
+        state.execute("INSERT INTO threads VALUES (?, ?, 'paginated')",
+                      (thread_id, str(rollout)))
+        state.commit()
+        state.close()
+        state_path.chmod(0o600)
+
+        history_path = home / "thread_history_1.sqlite"
+        history = sqlite3.connect(history_path)
+        history.executescript("""
+            CREATE TABLE thread_turns (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, status TEXT,
+                PRIMARY KEY(thread_id, turn_id)
+            );
+            CREATE TABLE thread_items (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                item_json TEXT NOT NULL, item_type TEXT NOT NULL, rollout_ordinal INTEGER,
+                PRIMARY KEY(thread_id, turn_id, item_id)
+            );
+            CREATE TABLE thread_history_projection_state (
+                thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER,
+                next_rollout_ordinal INTEGER
+            );
+        """)
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?, 0, 0)", (thread_id,))
+        history.commit()
+        history.close()
+        history_path.chmod(0o600)
+        return control / "app-server-control.sock", history_path, rollout
+
     def _fixture_tool_trace(self, fixture, sentinel, *, include_action=True):
         fixture_rel = Path(".agent_reports/native-parent-fixture")
         read_command = f"cat {fixture_rel}/*.md {fixture_rel}/fixture-facts.json"
@@ -246,6 +292,14 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         fixture = fixture or self.fixture
         return self._fixture_tool_trace(
             fixture, sentinel or self.sentinel, include_action=True)
+
+    def _stored_report_fixture(self):
+        root = Path(__file__).resolve().parent / "fixtures" / "codex_parent_completion_replay"
+        facts = json.loads((root / "first-report-facts.json").read_text(encoding="utf-8"))
+        sentinel = facts["after"]["sentinel"]
+        fixture = replay._write_native_fixture(self.worktree, sentinel)
+        self.assertEqual(fixture["facts"]["report"], facts)
+        return root, facts, fixture, sentinel
 
     def _report_text(self, language="en", report=None, fixture=None):
         facts = (fixture or self.fixture)["facts"]["report"]
@@ -280,7 +334,7 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
     @contextmanager
     def _mock_native_runtime(self, output, *, report_pass=True, action_applied=True,
                              extra_history=False, history_error=False,
-                             assert_d1_before_d2=False):
+                             assert_d1_before_d2=False, report_mutator=None):
         state = {"history_calls": 0, "queue_sends": [], "fixture": None,
                  "followthrough_snapshot": None, "d1_before_d2": False,
                  "completion_record": None, "runtime": None, "jobs": None}
@@ -332,6 +386,8 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
                     "Approved. Before after. Checks pass. Synthetic commit deployment serving. "
                     "Production skipped not measured.\nFACTUAL_REPORT_JSON:\n"
                     + json.dumps(fixture["facts"]["report"], ensure_ascii=False))
+            if report_mutator is not None:
+                final_text = report_mutator(final_text)
             continuation_id = "delivery-replay-continuation"
             state["continuation_turn"] = {
                 "id": "continuation-turn", "status": "completed",
@@ -521,6 +577,27 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self._assert_case_records(stored, (
             "d1_first_report", "d2_duplicate_cleanup", "d3_new_conflict",
             "direct_question", "overall_acceptance"))
+
+    def test_run_replay_denied_completion_still_evaluates_later_cases(self):
+        output = self.root / "orchestration-denied-completion"
+        output.mkdir(mode=0o700)
+        denied = lambda report: report.replace(
+            "I completed the already approved isolated parent follow-through",
+            "I did not complete the already approved isolated parent follow-through", 1)
+        with self._mock_native_runtime(output, report_mutator=denied,
+                                      assert_d1_before_d2=True) as native:
+            report = replay._run_replay(output)
+
+        stored = json.loads((output / "replay.json").read_text(encoding="utf-8"))
+        cases = stored["replay_cases"]
+        self.assertTrue(native["d1_before_d2"])
+        self.assertEqual(cases["d1_first_report"]["status"], "FAIL")
+        self.assertFalse(cases["d1_first_report"]["checks"]
+                         ["report_has_substantive_closing_prose"])
+        self.assertEqual(cases["d2_duplicate_cleanup"]["status"], "PASS")
+        self.assertEqual(cases["d3_new_conflict"]["status"], "PASS")
+        self.assertEqual(cases["direct_question"]["status"], "PASS")
+        self.assertEqual(report["verdict"], "FAIL")
 
     def test_run_replay_missing_first_report_still_evaluates_later_cases(self):
         output = self.root / "orchestration-empty-report"
@@ -857,6 +934,351 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertTrue(checks["verifier_script_unchanged"])
         self.assertTrue(checks["followthrough_script_unchanged"])
 
+    def test_saved_original_first_report_is_positive_with_independent_facts(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-positive.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "253c30c510e0ffc6b0c382b841b12d7a3557bdd0a53c27fce3968eb8675a0aab")
+        report = report_bytes.decode("utf-8")
+        self.assertEqual(replay._factual_report_object(report), facts)
+        checks = replay._first_report_checks(
+            report, self._fixture_tool_trace(fixture, sentinel), fixture)
+        for key in ("report_matches_fixture_facts", "report_has_substantive_closing_prose",
+                    "every_exact_artifact_was_read", "fixture_verifier_passed_in_native_tool_trace",
+                    "one_approved_followthrough_tool_invocation",
+                    "followthrough_state_matches_one_time_fixture_action"):
+            self.assertTrue(checks[key], key)
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_saved_original_first_report_accepts_fenced_json_whitespace_variants(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-positive.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "253c30c510e0ffc6b0c382b841b12d7a3557bdd0a53c27fce3968eb8675a0aab")
+        report = report_bytes.decode("utf-8")
+        fence_open = "FACTUAL_REPORT_JSON:\n```json\n"
+        self.assertEqual(report.count(fence_open), 1)
+        tools = self._fixture_tool_trace(fixture, sentinel)
+
+        for label, leading_whitespace in (("blank line", "\n"), ("indentation", "  ")):
+            with self.subTest(leading_whitespace=label):
+                varied_report = report.replace(
+                    fence_open, fence_open + leading_whitespace, 1)
+                self.assertEqual(
+                    varied_report.replace(fence_open + leading_whitespace, fence_open, 1),
+                    report)
+                self.assertEqual(replay._factual_report_object(varied_report), facts)
+                checks = replay._first_report_checks(varied_report, tools, fixture)
+                for key in (
+                        "report_matches_fixture_facts", "report_has_substantive_closing_prose",
+                        "every_exact_artifact_was_read",
+                        "fixture_verifier_passed_in_native_tool_trace",
+                        "one_approved_followthrough_tool_invocation",
+                        "followthrough_state_matches_one_time_fixture_action"):
+                    self.assertTrue(checks[key], key)
+                self.assertTrue(all(checks["prose_content_checks"].values()))
+                self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_saved_positive_semantic_mutations_keep_facts_and_tool_trace_constant(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report = (root / "first-report-positive.txt").read_bytes().decode("utf-8")
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        prose, json_tail = report.split(marker, 1)
+        tools = self._fixture_tool_trace(fixture, sentinel)
+
+        def check_mutation(name, mutated_prose, key, expected):
+            with self.subTest(name=name):
+                checks = replay._first_report_checks(mutated_prose + marker + json_tail,
+                                                     tools, fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["every_exact_artifact_was_read"])
+                self.assertTrue(checks["fixture_verifier_passed_in_native_tool_trace"])
+                self.assertTrue(checks["one_approved_followthrough_tool_invocation"])
+                self.assertTrue(checks["followthrough_state_matches_one_time_fixture_action"])
+                self.assertEqual(checks["prose_content_checks"].get(key,
+                                                                     checks["synthetic_value_checks"].get(
+                                                                         key.removeprefix("id_"))), expected)
+                self.assertEqual(checks["report_has_substantive_closing_prose"], expected)
+                return checks
+
+        alternatives = (
+            ("before did not exist", prose.replace(
+                "Before: no follow-through file, action count 0.",
+                "Before: the follow-through file did not exist, action count 0."),
+             "describes_before_state_and_zero_actions"),
+            ("before was not present", prose.replace(
+                "Before: no follow-through file, action count 0.",
+                "Before: the follow-through file was not present, action count 0."),
+             "describes_before_state_and_zero_actions"),
+            ("six passed without zero failures", prose.replace(
+                "passing 6 checks with 0 failures", "passing all 6 checks"),
+             "reports_six_check_verification_result"),
+        )
+        for name, mutated, key in alternatives:
+            self.assertNotEqual(mutated, prose)
+            checks = check_mutation(name, mutated, key, True)
+            self.assertTrue(all(checks["prose_content_checks"].values()))
+            self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+        unrelated_negation = prose.replace(
+            "All seven artifacts were read in the specified order.",
+            "An unrelated task did not complete. All seven artifacts were read in the specified order.", 1)
+        unrelated_checks = check_mutation("unrelated negation does not deny follow-through",
+                                          unrelated_negation, "explains_fixture_reason", True)
+        self.assertTrue(all(unrelated_checks["prose_content_checks"].values()))
+
+        values = facts["synthetic_values"]
+        ids = {key: replay._expected_identifier(key, value) for key, value in values.items()}
+        group_qualified = (prose.replace(
+            "Synthetic commit:", "All displayed values are synthetic fixture data. Commit:", 1)
+            .replace("Synthetic deployment:", "Deployment:", 1)
+            .replace("Synthetic serving:", "Serving:", 1))
+        grouped = check_mutation("one qualifier for adjacent role values", group_qualified,
+                                 "names_actual_synthetic_values", True)
+        self.assertEqual(grouped["synthetic_value_checks"],
+                         {key: True for key in ("commit", "deployment", "serving")})
+        unqualified = group_qualified.replace("All displayed values are synthetic fixture data. ", "", 1)
+        unqualified_checks = replay._first_report_checks(unqualified + marker + json_tail,
+                                                         tools, fixture)
+        self.assertEqual(unqualified_checks["synthetic_value_checks"],
+                         {key: False for key in ids})
+        self.assertFalse(unqualified_checks["report_has_substantive_closing_prose"])
+
+        denied = prose.replace("Completed the approved synthetic fixture follow-through",
+                               "Did not complete the approved synthetic fixture follow-through", 1)
+        denied_checks = replay._first_report_checks(denied + marker + json_tail, tools, fixture)
+        self.assertTrue(denied_checks["report_matches_fixture_facts"])
+        self.assertTrue(denied_checks["every_exact_artifact_was_read"])
+        self.assertTrue(denied_checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertFalse(denied_checks["prose_content_checks"]["explains_fixture_reason"])
+        self.assertFalse(denied_checks["report_has_substantive_closing_prose"])
+
+        operating_change = prose.replace(
+            "No real commit, PR, CI, deployment, production serving, or operating state was changed or measured.",
+            "Production serving was changed, but no CI run, PR, or deployment was changed or measured.", 1)
+        operating_checks = replay._first_report_checks(
+            operating_change + marker + json_tail, tools, fixture)
+        self.assertTrue(operating_checks["report_matches_fixture_facts"])
+        self.assertTrue(operating_checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertFalse(operating_checks["prose_content_checks"]
+                         ["states_fixture_skip_and_operating_limit"])
+        self.assertFalse(operating_checks["report_has_substantive_closing_prose"])
+
+        double_negative = prose.replace(
+            "Before: no follow-through file, action count 0.",
+            "Before: the follow-through file was not absent, action count 0.", 1)
+        double_negative_checks = replay._first_report_checks(
+            double_negative + marker + json_tail, tools, fixture)
+        self.assertFalse(double_negative_checks["prose_content_checks"]
+                         ["describes_before_state_and_zero_actions"])
+        reversed_state = prose.replace("Before: no follow-through file",
+                                       "Before: the follow-through file was present", 1)
+        reversed_checks = replay._first_report_checks(reversed_state + marker + json_tail,
+                                                      tools, fixture)
+        self.assertFalse(reversed_checks["prose_content_checks"]
+                         ["describes_before_state_and_zero_actions"])
+
+        failed_verification = prose.replace("passing 6 checks with 0 failures",
+                                            "failing 2 of 6 checks", 1)
+        failed_checks = replay._first_report_checks(failed_verification + marker + json_tail,
+                                                    tools, fixture)
+        self.assertFalse(failed_checks["prose_content_checks"]
+                         ["reports_six_check_verification_result"])
+        wrong_count = prose.replace("passing 6 checks with 0 failures",
+                                    "passing 5 checks with 0 failures", 1)
+        wrong_count_checks = replay._first_report_checks(wrong_count + marker + json_tail,
+                                                         tools, fixture)
+        self.assertFalse(wrong_count_checks["prose_content_checks"]
+                         ["reports_six_check_verification_result"])
+
+    def test_korean_absence_double_negation_and_denied_completion(self):
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        report = self._report_text(language="ko")
+        prose, json_tail = report.split(marker, 1)
+        tools = self._valid_tool_trace()
+
+        for name, old, new in (
+            ("did not exist", "후속 파일이 없고", "후속 파일이 존재하지 않았고"),
+            ("was not present", "후속 파일이 없고", "후속 파일이 있지 않았고"),
+        ):
+            with self.subTest(name=name):
+                mutated = prose.replace(old, new, 1)
+                checks = replay._first_report_checks(mutated + marker + json_tail,
+                                                     tools, self.fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["prose_content_checks"]
+                                ["describes_before_state_and_zero_actions"])
+                self.assertTrue(checks["report_has_substantive_closing_prose"])
+
+        for name, replacement in (
+            ("없지 않", "후속 파일이 없지 않았고"),
+            ("존재하지 않는 것은 아니다", "후속 파일이 존재하지 않는 것은 아니고"),
+        ):
+            with self.subTest(name=name):
+                mutated = prose.replace("후속 파일이 없고", replacement, 1)
+                checks = replay._first_report_checks(mutated + marker + json_tail,
+                                                     tools, self.fixture)
+                self.assertFalse(checks["prose_content_checks"]
+                                 ["describes_before_state_and_zero_actions"])
+                self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        denied = prose.replace(
+            "이미 승인된 후속 작업을 마치기 위해 정확한 결과를 읽고 처리했습니다.",
+            "이미 승인된 후속 작업을 완료하지 않았기 때문에 정확한 결과를 읽고 처리했습니다.", 1)
+        denied_checks = replay._first_report_checks(denied + marker + json_tail,
+                                                    tools, self.fixture)
+        self.assertFalse(denied_checks["prose_content_checks"]["explains_fixture_reason"])
+        self.assertFalse(denied_checks["report_has_substantive_closing_prose"])
+
+        operating_change = prose.replace(
+            "실제 운영 endpoint, 배포, commit, CI, PR 상태를 측정하거나 변경하지 않았습니다.",
+            "실제 운영 serving 상태는 변경되었지만 CI, PR 및 배포는 측정하거나 변경하지 않았습니다.", 1)
+        operating_checks = replay._first_report_checks(
+            operating_change + marker + json_tail, tools, self.fixture)
+        self.assertFalse(operating_checks["prose_content_checks"]
+                         ["states_fixture_skip_and_operating_limit"])
+
+    def test_saved_previous_short_report_remains_negative_with_valid_facts(self):
+        root, facts, fixture, sentinel = self._stored_report_fixture()
+        report_bytes = (root / "first-report-negative.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(report_bytes).hexdigest(),
+                         "cf8d6b7ef114cf9e137d43c7f4fcc9875b99e8ec8d919d94bf82f82767a108c3")
+        report = report_bytes.decode("utf-8")
+        tools = self._fixture_tool_trace(fixture, sentinel)
+        checks = replay._first_report_checks(report, tools, fixture)
+        self.assertIsNone(replay._factual_report_object(report))
+        self.assertFalse(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        with_valid_facts = (report.rstrip() + "\nFACTUAL_REPORT_JSON:\n"
+                            + json.dumps(facts, ensure_ascii=False))
+        checks = replay._first_report_checks(with_valid_facts, tools, fixture)
+        self.assertTrue(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+        self.assertFalse(checks["prose_content_checks"]["names_actual_synthetic_values"])
+
+    def test_factual_report_accepts_plain_or_fenced_json_and_rejects_invalid_payloads(self):
+        facts = self.fixture["facts"]["report"]
+        plain = "FACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False)
+        fenced = "FACTUAL_REPORT_JSON:\n```json\n" + json.dumps(facts, indent=2) + "\n```\n"
+        fenced_blank_line = "FACTUAL_REPORT_JSON:\n```json\n\n" + json.dumps(facts) + "\n```"
+        fenced_indented = "FACTUAL_REPORT_JSON:\n```json\n  " + json.dumps(facts) + "\n```"
+        bare_fence = "FACTUAL_REPORT_JSON:\n```\n" + json.dumps(facts) + "\n```"
+        for text in (plain, fenced, fenced_blank_line, fenced_indented, bare_fence):
+            with self.subTest(text=text[:40]):
+                self.assertEqual(replay._factual_report_object(text), facts)
+        for payload in ("```json\n{\n```", "```json\n{}", "[1, 2]", "null", "{} trailing"):
+            with self.subTest(payload=payload):
+                self.assertIsNone(replay._factual_report_object(
+                    "FACTUAL_REPORT_JSON:\n" + payload))
+
+    def test_natural_labels_and_unadorned_identifiers_are_accepted(self):
+        facts = self.fixture["facts"]["report"]
+        values = facts["synthetic_values"]
+        identifiers = {key: replay._expected_identifier(key, value)
+                       for key, value in values.items()}
+        prose = (
+            "I completed the approved follow-through to finish the isolated parent replay.\n"
+            "Before the action, no follow-through file existed and the action count was zero.\n"
+            "After the action, the follow-through file exists and the action count is one.\n"
+            "Verification passed all six checks with zero failures.\n"
+            f"Synthetic commit: `{identifiers['commit']}`.\n"
+            f"Synthetic deployment: `{identifiers['deployment']}`.\n"
+            f"Synthetic serving: `{identifiers['serving']}` (not probed).\n"
+            "Production deployment and serving checks were skipped.\n"
+            "No production operating state was changed or measured.\n"
+            "This isolated Codex replay tests delivery and reporting only."
+        )
+        report = prose + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False)
+        checks = replay._first_report_checks(report, self._valid_tool_trace(), self.fixture)
+        self.assertTrue(checks["report_has_substantive_closing_prose"])
+        self.assertTrue(all(checks["prose_content_checks"].values()))
+        self.assertTrue(all(checks["synthetic_value_checks"].values()))
+
+    def test_identifier_negation_mutation_and_reversed_states_are_rejected(self):
+        facts = self.fixture["facts"]["report"]
+        tools = self._valid_tool_trace()
+        values = facts["synthetic_values"]
+        deployment_id = replay._expected_identifier("deployment", values["deployment"])
+        baseline = self._report_text()
+
+        wrong_id = baseline.replace(deployment_id, deployment_id + "-wrong", 1)
+        checks = replay._first_report_checks(wrong_id, tools, self.fixture)
+        self.assertTrue(checks["report_matches_fixture_facts"])
+        self.assertFalse(checks["synthetic_value_checks"]["deployment"])
+        self.assertFalse(checks["report_has_substantive_closing_prose"])
+
+        negated_id = baseline.replace(
+            f"deployment value is {values['deployment']}",
+            f"deployment value is not {values['deployment']}", 1)
+        checks = replay._first_report_checks(negated_id, tools, self.fixture)
+        self.assertFalse(checks["synthetic_value_checks"]["deployment"])
+
+        reversed_states = baseline.replace(
+            "the follow-through file was absent", "the follow-through file was present", 1).replace(
+            "the file was present and", "the file was absent and", 1)
+        self.assertNotEqual(reversed_states, baseline)
+        checks = replay._first_report_checks(reversed_states, tools, self.fixture)
+        self.assertFalse(checks["prose_content_checks"]["describes_before_state_and_zero_actions"])
+
+        negated_verification = baseline.replace(
+            "passed all six checks", "did not pass all six checks", 1)
+        checks = replay._first_report_checks(negated_verification, tools, self.fixture)
+        self.assertFalse(checks["prose_content_checks"]["reports_six_check_verification_result"])
+
+    def test_content_mutations_fail_while_valid_json_and_tool_evidence_stay_intact(self):
+        tools = self._valid_tool_trace()
+        values = self.fixture["facts"]["report"]["synthetic_values"]
+        ids = {key: replay._expected_identifier(key, value) for key, value in values.items()}
+        text = self._report_text().split("\nFACTUAL_REPORT_JSON:\n", 1)[0]
+        ko = self._report_text(language="ko").split("\nFACTUAL_REPORT_JSON:\n", 1)[0]
+        swap = text.replace(ids["commit"], "@@").replace(ids["deployment"], ids["commit"]).replace(
+            "@@", ids["deployment"])
+        cases = (
+            ("commit missing", text.replace(ids["commit"], "unknown"), "names_actual_synthetic_values"),
+            ("commit longer fake", text.replace(ids["commit"], ids["commit"] + "x"),
+             "names_actual_synthetic_values"),
+            ("roles swapped", swap, "names_actual_synthetic_values"),
+            ("serving negated", text.replace("serving value is", "serving value is not"),
+             "names_actual_synthetic_values"),
+            ("ko deployment wrong", ko.replace(ids["deployment"], ids["deployment"] + "9"),
+             "names_actual_synthetic_values"),
+            ("reason missing", text.replace("I completed the already approved isolated parent "
+                                            "follow-through after reading the exact result. ", ""),
+             "explains_fixture_reason"),
+            ("before/after missing", text.replace("Before the action", "Earlier").replace(
+                "after the action", "later").replace("the follow-through file was absent and", "x"),
+             "describes_before_state_and_zero_actions"),
+            ("count reversed", text.replace("count was 0", "count was 1", 1).replace(
+                "count was 1.", "count was 0.", 1), "describes_before_state_and_zero_actions"),
+            ("verification failed", text.replace("passed all six checks with 0 failed",
+                                                 "failed 2 of six checks"),
+             "reports_six_check_verification_result"),
+            ("skip missing", text.replace("Production deployment and serving checks were skipped. ", ""),
+             "states_fixture_skip_and_operating_limit"),
+            ("production changed", text.replace("was changed or measured", "was changed and measured")
+             .replace("No production endpoint", "A production endpoint"),
+             "states_fixture_skip_and_operating_limit"),
+            ("scope limit missing", text.replace("This isolated Codex replay tests delivery and "
+                                                 "reporting only.", ""),
+             "states_isolated_replay_scope_limit"),
+        )
+        marker = "\nFACTUAL_REPORT_JSON:\n"
+        json_tail = marker + json.dumps(self.fixture["facts"]["report"], ensure_ascii=False)
+        for name, mutated, key in cases:
+            with self.subTest(name):
+                self.assertNotEqual(mutated, text if "ko" not in name else ko)
+                mutated = mutated + json_tail
+                checks = replay._first_report_checks(mutated, tools, self.fixture)
+                self.assertTrue(checks["report_matches_fixture_facts"])
+                self.assertTrue(checks["every_exact_artifact_was_read"])
+                self.assertFalse(checks["report_has_substantive_closing_prose"])
+                failed = [k for k, v in {**checks["prose_content_checks"],
+                                         **{f"id_{k}": v for k, v in
+                                            checks["synthetic_value_checks"].items()}}.items() if not v]
+                self.assertTrue(failed, name)
+
     def test_keyword_presence_cannot_substitute_for_factual_values_or_action_trace(self):
         tools = self._valid_tool_trace()
         facts = self.fixture["facts"]
@@ -906,6 +1328,40 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertTrue(all(checks["prose_content_checks"].values()))
         self.assertTrue(all(checks["synthetic_value_checks"].values()))
 
+    def test_natural_multisentence_prose_is_independent_of_exact_json(self):
+        facts = self.fixture["facts"]["report"]
+        values = facts["synthetic_values"]
+        prose = (
+            "I read the exact result. I completed the already approved follow-through after reading it "
+            "so the requested task could be fulfilled.\n"
+            "Before, the follow-through file was absent and the approved action count was 0. "
+            "Afterward, the file was present and the approved action count was 1.\n"
+            "Verification with verify_fixture.py passed all six checks; 0 failed.\n"
+            f"The synthetic commit value is {values['commit']}. "
+            f"The synthetic deployment value is {values['deployment']}. "
+            f"The synthetic serving value is {values['serving']}.\n"
+            "Production deployment and serving checks were skipped. "
+            "No production operating state was changed or measured. "
+            "This isolated Codex replay tests delivery and reporting only."
+        )
+        tools = self._valid_tool_trace()
+        without_json = replay._first_report_checks(prose, tools, self.fixture)
+        with_json = replay._first_report_checks(
+            prose + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False),
+            tools, self.fixture)
+        self.assertTrue(without_json["report_has_substantive_closing_prose"])
+        self.assertTrue(with_json["report_has_substantive_closing_prose"])
+        self.assertFalse(without_json["report_matches_fixture_facts"])
+        self.assertTrue(with_json["report_matches_fixture_facts"])
+        self.assertEqual(without_json["prose_content_checks"], with_json["prose_content_checks"])
+
+        wrong_value = prose.replace(values["deployment"], "wrong-deployment-value")
+        wrong = replay._first_report_checks(
+            wrong_value + "\nFACTUAL_REPORT_JSON:\n" + json.dumps(facts, ensure_ascii=False),
+            tools, self.fixture)
+        self.assertFalse(wrong["report_has_substantive_closing_prose"])
+        self.assertFalse(wrong["synthetic_value_checks"]["deployment"])
+
     def test_compound_shell_results_do_not_prove_verifier_or_action_success(self):
         tools = self._valid_tool_trace()
         verifier = next(item for item in tools if item["id"] == "verify-1")
@@ -948,6 +1404,66 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         action["commandActions"] = [{"command": action_command, "type": "unknown"}]
         checks = replay._first_report_checks(self._report_text(), tools, self.fixture)
         self.assertFalse(checks["one_approved_followthrough_tool_invocation"])
+
+    def test_verifier_marker_and_success_must_belong_to_the_same_invocation(self):
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        marker = "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+        failed_with_marker = {
+            **verifier, "id": "verify-failed-with-marker", "status": "failed",
+            "exitCode": 1, "aggregatedOutput": marker,
+        }
+        successful_without_marker = {
+            **verifier, "id": "verify-success-without-marker", "status": "completed",
+            "exitCode": 0, "aggregatedOutput": "unrelated output",
+        }
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], failed_with_marker, successful_without_marker],
+            self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(len(checks["verifier_invocations"]), 2)
+        self.assertTrue(checks["verifier_invocations"][0]["output_marker_observed"])
+        self.assertFalse(checks["verifier_invocations"][0]["tool_succeeded"])
+        self.assertFalse(checks["verifier_invocations"][1]["output_marker_observed"])
+        self.assertTrue(checks["verifier_invocations"][1]["tool_succeeded"])
+
+    def test_compound_shell_uses_only_matching_per_action_result_and_output(self):
+        tools = self._valid_tool_trace()
+        verifier = next(item for item in tools if item["id"] == "verify-1")
+        script = ".agent_reports/native-parent-fixture/verify_fixture.py"
+        command = f"python3 -B {script}; echo unrelated"
+        marker = "FIXTURE_VERIFICATION=PASS checks=6 failed=0"
+        compound = {
+            **verifier, "command": "/usr/bin/zsh -lc " + json.dumps(command),
+            "commandActions": [
+                {"command": f"python3 -B {script}", "cwd": str(self.worktree),
+                 "type": "unknown", "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": marker},
+                {"command": "echo unrelated", "cwd": str(self.worktree),
+                 "type": "unknown", "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": "unrelated"},
+            ],
+            "aggregatedOutput": marker + "\nunrelated",
+            "status": "completed", "exitCode": 0,
+        }
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], compound], self.fixture)
+        self.assertTrue(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertTrue(checks["verifier_invocations"][0]["execution_result_proven"])
+
+        mixed = {
+            **compound,
+            "commandActions": [
+                {**compound["commandActions"][0], "status": "failed", "exitCode": 1},
+                {**compound["commandActions"][0], "status": "completed", "exitCode": 0,
+                 "aggregatedOutput": "no marker"},
+            ],
+        }
+        mixed["command"] = "/usr/bin/zsh -lc " + json.dumps(f"python3 -B {script}; python3 -B {script}")
+        checks = replay._first_report_checks(
+            self._report_text(), [*tools[:2], mixed], self.fixture)
+        self.assertFalse(checks["fixture_verifier_passed_in_native_tool_trace"])
+        self.assertEqual(len(checks["verifier_invocations"]), 2)
 
     def test_duplicate_identical_action_entries_are_counted_separately(self):
         tools = self._valid_tool_trace()
@@ -992,10 +1508,11 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         courier = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = courier
         spec.loader.exec_module(courier)
+        queue_socket, native_history_path, native_rollout = self._native_queue_fixture("idle-parent")
         watcher_args = SimpleNamespace(
             jobs=jobs.resolve(), parent_session_id="idle-parent",
             sealed_batch_id=metadata["managed_sealed_batch_id"],
-            interval=0.05, queue_socket=Path("/isolated-native-queue.sock"),
+            interval=0.05, queue_socket=queue_socket,
         )
         watcher = courier.NoticeWatcher(watcher_args, {attempt}, capability=None)
         cleanup_path = pending.record_path(self.root, "idle-parent", cleanup["delivery_id"])
@@ -1044,25 +1561,125 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
         self.assertNotEqual(late["delivery_id"], completion["delivery_id"])
         self.assertEqual(pending.read(self.root, "idle-parent", cleanup["delivery_id"])["expiry_reason"],
                          "supervision-resolved")
-        native_turn = {"id": "isolated-native-turn-1", "status": "completed"}
         late_path = pending.record_path(self.root, "idle-parent", late["delivery_id"])
-        with mock.patch.object(courier.codex_queue_delivery, "send_at_least_once", return_value={
-                 "status": "queued", "already_pending": False,
-                 "queued_submission_id": "isolated-native-turn-1"}) as late_send, \
-             mock.patch.object(courier.codex_queue_delivery, "list_queue", return_value=[]), \
-             mock.patch.object(courier.codex_queue_delivery, "find_turn_by_client_message_id",
-                 return_value=native_turn) as late_find:
+        queue = courier.codex_queue_delivery
+        notice_context = courier.notice_receipt.context(
+            late["receipt"], courier.notice_receipt.gateway_delivery_id(late["receipt"]))
+        additional = notice_context.get("additionalContext")
+        notice_values = [value.get("value") for value in additional.values()
+                         if isinstance(value, dict) and isinstance(value.get("value"), str)] \
+            if isinstance(additional, dict) else []
+        self.assertEqual(len(notice_values), 1)
+        notice_text = notice_values[0]
+        native_turn_id = "isolated-native-turn-1"
+        native_requests = []
+        prepared_fences = []
+        observation_statuses = []
+        observed_turns = []
+        events = []
+        expected_native_item = {
+            "type": "userMessage", "clientId": late["delivery_id"],
+            "content": [{"type": "text", "text": notice_text, "text_elements": []}],
+        }
+
+        def fake_rpc(path, method, params, *, timeout, session=None):
+            native_requests.append((method, dict(params)))
+            if method == "thread/queue/list":
+                return {"data": []}
+            if method == "thread/turns/list":
+                return {"data": [{"id": "isolated-prior-turn", "status": "completed"}]}
+            if method != "thread/queue/add":
+                self.fail(f"unexpected native queue RPC: {method}")
+
+            record = pending.read(self.root, "idle-parent", late["delivery_id"])
+            identity = pending.submission_fence_identity(record, params.get("threadId"))
+            fence = pending.read_submission_fence(
+                self.root, "idle-parent", late["delivery_id"], expected_identity=identity)
+            prepared_fences.append(fence.get("state") if fence else None)
+
+            submitted_input = params.get("input")
+            native_content = [
+                {**item, "text_elements": item.get("text_elements", [])}
+                for item in submitted_input if isinstance(item, dict)
+            ] if isinstance(submitted_input, list) else []
+            native_item = {
+                "type": "userMessage", "clientId": params.get("clientUserMessageId"),
+                "content": native_content,
+            }
+            history = sqlite3.connect(native_history_path)
+            history.execute("INSERT INTO thread_turns VALUES (?, ?, 'completed')",
+                            (params.get("threadId"), native_turn_id))
+            history.execute(
+                "INSERT INTO thread_items VALUES (?, ?, ?, ?, 'userMessage', 1)",
+                (params.get("threadId"), native_turn_id, "isolated-native-item-1",
+                 json.dumps(native_item, ensure_ascii=False)),
+            )
+            history.execute(
+                "UPDATE thread_history_projection_state "
+                "SET next_rollout_byte_offset = ?, next_rollout_ordinal = 2 WHERE thread_id = ?",
+                (native_rollout.stat().st_size, params.get("threadId")),
+            )
+            history.commit()
+            history.close()
+            events.append("queue-add-accepted")
+            return {"queuedSubmission": {"id": native_turn_id}}
+
+        real_observe = queue._observe_peer_message
+
+        def observe_native_history(*args, **kwargs):
+            observation = real_observe(*args, **kwargs)
+            observation_statuses.append(observation.status)
+            if observation.status == "matched":
+                observed_turns.append(observation.turn)
+                events.append("exact-consumption-observed")
+            return observation
+
+        real_send = queue.send_at_least_once
+        real_ack = pending.ack
+
+        def ack_after_exact_consumption(*args, **kwargs):
+            self.assertIn("exact-consumption-observed", events)
+            events.append("acked")
+            return real_ack(*args, **kwargs)
+
+        with ExitStack() as stack:
+            late_send = stack.enter_context(mock.patch.object(
+                queue, "send_at_least_once", wraps=real_send))
+            native_rpc = stack.enter_context(mock.patch.object(
+                queue, "_rpc", side_effect=fake_rpc))
+            native_observe = stack.enter_context(mock.patch.object(
+                queue, "_observe_peer_message", side_effect=observe_native_history))
+            late_ack = stack.enter_context(mock.patch.object(
+                pending, "ack", side_effect=ack_after_exact_consumption))
             watcher._one(late_path)
+
         late_send.assert_called_once()
-        late_find.assert_called_once()
-        self.assertEqual(late_find.call_args.args[0:2],
-                         (watcher_args.queue_socket, "idle-parent"))
-        self.assertEqual(late_find.call_args.args[2], late["delivery_id"])
-        self.assertEqual(late_find.call_args.kwargs["timeout"], 5.0)
+        self.assertEqual(late_send.call_args.kwargs["message"], notice_text)
+        self.assertTrue(late_send.call_args.kwargs["require_message_match"])
+        self.assertTrue(callable(late_send.call_args.kwargs["before_add"]))
+        self.assertEqual([method for method, _params in native_requests], [
+            "thread/queue/list", "thread/turns/list", "thread/queue/add", "thread/queue/list",
+        ])
+        add_params = next(params for method, params in native_requests if method == "thread/queue/add")
+        self.assertEqual(add_params, {
+            "threadId": "idle-parent", "clientUserMessageId": late["delivery_id"],
+            "input": [{"type": "text", "text": notice_text}],
+        })
+        self.assertEqual(prepared_fences, ["prepared"])
+        self.assertEqual(observation_statuses, ["not_observed", "not_observed", "matched"])
+        self.assertEqual(native_observe.call_count, 3)
+        self.assertEqual([turn["id"] for turn in observed_turns], [native_turn_id])
+        self.assertEqual(observed_turns[0]["items"], [expected_native_item])
+        self.assertEqual(events, ["queue-add-accepted", "exact-consumption-observed", "acked"])
+        late_ack.assert_called_once()
         late_record = pending.read(self.root, "idle-parent", late["delivery_id"])
         self.assertEqual(late_record["state"], "acked")
         self.assertEqual(late_record["acked_by"], watcher.owner)
-        self.assertEqual(native_turn["status"], "completed")
+        fence_identity = pending.submission_fence_identity(late_record, "idle-parent")
+        accepted_fence = pending.read_submission_fence(
+            self.root, "idle-parent", late["delivery_id"], expected_identity=fence_identity)
+        self.assertEqual(accepted_fence["state"], "accepted")
+        self.assertEqual(accepted_fence["queue_submission_id"], native_turn_id)
         old_after_conflict = pending.read(self.root, "idle-parent", completion["delivery_id"])
         self.assertEqual(pending.received_ack_identity(
             old_after_conflict, "idle-parent", completion["delivery_id"]), old_ack)

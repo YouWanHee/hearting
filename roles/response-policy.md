@@ -215,9 +215,13 @@ an unnecessary question just to make the UI more visible.
   detail in existing evidence and refer to it only when useful. Preserve exact
   typed handoff acceptance commands and predecessor duties. Read exact completion
   results and carry out approved review/follow-through now or through the
-  existing registered continuation. Receipt, queue consumption, and ACK are not
-  work; report actual chronology. Once that exact result has been reviewed and
-  its approved follow-through completed, an automatic repeat or cleanup-only
+  existing registered continuation. A continuation keeps the original accepted
+  user task and every requested output constraint intact; the receipt is
+  supplemental context, not a replacement or a reason to narrow the task. Do
+  not assume the original user message was physically deleted; use the exact
+  source turn available to the continuation. Receipt, queue consumption, and
+  ACK are not work; report actual chronology. Once that exact result has been
+  reviewed and its approved follow-through completed, an automatic repeat or cleanup-only
   notice does not ask for the same response or action again. Keep a new failure,
   conflict, unfinished work, missing first consumption, and a real authority
   decision visible; answer a direct user status question.

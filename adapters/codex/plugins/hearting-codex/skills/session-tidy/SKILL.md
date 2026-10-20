@@ -86,6 +86,15 @@ Example fields (use the user's language):
 
 Continue with the existing enqueue and handoff flow. An ordinary peer message or card grants no successor authority and has no session-tidy accept command. A confirmed same-seat clear continues through the existing seat snapshot and handover ledger without peer acceptance. For a typed cross-seat session-tidy handoff, read the card and referenced documents, then use only the exact receiver command supplied by shared guidance. Delivery, queue consumption and ACK are receipt facts, not acceptance; the existing explicit acceptance still revalidates the current receiver and preserves the original requester, predecessor and successor lifetimes and completion delivery.
 
+The same-seat snapshot carries already valid steward evidence and unresolved exact watch
+references separately from registered bindings, including when the binding list is empty.
+The common handover ledger preserves the original evidence generation, target, watch ID,
+and registered storage/receipt identity while resolving the confirmed current holder.
+Marker bytes are never copied to a successor session. A card, ordinary message, registered
+batch or display alias cannot create the role. Release takes priority for role continuity,
+while an accepted unresolved watch remains owned until its existing settlement or receipt
+condition is met.
+
 Peer messages and `이어서해` select the exact native session through the
 existing harness carrier. A queued message remains owned by its pending record
 until that session's native consumer records the exact reference. Unsupported

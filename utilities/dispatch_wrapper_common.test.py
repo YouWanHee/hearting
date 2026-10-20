@@ -61,6 +61,34 @@ class WrapperCommonTest(unittest.TestCase):
         self.assertEqual(C._route_guard_refusal('{"status":"blocked","reason":"safe","detail":"x\\ny"}'),
                          ("safe", "x y"))
 
+    def test_guard_detail_cannot_inject_receipt_fields_or_terminal_controls(self):
+        detail = 'cherry-pick\u2028reason=forged\x1b[31m\x00\x85started=1'
+        reason, bounded = C._route_guard_refusal(json.dumps(
+            dict(status='blocked', reason='unsafe-git-operation', detail=detail)))
+        self.assertEqual(reason, 'unsafe-git-operation')
+        self.assertEqual(len(bounded.splitlines()), 1)
+        self.assertNotIn('\x1b', bounded)
+        self.assertNotIn('\x00', bounded)
+
+    def test_guard_parser_rejects_mixed_output_and_non_ascii_reasons(self):
+        refusal = dict(status='blocked', reason='unsafe-git-operation', detail='cherry-pick')
+        generic = ('worker-route-validation-failed', 'guard output lacked a typed refusal')
+        for value in [json.dumps(refusal)+'\nraw log',
+                      json.dumps(refusal)+'\n'+json.dumps(refusal),
+                      json.dumps({**refusal, 'reason': 'unsaf\u00e9-git-operation'})]:
+            with self.subTest(value=value):
+                self.assertEqual(C._route_guard_refusal(value), generic)
+
+    def test_guard_parser_checks_exit_and_existing_identity_without_new_inputs(self):
+        refusal = dict(status='blocked', reason='future-refusal', detail='future detail',
+                       route_id='rt-other')
+        generic = ('worker-route-validation-failed', 'guard output lacked a typed refusal')
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), returncode=1), generic)
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), route_id='rt-current'), generic)
+        refusal['route_id'] = 'unknown'
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), route_id='rt-current'),
+                         ('future-refusal', 'future detail'))
+
     def test_route_validation_receipt_uses_guard_reason(self):
         from unittest import mock
         import subprocess

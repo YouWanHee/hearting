@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dispatch_contract import resolve_agent_home as _resolve_agent_home  # noqa: E402
 from dispatch_contract import resolve_dispatch_state_root as _resolve_dispatch_state_root  # noqa: E402
+from dispatch_contract import bounded_candidate_outcomes, candidate_detail, diagnostic_token  # noqa: E402
 
 _KINDS = {"degradation", "chain-exhausted", "leg-failure", "writer-unregistered"}
 _HOPS = {"same-harness-headless", "cross-harness-headless", "native-subagent", "inline"}
@@ -98,31 +99,14 @@ def record_degradation(*, route_id=None, route_node=None, route_hash=None, dispa
             if key in row:
                 row[key] = _clip(row[key], limit)
         if "candidate_outcomes" in row:
-            if not isinstance(row["candidate_outcomes"], list):
-                row.pop("candidate_outcomes")
-            else:
-                outcomes = row["candidate_outcomes"]
-                omitted = len(outcomes) - min(len(outcomes), 32)
-                bounded = []
-                for item in outcomes[:32]:
-                    if not isinstance(item, dict):
-                        omitted += 1
-                        continue
-                    bounded.append({
-                        "ordinal": item.get("ordinal") if isinstance(item.get("ordinal"), int) else 0,
-                        "tuple": _clip(item.get("tuple", ""), 160),
-                        "attempted": item.get("attempted") is True,
-                        "attempt_id": _clip(item.get("attempt_id", ""), 120),
-                        "exit": _clip(item.get("exit", ""), 16),
-                        "reason": _clip(item.get("reason", ""), 160),
-                        "detail": _clip(item.get("detail", ""), 512),
-                    })
-                row["candidate_outcomes"] = bounded
-                try:
-                    omitted += max(0, int(row.get("candidate_outcomes_omitted", 0)))
-                except (TypeError, ValueError):
-                    pass
-                row["candidate_outcomes_omitted"] = omitted
+            row["candidate_outcomes"], row["candidate_outcomes_omitted"] = bounded_candidate_outcomes(
+                row["candidate_outcomes"], row.get("candidate_outcomes_omitted", 0))
+            if "detail" in row:
+                row["detail"] = candidate_detail(row.get("reason", ""), row["detail"])
+        if "last_direct_failure" in row:
+            if not isinstance(row["last_direct_failure"], str):
+                return None
+            row["last_direct_failure"] = diagnostic_token(row["last_direct_failure"], 256)
         row["event_id"] = fields.get("event_id") or _event_id(row)
         payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         filename = route_id + ".jsonl" if isinstance(route_id, str) and route_id else "_unattributed.jsonl"

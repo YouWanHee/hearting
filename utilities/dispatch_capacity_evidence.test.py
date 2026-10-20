@@ -64,6 +64,28 @@ class QuotaEvidenceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split() for line in result.stdout.splitlines())
 
+    def test_opencode_hard_hold_requires_every_automatic_model_to_be_unavailable(self):
+        import model_profile
+        import opencode_runtime
+        selected = {"model": "opencode-go/model", "budget": "high"}
+        with mock.patch.object(model_profile, "resolve_runtime_profile",
+                               return_value=(selected, object())), \
+             mock.patch.object(opencode_runtime, "automatic_candidates", return_value=[
+                 {"model": "opencode-go/model", "state": "unavailable"},
+                 {"model": "opencode/beam-free", "state": "unavailable"},
+                 {"model": "openai/gpt-6.1-sol", "state": "unavailable"},
+             ]):
+            state = Q._opencode_model_state("balanced", self.env)
+            self.assertTrue(state.startswith("limited(provider-model-unavailable:"), state)
+            self.assertIn("opencode-go-unavailable", state)
+        with mock.patch.object(model_profile, "resolve_runtime_profile",
+                               return_value=(selected, object())), \
+             mock.patch.object(opencode_runtime, "automatic_candidates", return_value=[
+                 {"model": "opencode-go/model", "state": "unavailable"},
+                 {"model": "opencode/beam-free", "state": "unknown"},
+             ]):
+            self.assertIsNone(Q._opencode_model_state("balanced", self.env))
+
     def test_actual_usage_consumer_overrides_positive_gauge_without_mutating_evidence(self):
         before = (self.jobs.read_bytes(), self.log.read_bytes(), self.config.read_bytes())
         states = self.states()

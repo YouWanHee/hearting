@@ -50,13 +50,19 @@ runtime feature is undocumented or missing.
 
 ## Investigated OpenCode Native Surfaces
 
-Investigated against OpenCode 1.17.x via the published config schema
-(`https://opencode.ai/config.json`), the `opencode` CLI help output, the
-`opencode debug` subcommands, and the built-in `customize-opencode` skill
-documentation.
+V1 surfaces were previously checked against the 1.17.x runtime. V2 contracts
+are compared against official V2 CLI, config, permissions, providers, API,
+Promise plugin, and CLI plugin documentation plus the pinned
+`anomalyco/opencode@v2.0.32` implementation. This source inspection is not
+native installed-runtime execution; the 2.0.32 service, guard, and resume
+results remain a supervisor verification item.
 
 | OpenCode runtime surface | Native? | Adapter source / projection |
 |---|---|---|
+| `run` CLI and model syntax | yes | V1 uses `--dir` / `--variant`; V2 uses process cwd, `--format json`, and `provider/model#variant`; `--pure` is V1-only |
+| Background service and session environment | yes | V2 local clients discover the shared service, which owns sessions, credentials, config, permissions, and tools; `run` forwards its environment to the exact session |
+| Session persistence and event observation | yes | V1 session/message tables remain supported; V2 uses `session_v2` and ordered `session_message.seq`; Hearting reads exact sids through bounded read-only queries and preserves unknown on ambiguity |
+| Credential store | yes | CLI version selects V1/V2 behavior independently of database schema; V1 reads legacy auth.json, while V2 reads active opencode OAuth for Go usage first, then an opencode-go key only if OAuth is absent, and legacy auth as the final compatibility tier. Rejected active credentials do not fall through. Reads are bounded/read-only; worker homes never link or copy opencode.db |
 | Project config (`opencode.json` / `opencode.jsonc` / `.opencode/opencode.json`) | yes | user-owned; adapter merges `skills.paths`, and the bootstrap `instructions` entry only when the config-home `AGENTS.md` auto-load is absent |
 | Global config (`~/.config/opencode/opencode.json`) | yes | user-owned; adapter documents projection entries |
 | Bootstrap auto-load (`<config-home>/AGENTS.md`) | yes | `adapters/opencode/AGENTS.md`, linked by `harness runtime activate`; the single bootstrap carrier (`core/ADAPTATION.md §6.1`) |
@@ -65,11 +71,11 @@ documentation.
 | Skills (`.opencode/skill/<name>/SKILL.md` or `.opencode/skills/<name>/SKILL.md`) | yes | `adapters/opencode/skills/<name>/SKILL.md` generated from `capabilities/` |
 | External skill autoload (`~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`) | yes (compat) | not relied on; adapter must generate its own skills, not depend on Claude skill autoload |
 | Agents (`.opencode/agent/<name>.md` or `.opencode/agents/<name>.md`) | yes | `adapters/opencode/agents/<name>/<name>.md` generated from `roles/README.md` role profiles, plus an explicit `EXTRA_AGENTS` out-of-catalog path in `adapters/opencode/bin/sync-native-agents.py` (e.g. `memory-scout`, sourced from `core/MEMORY.md` §7.4 rather than a role-catalog row), with `mode: subagent` |
-| Plugin hooks (JS/TS: `tool.execute.before`, `tool.execute.after`, `event`, `config`, `chat.message`, `command.execute.before`, `permission.ask`, `shell.env`, ...) | yes | `adapters/opencode/plugins/hearting-guards.js` records spec reads and design saves after tool execution; its `shell.env` blanks the inherited `AGENT_DISPATCH_CALLER_HARNESS` and other harnesses' session IDs in tool commands and sets `OPENCODE_SESSION_ID` and `AGENT_PARENT_COMPLETION_CARRIER`; its `opencode-turn` carrier starts an idle parent's next turn with the completion records owed to it (`core/ADAPTATION.md` §7.4) |
-| Permission model (`permission` config: `allow`/`ask`/`deny` per tool, per-agent override) | yes | adapter documents recommended permission rules; not a harness guard replacement |
+| Server plugin hooks | yes | V1 returned hook map at `plugins/hearting-guards.js`; V2 Promise setup at `plugins/hearting-guards/index.ts` ports tool, shell, session, and event hooks |
+| Permission model | versioned | V1 uses `permission` tool maps; V2 uses ordered `permissions` and policy rules. `dispatch-headless.py` translates the existing scoped grant into V2 actions |
 | Permission contract wrapper | yes | `adapters/opencode/bin/preflight.sh permissions` reports native permission surfaces and rejects Claude `allowedTools` as a portable contract |
 | MCP servers (`mcp` config: local/remote) | yes | `adapters/opencode/bin/preflight.sh mcp` reports native MCP surfaces and rejects Claude `settings.json` MCP payloads as a portable contract |
-| Model selection (`model`, `small_model`, per-agent `model`, `variant`) | yes | `adapters/opencode/bin/role-map.sh` resolves portable roles to model/variant |
+| Model selection (`model`, per-agent `model`, variant) | yes | `adapters/opencode/bin/role-map.sh` resolves portable roles; V2 provider/model suffix syntax and scoped eligibility are normalized by `utilities/opencode_runtime.py` |
 | Statusline / footer | no user shell surface | TUI footer is native; harness status signals stay instruction-only/preflight |
 | Shell hooks (Claude-style `settings.json` hook events) | no | harness guards run as explicit preflight wrappers |
 
@@ -181,12 +187,33 @@ the background after writes and stale reads. `session.compacted` empties the
 session's candidate display history through `mem.py _seen-reset`; a new
 session ID starts empty on its own.
 
+### OpenCode V2 server plugin
+
+The legacy hook table below describes the V1 `server()` entrypoint. V2 loads
+`adapters/opencode/plugins/hearting-guards/index.ts`, whose default definition
+uses the Promise API `setup(ctx)` and registers `ctx.tool`, `ctx.shell`,
+`ctx.session`, and `ctx.event` hooks. The flat `hearting-guards.js` file keeps
+the V1 `server()` export. The global installer projects both paths so OpenCode
+V2's package-directory discovery can find the V2 entrypoint.
+
+V2 worker sessions are identified from their exact native session title/agent;
+the shared service process environment is not treated as worker identity.
+Worker prompt, context, idle, and delete lifecycle hooks are silent no-ops.
+The V2 tool-before hook still applies the common core-write and route-presence
+guards. Successful and typed provider HTTP outcomes feed the existing scoped
+eligibility cache without storing response bodies or credentials.
+
+The terminal client plugin API is separate (`cli.json`, `@opencode/plugin/tui`).
+The current adapter does not port external Herdr TUI code to that API. V2
+session/environment forwarding and native permission enforcement still need
+same-head verification by the supervisor; fixture registration is not native
+guard evidence.
+
 ## Parity Status vs Claude
 
-Goal of this adapter is harness behavior parity on OpenCode. The hard guard
-invariants Claude enforces through `settings.json` hooks are enforced here
-through the plugin and throw to abort, and the prompt/session lifecycle
-injections are auto-applied. The table records the current state.
+Goal of this adapter is harness behavior parity on OpenCode. The table records
+the retained V1 hook-map path. V2 uses the Promise plugin realization above;
+the harness does not claim V2 TUI/status parity before native verification.
 
 Registered headless launches allow native reads of the sealed agent home's
 `capabilities/` directory (including its canonical symlink target), while
@@ -295,13 +322,13 @@ Harness-specific status signals need OpenCode-native realization:
 | loop guidance | Run `adapters/opencode/bin/preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` before following loop guides; OpenCode reports manual contracts, missing implementations, and drill auto-run restrictions without executing loop scripts. The `note` loop and note semantics are application-owned; the harness exposes only the optional app-neutral `artifact-sink` port |
 | worklog state signal | Run `adapters/opencode/bin/preflight.sh worklog [cwd]` to inspect configured `<agent-notes-root>` / `<worklog-board-app>` paths read-only before OpenCode updates notes or diagnoses board state |
 | role profiles | Read `roles/README.md`, then run `adapters/opencode/bin/preflight.sh role <portable-role>` to resolve OpenCode model/variant settings |
-| permission mapping | Run `adapters/opencode/bin/preflight.sh permissions` to inspect the OpenCode native permission contract and confirm Claude `allowedTools` is unsupported |
+| permission mapping | Run `adapters/opencode/bin/preflight.sh permissions` to inspect V1 `permission` or V2 ordered `permissions` and confirm Claude `allowedTools` is unsupported |
 | MCP mapping | Run `adapters/opencode/bin/preflight.sh mcp --check` to inspect OpenCode's native MCP CLI/config surface; do not copy Claude `settings.json` MCP registrations or project `tools/design-mcp` wholesale |
-| headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` before OpenCode `run` dispatch; it checks the worktree, command availability, and installed runtime projection without launching. The dispatch surface accepts `--model-profile deep|balanced-deep|light|mini` independently of optional behavioral `--model-role`. A route-bound profile resolves through `config/models.conf`; `_kernel/owner` rejects a stage `worker_mode` and may be profile-only, caller model/variant replacement is denied, and substantive registered `mini` is denied. OpenCode's `variant` axis is verified (2026-09-30, headless `opencode run --variant`), so the shipped tiers separate by variant as well as model: `balanced-deep`, `light` and `mini` are declared tiers (`mini` is the light model one variant step lower), `balanced` collapses into `light` (`collapsed-balanced-to-light`), and `deep`/`top` collapse into `balanced-deep` because no deep tier is declared (`collapsed-deep-to-balanced-deep`, `collapsed-top-to-balanced-deep`). A route-sealed `compose --pin` model is applied by the wrapper (`model_source=pin`). `runtime-default` is represented by omitting `--variant`. Registry/Fleet keeps capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same projection check; liveness, harvest, merge, and cleanup boundaries remain unchanged |
+| headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` to verify the worktree, command availability, and both guard entrypoints. V1 retains `--dir`/`--variant`; V2 uses process cwd, JSON events, exact `--session` resume, and `provider/model#variant`. `runtime-default` omits the V1 flag or V2 suffix. Route pins stay exact; automatic provider fallback consumes scoped eligibility. |
 | QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps the shared QA assurance budget to OpenCode role checks and fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` preserves the core split: an explicit graph takes precedence over the default recipe; QA only scales selected checks |
 | role modes | Read `roles/MODES.md`, then run `adapters/opencode/bin/preflight.sh mode-info <family/mode>`; treat adapter-coupled modes as unsupported unless wrappers exist, obey `fallback=reference-only`, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
 | capabilities | Read `capabilities/README.md`, then run `adapters/opencode/bin/preflight.sh capability-info <capability>`; do not assume Claude Skill invocation |
-| runtime qualifiers (unverified/unsupported) | The installed OpenCode version is unpinned. `shell.env`'s `sessionID` is **undocumented in the published plugin docs** and only typed `sessionID?` in the upstream `dev` source, so its runtime availability is unverified; the sessionless-compile path is the designed fallback. The `shell` tool alias, stable `tool.execute.after` exit metadata, and plugin coverage of `task`-spawned subagent tool calls remain unverified. The returned-hook-map shape this work targets is the current/legacy OpenCode plugin API; an OpenCode V2 plugin API with a different beta registration shape is a distinct, unverified migration risk, alongside the existing "installed OpenCode version is unpinned" qualifier |
+| runtime qualifiers (unverified/unsupported) | V2 Promise server hooks and session-message reads are implemented from the pinned API, but same-head service resume, worker environment propagation, native permission enforcement, and observer/liveness behavior still need supervisor evidence. The V2 server plugin has no TUI/pane publisher API; external Herdr TUI compatibility is not claimed. Missing API/DB rows and absent plugin markers remain unknown, never dead evidence |
 
 ## Model Mapping
 

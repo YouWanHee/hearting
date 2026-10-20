@@ -1538,15 +1538,246 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                  }), \
                  mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
                  mock.patch.object(module.pending_delivery, "ack") as ack, \
-                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once") as send, \
+                 mock.patch.object(module.pending_delivery, "submission_fence_identity",
+                                   return_value={"test": "identity"}), \
+                 mock.patch.object(module.pending_delivery, "read_submission_fence",
+                                   return_value={"state": "accepted"}), \
+                 mock.patch.object(module.pending_delivery, "record_submission_accepted"), \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                   return_value={"status": "queued", "already_pending": True}) as send, \
                  mock.patch.object(module.codex_queue_delivery, "list_queue", return_value=[item]):
                 watcher._one(path)
-            send.assert_called_once_with(
-                args.queue_socket, thread_id=SESSION, client_message_id=delivery_id,
-                message="typed notice", timeout=5.0,
-            )
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[:1], (args.queue_socket,))
+            self.assertEqual(send.call_args.kwargs["thread_id"], SESSION)
+            self.assertEqual(send.call_args.kwargs["client_message_id"], delivery_id)
+            self.assertEqual(send.call_args.kwargs["message"], "typed notice")
+            self.assertFalse(send.call_args.kwargs["allow_add"])
+            self.assertFalse(send.call_args.kwargs["retry_ambiguous"])
+            self.assertTrue(send.call_args.kwargs["require_message_match"])
+            self.assertTrue(callable(send.call_args.kwargs["before_add"]))
             ambiguous.assert_called_once()
             ack.assert_not_called()
+
+    def test_native_queue_notice_ack_requires_exact_consumed_message(self) -> None:
+        module = load_completion_module()
+        for consumed in (None, {"id": "turn-exact", "status": "completed"}):
+            with self.subTest(consumed=consumed is not None), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                jobs = root / "jobs.log"
+                jobs.write_text("", encoding="utf-8")
+                delivery_id = "delivery-" + ("a" if consumed is None else "b") * 32
+                receipt = {
+                    "schema_version": 1, "kind": "supervision",
+                    "owner_attempt_id": "att-owner", "sealed_batch_id": "batch-exact",
+                }
+                path = root / "delivery-notice.json"
+                path.write_text(json.dumps({
+                    "delivery_id": delivery_id, "state": "pending", "receipt": receipt,
+                }), encoding="utf-8")
+                args = SimpleNamespace(
+                    queue_socket=Path("/tmp/app-server.sock"), jobs=jobs,
+                    parent_session_id=SESSION, sealed_batch_id="batch-exact",
+                    interval=0.1,
+                )
+                with mock.patch.object(module.notice_receipt, "validate_pending_record"), \
+                     mock.patch.object(module.notice_receipt, "context", return_value={
+                         "additionalContext": {"notice": {"value": "exact notice body"}},
+                     }), \
+                     mock.patch.object(module.notice_receipt, "gateway_delivery_id",
+                                       return_value="notice-id"), \
+                     mock.patch.object(module, "queue_target", return_value=SESSION), \
+                     mock.patch.object(module.pending_delivery, "claim", return_value={
+                         "delivery_id": delivery_id, "state": "claimed", "receipt": receipt,
+                     }), \
+                     mock.patch.object(module.pending_delivery, "submission_fence_identity",
+                                       return_value={"test": "identity"}), \
+                     mock.patch.object(module.pending_delivery, "read_submission_fence",
+                                       return_value={"state": "accepted", "attempt": 1}), \
+                     mock.patch.object(module.pending_delivery, "record_submission_accepted"), \
+                     mock.patch.object(module.pending_delivery, "record_send"), \
+                     mock.patch.object(module.pending_delivery, "release_claim"), \
+                     mock.patch.object(module.pending_delivery, "mark_sent_ambiguous"), \
+                     mock.patch.object(module.pending_delivery, "ack") as ack, \
+                     mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                       return_value={"status": "queued", "already_pending": True}), \
+                     mock.patch.object(module.codex_queue_delivery, "list_queue", return_value=[]), \
+                     mock.patch.object(module.codex_queue_delivery, "_known_consumed",
+                                       return_value=consumed) as observed:
+                    module.NoticeWatcher(args, {"att-owner"}, capability=None)._one(path)
+                observed.assert_called_once_with(
+                    args.queue_socket, SESSION, delivery_id, timeout=5.0,
+                    strict_history=True, expected_message="exact notice body",
+                )
+                if consumed is None:
+                    ack.assert_not_called()
+                else:
+                    ack.assert_called_once()
+
+    def test_notice_fence_write_failure_stops_before_queue_add(self) -> None:
+        module = load_completion_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            delivery_id = "delivery-" + "c" * 32
+            receipt = {
+                "schema_version": 1, "kind": "supervision",
+                "owner_attempt_id": "att-owner", "sealed_batch_id": "batch-exact",
+            }
+            path = root / "delivery-notice.json"
+            path.write_text(json.dumps({
+                "delivery_id": delivery_id, "state": "pending", "receipt": receipt,
+            }), encoding="utf-8")
+            args = SimpleNamespace(
+                queue_socket=Path("/tmp/app-server.sock"), jobs=jobs,
+                parent_session_id=SESSION, sealed_batch_id="batch-exact",
+                interval=0.1,
+            )
+            queue_adds = []
+
+            def queue_send(*_args, **kwargs):
+                kwargs["before_add"]()
+                queue_adds.append(kwargs["client_message_id"])
+                return {"status": "queued", "already_pending": False}
+
+            with mock.patch.object(module.notice_receipt, "validate_pending_record"), \
+                 mock.patch.object(module.notice_receipt, "context", return_value={
+                     "additionalContext": {"notice": {"value": "typed notice"}},
+                 }), \
+                 mock.patch.object(module.notice_receipt, "gateway_delivery_id",
+                                   return_value="notice-id"), \
+                 mock.patch.object(module, "queue_target", return_value=SESSION), \
+                 mock.patch.object(module.pending_delivery, "claim", return_value={
+                     "delivery_id": delivery_id, "state": "claimed", "receipt": receipt,
+                 }), \
+                 mock.patch.object(module.pending_delivery, "submission_fence_identity",
+                                   return_value={"test": "identity"}), \
+                 mock.patch.object(module.pending_delivery, "read_submission_fence",
+                                   return_value=None), \
+                 mock.patch.object(module.pending_delivery, "prepare_submission_fence",
+                                   side_effect=module.pending_delivery.PendingDeliveryError(
+                                       "delivery-persistence-refused", "forced")), \
+                 mock.patch.object(module.pending_delivery, "reclaim"), \
+                 mock.patch.object(module.pending_delivery, "release_claim"), \
+                 mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
+                 mock.patch.object(module.pending_delivery, "ack") as ack, \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                   side_effect=queue_send) as send:
+                module.NoticeWatcher(args, {"att-owner"}, capability=None)._one(path)
+
+            send.assert_called_once()
+            self.assertEqual(queue_adds, [])
+            ambiguous.assert_not_called()
+            ack.assert_not_called()
+
+    def test_notice_fence_survives_accepted_before_record_crash_and_new_watcher_reclaim(self) -> None:
+        module = load_completion_module()
+        pending = module.pending_delivery
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            delivery_id = "delivery-" + "a" * 32
+            receipt = {
+                "schema_version": 1, "kind": "supervision",
+                "owner_attempt_id": "att-owner", "sealed_batch_id": "batch-exact",
+            }
+
+            def create_notice(selected_id, selected_receipt):
+                return pending.create(
+                    root, recipient_kind="codex-native-queue", recipient_key=SESSION,
+                    delivery_id=selected_id, session_generation="1",
+                    session_generation_supported="1", attempt_ids=["att-owner"],
+                    parent_attempt_id="att-owner", route_id="rt-notice",
+                    route_node="execute", receipt=selected_receipt,
+                    receipt_digest=pending._canonical_receipt_digest(selected_receipt),
+                    row_revisions={"att-owner": selected_receipt["sealed_batch_id"]},
+                )
+
+            create_notice(delivery_id, receipt)
+            initial = pending.claim(
+                root, SESSION, delivery_id, claim_owner="crashed-watcher",
+                lease_seconds=0.01, require_generation_proof=True,
+                live_recipient_generation=(SESSION, "1"), jobs=jobs,
+                retry_context=f"{SESSION}:1:{SESSION}")
+            fence_identity = pending.submission_fence_identity(initial, SESSION)
+            pending.prepare_submission_fence(
+                root, SESSION, delivery_id, claim_owner="crashed-watcher",
+                expected_identity=fence_identity)
+            accepted_adds = [delivery_id]  # The queue accepted after the durable pre-add fence.
+            initial_deadline = initial["claim_deadline_ns"]
+
+            args = SimpleNamespace(
+                queue_socket=Path("/tmp/app-server.sock"), jobs=jobs,
+                parent_session_id=SESSION, sealed_batch_id="batch-exact",
+                interval=0.1,
+            )
+            observed_calls = []
+            current_delivery = []
+
+            def queue_observation(*_args, **kwargs):
+                observed_calls.append(kwargs)
+                current_delivery.append(kwargs["client_message_id"])
+                if kwargs["allow_add"]:
+                    kwargs["before_add"]()
+                    accepted_adds.append(kwargs["client_message_id"])
+                    return {"status": "queued", "queued_submission_id": "queue-new",
+                            "already_pending": False}
+                raise module.codex_queue_delivery.QueueDeliveryError(
+                    "queue-add-previously-unconfirmed", ambiguous=True)
+
+            with mock.patch.object(module.notice_receipt, "validate_pending_record"), \
+                 mock.patch.object(module.notice_receipt, "context", return_value={
+                     "additionalContext": {"notice": {"value": "typed notice"}},
+                 }), \
+                 mock.patch.object(module.notice_receipt, "gateway_delivery_id",
+                                   return_value="notice-id"), \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                   side_effect=queue_observation), \
+                 mock.patch.object(module.codex_queue_delivery, "list_queue",
+                                   side_effect=lambda _socket, _thread_id, **_kw: [
+                                       {"id": "queue-new",
+                                        "clientUserMessageId": current_delivery[-1]}]), \
+                 mock.patch.object(module, "queue_target", return_value=SESSION):
+                watcher = module.NoticeWatcher(args, {"att-owner"}, capability=None)
+                with mock.patch.object(module.time, "monotonic_ns",
+                                       return_value=initial_deadline + 1):
+                    watcher._one(pending.record_path(root, SESSION, delivery_id))
+                self.assertEqual(pending.read_submission_fence(
+                    root, SESSION, delivery_id,
+                    expected_identity=fence_identity)["state"], "prepared")
+
+                retry = json.loads(pending.courier_retry_path(
+                    pending.record_path(root, SESSION, delivery_id)).read_text())["retry"]
+                with mock.patch.object(module.time, "time_ns",
+                                       return_value=retry["next_attempt_at_ns"] + 1):
+                    module.NoticeWatcher(args, {"att-owner"}, capability=None)._one(
+                        pending.record_path(root, SESSION, delivery_id))
+                self.assertEqual(pending.read_submission_fence(
+                    root, SESSION, delivery_id,
+                    expected_identity=fence_identity)["state"], "prepared")
+
+                new_id = "delivery-" + "b" * 32
+                new_receipt = {**receipt, "sealed_batch_id": "batch-new-conflict"}
+                create_notice(new_id, new_receipt)
+                module.NoticeWatcher(args, {"att-owner"}, capability=None)._one(
+                    pending.record_path(root, SESSION, new_id))
+                self.assertEqual(pending.read_submission_fence(
+                    root, SESSION, new_id,
+                    expected_identity=pending.submission_fence_identity(
+                        pending.read(root, SESSION, new_id), SESSION))["state"], "accepted")
+
+            self.assertEqual(accepted_adds, [delivery_id, new_id])
+            self.assertEqual(len(observed_calls), 3)
+            self.assertFalse(observed_calls[0]["allow_add"])
+            self.assertFalse(observed_calls[1]["allow_add"])
+            self.assertTrue(observed_calls[2]["allow_add"])
+            self.assertTrue(all(not call["retry_ambiguous"] for call in observed_calls))
+            old_record = pending.read(root, SESSION, delivery_id)
+            self.assertEqual(old_record["state"], "pending")
+            self.assertIsNone(old_record["acked_at_ns"])
+            self.assertEqual(pending.read(root, SESSION, new_id)["state"], "pending")
 
 
 if __name__ == "__main__":

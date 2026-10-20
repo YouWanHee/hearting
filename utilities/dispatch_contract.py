@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+import unicodedata
 from typing import Callable, Iterator, Mapping, NamedTuple
 from types import MappingProxyType
 
@@ -2793,6 +2794,88 @@ ROUTE_STATE_REFUSAL_REASONS = (
     "round-unsettled",
 )
 
+# Receipts and the ledger carry the same bounded facts, never a clipped copy
+# of a child's output. Keep this at their shared boundary, including callers
+# which write candidate evidence directly without going through fallback.
+CANDIDATE_PAYLOAD_BYTES = 32 * 1024
+_DIAGNOSTIC_COUNT_MAX = 2**31 - 1
+_DIAGNOSTIC_DETAILS = frozenset({
+    "", "merge", "rebase", "cherry-pick", "HEAD cannot be resolved",
+    "wrapper timed out", "capacity retry was stopped", "capacity death",
+    "existing retry is terminal", "existing retry has no attempt ID",
+    "duplicate attempt claimed", "duplicate claim has no row",
+    "open", "running", "done", "unknown", "watchdog fallback",
+    "the call was stopped, so the worker was stopped with it",
+    "sealed parent identity is not the live dispatch-depth-1 owner",
+    "OSError", "ValueError", "TimeoutExpired", "PermissionError", "FileNotFoundError",
+    "[detail omitted]", "detached HEAD",
+})
+
+
+def diagnostic_line(value: object, limit: int = 512) -> str:
+    """A display line cannot introduce receipt keys or terminal controls."""
+    if not isinstance(value, str):
+        return ""
+    value = "".join(" " if unicodedata.category(ch).startswith("C") else ch
+                    for ch in value[:limit * 2])
+    return " ".join(value.split())[:limit]
+
+
+def diagnostic_token(value: object, limit: int = 160) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value[:limit]
+    return value if re.fullmatch(r"[A-Za-z0-9._:/-]*", value) else ""
+
+
+def candidate_detail(reason: str, value: object) -> str:
+    """Only finite local facts may persist; unknown free text is omitted."""
+    if not isinstance(value, str):
+        return ""
+    if value in _DIAGNOSTIC_DETAILS:
+        return value
+    if reason == "unsafe-git-state" and value.startswith("detached HEAD in "):
+        return "detached HEAD"
+    return "[detail omitted]"
+
+
+def candidate_count(value: object) -> int:
+    return min(max(value, 0), _DIAGNOSTIC_COUNT_MAX) if type(value) is int else 0
+
+
+def bounded_candidate_outcomes(values: object, omitted: object = 0) -> tuple[list, int]:
+    """Normalize untrusted candidate input and bound its serialized size."""
+    count = candidate_count(omitted)
+    if not isinstance(values, list):
+        return [], count
+    count = candidate_count(count + max(0, len(values) - 32))
+    rows = []
+    for item in values[:32]:
+        if not isinstance(item, dict):
+            count = candidate_count(count + 1)
+            continue
+        attempted = item.get("attempted") is True
+        reason = diagnostic_token(item.get("reason", ""))
+        exit_code = item.get("exit", "")
+        if type(exit_code) is int:
+            exit_code = str(exit_code) if -999 <= exit_code <= 999 else ""
+        exit_code = diagnostic_token(exit_code, 16)
+        rows.append({
+            "ordinal": (item["ordinal"] if type(item.get("ordinal")) is int
+                        and 0 <= item["ordinal"] <= _DIAGNOSTIC_COUNT_MAX else 0),
+            "tuple": diagnostic_token(item.get("tuple", "")),
+            "attempted": attempted,
+            "attempt_id": diagnostic_token(item.get("attempt_id", ""), 120) if attempted else "",
+            "exit": exit_code if attempted else "",
+            "reason": reason,
+            "detail": candidate_detail(reason, item.get("detail", "")),
+        })
+    # ensure_ascii=True is the larger of the receipt and ledger encodings.
+    while len(json.dumps(rows).encode("utf-8")) > CANDIDATE_PAYLOAD_BYTES:
+        rows.pop()
+        count = candidate_count(count + 1)
+    return rows, count
+
 
 def route_state_next_action(reason: str, detail: str, route_file: str | None,
                              node) -> str:
@@ -3097,9 +3180,24 @@ def _forked_across_uid_boundary(entry: Path, tail) -> bool:
     return real_uid != os.getuid() and parent_start <= start
 
 
+def _in_user_manager_scope(entry: Path) -> bool:
+    """Whether this process lives in the user's service manager scope.
+
+    systemd starts `systemd --user` and its `(sd-pam)` helper from PID 1 straight into
+    `user@<uid>.service/init.scope`, and both are non-dumpable. A fork inherits its parent's
+    cgroup, so an attempt's descendant sits in its session or app scope, never there; the
+    birth rule cannot help because the manager restarts on a later login."""
+    try:
+        cgroups = (entry / "cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    scope = f"/user@{os.getuid()}.service/init.scope"
+    return any(line.rpartition(":")[2].endswith(scope) for line in cgroups.splitlines())
+
+
 def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
-    """Only another UID, a fork across a UID boundary, or an adjacent stable birth observation
-    may exclude denial."""
+    """Only another UID, a fork across a UID boundary, the user's service manager scope, or an
+    adjacent stable birth observation may exclude denial."""
     try:
         if entry.stat().st_uid != os.getuid():
             return "", ""
@@ -3122,6 +3220,8 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     except (OSError, IndexError, ValueError):
         stable, tail = "", None
     if tail is not None and _forked_across_uid_boundary(entry, tail):
+        return "", ""
+    if _in_user_manager_scope(entry):
         return "", ""
     return stable, f"procfs-environ:{entry.name}:same-uid-unobservable"
 

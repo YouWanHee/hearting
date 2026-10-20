@@ -2701,6 +2701,11 @@ check_opencode_native_plugin_projection() {
   for entry in $plugin_entries; do
     case "$entry" in
       hearting-guards.js|herdr-agent-state.js) ;;
+      hearting-guards)
+        if [ ! -f adapters/opencode/plugins/hearting-guards/index.ts ]; then
+          fail_msg "adapters/opencode/plugins/hearting-guards/index.ts is missing"
+        fi
+        ;;
       *) fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection" ;;
     esac
   done

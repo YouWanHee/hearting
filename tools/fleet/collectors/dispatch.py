@@ -65,11 +65,13 @@ except Exception:  # a monitor must never fail to import over a read helper
 
 from .. import gitinfo
 from .. import model
-from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
+from ..model import (DONE_AFTERGLOW_MIN, ContextEvidence, DispatchJob,
+                     etime_to_min, project_of)
 from ..token_budget import (context_policy_snapshot, context_policy_used_pct,
                             parse_codex_token_count, telemetry_from_explicit)
 from . import procscan
 from . import parse_cache
+from . import shell_jobs
 
 _AUTOPILOT = re.compile(r"/autopilot-([a-z-]+)")
 _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
@@ -95,12 +97,6 @@ _MANAGED_SIDECAR_RE = re.compile(
     r"^(.*/\.harness/managed-sessions/[^/]+)/managed-sidecars/[^/]+$"
 )
 _TERMINAL_REGISTRY_STATUSES = frozenset(("done", "killed", "cancelled"))
-# F-46 (v29): a `done` row lingers this long as a display-only afterglow row — the job-row
-# mirror of the group cooling window (render `_COOL_WINDOW_MIN`). Rationale: a multi-minute
-# quick dispatch used to evaporate the instant it finished, so the user read it as "never
-# ran". `killed`/`cancelled` are NOT afterglow (they keep the existing stale/dead path):
-# an interrupted attempt is not a completion worth lingering on.
-DONE_AFTERGLOW_MIN = 15
 _PID_HOST_NAMESPACE_PROOF = "nspid-procfs-root-v1"
 _DEGRADATION_CACHE = {}
 _DEGRADATION_CACHE_LIMIT = 128
@@ -704,13 +700,10 @@ def _codex_job_liveness(cwd, now, stale_min=15, profile=None, slug=None,
 
 
 def _opencode_db():
-    explicit = os.environ.get("OPENCODE_DB")
-    if explicit:
-        return explicit
-    data_home = os.environ.get("OPENCODE_DATA_HOME")
-    if data_home:
-        return os.path.join(data_home, "opencode.db")
-    return os.path.expanduser("~/.local/share/opencode/opencode.db")
+    if str(_ROOT / "utilities") not in sys.path:
+        sys.path.insert(0, str(_ROOT / "utilities"))
+    import opencode_runtime
+    return str(opencode_runtime.opencode_db_path())
 
 
 def _opencode_to_seconds(ts):
@@ -742,40 +735,53 @@ def _opencode_job_liveness(cwd, now, stale_min=15, slug=None, job=None):
         db = os.path.join(runtime_dir, "data", "opencode", "opencode.db")
     if not os.path.exists(db):
         return "unknown"
-    con = None
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
-        rows = con.execute(
-            """
-            SELECT
-              s.directory,
-              MAX(
-                s.time_updated,
-                COALESCE((SELECT MAX(time_updated) FROM message WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_updated) FROM part WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_updated) FROM session_message WHERE session_id = s.id), 0),
-                COALESCE((SELECT MAX(time_created) FROM session_input WHERE session_id = s.id), 0)
-              ) AS last_updated
-            FROM session s
-            ORDER BY last_updated DESC
-            """
-        )
-        newest = None
-        for row in rows:
-            if _same_path(row[0], cwd):
-                newest = _opencode_to_seconds(row[1])
-                break
+        import opencode_runtime
+        session_id = ""
+        attempt_id = getattr(job, "attempt_id", None)
+        registry_path = getattr(job, "_registry_path", None)
+        if attempt_id and registry_path:
+            try:
+                from opencode_session_runtime import read_binding
+                from types import SimpleNamespace
+                session_id = read_binding(SimpleNamespace(
+                    jobs=registry_path, parent_attempt_id=attempt_id, worktree=cwd))
+            except Exception:
+                session_id = ""
+        if not session_id and job is not None:
+            try:
+                from opencode_server_log import bind_session
+                session_id = bind_session(getattr(job, "log_file", None)) or ""
+            except Exception:
+                session_id = ""
+        if session_id:
+            observation = opencode_runtime.read_session_observation(session_id, db_path=db)
+        else:
+            candidates = opencode_runtime.list_session_candidates(cwd, db_path=db, limit=2)
+            if len(candidates) != 1:
+                observation = {"state": "unknown", "reason": "session-ambiguous-or-unobserved"}
+            else:
+                candidate = candidates[0]
+                observation = opencode_runtime.read_session_observation(
+                    candidate["id"], db_path=db, generation=candidate.get("generation"))
+        if observation.get("state") != "observed":
+            newest = None
+        else:
+            session = observation.get("session") or {}
+            if session.get("directory") and not _same_path(session["directory"], cwd):
+                return "unknown"
+            stamp = session.get("time_updated") or 0
+            for message in observation.get("messages") or ():
+                stamp = max(stamp, message.get("updated") or message.get("created") or 0)
+            newest = _opencode_to_seconds(stamp) if stamp else None
     except Exception:
         newest = None
-    finally:
-        if con is not None:
-            con.close()
     if newest:
         return "working" if (now - newest) / 60.0 <= stale_min else "stale"
     hb_age = _opencode_heartbeat_age(slug, now, job=job)
     if hb_age is not None and hb_age <= stale_min:
         return "working"
-    return "dead"
+    return "unknown"
 
 
 # F-15c: an `open` registry row with no transcript yet, within this startup grace window,
@@ -1244,8 +1250,10 @@ def _attempt_summary_sid(job):
 def _note_home_view(job, jobs_path=None):
     """Admit a displayed native home; mark an actual retention candidate.
 
-    A candidate's marker (at most one write per home per hour) keeps retention
-    from detaching it during a read. Excluded homes need no retention writes.
+    A candidate's marker (at most one write per home per five minutes) keeps
+    retention from detaching it during a read. An admitted read using a cached
+    marker retains at least 55 minutes of the one-hour view window. Excluded
+    homes need no retention writes.
     Only displayed rows call this, so dropped historical rows never pin a home.
     """
     home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
@@ -1664,6 +1672,16 @@ def _enrich_claude_stream_session(job, fast_first=False):
     if not session_id:
         return
     job._runtime_session_id = session_id
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    else:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_claude_jobs(telemetry_path, session_id=session_id,
+                                        attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            telemetry_path, ("claude", os.path.abspath(telemetry_path), session_id, job.attempt_id))
 
 
 def _codex_attempt_thread_ids(lines):
@@ -1958,6 +1976,18 @@ def _enrich_codex_attempt_session(job, fast_first=False):
         except OSError:
             pass
     job.exec_tool = parsed.get("exec_tool")
+    if thread_id and not fast_first:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_codex_jobs(path, session_id=thread_id, attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            path, ("codex", os.path.abspath(path), thread_id, job.attempt_id))
+    elif thread_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    elif parsed.get("thread_ambiguity"):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "multiple-attempt-thread-ids"}
 
 
 def _parse_opencode_attempt_tail(path):
@@ -2078,10 +2108,22 @@ _OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
 
 def _enrich_opencode_native_activity(job, session_id, fast_first=False):
     """Observe only the attempt-private DB; first publication remains log-only."""
-    if fast_first or not session_id or not _native_home_admitted(job):
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+        return
+    if not session_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "exact-session-id-unresolved"}
+        return
+    if not _native_home_admitted(job):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "private-runtime-not-admitted"}
         return
     runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
     if not isinstance(runtime, str) or not os.path.isabs(runtime):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "attempt-private-runtime-unresolved"}
         return
     db = os.path.join(runtime, "data", "opencode", "opencode.db")
     try:
@@ -2090,19 +2132,43 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
         if (not signatures[""] or signatures["-journal"] or
                 sum(info[2] for suffix, info in signatures.items()
                     if info and suffix in ("", "-wal")) > _OPENCODE_ACTIVITY_BYTES):
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": "unavailable",
+                                         "reason": "private-db-missing-or-over-read-cap"}
             return
-        key = (db, session_id)
+        from . import opencode as opencode_collector
+        attempt_id = getattr(job, "attempt_id", None)
+        key = (db, session_id, attempt_id)
         cached = _OPENCODE_ACTIVITY_CACHE.get(key)
-        if cached and cached[0] == signatures:
-            activity = cached[1]
+        same_source = bool(cached and cached[0] == signatures)
+        cached_shell = cached[2] if same_source and len(cached) > 2 else None
+        shell_complete = bool(
+            isinstance(cached_shell, dict)
+            and (cached_shell.get("shell_cursor") or {}).get("caught_up"))
+        if same_source and shell_complete:
+            activity, shell_observation = cached[1], cached_shell
         else:
             with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
                 deadline = time.monotonic() + .05
                 connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
-                activity = refresh_title.read_opencode_activity(connection, session_id)
+                activity = cached[1] if same_source else refresh_title.read_opencode_activity(
+                    connection, session_id)
+                opencode_runtime = opencode_collector._opencode_v2_runtime()
+                page = opencode_runtime.read_session_shell_tasks(
+                    connection, session_id,
+                    after_seq=opencode_collector._v2_shell_cursor(db, session_id, attempt_id),
+                    refresh_seqs=opencode_collector._v2_shell_refresh_seqs(
+                        db, session_id, attempt_id))
+                signature = signatures.get("")
+                identity = ({"device": signature[0], "inode": signature[1]}
+                            if isinstance(signature, tuple) and len(signature) >= 2 else None)
+                shell_observation = dict(page, database_identity=identity)
             if signatures != refresh_title._opencode_source_signatures(db):
+                job.shell_jobs = []
+                job.shell_job_observation = {"state": "unavailable",
+                                             "reason": "private-db-changed-during-snapshot"}
                 return
-            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity)
+            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity, shell_observation)
             if len(_OPENCODE_ACTIVITY_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
                 _OPENCODE_ACTIVITY_CACHE.pop(next(iter(_OPENCODE_ACTIVITY_CACHE)))
         job.exec_tool = None
@@ -2112,7 +2178,20 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
             job.exec_tool = {"name": label} if label else None
         if activity.get("summary"):
             job._native_now = (activity["summary"], activity.get("summary_ts"))
+        observed = shell_observation
+        if observed.get("state") == "observed" and observed.get("generation") == "v2":
+            opencode_collector._attach_v2_shell_tasks(
+                job, observed, db, session_id,
+                tree=getattr(job, "_proc_tree", None),
+                kids=getattr(job, "_proc_kids", None),
+                native_data_root=os.path.join(runtime, "data", "opencode"))
+        else:
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": observed.get("state", "unknown"),
+                                         "reason": observed.get("reason", "private-v2-db-unavailable")}
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "private-db-read-failed"}
         return
 
 
@@ -2343,7 +2422,9 @@ def _scan_degradations(route_ids, agent_home=None, tail=64, jobs=()):
         else:
             try:
                 with open(path, "rb") as stream:
-                    stream.seek(max(0, st.st_size - 256 * tail))
+                    # One bounded candidate record can exceed the old 16KiB
+                    # default window. Include that whole row, still bounded.
+                    stream.seek(max(0, st.st_size - max(65536, 256 * tail)))
                     raw = stream.read().splitlines()[-tail:]
                 rows = []
                 for line in raw:

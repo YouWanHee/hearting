@@ -1,0 +1,87 @@
+Completed the approved synthetic fixture follow-through to finish the isolated parent replay. All seven artifacts were read in the specified order. Before: no follow-through file, action count 0. After: [follow-through.json](/tmp/codex-parent-replay-u2nfsyk3/workspace/.agent_reports/native-parent-fixture/follow-through.json) exists with the exact sentinel and action count 1; the action ran once.
+
+Verification: Python 3 ran the exact verifier, passing 6 checks with 0 failures. A separate check confirmed the follow-through contents exactly. The synthetic history records an initial rejection, parser correction, verification pass, deployment success, review pass, and documentation completion. No real independent review occurred.
+
+Synthetic commit: `fixture-commit-fixture-e134a236aa1d`. Synthetic deployment: `fixture-deploy-fixture-e134a236aa1d`, success. Synthetic serving: `synthetic://serving/fixture-e134a236aa1d`, not probed. Production deployment and serving checks were skipped; the historical suite’s 2 skips were recorded without rerunning that suite. No real commit, PR, CI, deployment, production serving, or operating state was changed or measured. No fixture work remains.
+
+FACTUAL_REPORT_JSON:
+```json
+{
+  "after": {
+    "approved_action_count": 1,
+    "followthrough_file": "present",
+    "sentinel": "HEARTING_REPLAY_3FD35E9ED23E4F36AF53E78B665784F9"
+  },
+  "before": {
+    "approved_action_count": 0,
+    "followthrough_file": "absent"
+  },
+  "chronology": [
+    {
+      "event": "original-code-attempt",
+      "evidence": "synthetic-request-boundary-assertion",
+      "reason": "The original request boundary rejected the fixture input.",
+      "result": "FAIL",
+      "sequence": 1
+    },
+    {
+      "event": "fix-applied",
+      "evidence": "synthetic-parser-correction",
+      "reason": "The fixture parser now accepts the documented input.",
+      "result": "FIXED",
+      "sequence": 2
+    },
+    {
+      "event": "verification",
+      "evidence": "fixture-verifier-6-checks",
+      "reason": "Six isolated fixture assertions passed.",
+      "result": "PASS",
+      "sequence": 3
+    },
+    {
+      "event": "deployment",
+      "evidence": "synthetic-deployment",
+      "reason": "A synthetic deployment record was marked successful.",
+      "result": "SUCCESS",
+      "sequence": 4
+    },
+    {
+      "event": "independent-review",
+      "evidence": "synthetic-review-01",
+      "reason": "The isolated fixture review record passed.",
+      "result": "PASS",
+      "sequence": 5
+    },
+    {
+      "event": "documentation",
+      "evidence": "synthetic-docs-complete",
+      "reason": "The isolated fixture documentation record is complete.",
+      "result": "COMPLETE",
+      "sequence": 6
+    }
+  ],
+  "fixture": "synthetic-isolated-codex-parent-replay",
+  "fixture_id": "fixture-e134a236aa1d",
+  "limits": [
+    "All six chronology records and the deployment, review, commit, and serving values are synthetic fixture data.",
+    "No production endpoint, deployment, commit, CI run, PR, or operating state was changed or measured.",
+    "This isolated app-server replay tests Codex delivery and reporting only."
+  ],
+  "reason": "Complete the already approved isolated parent follow-through after reading the exact result.",
+  "skipped": [
+    "Production deployment and serving checks were skipped; the displayed values are synthetic.",
+    "The historical direct dispatch_completion_join suite recorded 2 skips; this native replay did not rerun it."
+  ],
+  "synthetic_values": {
+    "commit": "synthetic-only:commit-id=fixture-commit-fixture-e134a236aa1d",
+    "deployment": "synthetic-only:status=success id=fixture-deploy-fixture-e134a236aa1d",
+    "serving": "synthetic-only:synthetic://serving/fixture-e134a236aa1d (not probed)"
+  },
+  "verification": {
+    "checks_failed": 0,
+    "checks_passed": 6,
+    "command": "python3 -B verify_fixture.py",
+    "result": "PASS"
+  }
+}
+```

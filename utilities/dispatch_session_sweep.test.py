@@ -1864,12 +1864,15 @@ class NativeReceivingTurnRetentionTest(unittest.TestCase):
             record = {"delivery_id": "delivery-exact", "recipient_kind": "codex-native-queue",
                 "attempt_ids": ["att-exact"], "receipt": {"children": [{"attempt_id": "att-exact"}]}}
             binding = {"thread_id": "sid-exact", "turn_id": "turn-exact", "status": "inProgress"}
+            prompt = "Exact hook prompt\nOUTPUT_FORMAT_CANARY: exact JSON"
             with mock.patch.object(SWEEP, "record_jobs", return_value=jobs), \
                  mock.patch("peer_obligations.retain_registered_completion", return_value=True) as retain:
-                ackable = SWEEP.retain_receiving_turn([(root, [record])], "sid-exact", binding)
+                ackable = SWEEP.retain_receiving_turn(
+                    [(root, [record])], "sid-exact", binding, request_context=prompt)
                 self.assertEqual(ackable, {(str(root), "delivery-exact")})
                 self.assertEqual(retain.call_count, 1)
                 self.assertEqual(retain.call_args.kwargs["receiving_turn"], binding)
+                self.assertEqual(retain.call_args.kwargs["request_context"], prompt)
                 self.assertEqual(SWEEP.retain_receiving_turn([(root, [record])], "sid-exact", None), set())
                 self.assertEqual(retain.call_count, 1)
 

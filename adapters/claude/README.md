@@ -18,6 +18,10 @@ This adapter maps the common agent harness onto Claude Code.
 Fleet is read-only. Interactive Claude summary refresh remains a statusline
 lifecycle producer, while registered Claude dispatch uses the attempt-owned
 supervisor and `dispatch-reconcile --apply` exact-live recovery contract.
+Fleet also reads exact Claude attempt-stream `local_bash` background lifecycle
+events when no persistent transcript exists. Task, run, Bash call, full session,
+and source generation remain bound; task-set snapshots alone do not create rows,
+and native completion remains separate from process liveness.
 
 ## Worker bootstrap boundary
 
@@ -196,6 +200,15 @@ down, each at ratio 0.5. `--beside` selects the reference tab; `--pane` keeps
 explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
 with an empty prompt, or opens a tab in the same workspace. No pane move or
 extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
+
+## Fleet background Bash rows
+
+Fleet reads Bash `tool_use`/`tool_result` pairs from the exact session
+transcript. A native background acknowledgement identifies a task and its
+output file; the acknowledgement is not proof that the process is still alive.
+Fleet reports a process as alive only when an identity-checked descendant has
+the exact writable output-file descriptor. File presence alone is output
+evidence, not liveness. See [Claude background Bash documentation](https://code.claude.com/docs/en/interactive-mode#background-bash-commands).
 
 ## Runtime compaction tidy
 

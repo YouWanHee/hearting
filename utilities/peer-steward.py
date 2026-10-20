@@ -1090,6 +1090,9 @@ def _observed_start_agent(args, deadline=None, wait=False):
                 return None
             cwd = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
             if cwd and os.path.realpath(str(agent.get("cwd") or "")) != cwd:
+                # Not this start. Name the miss so a refused start receipt explains
+                # why the pane's agent was not adopted (herdr may report no cwd).
+                args.observed_miss = "cwd-mismatch" if agent.get("cwd") else "cwd-empty"
                 return None
             name = agent.get("name")
             if name and name != args.name:
@@ -1572,6 +1575,7 @@ def _start_in_pane(args):
         f"managed={managed}"
         + (f" ready=false reason={trust_wait}" if trust_wait else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
+        + (f" observed={args.observed_miss}" if not started and getattr(args, "observed_miss", None) else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
@@ -2412,6 +2416,37 @@ def _watch_paths(watch_id, root=None):
     )
 
 
+def _prepare_watch_notice(watch_id, arm, receipt):
+    """Queue one stable exact-ref notice under the original steward identity."""
+    steward = (arm or {}).get("steward") or {}
+    steward_seat = (arm or {}).get("steward_seat") or {}
+    harness, sid = steward.get("harness"), steward.get("session_id")
+    if (harness not in {"claude", "codex", "opencode"}
+            or not peer_message.usable_session_id(sid)
+            or steward_seat.get("kind") not in {"pane", "native"}
+            or not steward_seat.get("key")):
+        return None
+    agent = (receipt or {}).get("agent") or (arm or {}).get("agent") or {}
+    target = agent.get("name") or agent.get("session_id") or (arm or {}).get("target") or "unknown"
+    body = (f"[peer-steward] watch_id={watch_id} state={(receipt or {}).get('state', 'unknown')} "
+            f"target={target}; exact watch receipt is available")
+    sender = {"harness": harness, "session_id": sid}
+    if steward.get("project"):
+        sender["project"] = steward["project"]
+    recipient = {"harness": harness, "session_id": sid}
+    try:
+        _text, transfer_ref = peer_message.prepare_peer_message(
+            body, sender, recipient, defer=True, refs=[f"peer-watch:{watch_id}"],
+            receipt=f"peer-steward-watch:{watch_id}")
+        current = _read_json(_watch_paths(watch_id).arm) or dict(arm or {})
+        if current.get("notice_transfer_ref") != transfer_ref:
+            _write_json_atomic(_watch_paths(watch_id).arm,
+                               {**current, "notice_transfer_ref": transfer_ref})
+        return transfer_ref
+    except Exception:  # noqa: BLE001 - status/reconnect remains the ordinary fallback
+        return None
+
+
 def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
     """Settle one exact watch after its observer has the watch lock."""
     paths = _watch_paths(watch_id)
@@ -2442,6 +2477,7 @@ def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+    _prepare_watch_notice(watch_id, arm, receipt)
     return receipt
 
 
@@ -2911,13 +2947,43 @@ def _watch_arm_scope_matches(arm, server, steward_sid, until, agent):
         return False
     steward = arm.get("steward") or {}
     if steward.get("session_id") != steward_sid:
-        return False
+        if not _confirmed_watch_successor(arm.get("watch_id"), arm, steward_sid):
+            return False
     if tuple(sorted(arm.get("until") or [])) != tuple(sorted(until or [])):
         return False
     expected = arm.get("agent") or {}
     return all(expected.get(key) not in {None, "", "-"}
                and expected.get(key) == agent.get(key)
                for key in ("harness", "pane"))
+
+
+def _confirmed_watch_successor(watch_id, arm, requested_sid=None, *, include_acked=False):
+    """A watch follows only the exact successor stored by the common seat resolver."""
+    steward = (arm or {}).get("steward") or {}
+    seat_key = ((arm or {}).get("steward_seat") or {}).get("key")
+    if not watch_id or not seat_key:
+        return None
+    try:
+        import dispatch_seat_handover as handover
+        relation = handover.resolve_watch(str(watch_id), seat_key=seat_key,
+                                          include_acked=include_acked)
+    except Exception:
+        return None
+    if not isinstance(relation, dict):
+        return None
+    if any(relation.get(field) != (arm or {}).get(field) for field in
+           ("server", "target", "agent", "until", "deadline", "origin")):
+        # Arms predating the optional persisted `origin` compare against their
+        # original steward tuple below; no name or pane alias fills the gap.
+        if any(relation.get(field) != (arm or {}).get(field) for field in
+               ("server", "target", "agent", "until", "deadline")):
+            return None
+    holder = relation.get("holder") or {}
+    if holder.get("harness") != steward.get("harness"):
+        return None
+    if requested_sid is not None and holder.get("sid") != requested_sid:
+        return None
+    return relation
 
 
 def _watch_arm_matches(arm, server, steward_sid, until, agent):
@@ -3393,7 +3459,10 @@ def cmd_watch(args):
                 old_agent = old_arm.get("agent") or {}
                 if all(old_agent.get(key) == agent.get(key)
                        for key in ("pane", "harness", "session_id")):
-                    superseded.append((old_id, old_arm))
+                    # A role successor or an unconfirmed callback never retires
+                    # the predecessor's accepted duty. Same-seat transfer is
+                    # settled by the original watch and its shared resolver.
+                    continue
 
         foreground = _retire_foreground(agent["pane"], agent["harness"], strict=False)
         foreground_identity = ({key: foreground.get(key) for key in
@@ -3656,7 +3725,10 @@ def cmd_watch_run(args):
                 steward_reason = _watch_terminal_from_view(
                     initial_view, steward_agent, server, event_transport)
                 if steward_reason == "session-replaced":
-                    terminal_reason = "steward-replaced"
+                    # Session replacement can precede the ordinary confirmed
+                    # start callback. Keep this accepted duty pending until the
+                    # shared seat lineage resolves; unknown is not terminal.
+                    _confirmed_watch_successor(args.watch_id, arm)
                 elif steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                     terminal_reason = "steward-exited"
 
@@ -3672,7 +3744,7 @@ def cmd_watch_run(args):
                 elif native_record and native_record.get("sessionId") == (arm.get("steward") or {}).get("session_id"):
                     steward_pidfd = os.pidfd_open(native_pid, 0)
                 elif native_record and native_record.get("sessionId"):
-                    terminal_reason = "steward-replaced"
+                    _confirmed_watch_successor(args.watch_id, arm)
             except (AttributeError, OSError, TypeError, ValueError):
                 # Missing native proof stays unknown. A PID number or missing
                 # session record alone is never used as a death vote.
@@ -4040,8 +4112,7 @@ def cmd_watch_run(args):
                         steward_reason = _watch_terminal_from_view(
                             view, steward_agent, server, event_transport)
                         if steward_reason == "session-replaced":
-                            terminal_reason = "steward-replaced"
-                            break
+                            _confirmed_watch_successor(args.watch_id, arm)
                         if steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                             terminal_reason = "steward-exited"
                             break
@@ -4121,6 +4192,8 @@ def cmd_watch_run(args):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+
+    _prepare_watch_notice(args.watch_id, arm, receipt)
 
     _record(
         to_harness=agent.get("harness", "unknown"),
@@ -4488,7 +4561,19 @@ def _status_entry(watch_id, arm, root):
             "refs": receipt.get("refs") or [],
         }
     arm = arm or {"watch_id": watch_id}
-    if paths.ack.exists():
+    recipient = {"harness": (arm.get("steward") or {}).get("harness"),
+                 "session_id": (arm.get("steward") or {}).get("session_id")}
+    resolved = _confirmed_watch_successor(watch_id, arm, include_acked=True)
+    if resolved:
+        holder = resolved.get("holder") or {}
+        recipient = {"harness": holder.get("harness"), "session_id": holder.get("sid")}
+    try:
+        import dispatch_seat_handover as handover
+        acked = handover.watch_ack_valid(paths.ack, watch_id,
+                                         recipient.get("harness"), recipient.get("session_id"))
+    except Exception:
+        acked = False
+    if acked:
         state = "acked"
     elif receipt is not None:
         state = "receipt"
@@ -4506,6 +4591,7 @@ def _status_entry(watch_id, arm, root):
         "wake": arm.get("wake", "-"),
         "armed_ts": arm.get("armed_ts", "-"),
         "steward": arm.get("steward") or {},
+        "recipient": recipient,
         "watcher": {"pid": watcher.get("pid", "-"), "pid_start": watcher.get("pid_start", "-")},
         "receipt": str(paths.receipt),
         "ack": str(paths.ack),
@@ -4517,6 +4603,16 @@ def _status_entry(watch_id, arm, root):
     }
 
 
+def _watch_notice_pending(watch_id, recipient):
+    """A queued exact native notice owns the display/ACK path for this receipt."""
+    try:
+        ref = f"peer-watch:{watch_id}"
+        return any(ref in (row.get("refs") or ())
+                   for row in peer_message._pending_rows(recipient=recipient))
+    except Exception:
+        return False
+
+
 def cmd_status(args):
     root = _watch_root()
     entries = _watch_entries(root)
@@ -4524,10 +4620,13 @@ def cmd_status(args):
         entries = [(w, a) for w, a in entries if w == args.watch]
     rows = [_status_entry(w, a, root) for w, a in entries]
     if args.undelivered:
-        sid, _harness = _current_session_identity()
+        sid, harness = _current_session_identity()
         rows = [
             row for row in rows
-            if row["state"] == "receipt" and (row["steward"] or {}).get("session_id") == sid
+            if row["state"] == "receipt"
+            and (row.get("recipient") or {}).get("session_id") == sid
+            and (row.get("recipient") or {}).get("harness") == harness
+            and not _watch_notice_pending(row["watch_id"], row.get("recipient") or {})
         ]
     if args.json:
         print(json.dumps({"watch_root": str(root), "watches": rows}, ensure_ascii=False))
@@ -4575,28 +4674,20 @@ def cmd_rearm(args):
 
 
 def cmd_ack(args):
-    """The single O_EXCL ack implementation.
-
-    A second carrier is expected and is not an error: wake is at-least-once,
-    display is idempotent. If `FileExistsError` ever escaped here, a carrier
-    that lost the race would exit 0 where it must exit 2.
-    """
-    paths = _watch_paths(args.watch_id)
-    session_id, _harness = _current_session_identity()
-    try:
-        fd = os.open(str(paths.ack), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
+    """Publish or validate the shared exact-recipient ACK before settling its ref."""
+    session_id, harness = _current_session_identity()
+    import dispatch_seat_handover as handover
+    outcome = handover.acknowledge_watch(args.watch_id, harness, session_id, args.carrier)
+    if outcome == "created":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
+        print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    elif outcome == "already":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
         print(f"watch_id={args.watch_id} ack=already")
-        return 0
-    except OSError as exc:
-        print(f"watch_id={args.watch_id} ack=failed reason=errno-{exc.errno}", file=sys.stderr)
-        return 0
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"carrier": args.carrier, "session_id": session_id, "ts": _utc_now()},
-            fh, ensure_ascii=False,
-        )
-    print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    elif outcome == "not-recipient":
+        print(f"watch_id={args.watch_id} ack=not-recipient")
+    else:
+        print(f"watch_id={args.watch_id} ack=failed reason=unresolved-recipient", file=sys.stderr)
     return 0
 
 _PROMPT_VERIFY_TIMEOUT_MS = 8000      # bounded native /clear command invocation
@@ -5384,9 +5475,14 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         from codex_queue_dispatch import resolve_queue_socket
         import codex_queue_delivery
         endpoint = resolve_queue_socket()
-        turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
-        current_turn = codex_queue_delivery.read_exact_turn(
-            endpoint, recipient_sid, turn_id, timeout=5.0)
+        source_turn_id = observation.get("continuation_source_turn") or binding.get("turn_id")
+        turn_id = source_turn_id
+        try:
+            source_turn = codex_queue_delivery.read_exact_turn(
+                endpoint, recipient_sid, source_turn_id, timeout=5.0)
+        except codex_queue_delivery.QueueDeliveryError:
+            source_turn = None
+        current_turn = source_turn
         continuation_id = observation.get("continuation_id")
         if continuation_id:
             continuation = codex_queue_delivery.find_turn_by_client_message_id(
@@ -5423,6 +5519,10 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
             store.update(duty["id"], state="unknown", delivery="pending",
                          observation={**observation, "reason": "native-receiving-turn-no-longer-current"})
             return True
+        try:
+            source_messages = _native_user_message_sources(source_turn)
+        except codex_queue_delivery.QueueDeliveryError:
+            source_messages = []
         receipt = exact.get("receipt")
         if not isinstance(receipt, dict):
             store.update(duty["id"], state="unknown", delivery="pending",
@@ -5433,24 +5533,79 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
         followup = completion_followup_text(
             receipt, jobs=str(jobs_path),
             surface=str(_UTILITIES_DIR.parent / "adapters/codex/bin/preflight.sh"))
-        message = ("AGENT_HARNESS_COMPLETION_V1\n" + encoded + "\n" + followup
-                   + f"\nThe exact receiving turn {turn_id} was interrupted. Continue its approved follow-through "
-                     "and report once; check existing exact artifact and next-leg lineage before repeating "
-                     "any action. Preserve new failures, conflicts, and unfinished work.")
+        request_context = observation.get("native_request_context")
+        original_request = None
+        request_reference = None
+        source_reason = "native-original-user-message-unavailable"
+        source_record = None
+        receiving_binding = observation.get("native_receiving_turn") or binding
+        if (isinstance(request_context, dict)
+                and request_context.get("source") == "codex-userprompt-submit"
+                and request_context.get("status") == "available"
+                and isinstance(request_context.get("text"), str)
+                and request_context.get("text")
+                and request_context.get("thread_id") == recipient_sid
+                and request_context.get("turn_id") == receiving_binding.get("turn_id")
+                and request_context.get("delivery_id") == delivery_id
+                and request_context.get("receipt_digest")
+                    == row.metadata.get("delivery_receipt_digest")
+                and request_context.get("row_revision")
+                    == row.metadata.get("delivery_row_revision")):
+            original_request = request_context["text"]
+            source_record = {"source": "codex-userprompt-submit", "status": "available",
+                             "thread_id": recipient_sid,
+                             "turn_id": receiving_binding.get("turn_id")}
+            request_reference = (
+                "\nOriginal user request source: read the exact JSON field "
+                "observation.native_request_context.text in the existing durable obligation "
+                f"file {store._record_path(duty['id']).resolve()} (duty {duty['id']}; "
+                f"Codex thread {recipient_sid}, turn {receiving_binding.get('turn_id')}; "
+                f"delivery {delivery_id}; receipt revision "
+                f"{row.metadata.get('delivery_row_revision')}). Fulfill it verbatim, including "
+                "all requested content and output-format requirements."
+            )
+        elif source_messages:
+            source_record = {"source": "codex-native-userMessage", "status": "available",
+                             "item_ids": [item["item_id"] for item in source_messages]}
+        else:
+            if (isinstance(request_context, dict)
+                    and request_context.get("status") == "unavailable"
+                    and request_context.get("thread_id") == recipient_sid
+                    and request_context.get("turn_id") == receiving_binding.get("turn_id")
+                    and request_context.get("delivery_id") == delivery_id
+                    and request_context.get("receipt_digest")
+                        == row.metadata.get("delivery_receipt_digest")
+                    and request_context.get("row_revision")
+                        == row.metadata.get("delivery_row_revision")):
+                source_reason = request_context.get("reason", source_reason)
+            elif isinstance(request_context, dict):
+                source_reason = "hook-request-context-binding-unavailable"
+            source_record = {"source": "unavailable", "status": "unavailable",
+                             "reason": source_reason}
+        message = _native_continuation_message(
+            thread_id=recipient_sid, turn_id=turn_id, source_turn_id=source_turn_id,
+            receipt_text=encoded,
+            followup=followup, source_messages=source_messages,
+            original_request=original_request,
+            request_reference=request_reference,
+            source_unavailable_reason=(source_reason if source_record["status"] == "unavailable"
+                                       else None))
         stable = "delivery-" + hashlib.sha256((
             "codex-native-recovery-v1\0" + delivery_id + "\0" + turn_id + "\0"
             + str(row.metadata.get("delivery_receipt_digest", ""))
         ).encode("utf-8")).hexdigest()[:32]
-        observation = {**observation, "continuation_id": stable,
-                       "continuation_source_turn": turn_id}
-        store.update(duty["id"], state="pending", delivery="pending",
-                     observation={**observation, "reason": "native-continuation-prepared"})
+        prepared_record, prepared = store.prepare_native_continuation(
+            duty["id"], continuation_id=stable, source_turn_id=turn_id,
+            source=source_record, message=message)
+        observation = dict(prepared_record.get("observation") or {})
+        stable = prepared["id"]
+        message = prepared["message"]
 
         def before_add():
             fresh = current_attempt_row(jobs_path, row.attempt_id)
             from dispatch_seat_handover import effective_parent
             from dispatch_contract import terminal_conflict_pending
-            fresh_turn = codex_queue_delivery.read_exact_turn(
+            fresh_receiving_turn = codex_queue_delivery.read_exact_turn(
                 endpoint, recipient_sid, turn_id, timeout=5.0)
             newest = codex_queue_delivery._latest_turn(endpoint, recipient_sid, timeout=5.0)
             latest_record = pending.read(root, storage_recipient, delivery_id)
@@ -5463,7 +5618,9 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                     or terminal_conflict_pending(fresh.metadata)
                     or pending_record_identity(fresh.metadata, jobs_path)
                         != (route_id, route_node, parent_attempt_id)
-                    or not fresh_turn or fresh_turn.get("status") != "interrupted"
+                    or not fresh_receiving_turn
+                    or fresh_receiving_turn.get("status") != "interrupted"
+                    or fresh_receiving_turn.get("id") != turn_id
                     or not isinstance(newest, dict) or newest.get("id") != turn_id
                     or not latest_record or latest_record.get("state") != "acked"
                     or pending.received_ack_identity(latest_record, storage_recipient, delivery_id)
@@ -5488,6 +5645,88 @@ def _resume_native_receiving_turn(duty, store, row, record, recipient_sid, stora
                      observation={**observation, "reason": "native-continuation-observation-unavailable",
                                   "detail": str(exc)[:160]})
         return True
+
+
+_NATIVE_QUEUE_MESSAGE_LIMIT = 16 * 1024
+
+
+def _native_user_message_sources(turn):
+    """Return exact text userMessage items from one exact native turn."""
+    import codex_queue_delivery
+
+    items = turn.get("items") if isinstance(turn, dict) else None
+    if not isinstance(items, list):
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-original-user-message-unavailable")
+    sources = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        item_id = item.get("id")
+        content = item.get("content")
+        if (not isinstance(item_id, str) or not item_id
+                or not isinstance(content, list) or len(content) != 1
+                or not isinstance(content[0], dict)
+                or content[0].get("type") != "text"
+                or not isinstance(content[0].get("text"), str)):
+            raise codex_queue_delivery.QueueDeliveryError(
+                "native-original-user-message-unavailable")
+        sources.append({"item_id": item_id, "text": content[0]["text"]})
+    if len({item["item_id"] for item in sources}) != len(sources):
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-original-user-message-unavailable")
+    return sources
+
+
+def _native_continuation_message(*, thread_id, turn_id, source_turn_id,
+                                 receipt_text, followup, source_messages,
+                                 original_request=None, request_reference=None,
+                                 source_unavailable_reason=None):
+    import codex_queue_delivery
+
+    prefix = ("AGENT_HARNESS_COMPLETION_V1\n" + receipt_text + "\n" + followup
+              + f"\nThe exact receiving turn {turn_id} was interrupted. Continue its approved follow-through "
+                "and report once; check existing exact artifact and next-leg lineage before repeating "
+                "any action. Preserve new failures, conflicts, and unfinished work.")
+    if original_request is not None:
+        source_header = (
+            "\nOriginal user request received by Codex UserPromptSubmit, verbatim. "
+            "Continue and fulfill that original task, preserving all requested content and output "
+            "formats; this receipt is context and does not replace or narrow the task:\n")
+        source_body = original_request
+    elif source_messages:
+        source_header = (
+            "\nOriginal user request from the exact interrupted turn, verbatim. "
+            "Continue and fulfill that original task, preserving all requested content and output formats; "
+            "this receipt is context and does not replace or narrow the task:\n")
+        source_body = "".join(
+            f"\n[original userMessage item {item['item_id']}]\n{item['text']}"
+            for item in source_messages)
+    else:
+        source_header = (
+            "\nThe original user request could not be recovered from the Codex hook or exact turn "
+            f"({source_unavailable_reason or 'source-unavailable'}). Continue the existing approved "
+            "follow-through in this receipt and record any missing original-task context honestly.\n")
+        source_body = ""
+    full = prefix + source_header + source_body
+    if len(full.encode("utf-8")) <= _NATIVE_QUEUE_MESSAGE_LIMIT:
+        return full
+    if original_request is not None and request_reference:
+        bounded = prefix + request_reference
+        if len(bounded.encode("utf-8")) <= _NATIVE_QUEUE_MESSAGE_LIMIT:
+            return bounded
+    references = ", ".join(item["item_id"] for item in source_messages)
+    if not references:
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-continuation-message-over-limit")
+    bounded = (prefix + f"\nOriginal task source: read the exact userMessage item(s) {references} "
+               f"in Codex thread {thread_id}, turn {source_turn_id}. Fulfill the entire original request, "
+               "including every requested content and output-format requirement. This receipt is only "
+               "continuation context; it does not replace, narrow, or summarize the original task.")
+    if len(bounded.encode("utf-8")) > _NATIVE_QUEUE_MESSAGE_LIMIT:
+        raise codex_queue_delivery.QueueDeliveryError(
+            "native-continuation-message-over-limit")
+    return bounded
 
 
 def _resume_registered_obligation(duty, store, *, read_context=None):
@@ -6902,8 +7141,10 @@ def _continue_look(target, req):
         return "new-session-unknown"
     if native_sid != new:
         return "target-changed"
+    # The continue is input to an idle session: work it dispatched (a supervisor's
+    # owners) keeps running and must not hold the continue back.
     readiness = _pane_readiness(target, state, expected_harness=harness,
-                                expected_sid=new, expected_pane=pane, purpose="completion",
+                                expected_sid=new, expected_pane=pane, purpose="input",
                                 target_observation=(state, ident), pane_info=info,
                                 native_session_id=native_sid)
     if readiness.state != "ready":

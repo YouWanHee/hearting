@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -56,7 +57,8 @@ class _ConfigHomeMixin:
             "FLEET_TITLE_PROVIDER",
             "AGENT_MODEL_GOVERNOR_ROOT", "HARNESS_CAPACITY_SCORES",
             "HARNESS_CAPACITY_BIAS", "DISPATCH_DEFAULTS_CONFIG",
-            "AGENT_DISPATCH_JOBS",
+            "AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID",
+            "HEARTING_WORKER_HOME",
         )}
         os.environ["AGENT_HOME"] = _REPO_ROOT
         os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self._tmp.name, "claude")
@@ -599,6 +601,165 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
                 mock.patch.object(rt.subprocess, "Popen") as popen:
             self.assertFalse(rt.maybe_spawn("claude", "raced", self.transcript))
         popen.assert_not_called()
+
+    def test_dispatch_provider_admission_orders_spawn_against_home_detach(self):
+        from dispatch_attempt_reference import admission
+        from dispatch_contract import dispatch_state_root
+
+        attempt = "att-home-provider"
+        home = Path(self._tmp.name) / "worker-home"
+        home.mkdir()
+        source = home / "projects" / "session.jsonl"
+        source.parent.mkdir()
+        source.write_text('{"message":"native session"}\n', encoding="utf-8")
+        jobs = Path(self._tmp.name) / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        root = dispatch_state_root(jobs)
+
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            with admission(root, (attempt,)):
+                self.assertFalse(rt.maybe_spawn(
+                    "claude", "dispatch-" + attempt, str(source),
+                    runtime_home=str(home)))
+            spawn.assert_not_called()
+            self.assertTrue(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(source),
+                runtime_home=str(home)))
+            spawn.assert_called_once()
+
+    def test_missing_jobs_blocks_home_scoped_provider_but_keeps_external_native_path(self):
+        attempt = "att-home-no-jobs"
+        managed_home = Path(self._tmp.name) / "dispatch-state" / "homes" / "workers" / ("a" * 32)
+        managed_source = managed_home / "projects" / "managed.jsonl"
+        managed_source.parent.mkdir(parents=True)
+        managed_source.write_text('{"message":"managed worker transcript"}\n', encoding="utf-8")
+        external_home = Path(self._tmp.name) / "native-home"
+        external_source = external_home / "projects" / "native.jsonl"
+        external_source.parent.mkdir(parents=True)
+        external_source.write_text('{"message":"external native transcript"}\n', encoding="utf-8")
+
+        # No jobs path means the managed-root boundary cannot be established.
+        # Keep HOME-scoped reads closed while the ordinary native transcript
+        # path, which has no worker HOME claim, remains usable.
+        for name in ("AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "HEARTING_WORKER_HOME"):
+            os.environ.pop(name, None)
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            self.assertFalse(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(managed_source),
+                runtime_home=str(managed_home)))
+            spawn.assert_not_called()
+
+            self.assertTrue(rt.maybe_spawn("claude", "native-session", str(external_source)))
+            spawn.assert_called_once()
+            self.assertNotIn("attempt_admission", spawn.call_args.kwargs)
+            self.assertNotIn("worker_home", spawn.call_args.kwargs)
+
+    def test_dispatch_provider_on_identityless_legacy_home_is_refused_after_detach(self):
+        from dispatch_contract import dispatch_state_root
+        from worker_runtime_home import _builder
+
+        attempt = "att-legacy-provider"
+        jobs = Path(self._tmp.name) / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        root = dispatch_state_root(jobs)
+        key = _builder.worker_home_key("/src/repo", "claude", "stage", attempt)
+        home = root / "homes" / "workers" / key
+        source = home / "projects" / "session.jsonl"
+        source.parent.mkdir(parents=True)
+        source.write_text('{"message":"native session"}\n', encoding="utf-8")
+        (home / "worker-home.json").write_text(json.dumps({
+            "harness": "claude", "worker_type": "stage", "source": "/src/repo"}))
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            self.assertTrue(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(source), runtime_home=str(home)))
+            spawn.assert_called_once()
+            # Detach-first: the key is gone, so no native transcript may be read.
+            retired = root / "homes" / "retired-fixture"
+            os.rename(home, retired)
+            spawn.reset_mock()
+            self.assertFalse(rt.maybe_spawn(
+                "claude", "dispatch-" + attempt, str(source), runtime_home=str(home)))
+            spawn.assert_not_called()
+
+    def test_native_session_provider_uses_inherited_attempt_admission(self):
+        from dispatch_attempt_reference import admission
+        from dispatch_contract import dispatch_state_root
+
+        attempt = "att-native-provider"
+        home = Path(self._tmp.name) / "worker-home"
+        home.mkdir()
+        source = home / "projects" / "native-session.jsonl"
+        source.parent.mkdir()
+        source.write_text('{"message":"native session"}\n', encoding="utf-8")
+        jobs = Path(self._tmp.name) / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("", encoding="utf-8")
+        os.environ.update({
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "AGENT_DISPATCH_ATTEMPT_ID": attempt,
+            "HEARTING_WORKER_HOME": str(home),
+        })
+        root = dispatch_state_root(jobs)
+        with mock.patch.object(rt, "_maybe_spawn_unadmitted", return_value=True) as spawn:
+            with admission(root, (attempt,)):
+                self.assertFalse(rt.maybe_spawn("claude", "native-session", str(source)))
+            self.assertTrue(rt.maybe_spawn("claude", "native-session", str(source)))
+            self.assertEqual(spawn.call_args.kwargs["attempt_admission"], attempt)
+            self.assertEqual(spawn.call_args.kwargs["worker_home"], str(home))
+
+    def test_provider_process_holds_home_admission_until_transcript_read_finishes(self):
+        from dispatch_attempt_reference import admission
+        from dispatch_contract import dispatch_state_root
+
+        attempt = "att-provider-lifetime"
+        home = Path(self._tmp.name) / "worker-home"
+        home.mkdir()
+        transcript = home / "projects" / "native-session.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text('{"message":"please summarize this work"}\n', encoding="utf-8")
+        jobs = Path(self._tmp.name) / "dispatch" / "jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("", encoding="utf-8")
+        os.environ.update({
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "AGENT_DISPATCH_ATTEMPT_ID": attempt,
+            "HEARTING_WORKER_HOME": str(home),
+        })
+        entered, release, results = threading.Event(), threading.Event(), []
+
+        def slow_provider(*_args, **kwargs):
+            entered.set()
+            release.wait(5)
+            kwargs["provider_box"]["provider"] = "fixture"
+            return "TITLE: Native work\nNOW: Native work is being summarized"
+
+        def refresh():
+            results.append(rt.main([
+                "--harness", "claude", "--sid", "native-session",
+                "--transcript", str(transcript),
+            ]))
+
+        thread = threading.Thread(target=refresh)
+        try:
+            with mock.patch.object(rt, "run_worker", side_effect=slow_provider):
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                with admission(dispatch_state_root(jobs), (attempt,), blocking=False) as admitted:
+                    self.assertFalse(admitted)
+                release.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results, [0])
+            with admission(dispatch_state_root(jobs), (attempt,), blocking=False) as admitted:
+                self.assertTrue(admitted)
+        finally:
+            release.set()
+            if thread.is_alive():
+                thread.join(5)
 
     def test_scheduler_targets_children_but_never_internal_sessions(self):
         # Dispatched children are first-class title targets (user 2026-07-16);

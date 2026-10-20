@@ -106,7 +106,7 @@ resolve_report_bundle_root = WRAPPER_COMMON.resolve_report_bundle_root
 seed_launch_heartbeat = WRAPPER_COMMON.seed_launch_heartbeat
 _registered_owner = WRAPPER_COMMON.registered_owner
 completion_state_path = WRAPPER_COMMON.completion_state_path
-from dispatch_summary import launch_summary_owner, owner_root  # noqa: E402
+from dispatch_summary import launch_summary_owner, summary_writable_dirs  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
     bind_owner_launch,
@@ -888,13 +888,21 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     # that writes exact-attempt state under the fleet titles root; without
     # write access the pre-release fence closes every child as
     # `summary-owner-launch-failed`/`never-launched`.
-    summary_owner_root = owner_root()
+    summary_dirs = summary_writable_dirs()
     candidates = (
         canonical_registry_root,
         claude_config / "session-env",
-        summary_owner_root,
+        *summary_dirs,
     )
-    return tuple(path.resolve() for path in candidates if path.is_dir())
+    result = []
+    seen = set()
+    for path in candidates:
+        path = path.resolve()
+        if path in summary_dirs or path.is_dir():
+            if path not in seen:
+                seen.add(path)
+                result.append(path)
+    return tuple(result)
 
 
 def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
@@ -905,8 +913,8 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
 
     to_create = list(progress_writable_dirs(args))
     to_create.extend(route_bound_worker_writable_dirs(args))
-    if getattr(args, "nested_headless_network", False):
-        to_create.append(owner_root())
+    if nested_owner_writable_dirs(args):
+        to_create.extend(summary_writable_dirs())
     if spec_read_marker_required(args):
         to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(

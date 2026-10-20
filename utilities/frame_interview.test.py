@@ -115,6 +115,18 @@ class ValidateTest(unittest.TestCase):
     def test_a_plain_interview_is_valid(self):
         self.assertEqual(FI.validate(good_interview(), intensity="standard"), [])
 
+    def test_affected_can_be_unspecified_without_weakening_the_other_brief_fields(self):
+        for value in ("", "  ", None):
+            interview = good_interview()
+            interview["brief"]["affected"] = value
+            if value is None:
+                del interview["brief"]["affected"]
+            self.assertEqual(FI.validate(interview, intensity="quick"), [])
+        for field in ("problem", "outcome", "constraints"):
+            interview = good_interview()
+            interview["brief"][field] = ""
+            self.assertIn(f"brief.{field}: missing", FI.validate(interview, intensity="quick"))
+
     def test_the_cap_follows_intensity(self):
         many = good_interview()
         base = many["questions"][0]
