@@ -2908,7 +2908,6 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertFalse(paths.observation.exists())
 
     def test_seatless_claude_watch_settles_only_on_complete_empty_census(self):
-        from recipient_lifetime import RecipientCensus
         self.watch_root.mkdir(parents=True, exist_ok=True)
         watch_id = "seatless-ended"
         arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
@@ -2916,14 +2915,16 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
                "observer_generation": 4, "steward_seat": None,
                "agent": {"harness": "codex", "session_id": "target-sid",
                          "name": "peer-a", "pane": "-"},
-               "steward": {"harness": "claude", "session_id": "recipient-sid"},
+               "steward": {"harness": "claude", "session_id": "recipient-sid",
+                           "project": "SR_CorrNet"},
                "watcher": {}}
         paths = peer_steward._watch_paths(watch_id, self.watch_root)
         paths.arm.write_text(json.dumps(arm), encoding="utf-8")
 
-        settled = peer_steward._settle_ended_seatless_recipient(
-            watch_id, arm, self.watch_root,
-            census=RecipientCensus(lambda *_args: "ended"))
+        with mock.patch.object(claude_process_identity, "claude_session_census",
+                               return_value=(True, set(), set())):
+            settled = peer_steward._settle_ended_seatless_recipient(
+                watch_id, arm, self.watch_root)
 
         self.assertTrue(settled)
         receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))

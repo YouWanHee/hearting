@@ -64,24 +64,46 @@ def _proc_start(stat_text: str) -> str:
     return fields[19] if close >= 0 and len(fields) > 19 else ""
 
 
+_EMBEDDED_HELPERS = {"rg", "ugrep"}
+
+
+def _native_claude_executable(executable: str) -> bool:
+    return (os.path.basename(executable).lower() in {"claude", "claude-code"}
+            or "/claude/versions/" in executable.lower())
+
+
+def _claude_shaped_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    argv0 = os.path.basename(argv[0]).lower()
+    return (argv0 in {"claude", "claude-code", "claude bg-spare", "claude bg-pty-host"}
+            or "/claude/versions/" in argv[0].lower()
+            or any("@anthropic-ai/claude-code" in item or item.endswith("/claude")
+                   for item in argv)
+            or (argv0 in {"node", "nodejs", "bun"} and len(argv) > 1
+                and ("claude-code" in argv[1] or "@anthropic-ai/claude-code" in argv[1])))
+
+
 def _runtime_identity(proc: Path):
-    """Read a candidate process tuple; None means a visible non-Claude process."""
+    """Read process ownership and argv; disappeared processes are not candidates."""
     try:
+        process_uid = proc.stat().st_uid
         stat_text = (proc / "stat").read_text(encoding="ascii")
         start = _proc_start(stat_text)
-        executable = os.path.basename(os.readlink(proc / "exe")).lower()
-        argv = [item.decode("utf-8", "replace") for item in (proc / "cmdline").read_bytes().split(b"\0") if item]
+    except FileNotFoundError:
+        return None
+    try:
+        argv = [item.decode("utf-8", "replace")
+                for item in (proc / "cmdline").read_bytes().split(b"\0") if item]
+    except FileNotFoundError:
+        return None
+    try:
+        executable = os.readlink(proc / "exe")
     except FileNotFoundError:
         return None
     except OSError:
-        raise
-    is_claude = executable in {"claude", "claude-code"} or any(
-        "@anthropic-ai/claude-code" in item or item.endswith("/claude")
-        for item in argv
-    )
-    if not is_claude:
-        return None
-    return start, argv
+        executable = None
+    return process_uid, start, argv, executable
 
 
 def _argument_sessions(argv: list[str]) -> set[str]:
@@ -125,7 +147,7 @@ def invocation_kind(argv: list[str]) -> str:
         if "@anthropic-ai/claude-code" not in script and "claude-code" not in script:
             return "unknown"
         tokens = ["claude", *tokens[2:]]
-    elif executable not in {"claude", "claude-code"}:
+    elif executable not in {"claude", "claude-code"} and "/claude/versions/" not in argv[0].lower():
         # Native launcher paths are accepted only when argv names that launcher.
         if not executable.endswith("claude"):
             return "unknown"
@@ -266,7 +288,22 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
             continue
         if identity is None:
             continue
-        start, argv = identity
+        process_uid, start, argv, executable = identity
+        native_exe = bool(executable and _native_claude_executable(executable))
+        argv0 = os.path.basename(argv[0]).lower() if argv else ""
+        if process_uid != os.getuid():
+            if _claude_shaped_argv(argv):
+                reasons.add("foreign-claude-shaped-process")
+            continue
+        if native_exe and argv0 in _EMBEDDED_HELPERS:
+            continue
+        if native_exe and not _claude_shaped_argv(argv):
+            reasons.add("native-process-argv-unresolved")
+            continue
+        if not native_exe and not _claude_shaped_argv(argv):
+            # A same-uid process with an unreadable executable is resolved by
+            # its argv. Ordinary non-Claude helpers are outside this census.
+            continue
         try:
             namespace = os.readlink(proc / "ns" / "pid")
             environ = (proc / "environ").read_bytes().split(b"\0")
@@ -288,7 +325,6 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
             continue
         home = Path(home_value)
         if (not _owner_directory(home) or not _owner_directory(home / "sessions")
-                or not _owner_directory(home / ".statusline")
                 or _remote_mount(home, mounts_path)):
             reasons.add("remote-config-home")
             continue
@@ -304,7 +340,15 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
         home_key = str(home)
         if home_key not in tap_indexes:
             try:
-                tap_indexes[home_key] = tap_claim_index(home, strict=True)
+                statusline_dir = home / ".statusline"
+                try:
+                    statusline_info = statusline_dir.lstat()
+                except FileNotFoundError:
+                    tap_indexes[home_key] = {}
+                else:
+                    if not stat.S_ISDIR(statusline_info.st_mode):
+                        raise OSError("statusline tap path is not a directory")
+                    tap_indexes[home_key] = tap_claim_index(home, strict=True)
             except OSError:
                 tap_indexes[home_key] = None
         if tap_indexes[home_key] is None:
@@ -319,9 +363,8 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
                 continue
             reasons.add("session-identity-unresolved")
             continue
-        if len(claims) != 1:
-            reasons.add("session-identity-conflict")
-            continue
+        # Native, exact tap, and argv aliases may all describe one process's
+        # session history. Every exact claim is a holder; multiplicity is safe.
 
     if not reasons:
         try:
@@ -330,7 +373,12 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
             for pid in final_pids:
                 identity = _runtime_identity(root / pid)
                 if identity is not None:
-                    final_candidates[pid] = identity[0]
+                    process_uid, start, argv, executable = identity
+                    native_exe = bool(executable and _native_claude_executable(executable))
+                    if (process_uid == os.getuid()
+                            and not (native_exe and os.path.basename(argv[0]).lower() in _EMBEDDED_HELPERS)
+                            and (native_exe or _claude_shaped_argv(argv))):
+                        final_candidates[pid] = start
             if final_candidates != {pid: item[0] for pid, item in candidates.items()}:
                 reasons.add("process-inventory-changed")
         except OSError:

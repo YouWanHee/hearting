@@ -2612,9 +2612,6 @@ def _settle_ended_seatless_recipient(watch_id, arm, root=None, *, census=None,
         from claude_process_identity import is_local_path
         if not is_local_path(paths.arm.parent):
             return False
-        project = steward.get("project")
-        if project and (not Path(project).is_absolute() or not is_local_path(project)):
-            return False
     except (OSError, TypeError, ValueError):
         return False
     if census is None:
