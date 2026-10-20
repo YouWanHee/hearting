@@ -2536,10 +2536,9 @@ ledger. The original address remains a bounded diagnostic label.
 Prompt resolution distinguishes a complete no-match (`not-found`), multiple
 current matches or a name/tag collision (`ambiguous`), and observations that
 are missing, partial, malformed, or conflicting (`observation-unavailable` or
-`identity-unverified`). Failure diagnostics retain every known candidate pane;
-unknown observations are never treated as an empty inventory or silently
-discarded to choose a remaining match. A duplicate session ID in two panes is
-two candidates. None of these failures creates a carrier submission or an
+`identity-unverified`). Failure diagnostics retain every known candidate pane.
+A duplicate session ID in two panes is two candidates. None of these failures
+creates a carrier submission or an
 unresolved-recipient delivery obligation. Successful resolution does not relax
 the existing exact SID/PID-birth, native state, registered-work, composer,
 form, or receive-evidence checks. A name or tag match does not expand the
