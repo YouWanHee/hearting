@@ -20,6 +20,36 @@ class AttemptViewTests(unittest.TestCase):
         self.assertNotIn("xyz", clean)
         self.assertNotIn("\x1b", clean)
 
+    def test_c1_csi_sequence_is_removed_as_a_unit(self):
+        self.assertEqual(view.sanitize("before\u009b31mred\u009b0mafter"), "beforeredafter")
+
+    def test_claude_and_opencode_tool_inputs_render_real_lines(self):
+        import contextlib
+        import io
+        command = "cat <<'EOF'\nhello\nEOF"
+        fixtures = (
+            ("claude", {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command,
+                 "note": "old\nnew", "count": 2}}]}}),
+            ("opencode", {"type": "tool_use", "part": {"tool": "bash", "state": {
+                "status": "running", "input": {"command": command, "note": "old\nnew", "count": 2}}}}),
+        )
+        for harness, record in fixtures:
+            with self.subTest(harness=harness):
+                lines = view.format_record(harness, record)
+                self.assertEqual(lines[0].text.splitlines(), ["tool " + ("Bash" if harness == "claude" else "bash") + ":",
+                                                               "cat <<'EOF'", "hello", "EOF"])
+                rendered = "\n".join(line.text for line in lines)
+                self.assertIn("note:\nold\nnew", rendered)
+                for full in (False, True):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output): view._present(lines, full=full)
+                    shown = output.getvalue()
+                    self.assertIn("tool ", shown)
+                    self.assertIn("cat <<'EOF'\nhello\nEOF", shown)
+                    self.assertNotIn("\\nhello", shown)
+                    self.assertIn("count: 2", shown)
+
     def test_unknown_and_raw_records_survive_as_one_line(self):
         self.assertEqual(len(view.format_record("codex", "not-json\nsecond")), 1)
         lines = view.format_record("claude", {"type": "new-event", "payload": "hello"})
@@ -62,8 +92,9 @@ class AttemptViewTests(unittest.TestCase):
         tool = view.format_record("opencode", {"type": "tool_use", "part": {
             "tool": "read", "callID": "c1", "state": {
                 "status": "completed", "input": {"path": "a"}, "output": "one\ntwo"}}})
-        self.assertEqual([line.kind for line in tool], ["tool", "output"])
-        self.assertIn("one\ntwo", tool[1].text)
+        self.assertEqual([line.kind for line in tool], ["tool", "tool", "output"])
+        self.assertIn("path: a", tool[1].text)
+        self.assertIn("one\ntwo", tool[2].text)
         receipt = view.format_record("opencode", {"type": "tool_use", "part": {
             "tool": "bash", "callID": "c2", "state": {"status": "running"}}})
         self.assertEqual(len(receipt), 1)

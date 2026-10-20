@@ -139,6 +139,12 @@ def sanitize(value: object) -> str:
                     i += 1
             continue
         if 0x80 <= code <= 0x9f:
+            if code == 0x9b:
+                i += 1
+                while i < len(text) and not (0x40 <= ord(text[i]) <= 0x7e):
+                    i += 1
+                i += i < len(text)
+                continue
             i += 1
             if code in (0x90, 0x98, 0x9d, 0x9e, 0x9f):
                 while i < len(text) and ord(text[i]) != 0x9c:
@@ -200,6 +206,25 @@ def format_record(harness: str, record: object) -> list[Line]:
             if isinstance(value, (dict, list)):
                 value = _compact(value)
             result.append(Line(category, sanitize(f"{label}: {value}")))
+    def add_tool_input(name, value):
+        label = "tool " + str(name)
+        if not isinstance(value, dict):
+            add(label, value, "tool")
+            return
+        is_shell = str(name).casefold() == "bash"
+        command = value.get("command") if is_shell else None
+        if command is not None:
+            result.append(Line("tool", sanitize(f"{label}:\n{command}")))
+        else:
+            result.append(Line("tool", sanitize(label + ":")))
+        for key, argument in value.items():
+            if is_shell and key == "command":
+                continue
+            if isinstance(argument, str) and "\n" in argument:
+                result.append(Line("tool", sanitize(f"{key}:\n{argument}")))
+            else:
+                rendered = argument if isinstance(argument, str) else _compact(argument)
+                result.append(Line("tool", sanitize(f"{key}: {rendered}")))
     if kind == "notice":
         add("notice", record.get("text") or record.get("reason"), "notice")
     elif harness == "claude":
@@ -223,7 +248,7 @@ def format_record(harness: str, record: object) -> list[Line]:
                     if ptype == "text": add("assistant" if kind == "assistant" else "user", part.get("text"), "message" if kind == "assistant" else "prompt")
                     elif ptype == "thinking": add("thinking", part.get("thinking"), "thinking")
                     elif ptype == "tool_use":
-                        add("tool " + str(part.get("name", "")), part.get("input"), "tool")
+                        add_tool_input(part.get("name", ""), part.get("input"))
                     elif ptype == "tool_result": add("tool output", part.get("content"), "output")
                     elif ptype == "attachment": add("attachment", part.get("type") or "unknown", "attachment")
                     else: add(str(ptype or "content"), part, "unknown")
@@ -291,7 +316,7 @@ def format_record(harness: str, record: object) -> list[Line]:
             status = state.get("status")
             tool_input = state.get("input")
             if tool_input is not None:
-                add("tool " + str(name), tool_input, "tool")
+                add_tool_input(name, tool_input)
             elif status is not None:
                 result.append(Line("result", sanitize(f"tool {name} {status}")))
             output = state.get("output") or state.get("error")
