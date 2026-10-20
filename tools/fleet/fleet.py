@@ -65,7 +65,13 @@ def parse_args(argv):
     p.add_argument("--demo", action="store_true",
                    help="render synthetic fixture data (all harnesses + states) for rendering checks")
     p.add_argument("--view", choices=["group", "process"], default=None,
-                   help="select the legacy group or process renderer for --once")
+                   help="F-30 (v10): initial view — group (default, per-project) or process "
+                        "(per-route pipeline cards). Additive; the live TUI's `p` key toggles "
+                        "the same state either way (plan §P3 — this is --once's ONLY entry "
+                        "point into the process view, since `p` is a curses-live-only key).")
+    p.add_argument("--explorer", action="store_true",
+                   help="use the in-development B explorer screen (work ledger + output); "
+                        "`fleet2` launches this. --view does not apply to it.")
     return p.parse_args(argv)   # argparse exits 2 on bad args (matches PRD §3 exit codes)
 
 
@@ -341,11 +347,15 @@ def main(argv=None):
     render.set_show_all(args.show_all)
     render.set_api_disabled(disabled["api_disabled"])
     render.set_hearting(hearting)
-    # The legacy renderer remains an explicit noninteractive compatibility path.
+    # The B explorer is opt-in (`--explorer`, launched as `fleet2`) until it is ready to be
+    # the default; plain `fleet` keeps the group/process screen.
+    render.set_explorer_mode(args.explorer)
+    # F-30 (v10, plan §P3/§9): --view is additive and honors the SAME single _PROCESS_VIEW
+    # state the `p` key flips — never a second decision path. FLEET_VIEW env is the reduction
+    # fallback the plan reserves in case --view itself is judged out of scope later (§9 note 1);
+    # both stay best-effort no-ops when unset (default = the pre-v10 group view).
     view = args.view or os.environ.get("FLEET_VIEW")
-    legacy_once = bool(args.once and view)
-    render.set_explorer_mode(not legacy_once)
-    if legacy_once:
+    if view and not args.explorer:
         render.set_process_view(view == "process")
     if args.once:
         try:
