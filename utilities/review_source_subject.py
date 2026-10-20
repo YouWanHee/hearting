@@ -610,6 +610,17 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
     return record
 
 
+def _source_generations(route: dict) -> list[dict]:
+    """Return the route and its verified continuation lineage."""
+    if route.get("continuation_contract_version") != 1:
+        return [route]
+    from route_lineage import RouteLineageError, verified_route_lineage
+    try:
+        return verified_route_lineage(route, artifact_root=route.get("artifact_root"))
+    except RouteLineageError as exc:
+        raise SourceSubjectError("review-source-lineage-unverifiable", exc.code) from exc
+
+
 def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path) -> int:
     """Predict the route-wide source epoch from append-only marker history.
 
@@ -620,13 +631,7 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
     epoch across source-consuming markers carries across sibling branches too.
     """
     directory = Path(completion_dir)
-    generations = [route]
-    if route.get("continuation_contract_version") == 1:
-        from route_lineage import RouteLineageError, verified_route_lineage
-        try:
-            generations = verified_route_lineage(route, artifact_root=route.get("artifact_root"))
-        except RouteLineageError as exc:
-            raise SourceSubjectError("review-source-lineage-unverifiable", exc.code) from exc
+    generations = _source_generations(route)
     completion_root = directory.parent
     observations = []
     for generation in generations:
@@ -678,10 +683,72 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
     return maximum + (digest != latest)
 
 
+def _inline_evidence_subject_unchanged(route: dict, node: dict, evidence_sha256: str,
+                                       digest: str, epoch: int,
+                                       completion_dir: str | Path,
+                                       attempt_id: str) -> None:
+    """Refuse to give previously recorded review bytes a different source subject."""
+    completion_root = Path(completion_dir).parent
+    unknown = False
+    changed = False
+    for generation in _source_generations(route):
+        candidate = next((item for item in generation.get("nodes", [])
+                          if item.get("id") == node.get("id")
+                          and is_implementation_review(generation, item)), None)
+        if candidate is None:
+            continue
+        node_id = str(candidate["id"])
+        generation_dir = completion_root / str(generation.get("route_id", ""))
+        for history_path in sorted(generation_dir.glob(f"{node_id}.*.json")):
+            suffix = history_path.name[len(node_id) + 1:-5]
+            if not suffix.isdigit():
+                continue
+            sequence = int(suffix)
+            try:
+                info = history_path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise SourceSubjectError("review-source-marker-kind-invalid", node_id)
+                marker = json.loads(history_path.read_text(encoding="utf-8"))
+                if (not isinstance(marker, dict)
+                        or marker.get("route_id") != generation.get("route_id")
+                        or marker.get("route_hash") != generation.get("route_hash")
+                        or marker.get("node_id") != node_id
+                        or marker.get("completion_gate") != candidate.get("completion_gate")
+                        or marker.get("sequence") != sequence):
+                    raise SourceSubjectError("review-source-marker-identity-invalid", node_id)
+                evidence = marker.get("evidence")
+                if not isinstance(evidence, dict) or not re.fullmatch(
+                        r"[0-9a-f]{64}", str(evidence.get("sha256", ""))):
+                    raise SourceSubjectError("review-source-marker-evidence-invalid", node_id)
+                if evidence["sha256"] != evidence_sha256:
+                    continue
+                subject = marker.get("source_subject")
+                if (not isinstance(subject, dict)
+                        or subject.get("schema_version") != SCHEMA_VERSION
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(subject.get("digest", "")))
+                        or not isinstance(subject.get("epoch"), int)
+                        or isinstance(subject.get("epoch"), bool)
+                        or subject["epoch"] < 0):
+                    unknown = True
+                elif subject["digest"] != digest or subject["epoch"] != epoch:
+                    changed = True
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, TypeError) as exc:
+                if isinstance(exc, SourceSubjectError):
+                    raise
+                raise SourceSubjectError("review-source-marker-unreadable", node_id) from exc
+    if unknown:
+        raise SourceSubjectError("review-source-binding-missing", attempt_id)
+    if changed:
+        raise SourceSubjectError("review-source-subject-changed-before-completion", attempt_id)
+
+
 def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
                    attempt_metadata: dict | None = None, jobs: str | Path | None = None,
                    worktree: str | Path | None = None, completion_dir: str | Path,
-                   owner_inline: bool = False) -> dict | None:
+                   owner_inline: bool = False,
+                   evidence_sha256: str | None = None) -> dict | None:
     """Subject fields to put on a newly published completion marker."""
     if not has_source_subject(route, node):
         return None
@@ -689,6 +756,11 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
         if is_implementation_review(route, node) and owner_inline and attempt_id:
             current = observe(route, node, worktree=worktree)
             epoch = source_epoch(route, node, current["digest"], completion_dir)
+            if evidence_sha256 is not None:
+                _inline_evidence_subject_unchanged(
+                    route, node, evidence_sha256, current["digest"], epoch,
+                    completion_dir, attempt_id,
+                )
             return {"schema_version": SCHEMA_VERSION, "digest": current["digest"],
                     "epoch": epoch, "inline_provenance": {
                         "kind": "owner-inline", "attempt_id": attempt_id,

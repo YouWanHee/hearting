@@ -2,6 +2,7 @@
 """Effective source-subject identity, binding, and replacement regressions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -216,6 +217,54 @@ class SourceSubjectTest(unittest.TestCase):
             self.route, self.node, attempt_id=None, worktree=self.repo,
             completion_dir=completion, owner_inline=True,
         ))
+
+    def test_owner_inline_does_not_rebind_historical_evidence_subject(self):
+        current_digest = self.observe()["digest"]
+        evidence_sha = hashlib.sha256(b"previous review evidence").hexdigest()
+        completion_root = Path(self.temp.name) / "completion"
+        cases = (
+            ("unknown", None, "review-source-binding-missing"),
+            ("stale", {"schema_version": SUBJECT.SCHEMA_VERSION,
+                        "digest": "0" * 64, "epoch": 0},
+             "review-source-subject-changed-before-completion"),
+            ("same", {"schema_version": SUBJECT.SCHEMA_VERSION,
+                      "digest": current_digest, "epoch": 0}, None),
+        )
+        for label, subject, expected_error in cases:
+            with self.subTest(history=label):
+                route = {**self.route, "route_id": f"rt-subject-{label}"}
+                completion = completion_root / route["route_id"]
+                completion.mkdir(parents=True)
+                marker = {
+                    "schema_version": 2, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "registry_digest": "sha256:fixture",
+                    "node_id": self.node["id"],
+                    "completion_gate": self.node["completion_gate"], "sequence": 1,
+                    "attempt_id": f"att-history-{label}",
+                    "evidence": {"path": "historical.md", "sha256": evidence_sha},
+                }
+                if subject is not None:
+                    marker["source_subject"] = subject
+                encoded = json.dumps(marker, sort_keys=True).encode("utf-8")
+                (completion / "impl-review.1.json").write_bytes(encoded)
+                (completion / "impl-review.json").write_bytes(encoded)
+
+                if expected_error:
+                    with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+                        SUBJECT.marker_subject(
+                            route, self.node, attempt_id="att-new-inline-review",
+                            worktree=self.repo, completion_dir=completion,
+                            owner_inline=True, evidence_sha256=evidence_sha,
+                        )
+                    self.assertEqual(refused.exception.reason, expected_error)
+                else:
+                    fresh = SUBJECT.marker_subject(
+                        route, self.node, attempt_id="att-new-inline-review",
+                        worktree=self.repo, completion_dir=completion,
+                        owner_inline=True, evidence_sha256=evidence_sha,
+                    )
+                    self.assertEqual((fresh["digest"], fresh["epoch"]),
+                                     (current_digest, 0))
 
     def observe_test(self):
         return SUBJECT.observe(self.route, self.test_node, worktree=self.repo)

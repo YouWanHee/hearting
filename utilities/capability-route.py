@@ -7364,23 +7364,37 @@ def write_completion_marker(
         owner_override=owner_override, owner_chain=owner_chain,
     )
     from review_source_subject import SourceSubjectError, is_implementation_review, marker_subject
-    try:
-        source_subject = marker_subject(
-            route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
-            jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
-            owner_inline=(review_identity.get("reviewer_kind") == "owner-inline"
-                          and axes.get("registered_worker") is False
-                          and axes.get("execution_surface") == "inline"),
-        )
-    except SourceSubjectError as exc:
-        # Only an implementation review consumes its source subject as evidence.
-        # Another scoped node's subject is optional epoch history: when its tree
-        # cannot be observed, the marker records none (legacy-unknown).
-        if (is_implementation_review(route, node) or exc.reason not in {
-                "review-source-git-unavailable", "review-source-worktree-unavailable",
-                "review-source-scope-unavailable"}):
-            raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+    inline_review_write = (
+        is_implementation_review(route, node)
+        and review_identity.get("reviewer_kind") == "owner-inline"
+        and axes.get("registered_worker") is False
+        and axes.get("execution_surface") == "inline"
+    )
+    # An exact attempt replay is historical even after source drift. Check its
+    # immutable evidence/axes/history before asking for a new source binding.
+    replay_candidate = (_completion_marker_replay(
+        route, node, node_id, evidence, axes, directory, repair=False,
+        evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+    ) if inline_review_write else None)
+    if replay_candidate is not None:
         source_subject = None
+    else:
+        try:
+            source_subject = marker_subject(
+                route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
+                jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
+                owner_inline=inline_review_write,
+                evidence_sha256=sha if inline_review_write else None,
+            )
+        except SourceSubjectError as exc:
+            # Only an implementation review consumes its source subject as evidence.
+            # Another scoped node's subject is optional epoch history: when its tree
+            # cannot be observed, the marker records none (legacy-unknown).
+            if (is_implementation_review(route, node) or exc.reason not in {
+                    "review-source-git-unavailable", "review-source-worktree-unavailable",
+                    "review-source-scope-unavailable"}):
+                raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+            source_subject = None
     replayed=_completion_marker_replay(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,

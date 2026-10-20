@@ -119,6 +119,16 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         old_history = (marker_dir / f"impl-review.{old['sequence']}.json").read_bytes()
         self.assertEqual(old['reviewer_kind'], 'owner-inline')
         self.assertEqual(self.currency(old).reason, 'completion-source-subject-unknown')
+        unknown_attempt = 'att-inline-claim-legacy-unknown'
+        unknown_meta = {**self._metadata(node, unknown_attempt, 'owner'),
+                        'registered_worker': '0', 'execution_surface': 'inline',
+                        'transport': 'interactive', 'fallback_hop': 'inline'}
+        with self.assertRaisesRegex(ValueError, '^review-source-binding-missing:'):
+            ROUTE_WRITER.complete_node(
+                self.route, node, node['id'], evidence,
+                attempt_id=unknown_attempt, explicit_attempt_metadata=unknown_meta)
+        self.assertEqual((marker_dir / f"impl-review.{old['sequence']}.json").read_bytes(),
+                         old_history)
         self.complete_node('test', 'att-historical-test', 'historical test')
         self._row(self._row_metadata('att-historical-test'),
                   extra=finished_process())
@@ -338,6 +348,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.assertEqual(self.currency(b_marker).state, 'current')
         (self.repo / 'engine.py').write_text("value = 'A'\n", encoding='utf-8')
         source_a_again = SUBJECT.observe(self.route, node, worktree=self.repo)
+        self.assertEqual(source_a_again['digest'], marker['source_subject']['digest'])
         self.assertEqual(SUBJECT.source_epoch(
             self.route, node, source_a_again['digest'], marker_dir),
             marker['source_subject']['epoch'] + 2)
@@ -345,6 +356,34 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
             self.route, node, marker, marker_dir, jobs=self.jobs),
             ('superseded', 'completion-review-source-stale'))
         self.assertEqual(self.currency(b_marker).reason, 'completion-review-source-stale')
+        b_history_path = marker_dir / f"impl-review.{b_marker['sequence']}.json"
+        b_history_before = b_history_path.read_bytes()
+        b_canonical_before = (marker_dir / 'impl-review.json').read_bytes()
+        replay_marker, replay_result = ROUTE_WRITER.complete_node(
+            self.route, node, node['id'], b_evidence,
+            attempt_id=b_attempt, explicit_attempt_metadata=b_metadata)
+        self.assertEqual(replay_result['status'], 'unregistered-complete')
+        self.assertEqual(replay_marker, b_marker)
+        self.assertEqual(b_history_path.read_bytes(), b_history_before)
+
+        for attempt_id, evidence_path in (
+                ('att-inline-reuse-old-evidence-path', b_evidence),
+                ('att-inline-reuse-copied-old-evidence', self.output_dir / 'copied-review-B.md'),
+                ('att-inline-reuse-old-A-epoch', new_evidence)):
+            if evidence_path != b_evidence:
+                evidence_path.write_bytes(b_evidence.read_bytes())
+            metadata = {**self._metadata(node, attempt_id, 'owner'),
+                        'registered_worker': '0', 'execution_surface': 'inline',
+                        'transport': 'interactive', 'fallback_hop': 'inline'}
+            with self.subTest(attempt_id=attempt_id):
+                with self.assertRaisesRegex(
+                        ValueError, '^review-source-subject-changed-before-completion:'):
+                    ROUTE_WRITER.complete_node(
+                        self.route, node, node['id'], evidence_path,
+                        attempt_id=attempt_id, explicit_attempt_metadata=metadata)
+                self.assertEqual((marker_dir / 'impl-review.json').read_bytes(),
+                                 b_canonical_before)
+                self.assertEqual(b_history_path.read_bytes(), b_history_before)
         with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
             pending = replacement._reuse_snapshot(
                 self.jobs, self.route, self.jobs.read_text().splitlines())['pending']
