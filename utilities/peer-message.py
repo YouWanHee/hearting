@@ -765,19 +765,36 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
         return updated
 
 
-def claim_pending_first_input(ref, recipient, process_proof):
-    """Claim exactly one guarded first-turn submission while the target has no SID."""
+def reserve_pending_first_input(ref, recipient, process_proof, *, claimant=None):
+    """Reserve one guarded first-turn submission without marking it sent.
+
+    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
+    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
+    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
+    """
     if (not isinstance(recipient, dict)
             or recipient.get("harness") not in ("claude", "codex", "opencode")
             or not isinstance(recipient.get("pane_id"), str)
             or not _valid_first_input_process(process_proof, recipient)):
         return None
     from dispatch_contract import process_start_ticks
+    claimant = claimant or {"pid": os.getpid(), "start": process_start_ticks(os.getpid())}
     with pending_lock(ref):
         row = _read_pending(ref)
         original = (row or {}).get("to") or {}
         expected = pending_first_input_process(row)
-        if (not row or row.get("state") != "pending" or row.get("rpc_claim")
+        old_claim = (row or {}).get("rpc_claim") or {}
+        if old_claim:
+            from dispatch_contract import process_identity_disposition
+            try:
+                dead = (row.get("state") == "pending"
+                        and process_identity_disposition(int(old_claim.get("pid", 0)),
+                                                         str(old_claim.get("start") or "")) == "dead")
+            except (TypeError, ValueError):
+                dead = False
+            if not dead:
+                return None
+        if (not row or row.get("state") != "pending"
                 or not _valid_pane_bound_endpoint(original)
                 or original.get("harness") != recipient["harness"]
                 or original.get("pane_id") != recipient["pane_id"]
@@ -786,12 +803,23 @@ def claim_pending_first_input(ref, recipient, process_proof):
             return None
         if _registered_delivery_settled(row):
             return None
-        claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
-                 "start": process_start_ticks(os.getpid())}
-        updated = dict(row, state="unverified", receipt="native-first-input-inflight",
-                       rpc_claim=claim)
+        claim = {"token": secrets.token_hex(16), "pid": claimant.get("pid"),
+                 "start": claimant.get("start"), "first_input": True,
+                 "recipient": _rpc_claim_recipient(recipient)}
+        updated = dict(row, rpc_claim=claim)
         _save_pending(updated)
         return updated
+
+
+def claim_pending_first_input(ref, recipient, process_proof):
+    """Compatibility helper for callers whose reserve and write are adjacent."""
+    reserved = reserve_pending_first_input(ref, recipient, process_proof)
+    return begin_pending_write(reserved, recipient=recipient,
+                               receipt="native-first-input-inflight") if reserved else None
+
+
+def _rpc_claim_recipient(recipient):
+    return {key: recipient.get(key) for key in ("harness", "session_id", "pane_id")}
 
 
 def _pending_target_matches(row, recipient):
@@ -1178,17 +1206,22 @@ def schedule_acceptance_reply(handoff_ref, sender, recipient):
     return ref
 
 
-def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
-                        allow_hook_context_recovery=False):
-    """Reserve one exact deferred row before any pane input, using the existing claim state.
+def reserve_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
+                          allow_hook_context_recovery=False, claimant=None):
+    """Reserve an exact deferred row while retaining its pending state.
 
     Other senders and native callbacks cannot submit it again once it is
     unverified/inflight. An ambiguous send preserves the payload for actual
     receiver acknowledgement rather than blindly typing it a second time.
+
+    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
+    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
+    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
     """
     if not _valid_transfer_endpoint(recipient):
         return None
     from dispatch_contract import process_start_ticks
+    claimant = claimant or {"pid": os.getpid(), "start": process_start_ticks(os.getpid())}
     with pending_lock(ref):
         row = _read_pending(ref)
         recover_hook_context = bool(
@@ -1199,16 +1232,75 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
             and row.get("receipt") == "hook-context-emitted"
             and not row.get("no_trailer")
         )
+        old_claim = (row or {}).get("rpc_claim") or {}
+        if old_claim:
+            from dispatch_contract import process_identity_disposition
+            try:
+                dead = (row.get("state") == "pending"
+                        and process_identity_disposition(int(old_claim.get("pid", 0)),
+                                                         str(old_claim.get("start") or "")) == "dead")
+            except (TypeError, ValueError):
+                dead = False
+            if not dead:
+                return None
         if (not row or (row["state"] != "pending" and not recover_hook_context)
-                or row.get("rpc_claim")
                 or not _pending_target_matches(row, recipient)):
             return None
         if _registered_delivery_settled(row):
             return None
-        claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
-                 "start": process_start_ticks(os.getpid())}
-        _save_pending(dict(row, state="unverified", receipt=receipt, rpc_claim=claim))
+        claim = {"token": secrets.token_hex(16), "pid": claimant.get("pid"),
+                 "start": claimant.get("start"), "receipt": receipt,
+                 "recipient": _rpc_claim_recipient(recipient)}
+        _save_pending(dict(row, rpc_claim=claim))
         return dict(row, rpc_claim=claim)
+
+
+def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
+    """Mark an exact reserved pending transfer unverified immediately before I/O.
+
+    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
+    packages/daemon/src/domain/seat-delivery-guard.ts and
+    packages/daemon/src/domain/session-transport.ts (Apache-2.0); Modified for
+    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
+    """
+    if not isinstance(row, dict) or not isinstance(row.get("rpc_claim"), dict):
+        return None
+    ref, claim = row.get("ref"), row["rpc_claim"]
+    recipient = recipient or claim.get("recipient") or {}
+    from dispatch_contract import process_identity_disposition, process_start_ticks
+    claimant = claimant or {"pid": os.getpid(), "start": process_start_ticks(os.getpid())}
+    try:
+        if (claim.get("pid") != claimant.get("pid") or claim.get("start") != claimant.get("start")
+                or process_identity_disposition(int(claim.get("pid", 0)),
+                                                str(claim.get("start") or "")) != "live"):
+            return None
+    except (TypeError, ValueError):
+        return None
+    with pending_lock(ref):
+        current = _read_pending(ref)
+        recover_hook_context = bool(current and current.get("state") == "queued"
+            and current.get("receipt") == "hook-context-emitted"
+            and receipt == "hook-context-inflight")
+        exact_recipient = (_rpc_claim_recipient(recipient) == claim.get("recipient"))
+        if (not current or (current.get("state") != "pending" and not recover_hook_context)
+                or current.get("rpc_claim") != claim
+                or not exact_recipient
+                or (not claim.get("first_input")
+                    and not _pending_target_matches(current, recipient))
+                or _registered_delivery_settled(current)):
+            return None
+        updated = dict(current, state="unverified", receipt=receipt or claim.get("receipt")
+                       or "delivery-inflight")
+        _save_pending(updated)
+        return updated
+
+
+def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
+                        allow_hook_context_recovery=False):
+    """Compatibility helper for callers whose reserve and write are adjacent."""
+    reserved = reserve_pending_herdr(ref, recipient, receipt=receipt,
+                                     allow_hook_context_recovery=allow_hook_context_recovery)
+    return begin_pending_write(reserved, recipient=recipient, receipt=receipt) if reserved else None
 
 
 def mark_pending_queued(ref, *, receipt="delivery-observed"):
@@ -1242,13 +1334,18 @@ def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitt
 
 
 def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
-    """Release this exact claim only when its caller has not submitted the message."""
+    """Release this exact pending claim only before the external write.
+
+    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
+    packages/daemon/src/domain/occupant-invalidator.ts (Apache-2.0); Modified for
+    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
+    """
     with pending_lock(row["ref"]):
         current = _read_pending(row["ref"])
-        if (not current or current["state"] != "unverified"
+        if (not current or current["state"] not in {"pending", "queued"}
                 or current.get("rpc_claim") != row.get("rpc_claim")):
             return False
-        _save_pending(dict(current, state="pending", rpc_claim=None, receipt=receipt))
+        _save_pending(dict(current, rpc_claim=None, receipt=receipt))
         return True
 
 
@@ -2466,7 +2563,7 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
                     continue
             native_boundary = bool(native_delivery and event in {"UserPromptSubmit", "PostToolUse"})
             try:
-                claimed = claim_pending_herdr(
+                claimed = reserve_pending_herdr(
                     row["ref"], recipient, receipt="hook-context-inflight",
                     allow_hook_context_recovery=native_boundary)
             except BlockingIOError:
@@ -2503,6 +2600,20 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
             break
     if extra_context:
         context.append(extra_context)
+    if not context:
+        return
+    begun = []
+    for row in claims:
+        writing = begin_pending_write(row, recipient=recipient,
+                                      receipt="hook-context-inflight")
+        if writing:
+            begun.append(writing)
+        else:
+            try:
+                context.remove(row["text"])
+            except ValueError:
+                pass
+    claims = begun
     if not context:
         return
     text = "\n\n".join(context)
@@ -2544,6 +2655,43 @@ def cmd_pending(args):
     claim_ref = getattr(args, "claim", None)
     queued_ref = getattr(args, "queued", None)
     resuming_ref = getattr(args, "resuming", None)
+    reserve_ref = getattr(args, "reserve", None)
+    begin_ref = getattr(args, "begin_write", None)
+    claimant = {"pid": getattr(args, "claim_pid", None),
+                "start": getattr(args, "claim_start", None)}
+    if reserve_ref or begin_ref:
+        import dispatch_contract as DC
+        try:
+            claimant["pid"] = int(claimant["pid"])
+            if (claimant["pid"] <= 1 or not isinstance(claimant["start"], str)
+                    or not claimant["start"].isdigit()
+                    or DC.process_identity_disposition(claimant["pid"], claimant["start"]) != "live"):
+                return 1
+        except (TypeError, ValueError):
+            return 1
+        if reserve_ref:
+            row = _read_pending(reserve_ref)
+            if not row or row.get("state") != "pending" \
+                    or not _same_transfer_session(pending_delivery_recipient(row), recipient):
+                return 1
+            reserved = reserve_pending_herdr(reserve_ref, recipient,
+                receipt="opencode-prompt-inflight", claimant=claimant)
+            if not reserved:
+                return 1
+            print(json.dumps(reserved, ensure_ascii=False))
+            return 0
+        row = _read_pending(begin_ref)
+        claim = (row or {}).get("rpc_claim") or {}
+        if (not row or not isinstance(getattr(args, "claim_token", None), str)
+                or claim.get("token") != args.claim_token
+                or not _same_transfer_session(pending_delivery_recipient(row), recipient)):
+            return 1
+        begun = begin_pending_write(row, recipient=recipient,
+                                    receipt="opencode-prompt-inflight", claimant=claimant)
+        if not begun:
+            return 1
+        print(json.dumps(begun, ensure_ascii=False))
+        return 0
     if not claim_ref and not queued_ref and not resuming_ref and not received_ref:
         # The OpenCode idle callback itself owns delivery. Listing is side-effect
         # free so it does not recursively start another continuation decision.
@@ -3253,7 +3401,12 @@ def main(argv=None):
     intent.add_argument("--queued")
     intent.add_argument("--resuming")
     intent.add_argument("--received")
+    intent.add_argument("--reserve")
+    intent.add_argument("--begin-write")
     p_pending.add_argument("--message-id")
+    p_pending.add_argument("--claim-pid", type=int)
+    p_pending.add_argument("--claim-start")
+    p_pending.add_argument("--claim-token")
     p_pending.set_defaults(func=cmd_pending)
 
     p_record = sub.add_parser("record")

@@ -8,9 +8,11 @@ import io
 import importlib.util
 import json
 import os
+import select
 import shlex
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -1299,14 +1301,136 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
 
     def test_unsent_claim_can_retry_but_receiver_ack_is_never_undone(self):
         text, ref = self.pending()
-        first = peer_message.claim_pending_herdr(ref, self.recipient)
+        first = peer_message.reserve_pending_herdr(ref, self.recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
         self.assertTrue(peer_message.release_unsent_herdr_claim(first))
-        second = peer_message.claim_pending_herdr(ref, self.recipient)
+        second = peer_message.reserve_pending_herdr(ref, self.recipient)
         self.assertIsNotNone(second)
         self.assertFalse(peer_message.release_unsent_herdr_claim(first))
+        writing = peer_message.begin_pending_write(second)
+        self.assertEqual(writing["state"], "unverified")
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
         self.assertFalse(peer_message.release_unsent_herdr_claim(second))
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
+    def test_prewrite_reservation_is_recoverable_but_unverified_is_not_replayed(self):
+        _text, ref = self.pending()
+        first = peer_message.reserve_pending_herdr(ref, self.recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+        with mock.patch("dispatch_contract.process_identity_disposition", return_value="dead"):
+            recovered = peer_message.reserve_pending_herdr(ref, self.recipient)
+        self.assertNotEqual(first["rpc_claim"]["token"], recovered["rpc_claim"]["token"])
+        with mock.patch("dispatch_contract.process_identity_disposition", return_value="live"):
+            writing = peer_message.begin_pending_write(recovered)
+        self.assertEqual(writing["state"], "unverified")
+        self.assertFalse(peer_message.release_unsent_herdr_claim(writing))
+        self.assertIsNone(peer_message.reserve_pending_herdr(ref, self.recipient))
+
+    def test_begin_write_rejects_a_recipient_changed_after_reservation(self):
+        _text, ref = self.pending()
+        reserved = peer_message.reserve_pending_herdr(ref, self.recipient)
+        changed = dict(self.recipient, session_id="different-recipient")
+        self.assertIsNone(peer_message.begin_pending_write(reserved, recipient=changed))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+        writing = peer_message.begin_pending_write(reserved, recipient=self.recipient)
+        self.assertEqual(writing["state"], "unverified")
+
+    def test_sigkill_before_and_after_begin_write_preserves_at_most_once(self):
+        child_code = "\n".join((
+            "import importlib.util, json, os, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent))",
+            "spec=importlib.util.spec_from_file_location('peer_message', sys.argv[1])",
+            "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)",
+            "ref, recipient, ready_fd, release_fd, mode, write_path=sys.argv[2:]",
+            "recipient=json.loads(recipient)",
+            "reserved=module.reserve_pending_herdr(ref, recipient)",
+            "if reserved is None: print(module._read_pending(ref), recipient, file=sys.stderr); raise SystemExit(3)",
+            "if mode == 'after':",
+            " writing=module.begin_pending_write(reserved, recipient=recipient)",
+            " if writing is None: raise SystemExit(4)",
+            " with open(write_path, 'a') as output: output.write('write')",
+            "os.write(int(ready_fd), b'R')",
+            "os.read(int(release_fd), 1)",
+        ))
+        for mode in ("before", "after"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                _body, ref = peer_message.prepare_peer_message(
+                    f"kill boundary fixture {mode}", self.sender, self.recipient, defer=True)
+                writes = Path(tmp) / "writes.log"
+                ready_read, ready_write = os.pipe()
+                release_read, release_write = os.pipe()
+                child = subprocess.Popen([
+                    sys.executable, "-c", child_code, str(_HERE / "peer-message.py"), ref,
+                    json.dumps(self.recipient), str(ready_write), str(release_read), mode, str(writes)],
+                    cwd=_HERE.parent, env=os.environ.copy(),
+                    pass_fds=(ready_write, release_read), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE)
+                os.close(ready_write)
+                os.close(release_read)
+                try:
+                    if not select.select([ready_read], [], [], 10)[0]:
+                        child.wait(timeout=5)
+                        self.fail("child exited before barrier: code=%s stderr=%r" %
+                                  (child.returncode, child.stderr.read()))
+                    ready = os.read(ready_read, 1)
+                    if ready != b"R":
+                        child.wait(timeout=5)
+                        self.fail("child exited before barrier: code=%s stderr=%r" %
+                                  (child.returncode, child.stderr.read()))
+                    child.kill()
+                    child.wait(timeout=5)
+                    if child.stderr:
+                        child.stderr.close()
+                finally:
+                    os.close(ready_read)
+                    os.close(release_write)
+                if mode == "before":
+                    reserved = peer_message.reserve_pending_herdr(ref, self.recipient)
+                    self.assertIsNotNone(reserved)
+                    writing = peer_message.begin_pending_write(reserved, recipient=self.recipient)
+                    self.assertIsNotNone(writing)
+                    with writes.open("a") as output:
+                        output.write("write")
+                else:
+                    self.assertIsNone(peer_message.reserve_pending_herdr(ref, self.recipient))
+                self.assertEqual(writes.read_text().splitlines(), ["write"])
+
+    def test_opencode_reserve_and_begin_write_each_fit_their_own_timeout(self):
+        from dispatch_contract import process_start_ticks
+        recipient = {"harness": "opencode", "session_id": "opencode-latency"}
+        claimant = {"pid": os.getpid(), "start": process_start_ticks(os.getpid())}
+        env = {**os.environ, "AGENT_HOME": str(_HERE.parent)}
+        reserve_ms, begin_ms = [], []
+        for index in range(20):
+            _body, ref = peer_message.prepare_peer_message(
+                f"latency fixture {index}", self.sender, recipient, defer=True)
+            reserve_start = time.monotonic()
+            reserved = subprocess.run([
+                sys.executable, str(_HERE / "peer-message.py"), "pending",
+                "--to-harness", "opencode", "--to-session-id", recipient["session_id"],
+                "--reserve", ref, "--claim-pid", str(claimant["pid"]),
+                "--claim-start", claimant["start"]], env=env, text=True,
+                capture_output=True, timeout=1.5)
+            reserve_ms.append((time.monotonic() - reserve_start) * 1000)
+            self.assertEqual(reserved.returncode, 0, reserved.stderr)
+            claim = json.loads(reserved.stdout)["rpc_claim"]
+            begin_start = time.monotonic()
+            begun = subprocess.run([
+                sys.executable, str(_HERE / "peer-message.py"), "pending",
+                "--to-harness", "opencode", "--to-session-id", recipient["session_id"],
+                "--begin-write", ref, "--claim-token", claim["token"],
+                "--claim-pid", str(claimant["pid"]), "--claim-start", claimant["start"]],
+                env=env, text=True, capture_output=True, timeout=1.5)
+            begin_ms.append((time.monotonic() - begin_start) * 1000)
+            self.assertEqual(begun.returncode, 0, begun.stderr)
+            self.assertEqual(json.loads(begun.stdout)["state"], "unverified")
+        total_ms = sum(reserve_ms) + sum(begin_ms)
+        print("OpenCode transition latency: reserve_max_ms=%.1f begin_write_max_ms=%.1f "
+              "total_added_ms=%.1f samples=20" %
+              (max(reserve_ms), max(begin_ms), total_ms))
+        self.assertLess(max(reserve_ms), 1500)
+        self.assertLess(max(begin_ms), 1500)
 
     def test_claude_paste_wrapper_keeps_exact_ref_and_body(self):
         recipient = dict(self.recipient, harness="claude")

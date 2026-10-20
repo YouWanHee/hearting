@@ -75,6 +75,27 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(self._owns_after("codex-sid-after-clear", "codex"))
         self.assertTrue(self._owns_after("claude-sid", "claude"))
 
+    def test_only_current_recipient_owns_after_two_handovers(self):
+        jobs = Path("/tmp/registered-parent-handover-jobs")
+        binding = HANDOVER.binding_of(jobs, self.OWNER)
+        rows = [
+            {"from": "codex-sid", "sid": "claude-sid", "harness": "claude",
+             "bindings": [binding], "ts": 1},
+            {"from": "claude-sid", "sid": "opencode-sid", "harness": "opencode",
+             "bindings": [binding], "ts": 2},
+        ]
+        with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
+             mock.patch.object(HANDOVER, "handover_rows", return_value=rows):
+            self.assertFalse(RA.owns(self.OWNER, "codex-sid", jobs))
+            self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
+            self.assertTrue(RA.owns(self.OWNER, "opencode-sid", jobs))
+
+    def test_unreadable_handover_keeps_registered_parent_safe_default(self):
+        jobs = Path("/tmp/registered-parent-unreadable-jobs")
+        with mock.patch.object(HANDOVER, "_seats_for_binding", side_effect=OSError("unreadable")):
+            self.assertTrue(RA.owns(self.OWNER, "codex-sid", jobs))
+            self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
+
     def test_a_non_owner_cannot_start_the_replacement_owner(self):
         with self.assertRaises(DC.DispatchContractError) as refused:
             RA.require_replacement_parent(None, {}, self.OWNER, current_session=lambda: "claude-sid")

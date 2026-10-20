@@ -898,11 +898,20 @@ def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str
     return _effective(meta, jobs, read_context=read_context)[1]
 
 
-def owns(meta: dict, session: str, jobs=None) -> bool:
-    """True when ``session`` is the registered parent or its confirmed same-seat successor."""
+def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
+    """True only for the registered parent or its current effective successor.
+
+    If the handover snapshot cannot be read, ``effective_parent`` deliberately
+    falls back to the registered parent, preserving the existing safe default.
+
+    Based on OpenRig v0.6.13 commit 9eeb2e42ca6dcfb8da60a8517dc39c7d83b84082,
+    packages/daemon/src/domain/occupant-invalidator.ts and
+    packages/daemon/src/domain/seat-delivery-guard.ts (Apache-2.0); Modified for
+    Hearting: Python/file-state adaptation. See THIRD_PARTY_NOTICES.md.
+    """
     if not session:
         return False
-    return meta.get("parent_sid") == session or (jobs is not None and effective_parent(meta, jobs) == session)
+    return effective_parent(meta, jobs, read_context=read_context) == session
 
 
 def _seats_for_binding(jobs, meta: dict, *, read_context=None) -> list:

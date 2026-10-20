@@ -794,14 +794,17 @@ def correction_source_session(environ=None) -> str:
     return session_label(environ)
 
 
-def owns(meta, session, jobs) -> bool:
-    """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if session and meta.get("parent_sid") == session:
-        return True
-    if not session or jobs is None:
+def owns(meta, session, jobs, *, read_context=None) -> bool:
+    """The registered parent or current confirmed seat successor.
+
+    Unreadable handover state retains the existing registered-parent fallback.
+    """
+    if not session:
         return False
     from dispatch_seat_handover import owns as seat_owns
-    return seat_owns(meta, session, jobs)
+    if read_context is None:
+        return seat_owns(meta, session, jobs)
+    return seat_owns(meta, session, jobs, read_context=read_context)
 
 
 def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
