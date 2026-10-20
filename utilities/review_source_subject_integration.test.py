@@ -816,6 +816,25 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.assertEqual(self.currency(marker).reason,
                          "completion-review-source-binding-missing")
 
+    def test_marker_currency_maps_non_object_binding_sidecars_to_integrity_failure(self):
+        _metadata, marker = self.complete_review("att-review-non-object-binding")
+        subject_path = SUBJECT.binding_path(self.jobs, marker["attempt_id"])
+        self.assertEqual(self.currency(marker).state, "current")
+
+        for malformed in ([], "sidecar", None):
+            with self.subTest(malformed=malformed):
+                subject_path.write_text(json.dumps(malformed), encoding="utf-8")
+                result = self.currency(marker)
+                self.assertEqual((result.state, result.reason),
+                                 ("integrity-broken:identity-mismatch",
+                                  "completion-review-source-binding-missing"))
+
+        subject_path.unlink()
+        missing = self.currency(marker)
+        self.assertEqual((missing.state, missing.reason),
+                         ("integrity-broken:identity-mismatch",
+                          "completion-review-source-binding-missing"))
+
     def test_marker_currency_uses_sealed_registry_under_ambient_mismatch(self):
         self.current_smoke_markers("sealed-registry")
         metadata, marker = self.complete_review("att-review-sealed-registry")

@@ -617,6 +617,58 @@ class Case5ReadRootsTest(unittest.TestCase):
                 with self.subTest(applied=applied), self.assertRaises(DC.DispatchContractError):
                     RA.require_recovery_grant_addresses(candidate, history, route=route)
 
+    def test_selected_agent_recovery_grants_use_global_then_local_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifact = root / "worktree", root / "artifact"
+            install, readonly = root / "install", root / "records"
+            for path in (worktree, artifact, install / "core", install / "utilities", readonly):
+                path.mkdir(parents=True, exist_ok=True)
+            history = {
+                "harness": "codex", "worktree": str(worktree),
+                "jobs": str(root / "state" / "jobs.log"),
+                "applied_permissions": {"execution_access": {
+                    "writable_roots": [], "read_roots": [str(readonly)],
+                    "network": "not-requested",
+                }},
+            }
+            route = {"cwd": str(worktree), "artifact_root": str(artifact),
+                     "work_request": {"text": ""}}
+            global_policy = {
+                "external_directory": {
+                    "*": "deny", str(worktree) + "/**": "allow",
+                    str(artifact) + "/**": "allow", str(readonly) + "/**": "allow",
+                },
+                "edit": {
+                    "*": "deny", str(worktree) + "/**": "allow",
+                    str(readonly) + "/**": "deny",
+                },
+            }
+
+            def recorded(local_policy):
+                config = {"permission": global_policy,
+                          "agent": {"build": {"permission": local_policy}}}
+                applied = DR._applied_permissions(SimpleNamespace(
+                    opencode_config_content=json.dumps(config), agent="build"))
+                return {"harness": "opencode", "launch_home": str(install),
+                        "applied_permissions": applied}
+
+            RA.require_recovery_grant_addresses(recorded({}), history, route=route)
+            outside = str(root / "outside") + "/**"
+            cases = {
+                "selected-edit-outside": {"edit": {outside: "allow"}},
+                "selected-external-directory-outside": {
+                    "external_directory": {"*": "deny", outside: "allow"}},
+                # This later selected path rule overrides the global
+                # read-only deny for the same resource.
+                "selected-edit-writes-read-only-root": {
+                    "edit": {str(readonly) + "/**": "allow"}},
+            }
+            for name, local_policy in cases.items():
+                with self.subTest(case=name), self.assertRaises(DC.DispatchContractError):
+                    RA.require_recovery_grant_addresses(
+                        recorded(local_policy), history, route=route)
+
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
     """Case 6: an uncapped execute FAIL; envelopes are matched exactly.
