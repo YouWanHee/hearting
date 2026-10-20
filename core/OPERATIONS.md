@@ -2672,49 +2672,37 @@ background record form.
 describes one session badge and hides calls younger than 60 seconds. The
 approved background-task intent expands those display limits for acknowledged
 native background jobs while preserving F-47's parent-classification and
-zero-injection boundaries. This delta is additive to the v86 Codex stale-`idle`
-classification correction above: shell evidence never changes parent status,
-pulse, route, gate, or controls.
+zero-injection boundaries, alongside the v86 Codex stale-`idle` correction.
 
-Current background execution is separate from retained task history. The shared
-selector accepts only exact, confirmed background identities that are
-nonterminal, belong to a current source generation, and carry valid current
-execution evidence. It deduplicates `(harness, full session ID, optional
-attempt ID, source generation, native call/task ID)`; absent identity components
-cannot contribute to the display count. Native handles remain distinct from
-OS process identities. A terminal fact wins over a later stale running cache.
+The shared screen selector is separate from JSON/detail history. Its eligible
+jobs have confirmed background mode, a current source generation, nonterminal
+status and current execution evidence. The deduplication key is `(harness,
+full session ID, optional attempt ID, source generation, source locator, optional
+native ID kind, native call/task ID)`; incomplete identities are excluded. Terminal
+facts override stale running caches, and retired generations remain invalid
+through normalization, observation, merging and serialization.
 
-Evidence time is distinct from event time, collection time, and task age. Exact
-live writable-descriptor/process-generation observation and an exact mutable
-native running-row query are current for that collection. Claude exact native
-nonterminal updates and Codex exact structured ongoing continuations can supply
-event-based evidence only when their valid event timestamp is no more than 120
-seconds old (`0 <= now - evidence_at <= 120`). This is an internal observation
-tolerance, not a runtime freshness guarantee or a configurable setting.
-Acknowledgements and start-only records confirm background identity but do not
-by themselves establish current execution. Re-reading an unchanged source,
-retained cache, collection time, output-file presence, a prior process-alive
-value, or parent liveness cannot renew execution evidence. Missing, invalid,
-future, backward, or stale evidence leaves current execution unknown without
-inventing completion or failure. Source-generation retirement is irreversible
-for that job identity; normalization, observation, merging, and serialization
-must not make retired evidence current again. Exact process evidence remains
-usable when unrelated source coverage is partial.
+Current evidence comes from an exact live writable-descriptor/process-generation
+observation, an actually queried mutable native running row, or an exact Claude
+nonterminal update / Codex structured ongoing continuation with valid event time
+`0 <= now - evidence_at <= 120`. This internal tolerance is independent of task
+age and adds no setting or runtime freshness guarantee. Acknowledgements,
+start-only records, rereads, retained cache, collection time, output-file
+presence, prior process-alive values and parent liveness supply no new execution
+evidence. Missing, invalid, future, backward or stale evidence stays unknown;
+completion and failure retain their native authority. Unrelated partial source
+coverage leaves independently valid exact process evidence usable.
 
-The default screen keeps every existing foreground exec badge and adds no
-shell-only row or repeated observation row. When an existing NOW detail row is
-already present, it may append the newest eligible background job, elapsed time,
-and `(+N)` for other eligible identities. A job without a valid start may be
-ordered by its current evidence time and displays elapsed as `?`. At widths
-where the tail does not fit, shrink in this order: clip the sanitized command,
-show only `⚙ N`, then omit the tail. Existing NOW prose/resource text, age,
-gauge, and foreground badge keep priority, and shell evidence never increases
-the number of NOW body lines. Completed, unknown, historical, retired, and
-unobserved tasks remain available through the existing bounded JSON/detail
-history. A missing NOW row is not created for shell history.
+An existing NOW detail line carries only the newest eligible job, elapsed time
+and `(+N)` for the others. A missing valid start uses current evidence time for
+ordering and `?` for elapsed. The suffix shrinks from sanitized command clipping
+to `⚙ N` to omission; NOW prose/resource text, age, gauge and foreground badge
+retain priority and the existing line count. Shell-only rows and repeated
+observation rows are absent; bounded JSON/detail history retains completed,
+unknown, historical, retired and unobserved tasks. Parent classification,
+pulse, route, gates and controls are unaffected; native handles remain distinct
+from OS process identities.
 
-The governing shared PRD snapshot remains read-only in this route. Its summary
-is labelled v85 while this accepted delta is labelled v86; this known boundary
-is recorded here without changing the shared snapshot or claiming that its
-canonical revision was amended. The task owner carries the delta through the
-existing spec maintenance path.
+The read-only shared PRD summary is labelled v85 while this accepted delta is
+labelled v86. This records the boundary for existing spec maintenance without
+claiming an amendment to that shared snapshot.
