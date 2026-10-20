@@ -1870,10 +1870,13 @@ async function pendingPeerDelivery(ctx, sid) {
         elapsed_ms: reserveMs, timeout_ms: 1500,
       })
       if (!reserved) return "claim-unavailable"
-      if (reserved.ref !== row.ref) return "claim-ref-mismatch"
-      if (reserved.state !== "pending") return "claim-state-mismatch"
-      if (reserved.text !== row.text) return "claim-body-mismatch"
-      if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+      const releaseReservation = () => pendingPeerTransition(sid, ["--release-reservation", row.ref,
+        "--claim-token", reserved.rpc_claim?.token || "",
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      if (reserved.ref !== row.ref) { releaseReservation(); return "claim-ref-mismatch" }
+      if (reserved.state !== "pending") { releaseReservation(); return "claim-state-mismatch" }
+      if (reserved.text !== row.text) { releaseReservation(); return "claim-body-mismatch" }
+      if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }
       const beginStarted = performance.now()
       const claimed = pendingPeerCommand(sid, ["--begin-write", row.ref,
         "--claim-token", reserved.rpc_claim?.token || "",
@@ -1883,7 +1886,10 @@ async function pendingPeerDelivery(ctx, sid) {
         elapsed_ms: beginMs, timeout_ms: 1500,
       })
       if (!claimed || claimed.ref !== row.ref || claimed.state !== "unverified"
-          || claimed.rpc_claim?.token !== reserved.rpc_claim?.token) continue
+          || claimed.rpc_claim?.token !== reserved.rpc_claim?.token) {
+        releaseReservation()
+        continue
+      }
       let accepted
       let persistenceResponseLost = false
       try {

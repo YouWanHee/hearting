@@ -6524,10 +6524,12 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                         peer_message.release_unsent_herdr_claim(
                             claimed, receipt=direct_reason)
                     else:
+                        reserved = claimed
                         claimed = peer_message.begin_pending_write(
                             claimed, recipient={"harness": t_harness, "pane_id": target_pane},
                             receipt="native-first-input-inflight")
                         if claimed is None:
+                            peer_message.release_pending_herdr_claim(reserved)
                             direct_reason = "peer-delivery-already-claimed"
                     if direct_reason is None:
                         # This is the one external submission attempt. A lost or
@@ -6592,11 +6594,13 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                             claimed, receipt=direct_reason)
                         claimed = None
                     else:
+                        reserved = claimed
                         claimed = peer_message.begin_pending_write(
                             claimed, recipient={"harness": "claude", "session_id": t_sid,
                                                 "pane_id": target_pane},
                             receipt="claude-pty-prompt-inflight")
                         if claimed is None:
+                            peer_message.release_pending_herdr_claim(reserved)
                             direct_reason = "peer-delivery-already-claimed"
                         else:
                             rc, payload = _herdr_prompt(
@@ -7483,10 +7487,12 @@ def _continue_claude_prompt(target, pane, sid, ref, text):
     if reason:
         peer_message.release_unsent_herdr_claim(claimed, receipt=reason)
         return "native-pending", "queued", reason
+    reserved = claimed
     claimed = peer_message.begin_pending_write(
         claimed, recipient={"harness": "claude", "session_id": sid, "pane_id": pane},
         receipt="claude-pty-prompt-inflight")
     if claimed is None:
+        peer_message.release_pending_herdr_claim(reserved)
         return "native-pending", "queued", "peer-delivery-already-claimed"
     rc, payload = _herdr_prompt(pane, text, wait=True, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
     if rc == 0:

@@ -1313,6 +1313,35 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertFalse(peer_message.release_unsent_herdr_claim(second))
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
 
+    def test_pending_reservation_release_is_exact_and_never_releases_after_write(self):
+        _text, ref = self.pending()
+        reserved = peer_message.reserve_pending_herdr(ref, self.recipient)
+        wrong_token = dict(reserved, rpc_claim=dict(reserved["rpc_claim"], token="wrong"))
+        self.assertFalse(peer_message.release_pending_herdr_claim(wrong_token))
+        self.assertEqual(peer_message._read_pending(ref)["rpc_claim"], reserved["rpc_claim"])
+        self.assertTrue(peer_message.release_pending_herdr_claim(reserved))
+        self.assertIsNone(peer_message._read_pending(ref).get("rpc_claim"))
+
+        reserved = peer_message.reserve_pending_herdr(ref, self.recipient)
+        with mock.patch("dispatch_contract.process_identity_disposition", return_value="live"):
+            writing = peer_message.begin_pending_write(reserved, recipient=self.recipient)
+        self.assertEqual(writing["state"], "unverified")
+        self.assertFalse(peer_message.release_pending_herdr_claim(reserved))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        self.assertEqual(peer_message._read_pending(ref)["rpc_claim"], writing["rpc_claim"])
+
+        _text, queued_ref = self.pending("queued release fixture")
+        queued = peer_message.reserve_pending_herdr(queued_ref, self.recipient)
+        peer_message._save_pending(dict(queued, state="queued"))
+        self.assertFalse(peer_message.release_pending_herdr_claim(queued))
+        self.assertEqual(peer_message._read_pending(queued_ref)["state"], "queued")
+
+        received_text, received_ref = self.pending("received release fixture")
+        received = peer_message.reserve_pending_herdr(received_ref, self.recipient)
+        self.assertEqual(peer_message.receive_peer_message(received_text, self.recipient), 0)
+        self.assertFalse(peer_message.release_pending_herdr_claim(received))
+        self.assertEqual(peer_message._read_pending(received_ref)["state"], "received")
+
     def test_prewrite_reservation_is_recoverable_but_unverified_is_not_replayed(self):
         _text, ref = self.pending()
         first = peer_message.reserve_pending_herdr(ref, self.recipient)

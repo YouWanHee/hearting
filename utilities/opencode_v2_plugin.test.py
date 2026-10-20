@@ -17,6 +17,148 @@ BASE_ENV = {key: value for key, value in os.environ.items() if key not in WORKER
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
+    def test_pending_peer_delivery_releases_only_prewrite_reservations(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the native plugin harness")
+        spec = importlib.util.spec_from_file_location("opencode_delivery_peer", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        real_python = shutil.which("python3")
+        plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
+        script = r'''
+import assert from "node:assert/strict"
+import fs from "node:fs"
+import childProcess from "node:child_process"
+import { pathToFileURL } from "node:url"
+const ownStat = fs.readFileSync("/proc/self/stat", "utf8")
+const ownSplit = ownStat.lastIndexOf(") ")
+const ownStart = ownStat.slice(ownSplit + 2).trim().split(/\s+/)[19]
+const selectionDir = `${process.env.XDG_STATE_HOME}/hearting/tui-identity`
+fs.mkdirSync(selectionDir, { recursive: true })
+fs.writeFileSync(`${selectionDir}/${process.pid}-${ownStart}.json`, JSON.stringify({
+  schema: "hearting-tui-selection-v1", sessionID: process.env.TARGET_SID,
+  pid: process.pid, start: ownStart,
+}))
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.PLUGIN_PATH))
+const sid = process.env.TARGET_SID
+const marker = process.env.RESERVE_MARKER
+const otherDirectory = process.env.ALT_DIRECTORY
+let writes = 0
+const traces = []
+let directoryReads = 0
+const nativeResponse = (data) => ({ data, response: { ok: true, status: 200 } })
+const ctx = { location: { directory: process.cwd() }, client: { app: { log: async (row) => traces.push(row.body.extra) }, session: {
+  get: async () => nativeResponse({ id: sid, projectID: "fixture", directory: process.cwd(),
+    slug: "fixture", title: "fixture", version: "1", time: { created: 1, updated: 1 } }),
+  status: async () => nativeResponse({ [sid]: { type: "idle" } }),
+  messages: async () => nativeResponse([]),
+  prompt: async () => {
+    writes++
+    if (process.env.CASE === "ambiguous") throw Object.assign(new Error("lost"), {
+      response: { ok: false, status: 500 },
+    })
+    return nativeResponse({ info: { id: "user_saved", sessionID: sid, role: "user" },
+      parts: [{ type: "text", text: process.env.EXPECTED_TEXT }] })
+  },
+  promptAsync: async () => ({ response: { ok: true, status: 204 } }),
+} } }
+Object.defineProperty(ctx, "directory", { get() {
+  directoryReads++
+  if (fs.existsSync(marker)) { fs.unlinkSync(marker); return otherDirectory }
+  return process.cwd()
+} })
+const hooks = await AgentHarnessGuards(ctx)
+const readTransfer = () => {
+  const result = childProcess.spawnSync("python3", [process.env.PEER_HELPER, "pending",
+    "--to-harness", "opencode", "--to-session-id", sid], { encoding: "utf8" })
+  assert.equal(result.status, 0, result.stderr)
+  return JSON.parse(result.stdout).find((candidate) => candidate.ref === process.env.TRANSFER_REF)
+}
+try {
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+  if (process.env.CASE === "root-change") {
+    assert.equal(writes, 0)
+    const released = readTransfer()
+    assert.equal(released.state, "pending")
+    assert.equal(released.rpc_claim, null)
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    assert.equal(writes, 1, `the next callback did not deliver the released reservation: ${JSON.stringify({ traces, row: readTransfer(), directoryReads, reserves: fs.existsSync(process.env.RESERVE_LOG) ? fs.readFileSync(process.env.RESERVE_LOG, "utf8") : "" })}`)
+  } else if (process.env.CASE === "begin-refused") {
+    assert.equal(writes, 0)
+  } else {
+    assert.equal(writes, 1, JSON.stringify(traces))
+    const stat = fs.readFileSync("/proc/self/stat", "utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    const row = readTransfer()
+    assert.equal(row.state, "unverified")
+    const released = childProcess.spawnSync("python3", [process.env.PEER_HELPER, "pending",
+      "--to-harness", "opencode", "--to-session-id", sid, "--release-reservation", row.ref,
+      "--claim-token", row.rpc_claim.token, "--claim-pid", String(process.pid), "--claim-start", start],
+      { encoding: "utf8" })
+    assert.equal(released.status, 1, "release must be a no-op after begin-write")
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    assert.equal(writes, 1, "an ambiguous write was submitted again")
+  }
+} finally { hooks.dispose?.({ silent: true }) }
+'''
+        for case in ("root-change", "begin-refused", "ambiguous"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="opencode-pending-delivery-") as tmp:
+                root = Path(tmp)
+                peer_root = root / "peer"
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                native_node = fake_bin / "opencode"
+                native_node.symlink_to(node)
+                marker = root / "reserved"
+                once = root / "root-change-used"
+                sid = "ses_deliveryfixture"
+                recipient = {"harness": "opencode", "session_id": sid}
+                with mock.patch.dict(os.environ, {
+                        "HOME": str(root / "home"), "XDG_STATE_HOME": str(root / "state"),
+                        "AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                        "AGENT_DISPATCH_JOBS": str(root / "jobs.log"),
+                        "AGENT_RUNTIME_ROOT": str(root / "runtime")}):
+                    _text, ref = peer.prepare_peer_message("one original prompt", {
+                        "harness": "codex", "session_id": "sender"}, recipient, defer=True)
+                    expected_text = peer._read_pending(ref)["text"]
+                    wrapper = fake_bin / "python3"
+                    wrapper.write_text(
+                        "#!/bin/sh\n"
+                        f"REAL_PYTHON={real_python}\n"
+                        + (f"case \" $* \" in *\" --reserve \"*) if [ ! -e {once} ]; then touch {once} {marker}; fi;; esac\n"
+                           if case == "root-change" else "")
+                        + (f"case \" $* \" in *\" --reserve \"*) echo reserve >> {root / 'reserves'};; esac\n"
+                           if case == "root-change" else "")
+                        + ("for arg in \"$@\"; do [ \"$arg\" = \"--begin-write\" ] && exit 1; done\n"
+                           if case == "begin-refused" else "")
+                        + "exec \"$REAL_PYTHON\" \"$@\"\n", encoding="utf-8")
+                    wrapper.chmod(0o755)
+                    alt = root / "other-directory"
+                    alt.mkdir()
+                    env = {**BASE_ENV, "PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(root / "home"),
+                        "XDG_STATE_HOME": str(root / "state"), "XDG_CONFIG_HOME": str(root / "config"),
+                        "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache"),
+                        "AGENT_HOME": str(ROOT), "AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                        "AGENT_DISPATCH_JOBS": str(root / "jobs.log"), "AGENT_RUNTIME_ROOT": str(root / "runtime"),
+                        "PLUGIN_PATH": str(plugin), "TARGET_SID": sid, "TRANSFER_REF": ref,
+                        "EXPECTED_TEXT": expected_text, "RESERVE_MARKER": str(marker),
+                        "ALT_DIRECTORY": str(alt), "PEER_HELPER": str(ROOT / "utilities/peer-message.py"),
+                        "RESERVE_LOG": str(root / "reserves"),
+                        "CASE": case, "PYTHONDONTWRITEBYTECODE": "1", "OPENCODE_VERSION": "1.19.0"}
+                    run = subprocess.run([str(native_node), "--input-type=module", "-e", script],
+                        cwd=root, env=env, text=True, capture_output=True, timeout=20)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    row = peer._read_pending(ref)
+                    if case == "root-change":
+                        self.assertIn(row["state"], {"queued", "received"})
+                    elif case == "begin-refused":
+                        self.assertEqual(row["state"], "pending")
+                        self.assertIsNone(row.get("rpc_claim"))
+                    else:
+                        self.assertEqual(row["state"], "unverified")
+
     def test_peer_prompt_write_boundary_orders_reserve_recheck_begin_and_no_reply(self):
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
         start = source.index('const reserveStarted = performance.now()',
@@ -24,7 +166,7 @@ class OpenCodeV2PluginTest(unittest.TestCase):
         end = source.index('pendingPeerTrace(ctx, sid, "noReply-save"', start)
         delivery = source[start:end]
         reserve = delivery.index('["--reserve", row.ref')
-        root_recheck = delivery.index('if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"')
+        root_recheck = delivery.index('if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }')
         begin_write = delivery.index('["--begin-write", row.ref')
         sdk_write = delivery.index('client.prompt({ path: { id: sid }')
         self.assertLess(reserve, root_recheck)

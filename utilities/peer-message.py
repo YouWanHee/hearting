@@ -814,8 +814,13 @@ def reserve_pending_first_input(ref, recipient, process_proof, *, claimant=None)
 def claim_pending_first_input(ref, recipient, process_proof):
     """Compatibility helper for callers whose reserve and write are adjacent."""
     reserved = reserve_pending_first_input(ref, recipient, process_proof)
-    return begin_pending_write(reserved, recipient=recipient,
-                               receipt="native-first-input-inflight") if reserved else None
+    if not reserved:
+        return None
+    writing = begin_pending_write(reserved, recipient=recipient,
+                                  receipt="native-first-input-inflight")
+    if writing is None:
+        release_pending_herdr_claim(reserved)
+    return writing
 
 
 def _rpc_claim_recipient(recipient):
@@ -1300,7 +1305,12 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
     """Compatibility helper for callers whose reserve and write are adjacent."""
     reserved = reserve_pending_herdr(ref, recipient, receipt=receipt,
                                      allow_hook_context_recovery=allow_hook_context_recovery)
-    return begin_pending_write(reserved, recipient=recipient, receipt=receipt) if reserved else None
+    if not reserved:
+        return None
+    writing = begin_pending_write(reserved, recipient=recipient, receipt=receipt)
+    if writing is None:
+        release_pending_herdr_claim(reserved)
+    return writing
 
 
 def mark_pending_queued(ref, *, receipt="delivery-observed"):
@@ -1343,6 +1353,20 @@ def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
     with pending_lock(row["ref"]):
         current = _read_pending(row["ref"])
         if (not current or current["state"] not in {"pending", "queued"}
+                or current.get("rpc_claim") != row.get("rpc_claim")):
+            return False
+        _save_pending(dict(current, rpc_claim=None, receipt=receipt))
+        return True
+
+
+def release_pending_herdr_claim(row, *, receipt="delivery-reservation-released"):
+    """Release this exact reservation only while its payload is still pending."""
+    if not isinstance(row, dict) or not isinstance(row.get("rpc_claim"), dict):
+        return False
+    ref = row.get("ref")
+    with pending_lock(ref):
+        current = _read_pending(ref)
+        if (not current or current.get("state") != "pending"
                 or current.get("rpc_claim") != row.get("rpc_claim")):
             return False
         _save_pending(dict(current, rpc_claim=None, receipt=receipt))
@@ -2609,6 +2633,7 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None,
         if writing:
             begun.append(writing)
         else:
+            release_pending_herdr_claim(row)
             try:
                 context.remove(row["text"])
             except ValueError:
@@ -2657,9 +2682,10 @@ def cmd_pending(args):
     resuming_ref = getattr(args, "resuming", None)
     reserve_ref = getattr(args, "reserve", None)
     begin_ref = getattr(args, "begin_write", None)
+    release_ref = getattr(args, "release_reservation", None)
     claimant = {"pid": getattr(args, "claim_pid", None),
                 "start": getattr(args, "claim_start", None)}
-    if reserve_ref or begin_ref:
+    if reserve_ref or begin_ref or release_ref:
         import dispatch_contract as DC
         try:
             claimant["pid"] = int(claimant["pid"])
@@ -2680,12 +2706,18 @@ def cmd_pending(args):
                 return 1
             print(json.dumps(reserved, ensure_ascii=False))
             return 0
-        row = _read_pending(begin_ref)
+        transition_ref = begin_ref or release_ref
+        row = _read_pending(transition_ref)
         claim = (row or {}).get("rpc_claim") or {}
         if (not row or not isinstance(getattr(args, "claim_token", None), str)
                 or claim.get("token") != args.claim_token
+                or claim.get("pid") != claimant["pid"]
+                or claim.get("start") != claimant["start"]
                 or not _same_transfer_session(pending_delivery_recipient(row), recipient)):
             return 1
+        if release_ref:
+            return 0 if release_pending_herdr_claim(
+                row, receipt="opencode-prompt-reservation-released") else 1
         begun = begin_pending_write(row, recipient=recipient,
                                     receipt="opencode-prompt-inflight", claimant=claimant)
         if not begun:
@@ -3403,6 +3435,7 @@ def main(argv=None):
     intent.add_argument("--received")
     intent.add_argument("--reserve")
     intent.add_argument("--begin-write")
+    intent.add_argument("--release-reservation")
     p_pending.add_argument("--message-id")
     p_pending.add_argument("--claim-pid", type=int)
     p_pending.add_argument("--claim-start")
