@@ -137,17 +137,24 @@ class ForegroundActivityTests(unittest.TestCase):
                  mock.patch.object(monitor, "_members", return_value=set(table)), \
                  mock.patch.object(monitor, "_runtime_lineage", return_value=set(table)), \
                  mock.patch.object(monitor, "_lease_active", return_value=False):
-                self.assertFalse(monitor.sample().active)
+                # The consumer renews the no-progress clock on active or
+                # uncertain, so an observed session must be neither.
+                baseline = monitor.sample()
+                self.assertEqual((baseline.active, baseline.uncertain), (False, False))
                 db.execute("UPDATE session_message SET time_updated=2 WHERE session_id='ses_other'")
                 db.commit()
-                self.assertFalse(monitor.sample().active, "another session reset the attempt clock")
+                other = monitor.sample()
+                self.assertEqual((other.active, other.uncertain), (False, False),
+                                 "another session reset the attempt clock")
                 db.execute("UPDATE session_v2 SET time_updated=2 WHERE id='ses_own'")
                 db.commit()
-                self.assertFalse(monitor.sample().active, "session metadata alone counted as model work")
+                metadata = monitor.sample()
+                self.assertEqual((metadata.active, metadata.uncertain), (False, False),
+                                 "session metadata alone reset the attempt clock")
                 db.execute("UPDATE session_message SET time_updated=2 WHERE session_id='ses_own'")
                 db.commit()
                 own = monitor.sample()
-                self.assertTrue(own.active)
+                self.assertEqual((own.active, own.uncertain), (True, False))
                 self.assertIn("exact-opencode-session-change", own.reasons)
                 db.close()
                 context.opencode_db.unlink()

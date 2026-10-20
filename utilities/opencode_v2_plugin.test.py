@@ -8,6 +8,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+# A test run inside a registered worker must not lend the fixture its markers.
+WORKER_MARKERS = ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                  "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "AGENT_DISPATCH_REGISTERED_WORKER")
+BASE_ENV = {key: value for key, value in os.environ.items() if key not in WORKER_MARKERS}
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
@@ -58,11 +62,16 @@ const child = { messages: [{ info: { id: "msg_child", sessionID: "child", role: 
 await hooks["experimental.chat.messages.transform"]({}, child)
 assert.deepEqual(child.messages[0].parts, [])
 hooks.dispose?.({ silent: true })
+const fs = await import("node:fs")
+assert.deepEqual(fs.readdirSync(process.env.HOME, { recursive: true }), [],
+  "worker hooks wrote main lifecycle state")
 '''
-            env = {**os.environ, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+            env = {**BASE_ENV, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
                    "HOME": tmp, "AGENT_HOME": str(ROOT), "AGENT_SESSION_ROLE": "worker",
                    "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_STAGE_AUTHORITY": "1",
-                   "AGENT_DISPATCH_SUBSESSION_ID": "", "PYTHONDONTWRITEBYTECODE": "1"}
+                   "AGENT_DISPATCH_SUBSESSION_ID": "", "PYTHONDONTWRITEBYTECODE": "1",
+                   "XDG_STATE_HOME": tmp + "/.state", "XDG_CONFIG_HOME": tmp + "/.config",
+                   "XDG_DATA_HOME": tmp + "/.data", "XDG_CACHE_HOME": tmp + "/.cache"}
             run = subprocess.run([node, "--input-type=module", "-e", script], cwd=ROOT,
                                  env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -193,8 +202,11 @@ const ctx = {
   app: { log: async () => { appLogs++ } },
   session: {
     get: async ({ sessionID: sid }) => ({
-      id: sid, title: sid === "ses_main" ? "Main work" : "hearting-worker-att-fixture", agent: "build",
-      ...(sid === "ses_child" ? { parentID: sessionID } : {}),
+      id: sid, agent: "build",
+      title: { ses_main: "Main work", ses_titler: "hearting-worker-hearting-fleet-titler" }[sid]
+        || "hearting-worker-att-fixture",
+      // Native 2.0.32 session info carries parentID, null for a root session.
+      parentID: sid === "ses_child" ? sessionID : null,
       location: { directory: process.env.TEMP_ROOT },
     }),
     prompt: async () => { modelCalls++ },
@@ -246,22 +258,27 @@ for (let i = 0; i < 2; i++) {
   assert.match(summary.system[0].text, /normal compaction summary/)
   assert.equal(summary.context, undefined, "V1 context leaked into the V2 event")
 }
-for (const sid of ["ses_child", "ses_main"]) {
+assert.equal(modelCalls, 0)
+assert.equal(appLogs, 0)
+assert.deepEqual(fs.readdirSync(process.env.TEMP_ROOT, { recursive: true }), [],
+  "worker lifecycle wrote project state")
+assert.deepEqual(fs.readdirSync(process.env.HOME, { recursive: true }), [],
+  "worker lifecycle wrote user state")
+// Neighbors in the shared service: a native child, a fleet helper session and
+// a main session, whose own normal lifecycle may write main state.
+for (const sid of ["ses_child", "ses_titler", "ses_main"]) {
   const unrelated = { sessionID: sid, system: [] }
   await hooks.get("session.context")(unrelated)
   assert.ok(!unrelated.system.some((part) => part.text?.includes(contract)), "worker contract leaked to " + sid)
+  const summary = { sessionID: sid, system: [] }
+  await hooks.get("session.compaction")(summary)
+  // Main V2 compaction keeps the native summary template untouched.
+  assert.deepEqual(summary.system, [], "compaction instructions leaked to " + sid)
 }
-assert.equal(modelCalls, 0)
-assert.equal(appLogs, 0)
 await cleanup()
-const projectFiles = fs.readdirSync(process.env.TEMP_ROOT, { recursive: true })
-const homeFiles = fs.readdirSync(process.env.HOME, { recursive: true })
-assert.deepEqual(projectFiles, [], "worker lifecycle wrote project state")
-assert.deepEqual(homeFiles, [], "worker lifecycle wrote user state")
 '''
-            env = {**os.environ, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+            env = {**BASE_ENV, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
                    "TEMP_ROOT": str(project), "HOME": str(home), "AGENT_HOME": str(ROOT),
-                   "AGENT_SESSION_ROLE": "worker",
                    "PYTHONDONTWRITEBYTECODE": "1", "XDG_STATE_HOME": str(home / ".state"),
                    "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".data"),
                    "XDG_CACHE_HOME": str(home / ".cache")}

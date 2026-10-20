@@ -63,7 +63,8 @@ def resolve_activity_policy(worker_type: str | None) -> ActivityPolicy:
 def make_activity_context(policy: ActivityPolicy, *, worker_type: str, harness: str,
                           log_path: Path, jobs: Path, metadata: Mapping[str, str],
                           runtime_executable: str,
-                          transcript_roots: tuple[Path, ...] = ()) -> ForegroundActivityContext | None:
+                          transcript_roots: tuple[Path, ...] = (),
+                          opencode_db: Path | None = None) -> ForegroundActivityContext | None:
     if worker_type == "owner" or policy.window_seconds is None:
         return None
     return ForegroundActivityContext(
@@ -71,6 +72,7 @@ def make_activity_context(policy: ActivityPolicy, *, worker_type: str, harness: 
         log_path=Path(log_path), metadata=dict(metadata), jobs=Path(jobs),
         transcript_roots=transcript_roots,
         runtime_executable=runtime_executable,
+        opencode_db=opencode_db,
     )
 
 
@@ -114,8 +116,8 @@ def build_activity_context(*, worker_type: str, harness: str, log_path: Path,
             "route_id": route_id or "",
             "route_node": route_node or "",
         }
-        context = ForegroundActivityContext(
-            window_seconds=policy.window_seconds, harness=harness,
+        context = make_activity_context(
+            policy, worker_type=worker_type, harness=harness,
             log_path=Path(log_path), jobs=Path(jobs), metadata=metadata,
             runtime_executable=harness, transcript_roots=roots,
             opencode_db=opencode_db,

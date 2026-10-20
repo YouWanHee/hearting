@@ -78,16 +78,19 @@ const v2SessionInfo = new Map()
 const v2WorkerSessions = new Set()
 const v2ContractSessions = new Set()
 const v2ActiveSession = new AsyncLocalStorage()
-let terminalContract
+let terminalContract = ""
+let terminalContractRetryAt = 0
 
 function workerTerminalContract() {
-  if (terminalContract !== undefined) return terminalContract
+  if (terminalContract || Date.now() < terminalContractRetryAt) return terminalContract
   // Render the short canonical kernel section once, never the full kernel or
-  // main lifecycle context on every model request.
+  // main lifecycle context on every model request. A failed render is retried
+  // later instead of disabling the contract for a long-lived shared service.
   const result = spawnSync(python3, ["-B", "-c",
     "import sys; from pathlib import Path; sys.path.insert(0, str(Path(sys.argv[1]) / 'utilities')); from worker_bootstrap import worker_terminal_contract; print(worker_terminal_contract(Path(sys.argv[1])))", root],
   { cwd: root, encoding: "utf8", timeout: 4000 })
   terminalContract = result.status === 0 ? (result.stdout || "").trim() : ""
+  if (!terminalContract) terminalContractRetryAt = Date.now() + 60000
   return terminalContract
 }
 
@@ -96,7 +99,7 @@ async function sessionWorkerContract(ctx, sid) {
   if (v2ActiveSession.getStore()) {
     return v2ContractSessions.has(sid) ? workerTerminalContract() : ""
   }
-  if (process.env.AGENT_DISPATCH_REGISTERED_WORKER !== "1") return ""
+  if (!isWorkerSession() || process.env.AGENT_DISPATCH_REGISTERED_WORKER !== "1") return ""
   const info = await compactSessionInfo(ctx, sid, true)
   // A native child inherits the private runtime's environment, not its
   // registered parent's terminal task contract.
@@ -985,14 +988,8 @@ async function setupOpenCodeV2(ctx) {
       }
       return
     }
-    const output = { context: [] }
     await hooks["experimental.session.compacting"]?.(
-      { sessionID: event.sessionID }, output)
-    if (Array.isArray(event.system)) {
-      for (const text of output.context) {
-        if (typeof text === "string" && text) event.system.push({ type: "text", text })
-      }
-    }
+      { sessionID: event.sessionID }, { ...event })
   }))
   await ctx.session.hook("http.response", async (event) => {
     const model = event.model

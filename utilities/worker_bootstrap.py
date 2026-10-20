@@ -831,12 +831,14 @@ def supervised_owner_prompt() -> str:
     )
 
 
+_TERMINAL_CONTRACT_START = "<!-- worker-terminal-contract:start -->"
+_TERMINAL_CONTRACT_END = "<!-- worker-terminal-contract:end -->"
+
+
 def worker_terminal_contract(root: Path) -> str:
     """The kernel's short completion contract, reusable after native compaction."""
     kernel = (root / "roles" / "worker-bootstrap.md").read_text(encoding="utf-8")
-    start = "<!-- worker-terminal-contract:start -->"
-    end = "<!-- worker-terminal-contract:end -->"
-    return kernel.split(start, 1)[1].split(end, 1)[0].strip()
+    return kernel.split(_TERMINAL_CONTRACT_START, 1)[1].split(_TERMINAL_CONTRACT_END, 1)[0].strip()
 
 
 def render_worker_bootstrap(root: Path, worker_type: str, unit: str | None = None) -> str:
@@ -855,6 +857,10 @@ def render_worker_bootstrap(root: Path, worker_type: str, unit: str | None = Non
         root / "roles" / "worker-types" / f"{worker_type}.md",
     )
     fragments = [path.read_text(encoding="utf-8").strip() for path in paths]
+    # The section markers locate the recurring contract; workers need only its text.
+    fragments[0] = "\n".join(
+        line for line in fragments[0].splitlines()
+        if line not in {_TERMINAL_CONTRACT_START, _TERMINAL_CONTRACT_END})
     persona = unit_persona_body(root, unit)
     if persona:
         fragments.append(persona)

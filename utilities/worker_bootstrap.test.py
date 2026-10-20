@@ -135,6 +135,7 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertIn("no judgment was reached", contract)
         self.assertNotIn("Portable Worker Kernel", contract)
         self.assertNotIn("memory lifecycle", contract)
+        self.assertNotIn("worker-terminal-contract:", W.render_worker_bootstrap(ROOT, "stage"))
 
     def test_task_publication_scope_stays_with_the_approved_owner(self):
         owner = W.render_worker_bootstrap(ROOT, "owner")
