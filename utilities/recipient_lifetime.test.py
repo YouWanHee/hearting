@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import unittest
 import json
 import os
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from recipient_lifetime import RecipientCensus, recipient_state
+import claude_process_identity
 from claude_process_identity import claude_session_census, invocation_kind
 
 
@@ -30,6 +32,18 @@ class RecipientLifetimeTest(unittest.TestCase):
     def _fake_proc_root(self, root):
         (root / "self" / "ns").mkdir(parents=True)
         os.symlink("pid:[4026531836]", root / "self" / "ns" / "pid")
+
+    def _recipient_fixture(self, base):
+        root = base / "proc"
+        self._fake_proc_root(root)
+        home = base / "native-home" / ".claude"
+        (home / "projects" / "project-a").mkdir(parents=True)
+        return root, home
+
+    def _real_census_at(self, root):
+        return mock.patch.object(
+            claude_process_identity, "claude_session_census",
+            side_effect=lambda: claude_session_census(proc_root=root))
 
     def test_fake_proc_non_initial_observer_namespace_is_incomplete_without_processes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -72,6 +86,134 @@ class RecipientLifetimeTest(unittest.TestCase):
         self.assertEqual(recipient_state(harness="claude", session_id="sid", census=census), "unknown")
         self.assertEqual(recipient_state(harness="claude", session_id="sid",
                                          successor_state="conflict", census=census), "unknown")
+
+    def test_initial_namespace_complete_empty_census_requires_prior_existence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, home = self._recipient_fixture(Path(temp))
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                complete, holders, reasons = claude_session_census(proc_root=root)
+                self.assertTrue(complete, reasons)
+                self.assertEqual(holders, set())
+                self.assertEqual(reasons, set())
+
+                census = RecipientCensus()
+                self.assertEqual(census.state("claude", "unseen-session"), "unknown")
+                (home / "history.jsonl").write_text(
+                    json.dumps({"sessionId": "unseen-session"}) + "\n", encoding="utf-8")
+                self.assertEqual(census.state("claude", "unseen-session"), "unknown",
+                                 "evidence is memoized within one recipient pass")
+                self.assertEqual(RecipientCensus().state("claude", "unseen-session"), "ended")
+
+    def test_exact_native_transcript_proves_existence_with_complete_empty_census(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, home = self._recipient_fixture(Path(temp))
+            (home / "projects" / "project-a" / "transcript-session.jsonl").write_text(
+                "{}\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                self.assertEqual(RecipientCensus().state("claude", "transcript-session"), "ended")
+
+    def test_native_history_only_proves_exact_session_existence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, home = self._recipient_fixture(Path(temp))
+            (home / "history.jsonl").write_text(
+                json.dumps({"sessionId": "history-only-session"}) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                self.assertEqual(RecipientCensus().state("claude", "history-only-session"), "ended")
+                self.assertFalse(any((home / "projects").glob("*/history-only-session.jsonl")))
+
+    def test_live_holder_and_incomplete_census_keep_existing_priority(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root, home = self._recipient_fixture(base)
+            proc, _runtime_home = self._fake_runtime(
+                root, 123, argv=("claude", "--resume", "live-without-transcript"), home=home)
+            (home / "sessions" / "123.json").write_text(json.dumps({
+                "pid": 123, "procStart": "123", "sessionId": "live-without-transcript"}),
+                encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                complete, holders, reasons = claude_session_census(proc_root=root)
+                self.assertTrue(complete, reasons)
+                self.assertEqual(holders, {"live-without-transcript"})
+                self.assertEqual(RecipientCensus().state("claude", "live-without-transcript"), "alive")
+
+            incomplete_root = base / "incomplete-proc"
+            self._fake_proc_root(incomplete_root)
+            (incomplete_root / "self" / "ns" / "pid").unlink()
+            os.symlink("pid:[4026532999]", incomplete_root / "self" / "ns" / "pid")
+            (home / "history.jsonl").write_text(
+                json.dumps({"sessionId": "recorded-but-incomplete"}) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(incomplete_root):
+                complete, holders, reasons = claude_session_census(proc_root=incomplete_root)
+                self.assertFalse(complete)
+                self.assertEqual(holders, set())
+                self.assertEqual(reasons, {"observer-not-in-initial-pid-namespace"})
+                self.assertEqual(RecipientCensus().state("claude", "recorded-but-incomplete"), "unknown")
+
+    def test_history_requires_a_complete_exact_session_id_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, home = self._recipient_fixture(Path(temp))
+            (home / "history.jsonl").write_text(
+                json.dumps({"sessionId": "another-session"}) + "\n"
+                + json.dumps({"message": "wanted-session"}) + "\n"
+                + json.dumps({"sessionId": 7}) + "\n"
+                + "{malformed json}\n"
+                + json.dumps({"sessionId": "wanted-session"}),
+                encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                self.assertEqual(RecipientCensus().state("claude", "wanted-session"), "unknown")
+                for unsafe in ("../wanted-session", "wanted*session"):
+                    with self.subTest(unsafe=unsafe):
+                        self.assertEqual(RecipientCensus().state("claude", unsafe), "unknown")
+
+    def test_untrusted_native_evidence_never_proves_existence(self):
+        for kind in ("symlink", "transcript-symlink", "remote", "foreign-owner", "replaced"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root, home = self._recipient_fixture(Path(temp))
+                history = home / "history.jsonl"
+                evidence = json.dumps({"sessionId": "guarded-session"}) + "\n"
+                if kind == "symlink":
+                    target = Path(temp) / "outside-history.jsonl"
+                    target.write_text(evidence, encoding="utf-8")
+                    history.symlink_to(target)
+                elif kind == "transcript-symlink":
+                    target = Path(temp) / "outside-transcript.jsonl"
+                    target.write_text("{}\n", encoding="utf-8")
+                    (home / "projects" / "project-a" / "guarded-session.jsonl").symlink_to(target)
+                else:
+                    history.write_text(evidence, encoding="utf-8")
+                guards = [
+                    mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}),
+                    mock.patch.object(claude_process_identity, "claude_session_census",
+                                      return_value=(True, set(), set())),
+                ]
+                if kind == "remote":
+                    guards.append(mock.patch(
+                        "recipient_lifetime.is_local_path", return_value=False))
+                if kind == "foreign-owner":
+                    current_uid = os.getuid()
+                    guards.append(mock.patch("recipient_lifetime.os.getuid",
+                                             return_value=current_uid + 1))
+                if kind == "replaced":
+                    real_lstat = Path.lstat
+                    reads = [0]
+
+                    def changing_lstat(path, *args, **kwargs):
+                        info = real_lstat(path, *args, **kwargs)
+                        if Path(path) == history:
+                            reads[0] += 1
+                            if reads[0] > 1:
+                                return SimpleNamespace(
+                                    st_dev=info.st_dev, st_ino=info.st_ino, st_mode=info.st_mode,
+                                    st_uid=info.st_uid, st_size=info.st_size,
+                                    st_mtime_ns=info.st_mtime_ns + 1,
+                                    st_ctime_ns=info.st_ctime_ns)
+                        return info
+
+                    guards.append(mock.patch.object(Path, "lstat", changing_lstat))
+                with contextlib.ExitStack() as stack:
+                    for guard in guards:
+                        stack.enter_context(guard)
+                    self.assertEqual(RecipientCensus().state("claude", "guarded-session"), "unknown")
 
     def test_fake_proc_exact_current_session_and_unresolved_runtime(self):
         with tempfile.TemporaryDirectory() as temp:

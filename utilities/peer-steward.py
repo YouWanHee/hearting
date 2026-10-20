@@ -2863,7 +2863,7 @@ def _settle_terminal_watch_if_unobserved(watch_id, arm, root=None,
 
 def _settle_ended_seatless_recipient(watch_id, arm, root=None, *, census=None,
                                       lock_held=False):
-    """Settle only a seat-less Claude watch with a complete no-holder census."""
+    """Settle a seat-less Claude watch with native existence and no-holder proof."""
     paths = _watch_paths(watch_id, root)
     if paths.receipt.exists():
         return True

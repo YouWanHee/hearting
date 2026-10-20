@@ -2926,6 +2926,9 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
                "watcher": {}}
         paths = peer_steward._watch_paths(watch_id, self.watch_root)
         paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        native_home = Path.home() / ".claude"
+        (native_home / "history.jsonl").write_text(
+            json.dumps({"sessionId": "recipient-sid"}) + "\n", encoding="utf-8")
 
         with mock.patch.object(claude_process_identity, "claude_session_census",
                                return_value=(True, set(), set())):
@@ -2938,6 +2941,26 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
                          ("steward-exited", "steward-exited"))
         self.assertEqual(receipt["refs"], ["attempt:one"])
         self.assertEqual(receipt["observer_generation"], 4)
+        self.assertFalse(paths.observation.exists())
+
+    def test_seatless_claude_watch_without_native_existence_evidence_stays_pending(self):
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "seatless-unseen"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "default", "armed_ts": "then", "steward_seat": None,
+               "agent": {"harness": "codex", "session_id": "target-sid", "pane": "-"},
+               "steward": {"harness": "claude", "session_id": "never-seen-session"},
+               "watcher": {}}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+
+        with mock.patch.object(claude_process_identity, "claude_session_census",
+                               return_value=(True, set(), set())):
+            self.assertFalse(peer_steward._settle_ended_seatless_recipient(
+                watch_id, arm, self.watch_root))
+
+        self.assertTrue(paths.arm.exists())
+        self.assertFalse(paths.receipt.exists())
         self.assertFalse(paths.observation.exists())
 
     def test_seatless_watch_alive_or_incomplete_census_remains_pending(self):
