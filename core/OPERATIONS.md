@@ -1171,11 +1171,10 @@ information beside the completion; unfinished settlement or publication still
 reports its own obligation.
 
 `capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
-file to inspect) sends input to a registered dispatch-depth-1 owner attempt; any
-other target is refused with `correction-target-not-owner`. Any session can send
-it — the sending session is recorded (`correction_source_session`), not checked —
-and the runtime supervisor delivers it; only launching a replacement owner is
-parent-only (below).
+file to inspect) targets only a registered dispatch-depth-1 owner attempt (else
+`correction-target-not-owner`). Any session can send it; `correction_source_session`
+records the sender without checking it. The runtime supervisor delivers it; only
+launching a replacement owner is parent-only (below).
 The exact attempt binds one durable input receipt; repeating
 a request ID returns that receipt. Every registered dispatch-depth-1 owner —
 quick and solo as well as standard+ — runs under its harness supervisor, so the
@@ -2057,7 +2056,6 @@ naming the launching attempt.
 
 ### §5.14. Peer-Session Steering (steward role)
 
-
 A steward is informally depth −1; not a dispatch depth: the stewarding
 session is an ordinary dispatch depth 0 session, like the peers it addresses. This role
 carries no launch, gate, write, or approval authority over the session it addresses — its
@@ -2066,13 +2064,13 @@ append-only ledger below is the only record of them (SD-122 §13.37.2-(1)).
 
 | Question | Existing identifier |
 |---|---|
-| Who talks with the user? | any dispatch depth 0 session (main, peer or steward); other docs also call it the supervisor or main session. |
+| Who talks with the user? | any dispatch depth 0 session: main, peer or steward (elsewhere also "supervisor"). |
 | Who runs the route? | its dispatch depth 1 `owner`, which coordinates dispatch depth 2 stages. |
 | Who keeps the owner alive and carries its input and results? | the runtime supervisor, a process rather than a session (§5.10a, §5.12). |
 | Who receives the result now? | the single `effective_parent`: the registered parent, or the last confirmed same-seat successor after a handover. |
 | Who only observes? | a `watch` holder (Fleet ⚑ shows the steward relation); observation settles no stage result (S3). |
 | Who approves? | the person; the session that received the answer writes the release/approval record (S5). |
-| Who may perform parent-only route actions? | sessions `route_authority.owns` accepts: the registered parent and its confirmed successor — a separate check from `effective_parent` (row 4). |
+| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor; a separate check from row 4. |
 
 Six invariants govern the role:
 
@@ -2192,10 +2190,8 @@ missing or disposed records and unsupported dead Claude/Codex identity remain
 unknown. Native source availability is not inferred from a label or saved SID.
 Replacement admission and lineage use that same parent judgment: a depth-1
 replacement may be launched by the registered parent or its ledger-confirmed
-successor. Result delivery follows the one current `effective_parent`, while these
-parent-only actions use `route_authority.owns`, which accepts the registered parent
-as well as its ledger-confirmed successor; the two are separate judgments. Parent
-attempt bindings remain exact, as do route, node, depth,
+successor. This parent judgment (`route_authority.owns`) is separate from result
+delivery, which follows the single `effective_parent`. Parent attempt bindings remain exact, as do route, node, depth,
 sub-session and input digests. A changed parent label on a depth-1 node replay
 is accepted only for that same parent; depth-2 parent bindings stay exact.
 The launch input follows the confirmed parent's session, harness and ordinary

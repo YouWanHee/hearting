@@ -273,7 +273,9 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
     continuation supervisor is one shared implementation
     (`OPERATIONS §5.12`); exactly-once advance is claim-based and restart-safe,
     and no model sleep loop or arbitrary detached shell substitutes for it.
-16. The steward role and its advisory relation are defined in `OPERATIONS §5.14`.
+16. A steward session holds no launch, gate, write, or approval authority over
+    another root; peer messages are advisory and the ledger is the only record
+    (`OPERATIONS §5.14`).
 17. Registered `code-test` results bind to the effective source subject through
     admission, registration, launch, completion, and downstream gate currency.
     Each content digest keeps its own finite verdict budget across route
