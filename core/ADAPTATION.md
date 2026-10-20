@@ -637,7 +637,10 @@ stamp path in `core/HOOKS.md`.
 
 **Detached watch realization.** `peer-steward.py watch <target>` persists one logical
 obligation with exact Herdr endpoint, target pane, harness, session and until-set identity
-before starting its observer. One logical watch invokes `herdr agent wait` once. An explicit
+before starting its observer. A seat-less Claude recipient settles only when an exact local
+native transcript or history record proves prior existence and a complete census finds no
+holder; missing or uncertain existence evidence remains unknown. One logical watch invokes
+`herdr agent wait` once. An explicit
 timeout is one absolute deadline recorded when the duty is armed; reaching it writes the
 terminal timeout receipt and exit 3. Observer restart does not grant another wait or a
 fresh timeout. The supervisor listens for its own wait child's exit, the endpoint event

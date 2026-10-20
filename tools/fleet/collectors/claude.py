@@ -29,6 +29,7 @@ _UTILITIES = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..
 if os.path.normpath(_UTILITIES) not in map(os.path.normpath, sys.path):
     sys.path.insert(0, os.path.normpath(_UTILITIES))
 from claude_project_dir import encode_project_dir  # noqa: E402
+from claude_process_identity import tap_sids_by_pid  # noqa: E402
 
 
 def _home():
@@ -499,27 +500,7 @@ def _apply_registry(sess, sj):
 
 def _tap_sids_by_pid(home, pid, proc_start):
     """Exact PID/start claims; modification time cannot choose a conversation."""
-    if pid is None or not proc_start:
-        return set()
-    try:
-        names = os.listdir(os.path.join(home, ".statusline"))
-    except OSError:
-        return set()
-    found = set()
-    for name in names:
-        if not name.endswith(".json") or name.startswith("."):
-            continue
-        try:
-            with open(os.path.join(home, ".statusline", name)) as handle:
-                row = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if (isinstance(row, dict) and str(row.get("pid")) == str(pid)
-                and str(row.get("proc_start") or "") == str(proc_start)):
-            sid = row.get("session_id") or name[:-5]
-            if isinstance(sid, str) and sid:
-                found.add(sid)
-    return found
+    return tap_sids_by_pid(home, pid, proc_start)
 
 
 def _tap_sid_by_pid(home, pid, proc_start):

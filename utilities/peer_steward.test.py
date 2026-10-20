@@ -45,7 +45,9 @@ _SPEC = importlib.util.spec_from_file_location("peer_steward", str(_HERE / "peer
 peer_steward = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(peer_steward)
 sys.path.insert(0, str(_HERE.parent / "tools"))
+sys.path.insert(0, str(_HERE))
 import fixture_processes  # noqa: E402
+import claude_process_identity  # noqa: E402
 terminal_surface = peer_steward.terminal_surface
 
 
@@ -95,6 +97,12 @@ class _TmpRootMixin:
         proof.start()
         self.addCleanup(proof.stop)
         self.addCleanup(lambda: setattr(peer_steward, "_HERDR_SESSION", self._old_herdr_session))
+        census_patch = mock.patch.object(
+            claude_process_identity, "claude_session_census",
+            return_value=(False, set(), {"fixture-census-incomplete"}),
+        )
+        census_patch.start()
+        self.addCleanup(census_patch.stop)
         self.addCleanup(self._restore_environ)
 
     def _restore_environ(self):
@@ -1378,6 +1386,14 @@ class _WatchMixin(_TmpRootMixin):
                         fifo=str(self.tmp_root / "release.fifo"))
         self.bin = self.tmp_root / "fakebin"
         self.bin.mkdir()
+        census_home = self.tmp_root / "home" / ".claude"
+        (census_home / "sessions").mkdir(parents=True, exist_ok=True)
+        (census_home / ".statusline").mkdir(parents=True, exist_ok=True)
+        self.census_process = subprocess.Popen(
+            ["bash", "-c", "exec -a /usr/bin/claude sleep 600"],
+            env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self._stop_census_process)
         fake = self.bin / "herdr"
         fake.write_text(_FAKE_HERDR)
         fake.chmod(0o755)
@@ -1385,6 +1401,15 @@ class _WatchMixin(_TmpRootMixin):
         self.fifo = self.tmp_root / "release.fifo"
         os.mkfifo(self.fifo)
         self.watch_root = peer_steward.peer_message.peer_state_root() / "peer-watches"
+
+    def _stop_census_process(self):
+        if self.census_process.poll() is None:
+            self.census_process.terminate()
+            try:
+                self.census_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.census_process.kill()
+                self.census_process.wait(timeout=2)
 
     def _env(self, mode="idle", session_id="steward-1", with_herdr=True):
         env = dict(os.environ)
@@ -2888,8 +2913,112 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
                          ("pane-exited", "completed-retire"))
         self.assertFalse(paths.observation.exists())
 
+    def test_seatless_claude_watch_settles_only_on_complete_empty_census(self):
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "seatless-ended"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "default", "armed_ts": "then", "refs": ["attempt:one"],
+               "observer_generation": 4, "steward_seat": None,
+               "agent": {"harness": "codex", "session_id": "target-sid",
+                         "name": "peer-a", "pane": "-"},
+               "steward": {"harness": "claude", "session_id": "recipient-sid",
+                           "project": "SR_CorrNet"},
+               "watcher": {}}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        native_home = Path.home() / ".claude"
+        (native_home / "history.jsonl").write_text(
+            json.dumps({"sessionId": "recipient-sid"}) + "\n", encoding="utf-8")
+
+        with mock.patch.object(claude_process_identity, "claude_session_census",
+                               return_value=(True, set(), set())):
+            settled = peer_steward._settle_ended_seatless_recipient(
+                watch_id, arm, self.watch_root)
+
+        self.assertTrue(settled)
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("steward-exited", "steward-exited"))
+        self.assertEqual(receipt["refs"], ["attempt:one"])
+        self.assertEqual(receipt["observer_generation"], 4)
+        self.assertFalse(paths.observation.exists())
+
+    def test_seatless_claude_watch_without_native_existence_evidence_stays_pending(self):
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "seatless-unseen"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "default", "armed_ts": "then", "steward_seat": None,
+               "agent": {"harness": "codex", "session_id": "target-sid", "pane": "-"},
+               "steward": {"harness": "claude", "session_id": "never-seen-session"},
+               "watcher": {}}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+
+        with mock.patch.object(claude_process_identity, "claude_session_census",
+                               return_value=(True, set(), set())):
+            self.assertFalse(peer_steward._settle_ended_seatless_recipient(
+                watch_id, arm, self.watch_root))
+
+        self.assertTrue(paths.arm.exists())
+        self.assertFalse(paths.receipt.exists())
+        self.assertFalse(paths.observation.exists())
+
+    def test_seatless_watch_alive_or_incomplete_census_remains_pending(self):
+        from recipient_lifetime import RecipientCensus
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "seatless-uncertain"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "default", "armed_ts": "then", "steward_seat": None,
+               "agent": {"harness": "codex", "session_id": "target-sid", "pane": "-"},
+               "steward": {"harness": "claude", "session_id": "recipient-sid"},
+               "watcher": {}}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        for result in ("alive", "unknown"):
+            with self.subTest(result=result):
+                census = RecipientCensus(lambda *_args, value=result: value)
+                self.assertFalse(peer_steward._settle_ended_seatless_recipient(
+                    watch_id, arm, self.watch_root, census=census))
+                self.assertFalse(paths.receipt.exists())
+
+    def test_terminal_pending_reason_is_written_before_a_busy_observer_is_woken(self):
+        from recipient_lifetime import RecipientCensus
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "seatless-lock-race"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "default", "armed_ts": "then", "steward_seat": None,
+               "agent": {"harness": "codex", "session_id": "target-sid", "pane": "-"},
+               "steward": {"harness": "claude", "session_id": "recipient-sid"},
+               "watcher": {}}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        lock_fd = peer_steward._open_lock(paths.lock)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self.assertTrue(peer_steward._settle_ended_seatless_recipient(
+                watch_id, arm, self.watch_root,
+                census=RecipientCensus(lambda *_args: "ended")))
+            observation = json.loads(paths.observation.read_text(encoding="utf-8"))
+            self.assertEqual((observation["state"], observation["reason"]),
+                             ("terminal_pending", "steward-exited"))
+            self.assertFalse(paths.receipt.exists())
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
 
 class WatchTerminalReconcileTest(unittest.TestCase):
+    def test_live_seatless_claude_watch_schedules_existing_reconciliation_pass(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        arm = {"watch_id": "seatless-live", "steward_seat": None,
+               "steward": {"harness": "claude", "session_id": "recipient-sid"},
+               "watcher": {"pid": 123, "pid_start": "456"}}
+        with mock.patch.object(peer_steward, "_watch_root", return_value=root), \
+             mock.patch.object(peer_steward, "_watch_entries", return_value=[("seatless-live", arm)]), \
+             mock.patch.object(peer_steward, "_watcher_present", return_value=True):
+            self.assertTrue(peer_steward._watch_reconciliation_needed(entries=[("seatless-live", arm)]))
+
     def test_server_rearm_drops_a_socket_path_bound_to_another_endpoint(self):
         module = peer_steward
         foreign = module._herdr_env_for_server("fourth", {
@@ -3002,7 +3131,8 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                 321, "654", paths.lock, "utilities/peer-steward.py", required,
                 binding, lock_fd_option="--lock-fd", exact_arguments=True,
                 argument_variants=[])
-            spawn.assert_called_once_with(watch_id, arm, service_current=binding)
+            spawn.assert_called_once_with(watch_id, arm, service_current=binding,
+                                          recipient_census=mock.ANY)
 
 
 class JoinTest(_WatchMixin, unittest.TestCase):

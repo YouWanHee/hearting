@@ -86,13 +86,25 @@ _DEPENDENCIES = contextvars.ContextVar("retention_dependencies", default=None)
 _REGISTRY_DEADLINE = contextvars.ContextVar("retention_registry_deadline", default=None)
 
 
+def _stamp_from_stat(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size,
+            st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _stamp(path):
     try:
         st = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return None
-    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size,
-            st.st_mtime_ns, st.st_ctime_ns)
+    return _stamp_from_stat(st)
+
+
+def _stamp_at(dir_fd, name):
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return _stamp_from_stat(st)
 
 
 def _track(path):
@@ -1485,12 +1497,14 @@ def _parse_metadata(value: str) -> dict[str, str]:
 
 
 def _delivery_record_relation(path: Path, related: set[str] | frozenset[str],
-                              binding: _HomeBinding | None = None) -> str:
+                              binding: _HomeBinding | None = None, *,
+                              dir_fd: int | None = None) -> str:
     """related | unrelated | unknown for a changed delivery record."""
     from dispatch_pending_delivery import PendingDeliveryError, _validate_record
     for attempt in range(2):
         try:
-            found = _read_json(str(path), MAX_DELIVERY_BYTES)
+            read_path = path.name if dir_fd is not None else str(path)
+            found = _read_json(read_path, MAX_DELIVERY_BYTES, dir_fd=dir_fd)
             if found is None:
                 return "unrelated"
             value = found[0]
@@ -1523,6 +1537,20 @@ def _bounded_directory_entries(path: Path, deadline: float) -> list | None:
     entries = []
     try:
         with os.scandir(path) as listing:
+            for entry in listing:
+                if (len(entries) >= MAX_DELIVERY_RECORDS
+                        or time.monotonic() >= deadline):
+                    return None
+                entries.append(entry)
+    except OSError:
+        return None
+    return entries
+
+
+def _bounded_directory_entries_fd(dir_fd: int, deadline: float) -> list | None:
+    entries = []
+    try:
+        with os.scandir(dir_fd) as listing:
             for entry in listing:
                 if (len(entries) >= MAX_DELIVERY_RECORDS
                         or time.monotonic() >= deadline):
@@ -1670,6 +1698,72 @@ class _CandidateDeliveryBaseline:
     base_stamp: object
 
 
+def _late_candidate_group_change(baseline: _CandidateDeliveryBaseline,
+                                 related: frozenset[str],
+                                 binding: _HomeBinding | None,
+                                 baseline_files: frozenset[Path],
+                                 deadline: float) -> str | None:
+    """Freshly inspect changed groups relative to one pinned delivery directory."""
+    if not baseline.group_stamps:
+        return None
+    try:
+        base_fd = os.open(baseline.base, _DIR_FLAGS)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unknown"
+    try:
+        opened_base = _stamp_from_stat(os.fstat(base_fd))
+        path_base = _stamp(baseline.base)
+        if (path_base is None or not stat.S_ISDIR(path_base[2])
+                or path_base[:4] != opened_base[:4]):
+            return "unknown"
+
+        for group, before in baseline.group_stamps:
+            if time.monotonic() >= deadline:
+                return "unknown"
+            after = _stamp_at(base_fd, group.name)
+            if after == before or after is None:
+                continue
+            if not stat.S_ISDIR(after[2]):
+                return "unknown"
+            try:
+                group_fd = os.open(group.name, _DIR_FLAGS, dir_fd=base_fd)
+            except OSError:
+                return "unknown"
+            try:
+                if _stamp_from_stat(os.fstat(group_fd)) != after:
+                    return "unknown"
+                entries = _bounded_directory_entries_fd(group_fd, deadline)
+                if entries is None or _stamp_at(base_fd, group.name) != after:
+                    return "unknown"
+                for entry in entries:
+                    if time.monotonic() >= deadline:
+                        return "unknown"
+                    path = group / entry.name
+                    if not entry.name.endswith(".json") or path in baseline_files:
+                        continue
+                    relation = _delivery_record_relation(
+                        path, related, binding, dir_fd=group_fd)
+                    if relation == "related":
+                        return "changed"
+                    if relation == "unknown":
+                        return "unknown"
+            finally:
+                os.close(group_fd)
+
+        # The path must still name the directory descriptor used above. Its
+        # metadata may have changed because new groups appeared; the later
+        # base-membership pass handles those just as before.
+        path_base = _stamp(baseline.base)
+        if (path_base is None or not stat.S_ISDIR(path_base[2])
+                or path_base[:4] != opened_base[:4]):
+            return "unknown"
+    finally:
+        os.close(base_fd)
+    return None
+
+
 def _prepare_candidate_delivery_baseline(ctx: _Context, attempt: str | None,
                                          deadline: float) -> _CandidateDeliveryBaseline | None:
     """Prepare immutable lookup sets outside jobs.log.lock for final freshness."""
@@ -1750,33 +1844,12 @@ def _late_candidate_delivery_change(ctx: _Context, attempt: str | None,
         if relation == "unknown":
             return "unknown"
 
-    # A new record in any known group changes that group's membership stamp.
-    # Read only additions, so ongoing unrelated writers do not require a quiet
-    # global generation and existing large payloads stay outside this lock.
-    for group, before in baseline.group_stamps:
-        if time.monotonic() >= deadline:
-            return "unknown"
-        after = _stamp(group)
-        if after == before or after is None:
-            continue
-        if group.is_symlink() or not group.is_dir():
-            return "unknown"
-        entries = _bounded_directory_entries(group, deadline)
-        if entries is None:
-            return "unknown"
-        if _stamp(group) != after:
-            return "unknown"
-        for entry in entries:
-            if time.monotonic() >= deadline:
-                return "unknown"
-            path = Path(entry.path)
-            if not entry.name.endswith(".json") or path in baseline_files:
-                continue
-            relation = _delivery_record_relation(path, related, binding)
-            if relation == "related":
-                return "changed"
-            if relation == "unknown":
-                return "unknown"
+    # Fresh per-group metadata observations use one pinned directory handle,
+    # avoiding repeated resolution of the shared pending-delivery path.
+    group_change = _late_candidate_group_change(
+        baseline, related, binding, baseline_files, deadline)
+    if group_change is not None:
+        return group_change
 
     if _stamp(baseline.base) != baseline.base_stamp:
         groups = _bounded_directory_entries(baseline.base, deadline)

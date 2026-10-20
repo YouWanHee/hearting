@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import codecs
 import contextlib
 import contextvars
+import hashlib
 import os
 from pathlib import Path
 import threading
@@ -26,6 +27,9 @@ _CACHE_MAX_PATHS = 128
 _CACHE_MAX_BYTES = 64 * 1024 * 1024
 _MAX_SEGMENTS = 256
 _COMPACT_SEGMENTS = 128
+_NON_CANONICAL_LINE_SEPARATORS = (b"\r", b"\v", b"\f", b"\x1c", b"\x1d",
+                                 b"\x1e", b"\xc2\x85", b"\xe2\x80\xa8",
+                                 b"\xe2\x80\xa9")
 _LOCK = threading.RLock()
 _CACHE: OrderedDict[str, "RegistryView"] = OrderedDict()
 _READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("dispatch_registry_read_scope", default=None)
@@ -239,7 +243,7 @@ class RegistryView:
     __slots__ = ("path_identity", "resolved_path", "signature", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
                  "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
-                 "has_invalid_utf8")
+                 "has_invalid_utf8", "_raw_digest", "_prefix_reuse_eligible")
 
     def __init__(self, path_identity: str, resolved_path: str, signature: tuple,
                  raw: bytes, *, previous: "RegistryView | None" = None):
@@ -248,10 +252,15 @@ class RegistryView:
         self.signature = signature
         self.last_observed_at = time.monotonic()
         self._has_duplicate_attempts = None
+        self._raw_digest = hashlib.sha256(raw)
         if previous is None:
             invalid_utf8, incomplete_utf8 = _utf8_status(raw)
             self._invalid_utf8_prefix = invalid_utf8
             self.has_invalid_utf8 = invalid_utf8 or incomplete_utf8
+            self._prefix_reuse_eligible = (
+                not invalid_utf8
+                and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
+            )
             boundary = raw.rfind(b"\n") + 1
             complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
             tail = raw[boundary:]
@@ -266,6 +275,12 @@ class RegistryView:
             invalid_utf8, incomplete_utf8 = _utf8_status(combined)
             self._invalid_utf8_prefix = previous._invalid_utf8_prefix or invalid_utf8
             self.has_invalid_utf8 = self._invalid_utf8_prefix or incomplete_utf8
+            self._raw_digest = previous._raw_digest.copy()
+            self._raw_digest.update(raw)
+            self._prefix_reuse_eligible = (
+                previous._prefix_reuse_eligible and not invalid_utf8
+                and not any(separator in combined for separator in _NON_CANONICAL_LINE_SEPARATORS)
+            )
             pieces = combined.split(b"\n")
             complete_bytes, tail = pieces[:-1], pieces[-1]
             complete = tuple(piece.decode("utf-8", errors="replace") for piece in complete_bytes)
@@ -542,9 +557,30 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
         else:
             _drop(identity)
             _METRICS["invalidations"] += 1
-            view = RegistryView(identity, resolved, signature, raw)
-            _METRICS["full_metadata_parses"] += 1
-            _METRICS["metadata_rows_parsed"] += view.record_count
+            previous = cached
+            reusable = bool(
+                previous is not None and previous._prefix_reuse_eligible
+                and previous.resolved_path == resolved
+                and previous.signature[:2] == signature[:2]
+                and signature[2] > previous.signature[2]
+                and len(raw) == signature[2]
+                and hashlib.sha256(memoryview(raw)[:previous.signature[2]]).digest()
+                    == previous._raw_digest.digest()
+                and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
+                and not _utf8_status(raw)[0]
+            )
+            if reusable:
+                suffix = raw[previous.signature[2]:]
+                view = RegistryView(identity, resolved, signature, suffix, previous=previous)
+                _METRICS["delta_reads"] += 1
+                _METRICS["delta_bytes_read"] += len(suffix)
+                _METRICS["metadata_rows_parsed"] += view.record_count - previous.record_count
+            else:
+                # Drop both the cache entry and our local reference before parsing.
+                cached = previous = None
+                view = RegistryView(identity, resolved, signature, raw)
+                _METRICS["full_metadata_parses"] += 1
+                _METRICS["metadata_rows_parsed"] += view.record_count
             _remember(identity, view)
     return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
 
@@ -610,6 +646,7 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
         _drop(identity)
         _METRICS["invalidations"] += 1
         previous = None
+        full_read = False
         if can_append:
             try:
                 observed_resolved, observed_signature, raw = _stable_read(
@@ -624,10 +661,17 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
                     _METRICS["delta_bytes_read"] += len(raw)
                 else:
                     resolved, signature, raw = _stable_read(path, identity)
+                    full_read = True
             except OSError:
                 raise
         else:
             resolved, signature, raw = _stable_read(path, identity)
+            full_read = True
+        if full_read:
+            # Ordinary fresh reads retain their established full-rebuild semantics.
+            # Scoped passive observations use the checked-prefix path above; the
+            # append-only API continues to use only its bounded trusted suffix path.
+            cached = None
         _METRICS["content_reads"] += 1
         _METRICS["bytes_read"] += len(raw)
         view = RegistryView(identity, resolved, signature, raw, previous=previous)

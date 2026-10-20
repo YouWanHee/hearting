@@ -2861,6 +2861,58 @@ def _settle_terminal_watch_if_unobserved(watch_id, arm, root=None,
         os.close(fd)
 
 
+def _settle_ended_seatless_recipient(watch_id, arm, root=None, *, census=None,
+                                      lock_held=False):
+    """Settle a seat-less Claude watch with native existence and no-holder proof."""
+    paths = _watch_paths(watch_id, root)
+    if paths.receipt.exists():
+        return True
+    if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
+        return False
+    seat = arm.get("steward_seat")
+    if ("steward_seat" in arm and seat is not None):
+        return False
+    steward = arm.get("steward") or {}
+    harness, sid = steward.get("harness"), steward.get("session_id")
+    if harness != "claude" or not peer_message.usable_session_id(sid):
+        return False
+    try:
+        from claude_process_identity import is_local_path
+        if not is_local_path(paths.arm.parent):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    if census is None:
+        from recipient_lifetime import RecipientCensus, recipient_state
+        census = RecipientCensus()
+    else:
+        from recipient_lifetime import recipient_state
+    if recipient_state(harness=harness, session_id=sid, census=census) != "ended":
+        return False
+
+    current = _read_json(paths.arm)
+    current_steward = (current or {}).get("steward") or {}
+    if (not isinstance(current, dict) or current.get("watch_id") != watch_id
+            or ("steward_seat" in current and current.get("steward_seat") is not None)
+            or current_steward.get("harness") != harness
+            or current_steward.get("session_id") != sid
+            or (current.get("server") or "default") != (arm.get("server") or "default")):
+        return False
+    expected = dict(current.get("agent") or {})
+    server = current.get("server") or "default"
+    _write_json_atomic(paths.observation, {
+        "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
+        "state": "terminal_pending", "reason": "steward-exited",
+        "server": server,
+        "agent": {key: expected.get(key, "-") for key in ("harness", "session_id", "pane")},
+    })
+    if lock_held:
+        _write_terminal_watch_receipt(watch_id, current, "steward-exited")
+        return True
+    return _settle_terminal_watch_if_unobserved(
+        watch_id, current, root, reason_override="steward-exited")
+
+
 def _request_watch_terminal(identity, reason):
     """Ask matching observers to settle on their next bounded wake."""
     if not isinstance(identity, dict):
@@ -4659,12 +4711,21 @@ def _watch_observer_duty_argv(watch_id, arm, *, rearm_generation, lock_fd=None,
     return argv
 
 
-def _spawn_watch_observer(watch_id, arm, *, service_current=None):
+def _spawn_watch_observer(watch_id, arm, *, service_current=None,
+                          recipient_census=None):
     """Reattach the observer to accepted intent without changing its identity."""
     if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
         return False
     paths = _watch_paths(watch_id)
-    if paths.receipt.exists() or _watcher_present(arm):
+    if paths.receipt.exists():
+        return True
+    if recipient_census is None:
+        from recipient_lifetime import RecipientCensus
+        recipient_census = RecipientCensus()
+    if _settle_ended_seatless_recipient(
+            watch_id, arm, census=recipient_census):
+        return True
+    if _watcher_present(arm):
         return True
     prior_observation = _read_json(paths.observation) or {}
     if _settle_terminal_watch_if_unobserved(watch_id, arm):
@@ -4694,6 +4755,15 @@ def _spawn_watch_observer(watch_id, arm, *, service_current=None):
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
+        current_arm = _read_json(paths.arm)
+        if (not isinstance(current_arm, dict) or current_arm.get("watch_id") != watch_id
+                or (current_arm.get("steward") or {}).get("session_id") !=
+                    (arm.get("steward") or {}).get("session_id")):
+            return False
+        if _settle_ended_seatless_recipient(
+                watch_id, current_arm, census=recipient_census, lock_held=True):
+            return True
+        arm = current_arm
         os.set_inheritable(lock_fd, True)
         log_fd = os.open(str(paths.log), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         server = arm.get("server") or "default"
@@ -4766,6 +4836,8 @@ def _watch_observer_takeover_argvs(watch_id, arm):
 def _ensure_watch_observers(*, service_current=None, entries=None):
     root = _watch_root()
     transports = {}
+    from recipient_lifetime import RecipientCensus
+    recipient_census = RecipientCensus()
     try:
         for watch_id, _snapshot_arm in (_watch_entries(root) if entries is None else entries):
             paths = _watch_paths(watch_id, root)
@@ -4777,6 +4849,9 @@ def _ensure_watch_observers(*, service_current=None, entries=None):
             if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
                 continue
             if paths.receipt.exists():
+                continue
+            if _settle_ended_seatless_recipient(
+                    watch_id, arm, root, census=recipient_census):
                 continue
             if _settle_terminal_watch_if_unobserved(watch_id, arm, root):
                 continue
@@ -4813,7 +4888,8 @@ def _ensure_watch_observers(*, service_current=None, entries=None):
                     watch_id, arm, root, terminal_reason)):
                 continue
             if not _watcher_present(arm):
-                _spawn_watch_observer(watch_id, arm, service_current=service_current)
+                _spawn_watch_observer(watch_id, arm, service_current=service_current,
+                                      recipient_census=recipient_census)
     finally:
         for transport in transports.values():
             transport.close()
@@ -4932,6 +5008,14 @@ def cmd_rearm(args):
     # No claim bookkeeping here: `cmd_watch` holds the dedupe lock, sees that the
     # claimed watch is dead with no receipt, and reclaims the key itself.
     if _spawn_watch_observer(watch_id, arm):
+        if paths.receipt.exists():
+            print(f"watch_id={watch_id} state=already-done receipt={paths.receipt}")
+            return 0
+        observation = _read_json(paths.observation) or {}
+        if (observation.get("state") == "terminal_pending"
+                and observation.get("reason") == "steward-exited"):
+            print(f"watch_id={watch_id} state=pending reason=steward-exited receipt={paths.receipt}")
+            return 0
         print(f"watch_id={watch_id} state=rearmed receipt={paths.receipt}")
         print(steward_fields(
             arm.get("wake"), watch_id, agent_home=Path(__file__).resolve().parents[1],
@@ -6418,6 +6502,9 @@ def _watch_reconciliation_needed(*, service_current=None, entries=None):
     for watch_id, arm in (_watch_entries(root) if entries is None else entries):
         if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
             continue
+        if ((arm.get("steward") or {}).get("harness") == "claude"
+                and ("steward_seat" not in arm or arm.get("steward_seat") is None)):
+            return True
         if not _watcher_present(arm) or service_current:
             return True
     return False
