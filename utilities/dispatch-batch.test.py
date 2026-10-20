@@ -261,7 +261,7 @@ class DispatchBatchTest(unittest.TestCase):
         ]
         return contextlib.ExitStack(), assignments
 
-    def legs(self, assignments=None, prompt=None):
+    def legs(self, assignments=None, prompt=None, parent_attempt="att-parent-fixture"):
         assignments = assignments or self.common_patches()[1]
         legs = []
         for node, adapter, hop, ordinal in assignments:
@@ -277,7 +277,7 @@ class DispatchBatchTest(unittest.TestCase):
                     node,
                     slug,
                     "owner",
-                    "att-parent-fixture",
+                    parent_attempt,
                     adapter,
                     ordinal,
                 ),
@@ -293,14 +293,14 @@ class DispatchBatchTest(unittest.TestCase):
 
     def write_existing(
         self, leg, *, status="open", note="", claimed="1", append=True,
-        live_identity=True,
+        live_identity=True, parent_attempt="att-parent-fixture",
         all_legs=None,
     ):
         all_legs = all_legs or self.legs()
         _manifest, manifest_digest, leg_digests = BATCH.build_manifest(
             replica_group="plan",
             route_id=self.route["route_id"],
-            parent_attempt_id="att-parent-fixture",
+            parent_attempt_id=parent_attempt,
             independence="cross-harness",
             members=[{
                 "assignment_sha256": str(item["assignment_sha256"]),
@@ -323,13 +323,13 @@ class DispatchBatchTest(unittest.TestCase):
             f"fallback_hop={leg['hop']},harness={leg['adapter']},"
             f"child_harness={leg['adapter']},route_id={self.route['route_id']},"
             f"route_node={leg['node']},parent=owner,"
-            "parent_attempt_id=att-parent-fixture,launch_authority=conductor,"
+            f"parent_attempt_id={parent_attempt},launch_authority=conductor,"
             f"fallback_ordinal={leg['ordinal']},attempt_id={leg['attempt_id']},"
             f"launch_claimed={claimed},launch_fence=registry-v1,parallel_group=plan,replica_group=plan,"
             "reservation_kind=parallel-batch,batch_declared_size=2,"
             "batch_admission_count=2,"
             f"batch_group=plan,batch_route_id={self.route['route_id']},"
-            "batch_parent_attempt_id=att-parent-fixture,"
+            f"batch_parent_attempt_id={parent_attempt},"
             f"batch_attempt_id={leg['attempt_id']},batch_route_node={leg['node']},"
             f"batch_harness={leg['adapter']},batch_fallback_hop={leg['hop']},"
             f"batch_fallback_ordinal={leg['ordinal']},"
@@ -359,12 +359,12 @@ class DispatchBatchTest(unittest.TestCase):
         with self.jobs.open(mode, encoding="utf-8") as handle:
             handle.write(row)
 
-    def partial_continuation(self, source_legs):
+    def partial_continuation(self, source_legs, parent_attempt="att-parent-fixture"):
         legs = [dict(leg, leg_class="peer") for leg in source_legs]
         manifest, manifest_digest, leg_digests = BATCH.build_manifest(
             parallel_group="plan",
             route_id=self.route["route_id"],
-            parent_attempt_id="att-parent-fixture",
+            parent_attempt_id=parent_attempt,
             independence="cross-harness",
             members=BATCH.manifest_members(legs),
             required_independence_axes=[
@@ -419,9 +419,10 @@ class DispatchBatchTest(unittest.TestCase):
         }
         return manifest, continuation, partial
 
-    def seal_original_input(self):
+    def seal_original_input(self, parent_attempt="att-parent-fixture"):
         from dispatch_replacement_batch import seal_launch_input
-        manifest, _continuation, _partial = self.partial_continuation(self.legs())
+        manifest, _continuation, _partial = self.partial_continuation(
+            self.legs(parent_attempt=parent_attempt), parent_attempt=parent_attempt)
         _checked, digest, _legs = BATCH.verify_manifest(manifest)
         args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
             slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
@@ -594,11 +595,14 @@ class DispatchBatchTest(unittest.TestCase):
 
     def test_public_group_restart_keeps_cancelled_manifest_bindings_stable(self):
         from dispatch_replacement_batch import seal_launch_input
+        from recovery_history import batch_input_path
 
-        legs = self.legs()
-        for leg in legs:
+        parent_a = "att-parent-fixture"
+        parent_b = "att-successor-fixture"
+        legs_a = self.legs(parent_attempt=parent_a)
+        for leg in legs_a:
             self.write_existing(leg, status="done", note="cancelled-by-parent",
-                                claimed="0", live_identity=False)
+                                claimed="0", live_identity=False, parent_attempt=parent_a)
         rewritten = []
         for line in self.jobs.read_text(encoding="utf-8").splitlines():
             fields = line.split("\t")
@@ -606,15 +610,29 @@ class DispatchBatchTest(unittest.TestCase):
             rewritten.append("\t".join(fields))
         self.jobs.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
-        manifest, _continuation, _partial = self.partial_continuation(legs)
-        _checked, digest, _leg_digests = BATCH.verify_manifest(manifest)
+        manifest_a, _continuation, _partial = self.partial_continuation(legs_a, parent_a)
+        _checked, digest_a, _leg_digests = BATCH.verify_manifest(manifest_a)
         args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
             slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
             qa=None, log_dir=None, allow_degraded_independence=False)
-        seal_launch_input(self.jobs, args, self.route, manifest, digest)
+        seal_launch_input(self.jobs, args, self.route, manifest_a, digest_a)
+        generation_a_rows = self.jobs.read_bytes()
 
-        def public_start():
+        def public_start(parent_attempt):
             output = io.StringIO()
+            created = []
+
+            class FakeProcess:
+                returncode = 0
+                pid = 10001
+
+                def __init__(self, command, **kwargs):
+                    self.command = command
+                    created.append(self)
+
+                def communicate(self):
+                    return success_receipt(self.command), ""
+
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
                 stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
@@ -624,46 +642,84 @@ class DispatchBatchTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
                 stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output",
                     return_value=str(self.base)))
+                stack.enter_context(mock.patch.object(BATCH, "assign_harnesses",
+                    return_value=(self.common_patches()[1], "cross-harness", {
+                        "families_considered": [], "usable_families": [],
+                        "family_exclusions": {}, "capacity": {}, "degradation_cause": ""})))
                 stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple",
                     side_effect=resolve_side_effect))
-                stack.enter_context(mock.patch.object(BATCH, "assign_harnesses",
-                    side_effect=AssertionError("restart must retain sealed member placement")))
-                stack.enter_context(mock.patch.object(BATCH, "reserve_batch"))
-                stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+                stack.enter_context(mock.patch.object(BATCH, "reserve_batch",
+                    return_value=["a" * 32, "b" * 32]))
+                stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+                stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen",
+                    side_effect=FakeProcess))
                 stack.enter_context(mock.patch.dict(os.environ, {
-                    "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                    "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": parent_attempt,
                     "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
                     "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write"}))
                 with contextlib.redirect_stdout(output):
                     result = BATCH.main(self.argv())
-            return result, output.getvalue()
+            return result, json.loads(output.getvalue()), created
 
-        first_code, first_output = public_start()
-        second_code, second_output = public_start()
-        self.assertEqual(first_code, 0, first_output)
-        self.assertEqual(second_code, 0, second_output)
-        for output in (first_output, second_output):
-            self.assertNotIn("batch-prior-binding-drift", output)
-            self.assertNotIn("batch-prior-manifest-ambiguous", output)
-        payload = BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
-            "plan", "att-parent-fixture", BATCH.DEFAULT_PROMPT)
-        self.assertEqual(payload["manifest"], manifest)
-        self.assertEqual([leg["attempt_id"] for leg in self.legs()],
-                         [leg["attempt_id"] for leg in legs])
-        attempt_rows = [line for line in self.jobs.read_text().splitlines()
-                        if "batch_attempt_id=" in line]
-        self.assertEqual(len(attempt_rows), len(legs))
+        # This fixture uses ordinary replica nodes without a review_round_cap.
+        first_code, first, first_processes = public_start(parent_b)
+        self.assertEqual(first_code, 0, json.dumps(first))
+        self.assertEqual(first["state"], "launched")
+        self.assertEqual(first["admitted"], 2)
+        self.assertEqual(first["registered"], 1)
+        self.assertEqual(first["started"], 1)
+        self.assertEqual(first["child_spawned"], 1)
+        self.assertTrue(all(leg["registered"] == "1" for leg in first["legs"]))
+        self.assertTrue(all(leg["started"] == "1" for leg in first["legs"]))
+        self.assertTrue(all(leg["child_spawned"] == "1" for leg in first["legs"]))
+        self.assertEqual(len(first_processes), len(legs_a))
+        for refusal in ("batch-prior-binding-", "replacement-batch-source-drift",
+                        "review-verdictless-bound", "blocked-live"):
+            self.assertNotIn(refusal, json.dumps(first))
 
-        from recovery_history import batch_input_path
-        input_path = batch_input_path(self.jobs, digest)
+        legs_b = self.legs(parent_attempt=parent_b)
+        for leg in legs_b:
+            self.write_existing(leg, status="running", note="", claimed="1",
+                                live_identity=True, parent_attempt=parent_b, all_legs=legs_b)
+        generation_a_lines = [line for line in generation_a_rows.decode().splitlines()
+            if f"parent_attempt_id={parent_a}" in line]
+        current_a_lines = [line for line in self.jobs.read_text().splitlines()
+            if f"parent_attempt_id={parent_a}" in line]
+        self.assertEqual(current_a_lines, generation_a_lines)
+        self.assertEqual(len(current_a_lines), len(legs_a))
+        for line in current_a_lines:
+            self.assertIn("batch_manifest_sha256=", line)
+            self.assertIn("batch_leg_sha256=", line)
+            self.assertIn("failure_class=cancelled", line)
+
+        manifest_b, _continuation, _partial = self.partial_continuation(legs_b, parent_b)
+        _checked, digest_b, _leg_digests = BATCH.verify_manifest(manifest_b)
+        seal_launch_input(self.jobs, args, self.route, manifest_b, digest_b)
+        input_path = batch_input_path(self.jobs, digest_b)
         original = input_path.read_text(encoding="utf-8")
         tampered = json.loads(original)
         tampered["manifest"]["members"][0]["route_node"] = "foreign-node"
         input_path.write_text(json.dumps(tampered), encoding="utf-8")
-        with self.assertRaises(BATCH.BatchError):
+        with self.assertRaises(BATCH.BatchError) as error:
             BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
-                "plan", "att-parent-fixture", BATCH.DEFAULT_PROMPT)
+                "plan", parent_b, BATCH.DEFAULT_PROMPT)
+        self.assertIn(error.exception.reason,
+                      {"replacement-batch-source-drift", "batch-prior-binding-invalid"})
         input_path.write_text(original, encoding="utf-8")
+
+        second_code, second, second_processes = public_start(parent_b)
+        self.assertEqual(second_code, 0, json.dumps(second))
+        self.assertEqual(second["state"], "idempotent-existing")
+        self.assertEqual(second["existing"], 2)
+        self.assertEqual(second["newly_started"], 0)
+        self.assertEqual(second_processes, [])
+        self.assertEqual([leg["attempt_id"] for leg in legs_b],
+                         [leg["attempt_id"] for leg in self.legs(parent_attempt=parent_b)])
+        self.assertEqual(len([line for line in self.jobs.read_text().splitlines()
+            if f"parent_attempt_id={parent_b}" in line]), len(legs_b))
+        attempt_rows = [line for line in self.jobs.read_text().splitlines()
+                        if "batch_attempt_id=" in line]
+        self.assertEqual(len(attempt_rows), len(legs_a) + len(legs_b))
 
     def test_load_route_rejects_non_object_json_before_verification(self):
         self.route_path.write_text("[]", encoding="utf-8")
