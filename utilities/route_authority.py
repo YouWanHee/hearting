@@ -2378,6 +2378,15 @@ def _admit_supervised_owner_resource_start(args, agent_home, jobs):
         return False
     if target is None:
         return False
+    supervised_resources = {
+        row.get("id") for row in route.get("nodes", [])
+        if isinstance(row, dict) and row.get("kind") == "resource-runner"
+        and (row.get("continuation") or {}).get("kind") == "supervised"
+    }
+    # Ordinary stages never open the workflow ledger here: only a start that
+    # follows a supervised resource node can be its owner-controlled edge.
+    if not supervised_resources.intersection(target.get("depends_on") or []):
+        return False
     import dispatch_resource_wait as OWNER_RESOURCE
     supervisor = OWNER_RESOURCE.supervisor()
     ledger = supervisor.ledger_for(route, str(jobs))
