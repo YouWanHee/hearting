@@ -1889,7 +1889,7 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
         _HERDR_SESSION = old_server
 
 
-def _resume_retire_obligation(duty, store):
+def _resume_retire_obligation(duty, store, *, read_context=None):
     global _HERDR_SESSION
     intent = duty.get("intent") or {}
     ident = dict((duty.get("intent") or {}).get("identity") or {})
@@ -1956,7 +1956,8 @@ def _resume_retire_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
-                                    expected_sid=observed["session_id"])
+                                    expected_sid=observed["session_id"],
+                                    read_context=read_context)
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
                          expected_phases={"waiting"},
@@ -5027,7 +5028,7 @@ def _bottom_form_tokens(target, window=15):
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
                     purpose="completion", target_observation=None, pane_info=None,
-                    native_session_id=None, registry_append_only=False):
+                    native_session_id=None, registry_append_only=False, read_context=None):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session, and for a Codex TUI
@@ -5087,7 +5088,9 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
                                     pane or "", harness or "", sid or "",
                                     execution_attempt_ids=execution_ids,
                                     include_parent=purpose != "input",
-                                    registry_append_only=registry_append_only))
+                                    read_context=read_context,
+                                    registry_append_only=(registry_append_only or bool(
+                                        read_context and read_context.registry_append_only))))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
@@ -5112,6 +5115,84 @@ _FLUSH_STUCK_HOURS = 1.0
 
 def _message_obligation_id(ref):
     return "message-" + ref
+
+
+def _census_session_presence(census, session_id, server):
+    """Return True/False only for a complete, well-shaped exact-endpoint census."""
+    if (census is None or census.complete is not True
+            or census.endpoint != herdr_observation.endpoint_name(server)
+            or not isinstance(session_id, str) or not session_id):
+        return None
+    for pane in census.panes:
+        session = pane.get("agent_session")
+        if session is None:
+            continue
+        if not isinstance(session, dict):
+            return None
+        value = session.get("value")
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None
+        if value == session_id:
+            return True
+    return False
+
+
+def _message_terminal_evidence(duty, row, observed, reason):
+    """Prove only an exact recipient loss or death of its pane-bound process."""
+    intent = duty.get("intent") or {}
+    identity = intent.get("identity") or {}
+    original = (row or {}).get("to") or intent.get("to") or {}
+    server = identity.get("server") or "default"
+    pane_bound = peer_message._valid_pane_bound_endpoint(original)
+    recipient = peer_message.pending_delivery_recipient(row) if row else None
+    if pane_bound:
+        proof = peer_message.pending_first_input_process(row)
+        if proof is None:
+            return None
+        try:
+            namespace = os.readlink("/proc/self/ns/pid")
+            if proof.get("pid_namespace") != namespace:
+                return None
+            from dispatch_contract import process_identity_disposition
+            disposition = process_identity_disposition(proof["pid"], proof["start"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if disposition != "dead":
+            return None
+        evidence = {"kind": "first-input-process-dead", "server": server,
+                    "process": proof, "process_disposition": disposition}
+        if recipient is not None:
+            census = herdr_observation.pane_census(session=server)
+            presence = _census_session_presence(census, recipient.get("session_id"), server)
+            if presence is not False:
+                return None
+            evidence.update({"harness": recipient.get("harness"),
+                             "recipient_session_id": recipient.get("session_id"),
+                             "recipient_session_absent": True,
+                             "census_complete": True, "session_absent": True,
+                             "census_endpoint": census.endpoint,
+                             "census_observed_at": census.observed_at})
+        return evidence
+
+    if recipient is None:
+        return None
+    expected_pane = identity.get("pane") or original.get("pane_id")
+    if (reason is None and observed.get("harness") == recipient.get("harness")
+            and observed.get("session_id") == recipient.get("session_id")
+            and (not expected_pane or observed.get("pane") == expected_pane)):
+        return None
+    census = herdr_observation.pane_census(session=server)
+    presence = _census_session_presence(census, recipient.get("session_id"), server)
+    if presence is not False:
+        return None
+    return {"kind": "recipient-session-absent", "server": server,
+            "harness": recipient.get("harness"),
+            "session_id": recipient.get("session_id"),
+            "census_complete": True, "session_absent": True,
+            "census_endpoint": census.endpoint,
+            "census_observed_at": census.observed_at}
 
 
 def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None, handoff_acceptance=False):
@@ -5241,12 +5322,16 @@ def _resume_message_obligation(duty, store, *, read_context=None):
     duty_id = duty["id"]
 
     def checkpoint(**changes):
+        nonlocal duty
         # This duty came from the current read pass. If the requested checkpoint
         # is already present, skip the lock and record reread as well as the write.
-        # A concurrent advance is preserved because this path never writes it back.
+        # The message-specific CAS preserves concurrent receipts and terminal rows.
         if all(duty.get(key) == value for key, value in changes.items()):
             return duty
-        return store.update(duty_id, skip_unchanged=True, **changes)
+        duty = store.update_message_checkpoint(
+            duty_id, expected_revision=duty.get("revision"),
+            skip_unchanged=True, **changes)
+        return duty
 
     target = intent.get("target")
     # Later checkpoints replace the observation but carry the minted delay
@@ -5286,6 +5371,13 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         checkpoint(state="unknown", observation={"ref": ref, "reason": "pending-row-unreadable"})
         return
     if row is None:
+        if not intent.get("handoff_acceptance"):
+            recovered = peer_message.recover_missing_pending_receipt(
+                ref, intent, roots=roots, read_context=read_context)
+            if recovered is not None:
+                received, recipient = recovered
+                if store.acknowledge_message_receipt(duty_id, received, recipient):
+                    return
         checkpoint(state="unknown", observation={"ref": ref, "reason": "pending-row-missing"})
         return
     if intent.get("handoff_acceptance"):
@@ -5320,10 +5412,6 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         checkpoint(state="complete", result="received", delivery="acknowledged", cleanup="complete",
                    observation={"ref": ref, "reason": "exact-peer-ref"})
         return
-    if row.get("state") in {"queued", "unverified"}:
-        checkpoint(state="unknown", observation={"ref": ref, "transport_state": row["state"],
-                                                   "reason": row.get("receipt", "delivery-unconfirmed")})
-        return
     identity = (duty.get("intent") or {}).get("identity") or {}
     # Identity is held outside mutable observations. The accepted target stays
     # nameable only while its exact harness/session/pane still resolves.
@@ -5335,6 +5423,29 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
         expected_pane = identity.get("pane") or ""
         pane_bound = peer_message._valid_pane_bound_endpoint(recipient)
+        terminal_evidence = _message_terminal_evidence(duty, row, ident, reason)
+        if terminal_evidence is not None:
+            outcome = peer_message.cancel_message_obligation(
+                ref, duty_id=duty_id, expected_revision=duty.get("revision"),
+                identity=identity, message=row, evidence=terminal_evidence)
+            if outcome == "cancelled":
+                return
+            if outcome == "received":
+                return
+            if outcome in {"changed", "missing"}:
+                return
+            if outcome == "inflight":
+                checkpoint(state="unknown", observation={"ref": ref,
+                           "reason": "delivery-inflight"})
+                return
+        if row.get("state") in {"queued", "unverified"}:
+            # Keep the acceptance receipt intact when a fresh target check is
+            # still inconclusive. It is not a receive, and another pass will
+            # reobserve the target without rewriting this unchanged evidence.
+            checkpoint(state="unknown", observation={"ref": ref,
+                       "transport_state": row["state"],
+                       "reason": row.get("receipt", "delivery-unconfirmed")})
+            return
         if (reason or ident.get("harness") != recipient.get("harness")
                 or (expected_pane and ident.get("pane") != expected_pane)
                 or (not pane_bound and ident.get("session_id") != recipient.get("session_id"))):
@@ -5381,7 +5492,8 @@ def _resume_message_obligation(duty, store, *, read_context=None):
             recipient = peer_message.pending_delivery_recipient(bound)
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
-                                    expected_sid=recipient.get("session_id"), purpose="input")
+                                    expected_sid=recipient.get("session_id"), purpose="input",
+                                    read_context=read_context)
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
                 checkpoint(state="unknown" if readiness.state == "unknown" else "pending",
@@ -6080,7 +6192,7 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
             elif kind == "retire":
                 with peer_obligations.legacy_runner_lock(store) as acquired:
                     if acquired:
-                        _resume_retire_obligation(duty, store)
+                        _resume_retire_obligation(duty, store, read_context=read_context)
             elif kind == "registered-batch":
                 _resume_registered_obligation(duty, store, read_context=read_context)
         except Exception:

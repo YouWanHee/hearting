@@ -2331,6 +2331,16 @@ separate transfer. Lost responses reconcile against exact native history before 
 resume. Ambiguity never submits the body again. Native callbacks preserve pending
 refs when the runtime has no supported wake.
 
+The obligation runner may cancel delivery only after an exact, complete endpoint
+observation proves that the original recipient is gone, or the original
+pane-bound process lifetime is proven dead. The cancellation closes that
+delivery attempt; it does not claim receipt or success, and it preserves the
+transfer and its evidence. Missing or unreadable rows, incomplete observations,
+unresolved identities, live claims, and still-live original recipients remain
+unknown. A later exact-ref receipt still records delivery against the same duty
+without reopening a cancelled attempt. Registered-batch continuation and
+handover duties retain their own settlement rules.
+
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for
 OpenCode) and `from.name` (the sender's registry name, Claude

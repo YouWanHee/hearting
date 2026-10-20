@@ -1905,7 +1905,7 @@ console.log(JSON.stringify({saves, resumes, queued, messages, bindingBeforeIdle,
         self.assertEqual(result["saves"], 1, result)
         self.assertTrue(result["carrierArmed"], result)
         self.assertEqual(result["savesAfterIdle"], 1, result)
-        self.assertEqual(len(result["resumes"]), 1)
+        self.assertEqual(len(result["resumes"]), 1, result)
         self.assertEqual(result["resumes"][0]["body"], {"messageID": "native-message-1", "parts": []})
         self.assertEqual(result["queued"]["state"], "queued")
         self.assertEqual(result["queued"]["actual_message_id"], "native-message-1")

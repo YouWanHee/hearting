@@ -188,6 +188,27 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual((readiness["identity_verified"], readiness["session_id"]),
                              (verified, session))
 
+    def test_readiness_forwards_the_runner_pass_context_to_bound_work(self):
+        from peer_read_context import PeerReadContext
+
+        context = PeerReadContext(registry_append_only=True)
+        identity = {"harness": "codex", "session_id": "sid-peer", "pane": "w1:p9"}
+        info = {"shell_pid": 101, "foreground_processes": []}
+        with mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="22"), \
+             mock.patch.object(peer_steward.peer_obligations, "execution_attempts_for_processes",
+                               return_value=()), \
+             mock.patch.object(peer_steward.peer_obligations, "bound_work_for_pane",
+                               return_value=((), "observed")) as bound, \
+             mock.patch.object(peer_steward.peer_obligations, "pane_readiness",
+                               return_value=SimpleNamespace(state="ready", reason="")):
+            peer_steward._pane_readiness(
+                "peer", "idle", target_observation=("idle", identity), pane_info=info,
+                read_context=context)
+        bound.assert_called_once()
+        self.assertIs(bound.call_args.kwargs["read_context"], context)
+        self.assertTrue(bound.call_args.kwargs["registry_append_only"])
+
     def test_delay_notice_is_minted_once_across_replaced_checkpoints(self):
         store = peer_steward.peer_obligations.ObligationStore()
         sender = {"harness": "codex", "session_id": "sid-sender", "name": None}
@@ -4662,14 +4683,16 @@ class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
 
     def test_submitted_first_input_is_never_queued_again_after_sid_appears(self):
         _proof, ref, store, duty = self._row_and_duty(submitted=True)
-        with mock.patch.object(peer_steward, "_retire_target") as target, \
+        sidless = {"harness": "codex", "session_id": "-", "pane": "w1:pX"}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", sidless, 0, None)) as target, \
              mock.patch.object(peer_steward.peer_message, "bind_pending_recipient") as bind, \
              mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue:
             peer_steward._resume_message_obligation(duty, store)
         result = store.get(duty["id"])
         self.assertEqual(result["state"], "unknown")
         self.assertEqual(result["observation"]["reason"], "native-first-input-submitted")
-        target.assert_not_called()
+        target.assert_called_once_with("fresh")
         bind.assert_not_called()
         queue.assert_not_called()
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "queued")
@@ -4715,6 +4738,179 @@ class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(store.get(duty["id"])["observation"]["reason"], "target-process-changed")
         queue.assert_not_called()
         self.assertIsNone(peer_steward.peer_message._read_pending(ref).get("bound_to"))
+
+
+class MessageTerminalObligationTest(_TmpRootMixin, unittest.TestCase):
+    def _queued_duty(self, *, sid, target_name, ref_seed):
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "claude", "session_id": sid, "name": target_name,
+                     "pane_id": "w1:p" + ref_seed}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] terminal check " + ref_seed, sender, recipient, defer=True)
+        row = peer_steward.peer_message._read_pending(ref)
+        row = dict(row, state="queued", receipt="hook-context-emitted")
+        peer_steward.peer_message._save_pending(row)
+        store = peer_steward.peer_obligations.ObligationStore()
+        identity = {"server": "default", "pane": recipient["pane_id"],
+                    "harness": recipient["harness"], "session_id": sid}
+        duty = store.create("message-" + ref, "message", identity,
+            {"ref": ref, "body_digest": row["body_sha256"], "target": target_name,
+             "from": sender, "to": recipient})
+        return store, duty, row, recipient
+
+    def test_confirmed_missing_sid_closes_once_while_live_queued_sid_stays_open(self):
+        old_store, old_duty, _old_row, old_recipient = self._queued_duty(
+            sid="sid-old", target_name="old-peer", ref_seed="old")
+        live_store, live_duty, _live_row, live_recipient = self._queued_duty(
+            sid="sid-live", target_name="live-peer", ref_seed="live")
+        self.assertEqual(old_store.root, live_store.root)
+        absent = peer_steward.herdr_observation.PaneCensus("default", (), time.monotonic())
+        def target(name):
+            if name == "old-peer":
+                return "agent-not-found", {"harness": "-", "session_id": "-",
+                    "name": name, "pane": "-"}, 4, "agent-not-found"
+            return "idle", {"harness": "claude", "session_id": "sid-live",
+                    "name": name, "pane": live_recipient["pane_id"]}, 0, None
+
+        def census(*, session=None):
+            return absent if session == "default" else None
+
+        # The live target resolves exactly, so its census is not needed. Only
+        # the old target reaches the complete endpoint census.
+        with mock.patch.object(peer_steward, "_retire_target", side_effect=target), \
+             mock.patch.object(peer_steward.herdr_observation, "pane_census", side_effect=census), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as deliver:
+            peer_steward._reconcile_obligations(old_store,
+                [old_duty, live_duty])
+        old = old_store.get(old_duty["id"])
+        live = live_store.get(live_duty["id"])
+        self.assertEqual(old["state"], "cancelled")
+        self.assertEqual(old["result"], None)
+        self.assertEqual(old["cleanup"], "complete")
+        self.assertEqual(old["delivery"], "failed")
+        self.assertEqual(live["state"], "unknown")
+        self.assertEqual(live["delivery"], "pending")
+        self.assertNotIn(old_duty["id"], {row["id"] for row in old_store.list()})
+        deliver.assert_not_called()
+
+        with mock.patch.object(peer_steward, "_resume_message_obligation") as resume:
+            peer_steward._reconcile_obligations(old_store)
+        self.assertEqual([call.args[0]["id"] for call in resume.call_args_list],
+                         [live_duty["id"]])
+
+    def test_incomplete_or_foreign_session_census_preserves_unknown(self):
+        cases = (
+            (None, "census-unavailable"),
+            (peer_steward.herdr_observation.PaneCensus("other", (), time.monotonic()), "wrong-endpoint"),
+            (peer_steward.herdr_observation.PaneCensus("default", (
+                {"pane_id": "w1:pOther", "agent_session": {"value": "sid-old"}},),
+                time.monotonic()), "sid-still-present"),
+        )
+        for census, case in cases:
+            with self.subTest(case=case):
+                store, duty, _row, _recipient = self._queued_duty(
+                    sid="sid-old", target_name="old-peer", ref_seed=case.replace("-", "")[:8])
+                with mock.patch.object(peer_steward, "_retire_target",
+                        return_value=("agent-not-found", {"harness": "-", "session_id": "-",
+                            "name": "old-peer", "pane": "-"}, 4, "agent-not-found")), \
+                     mock.patch.object(peer_steward.herdr_observation, "pane_census", return_value=census):
+                    peer_steward._resume_message_obligation(duty, store)
+                latest = store.get(duty["id"])
+                self.assertEqual(latest["state"], "unknown")
+                self.assertNotIn("terminal_evidence", latest["observation"])
+
+    def test_exact_received_ledger_recovers_missing_pending_row(self):
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "recipient-session", "name": "worker"}
+        text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] recovered exact receipt", sender, recipient, defer=True)
+        pending = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(peer_steward.peer_message.receive_peer_message(text, recipient), 0)
+        peer_steward.peer_message._pending_path(ref).unlink()
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "", "harness": "codex",
+             "session_id": "recipient-session"},
+            {"ref": ref, "body_digest": pending["body_sha256"],
+             "from": sender, "to": pending["to"]})
+        store.update(duty["id"], state="unknown",
+                     observation={"ref": ref, "reason": "pending-row-missing"})
+
+        peer_steward._resume_message_obligation(store.get(duty["id"]), store)
+        recovered = store.get(duty["id"])
+        self.assertEqual((recovered["state"], recovered["result"], recovered["delivery"]),
+                         ("complete", "received", "acknowledged"))
+        self.assertEqual(recovered["observation"]["receiver_receipt"]["ref"], ref)
+
+    def test_missing_pending_row_without_exact_receipt_remains_unknown(self):
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "recipient-session", "name": "worker"}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] missing row without receipt", sender, recipient, defer=True)
+        pending = peer_steward.peer_message._read_pending(ref)
+        peer_steward.peer_message._pending_path(ref).unlink()
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "", "harness": "codex",
+             "session_id": "recipient-session"},
+            {"ref": ref, "body_digest": pending["body_sha256"],
+             "from": sender, "to": pending["to"]})
+
+        peer_steward._resume_message_obligation(duty, store)
+        latest = store.get(duty["id"])
+        self.assertEqual(latest["state"], "unknown")
+        self.assertEqual(latest["observation"]["reason"], "pending-row-missing")
+
+    def test_live_rpc_claim_blocks_terminal_cancellation(self):
+        store, duty, row, recipient = self._queued_duty(
+            sid="sid-claimed", target_name="claimed-peer", ref_seed="claim")
+        claim = {"token": "live-claim", "pid": os.getpid(), "start": "123"}
+        row = dict(row, state="unverified", rpc_claim=claim)
+        peer_steward.peer_message._save_pending(row)
+        missing = {"harness": "-", "session_id": "-", "name": "claimed-peer", "pane": "-"}
+        census = peer_steward.herdr_observation.PaneCensus("default", (), time.monotonic())
+        with mock.patch.object(peer_steward, "_retire_target",
+                return_value=("agent-not-found", missing, 4, "agent-not-found")), \
+             mock.patch.object(peer_steward.herdr_observation, "pane_census", return_value=census), \
+             mock.patch("dispatch_contract.process_identity_disposition", return_value="live"):
+            peer_steward._resume_message_obligation(duty, store)
+
+        latest = store.get(duty["id"])
+        current = peer_steward.peer_message._read_pending(duty["intent"]["ref"])
+        self.assertEqual(latest["state"], "unknown")
+        self.assertEqual(latest["observation"]["reason"], "delivery-inflight")
+        self.assertEqual(current["rpc_claim"], claim)
+        self.assertEqual(current["state"], "unverified")
+
+    def test_dead_pane_bound_process_closes_but_unresolved_process_does_not(self):
+        for disposition, expected in (("dead", "cancelled"), ("unresolved", "unknown")):
+            with self.subTest(disposition=disposition):
+                sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+                proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                         "pane_id": "w1:pBound", "pid": 99123, "start": "77",
+                         "pid_namespace": os.readlink("/proc/self/ns/pid")}
+                recipient = {"harness": "codex", "session_id": None,
+                             "name": "bound-peer", "pane_id": "w1:pBound"}
+                _text, ref = peer_steward.peer_message.prepare_peer_message(
+                    "[steer] pane-bound " + disposition, sender, recipient,
+                    defer=True, first_input_process=proof)
+                row = peer_steward.peer_message._read_pending(ref)
+                row = dict(row, state="queued", receipt="native-first-input-submitted")
+                peer_steward.peer_message._save_pending(row)
+                store = peer_steward.peer_obligations.ObligationStore()
+                identity = {"server": "default", "pane": "w1:pBound",
+                            "harness": "codex", "session_id": ""}
+                duty = store.create("message-" + ref, "message", identity,
+                    {"ref": ref, "body_digest": row["body_sha256"], "target": "bound-peer",
+                     "from": sender, "to": recipient})
+                with mock.patch.object(peer_steward, "_retire_target",
+                        return_value=("idle", {"harness": "codex", "session_id": "new-sid",
+                            "name": "bound-peer", "pane": "w1:pBound"}, 0, None)), \
+                     mock.patch("dispatch_contract.process_identity_disposition",
+                                return_value=disposition):
+                    peer_steward._resume_message_obligation(duty, store)
+                self.assertEqual(store.get(duty["id"])["state"], expected)
 
 
 class NormalProducerRunnerBindingTest(unittest.TestCase):

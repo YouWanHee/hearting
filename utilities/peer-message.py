@@ -1445,20 +1445,167 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
     return result
 
 
+def _peer_notice_record(ref, recipient, *, read_context=None):
+    if not isinstance(recipient, dict):
+        return None
+    try:
+        records = (read_context.peer_notice_records(_iter_records)
+                   if read_context is not None else _iter_records())
+        for record in records:
+            if (record.get("transfer_ref") == ref and record.get("kind") == "notice"
+                    and (record.get("delivery") or {}).get("status") == "received"
+                    and all((record.get("to") or {}).get(key) == recipient.get(key)
+                            for key in ("harness", "session_id"))):
+                return record
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError, RuntimeError):
+        return None
+    return None
+
+
 def _peer_notice_exists(ref, recipient):
-    return any(r.get("transfer_ref") == ref and r.get("kind") == "notice"
-        and (r.get("delivery") or {}).get("status") == "received"
-        and all((r.get("to") or {}).get(k) == recipient.get(k) for k in ("harness", "session_id"))
-        for r in _iter_records())
+    return _peer_notice_record(ref, recipient) is not None
+
+
+def recover_missing_pending_receipt(ref, intent, *, roots=None, read_context=None):
+    """Recover only a durable exact receipt bound to the immutable transfer."""
+    try:
+        transfer = _read_transfer_record(ref, roots=roots)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if (not isinstance(transfer, dict) or type(transfer.get("schema_version")) is not int
+            or transfer.get("schema_version") != 1 or transfer.get("message_id") != ref
+            or transfer.get("body_sha256") != intent.get("body_digest")
+            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_target(transfer.get("to"))
+            or (transfer.get("body_ref") is not None
+                and not _body_reference_descriptor_valid(transfer.get("body_ref"), ref))):
+        return None
+    expected = intent.get("to") or {}
+    target = transfer.get("to") or {}
+    if (not _valid_transfer_endpoint(target)
+            or any(expected.get(key) != target.get(key)
+                   for key in ("harness", "session_id", "pane_id"))):
+        return None
+    sender = intent.get("from") or {}
+    transfer_sender = transfer.get("from") or {}
+    if any(sender.get(key) != transfer_sender.get(key) for key in ("harness", "session_id")):
+        return None
+    notice = _peer_notice_record(ref, target, read_context=read_context)
+    if not notice:
+        return None
+    notice_sender = notice.get("from") or {}
+    notice_recipient = notice.get("to") or {}
+    if (any(notice_sender.get(key) != transfer_sender.get(key)
+            for key in ("harness", "session_id"))
+            or any(notice_recipient.get(key) != target.get(key)
+                   for key in ("harness", "session_id"))):
+        return None
+    return ({"ref": ref, "body_sha256": transfer["body_sha256"], "state": "received",
+             "to": dict(target),
+             "receipt": (notice.get("delivery") or {}).get("receipt") or "exact-peer-ref",
+             "received_at": notice.get("ts")},
+            {"harness": target["harness"], "session_id": target["session_id"]})
 
 
 def _ack_registered_delivery(received):
+    registered = False
     try:
         from peer_obligations import acknowledge_registered_delivery
-        return acknowledge_registered_delivery(received)
+        registered = acknowledge_registered_delivery(received)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         pass  # The retained courier retries the same receipt, never another send.
-    return False
+    try:
+        recipient = pending_delivery_recipient(received)
+        ref = received.get("ref") if isinstance(received, dict) else None
+        if (recipient is not None and isinstance(ref, str)
+                and re.fullmatch(r"[0-9a-f]{32}", ref)):
+            from peer_obligations import ObligationStore
+            store = ObligationStore()
+            duty_ids = ["message-" + ref]
+            for item in received.get("refs") or ():
+                if isinstance(item, str) and item.startswith("delay-notice:"):
+                    original_ref = item[len("delay-notice:"):]
+                    if re.fullmatch(r"[0-9a-f]{32}", original_ref):
+                        duty_ids.append("delay-" + original_ref)
+            for duty_id in duty_ids:
+                store.acknowledge_message_receipt(duty_id, received, recipient)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        # Receipt persistence is authoritative; a later normal callback retries
+        # this same exact ref without preparing another transfer.
+        pass
+    return registered
+
+
+def cancel_message_obligation(ref, *, duty_id, expected_revision, identity,
+                              message, evidence):
+    """Cancel only while the current pending row and duty still match the proof."""
+    if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+        return "invalid"
+    try:
+        with pending_lock(ref):
+            current = _read_pending(ref)
+            if current is None:
+                return "missing"
+            if current.get("state") == "received":
+                _ack_registered_delivery(current)
+                return "received"
+            if (current.get("ref") != ref
+                    or current.get("body_sha256") != (message or {}).get("body_sha256")):
+                return "changed"
+            for key in ("harness", "session_id", "pane_id"):
+                if (current.get("to") or {}).get(key) != ((message or {}).get("to") or {}).get(key):
+                    return "changed"
+            original_process = pending_first_input_process(current)
+            saved_process = pending_first_input_process(message)
+            if original_process != saved_process:
+                return "changed"
+            claim = current.get("rpc_claim")
+            if claim is not None:
+                try:
+                    from dispatch_contract import process_identity_disposition
+                    if (not isinstance(claim, dict) or type(claim.get("pid")) is not int
+                            or not isinstance(claim.get("start"), str)
+                            or process_identity_disposition(claim["pid"], claim["start"]) != "dead"):
+                        return "inflight"
+                except (OSError, ValueError, TypeError):
+                    return "inflight"
+            if evidence.get("kind") == "recipient-session-absent":
+                recipient = pending_delivery_recipient(current)
+                if (recipient is None
+                        or recipient.get("session_id") != evidence.get("session_id")
+                        or recipient.get("harness") != evidence.get("harness")):
+                    return "changed"
+            elif evidence.get("kind") == "first-input-process-dead":
+                if original_process is None:
+                    return "unknown"
+                try:
+                    namespace = os.readlink("/proc/self/ns/pid")
+                    from dispatch_contract import process_identity_disposition
+                    if (original_process.get("pid_namespace") != namespace
+                            or evidence.get("process") != original_process
+                            or process_identity_disposition(
+                                original_process["pid"], original_process["start"]) != "dead"):
+                        return "unknown"
+                except (OSError, ValueError, TypeError, KeyError):
+                    return "unknown"
+                recipient = pending_delivery_recipient(current)
+                if recipient is not None and (
+                        evidence.get("recipient_session_id") != recipient.get("session_id")
+                        or evidence.get("recipient_session_absent") is not True):
+                    return "changed"
+            else:
+                return "unknown"
+            from peer_obligations import ObligationStore
+            store = ObligationStore()
+            result = store.cancel_message_delivery(
+                duty_id, expected_revision=expected_revision, ref=ref,
+                body_digest=current.get("body_sha256"), identity=identity,
+                message=current, evidence=evidence)
+            if result and result.get("state") == "cancelled":
+                return "cancelled"
+            return "changed"
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return "unknown"
 
 
 def _ordinary_receiver_guidance():
@@ -1760,6 +1907,16 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
             _save_pending(received)
             _ack_registered_delivery(received)
             _ack_watch_refs(received, recipient, "peer-message-exact-ref")
+        elif rc == 0 and ref and transfer:
+            # The exact transfer and receiver-side notice still bind a late
+            # receipt when an older pending row is absent. Do not recreate the
+            # missing row or infer a receipt from queued output.
+            _ack_registered_delivery({
+                "ref": ref, "state": "received",
+                "body_sha256": transfer.get("body_sha256"),
+                "from": transfer.get("from"), "to": transfer.get("to"),
+                "refs": [], "receipt": "exact-peer-ref", "received_at": time.time(),
+            })
         return rc
 
 
