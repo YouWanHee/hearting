@@ -3701,6 +3701,191 @@ class SeatHandoverTest(TidyCase):
             self.assertEqual(self.handover.resolved_steward_relations(
                 "claude", "sid-B", seat_key=seat.key)[0]["holder"]["sid"], "sid-B")
 
+    def _prepare_transition_failure(self, pane, watch_target="target"):
+        pm = self.handover._peer_message()
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": watch_target, "name": watch_target},
+                "watch", "fixture-time", source="watch"))
+            self.assertEqual(self.snapshot("sid-A", pane=pane), 0)
+            seat = self.seat(pane)
+            return pm, seat, st._ledger_path(seat)
+
+    def test_partial_transition_write_keeps_complete_ledger_and_retries_one_successor(self):
+        pane = "test:partial-transition-write"
+        _pm, seat, ledger = self._prepare_transition_failure(pane)
+        before = ledger.read_bytes()
+        real_write = os.write
+        partial_calls = []
+
+        def partial_then_fail(fd, data):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                target = ""
+            if f".{seat.key}.jsonl." not in target or not target.endswith(".tmp"):
+                return real_write(fd, data)
+            partial_calls.append(len(data))
+            if len(partial_calls) == 1:
+                return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
+            raise OSError("fixture failure after positive partial transition write")
+
+        with mock.patch.object(self.handover.os, "write", side_effect=partial_then_fail):
+            _output, rows = self.start("sid-B", pane=pane)
+        self.assertGreaterEqual(len(partial_calls), 2)
+        self.assertEqual(rows, [])
+        self.assertEqual(self.handover.handover_rows(seat), [])
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            holder = self.handover.resolved_steward_relations(
+                "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"]
+        self.assertEqual(holder, "sid-A")
+        self.assertEqual(ledger.read_bytes().splitlines()[0], before.splitlines()[0])
+        self.assertFalse(list(ledger.parent.glob(f".{seat.key}.jsonl.*.tmp")))
+
+        _output, rows = self.start("sid-B", pane=pane)
+        self.assertEqual([(row["from"], row["sid"]) for row in rows], [("sid-A", "sid-B")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-B", seat_key=seat.key)[0]["holder"]["sid"], "sid-B")
+        _output, duplicate_rows = self.start("sid-B", pane=pane)
+        self.assertEqual([(row["from"], row["sid"]) for row in duplicate_rows],
+                         [("sid-A", "sid-B")])
+
+    def test_transition_fsync_failure_keeps_predecessor_until_retry(self):
+        pane = "test:transition-fsync-failure"
+        _pm, seat, ledger = self._prepare_transition_failure(pane)
+        before_lines = ledger.read_bytes().splitlines()
+        real_fsync = os.fsync
+        synced = []
+
+        def fail_after_full_staged_write(fd):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                target = ""
+            if f".{seat.key}.jsonl." in target and target.endswith(".tmp"):
+                synced.append(Path(target).stat().st_size)
+                raise OSError("fixture fsync failure after complete transition write")
+            return real_fsync(fd)
+
+        with mock.patch.object(self.handover.os, "fsync", side_effect=fail_after_full_staged_write):
+            _output, rows = self.start("sid-B", pane=pane)
+        self.assertEqual(len(synced), 1)
+        self.assertGreater(synced[0], 0)
+        self.assertEqual(rows, [])
+        self.assertEqual(ledger.read_bytes().splitlines()[:len(before_lines)], before_lines)
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"], "sid-A")
+
+        _output, rows = self.start("sid-B", pane=pane)
+        self.assertEqual([(row["from"], row["sid"]) for row in rows], [("sid-A", "sid-B")])
+        _output, rows = self.start("sid-B", pane=pane)
+        self.assertEqual(len(rows), 1)
+
+    def _ack_fixture(self, watch_id, holder="sid-B"):
+        root = self.state / f"watch-state-{watch_id}"
+        watch_root = root / "peer-watches"
+        watch_root.mkdir(parents=True, exist_ok=True)
+        seat = st.Seat("pane", "ack-seat-" + watch_id)
+        row = {"watch_id": watch_id,
+               "holder": {"harness": "claude", "sid": holder},
+               "origin": {"harness": "claude", "sid": "sid-A"},
+               "seat_key": seat.key, "storage_root": str(root),
+               "server": "fixture-server", "target": "fixture-target",
+               "agent": {"harness": "codex", "session_id": "target"},
+               "until": ["done"], "armed_ts": "fixture-armed",
+               "deadline": {"wall": 9999999999}}
+        return root, seat, row, watch_root / f"{watch_id}.ack.json"
+
+    def test_ack_partial_and_fsync_failures_leave_no_canonical_record_and_retry(self):
+        for failure in ("partial-write", "fsync"):
+            with self.subTest(failure=failure):
+                watch_id = "ack-fault-" + failure
+                _root, _seat, row, ack = self._ack_fixture(watch_id)
+                with self.iso.patched_environ(), \
+                     mock.patch.object(self.handover, "resolve_watch",
+                                       side_effect=lambda candidate, **_kwargs:
+                                       dict(row) if candidate == watch_id else None):
+                    if failure == "partial-write":
+                        real_write = os.write
+                        calls = []
+
+                        def partial_then_fail(fd, data):
+                            calls.append(len(data))
+                            if len(calls) == 1:
+                                return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
+                            raise OSError("fixture partial ACK write")
+
+                        with mock.patch.object(self.handover.os, "write", side_effect=partial_then_fail):
+                            self.assertEqual(self.handover.acknowledge_watch(
+                                watch_id, "claude", "sid-B", "fixture-carrier"), "unknown")
+                        self.assertGreaterEqual(len(calls), 2)
+                    else:
+                        real_write = os.write
+                        bytes_written = []
+
+                        def count_full_write(fd, data):
+                            count = real_write(fd, data)
+                            bytes_written.append(count)
+                            return count
+
+                        with mock.patch.object(self.handover.os, "write", side_effect=count_full_write), \
+                             mock.patch.object(self.handover.os, "fsync",
+                                               side_effect=OSError("fixture ACK fsync failure")):
+                            self.assertEqual(self.handover.acknowledge_watch(
+                                watch_id, "claude", "sid-B", "fixture-carrier"), "unknown")
+                        self.assertGreater(sum(bytes_written), 0)
+                    self.assertFalse(ack.exists())
+                    self.assertFalse(list(ack.parent.glob(f".{ack.name}.*.tmp")))
+                    self.assertEqual(self.handover.acknowledge_watch(
+                        watch_id, "claude", "sid-B", "retry-carrier"), "created")
+                    self.assertTrue(self.handover.watch_ack_valid(
+                        ack, watch_id, "claude", "sid-B"))
+                    saved = json.loads(ack.read_text(encoding="utf-8"))
+                    self.assertEqual((saved["watch_id"], saved["session_id"], saved["harness"]),
+                                     (watch_id, "sid-B", "claude"))
+
+    def test_ack_repairs_torn_inode_once_and_rejects_concurrent_stale_recipient(self):
+        import concurrent.futures
+
+        watch_id = "ack-concurrent-current-stale"
+        _root, _seat, row, ack = self._ack_fixture(watch_id)
+        ack.write_bytes(b'{"watch_id":')
+        with self.iso.patched_environ(), \
+             mock.patch.object(self.handover, "resolve_watch",
+                               side_effect=lambda candidate, **_kwargs:
+                               dict(row) if candidate == watch_id else None):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(self.handover.acknowledge_watch,
+                                       watch_id, "claude", sid, "fixture-carrier")
+                           for sid in ("sid-B", "sid-B", "sid-A")]
+                results = [future.result(timeout=10) for future in futures]
+            self.assertCountEqual(results, ["created", "already", "not-recipient"])
+            inode = ack.stat().st_ino
+            self.assertEqual(self.handover.acknowledge_watch(
+                watch_id, "claude", "sid-A", "stale-carrier"), "not-recipient")
+            self.assertEqual(ack.stat().st_ino, inode)
+            self.assertTrue(self.handover.watch_ack_valid(ack, watch_id, "claude", "sid-B"))
+            self.assertFalse(self.handover.watch_ack_valid(ack, watch_id, "claude", "sid-A"))
+            self.assertEqual(json.loads(ack.read_text(encoding="utf-8"))["session_id"], "sid-B")
+
+        stale_watch = "ack-existing-stale-predecessor"
+        _root, _seat, stale_row, stale_ack = self._ack_fixture(stale_watch)
+        stale_ack.write_text(json.dumps({"watch_id": stale_watch,
+                                         "harness": "claude", "session_id": "sid-A"}),
+                             encoding="utf-8")
+        before = stale_ack.read_bytes()
+        with self.iso.patched_environ(), \
+             mock.patch.object(self.handover, "resolve_watch",
+                               side_effect=lambda candidate, **_kwargs:
+                               dict(stale_row) if candidate == stale_watch else None):
+            self.assertEqual(self.handover.acknowledge_watch(
+                stale_watch, "claude", "sid-B", "current-carrier"), "unknown")
+            self.assertEqual(self.handover.acknowledge_watch(
+                stale_watch, "claude", "sid-A", "stale-carrier"), "not-recipient")
+        self.assertEqual(stale_ack.read_bytes(), before)
+
     def test_release_tombstone_survives_ledger_fold_without_advancing_session_activity(self):
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             seat = self.seat()
@@ -3713,6 +3898,44 @@ class SeatHandoverTest(TidyCase):
             rows = st._read_ledger_lines(seat)
             self.assertTrue(any(row.get("event") == "steward-release"
                                 and row.get("generation") == "generation-A" for row in rows))
+            self.assertEqual(st.session_summary(seat)[("claude", "sid-A")]["last_seen"], 100)
+
+    def test_release_fsync_failure_keeps_marker_until_tombstone_retry(self):
+        pm = self.handover._peer_message()
+        pane = "test:release-fsync-failure"
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane,
+                                       "CLAUDE_CODE_SESSION_ID": "sid-A"}):
+            self.assertTrue(pm.mark_steward("claude", "sid-A",
+                {"harness": "codex", "session_id": "target", "name": "target"},
+                "watch", "fixture-time", source="watch"))
+            seat = self.seat(pane)
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd), now=100)
+            marker = pm.steward_marker_path("claude", "sid-A")
+            real_fsync = os.fsync
+
+            def fail_release_publish(fd):
+                try:
+                    target = os.readlink(f"/proc/self/fd/{fd}")
+                except OSError:
+                    target = ""
+                if f".{seat.key}.jsonl." in target and target.endswith(".tmp"):
+                    raise OSError("fixture release fsync failure")
+                return real_fsync(fd)
+
+            with mock.patch.object(self.handover.os, "fsync", side_effect=fail_release_publish), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pm.cmd_release(SimpleNamespace(
+                    harness="claude", session_id="sid-A")), 1)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(self.handover.resolved_steward_relations(
+                "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"], "sid-A")
+
+            self.assertEqual(pm.cmd_release(SimpleNamespace(
+                harness="claude", session_id="sid-A")), 0)
+            self.assertFalse(marker.exists())
+            self.assertTrue(any(row.get("event") == "steward-release"
+                                for _key, row in self.handover._transition_rows(seat.key)))
             self.assertEqual(st.session_summary(seat)[("claude", "sid-A")]["last_seen"], 100)
 
 

@@ -291,7 +291,7 @@ def _owner_targets(winners, harness, session_id):
 
 
 def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
-                 _winners=None, include_native=False):
+                 _winners=None, include_native=False, _relations=None):
     """One same-repository role lookup for Fleet and herdr, with proven prior ids.
 
     Current snapshot rows override registry history for their exact join keys.
@@ -300,7 +300,9 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
     """
     if markers is None:
         markers = read_markers()
-    relations = read_relations()
+    # ``enrich`` supplies one relation snapshot for the whole refresh; direct
+    # helper callers still get a fresh read by default.
+    relations = read_relations() if _relations is None else _relations
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
@@ -338,7 +340,7 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
 
 
 def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
-              _targets=None):
+              _targets=None, _relations=None):
     """One display decision: exact self-role evidence or same-repository targets.
 
     The CLI's unknown/- sentinel is a flag on the current session, never a
@@ -349,7 +351,7 @@ def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessio
         return False
     if markers is None:
         markers = read_markers()
-    relations = read_relations()
+    relations = read_relations() if _relations is None else _relations
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
@@ -376,7 +378,8 @@ def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessio
                         for target in relation.get("targets") or ())):
             return True
     targets = _targets if _targets is not None else role_targets(
-        harness, session_id, aliases=aliases, markers=markers, cwd=cwd, sessions=sessions)
+        harness, session_id, aliases=aliases, markers=markers, cwd=cwd, sessions=sessions,
+        _relations=relations)
     return bool(targets)
 
 
@@ -407,9 +410,11 @@ def enrich(sessions, markers=None):
         keys = _session_keys(s)
         targets = role_targets(s.harness, s.session_id, markers=markers,
                                aliases=[sid for _harness, sid in keys[1:]],
-                               cwd=getattr(s, "cwd", None), sessions=context, _winners=winners)
+                               cwd=getattr(s, "cwd", None), sessions=context, _winners=winners,
+                               _relations=relations)
         s.steward = role_flag(s.harness, s.session_id, markers=markers,
-                              aliases=[sid for _harness, sid in keys[1:]], _targets=targets)
+                              aliases=[sid for _harness, sid in keys[1:]], _targets=targets,
+                              _relations=relations)
         if not targets:
             continue
         # `steward_evidence_targets` returns oldest-first — the stable order the

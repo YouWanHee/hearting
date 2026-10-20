@@ -3096,6 +3096,10 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
                                        "arm": peer_steward._read_json(
                                            peer_steward._watch_paths(fields["watch_id"]).arm),
                                        "refs": handover.resolved_watch_references()}))
+        # Exercise cmd_ack's ordinary recovery of a canonical path left torn by
+        # an interrupted writer; the callback itself must revalidate the holder.
+        torn_ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        torn_ack.write_bytes(b'{"watch_id":')
         first = self._run("ack", fields["watch_id"], "--carrier", "claude-async-rewake")
         second = self._run("ack", fields["watch_id"], "--carrier", "userprompt-sweep")
         self.assertEqual((first.returncode, second.returncode), (0, 0),
@@ -3105,6 +3109,34 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         ack = json.loads((self.watch_root / f"{fields['watch_id']}.ack.json").read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], "steward-1")
+
+    def test_ack_fsync_failure_does_not_settle_original_watch_ref_until_retry(self):
+        import contextlib
+        import io
+        import dispatch_seat_handover as handover
+
+        fields = self._arm(mode="idle")
+        self._wait_for_receipt(fields["watch_id"])
+        ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        with mock.patch.dict(os.environ, self._env("idle")), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("steward-1", "claude")), \
+             mock.patch.object(peer_steward.peer_message, "settle_watch_transfers",
+                               return_value=False) as settle, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(handover.os, "fsync",
+                                   side_effect=OSError("fixture ACK fsync failure")):
+                self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                    watch_id=fields["watch_id"], carrier="fixture-carrier")), 0)
+            settle.assert_not_called()
+            self.assertFalse(ack.exists())
+
+            self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                watch_id=fields["watch_id"], carrier="retry-carrier")), 0)
+            settle.assert_called_once_with(fields["watch_id"], "claude", "steward-1")
+            ack_data = json.loads(ack.read_text(encoding="utf-8"))
+            self.assertEqual((ack_data["watch_id"], ack_data["harness"], ack_data["session_id"]),
+                             (fields["watch_id"], "claude", "steward-1"))
 
     def test_a_restarted_watch_line_does_not_claim_the_hook_either(self):
         """`state=rearmed` — the branch B1-a was originally raised about.

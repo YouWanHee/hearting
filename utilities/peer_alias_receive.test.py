@@ -382,10 +382,32 @@ class AliasReceive(unittest.TestCase):
 
                 lifecycle = module("watch_transfer_codex_lifecycle",
                                    "adapters/codex/hooks/userprompt-lifecycle.py")
+                ack_path = watch_root / f"{watch_id}.ack.json"
+                real_write = os.write
+                writes = []
+
+                def partial_ack_then_fail(fd, data):
+                    try:
+                        target_path = os.readlink(f"/proc/self/fd/{fd}")
+                    except OSError:
+                        target_path = ""
+                    if f".{ack_path.name}." not in target_path or not target_path.endswith(".tmp"):
+                        return real_write(fd, data)
+                    writes.append(len(data))
+                    if len(writes) == 1:
+                        return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
+                    raise OSError("fixture interrupted native ACK write")
+
+                with mock.patch.object(handover.os, "write", side_effect=partial_ack_then_fail):
+                    lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
+                self.assertGreaterEqual(len(writes), 2)
+                self.assertFalse(ack_path.exists())
+                self.assertEqual(pm._read_pending(transfer_ref)["state"], "received")
+                # The next ordinary native receipt callback retries the same watch ID.
                 lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
                 pending = pm._read_pending(transfer_ref)
                 self.assertEqual((pending["state"], pending["receipt"]), ("received", "exact-peer-ref"))
-                ack = json.loads((watch_root / f"{watch_id}.ack.json").read_text(encoding="utf-8"))
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
                 self.assertEqual((ack["watch_id"], ack["harness"], ack["session_id"]),
                                  (watch_id, "codex", c))
                 self.assertEqual(handover.resolved_watch_references(

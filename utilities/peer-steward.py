@@ -4670,26 +4670,9 @@ def cmd_rearm(args):
 
 
 def cmd_ack(args):
-    """The single O_EXCL ack implementation.
-
-    A second carrier is expected and is not an error: wake is at-least-once,
-    display is idempotent. If `FileExistsError` ever escaped here, a carrier
-    that lost the race would exit 0 where it must exit 2.
-    """
-    paths = _watch_paths(args.watch_id)
+    """Publish or validate the shared exact-recipient ACK before settling its ref."""
     session_id, harness = _current_session_identity()
     import dispatch_seat_handover as handover
-    if paths.ack.exists():
-        ack = _read_json(paths.ack) or {}
-        if not handover.watch_ack_valid(paths.ack, args.watch_id,
-                                        ack.get("harness") or harness,
-                                        ack.get("session_id") or session_id):
-            print(f"watch_id={args.watch_id} ack=failed reason=invalid-existing", file=sys.stderr)
-            return 0
-        if ack.get("harness") == harness and ack.get("session_id") == session_id:
-            peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
-        print(f"watch_id={args.watch_id} ack=already")
-        return 0
     outcome = handover.acknowledge_watch(args.watch_id, harness, session_id, args.carrier)
     if outcome == "created":
         peer_message.settle_watch_transfers(args.watch_id, harness, session_id)

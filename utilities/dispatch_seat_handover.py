@@ -43,7 +43,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import shlex
+import stat
 import sys
 import time
 from typing import Iterable, Optional
@@ -345,6 +347,89 @@ def watch_ack_valid(path: Path, watch_id: str, harness: str, sid: str) -> bool:
             and data.get("harness") in {None, harness})
 
 
+def _write_fsynced_temp(path: Path, payload: bytes) -> Path:
+    """Write a complete sibling file and fsync it before any canonical publication."""
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = None
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short staged state write")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+    except BaseException:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return tmp
+
+
+def _ack_inode(path: Path, watch_id: str, harness: str, sid: str):
+    """Read one regular ACK inode without following links; classify torn vs stale data."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unsafe", None
+    identity = (before.st_dev, before.st_ino)
+    if not stat.S_ISREG(before.st_mode):
+        return "unsafe", identity
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unsafe", identity
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != identity or not stat.S_ISREG(opened.st_mode):
+            return "unsafe", identity
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "torn", identity
+    if not isinstance(data, dict):
+        return "torn", identity
+    if (data.get("watch_id") in {None, watch_id}
+            and data.get("session_id") == sid
+            and data.get("harness") in {None, harness}):
+        return "current", identity
+    return "other", identity
+
+
+def _unlink_torn_ack(path: Path, identity) -> bool:
+    """Remove only the same unreadable regular inode observed under the seat lock."""
+    if identity is None:
+        return False
+    try:
+        current = path.lstat()
+        if (not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != identity):
+            return False
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
 def resolved_watch_references(harness: Optional[str] = None, sid: Optional[str] = None, *,
                               seat_key: Optional[str] = None) -> list[dict]:
     """Return exact, unresolved watch duties and their current confirmed recipient."""
@@ -473,7 +558,7 @@ def resolve_watch(watch_id: str, *, seat_key: Optional[str] = None,
 def acknowledge_watch(watch_id: str, harness: str, sid: str, carrier: str) -> str:
     """Create the original watch ACK only for its revalidated current recipient."""
     try:
-        row = resolve_watch(watch_id)
+        row = resolve_watch(watch_id, include_acked=True)
         if row is None:
             return "unknown"
         holder = row.get("holder") or {}
@@ -486,23 +571,53 @@ def acknowledge_watch(watch_id: str, harness: str, sid: str, carrier: str) -> st
         seat_key = row.get("seat_key")
         lock = _st().seat_lock(str(seat_key)) if seat_key else contextlib.nullcontext()
         with lock:
-            current = resolve_watch(watch_id, seat_key=row.get("seat_key"))
-            if path.exists():
-                return ("already" if watch_ack_valid(path, watch_id, harness, sid)
-                        else "unknown")
-            if not current or (current.get("holder") or {}) != holder:
-                return "not-recipient"
             if root.is_symlink() or path.parent.is_symlink():
                 return "unknown"
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"watch_id": watch_id, "carrier": str(carrier)[:80],
-                           "session_id": sid, "harness": harness, "ts": _st().now_epoch()}, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-        return "created"
-    except FileExistsError:
-        return "already"
+            identity_fields = ("seat_key", "storage_root", "server", "target", "agent",
+                               "until", "armed_ts", "deadline", "origin")
+            for _attempt in range(4):
+                current = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+                if not current:
+                    return "unknown"
+                current_holder = current.get("holder") or {}
+                if current_holder != holder:
+                    return "not-recipient"
+                if any(current.get(field) != row.get(field) for field in identity_fields):
+                    return "unknown"
+
+                status, inode = _ack_inode(path, watch_id, harness, sid)
+                if status == "current":
+                    return "already"
+                if status == "torn":
+                    # Re-resolve immediately before removing the exact corrupt inode. A
+                    # stale predecessor cannot clear a successor's competing ACK.
+                    current = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+                    if (not current or (current.get("holder") or {}) != holder
+                            or any(current.get(field) != row.get(field)
+                                   for field in identity_fields)):
+                        return "not-recipient" if current else "unknown"
+                    if not _unlink_torn_ack(path, inode):
+                        continue
+                    continue
+                if status != "missing":
+                    return "unknown"
+
+                payload = (json.dumps({"watch_id": watch_id, "carrier": str(carrier)[:80],
+                                      "session_id": sid, "harness": harness,
+                                      "ts": _st().now_epoch()}, sort_keys=True) + "\n").encode("utf-8")
+                tmp = _write_fsynced_temp(path, payload)
+                try:
+                    try:
+                        # A hard link claims the canonical name atomically without
+                        # replacing a competing valid ACK.
+                        os.link(tmp, path, follow_symlinks=False)
+                    except FileExistsError:
+                        continue
+                    return "created"
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+            return "unknown"
     except Exception:  # noqa: BLE001 - uncertainty does not consume the watch
         return "unknown"
 
@@ -564,24 +679,35 @@ def _revalidate_snapshot_steward(seat, harness: str, sid: str, payload: dict) ->
 
 
 def _append_transition_row(seat, row: dict) -> None:
-    """Append and fsync one seat transition before any predecessor state is retired."""
+    """Atomically publish one fsynced transition before any predecessor is retired.
+
+    Rewriting the bounded seat ledger from its complete newline-terminated prefix also
+    discards a torn tail left by an older append writer. A failed staged write/fsync never
+    changes the canonical ledger, so a retry still sees the predecessor as holder.
+    """
     st = _st()
     path = st._ledger_path(seat)
     st.ensure_dir(path.parent)
     st._reject_symlink(path)
     payload = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    current = st.read_bytes(path)
+    if current is None:
+        if path.exists() or path.is_symlink():
+            raise OSError("unable to read seat ledger before transition")
+        current = b""
+    complete_end = current.rfind(b"\n") + 1
+    replacement = current[:complete_end] + payload
+    tmp = _write_fsynced_temp(path, replacement)
     try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("short seat-ledger write")
-            view = view[written:]
-        os.fsync(fd)
+        st._reject_symlink(path)
+        os.replace(tmp, path)
     finally:
-        os.close(fd)
-    st._fold_ledger(seat)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    # Folding is compaction after the durable transition boundary. If it fails, the
+    # canonical row is already committed and must not be reported as an uncommitted hop.
+    with contextlib.suppress(Exception):
+        st._fold_ledger(seat)
 
 
 def record_steward_release(seat, harness: str, sid: str, generation: str, now=None) -> bool:
