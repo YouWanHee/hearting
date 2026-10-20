@@ -4833,7 +4833,7 @@ class MessageTerminalObligationTest(_TmpRootMixin, unittest.TestCase):
             {"server": "default", "pane": "", "harness": "codex",
              "session_id": "recipient-session"},
             {"ref": ref, "body_digest": pending["body_sha256"],
-             "from": sender, "to": pending["to"]})
+             "from": sender, "to": pending["to"], "refs": pending["refs"]})
         store.update(duty["id"], state="unknown",
                      observation={"ref": ref, "reason": "pending-row-missing"})
 
@@ -4842,6 +4842,73 @@ class MessageTerminalObligationTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((recovered["state"], recovered["result"], recovered["delivery"]),
                          ("complete", "received", "acknowledged"))
         self.assertEqual(recovered["observation"]["receiver_receipt"]["ref"], ref)
+        notice = peer_steward.peer_message._peer_notice_record(ref, recipient)
+        receipt = recovered["observation"]["receiver_receipt"]
+        self.assertEqual(receipt["notice_body_sha256"], notice["body_sha256"])
+        self.assertEqual(receipt["recipient_binding"], notice["receiver_binding"])
+
+    def test_missing_pending_recovery_rejects_generic_and_incomplete_or_foreign_evidence(self):
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "recipient-session", "name": "worker"}
+        text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] receipt evidence negatives", sender, recipient, defer=True)
+        pending = peer_steward.peer_message._read_pending(ref)
+        store = peer_steward.peer_obligations.ObligationStore()
+        identity = {"server": "default", "pane": "", "harness": "codex",
+                    "session_id": "recipient-session"}
+        self.assertEqual(peer_steward.peer_message.receive_peer_message(text, recipient), 0)
+        peer_steward.peer_message._pending_path(ref).unlink()
+        valid = peer_steward.peer_message._peer_notice_record(ref, recipient)
+        self.assertIsNotNone(valid)
+        duty = store.create("message-" + ref, "message", identity,
+            {"ref": ref, "body_digest": pending["body_sha256"], "from": sender,
+             "to": pending["to"], "refs": pending["refs"]})
+        variants = {
+            "wrong-receipt-type": {**valid, "delivery": {**valid["delivery"],
+                                                               "receipt": "exact-native-history"}},
+            "wrong-provenance-type": {**valid, "receipt_provenance": "caller-supplied"},
+            "wrong-transfer-body-digest": {**valid,
+                "received_transfer_body_sha256": "0" * 64},
+            "foreign-sender": {**valid, "from": {**valid["from"],
+                                                     "session_id": "foreign-sender"}},
+            "foreign-recipient": {**valid, "to": {**valid["to"],
+                                                       "session_id": "foreign-recipient"}},
+            "foreign-ref": {**valid, "transfer_ref": "f" * 32},
+            "foreign-generation": {**valid, "receiver_binding": {
+                **valid["receiver_binding"], "recipient": {
+                    "harness": "codex", "session_id": "foreign-recipient"}}},
+            "legacy-incomplete": {key: value for key, value in valid.items()
+                                   if key not in {"receipt_provenance",
+                                                  "received_transfer_body_sha256",
+                                                  "receiver_binding"}},
+        }
+        for name, malformed in variants.items():
+            with self.subTest(evidence=name), mock.patch.object(
+                    peer_steward.peer_message, "_peer_notice_record", return_value=malformed):
+                peer_steward._resume_message_obligation(store.get(duty["id"]), store)
+                latest = store.get(duty["id"])
+                self.assertEqual(latest["state"], "unknown")
+                self.assertEqual(latest["observation"]["reason"], "pending-row-missing")
+
+        other_text, other_ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] generic notice is not receipt", sender, recipient, defer=True)
+        other_pending = peer_steward.peer_message._read_pending(other_ref)
+        other = store.create("message-" + other_ref, "message", identity,
+            {"ref": other_ref, "body_digest": other_pending["body_sha256"],
+             "from": sender, "to": other_pending["to"], "refs": other_pending["refs"]})
+        peer_steward.peer_message._pending_path(other_ref).unlink()
+        self.assertEqual(peer_steward.peer_message.cmd_record(
+            peer_steward.peer_message.argparse.Namespace(
+                from_harness=sender["harness"], from_session_id=sender["session_id"],
+                from_name=sender["name"], from_project="", to_harness=recipient["harness"],
+                to_session_id=recipient["session_id"], to_name=None, kind="notice",
+                surface="herdr", status="received", receipt="exact-peer-ref",
+                ref=[other_ref], transfer_ref=other_ref, body_file=None,
+                body_stdin=False, body_text="caller says received")), 0)
+        peer_steward._resume_message_obligation(other, store)
+        latest = store.get(other["id"])
+        self.assertEqual(latest["state"], "unknown")
+        self.assertEqual(latest["observation"]["reason"], "pending-row-missing")
 
     def test_missing_pending_row_without_exact_receipt_remains_unknown(self):
         sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}

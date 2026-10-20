@@ -2337,9 +2337,17 @@ pane-bound process lifetime is proven dead. The cancellation closes that
 delivery attempt; it does not claim receipt or success, and it preserves the
 transfer and its evidence. Missing or unreadable rows, incomplete observations,
 unresolved identities, live claims, and still-live original recipients remain
-unknown. A later exact-ref receipt still records delivery against the same duty
-without reopening a cancelled attempt. Registered-batch continuation and
-handover duties retain their own settlement rules.
+unknown. A watch-bound transfer retains its original ref, body digest, and
+recipient as immutable identity while delivery follows the confirmed current
+watch holder. The holder and the watch's recorded handover lineage are checked
+again under the existing seat lock through the message-duty write; a stale
+observation cannot acknowledge or cancel a successor. A later exact-ref receipt
+still records delivery against the same duty without reopening a cancelled
+attempt. Missing-pending recovery accepts only a notice written by the validated
+exact-ref receiver, bound to that original transfer-body digest and effective
+recipient generation. The notice-summary digest remains a separate fact, and a
+generic `received` ledger row is insufficient. Registered-batch continuation
+and handover duties retain their own settlement rules.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for

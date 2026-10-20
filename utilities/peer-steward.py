@@ -5147,6 +5147,15 @@ def _message_terminal_evidence(duty, row, observed, reason):
     server = identity.get("server") or "default"
     pane_bound = peer_message._valid_pane_bound_endpoint(original)
     recipient = peer_message.pending_delivery_recipient(row) if row else None
+    recipient_binding = (peer_message.pending_delivery_binding(row, include_acked=True)
+                         if row else None)
+    if (recipient_binding is None and row
+            and not any(isinstance(ref, str) and ref.startswith("peer-watch:")
+                        for ref in row.get("refs") or ())
+            and pane_bound):
+        recipient_binding = {"recipient": dict(original), "watches": []}
+    if recipient_binding is None:
+        return None
     if pane_bound:
         proof = peer_message.pending_first_input_process(row)
         if proof is None:
@@ -5162,7 +5171,8 @@ def _message_terminal_evidence(duty, row, observed, reason):
         if disposition != "dead":
             return None
         evidence = {"kind": "first-input-process-dead", "server": server,
-                    "process": proof, "process_disposition": disposition}
+                    "process": proof, "process_disposition": disposition,
+                    "recipient_binding": recipient_binding}
         if recipient is not None:
             census = herdr_observation.pane_census(session=server)
             presence = _census_session_presence(census, recipient.get("session_id"), server)
@@ -5192,7 +5202,8 @@ def _message_terminal_evidence(duty, row, observed, reason):
             "session_id": recipient.get("session_id"),
             "census_complete": True, "session_absent": True,
             "census_endpoint": census.endpoint,
-            "census_observed_at": census.observed_at}
+            "census_observed_at": census.observed_at,
+            "recipient_binding": recipient_binding}
 
 
 def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None, handoff_acceptance=False):
@@ -5409,8 +5420,10 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                    observation={"ref": ref, "reason": "dispatch-notice-consumed"})
         return
     if row.get("state") == "received":
-        checkpoint(state="complete", result="received", delivery="acknowledged", cleanup="complete",
-                   observation={"ref": ref, "reason": "exact-peer-ref"})
+        if peer_message.acknowledge_message_obligations(row):
+            return
+        checkpoint(state="unknown", observation={
+            "ref": ref, "reason": "received-binding-unverified"})
         return
     identity = (duty.get("intent") or {}).get("identity") or {}
     # Identity is held outside mutable observations. The accepted target stays
