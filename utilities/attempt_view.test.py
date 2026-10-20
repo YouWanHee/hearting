@@ -476,6 +476,54 @@ class AttemptViewTests(unittest.TestCase):
             self.assertEqual(text.count("[끝]"), 1)
             self.assertNotIn("종료 기록 없음", text)
 
+    def test_follow_final_refresh_discovers_child_registered_during_close_check(self):
+        import tempfile, contextlib, io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dispatch"; logs = root / "logs"; logs.mkdir(parents=True)
+            owner_id, child_id = "att-owner-race", "att-child-race"
+            owner = logs / f"x.{owner_id}.codex.jsonl"
+            child = logs / f"x.{child_id}.codex.jsonl"
+            owner.write_text('{"type":"result","subtype":"success"}\n')
+            child.write_text('{"type":"item.completed","item":{"id":"late","type":"agent_message","text":"late child row"}}\n')
+            registry = root / "jobs.log"
+            def line(attempt, status, path, extra=""):
+                worker = "owner" if attempt == owner_id else "stage"
+                return f"2026\t{status}\trepo\t/tmp\towner\tattempt_id={attempt},harness=codex,worker_type={worker},log_file={path}{extra}\n"
+            registry.write_text(line(owner_id, "open", owner))
+            original_find_attempt = view._find_attempt
+            calls = [0]
+            def close_after_child_registration(attempt):
+                calls[0] += 1
+                if calls[0] == 3:
+                    # The loop's child scan has used the old snapshot. Register
+                    # the child immediately before the owner's terminal close
+                    # decision; ordinary reads remain throttled at this instant.
+                    registry.write_text(line(owner_id, "done", owner) +
+                        line(child_id, "done", child,
+                             f",parent_attempt_id={owner_id},route_node=execute"))
+                    self.assertEqual(view._registry_rows(root, child_id), [])
+                    return (root, ["2026", "done", "repo", "/tmp", "owner", ""],
+                            {"failure_class":"none"})
+                return original_find_attempt(attempt)
+            slept = [False]
+            def finish_owner(_):
+                if not slept[0]:
+                    slept[0] = True
+                    with owner.open("a") as stream:
+                        stream.write('{"type":"result","subtype":"success"}\n')
+            output = io.StringIO()
+            with (mock.patch.object(view, "_dispatch_roots", return_value=(root,)),
+                  mock.patch.object(view, "_find_attempt", side_effect=close_after_child_registration),
+                  contextlib.redirect_stdout(output)):
+                result = view.main([owner_id, "--follow", "--poll-interval", "0"], clock=lambda:0, sleep=finish_owner)
+            text = output.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("[execute] ── 시작 (codex) ──", text)
+            self.assertIn("[execute] assistant: late child row", text)
+            self.assertEqual(text.count("[끝]"), 1)
+            self.assertLess(text.index("late child row"), text.index("[끝]"))
+
     def test_follow_grace_marks_missing_terminal_but_turn_completed_is_not_terminal(self):
         import tempfile, contextlib, io, time
         from unittest import mock

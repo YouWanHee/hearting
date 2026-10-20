@@ -532,10 +532,10 @@ def _registry_sources_for_path(path: Path):
     return matches
 
 
-def _find_children(parent_attempt):
+def _find_children(parent_attempt, *, force=False):
     children=[]
     for root in _dispatch_roots():
-        rows=_registry_rows(root, parent_attempt)
+        rows=_registry_rows(root, parent_attempt, force=force)
         for raw in rows:
             parsed=_metadata(raw)
             if not parsed: continue
@@ -896,6 +896,13 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
                 if status not in ("open", "running"):
                     if closed_since is None: closed_since=clock()
                     if terminal_seen or clock()-closed_since >= args.grace:
+                        # Refresh once before the final drain: a child can register
+                        # while the owner status is being read, inside the registry
+                        # reader's normal one-second throttle window.
+                        for child_id, child in _find_children(args.attempt, force=True):
+                            if child_id in seen_children: continue
+                            seen_children.add(child_id); cursors[child]=Cursor(child.path)
+                            print(f"[{sanitize(child.label)}] ── 시작 ({sanitize(child.harness)}) ──")
                         # Drain every source after closure so the last write is visible.
                         for source, cursor in list(cursors.items()):
                             if source.kind == "opencode-db":
