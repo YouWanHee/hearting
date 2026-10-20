@@ -4,14 +4,24 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 
 ROOT = Path(__file__).resolve().parents[1]
 # A test run inside a registered worker must not lend the fixture its markers.
 WORKER_MARKERS = ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
                   "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "AGENT_DISPATCH_REGISTERED_WORKER")
 BASE_ENV = {key: value for key, value in os.environ.items() if key not in WORKER_MARKERS}
+sys.path.insert(0, str(ROOT / "tools"))
+import fixture_processes
+
+
+def fixture_tempdir(stack):
+    raw = stack.enter_context(tempfile.TemporaryDirectory())
+    stack.callback(fixture_processes.reap, raw)
+    return raw
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
@@ -19,7 +29,8 @@ class OpenCodeV2PluginTest(unittest.TestCase):
         node = shutil.which("node")
         if not node:
             self.skipTest("node is unavailable")
-        with tempfile.TemporaryDirectory() as tmp:
+        with ExitStack() as stack:
+            tmp = fixture_tempdir(stack)
             script = r'''
 import assert from "node:assert/strict"
 import { pathToFileURL } from "node:url"

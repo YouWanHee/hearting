@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,13 @@ if _TOOLS_DIR not in sys.path:
 from fleet import projection, render
 from fleet.collectors import dispatch as fleet_dispatch
 from fleet.model import DispatchJob
+import fixture_processes
+
+
+def fixture_tempdir(stack, *, prefix):
+    raw = stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix))
+    stack.callback(fixture_processes.reap, raw)
+    return raw
 
 
 class OpenCodeContextPluginTest(unittest.TestCase):
@@ -90,7 +98,8 @@ hooks.dispose?.({{ silent: true }});
         self.assertIn("completionCarrier.idle(eventSid).catch", idle)
 
     def test_held_idle_observer_does_not_hold_the_opencode_event_consumer(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-held-idle-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-held-idle-")
             root = Path(raw)
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -125,6 +134,7 @@ console.log(JSON.stringify({{ elapsed_ms: performance.now() - started }}));
                 "XDG_DATA_HOME": str(root / "data"),
                 "XDG_STATE_HOME": str(root / "state"),
                 "XDG_CACHE_HOME": str(root / "cache"),
+                "PYTHONPYCACHEPREFIX": str(root / "cache" / "pycache"),
                 "AGENT_HOME": str(ROOT),
                 "OPENCODE_VERSION": "1.19.0",
                 "OBSERVER_PID_FILE": str(observer_pid),
@@ -156,7 +166,8 @@ console.log(JSON.stringify({{ elapsed_ms: performance.now() - started }}));
                         time.sleep(0.01)
 
     def test_real_plugin_config_hook_caps_only_loaded_provider_and_hides_auth_values(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-context-hook-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-context-hook-")
             home = Path(raw)
             xconfig, xdata, xstate, xcache = [home / name for name in ("config", "data", "state", "cache")]
             runtime = xconfig / "opencode"
@@ -221,6 +232,7 @@ console.log(JSON.stringify({{ after, again, disabled, restricted, policy, intera
             env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home), "XDG_CONFIG_HOME": str(xconfig),
                    "XDG_DATA_HOME": str(xdata), "XDG_STATE_HOME": str(xstate),
                    "XDG_CACHE_HOME": str(home / "cache"), "HEARTING_OPENCODE_MODELS_CACHE": str(xcache / "opencode"),
+                   "PYTHONPYCACHEPREFIX": str(xcache / "pycache"),
                    "FLEET_SESSION_REGISTRY_DIR": str(xstate / "agent-fleet" / "sessions"),
                    "AGENT_HOME": str(ROOT), "AGENT_SESSION_ROLE": "worker",
                    "AGENT_DISPATCH_ATTEMPT_ID": "att-context", "OPENCODE_VERSION": "1.19.0"}
@@ -287,10 +299,13 @@ console.log(JSON.stringify({{ after, again, disabled, restricted, policy, intera
             self.assertGreaterEqual(result["elapsed_ms"], 0)
 
     def test_helper_failure_keeps_original_plugin_config(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-context-failure-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-context-failure-")
             home = Path(raw)
             runtime = home / "config/opencode"
             (runtime / "agent-config").mkdir(parents=True)
+            for name in ("data", "state", "cache"):
+                (home / name).mkdir(parents=True, exist_ok=True)
             (runtime / "agent-config/models.conf").write_text("broken config\n")
             config = {"model": "openai/gpt", "provider": {"openai": {"models": {}}}}
             script = f'''import {{ AgentHarnessGuards }} from {json.dumps((ROOT / "adapters/opencode/plugins/hearting-guards.js").as_uri())};
@@ -298,7 +313,10 @@ const hooks = await AgentHarnessGuards({{ directory: process.cwd(), worktree: pr
 const config = {json.dumps(config)}; const result = await hooks.config(config);
 console.log(JSON.stringify({{ same: result === config, config: result }}));
 '''
-            env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home), "XDG_CONFIG_HOME": str(home / "config"),
+            env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home),
+                   "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
+                   "XDG_STATE_HOME": str(home / "state"), "XDG_CACHE_HOME": str(home / "cache"),
+                   "PYTHONPYCACHEPREFIX": str(home / "cache" / "pycache"),
                    "AGENT_HOME": str(ROOT), "AGENT_SESSION_ROLE": "worker"}
             run = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
                                  env=env, text=True, capture_output=True, timeout=10)
