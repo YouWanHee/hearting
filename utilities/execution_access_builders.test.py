@@ -66,6 +66,9 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         cls.opencode_base = load_base("fixture_opencode_base", "adapters/opencode/bin/dispatch-headless.py")
 
     def setUp(self) -> None:
+        self.runtime_version_patch = mock.patch.dict(
+            os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"})
+        self.runtime_version_patch.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.home = self.root / "home"
@@ -104,6 +107,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+        self.runtime_version_patch.stop()
 
     def write_request(self, **changes: object) -> None:
         data = {
@@ -521,6 +525,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             ))
         self.assertEqual("deny", denied["permission"]["edit"]["*"])
         self.assertEqual("deny", denied["permission"]["*"])
+
         # The normal --agent selection merges its rules after global rules.
         # Both original agent overrides must keep the contract-only exception.
         for override in ({"external_directory": "deny"}, {"edit": "allow"}):
@@ -708,6 +713,40 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             with self.assertRaises(ExecutionAccessError) as refused:
                 build_grant(strict, runtime=runtime)
             self.assertEqual(refused.exception.reason, f"execution-access-enforcement-unavailable:{runtime}")
+
+    def test_opencode_v2_permission_projection_uses_ordered_native_rules(self) -> None:
+        grant = build_grant(self.request, runtime="opencode")
+        existing = {
+            "theme": "system",
+            "permissions": [
+                {"action": "shell", "resource": "*", "effect": "ask"},
+                {"action": "edit", "resource": "*", "effect": "ask"},
+                {"action": "external_directory", "resource": "*", "effect": "deny"},
+            ],
+            "agents": {"build": {"mode": "primary", "permissions": [
+                {"action": "edit", "resource": "*", "effect": "ask"},
+            ]}},
+        }
+        with mock.patch.object(self.opencode.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(existing)}):
+            result = self.opencode.scoped_external_directory_config(
+                str(self.artifact), None, grant.additional_writable_roots,
+                worktree=str(self.worktree), selected_agent="build")
+            config = json.loads(result)
+            denied = json.loads(self.opencode.deny_commands(
+                result, ("git commit *",), selected_agent="build"))
+        self.assertNotIn("permission", config)
+        self.assertNotIn("agent", config)
+        self.assertIn("permissions", config)
+        self.assertIn("agents", config)
+        self.assertIn({"action": "shell", "resource": "*", "effect": "ask"},
+                      config["permissions"])
+        self.assertIn({"action": "external_directory", "resource": str(self.artifact),
+                       "effect": "allow"}, config["permissions"])
+        self.assertIn({"action": "shell", "resource": "git commit *", "effect": "deny"},
+                      denied["permissions"])
+        self.assertIn({"action": "edit", "resource": "*", "effect": "ask"},
+                      denied["agents"]["build"]["permissions"])
 
     def test_read_overlay_keeps_contract_deny_inside_selected_agent(self) -> None:
         readonly = self.root / "readonly-data"

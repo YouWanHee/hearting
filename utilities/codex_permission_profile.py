@@ -8,9 +8,13 @@ legacy sandbox projection; discovery never becomes a new launch gate.
 from functools import lru_cache
 import json
 from pathlib import Path
+import re
 import subprocess
 
 PROFILE_NAME = "hearting_linked_commit"
+OWNER_OBSERVE_PROFILE_NAME = "hearting_owner_observe"
+OWNER_COMMIT_NO_NETWORK_PROFILE_NAME = "hearting_linked_commit_no_network"
+TURN_PERMISSIONS_MIN_VERSION = (0, 160, 0)
 
 
 @lru_cache(maxsize=1)
@@ -20,6 +24,31 @@ def named_profiles_available() -> bool:
                                 text=True, stdin=subprocess.DEVNULL, timeout=10)
         return result.returncode == 0 and "--permission-profile" in result.stdout
     except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def turn_permissions_available(command: list[str] | None = None) -> bool:
+    """Whether this app-server CLI supports the negotiated turn profile selector.
+
+    Codex 0.160.0 added ``turn/start.permissions``. Unknown or unparseable
+    runtimes keep the existing sandbox-policy projection instead of receiving
+    a field their protocol may silently ignore.
+    """
+    executable = command[0] if command else "codex"
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True,
+                                text=True, stdin=subprocess.DEVNULL, timeout=10)
+        if result.returncode != 0:
+            return False
+        match = re.search(
+            r"\bcodex(?:[-_ ]cli(?:_rs)?)?[ /]+v?(0\.\d+\.\d+)\b",
+            result.stdout + "\n" + result.stderr,
+        )
+        if match is None:
+            return False
+        version = tuple(int(part) for part in match.group(1).split("."))
+        return version >= TURN_PERMISSIONS_MIN_VERSION
+    except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
 
@@ -78,6 +107,34 @@ def commit_profile_config(worktree: str, writable_roots: list[str],
     }, network)
 
 
+def owner_turn_profile_config(worktree: str, writable_roots: list[str],
+                              sandbox: str, *, primary_commit: bool = False) -> dict | None:
+    """Build safe default and owner commit profiles for same-thread turn selection."""
+    commit = commit_profile_config(
+        worktree, writable_roots, sandbox, True, primary_commit=primary_commit,
+    )
+    if commit is None:
+        return None
+    commit_profile = commit["permissions"][PROFILE_NAME]
+    observe_profile = {
+        "extends": ":read-only",
+        "filesystem": {},
+        "network": {"enabled": False},
+    }
+    no_network_profile = {
+        **commit_profile,
+        "network": {"enabled": False},
+    }
+    return {
+        "default_permissions": OWNER_OBSERVE_PROFILE_NAME,
+        "permissions": {
+            OWNER_OBSERVE_PROFILE_NAME: observe_profile,
+            PROFILE_NAME: commit_profile,
+            OWNER_COMMIT_NO_NETWORK_PROFILE_NAME: no_network_profile,
+        },
+    }
+
+
 def _profile(filesystem: dict, network: bool) -> dict:
     return {
         "default_permissions": PROFILE_NAME,
@@ -99,5 +156,7 @@ def _toml(value) -> str:
 def config_arguments(config: dict) -> list[str]:
     # Keep absolute paths in one inline TOML table: CLI dotted keys split dots
     # in path names (including .git), even when those segments are quoted.
-    return ["-c", "default_permissions=" + _toml(config["default_permissions"]),
-            "-c", "permissions." + PROFILE_NAME + "=" + _toml(config["permissions"][PROFILE_NAME])]
+    arguments = ["-c", "default_permissions=" + _toml(config["default_permissions"])]
+    for name, profile in config["permissions"].items():
+        arguments.extend(("-c", "permissions." + name + "=" + _toml(profile)))
+    return arguments

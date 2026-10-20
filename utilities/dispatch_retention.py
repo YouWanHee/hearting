@@ -234,11 +234,12 @@ def unlink_same_file(parent_fd, name, expected, stamp_fn):
 
 
 class Protection:
-    __slots__ = ("kind", "reason", "activity_ns", "attempt", "raw")
+    __slots__ = ("kind", "reason", "activity_ns", "attempt", "raw", "detail")
 
-    def __init__(self, kind, reason="", activity_ns=0, attempt="", raw=""):
+    def __init__(self, kind, reason="", activity_ns=0, attempt="", raw="", detail=""):
         self.kind, self.reason, self.activity_ns = kind, reason, activity_ns
         self.attempt, self.raw = attempt, raw
+        self.detail = detail
 
 
 TERMINAL_STATUSES = frozenset({"done", "killed", "cancelled"})
@@ -248,7 +249,8 @@ MAX_INTENT_CHILDREN = 256
 
 def terminal_protection(ctx, attempt, *, probe_processes, delivery_state,
                         replacement_state, route_state, owner_state, lease_state,
-                        delivery_index, supervisor_activity, process_quiescence):
+                        delivery_index, supervisor_activity, process_quiescence,
+                        protect_open_route=True, owner_detail=None):
     """Return ``eligible`` only when the exact attempt has no live consumer.
 
     Callback arguments are read-only evidence resolvers. ``unknown`` always
@@ -293,18 +295,35 @@ def terminal_protection(ctx, attempt, *, probe_processes, delivery_state,
         return Protection("unknown", "replacement-unknown")
     activity = max(activity, mtime)
 
-    state, mtime = route_state(row.meta)
-    if state == "open":
-        return Protection("keep", "route-open")
+    route = route_state(row.meta)
+    if len(route) == 3:
+        state, mtime, route_detail = route
+    else:
+        state, mtime = route
+        route_detail = "route-state-unavailable"
+    if state == "pending" or (state == "open" and protect_open_route):
+        return Protection("keep", "route-finish-pending" if state == "pending" else "route-open")
     if state == "unknown":
-        return Protection("unknown", "route-unknown")
+        return Protection("unknown", "route-unknown", detail=route_detail)
+    if state == "open":
+        # A route's administrative lifetime does not itself consume a worker HOME.
+        # The home caller continues through exact continuation, owner, lease and
+        # process evidence below. Other shared consumers keep the legacy rule.
+        pass
     activity = max(activity, mtime)
 
-    owner = owner_state(row.meta)
+    owner_evidence = owner_state(row.meta)
+    if isinstance(owner_evidence, tuple) and len(owner_evidence) == 2:
+        owner, owner_cause = owner_evidence
+    else:
+        owner, owner_cause = owner_evidence, "owner-state-unavailable"
     if owner == "live":
         return Protection("keep", "summary-live")
     if owner == "unknown":
-        return Protection("unknown", "summary-owner-unknown")
+        detail = (owner_cause if owner_cause != "owner-state-unavailable"
+                  else owner_detail(row.meta) if owner_detail is not None
+                  else owner_cause)
+        return Protection("unknown", "summary-owner-unknown", detail=detail)
     lease = lease_state(row.meta)
     if lease == "held":
         return Protection("keep", "lease-held")
@@ -322,11 +341,13 @@ def terminal_protection(ctx, attempt, *, probe_processes, delivery_state,
     if probe_processes:
         try:
             quiescence = process_quiescence(row.meta)
-        except Exception:  # noqa: BLE001 -- an unobservable process is not quiet
-            return Protection("unknown", "quiescence-unverifiable")
+        except Exception as exc:  # noqa: BLE001 -- an unobservable process is not quiet
+            return Protection("unknown", "quiescence-unverifiable",
+                              detail=type(exc).__name__.lower())
         if quiescence.state == "live":
             return Protection("keep", "not-quiescent")
         if quiescence.state != "quiescent":
-            return Protection("unknown", "quiescence-unverifiable")
+            detail = getattr(quiescence, "reason", "") or "process-state-unavailable"
+            return Protection("unknown", "quiescence-unverifiable", detail=detail)
 
     return Protection("eligible", activity_ns=activity, attempt=attempt, raw=row.raw)

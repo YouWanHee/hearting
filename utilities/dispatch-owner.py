@@ -864,7 +864,11 @@ def main(argv):
                 }
         else:
             dropped = []
-        states = _usage(jobs, profile, recheck="--dry-run" not in forwarded)
+        # A sealed/explicit target stays exact and reports its native provider
+        # error. Automatic placement applies provider/model eligibility through
+        # the shared usage state before allocation and all fallback bands.
+        states = _usage(jobs, None if explicit or pin_doc else profile,
+                        recheck="--dry-run" not in forwarded)
         overridden = None
         pin_chosen = False
         if pin_doc is not None:

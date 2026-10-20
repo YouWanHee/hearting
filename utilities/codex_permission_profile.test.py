@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import json
+import queue
 import os
 from pathlib import Path
 import shutil
@@ -150,6 +151,56 @@ class PermissionProfileTest(unittest.TestCase):
             restored.update(tomllib.loads(value))
         self.assertEqual(restored, config)
 
+    def test_owner_turn_profiles_keep_safe_default_and_commit_carveouts(self):
+        with mock.patch.object(profiles, "named_profiles_available", return_value=True):
+            config = profiles.owner_turn_profile_config(
+                str(self.wt), list(map(str, self.roots)), "workspace-write",
+            )
+        self.assertEqual(config["default_permissions"], profiles.OWNER_OBSERVE_PROFILE_NAME)
+        profiles_by_name = config["permissions"]
+        self.assertEqual(set(profiles_by_name), {
+            profiles.OWNER_OBSERVE_PROFILE_NAME,
+            profiles.PROFILE_NAME,
+            profiles.OWNER_COMMIT_NO_NETWORK_PROFILE_NAME,
+        })
+        observe = profiles_by_name[profiles.OWNER_OBSERVE_PROFILE_NAME]
+        self.assertEqual(observe["extends"], ":read-only")
+        self.assertEqual(observe["filesystem"], {})
+        self.assertFalse(observe["network"]["enabled"])
+        commit = profiles_by_name[profiles.PROFILE_NAME]
+        offline = profiles_by_name[profiles.OWNER_COMMIT_NO_NETWORK_PROFILE_NAME]
+        self.assertEqual(commit["filesystem"], offline["filesystem"])
+        self.assertTrue(commit["network"]["enabled"])
+        self.assertFalse(offline["network"]["enabled"])
+        for name in ("config", "hooks", "HEAD", "index", "worktrees"):
+            self.assertEqual(commit["filesystem"][str(self.repo / ".git" / name)], "read")
+        argv = profiles.config_arguments(config)
+        import tomllib
+        restored = {}
+        for flag, value in zip(argv[::2], argv[1::2]):
+            self.assertEqual(flag, "-c")
+            fragment = tomllib.loads(value)
+            for key, item in fragment.items():
+                if isinstance(item, dict):
+                    restored.setdefault(key, {}).update(item)
+                else:
+                    restored[key] = item
+        self.assertEqual(restored, config)
+
+    def test_turn_permissions_version_probe_falls_back_for_old_or_unknown_cli(self):
+        def version(output, returncode=0):
+            return mock.patch.object(profiles.subprocess, "run", return_value=mock.Mock(
+                returncode=returncode, stdout=output, stderr=""))
+
+        with version("codex-cli 0.160.0"):
+            self.assertTrue(profiles.turn_permissions_available())
+        with version("codex-cli 0.159.9"):
+            self.assertFalse(profiles.turn_permissions_available())
+        with version("Python 3.12.8"):
+            self.assertFalse(profiles.turn_permissions_available())
+        with version("codex-cli 0.163.0", returncode=1):
+            self.assertFalse(profiles.turn_permissions_available())
+
     def test_existing_optional_metadata_is_carved_out_without_legacy_root_grant(self):
         common = self.repo / ".git"
         (common / "config.worktree").write_text("[core]\n")
@@ -213,6 +264,27 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
         self.git("switch", "-q", start)
         self.git("worktree", "add", "-qb", "sibling", str(self.base / "sibling"))
         self.git("pack-refs", "--all")
+        victim_ref = "refs/heads/victim2"
+        self.assertIn(victim_ref, (common / "packed-refs").read_text())
+        # Recreate the former named profile: common Git metadata read-only,
+        # with only the existing per-worktree and objects/refs/logs grants.
+        old_profile = self.profile()
+        old_filesystem = {str(common): "read"}
+        old_filesystem.update({str(Path(root).resolve()): "write" for root in self.roots})
+        old_profile["permissions"][profiles.PROFILE_NAME]["filesystem"] = old_filesystem
+        old_result = subprocess.run(
+            ["codex", "sandbox", "-P", profiles.PROFILE_NAME,
+             "-C", str(self.wt), *profiles.config_arguments(old_profile), "--",
+             "git", "update-ref", "-d", victim_ref],
+            env=self.env, text=True, capture_output=True, timeout=30)
+        old_output = old_result.stdout + old_result.stderr
+        self.assertNotEqual(old_result.returncode, 0, old_output)
+        self.assertRegex(
+            old_output,
+            r"(?is)(packed-refs\.lock.*permission denied|permission denied.*packed-refs\.lock)",
+            old_output)
+        self.assertIn(victim_ref, self.git("for-each-ref", "--format=%(refname)"))
+        self.assertFalse((common / "packed-refs.lock").exists())
         (self.wt / ".codex").mkdir()
         (self.wt / ".codex/config.toml").write_text("# protected\n")
         before = {name: (common / name).read_bytes() for name in ("config", "HEAD", "index")}
@@ -312,22 +384,75 @@ time.sleep(4)
         spec = importlib.util.spec_from_file_location("c4_supervisor", Path(__file__).with_name("codex-app-server-supervisor.py"))
         supervisor = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(supervisor)
+        with mock.patch.object(profiles, "named_profiles_available", return_value=True):
+            owner_profiles = profiles.owner_turn_profile_config(
+                str(self.wt), list(map(str, self.roots)), "workspace-write",
+            )
+        self.assertIsNotNone(owner_profiles)
         # Existing user sandbox configuration must not defeat the invocation
         # profile. This is our private fixture config, never the real config.
         (Path(self.env["CODEX_HOME"]) / "config.toml").write_text('sandbox_mode="workspace-write"\n')
         server = supervisor.AppServer(["codex", "app-server", "--listen", "stdio://",
-                                      *profiles.config_arguments(self.profile())], str(self.wt), self.env)
+                                      *profiles.config_arguments(owner_profiles)], str(self.wt), self.env)
         try:
             server.request("initialize", {"clientInfo": {"name": "hearting-fixture", "version": "1"},
                                           "capabilities": {"experimentalApi": True}})
             server.notification("initialized")
             thread = server.request("thread/start", {"cwd": str(self.wt), "ephemeral": True,
                                                       "approvalPolicy": "never"})
-            self.assertEqual(thread["activePermissionProfile"]["id"], profiles.PROFILE_NAME)
+            thread_id = thread["thread"]["id"]
+            self.assertEqual(thread["activePermissionProfile"]["id"],
+                             profiles.OWNER_OBSERVE_PROFILE_NAME)
+            denied_path = self.wt / "read-only-denied.txt"
+            denied_code = f"from pathlib import Path; Path({str(denied_path)!r}).write_text('denied')"
+            denied = server.request("command/exec", {
+                "cwd": str(self.wt), "command": ["python3", "-c", denied_code],
+            })
+            self.assertNotEqual(denied["exitCode"], 0, denied["stderr"])
+            self.assertFalse(denied_path.exists())
+
+            def select_profile(profile_name):
+                server.request("thread/settings/update", {
+                    "threadId": thread_id, "permissions": profile_name,
+                })
+                deadline = time.monotonic() + 10
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail("Codex did not acknowledge the named profile update")
+                    if server.pending:
+                        event = server.pending.pop(0)
+                    else:
+                        try:
+                            line = server.messages.get(timeout=remaining)
+                        except queue.Empty:
+                            self.fail("Codex did not acknowledge the named profile update")
+                        self.assertTrue(line, "Codex closed before the profile update")
+                        event = json.loads(line)
+                    params = event.get("params", {})
+                    if (event.get("method") == "thread/settings/updated"
+                            and params.get("threadId") == thread_id):
+                        active = params["threadSettings"]["activePermissionProfile"] or {}
+                        self.assertEqual(active.get("id"), profile_name)
+                        return profile_name
+
+            selected_profile = select_profile(profiles.PROFILE_NAME)
             code = "from pathlib import Path; import subprocess; Path('source.txt').write_text('rpc edit\\n'); subprocess.run(['git','add','source.txt'],check=True); subprocess.run(['git','commit','-qm','rpc commit'],check=True)"
-            result = server.request("command/exec", {"cwd": str(self.wt), "command": ["python3", "-c", code]})
+            # command/exec is sessionless: explicitly use the profile that the
+            # real thread-settings notification acknowledged above.
+            result = server.request("command/exec", {
+                "cwd": str(self.wt), "command": ["python3", "-c", code],
+                "permissionProfile": selected_profile,
+            })
             self.assertEqual(result["exitCode"], 0, result["stderr"])
             self.assertEqual(self.git("log", "-1", "--format=%s", cwd=self.wt), "rpc commit")
+            selected_profile = select_profile(profiles.OWNER_OBSERVE_PROFILE_NAME)
+            denied = server.request("command/exec", {
+                "cwd": str(self.wt), "command": ["python3", "-c", denied_code],
+                "permissionProfile": selected_profile,
+            })
+            self.assertNotEqual(denied["exitCode"], 0, denied["stderr"])
+            self.assertFalse(denied_path.exists())
         finally:
             server.close()
 

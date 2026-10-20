@@ -24,7 +24,9 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import time
+from pathlib import Path
 
 from ..model import ContextEvidence, SubAgent
 from .. import session_registry
@@ -59,6 +61,130 @@ def _attempt_sidecar_fallback(sess):
     if not getattr(sess, "summary", None):
         sess.summary, sess.summary_ts = titles.fresh_summary_with_ts(
             attempt_sid, harness="opencode")
+
+
+def _opencode_v2_runtime():
+    utilities = Path(__file__).resolve().parents[3] / "utilities"
+    if str(utilities) not in sys.path:
+        sys.path.insert(0, str(utilities))
+    import opencode_runtime
+    return opencode_runtime
+
+
+def _enrich_v2(sess, tick, db):
+    """Exact V2 sid reader; a cwd/time fallback is accepted only when unique."""
+    runtime = _opencode_v2_runtime()
+    if not runtime.credential_store_present(db_path=db):
+        return False
+    sid, binding_source = session_of_process(sess.pid) if getattr(sess, "pid", None) else (None, "")
+    generation = None
+    if sid:
+        observed = runtime.read_session_observation(sid, db_path=db)
+        if observed.get("state") == "observed":
+            generation = observed.get("generation")
+    else:
+        started = _process_started_ms(sess)
+        if started is not None and sess.cwd:
+            candidates = runtime.list_session_candidates(
+                sess.cwd, db_path=db, after_created=started,
+                before_created=(tick or {}).get(sess.pid), limit=2)
+            if len(candidates) > 1:
+                _attempt_sidecar_fallback(sess)
+                return True
+            if len(candidates) == 1:
+                sid = candidates[0].get("id")
+                generation = candidates[0].get("generation")
+                binding_source = "unique-process-window"
+                observed = runtime.read_session_observation(
+                    sid, db_path=db, generation=generation)
+    if not sid:
+        _attempt_sidecar_fallback(sess)
+        return True
+    if generation != "v2":
+        return True
+    if "observed" not in locals():
+        observed = runtime.read_session_observation(sid, db_path=db, generation="v2")
+    if observed.get("state") != "observed" or observed.get("generation") != "v2":
+        _attempt_sidecar_fallback(sess)
+        return True
+    native = observed.get("session") or {}
+    if native.get("directory") and sess.cwd and os.path.realpath(native["directory"]) != os.path.realpath(sess.cwd):
+        # The process/session binding is exact, but a mismatched directory is
+        # not allowed to reattribute session activity to this pane.
+        return True
+    sess._opencode_bind_kind = "process" if binding_source == "opencode-tui-selection" else "window"
+    sess._refresh_source = {"kind": "opencode-db-v2", "harness": "opencode",
+                            "db_path": db, "session_id": sid,
+                            "table": "session_message",
+                            "cursor_kind": observed.get("cursor_kind"),
+                            "observed_cursor": observed.get("cursor")}
+    if native.get("directory"):
+        from .. import session_cwd
+        session_cwd.observe(sess, native["directory"], sid)
+    sess.session_id = sid
+    sess.title = titles.last_title(sid, harness="opencode")
+    sess.summary, sess.summary_ts = titles.fresh_summary_with_ts(sid, harness="opencode")
+    _attempt_sidecar_fallback(sess)
+    if native.get("slug"):
+        sess.slug = native["slug"]
+    sess.is_child = bool(native.get("parent_id"))
+    model = native.get("model") if isinstance(native.get("model"), dict) else {}
+    if model:
+        sess.model = model.get("id")
+        if model.get("providerID"):
+            sess._opencode_provider_id = model["providerID"]
+        variant = str(model.get("variant") or "").strip()
+        if variant.lower() in _DEFAULT_VARIANTS:
+            sess.effort_default = True
+        elif variant:
+            sess.effort = variant
+    for attr, key in (("cost", "cost"), ("session_input_tokens", "tokens_input"),
+                      ("session_output_tokens", "tokens_output"),
+                      ("session_reasoning_output_tokens", "tokens_reasoning")):
+        value = native.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            setattr(sess, attr, value)
+    values = [native.get(key) for key in ("tokens_input", "tokens_output", "tokens_reasoning")]
+    sess.tokens = sum(value for value in values if isinstance(value, (int, float))) or None
+    sess.session_total_tokens = sess.tokens
+    messages = observed.get("messages") or []
+    latest = next((row for row in reversed(messages)
+                   if row.get("type") == "assistant" and row.get("tokens")), None)
+    if latest:
+        last_ctx = _context_tokens_from_payload({"tokens": latest["tokens"]})
+        if isinstance(last_ctx, (int, float)) and last_ctx >= 0:
+            sess.active_context_tokens = int(last_ctx)
+    from ..token_budget import context_policy_snapshot, context_policy_used_pct
+    from ..context_policy import read_policy
+    model_ref = f"{model.get('providerID') or ''}/{sess.model or ''}"
+    policy_record = read_policy(harness="opencode", session_id=sid, pid=sess.pid,
+                                proc_start=sess.proc_start, model=model_ref)
+    policy_data = policy_record.get("policy") if isinstance(policy_record, dict) else None
+    if isinstance(policy_data, dict):
+        sess.context_policy = context_policy_snapshot(
+            source=policy_data.get("source") or "opencode-native-chat-params",
+            runtime_version=policy_data.get("runtime_version"),
+            configured_request_tokens=policy_data.get("configured_request_tokens"),
+            configured_request=policy_data.get("configured_request"),
+            effective_window_tokens=policy_data.get("effective_window_tokens"),
+            applied_trigger_tokens=policy_data.get("applied_trigger_tokens"),
+            output_allowance_tokens=policy_data.get("output_allowance_tokens"),
+            compaction_reserve_tokens=policy_data.get("compaction_reserve_tokens"),
+            disabled=policy_data.get("disabled"), enabled=policy_data.get("enabled"),
+            enforced=policy_data.get("enforced"), session_id=sid,
+            raw_percentage=policy_data.get("raw_percentage"), reason=policy_data.get("reason"))
+    else:
+        sess.context_policy = context_policy_snapshot(
+            source="opencode-db-v2", session_id=sid,
+            reason="selected-request-policy-not-observed")
+    sess.context_window_tokens = sess.context_policy["effective_window_tokens"]
+    sess.context_display_window_tokens = (sess.context_policy["applied_trigger_tokens"]
+                                          if sess.context_policy["state"] == "applied" else None)
+    sess.ctx_pct = context_policy_used_pct(sess.active_context_tokens, sess.context_policy)
+    stamp = native.get("time_updated")
+    if isinstance(stamp, (int, float)):
+        sess.mtime = stamp / 1000.0
+    return True
 
 
 def _message_table(con):
@@ -138,8 +264,7 @@ def _model_ctx_limit(model_id, provider=None):
 
 
 def _db():
-    return os.environ.get("OPENCODE_DB") or os.path.expanduser(
-        "~/.local/share/opencode/opencode.db")
+    return str(_opencode_v2_runtime().opencode_db_path())
 
 
 def _process_started_ms(sess):
@@ -541,6 +666,8 @@ def enrich(sess, tick=None):
         pass
     db = _db()
     if not sess.cwd or not os.path.exists(db):
+        return
+    if _enrich_v2(sess, tick, db):
         return
     con = None
     last_ctx = None

@@ -130,7 +130,8 @@ def parse_arm(payload: dict[str, Any]) -> tuple[str, str] | None:
     if len(watches) != 1:
         return None
     entry = watches[0]
-    if (entry.get("steward") or {}).get("session_id") != session_id:
+    recipient = entry.get("recipient") or entry.get("steward") or {}
+    if recipient.get("harness") != "claude" or recipient.get("session_id") != session_id:
         return None
 
     # The receipt must live under the canonical state root the utility itself

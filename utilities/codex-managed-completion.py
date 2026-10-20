@@ -338,14 +338,49 @@ class NoticeWatcher:
                     if isinstance(additional, dict) else []
                 if len(values) != 1:
                     raise CompletionError("native-queue-notice-context-invalid")
-                sent = True
+                fence_identity = pending_delivery.submission_fence_identity(claimed, target)
+                fence = pending_delivery.read_submission_fence(
+                    self.root, self.recipient, claimed["delivery_id"],
+                    expected_identity=fence_identity)
+                allow_add = fence is None or fence["state"] == "not-accepted"
+                prepared_attempt = None
+
+                def before_add():
+                    nonlocal sent, prepared_attempt
+                    prepared = pending_delivery.prepare_submission_fence(
+                        self.root, self.recipient, claimed["delivery_id"],
+                        claim_owner=self.owner, expected_identity=fence_identity)
+                    prepared_attempt = prepared["attempt"]
+                    sent = True
+
                 # Claim and ack stay with the registered recipient; the queue is the successor's after a /clear.
-                queue_result = codex_queue_delivery.send_at_least_once(
-                    queue_socket, thread_id=target,
-                    client_message_id=claimed["delivery_id"], message=values[0],
-                    timeout=5.0,
-                )
-                if queue_result.get("status") == "queued" and not queue_result.get("already_pending"):
+                try:
+                    queue_result = codex_queue_delivery.send_at_least_once(
+                        queue_socket, thread_id=target,
+                        client_message_id=claimed["delivery_id"], message=values[0],
+                        timeout=5.0, allow_add=allow_add, retry_ambiguous=False,
+                        require_message_match=True, before_add=before_add,
+                    )
+                except codex_queue_delivery.QueueDeliveryError as exc:
+                    if (prepared_attempt is not None and not exc.ambiguous
+                            and exc.reason.startswith("queue-rpc-refused:thread/queue/add:")):
+                        pending_delivery.record_submission_not_accepted(
+                            self.root, self.recipient, claimed["delivery_id"],
+                            claim_owner=self.owner, expected_identity=fence_identity,
+                            expected_attempt=prepared_attempt, reason=exc.reason)
+                        sent = False
+                    raise
+                if queue_result.get("status") in {"queued", "consumed"}:
+                    pending_delivery.record_submission_accepted(
+                        self.root, self.recipient, claimed["delivery_id"],
+                        claim_owner=self.owner, expected_identity=fence_identity,
+                        queue_submission_id=queue_result.get("queued_submission_id"),
+                        source=("queue-response" if prepared_attempt is not None
+                                else "exact-observation"),
+                        expected_attempt=prepared_attempt,
+                    )
+                if (queue_result.get("status") == "queued"
+                        and not queue_result.get("already_pending")):
                     try:
                         pending_delivery.record_send(
                             self.root, self.recipient, claimed["delivery_id"],
@@ -363,10 +398,17 @@ class NoticeWatcher:
                 pending_item = next((item for item in queued
                                      if item.get("clientUserMessageId") == claimed["delivery_id"]), None)
                 if pending_item is None:
-                    turn = codex_queue_delivery.find_turn_by_client_message_id(
-                        queue_socket, target, claimed["delivery_id"], timeout=5.0
+                    turn = codex_queue_delivery._known_consumed(
+                        queue_socket, target, claimed["delivery_id"], timeout=5.0,
+                        strict_history=True, expected_message=values[0],
                     )
                     if turn is not None:
+                        pending_delivery.record_submission_accepted(
+                            self.root, self.recipient, claimed["delivery_id"],
+                            claim_owner=self.owner, expected_identity=fence_identity,
+                            source="exact-observation",
+                            expected_attempt=prepared_attempt,
+                        )
                         pending_delivery.ack(
                             self.root, self.recipient, claimed["delivery_id"],
                             acked_by=self.owner,

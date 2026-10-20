@@ -387,14 +387,20 @@ and does not turn a duplicate start into a different assignment. Fleet's native
 observations use that attempt's recorded home across the three harnesses.
 
 **Per-attempt home retention.** A per-attempt home under `homes/workers/<key>`
-retires itself once its attempt has been terminal, quiescent and unused for seven
-days; no user command, flag, daemon or approval is involved. The pass runs at the end
+retires itself once its attempt has been terminal, quiescent and unused for one
+hour; no user command, flag, daemon or approval is involved. An exact, valid open
+route alone is not a HOME consumer: the home remains only while an existing
+continuation, delivery/replacement, summary/provider, lease, process or recent-view
+obligation can read it. Route and attempt outcomes retain their semantic state;
+an unreadable or conflicting route binding remains unknown. The pass runs at the end
 of every post-exit reaper and in a `reconcile --apply` that is not scoped to one exact attempt. It is due at
-most every five minutes, examines at most 32 homes (a fair cursor), and removes at
-most four destructively touched homes, including partial leftovers of an interrupted removal. The seven-day clock starts
-at the first pass that proves every protection below, because terminal rows record
-no close time; uncertain prepared evidence defers without restarting an established
-clock, while freshly observed renewed protection restarts it. Later activity (a Fleet
+most every five minutes, examines at most 128 homes (a fair cursor), and removes at
+most 16 destructively touched homes, including partial leftovers of an interrupted removal. The idle clock starts
+from the best completion estimate: the terminal row timestamp or, when later, the
+regular log file mtime. Only when that timestamp cannot be parsed does the clock
+start at the first pass that proves every protection below. Uncertain prepared
+evidence defers without restarting an established clock, while freshly observed
+renewed protection restarts it. Later activity (a Fleet
 view, a route outcome, a resolved delivery, a recovery record, a supervisor update,
 or a write to the home) extends it, including activity arriving before detach. A home is
 kept while: its row is not terminal; any open row references the attempt; a
@@ -403,15 +409,26 @@ pending delivery intent is unresolved or unreadable; only actual attempt IDs in
 delivery records protect worker homes (a depth-1 `-` parent and session notice
 identities refer to no worker home); a delivery record or group
 is malformed, unreadable or unattributable; a pruned delivery has only a legacy
-zero-byte or mismatched tombstone; its route is open, missing or its
-binding is unreadable; a terminal replacement successor still has unresolved
-route or delivery obligations; a summary owner or the supervisor lease is live or
+zero-byte or mismatched tombstone; its route binding is missing, damaged or
+unreadable; a terminal replacement successor still has unresolved delivery or
+source-HOME obligations; a summary owner/provider or the supervisor lease is live or
 unverifiable; process quiescence is not proven; Fleet displayed it within the
-window; or its `.credentials.json` is a regular file, which a Claude native refresh
+one-hour window; or its `.credentials.json` is a regular file, which a Claude native refresh
 left in place of the link and which may hold the only copy of a rotated token. A home
 is also kept, and counted rather than hidden in
-`homes/worker-retention/state.json`, when its attempt cannot be proven from the
-manifest, the row's `runtime_home` and the legacy key; shared `homes/codex`,
+`homes/worker-retention/state.json`, when its manifest is ambiguous or
+conflicting, or existing process, delivery, summary/provider or lease evidence is
+incomplete. A valid private legacy home whose attempt cannot be recovered at all is
+an identity-less candidate, not an unknown: it is judged by the same path-based
+evidence (process environment/cwd/fd, ledger inventories, leases, provider locks)
+and is reclaimed only on complete affirmative absence after the normal clock; no
+identity or row is invented for it. A native reader or supervisor pins exactly its
+own home with a shared directory lock paired with detach's exclusive lock.
+Other homes remain independently reclaimable, and a detach-first outcome refuses
+new reads. The result preserves
+the existing top-level unknown counts and records bounded causes beside them;
+`summary-owner-unknown`, `quiescence-unverifiable` and `route-unknown` remain
+fail-closed categories. Shared `homes/codex`,
 `<slug>.<profile>` and `destination=` homes are not enumerated. Detaching is one
 rename into `homes/worker-retention/retiring/` under a nonblocking registry lock
 and a reader-mark lock. Evidence is prepared outside the registry lock; its
@@ -424,14 +441,22 @@ tree is then removed outside every lock, by directory descriptor, without follow
 a link or crossing the detached leaf's mount boundary. Deletion belongs to this pass alone,
 outside the builder, Fleet, the installer and registry critical sections. Fleet
 admits excluded native homes without retention bookkeeping and admits each candidate
-native-home read through a valid recent marker written at most hourly;
-if admission cannot be proved promptly, independent attempt summaries, titles and
+native-home read through a valid recent marker, refreshed at most every five minutes.
+A read admitted with a cached marker therefore has at least 55 minutes of the
+one-hour view protection remaining. The examination budget remains 10 seconds and
+candidate removals share the existing 20-second deadline. The count limits bound
+work in short passes too; in-flight operations are not preempted by either time limit.
+If admission cannot be proved promptly, independent attempt summaries, titles and
 streams remain available while native-home reads are withheld. A
 post-exit reaper pass runs only after that reaper exits; selector-less reconcile
 also carries the sweep when normal work invokes it. Neither carrier promises a
 wall-clock cleanup deadline on a machine with no later normal work. Older
 cross-namespace owner evidence without a host-visible death receipt remains
-unknown and keeps its home.
+unknown and keeps its home. The independent seven-day route idle wait protects
+work the observer cannot see; it is not a HOME retention interval. Commit
+`1ed7b9032` records the regression that lengthened this route wait after a
+background sweep closed unseen work and pending runtime settlement, so HOME
+reclamation does not shorten the route policy.
 
 **Dispatch log retention.** Only regular Hearting attempt logs bound by an
 exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are
@@ -929,6 +954,7 @@ A legacy hash collision is diagnostic
      fields. `worker_role` remains legacy read-only identity metadata.
    - For a route-bound job, the compiler selects and seals both portable model role and model profile; wrappers resolve the profile through adapter config and reject trailing model/effort replacement. A model or effort different from the profile default is chosen once at `compose --pin <owner|frame|worker>=<harness>[:<model>[@<effort>]]`, sealed into the route (`selection_pins`, inherited by continuations), moved later only by the route's parent with `start --pin` (recorded beside the route), and read by the wrapper from the bound route with those changes applied (`model_source=pin`, `model_pin_status=applied|harness-only|harness-mismatch|none`); a checked capacity retry may still replace a pinned model and then reports `model_source=pin+capacity` with `model_pin=`. A sealed worker or owner pin also beats an explicit `--adapter` while the pinned harness is usable (supported by the checked tuple and under no active usage limit); the replaced request is recorded as `explicit_adapter=`, and a pinned harness that cannot run keeps the request and reports `harness-mismatch`. A sealed worker pin also bounds `stage-dispatch-fallback` descent: only the pinned harness's headless candidates may take that step (native-subagent/inline only when the owner runs on that harness); other harnesses are recorded `skipped-worker-pin`, and when the pinned harness cannot take the step the chain stops with `reason=worker-pin-unavailable` and one plain detail line instead of moving the step to another tool. Top (main-session-only) models are accepted for `frame` only; an owner or worker pin naming one keeps the tool and drops the model with `warning=pin-dropped`. Non-route direct/lifecycle surfaces retain their explicit model/inheritance contracts. Registered substantive owner/stage/review nodes reject `mini`. The orchestrator chooses harness placement subject to sealed diversity axes.
    - **Cross-harness routing under SD-16:** before dispatch, query each harness through `utilities/usage-check.sh`, which reports `ok`, `limited(reset)`, or `unknown`. The cascade is explicit target (including an explicit pin), hard eligibility, sealed affinity/policy, the balanced usage gate, quality band, then allocation ordering (target shares scaled by the optional `allocation.harness_weights`, e.g. OpenCode `0.3`). A frame leg reads the `harness_policy` sealed on its own node; an explicit harness outside the profile's bands is followed while it is enabled. Unknown gauges pass the balanced gate optimistically and use the neutral ordering share, while account-bound native quota rejections (through their exact reset and model scope) and legacy death markers from `usage-check.sh` remain hard exclusions until the login a worker would use answers otherwise: while Claude is held, a launch decision (`usage-check.sh --recheck`, `recheck=True`) sends that login one minimal request (`dispatch_capacity_evidence.probe`) at most every 10 minutes per login (`unscoped` while no account resolves) and model family, whatever the last attempt's outcome. The probed model follows the window that holds: Haiku for an all-model window, the limited family or model for a narrower one. An answer newer than a limit decides it: one that goes through lifts a limit whose window covers the probed model (an all-model window for any model, a family or model window only for that one), as when another account is signed in or quota returns before the recorded reset, and a rejection holds the models its window covers until its own reset. Later rejections preserve successful evidence that already lifted older limits. A probe that cannot run or fails for another reason changes nothing; gauges and Fleet read the stored answers. Under `capacity-aware`, unknown/zero headroom is excluded. Allocation order is compiled and sealed into the route (`dispatch_allocation`, `dispatch_defaults_digest`); `verify` never reloads live config. A user prohibition is stronger than any signal. A policy change is complete only when the allocation ledger (`utilities/dispatch_allocation_receipt.py list|summary`) shows the new field on a real attempt, not when the file validates.
+     **Provider/model availability:** quota headroom and execution availability are separate evidence. A candidate carries `usable`, `unavailable`, or `unknown`, scoped to its provider, selected account, and model where evidence supports that precision, with its reason and observation time. A confirmed credential or entitlement rejection is a hard exclusion for only the candidates covered by that evidence and outranks older successful quota/cache data. A timeout or unclassified error remains unknown and cannot clear a confirmed rejection. A newer same-scope success or an observed active-account change may restore eligibility. Automatic ranking and every cached ordering consume this filter before headroom, affinity, bias, and fallback; an explicit model pin remains exact and reports its native error. Credential presence and model inventory are not execution or entitlement evidence.
    - **Nested child-spawn eligibility under SD-48:** root headless readiness,
      runtime-native subagent readiness, and a conductor's ability to launch a
      registered dispatch-depth-2 child are separate runtime surfaces. Before
@@ -1314,6 +1340,10 @@ waiting for its declared outputs. The current launch retains its normal live
 owner/session binding. The ledger lock serializes the binding change, preserves
 the prior execution evidence, and refuses active or unobservable identities,
 completed stages, existing successor claims, unrelated failures, and parent close.
+An ended predecessor's terminal status, recorded exit code and matching sentinel
+remain exit evidence across PID namespaces. A namespace mismatch alone does not
+invalidate that recorded exit; missing or contradictory exit evidence still
+refuses replacement, and an observed live or reaping identity remains protected.
 All prior bindings protect their log, sentinel and progress paths across registries
 and path aliases. Existing active workflow progress is preserved. The final payload
 release checks parent close under the same ledger lock before publishing identity
@@ -2010,6 +2040,17 @@ A steward is informally depth −1; not a dispatch depth. This role carries no l
 gate, write, or approval authority over the session it addresses — its peer messages are
 advisory context between two already-running sessions, and the append-only ledger below
 is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the role:
+
+An already valid steward relation follows a confirmed same-seat session handover through
+the existing seat ledger. The ledger preserves the original explicit/watch/start evidence,
+its generation and exact target, and any unresolved watch identity while resolving the
+current holder and recipient from the confirmed successor chain. Registered parent,
+receipt, signature and storage identities remain anchored to their original
+registration. Ordinary messages, cards, registered bindings and Fleet display
+aliases create no role. A release revokes only its recorded
+generation; an unresolved accepted watch remains a separate duty. Unknown or interrupted
+adoption stays pending. F-100c-2's existing evidence rule remains in force; SD-147 entry
+admission is a separate, dormant contract and is not part of same-seat continuity.
 
 Fleet and herdr may join pane-session IDs for display through the shared read-only
 session-tidy reader. Its bounded compatibility join uses the exact pane, harness,

@@ -71,6 +71,7 @@ class PromptReceiptTest(unittest.TestCase):
         sid = "native-parent"
         root = Path("/tmp/native-state")
         record = {"delivery_id": "delivery-exact"}
+        request_prompt = "  Continue safely 🫶\nOUTPUT_FORMAT: JSON\t\n"
         batches = [(root, [record])]
         events = []
         context_alert = types.ModuleType("context_alert")
@@ -82,7 +83,7 @@ class PromptReceiptTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"context_alert": context_alert, "fleet": fleet,
                                            "herdr_session_projection": projection}), \
              mock.patch.object(hook, "is_worker_session", return_value=False), \
-             mock.patch.object(hook, "load_payload", return_value={"session_id": sid, "prompt": "continue"}), \
+             mock.patch.object(hook, "load_payload", return_value={"session_id": sid, "prompt": request_prompt}), \
              mock.patch.object(hook, "interaction_session_id", return_value=sid), \
              mock.patch.object(hook, "peer_notice"), mock.patch.object(hook, "retry_pending_peer"), \
              mock.patch.object(hook, "launch_trigger"), mock.patch.object(hook, "sd111_first_prompt_sweep"), \
@@ -91,7 +92,9 @@ class PromptReceiptTest(unittest.TestCase):
              mock.patch.object(hook, "native_receiving_turn", return_value={
                  "thread_id": sid, "turn_id": "turn-exact", "status": "inProgress"}) as bind, \
              mock.patch("dispatch_session_sweep.retain_receiving_turn",
-                        side_effect=lambda *a: events.append("retain") or {(str(root), record["delivery_id"])}), \
+                        side_effect=lambda *a, **kw: events.append("retain") or {
+                            (str(root), record["delivery_id"])
+                        }) as retain, \
              mock.patch.object(hook, "candidate_context", return_value=""), \
              mock.patch.object(hook, "run_preflight", return_value=""), \
              mock.patch.object(hook, "token_budget_context", return_value=""), \
@@ -100,6 +103,7 @@ class PromptReceiptTest(unittest.TestCase):
                         side_effect=lambda *a, **kw: events.append("ack")) as ack:
             self.assertEqual(hook.main(), 0)
         self.assertEqual(events, ["retain", "emit", "ack"])
+        self.assertEqual(retain.call_args.kwargs["request_context"], request_prompt)
         self.assertEqual(ack.call_args.args[2], [record])
         bind.assert_called_once()
 

@@ -397,7 +397,7 @@ def read_exact_turn(path: Path, thread_id: str, turn_id: str, *, timeout: float 
     matches = []
     for _ in range(MAX_QUEUE_PAGES):
         params: dict[str, Any] = {"threadId": thread_id, "limit": MAX_PAGE_SIZE,
-                                  "sortDirection": "desc"}
+                                  "sortDirection": "desc", "itemsView": "full"}
         if cursor:
             params["cursor"] = cursor
         response = _rpc(path, "thread/turns/list", params, timeout=timeout,
@@ -416,7 +416,8 @@ def read_exact_turn(path: Path, thread_id: str, turn_id: str, *, timeout: float 
             status = matches[0].get("status")
             if not isinstance(status, str) or not status:
                 raise QueueDeliveryError("queue-turn-status-unavailable")
-            return {"id": turn_id, "status": status}
+            return {"id": turn_id, "status": status,
+                    "items": matches[0].get("items")}
     raise QueueDeliveryError("queue-turn-history-page-limit-exceeded")
 
 

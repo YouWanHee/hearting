@@ -91,7 +91,7 @@ OPTIONAL_PROFILE_KEYS = frozenset({
 })
 # New scalar policy is optional independently of profile completeness: old
 # complete user copies stay selected and receive the in-memory default.
-OPTIONAL_SCALAR_KEYS = frozenset({CONTEXT_WINDOW_KEY})
+OPTIONAL_SCALAR_KEYS = frozenset({CONTEXT_WINDOW_KEY, "CFG_V2_AUTO_FALLBACKS"})
 # Policy keys a release added after a user copy was seeded. A complete user
 # copy without one stays selected whole-file, and the consumer sees the key
 # as absent (top review B2, 2026-09-10: the codex main-session-only key made

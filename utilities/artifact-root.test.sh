@@ -45,6 +45,36 @@ actual=$(env -u AGENT_ARTIFACT_ROOT PATH="$TMP/git-wrapper:$PATH" ARTIFACT_TEST_
 [ "$actual" = "$repo/.agent_reports" ] || fail "primary resolution avoids unrelated worktree enumeration"
 ok "primary resolution avoids unrelated worktree enumeration"
 
+# git < 2.31 has no `rev-parse --path-format`: it echoes the unknown option as
+# an extra line and exits 0. Emulate that with a PATH shim and require the
+# resolver to ask plainly and absolutize a relative answer itself.
+mkdir -p "$TMP/old-git" "$repo/sub/dir"
+cat > "$TMP/old-git/git" <<'SHIM'
+#!/bin/sh
+strip=0
+for arg in "$@"; do
+  [ "$arg" = "--path-format=absolute" ] && strip=1
+done
+if [ "$strip" = 1 ]; then
+  echo "--path-format=absolute"
+  n=$#
+  while [ "$n" -gt 0 ]; do
+    arg=$1
+    shift
+    [ "$arg" = "--path-format=absolute" ] || set -- "$@" "$arg"
+    n=$((n - 1))
+  done
+fi
+exec "$ARTIFACT_TEST_GIT" "$@"
+SHIM
+chmod +x "$TMP/old-git/git"
+actual=$(env -u AGENT_ARTIFACT_ROOT PATH="$TMP/old-git:$PATH" ARTIFACT_TEST_GIT="$git_bin" "$RESOLVER" "$linked")
+[ "$actual" = "$repo/.agent_reports" ] || fail "git without --path-format resolves linked worktree"
+ok "git without --path-format resolves linked worktree"
+actual=$(env -u AGENT_ARTIFACT_ROOT PATH="$TMP/old-git:$PATH" ARTIFACT_TEST_GIT="$git_bin" "$RESOLVER" "$repo/sub/dir")
+[ "$actual" = "$repo/.agent_reports" ] || fail "git without --path-format resolves primary subdirectory"
+ok "git without --path-format resolves primary subdirectory"
+
 # Custom git directory layouts keep the existing Git-owned worktree lookup.
 custom="$TMP/custom"
 mkdir -p "$custom"

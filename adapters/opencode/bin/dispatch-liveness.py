@@ -84,13 +84,8 @@ def same_path(a: str, b: str) -> bool:
 
 
 def db_path() -> Path:
-    explicit = os.environ.get("OPENCODE_DB")
-    if explicit:
-        return Path(explicit)
-    data_home = os.environ.get("OPENCODE_DATA_HOME")
-    if data_home:
-        return Path(data_home) / "opencode.db"
-    return Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    import opencode_runtime
+    return opencode_runtime.opencode_db_path()
 
 
 def to_seconds(ts: int | float | None) -> float:
@@ -99,28 +94,37 @@ def to_seconds(ts: int | float | None) -> float:
     return float(ts) / 1000.0 if ts > 10_000_000_000 else float(ts)
 
 
-def locate_latest_for_worktree(con: sqlite3.Connection, worktree: str) -> tuple[str, str, float] | None:
-    rows = con.execute(
-        """
-        SELECT
-          s.id,
-          s.slug,
-          s.directory,
-          MAX(
-            s.time_updated,
-            COALESCE((SELECT MAX(time_updated) FROM message WHERE session_id = s.id), 0),
-            COALESCE((SELECT MAX(time_updated) FROM part WHERE session_id = s.id), 0),
-            COALESCE((SELECT MAX(time_updated) FROM session_message WHERE session_id = s.id), 0),
-            COALESCE((SELECT MAX(time_created) FROM session_input WHERE session_id = s.id), 0)
-          ) AS last_updated
-        FROM session s
-        ORDER BY last_updated DESC
-        """,
-    )
-    for row in rows:
-        if same_path(row["directory"], worktree):
-            return row["id"], row["slug"] or "", to_seconds(row["last_updated"])
-    return None
+def locate_latest_for_worktree(con: sqlite3.Connection, worktree: str,
+                              session_id: str | None = None) -> tuple[str, str, float] | None:
+    database = con.execute("PRAGMA database_list").fetchone()[2]
+    if not database:
+        return None
+    utilities = Path(__file__).resolve().parents[3] / "utilities"
+    if str(utilities) not in sys.path:
+        sys.path.insert(0, str(utilities))
+    import opencode_runtime
+    candidate = None
+    if session_id:
+        observation = opencode_runtime.read_session_observation(session_id, db_path=database)
+        if observation.get("state") != "observed":
+            return None
+        candidate = observation.get("session") or {}
+    else:
+        candidates = opencode_runtime.list_session_candidates(worktree, db_path=database, limit=2)
+        if len(candidates) != 1:
+            return None
+        candidate = candidates[0]
+        observation = opencode_runtime.read_session_observation(
+            candidate["id"], db_path=database, generation=candidate.get("generation"))
+    if observation.get("state") != "observed":
+        return None
+    session = observation.get("session") or {}
+    if session.get("directory") and not same_path(session["directory"], worktree):
+        return None
+    updated = session.get("time_updated") or candidate.get("time_updated")
+    for message in observation.get("messages") or ():
+        updated = max(updated or 0, message.get("updated") or message.get("created") or 0)
+    return candidate["id"], session.get("slug") or candidate.get("slug") or "", to_seconds(updated)
 
 
 def heartbeat_age_min(agent_home: Path, slug: str, now: float) -> float | None:
@@ -214,7 +218,7 @@ def main(argv: list[str]) -> int:
     con.row_factory = sqlite3.Row
 
     now = time.time()
-    open_n = alive = suspect = 0
+    open_n = alive = suspect = unknown = 0
     try:
         rows = current_job_lines(jobs)
     except RuntimeError as exc:
@@ -251,7 +255,18 @@ def main(argv: list[str]) -> int:
                 print(f"COMPLETED {label} - namespace-local terminal heartbeat awaits registry reconciliation [open: {ts}]")
                 suspect += 1
                 continue
-            match = locate_latest_for_worktree(con, worktree)
+            metadata = dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+            bound_session = ""
+            attempt = metadata.get("attempt_id", "")
+            if attempt:
+                try:
+                    from types import SimpleNamespace
+                    from opencode_session_runtime import read_binding
+                    bound_session = read_binding(SimpleNamespace(
+                        jobs=str(jobs), parent_attempt_id=attempt, worktree=worktree))
+                except Exception:
+                    bound_session = ""
+            match = locate_latest_for_worktree(con, worktree, bound_session or None)
             if match is None:
                 # No SQLite session for this worktree. Fall back to the heartbeat
                 # side-channel: a recent heartbeat means the plugin is still
@@ -265,15 +280,15 @@ def main(argv: list[str]) -> int:
                     print(f"ALIVE    {label} (heartbeat {hb_age:.1f}m ago; plugin_loaded={plugin_marker})")
                     alive += 1
                     continue
-                # No fresh signal — SD-15b: consult the anchored log scan to name a limit/auth
-                # death (also catches hang-on-limit #8203); else fall through to the DEAD reasons.
+                # A confirmed provider rejection is evidence. Missing session
+                # and plugin observations are gaps, not proof that work died.
                 log_hit = log_shows_limit(agent_home, slug)
                 if log_hit is not None:
                     print(f"DEAD     {label} - log limit/auth pattern ({log_hit}) [open: {ts}]")
-                elif not plugin_marker:
-                    print(f"DEAD     {label} - OpenCode session not found for {worktree} and no plugin-load marker [open: {ts}]")
                 else:
-                    print(f"DEAD     {label} - OpenCode session not found for {worktree} [open: {ts}]")
+                    print(f"UNKNOWN  {label} - exact OpenCode session/guard observation unavailable [open: {ts}]")
+                    unknown += 1
+                    continue
                 suspect += 1
                 continue
             session_id, session_slug, updated_at = match
@@ -281,17 +296,10 @@ def main(argv: list[str]) -> int:
             detail = f"{session_id}"
             if session_slug:
                 detail = f"{session_id}/{session_slug}"
-            # Cross-check plugin-load marker: a running SQLite session *without*
-            # the marker means the headless runtime loaded OpenCode but the
-            # harness plugin did not init — guards are not active, so the run is
-            # effectively unguarded even if the process is alive.
             plugin_marker = plugin_loaded_for_slug(agent_home, slug)
             if age <= stale_min:
-                marker_note = "" if plugin_marker else " plugin_loaded=false"
+                marker_note = "" if plugin_marker else " plugin_loaded=unobserved"
                 print(f"ALIVE    {label} (OpenCode session {age}m ago: {detail}{marker_note})")
-                if not plugin_marker and slug:
-                    # Alive but unguarded — flag as SUSPECT so main harvests attention.
-                    print(f"  note: no plugin-load marker for {slug}; harness guards likely inactive")
                 alive += 1
             else:
                 hb_age = heartbeat_age_min(agent_home, slug, now)
@@ -305,10 +313,12 @@ def main(argv: list[str]) -> int:
                     if log_hit is not None:
                         print(f"DEAD     {label} - log limit/auth pattern ({log_hit}) [open: {ts}]")
                     else:
-                        print(f"SUSPECT  {label} - OpenCode session {age}m stale: {detail} [open: {ts}]")
+                        print(f"UNKNOWN  {label} - OpenCode session observation is stale: {detail} [open: {ts}]")
+                        unknown += 1
+                        continue
                     suspect += 1
 
-    print(f"open {open_n} ; alive {alive} ; suspect/dead {suspect}")
+    print(f"open {open_n} ; alive {alive} ; suspect/dead {suspect} ; unknown {unknown}")
     print(f"classifier_source={ATTEMPT_CLASSIFIER_SOURCE}")
     if suspect:
         print("SUSPECT/DEAD: inspect OpenCode session export/DB and dispatch log, then harvest or redispatch.")

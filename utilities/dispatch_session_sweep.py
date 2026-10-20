@@ -242,7 +242,8 @@ def record_jobs(root: Path, record: dict) -> Path | None:
 
 
 def retain_receiving_turn(batches: list[tuple[Path, list[dict]]], session_id: str,
-                          receiving_turn: dict | None) -> set[tuple[str, str]]:
+                          receiving_turn: dict | None, *,
+                          request_context: str | None = None) -> set[tuple[str, str]]:
     """Persist exact completion/turn ownership before a Codex prompt is ACKed.
 
     Returned keys identify records that the hook may ACK after successful
@@ -275,7 +276,8 @@ def retain_receiving_turn(batches: list[tuple[Path, list[dict]]], session_id: st
                 try:
                     if not retain_registered_completion(
                             jobs, attempt, session_id, record.get("recipient_kind", ""),
-                            delivery_record=record, receiving_turn=receiving_turn):
+                            delivery_record=record, receiving_turn=receiving_turn,
+                            request_context=request_context):
                         retained = False
                         break
                 except (OSError, ValueError, RuntimeError):

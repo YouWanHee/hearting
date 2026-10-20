@@ -4,6 +4,7 @@ A fixture uses a temporary dispatch state root; no live registry or home is read
 """
 import contextlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from fleet.model import DispatchJob  # noqa: E402
 from fleet.refresh import LiveSnapshot  # noqa: E402
 from worker_runtime_home import _builder  # noqa: E402
 
-DAY = 86400 * 10**9
+RETENTION_NS = retention.IDLE_SECONDS * 10**9
 CONTRACT = ("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
             "execution_surface=registered-headless,registered_worker=1,"
             "fallback_hop=same-harness-headless,worker_type=stage")
@@ -185,7 +186,7 @@ class WorkerHomeViewTest(unittest.TestCase):
         self.assertFalse(self.mark(old_key).exists())
         # The unviewed historical home is therefore still eligible to age out.
         retention.sweep(self.jobs, now_ns=self.now, force=True)
-        result = retention.sweep(self.jobs, now_ns=self.now + 8 * DAY, force=True)
+        result = retention.sweep(self.jobs, now_ns=self.now + int(8 / 7 * RETENTION_NS), force=True)
         self.assertEqual(result["removed"], 1)
         self.assertFalse(old.exists())
         self.assertTrue(shown.is_dir())
@@ -336,11 +337,51 @@ class WorkerHomeViewTest(unittest.TestCase):
             with original(jobs):
                 yield
 
-        later = self.now + 8 * DAY
+        later = self.now + int(8 / 7 * RETENTION_NS)
         with mock.patch.object(retention, "_registry_lock", lock):
             result = retention.sweep(self.jobs, now_ns=later, force=True)
         self.assertEqual(landed, [True])
         self.assertTrue(self.mark(key).is_file())
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"].get("recent-view"), 1)
+        self.assertTrue(path.is_dir())
+
+    def test_recent_cached_view_marker_survives_detach_boundary(self):
+        path, key = self.home("att-shown", "done")
+        retention.sweep(self.jobs, now_ns=self.now, force=True)
+        job = self.job(path)
+        later = self.now + int(8 / 7 * RETENTION_NS)
+        original_detach = retention._detach
+        marker_before = []
+        admissions = []
+
+        def record_admission(jobs, home):
+            admitted = retention.note_view(jobs, home)
+            admissions.append(admitted)
+            return admitted
+
+        def land_cached_marker(ctx, home_key, ident, attempt, raw, first_ns, deadline=None,
+                               _rechecks=0, binding=None):
+            marker = self.mark(key)
+            marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            marker.write_text("")
+            mark_time = later / 1e9 - (retention.VIEW_REFRESH_SECONDS - 1)
+            os.utime(marker, (mark_time, mark_time))
+            marker_before.append(marker.stat().st_mtime_ns)
+            with mock.patch.object(retention.time, "time", return_value=later / 1e9), \
+                    mock.patch.object(dispatch, "_note_worker_home_view", side_effect=record_admission):
+                with self.fleet_detail_pass(job):
+                    pass
+                native_read_allowed = dispatch._native_home_admitted(job)
+            marker_after = marker.stat().st_mtime_ns
+            self.assertEqual(marker_after, marker_before[-1])
+            self.assertTrue(native_read_allowed)
+            return original_detach(ctx, home_key, ident, attempt, raw, first_ns,
+                                   deadline=deadline, _rechecks=_rechecks, binding=binding)
+
+        with mock.patch.object(retention, "_detach", side_effect=land_cached_marker):
+            result = retention.sweep(self.jobs, now_ns=later, force=True)
+        self.assertEqual(admissions, [True, True])
         self.assertEqual(result["removed"], 0)
         self.assertEqual(result["kept"].get("recent-view"), 1)
         self.assertTrue(path.is_dir())
