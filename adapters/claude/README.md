@@ -18,6 +18,10 @@ This adapter maps the common agent harness onto Claude Code.
 Fleet is read-only. Interactive Claude summary refresh remains a statusline
 lifecycle producer, while registered Claude dispatch uses the attempt-owned
 supervisor and `dispatch-reconcile --apply` exact-live recovery contract.
+Fleet also reads exact Claude attempt-stream `local_bash` background lifecycle
+events when no persistent transcript exists. Task, run, Bash call, full session,
+and source generation remain bound; task-set snapshots alone do not create rows,
+and native completion remains separate from process liveness.
 
 ## Worker bootstrap boundary
 

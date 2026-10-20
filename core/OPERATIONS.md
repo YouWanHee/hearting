@@ -2605,6 +2605,17 @@ file is a locator separate from process liveness. API-request copies, ordinary
 user text, tool output, quotes, and mismatched identities have no terminal
 authority.
 
+Claude attempt streams also expose the snake-case
+`tool_use_result.backgroundTaskId` envelope. Accept it only for one exact user
+`tool_result` and retained Bash call in the exact session and source generation;
+the existing on-disk camel-case form keeps its separate provenance. Native
+system `task_started` confirms only a matching, backgrounded `local_bash` call.
+`task_updated` and `task_notification` match that task, run, call, session,
+attempt, and generation; only a valid `patch.end_time` supplies native terminal
+time. Notifications can supply status and exit summary without a clock. Task-set
+snapshots, quoted output, and non-Bash task types create no shell identity;
+native lifecycle and process liveness remain independent evidence.
+
 For Codex, trusted App Server `command_execution` events and exact native
 `exec_command`/`write_stdin` call/output pairs establish task identity and
 lifecycle. Outer `functions.exec`/`functions.write_stdin` text is arbitrary

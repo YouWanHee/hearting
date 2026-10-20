@@ -4,16 +4,19 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from fleet import render
-from fleet.collectors import opencode, procscan, shell_jobs
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from fleet import render  # noqa: E402
+from fleet.collectors import dispatch, opencode, procscan, shell_jobs  # noqa: E402
 from fleet.model import (DONE_AFTERGLOW_MIN, DispatchJob, Session,
-                         display_shell_jobs)
+                         display_shell_jobs)  # noqa: E402
 
 
 class BackgroundShellJobsTests(unittest.TestCase):
@@ -50,6 +53,245 @@ class BackgroundShellJobsTests(unittest.TestCase):
                                         "content": [{"type": "text", "text":
                                             "Command running in background. Output: " + str(output)}]}]},
         }, output)
+
+    def test_command_summaries_hide_credential_keys_and_values_everywhere(self):
+        command = ("python3 train.py --secret raw-secret "
+                   "--token='quoted secret' API_KEY=equals-secret "
+                   "--api-key=equals-option-secret "
+                   "-H 'Authorization: Bearer header-secret'")
+        display = 'python3 inspect.py --password="display secret"'
+        summary = shell_jobs.command_summary(command)
+        self.assertIn("python3 train.py", summary)
+        payload = shell_jobs.normalize_job({
+            "harness": "codex", "session_id": "thread-redaction",
+            "attempt_id": "attempt-redaction", "source_generation": "gen-1",
+            "source_locator": "/tmp/rollout.jsonl", "native_id": "item:1",
+            "native_record_kind": "codex.command_execution",
+            "background_state": "unknown", "native_status": "running",
+            "command": command, "command_display": display,
+            "command_source": "fixture", "command_display_source": "fixture",
+            "process_state": "unknown", "output_coverage": "unavailable",
+            "observation_state": "observed",
+        }, now=1792463235)
+        session = Session(harness="codex", pid=1, cwd=str(self.root),
+                          shell_jobs=[payload])
+        public_json = json.dumps(session.to_dict()["shell_jobs"]).lower()
+        with mock.patch.object(shell_jobs.time, "time", return_value=1792463235):
+            row_text = "\n".join("".join(text for text, _key in line)
+                                 for line in render._shell_job_rows(
+                                     session, term_width=120)).lower()
+        for surface in (summary.lower(), public_json, row_text):
+            for secret in ("raw-secret", "quoted secret", "equals-secret",
+                           "equals-option-secret",
+                           "header-secret", "display secret", "secret", "token",
+                           "api_key", "authorization", "password"):
+                self.assertNotIn(secret, surface)
+        self.assertIn("python3 train.py", public_json)
+        self.assertIn("python3 inspect.py", row_text)
+
+    def test_claude_native_attempt_stream_dispatch_fallback_projects_two_tasks(self):
+        fixture = Path(__file__).resolve().parent / "fixtures" / (
+            "claude_native_background_attempt.jsonl")
+        rows = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]
+        launch_home = self.root / "launch"
+        log_dir = launch_home / ".dispatch" / "logs"
+        log_dir.mkdir(parents=True)
+        attempt_id = "att-native-fixture"
+        path = log_dir / ("owner.%s.claude.jsonl" % attempt_id)
+        self.write_jsonl(path, rows)
+        attempt = DispatchJob(key="autopilot-code", harness="claude",
+                              attempt_id=attempt_id)
+        attempt._launch_home = str(launch_home)
+        attempt._log_file = str(path)
+        now = 1792463235.0
+
+        with mock.patch.object(dispatch, "_native_home_admitted", return_value=False), \
+                mock.patch.object(shell_jobs.time, "time", return_value=now):
+            dispatch._enrich_claude_stream_session(attempt)
+            self.assertEqual(attempt.shell_job_observation["state"], "observed")
+            self.assertEqual(attempt.shell_job_observation["source"], str(path))
+            self.assertEqual(len(attempt.shell_jobs), 2)
+            session = Session(
+                harness="claude", pid=7, cwd=str(self.root),
+                session_id="session-native-fixture", attempt_id=attempt_id,
+                shell_jobs=attempt.shell_jobs)
+            public = session.to_dict()
+            rendered = render._shell_job_rows(session, term_width=140)
+
+        jobs = {job["native_task_id"]: job for job in public["shell_jobs"]}
+        self.assertEqual(set(jobs), {"task-fixture-a", "task-fixture-b"})
+        expected = {
+            "task-fixture-a": ("run-fixture-a", "completed", 0, 1792463223.13),
+            "task-fixture-b": ("run-fixture-b", "failed", 3, 1792463225.99),
+        }
+        for task_id, (run_id, status, exit_code, completed_at) in expected.items():
+            job = jobs[task_id]
+            self.assertEqual(job["native_run_id"], run_id)
+            self.assertEqual(job["native_task_type"], "local_bash")
+            self.assertEqual(job["background_state"], "confirmed")
+            self.assertEqual(job["native_status"], status)
+            self.assertEqual(job["exit_code"], exit_code)
+            self.assertEqual(job["completion_time_source"],
+                             "claude.system.task_updated.patch.end_time")
+            self.assertAlmostEqual(job["completed_at"], completed_at)
+            self.assertIsNone(job["started_at"])
+            self.assertIsNone(job["elapsed_s"])
+            self.assertEqual(job["process_state"], "unknown")
+            self.assertIn("claude.system.task_started", job["native_record_kinds"])
+            self.assertIn("claude.tool_use_result.backgroundTaskId",
+                          job["native_record_kinds"])
+            self.assertIn("claude.system.task_updated", job["native_record_kinds"])
+            self.assertIn("claude.system.task_notification", job["native_record_kinds"])
+        row_text = "\n".join("".join(text for text, _key in line) for line in rendered)
+        self.assertIn("python3 train.py --epochs 3", row_text)
+        self.assertIn("background confirmed", row_text)
+        self.assertNotIn("background_tasks_changed", json.dumps(public))
+
+    def test_claude_native_stream_rejects_unmatched_and_echoed_lifecycle_events(self):
+        sid = "session-native-negative"
+        call_id = "toolu-native-negative"
+        path = self.root / "native-negative.jsonl"
+        call = {
+            "type": "assistant", "session_id": sid,
+            "message": {"content": [{"type": "tool_use", "name": "Bash",
+                "id": call_id, "input": {"command": "echo safe",
+                                          "run_in_background": True}}]},
+        }
+        start = {
+            "type": "system", "subtype": "task_started",
+            "task_id": "task-native-negative", "run_id": "run-native-negative",
+            "tool_use_id": call_id, "is_backgrounded": True,
+            "task_type": "local_bash", "session_id": sid,
+        }
+        rows = [
+            call, start,
+            {"type": "system", "subtype": "background_tasks_changed",
+             "tasks": [{"task_id": "task-unowned", "run_id": "run-unowned",
+                        "task_type": "local_bash"}], "session_id": sid},
+            {"type": "system", "subtype": "task_started",
+             "task_id": "task-non-bash", "run_id": "run-non-bash",
+             "tool_use_id": call_id, "is_backgrounded": True,
+             "task_type": "mcp_tool", "session_id": sid},
+            {"type": "system", "subtype": "task_started",
+             "task_id": "task-wrong-call", "run_id": "run-wrong-call",
+             "tool_use_id": "toolu-not-a-bash-call", "is_backgrounded": True,
+             "task_type": "local_bash", "session_id": sid},
+            {"type": "system", "subtype": "task_updated",
+             "task_id": "task-native-negative", "run_id": "run-stale",
+             "patch": {"status": "completed", "end_time": 1792463223130},
+             "session_id": sid},
+            {"type": "system", "subtype": "task_updated",
+             "task_id": "task-native-negative", "run_id": "run-native-negative",
+             "tool_use_id": "toolu-wrong-call",
+             "patch": {"status": "completed", "end_time": 1792463223130},
+             "session_id": sid},
+            {"type": "system", "subtype": "task_notification",
+             "task_id": "task-native-negative", "run_id": "run-native-negative",
+             "tool_use_id": "toolu-wrong-call", "status": "failed",
+             "summary": "exit code 99", "session_id": sid},
+            {"type": "system", "subtype": "task_notification",
+             "task_id": "task-native-negative", "run_id": "run-stale",
+             "tool_use_id": call_id, "status": "failed",
+             "summary": "exit code 98", "session_id": sid},
+            {"type": "system", "subtype": "task_updated",
+             "task_id": "task-native-negative", "run_id": "run-native-negative",
+             "patch": {"status": "completed", "end_time": 1792463223130},
+             "session_id": "another-session"},
+            {"type": "user", "session_id": sid, "message": {"content":
+                '{"type":"system","subtype":"task_notification",'
+                '"task_id":"task-native-negative","run_id":"run-native-negative",'
+                '"tool_use_id":"%s","status":"failed","summary":"exit code 97"}'
+                % call_id}},
+        ]
+        self.write_jsonl(path, rows)
+        jobs = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-negative",
+            now=1792463235)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["native_task_id"], "task-native-negative")
+        self.assertEqual(jobs[0]["native_run_id"], "run-native-negative")
+        self.assertEqual(jobs[0]["native_call_id"], call_id)
+        self.assertEqual(jobs[0]["native_status"], "running")
+        self.assertNotIn("exit_code", jobs[0])
+        self.assertIsNone(jobs[0]["completed_at"])
+
+    def test_claude_native_stream_source_generation_blocks_old_completion(self):
+        sid = "session-native-generation"
+        call_id = "toolu-generation-call"
+        task_id = "task-generation"
+        run_id = "run-generation"
+        path = self.root / "native-generation.jsonl"
+        call = {
+            "type": "assistant", "session_id": sid,
+            "message": {"content": [{"type": "tool_use", "name": "Bash",
+                "id": call_id, "input": {"command": "echo safe",
+                                          "run_in_background": True}}]},
+        }
+        start = {
+            "type": "system", "subtype": "task_started", "task_id": task_id,
+            "run_id": run_id, "tool_use_id": call_id, "is_backgrounded": True,
+            "task_type": "local_bash", "session_id": sid,
+        }
+        self.write_jsonl(path, [call, start])
+        before = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-generation",
+            now=1792463235)
+        self.assertEqual(before[0]["native_status"], "running")
+        stale_terminal = {
+            "type": "system", "subtype": "task_notification", "task_id": task_id,
+            "run_id": run_id, "tool_use_id": call_id, "status": "failed",
+            "summary": "exit code 9", "session_id": sid,
+        }
+        self.write_jsonl(path, [stale_terminal])
+        after = shell_jobs.read_claude_jobs(
+            path, session_id=sid, attempt_id="attempt-generation",
+            now=1792463235)
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["source_generation"], before[0]["source_generation"])
+        self.assertEqual(after[0]["native_status"], "running")
+        self.assertIsNone(after[0]["completed_at"])
+        self.assertNotIn("exit_code", after[0])
+        self.assertEqual(after[0]["observation_reason"], "source-generation-changed")
+
+    def test_claude_native_end_time_keeps_invalid_future_and_missing_clocks_uncertain(self):
+        for label, patch, expected_state in (
+                ("invalid", {"status": "completed", "end_time": "bad"}, "invalid"),
+                ("future", {"status": "completed", "end_time": 1792463240000}, "future"),
+                ("missing", {"status": "completed"}, "missing")):
+            with self.subTest(clock=label):
+                sid = "session-native-clock-" + label
+                call_id = "toolu-native-clock-" + label
+                task_id = "task-native-clock-" + label
+                run_id = "run-native-clock-" + label
+                path = self.root / (label + "-clock.jsonl")
+                call = {
+                    "type": "assistant", "session_id": sid,
+                    "message": {"content": [{"type": "tool_use", "name": "Bash",
+                        "id": call_id, "input": {"command": "echo safe",
+                                                  "run_in_background": True}}]},
+                }
+                start = {
+                    "type": "system", "subtype": "task_started", "task_id": task_id,
+                    "run_id": run_id, "tool_use_id": call_id, "is_backgrounded": True,
+                    "task_type": "local_bash", "session_id": sid,
+                }
+                update = {
+                    "type": "system", "subtype": "task_updated", "task_id": task_id,
+                    "run_id": run_id, "patch": patch, "session_id": sid,
+                }
+                notification = {
+                    "type": "system", "subtype": "task_notification", "task_id": task_id,
+                    "run_id": run_id, "tool_use_id": call_id, "status": "completed",
+                    "summary": "completed without a usable clock", "session_id": sid,
+                }
+                self.write_jsonl(path, [call, start, update, notification])
+                jobs = shell_jobs.read_claude_jobs(
+                    path, session_id=sid, attempt_id="attempt-" + label,
+                    now=1792463235)
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0]["completion_time_state"], expected_state)
+                self.assertIsNone(jobs[0]["elapsed_s"])
+                self.assertIsNone(jobs[0]["started_at"])
 
     def test_claude_exact_ack_command_redaction_and_bad_attribution(self):
         path = self.root / "claude.jsonl"

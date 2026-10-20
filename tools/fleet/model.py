@@ -145,12 +145,15 @@ class ShellJob(TypedDict, total=False):
     native_id: str
     native_id_kind: Optional[str]
     native_record_kind: Optional[str]
+    native_record_kinds: list[str]
     background_state: Optional[str]
     background_source: Optional[str]
     background_reason: Optional[str]
     identity_link_state: Optional[str]
     native_call_id: Optional[str]
     native_task_id: Optional[str]
+    native_run_id: Optional[str]
+    native_task_type: Optional[str]
     continuation_handle: Optional[str]
     command: Optional[str]
     command_display: Optional[str]
@@ -161,7 +164,11 @@ class ShellJob(TypedDict, total=False):
     start_source: Optional[str]
     observed_at: Optional[float]
     completed_at: Optional[float]
+    completion_time_source: Optional[str]
+    completion_time_state: Optional[str]
+    completion_time_reason: Optional[str]
     exit_code: Optional[int]
+    exit_code_source: Optional[str]
     native_status: str
     lifecycle_state: str
     process_state: str

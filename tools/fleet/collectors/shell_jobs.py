@@ -29,8 +29,17 @@ _STREAMS = OrderedDict()
 _OUTPUTS = OrderedDict()
 _VERIFIED_PROCESSES = OrderedDict()
 _TASKS = OrderedDict()
-_SECRET = re.compile(r"""(?i)(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\b\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)""")
-_SECRET_FLAG = re.compile(r"""(?i)(--?(?:password|passwd|token|secret|api[-_]?key|authorization)(?:=|\s+))(?:"[^"]*"|'[^']*'|[^\s,;]+)""")
+_CREDENTIAL_NAME = (r"(?:[A-Za-z_][A-Za-z0-9_-]*?)?"
+                    r"(?:password|passwd|token|secret|api[_-]?key|authorization)"
+                    r"[A-Za-z0-9_-]*")
+_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;|&]+)"""
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?<![\w-])" + _CREDENTIAL_NAME + r"\s*[:=]\s*" + _CREDENTIAL_VALUE)
+_SECRET_OPTION = re.compile(
+    r"(?i)(?<![\w-])--?(?:password|passwd|token|secret|api[-_]?key|authorization)"
+    r"(?:\s*=\s*" + _CREDENTIAL_VALUE + r"|\s+(?!-{1,2})" + _CREDENTIAL_VALUE
+    + r"|(?=$|[\s,;|&]))")
+_AUTH_HEADER = re.compile(r"(?i)(?<![\w-])authorization\s*:\s*[^'\x22\x60\r\n;|&]+")
 
 
 @dataclass(frozen=True)
@@ -73,8 +82,9 @@ def command_summary(value):
         return None
     value = "".join(ch if ch >= " " and ch not in "\x7f\x1b" else " " for ch in value)
     value = re.sub(r"\s+", " ", value).strip()
-    value = _SECRET.sub(r"\1[redacted]", value)
-    value = _SECRET_FLAG.sub(r"\1[redacted]", value)
+    value = _AUTH_HEADER.sub("[redacted]", value)
+    value = _SECRET_OPTION.sub("[redacted]", value)
+    value = _SECRET_ASSIGNMENT.sub("[redacted]", value)
     return value[:MAX_COMMAND] + ("…" if len(value) > MAX_COMMAND else "") if value else None
 
 
@@ -420,7 +430,8 @@ def _apply_claude_notification(state, notification, *, path, session_id,
             or prior.get("session_id") != session_id
             or prior.get("attempt_id") != attempt_id
             or prior.get("source_locator") != os.path.abspath(path)
-            or prior.get("source_generation") != str(generation)):
+            or prior.get("source_generation") != str(generation)
+            or prior.get("native_run_id")):
         return
     output_path = notification.get("output_path")
     prior_path = prior.get("output_path")
@@ -446,6 +457,209 @@ def _apply_claude_notification(state, notification, *, path, session_id,
     _store_task(state, task_id, updated)
 
 
+def _claude_record_kinds(prior, *record_kinds):
+    kinds = prior.get("native_record_kinds")
+    if not isinstance(kinds, list):
+        kinds = [prior["native_record_kind"]] if prior.get("native_record_kind") else []
+    for kind in record_kinds:
+        if isinstance(kind, str) and kind and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def _claude_tasks_for_call(state, call_id):
+    return [item for item in state["jobs"].values()
+            if isinstance(item, dict) and item.get("native_call_id") == call_id]
+
+
+def _claude_native_status(value):
+    statuses = {
+        "running": "running", "in_progress": "running", "ongoing": "running",
+        "background": "running", "completed": "completed", "complete": "completed",
+        "exited": "completed", "failed": "failed", "error": "failed",
+        "stopped": "stopped", "cancelled": "stopped", "canceled": "stopped",
+    }
+    return statuses.get(value.lower()) if isinstance(value, str) else None
+
+
+def _claude_native_start(state, row, *, path, session_id, attempt_id, generation):
+    if (row.get("type") != "system" or row.get("subtype") != "task_started"
+            or row.get("session_id") != session_id
+            or row.get("task_type") != "local_bash"
+            or row.get("is_backgrounded") is not True):
+        return
+    task_id, run_id, call_id = (row.get("task_id"), row.get("run_id"),
+                                row.get("tool_use_id"))
+    if not all(isinstance(value, str) and _CLAUDE_NATIVE_ID.fullmatch(value)
+               for value in (task_id, run_id, call_id)):
+        return
+    prior = state["jobs"].get(task_id)
+    call = state["calls"].get(call_id)
+    call_jobs = _claude_tasks_for_call(state, call_id)
+    call_job = call_jobs[0] if len(call_jobs) == 1 else None
+    if (len(call_jobs) > 1
+            or (call_job is not None and call_job.get("native_task_id") != task_id)
+            or (call is None and call_job is None)):
+        return
+    if prior is not None and (
+            prior.get("native_call_id") != call_id
+            or prior.get("session_id") != session_id
+            or prior.get("attempt_id") != attempt_id
+            or prior.get("source_locator") != os.path.abspath(path)
+            or prior.get("source_generation") != str(generation)
+            or (prior.get("native_run_id") and prior.get("native_run_id") != run_id)):
+        return
+    source = "claude.system.task_started"
+    item = dict(prior or {})
+    status = str(item.get("native_status") or "").lower()
+    terminal = status in {"completed", "complete", "exited", "failed", "error",
+                          "cancelled", "canceled", "stopped", "timed_out", "timeout"}
+    # task_started has no start clock; the assistant envelope timestamp is not
+    # a native task start time.
+    item.update({
+        "harness": "claude", "session_id": session_id, "attempt_id": attempt_id,
+        "source_generation": str(generation), "source_locator": os.path.abspath(path),
+        "native_id": task_id, "native_task_id": task_id, "native_call_id": call_id,
+        "native_run_id": run_id, "native_task_type": "local_bash",
+        "native_record_kind": item.get("native_record_kind") or source,
+        "native_record_kinds": _claude_record_kinds(item, source),
+        "background_state": "confirmed",
+        "background_source": item.get("background_source") or source,
+        "background_reason": None,
+        "command": item.get("command") or (call or {}).get("command"),
+        "command_source": item.get("command_source") or (
+            "Bash.input.command" if (call or {}).get("command") else None),
+        "started_at": item.get("started_at"),
+        "start_source": item.get("start_source"),
+        "observed_at": _row_time(row) or item.get("observed_at"),
+        "native_status": item.get("native_status") if terminal else "running",
+        "native_status_source": (item.get("native_status_source") if terminal else source),
+        "process_state": "unknown",
+        "process_reason": "native-task-event-has-no-process-identity",
+        "output_path": item.get("output_path"),
+        "output_reason": item.get("output_reason") or "native-output-locator-unavailable",
+        "output_coverage": item.get("output_coverage") or "unavailable",
+        "observation_state": "observed", "observation_reason": None,
+    })
+    _store_task(state, task_id, item)
+
+
+def _claude_native_prior(state, row, *, path, session_id, attempt_id, generation):
+    if (row.get("type") != "system" or row.get("session_id") != session_id):
+        return None
+    task_id, run_id = row.get("task_id"), row.get("run_id")
+    if (not isinstance(task_id, str) or not _CLAUDE_NATIVE_ID.fullmatch(task_id)
+            or not isinstance(run_id, str) or not _CLAUDE_NATIVE_ID.fullmatch(run_id)):
+        return None
+    prior = state["jobs"].get(task_id)
+    if (not isinstance(prior, dict) or prior.get("harness") != "claude"
+            or prior.get("native_task_id") != task_id
+            or prior.get("native_run_id") != run_id
+            or prior.get("native_task_type") != "local_bash"
+            or not prior.get("native_call_id")
+            or (row.get("tool_use_id") is not None
+                and row.get("tool_use_id") != prior.get("native_call_id"))
+            or prior.get("session_id") != session_id
+            or prior.get("attempt_id") != attempt_id
+            or prior.get("source_locator") != os.path.abspath(path)
+            or prior.get("source_generation") != str(generation)):
+        return None
+    return prior
+
+
+def _apply_claude_native_update(state, row, *, path, session_id, attempt_id, generation):
+    if row.get("subtype") != "task_updated":
+        return
+    prior = _claude_native_prior(
+        state, row, path=path, session_id=session_id,
+        attempt_id=attempt_id, generation=generation)
+    patch = row.get("patch")
+    status = _claude_native_status(patch.get("status")) if isinstance(patch, dict) else None
+    if prior is None or status is None:
+        return
+    source = "claude.system.task_updated"
+    item = dict(prior)
+    old_status = str(item.get("native_status") or "").lower()
+    old_terminal = old_status in {"completed", "complete", "exited", "failed", "error",
+                                  "cancelled", "canceled", "stopped", "timed_out", "timeout"}
+    if old_terminal and status == "running":
+        status = old_status
+    item.update({
+        "native_status": status,
+        "native_status_source": source,
+        "native_record_kinds": _claude_record_kinds(item, source),
+        "observed_at": _row_time(row) or item.get("observed_at"),
+    })
+    terminal = status in {"completed", "failed", "stopped"}
+    if terminal:
+        if "end_time" not in patch:
+            if valid_epoch(item.get("completed_at")) is None:
+                item.update(completed_at=None, completion_time_state="missing",
+                            completion_time_reason="native-task-update-has-no-end-time")
+        else:
+            stamp = valid_epoch(patch.get("end_time"), milliseconds=True)
+            if stamp is None:
+                if valid_epoch(item.get("completed_at")) is None:
+                    item.update(completed_at=None, completion_time_state="invalid",
+                                completion_time_reason="invalid-native-task-end-time",
+                                completion_time_source=(
+                                    "claude.system.task_updated.patch.end_time"))
+            else:
+                previous = valid_epoch(item.get("completed_at"))
+                if previous is not None and stamp < previous:
+                    return
+                item.update(
+                    completed_at=stamp,
+                    completion_time_source=(
+                        "claude.system.task_updated.patch.end_time"))
+                item.pop("completion_time_state", None)
+                item.pop("completion_time_reason", None)
+    _store_task(state, row["task_id"], item)
+
+
+def _apply_claude_native_notification(state, row, *, path, session_id,
+                                      attempt_id, generation):
+    if row.get("subtype") != "task_notification":
+        return
+    prior = _claude_native_prior(
+        state, row, path=path, session_id=session_id,
+        attempt_id=attempt_id, generation=generation)
+    call_id = row.get("tool_use_id")
+    status = _claude_native_status(row.get("status"))
+    if (prior is None or call_id != prior.get("native_call_id")
+            or status not in {"completed", "failed", "stopped"}):
+        return
+    source = "claude.system.task_notification"
+    item = dict(prior)
+    item.update({
+        "native_status": status,
+        "native_status_source": source,
+        "native_record_kinds": _claude_record_kinds(item, source),
+    })
+    if valid_epoch(item.get("completed_at")) is None and not item.get("completion_time_state"):
+        item.update(completion_time_state="missing",
+                    completion_time_reason="task-notification-has-no-timestamp")
+    output_path = row.get("output_file")
+    if isinstance(output_path, str) and output_path:
+        if os.path.isabs(output_path) and "\n" not in output_path:
+            prior_path = item.get("output_path")
+            if not prior_path or prior_path == output_path:
+                item.update(output_path=output_path, output_reason=None,
+                            output_coverage="sampled")
+        elif not item.get("output_path"):
+            item["output_reason"] = "invalid-native-output-locator"
+    summary = row.get("summary")
+    exit_codes = (re.findall(r"\bexit code\s+(-?\d+)\b", summary, re.IGNORECASE)
+                  if isinstance(summary, str) else [])
+    if len(exit_codes) == 1:
+        try:
+            item["exit_code"] = int(exit_codes[0])
+            item["exit_code_source"] = "claude.system.task_notification.summary"
+        except (ValueError, OverflowError):
+            pass
+    _store_task(state, row["task_id"], item)
+
+
 def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
     """Read exact Claude Bash acknowledgements from an incrementally scanned transcript."""
     source_key = ("claude", os.path.abspath(path), session_id, attempt_id)
@@ -467,6 +681,19 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
         state["coverage_reasons"].clear()
         state["jobs"].clear()
     for row in delta.get("lines", ()):
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "system":
+            _claude_native_start(
+                state, row, path=path, session_id=session_id,
+                attempt_id=attempt_id, generation=delta.get("generation"))
+            _apply_claude_native_update(
+                state, row, path=path, session_id=session_id,
+                attempt_id=attempt_id, generation=delta.get("generation"))
+            _apply_claude_native_notification(
+                state, row, path=path, session_id=session_id,
+                attempt_id=attempt_id, generation=delta.get("generation"))
+            continue
         if not _claude_row_matches_session(row, session_id):
             continue
         stamp = _row_time(row)
@@ -476,13 +703,24 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
         if isinstance(content, list) and row_type in ("assistant", "user"):
             result_parts = [part for part in content if isinstance(part, dict)
                             and part.get("type") == "tool_result"]
-            result_metadata = row.get("toolUseResult")
-            structured_task_id = None
-            if (row_type == "user" and len(result_parts) == 1
-                    and isinstance(result_metadata, dict)):
-                candidate = result_metadata.get("backgroundTaskId")
-                if isinstance(candidate, str) and _CLAUDE_NATIVE_ID.fullmatch(candidate):
-                    structured_task_id = candidate
+            metadata_candidates = []
+            metadata_conflict = False
+            if row_type == "user" and len(result_parts) == 1:
+                for key, source in (
+                        ("toolUseResult", "claude.toolUseResult.backgroundTaskId"),
+                        ("tool_use_result", "claude.tool_use_result.backgroundTaskId")):
+                    metadata = row.get(key)
+                    if (key == "tool_use_result" and row.get("session_id") != session_id):
+                        continue
+                    candidate = metadata.get("backgroundTaskId") if isinstance(metadata, dict) else None
+                    if isinstance(candidate, str) and _CLAUDE_NATIVE_ID.fullmatch(candidate):
+                        metadata_candidates.append((candidate, source))
+                if len({candidate for candidate, _source in metadata_candidates}) > 1:
+                    metadata_conflict = True
+            structured_task_id = (metadata_candidates[0][0] if metadata_candidates
+                                  and not metadata_conflict else None)
+            structured_sources = [source for candidate, source in metadata_candidates
+                                  if candidate == structured_task_id]
             for part in content:
                 if not isinstance(part, dict):
                     continue
@@ -496,6 +734,8 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                             "run_in_background": inputs.get("run_in_background") is True,
                         })
                 elif row_type == "user" and part.get("type") == "tool_result":
+                    if metadata_conflict:
+                        continue
                     call_id = part.get("tool_use_id")
                     call = state["calls"].pop(call_id, None)
                     if not isinstance(call, dict):
@@ -511,36 +751,75 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         task_id, output_path = text_task_id, text_output_path
                     if not task_id:
                         continue
-                    background_confirmed = structured_task_id is not None
-                    _store_task(state, task_id, {
+                    call_jobs = _claude_tasks_for_call(state, call_id)
+                    prior = state["jobs"].get(task_id)
+                    if (len(call_jobs) > 1
+                            or (call_jobs and call_jobs[0].get("native_task_id") != task_id)
+                            or (prior is not None and prior.get("native_call_id") != call_id)):
+                        continue
+                    ack_kind = "claude.background-bash-task-ack"
+                    record_kinds = _claude_record_kinds(
+                        prior or {}, *(structured_sources or [ack_kind]))
+                    if ack_kind not in record_kinds:
+                        record_kinds = _claude_record_kinds(
+                            dict(prior or {}, native_record_kinds=record_kinds), ack_kind)
+                    native_record_kind = ((prior or {}).get("native_record_kind")
+                                          or (structured_sources[0] if structured_sources
+                                              else ack_kind))
+                    background_confirmed = bool(structured_task_id) or (
+                        (prior or {}).get("background_state") == "confirmed")
+                    background_source = ((prior or {}).get("background_source")
+                                         or (structured_sources[0] if structured_sources else None))
+                    snake_metadata = any(source.startswith(
+                        "claude.tool_use_result.") for source in structured_sources)
+                    started_at = (prior or {}).get("started_at")
+                    start_source = (prior or {}).get("start_source")
+                    if started_at is None and not snake_metadata:
+                        started_at = call.get("started_at")
+                        start_source = ("Bash.tool_use.timestamp"
+                                        if started_at is not None else None)
+                    prior_status = str((prior or {}).get("native_status") or "").lower()
+                    terminal = prior_status in {
+                        "completed", "complete", "exited", "failed", "error",
+                        "cancelled", "canceled", "stopped", "timed_out", "timeout"}
+                    item = dict(prior or {})
+                    item.update({
                         "harness": "claude", "session_id": session_id,
                         "attempt_id": attempt_id, "source_generation": str(delta.get("generation")),
                         "source_locator": os.path.abspath(path), "native_id": task_id,
-                        "native_record_kind": (
-                            "claude.toolUseResult.backgroundTaskId" if background_confirmed
-                            else "claude.background-bash-task-ack"),
+                        "native_record_kind": native_record_kind,
+                        "native_record_kinds": record_kinds,
                         "background_state": "confirmed" if background_confirmed else "unknown",
-                        "background_source": (
-                            "claude.toolUseResult.backgroundTaskId" if background_confirmed
-                            else None),
+                        "background_source": background_source if background_confirmed else None,
                         "background_reason": (None if background_confirmed else
                                               "claude-native-background-task-metadata-unavailable"),
                         "native_call_id": call_id, "native_task_id": task_id,
-                        "command": call.get("command"),
-                        "command_source": "Bash.input.command" if call.get("command") else None,
-                        "started_at": call.get("started_at"),
-                        "start_source": "Bash.tool_use.timestamp", "observed_at": stamp,
-                        "native_status": "acknowledged", "process_state": "unknown",
+                        "native_run_id": (prior or {}).get("native_run_id"),
+                        "native_task_type": (prior or {}).get("native_task_type"),
+                        "command": (prior or {}).get("command") or call.get("command"),
+                        "command_source": ((prior or {}).get("command_source")
+                                           or ("Bash.input.command" if call.get("command") else None)),
+                        "started_at": started_at, "start_source": start_source,
+                        "observed_at": stamp,
+                        "native_status": ((prior or {}).get("native_status")
+                                          if terminal or prior_status == "running"
+                                          else "acknowledged"),
+                        "native_status_source": ((prior or {}).get("native_status_source")
+                                                 if terminal or prior_status == "running"
+                                                 else "claude.tool_result.acknowledgement"),
+                        "process_state": "unknown",
                         "process_reason": "task-ack-is-not-process-proof",
-                        "output_path": output_path,
-                        "output_reason": None if output_path else "ack-has-no-exact-output-path",
-                        "output_coverage": "sampled" if output_path else "unavailable",
+                        "output_path": ((prior or {}).get("output_path") or output_path),
+                        "output_reason": (None if (prior or {}).get("output_path") or output_path
+                                          else "ack-has-no-exact-output-path"),
+                        "output_coverage": ("sampled" if (prior or {}).get("output_path")
+                                            or output_path else "unavailable"),
                         "observation_state": delta.get("state"),
                         "observation_reason": delta.get("reason"),
                     })
+                    _store_task(state, task_id, item)
         notification = _claude_task_notification(row)
-        if (notification is not None
-                and row.get("sessionId") == session_id):
+        if (notification is not None and row.get("sessionId") == session_id):
             _apply_claude_notification(
                 state, notification, path=path, session_id=session_id,
                 attempt_id=attempt_id, generation=delta.get("generation"))
