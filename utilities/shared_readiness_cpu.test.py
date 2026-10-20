@@ -2,7 +2,7 @@
 """Matched production-entry carrier and peer-watch readiness measurements.
 
 This module is the measurement harness imported by
-``shared_readiness_cpu_fixture.test.py``.  It uses immutable baseline source
+``shared_readiness_cpu_fixture.test.py``. It uses the supplied baseline source
 and a content-bound candidate copy, real registered pending work, real carrier
 and ``__watch-run`` entry points, and the existing obligation runner.  Only the
 Herdr CLI and its local observation endpoint are faked.
@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import PurePosixPath
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -1316,6 +1317,140 @@ def _content_fingerprint(root):
             "bytes": total_bytes, "fingerprinted_roots": ["core", "hooks", "utilities", "tools/install"]}
 
 
+def _git_provenance(root):
+    """Report a revision only when Git's discovered top level is this source root."""
+    root = Path(root).resolve(strict=True)
+    top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True, check=False)
+    if top.returncode:
+        return {"status": "unavailable", "top_level": None, "dirty": None}
+    try:
+        top_level = Path(top.stdout.strip()).resolve(strict=True)
+    except OSError:
+        return {"status": "unavailable", "top_level": top.stdout.strip(), "dirty": None}
+    if top_level != root:
+        return {"status": "different-source-root", "top_level": str(top_level),
+                "dirty": None}
+
+    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=False)
+    if revision.returncode:
+        return {"status": "matched-source-root", "top_level": str(top_level),
+                "revision": None, "dirty": None, "dirty_paths": []}
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all",
+         "--", "core", "hooks", "utilities", "tools/install"],
+        capture_output=True, text=True, check=False,
+    )
+    dirty_paths = ([line[3:] for line in status.stdout.splitlines() if len(line) >= 4]
+                   if status.returncode == 0 else [])
+    return {"status": "matched-source-root", "top_level": str(top_level),
+            "revision": revision.stdout.strip(),
+            "dirty": bool(dirty_paths) if status.returncode == 0 else None,
+            "dirty_paths": dirty_paths,
+            "dirty_scope": ["core", "hooks", "utilities", "tools/install"]}
+
+
+def _verified_adjacent_manifest(root):
+    """Use an adjacent manifest only when it names and verifies this exact archive."""
+    root = Path(root).resolve(strict=True)
+    candidates = []
+    for path in sorted(root.parent.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            named_root = Path(payload.get("archive", "")).resolve(strict=False)
+        except (OSError, ValueError, TypeError):
+            continue
+        if named_root == root:
+            candidates.append((path, payload))
+    if not candidates:
+        return {"status": "not-found"}
+    if len(candidates) != 1:
+        return {"status": "ambiguous", "matching_manifests": [str(row[0]) for row in candidates]}
+
+    path, payload = candidates[0]
+    rows = payload.get("file_manifest")
+    errors = []
+    if not isinstance(rows, list) or not rows:
+        errors.append("file_manifest is missing or empty")
+        rows = []
+    if payload.get("checked_files") != len(rows):
+        errors.append("checked_files does not match file_manifest length")
+    seen = set()
+    checked_bytes = 0
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            errors.append("manifest contains a malformed row")
+            continue
+        relative = PurePosixPath(row["path"])
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            errors.append(f"unsafe manifest path: {row['path']}")
+            continue
+        source = root.joinpath(*relative.parts)
+        try:
+            resolved = source.resolve(strict=True)
+            if not resolved.is_relative_to(root) or source.is_symlink() or not source.is_file():
+                raise OSError("manifest path is not a regular file inside the archive")
+            blob = source.read_bytes()
+            expected_size = row.get("bytes")
+            expected_sha = row.get("sha256")
+            expected_blob = row.get("git_blob")
+            expected_mode = row.get("mode")
+            actual_mode = "100755" if source.stat().st_mode & 0o111 else "100644"
+            actual_blob = hashlib.sha1(
+                b"blob " + str(len(blob)).encode("ascii") + b"\0" + blob).hexdigest()
+            if (len(blob) != expected_size
+                    or hashlib.sha256(blob).hexdigest() != expected_sha
+                    or actual_blob != expected_blob or actual_mode != expected_mode):
+                errors.append(f"content, Git blob, or mode mismatch: {row['path']}")
+            checked_bytes += len(blob)
+            if row["path"] in seen:
+                errors.append(f"duplicate manifest path: {row['path']}")
+            seen.add(row["path"])
+        except OSError as exc:
+            errors.append(f"{row['path']}: {exc}")
+    if payload.get("checked_bytes") != checked_bytes:
+        errors.append("checked_bytes does not match verified manifest bytes")
+    return {
+        "status": "invalid" if errors else "verified",
+        "manifest_path": str(path),
+        "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "files_verified": len(seen),
+        "bytes_verified": checked_bytes,
+        "verification_scope": "listed manifest files",
+        "errors": errors,
+    }
+
+
+def _source_provenance(root):
+    root = Path(root).resolve(strict=True)
+    git = _git_provenance(root)
+    fingerprint = _content_fingerprint(root)
+    result = {
+        "kind": "git-worktree" if git["status"] == "matched-source-root" else "source-tree",
+        "path": str(root),
+        **fingerprint,
+        "git": git,
+    }
+    if git["status"] != "matched-source-root":
+        result["archive_manifest"] = _verified_adjacent_manifest(root)
+    return result
+
+
+def _invocation_record(evidence_dir):
+    evidence_dir = Path(evidence_dir).resolve()
+    return {
+        "executable": sys.executable,
+        "argv": list(sys.argv),
+        "cwd": str(Path.cwd().resolve()),
+        "evidence_paths": {
+            "json": str(evidence_dir / "readiness-cpu-fixture.json"),
+            "comparison": str(evidence_dir / "readiness-cpu-comparison.md"),
+            "cleanup": str(evidence_dir / "readiness-cpu-fixture-cleanup.json"),
+        },
+    }
+
+
 def _copy_managed_source(source_root, destination):
     data_root = Path(destination)
     releases = data_root / "releases"
@@ -1427,8 +1562,8 @@ def run_measurements(baseline_root, evidence_dir):
     _CLEANUP_PATH = evidence_dir / "readiness-cpu-fixture-cleanup.json"
     _CLEANUP_PATH.unlink(missing_ok=True)
     self_checks = sampler_self_checks()
-    baseline_fingerprint = _content_fingerprint(baseline_root)
-    candidate_fingerprint = _content_fingerprint(SOURCE_ROOT)
+    baseline_provenance = _source_provenance(baseline_root)
+    candidate_provenance = _source_provenance(SOURCE_ROOT)
     harness_fingerprint = {
         name: hashlib.sha256((SOURCE_ROOT / "utilities" / name).read_bytes()).hexdigest()
         for name in ("shared_readiness_cpu.test.py", "shared_readiness_cpu_fixture.test.py")
@@ -1443,13 +1578,13 @@ def run_measurements(baseline_root, evidence_dir):
         candidate_data, candidate_source = _copy_managed_source(
             SOURCE_ROOT, root / "candidate-data")
         sides = {
-            "baseline_main_a7f77262d": {
+            "baseline": {
                 "candidate": False, "source": baseline_source, "data_root": baseline_data,
-                "fingerprint": baseline_fingerprint,
+                "fingerprint": baseline_provenance,
             },
-            "candidate_567efc337": {
+            "candidate": {
                 "candidate": True, "source": candidate_source, "data_root": candidate_data,
-                "fingerprint": candidate_fingerprint,
+                "fingerprint": candidate_provenance,
             },
         }
         matrix = {"carrier": {}, "peer_watch": {}}
@@ -1485,7 +1620,7 @@ def run_measurements(baseline_root, evidence_dir):
                                 raise AssertionError(f"missing inclusive CPU boundary: {side_name}/{kind}/{window_name}")
                         if scenario["unrelated_event_12s"]["elapsed_seconds"] < 11.5:
                             raise AssertionError("unrelated-event sample was shorter than the required 12-second window")
-                        if (kind == "peer_watch" and side_name.startswith("candidate")
+                        if (kind == "peer_watch" and side_name == "candidate"
                                 and scenario["cold_start"]["classes"].get(
                                     "shared-runner", {}).get("peak_processes", 0) < 1):
                             raise AssertionError(
@@ -1499,41 +1634,11 @@ def run_measurements(baseline_root, evidence_dir):
     evidence = {
         "schema_version": 1,
         "measurement_scope": "isolated production-entry fixture; no host production PID claim",
-        "execution_contract": {
-            "capability_preflight": {
-                "status": "instruction-only",
-                "runtime_surface": "codex-native-skill",
-                "tool_contract": "none named",
-                "tool_contract_check": "none named",
-            },
-            "qa_policy": {
-                "level": "standard", "track": "code",
-                "assurance_scope": "selected-checks-only:not-completion-evidence",
-                "quality_reviewers": "1x-deep-reviewer+2x-fast-reviewers",
-                "fact_checker": "skip-code-track", "external_adversary": "skip",
-                "max_round": 1,
-            },
-            "narrow_verification_command": (
-                "python3 /home/Uihyeop/.local/share/hearting/releases/v3.37.14/utilities/"
-                "verification-background-lease.py --timeout 600 -- python3 "
-                "utilities/shared_readiness_cpu_fixture.test.py --baseline-root "
-                "/home/nas/user/Uihyeop/personal/hearting/.agent_reports/campaigns/"
-                "2026-10-07_hearting-backlog/2026-10-20_framed-cpu-kst-v3-peer-runner-pass-1bba86afe6-le/"
-                "artifacts/evidence/baseline-source-main-a7f77262d --evidence-dir "
-                "/home/nas/user/Uihyeop/personal/hearting/.agent_reports/campaigns/"
-                "2026-10-07_hearting-backlog/2026-10-20_framed-cpu-kst-v3-peer-runner-pass-1bba86afe6-le/"
-                "artifacts/evidence/execute-gaps/measure"
-            ),
-        },
+        "invocation": _invocation_record(evidence_dir),
         "source_provenance": {
-            "baseline": {"kind": "immutable-source-archive", "path": str(baseline_root),
-                         "revision_from_owner_handoff": "a7f77262d1f3a720a870618b3ebaa7260e2a5ceb",
-                         **baseline_fingerprint},
-            "candidate": {"kind": "worktree-source-content-fingerprint",
-                          "path": str(SOURCE_ROOT),
-                          "revision_from_owner_handoff": "567efc33752707c72ca3a40c6a2b8a2c2dfc89cc",
-                          **candidate_fingerprint},
-            "freshness_basis": "owner handoff confirms candidate descends from current main a7f77262d, with #688 and #692 ancestors; source content is fingerprinted independently of HEAD",
+            "baseline": baseline_provenance,
+            "candidate": candidate_provenance,
+            "authority": "source content fingerprint; Git revision is included only for an exact Git toplevel match",
             "measurement_harness_sha256": harness_fingerprint,
         },
         "workload": {key: value for key, value in workload.items()

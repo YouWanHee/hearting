@@ -11087,6 +11087,11 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                 self.assertTrue(peer_steward._publish_watch_readiness(
                     store, snapshot, read_context=read_context, incarnation=incarnation))
             transport.observe.assert_called_once()
+            self.assertGreater(read_context.registry_view.call_count, 0)
+            self.assertLess(read_context.registry_view.call_count, len(arms),
+                            "runner must not retain/build a RegistryView per watch")
+            self.assertTrue(all(call.args == (jobs,) and call.kwargs == {"append_only": True}
+                                for call in read_context.registry_view.call_args_list))
             self.assertEqual(heavy_read.call_count, 2)
             self.assertEqual(wake.call_count, 6)
             with mock.patch.object(peer_steward.herdr_observation,

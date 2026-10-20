@@ -501,6 +501,9 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         for index, (watch_id, _arm, paths) in enumerate(self.arms):
             self.assertEqual(paths.ack.exists(), index == 0,
                              "one watch acknowledgement must not settle another watch")
+        first_ack_isolation = (self.arms[0][2].ack.exists()
+                               and not any(paths.ack.exists()
+                                           for _watch, _arm, paths in self.arms[1:]))
         for index, (watch_id, _arm, _paths) in enumerate(self.arms[1:], start=1):
             self.assertEqual(acknowledge_watch(
                 watch_id, "claude", f"steward-{index}", "lifecycle-test"), "created")
@@ -508,6 +511,18 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(self.jobs.read_bytes()).hexdigest(), self.jobs_before,
                          "target readiness changed while jobs.log stayed byte-identical")
         runner_snapshots = len(self.snapshot_count_path.read_text().splitlines())
+        observations_by_group = {}
+        receipt_by_watch = {row["watch_id"]: row for row in receipts}
+        for watch_id, arm, _paths in self.arms:
+            native_state = receipt_by_watch[watch_id]["state"]
+            identity = (arm["agent"]["pane"], arm["agent"]["session_id"], native_state)
+            group = observations_by_group.setdefault(identity, [])
+            group.append(watch_id)
+        observation_groups = [
+            {"pane": pane, "session_id": session_id, "native_state": native_state,
+             "watch_ids": sorted(watch_ids), "watch_count": len(watch_ids)}
+            for (pane, session_id, native_state), watch_ids in sorted(observations_by_group.items())
+        ]
         EVIDENCE_ROWS.append({
             "case": "real-runner-five-stewards-plus-independent-target",
             "watch_count": 6,
@@ -519,7 +534,10 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             "jobs_sha256_before_after": [self.jobs_before,
                                          hashlib.sha256(self.jobs.read_bytes()).hexdigest()],
             "runner_session_snapshot_calls": runner_snapshots,
+            "runner_process_count": int(self.runner_pid is not None),
+            "observation_groups": observation_groups,
             "acknowledged_watch": first_id,
+            "first_ack_isolation": first_ack_isolation,
             "notice_records": {watch_id: 1 for watch_id in notices_by_watch},
             "notice_transfer_refs_present": {
                 watch_id: bool(peer_steward._read_json(paths.arm).get("notice_transfer_ref"))
@@ -604,6 +622,9 @@ def main(argv=None):
     suite.addTests(regression_suite)
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
+    effective_arguments = list(argv) if argv is not None else list(sys.argv[1:])
+    evidence_path = (str(args.evidence_dir / "shared-readiness-lifecycle.json")
+                     if args.evidence_dir else None)
     evidence = {
         "schema_version": 1,
         "scope": "execute phase 2 lifecycle; isolated production-entry fixture",
@@ -616,22 +637,12 @@ def main(argv=None):
             "utilities/shared_readiness_lifecycle.test.py": _sha256(Path(__file__)),
         },
         "selected_regressions": selected,
-            "verification_command": (
-                "python3 /home/Uihyeop/.local/share/hearting/releases/v3.37.14/utilities/"
-                "verification-background-lease.py --timeout 300 -- python3 utilities/"
-                "shared_readiness_lifecycle.test.py --evidence-dir <canonical evidence dir>"),
-            "capability_preflight": {
-                "capability": "code-execute", "adapter": "codex",
-                "status": "instruction-only", "tool_contract": None,
-                "tool_contract_check": None,
-            },
-            "qa_policy_preflight": {
-                "level": "standard", "track": "code",
-                "assurance_scope": "selected-checks-only:not-completion-evidence",
-                "quality_reviewers": "1x-deep-reviewer+2x-fast-reviewers",
-                "fact_checker": "skip-code-track", "external_adversary": "skip",
-                "max_round": 1,
-            },
+        "invocation": {
+            "script": str(Path(__file__).resolve()),
+            "effective_arguments": effective_arguments,
+            "cwd": str(Path.cwd().resolve()),
+            "evidence_path": evidence_path,
+        },
         "tests_run": result.testsRun,
         "failures": [str(item[0]) + "\n" + item[1] for item in result.failures],
         "errors": [str(item[0]) + "\n" + item[1] for item in result.errors],
@@ -640,16 +651,14 @@ def main(argv=None):
         "limitations": [
             "The detached production watcher entrypoints and production cmd_obligation_runner ran as isolated local processes; only the runner observation transport was pipe-backed test data because this sandbox denies local Unix-socket bind.",
             "All process and RSS/identity evidence in this phase is from an isolated local fixture.",
-            "The sealed stage-dispatch PRD at shared/spec/ref_4d540b57cb4bab92db77ffe2abcd35ff/revisions/rrev_5163074397e6a55fb00e4972a4b934b2/stage-dispatch/prd.md was absent from the supplied worktree and configured release roots; artifacts/plan.md names §13.37.2-(2), (10), and its contract summary was used.",
             "No host production PID was inspected or declared dead.",
         ],
     }
     if args.evidence_dir:
         args.evidence_dir.mkdir(parents=True, exist_ok=True)
-        target = args.evidence_dir / "shared-readiness-lifecycle.json"
-        target.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        Path(evidence_path).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
-        print(f"evidence={target}")
+        print(f"evidence={evidence_path}")
     return 0 if result.wasSuccessful() else 1
 
 

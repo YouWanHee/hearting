@@ -66,10 +66,6 @@ def main():
             "baseline_root": str(args.baseline_root),
             "evidence_dir": str(args.evidence_dir),
             "fixture_cleanup": cleanup or {"status": "not-recorded"},
-            "runtime_contract": {
-                "capability_preflight": "instruction-only; no tool contract or tool-contract check",
-                "qa_policy": "standard/code; assurance_scope=selected-checks-only:not-completion-evidence",
-            },
         }
         (args.evidence_dir / "readiness-cpu-fixture-failure.json").write_text(
             json.dumps(failure, indent=2, sort_keys=True) + "\n", encoding="utf-8")

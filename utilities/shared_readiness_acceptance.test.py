@@ -4,22 +4,30 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import resource
 import subprocess
 import sys
+import tempfile
 import time
+import tracemalloc
 
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 CPU_FIXTURE = HERE / "shared_readiness_cpu_fixture.test.py"
+CPU_HELPER = HERE / "shared_readiness_cpu.test.py"
 LIFECYCLE_FIXTURE = HERE / "shared_readiness_lifecycle.test.py"
+CACHE_MODULE_RELATIVE = Path("utilities") / "dispatch_registry_cache.py"
 WINDOWS = ("cold_start", "warm_unchanged_12s", "unrelated_event_12s")
 ROLES = ("carrier", "readiness-helper", "peer-watch", "shared-runner")
+RETAINED_FIXTURE_BYTES = 28 * 1024 * 1024
 
 
 def _read_json(path):
@@ -33,7 +41,7 @@ def _rss_kib(record, field):
     """Parse a retained-memory RSS field without substituting maxrss for rss_after."""
     value = record.get(field) if isinstance(record, dict) else None
     if isinstance(value, int) and not isinstance(value, bool):
-        return value
+        return value if value >= 0 else None
     if not isinstance(value, str):
         return None
     parts = value.strip().split()
@@ -178,21 +186,331 @@ def _source_hashes():
         HERE / "shared_readiness_cpu.test.py",
         HERE / "shared_readiness_cpu_fixture.test.py",
         HERE / "shared_readiness_acceptance.test.py",
+        HERE / "shared_readiness_lifecycle.test.py",
+        HERE / "peer_steward.test.py",
     )
     return {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in paths}
 
 
+def _load_cpu_helper():
+    spec = importlib.util.spec_from_file_location("readiness_cpu_provenance", CPU_HELPER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"CPU helper cannot be loaded: {CPU_HELPER}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _build_retained_fixture(path, target_bytes):
+    digest = hashlib.sha256()
+    rows = size = 0
+    with Path(path).open("wb") as stream:
+        while size < target_bytes:
+            row = (f"1970-01-01T00:00:00Z\trunning\t/repo\t/wt\tworker-{rows % 40}\t"
+                   f"attempt_id=att-{rows:07d},attempt_schema_version=2,registered_worker=1,"
+                   f"execution_surface=registered-headless,parent=parent-{rows % 1000},"
+                   f"route_id=route-{rows % 100},route_hash=sha256:{'a' * 64},"
+                   f"note={'n' * 60}\n").encode("utf-8")
+            stream.write(row)
+            digest.update(row)
+            size += len(row)
+            rows += 1
+    return {"bytes": size, "rows": rows, "sha256": digest.hexdigest(),
+            "target_bytes": target_bytes}
+
+
+def _proc_memory_status():
+    result = {}
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+            if line.startswith(("VmRSS:", "VmHWM:")):
+                key, value = line.split(":", 1)
+                result[key] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def _retained_memory_child(module_path, jobs_path, source_root, side):
+    """Read one source cache in a fresh child; cache and tracemalloc die with it."""
+    module_path = Path(module_path).resolve(strict=True)
+    jobs_path = Path(jobs_path).resolve(strict=True)
+    source_root = Path(source_root).resolve(strict=True)
+    expected_module = (source_root / CACHE_MODULE_RELATIVE).resolve(strict=True)
+    if module_path != expected_module:
+        raise ValueError("cache module is outside the declared source root")
+    module_hash_before = _sha256_file(module_path)
+    spec = importlib.util.spec_from_file_location("retained_registry_under_test", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"registry cache cannot be loaded: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    tracemalloc.start()
+    before = resource.getrusage(resource.RUSAGE_SELF)
+    started = time.monotonic()
+    view = module.registry_view(jobs_path, append_only=True)
+    elapsed = time.monotonic() - started
+    gc.collect()
+    retained_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    after = resource.getrusage(resource.RUSAGE_SELF)
+    status = _proc_memory_status()
+    result = {
+        "side": side,
+        "fresh_child_pid": os.getpid(),
+        "source_root": str(source_root),
+        "cache_module_path": str(module_path),
+        "cache_module_sha256": module_hash_before,
+        "cache_module_sha256_after": _sha256_file(module_path),
+        "jobs_path": str(jobs_path),
+        "jobs_bytes": jobs_path.stat().st_size,
+        "jobs_sha256": _sha256_file(jobs_path),
+        "elapsed_seconds": elapsed,
+        "self_cpu_seconds": ((after.ru_utime + after.ru_stime)
+                             - (before.ru_utime + before.ru_stime)),
+        "retained_traced_bytes": retained_bytes,
+        "peak_traced_bytes": peak_bytes,
+        "rss_after": status.get("VmRSS"),
+        "rss_high_water": status.get("VmHWM"),
+        "maxrss_kib": after.ru_maxrss,
+        "record_count": view.record_count,
+        "line_count": view.line_count,
+        "cache_metrics": module.metrics_snapshot(),
+    }
+    del view
+    sys.modules.pop(spec.name, None)
+    del module
+    gc.collect()
+    tracemalloc.stop()
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _retained_reading_errors(record, *, side, source_root, source_sha256, cache_sha256,
+                             fixture):
+    errors = []
+    if not isinstance(record, dict):
+        return ["child reading is missing or malformed"]
+    if record.get("side") != side:
+        errors.append("side label does not match the current source")
+    if record.get("source_root") != str(Path(source_root).resolve()):
+        errors.append("source root does not match this invocation")
+    if record.get("source_content_sha256") != source_sha256:
+        errors.append("source content fingerprint does not match the measured source")
+    if record.get("cache_module_sha256") != cache_sha256:
+        errors.append("cache module bytes do not match the current source")
+    if record.get("cache_module_sha256_after") != cache_sha256:
+        errors.append("cache module changed while the child measurement was running")
+    if record.get("jobs_sha256") != fixture.get("sha256"):
+        errors.append("jobs fixture digest does not match the paired fixture")
+    for field, expected in (("jobs_bytes", fixture.get("bytes")),
+                            ("record_count", fixture.get("rows")),
+                            ("line_count", fixture.get("rows"))):
+        actual = record.get(field)
+        if not isinstance(actual, int) or isinstance(actual, bool) or actual != expected:
+            errors.append(f"{field} does not match the paired fixture")
+    metrics = record.get("cache_metrics")
+    if not isinstance(metrics, dict):
+        errors.append("cache metrics are missing")
+    else:
+        for field, expected in (("full_metadata_parses", 1),
+                                ("metadata_rows_parsed", fixture.get("rows")),
+                                ("bytes_read", fixture.get("bytes"))):
+            actual = metrics.get(field)
+            if not isinstance(actual, int) or isinstance(actual, bool) or actual != expected:
+                errors.append(f"cache metric {field} does not match the paired fixture")
+    pid = record.get("fresh_child_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        errors.append("fresh child process identity is missing")
+    traced = record.get("retained_traced_bytes")
+    if not isinstance(traced, int) or isinstance(traced, bool) or traced < 0:
+        errors.append("retained traced allocation is missing")
+    peak_traced = record.get("peak_traced_bytes")
+    if (not isinstance(peak_traced, int) or isinstance(peak_traced, bool)
+            or peak_traced < 0 or (isinstance(traced, int) and peak_traced < traced)):
+        errors.append("peak traced allocation is missing or below retained allocation")
+    rss_after = _rss_kib(record, "rss_after")
+    rss_high_water = _rss_kib(record, "rss_high_water")
+    if rss_after is None:
+        errors.append("post-parse RSS reading is missing")
+    if rss_high_water is None:
+        errors.append("RSS high-water reading is missing")
+    if rss_after is not None and rss_high_water is not None and rss_high_water < rss_after:
+        errors.append("RSS high-water is below post-parse RSS")
+    maxrss = record.get("maxrss_kib")
+    if not isinstance(maxrss, int) or isinstance(maxrss, bool) or maxrss < 0:
+        errors.append("resource high-water reading is missing")
+    for field in ("elapsed_seconds", "self_cpu_seconds"):
+        value = record.get(field)
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value < 0):
+            errors.append(f"{field} reading is missing or invalid")
+    return errors
+
+
+def _run_retained_memory(evidence_dir, baseline_root, candidate_root, source_provenance,
+                         *, target_bytes=RETAINED_FIXTURE_BYTES):
+    evidence_dir = Path(evidence_dir)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    baseline_root = Path(baseline_root).resolve(strict=True)
+    candidate_root = Path(candidate_root).resolve(strict=True)
+    fixture_dir = evidence_dir / "fixture"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    errors = {}
+    readings = {}
+    child_commands = {}
+    with tempfile.TemporaryDirectory(prefix="readiness-retained-") as temporary:
+        jobs_path = Path(temporary) / "jobs.log"
+        fixture = _build_retained_fixture(jobs_path, target_bytes)
+        for side, source_root in (("baseline", baseline_root), ("candidate", candidate_root)):
+            module_path = source_root / CACHE_MODULE_RELATIVE
+            command = [sys.executable, str(Path(__file__).resolve()),
+                       "--retained-memory-child", str(module_path), str(jobs_path),
+                       str(source_root), side]
+            child = _run_child(f"retained-{side}", command, fixture_dir)
+            child_commands[side] = child
+            record = _read_json(child["stdout_log"])
+            source = source_provenance.get(side) if isinstance(source_provenance, dict) else None
+            source_sha256 = source.get("content_sha256") if isinstance(source, dict) else None
+            try:
+                expected_cache_sha256 = _sha256_file(module_path)
+            except OSError:
+                expected_cache_sha256 = None
+            if child["exit_code"] != 0:
+                errors[side] = [f"retained-memory child exited {child['exit_code']}"]
+            elif source_sha256 is None or expected_cache_sha256 is None:
+                errors[side] = ["source content or cache module fingerprint is missing"]
+            else:
+                if isinstance(record, dict):
+                    record["source_content_sha256"] = source_sha256
+                    record["source_git"] = source.get("git") if isinstance(source, dict) else None
+                    record["child_command"] = child["command"]
+                    record["stdout_log"] = child["stdout_log"]
+                    record["stderr_log"] = child["stderr_log"]
+                errors[side] = _retained_reading_errors(
+                    record, side=side, source_root=source_root,
+                    source_sha256=source_sha256, cache_sha256=expected_cache_sha256,
+                    fixture=fixture)
+            readings[side] = record
+            _write_json(evidence_dir / f"{side}.json", record or {
+                "status": "missing-child-reading", "child": child,
+                "validation_errors": errors[side],
+            })
+    child_pids = [record.get("fresh_child_pid") for record in readings.values()
+                  if isinstance(record, dict)]
+    if len(child_pids) != 2 or len(set(child_pids)) != 2:
+        errors["pair"] = ["baseline and candidate did not use distinct child processes"]
+    result = {
+        "schema_version": 1,
+        "status": "pass" if errors and all(not value for value in errors.values()) else "fail",
+        "probe_scope": "fresh one-shot child process per actual source cache",
+        "fixture": fixture,
+        "source_provenance": {
+            side: source_provenance.get(side) if isinstance(source_provenance, dict) else None
+            for side in ("baseline", "candidate")
+        },
+        "child_processes": child_pids,
+        "child_commands": child_commands,
+        "readings": readings,
+        "validation_errors": errors,
+        "output_paths": {
+            "summary": str(evidence_dir / "retained-memory.json"),
+            "baseline": str(evidence_dir / "baseline.json"),
+            "candidate": str(evidence_dir / "candidate.json"),
+        },
+    }
+    _write_json(evidence_dir / "retained-memory.json", result)
+    return result
+
+
+def _source_provenance_errors(measurement, baseline_root, candidate_root):
+    errors = []
+    provenance = measurement.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return ["source provenance object is missing"]
+    if provenance.get("authority") != (
+            "source content fingerprint; Git revision is included only for an exact Git toplevel match"):
+        errors.append("source content authority disclosure is missing or malformed")
+    harness_hashes = provenance.get("measurement_harness_sha256")
+    required_harnesses = {"shared_readiness_cpu.test.py",
+                          "shared_readiness_cpu_fixture.test.py"}
+    if (not isinstance(harness_hashes, dict)
+            or not required_harnesses.issubset(harness_hashes)
+            or any(not isinstance(harness_hashes.get(name), str)
+                   or len(harness_hashes[name]) != 64 for name in required_harnesses)):
+        errors.append("measurement harness source fingerprints are incomplete")
+    else:
+        for name in required_harnesses:
+            try:
+                actual_hash = _sha256_file(Path(candidate_root) / "utilities" / name)
+            except OSError:
+                actual_hash = None
+            if harness_hashes.get(name) != actual_hash:
+                errors.append(f"measurement harness fingerprint changed: {name}")
+    cpu_helper = _load_cpu_helper()
+    for side, expected_root in (("baseline", baseline_root), ("candidate", candidate_root)):
+        record = provenance.get(side)
+        if not isinstance(record, dict):
+            errors.append(f"{side} source provenance is missing")
+            continue
+        expected_root = Path(expected_root).resolve(strict=True)
+        if record.get("path") != str(expected_root):
+            errors.append(f"{side} source path does not match this invocation")
+        try:
+            actual = cpu_helper._source_provenance(expected_root)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{side} source cannot be revalidated: {exc}")
+            continue
+        for field in ("kind", "content_sha256", "files", "bytes", "fingerprinted_roots"):
+            if record.get(field) != actual.get(field):
+                errors.append(f"{side} {field} changed during measurement or is malformed")
+        recorded_git = record.get("git")
+        actual_git = actual.get("git")
+        if not isinstance(recorded_git, dict) or not isinstance(actual_git, dict):
+            errors.append(f"{side} Git source-root provenance is missing")
+        elif recorded_git != actual_git:
+            errors.append(f"{side} Git root, revision, or dirty-content disclosure changed")
+        recorded_manifest = record.get("archive_manifest")
+        actual_manifest = actual.get("archive_manifest")
+        if recorded_manifest != actual_manifest:
+            errors.append(f"{side} adjacent archive manifest changed or is malformed")
+        if isinstance(actual_manifest, dict) and actual_manifest.get("status") not in {
+                "verified", "not-found"}:
+            errors.append(f"{side} adjacent archive manifest is {actual_manifest.get('status')}")
+    return errors
+
+
 def _metric_rollup(measurement):
     rows = []
-    for lane, sides in measurement.get("matrix", {}).items():
+    matrix = measurement.get("matrix")
+    if not isinstance(matrix, dict):
+        return rows
+    for lane, sides in matrix.items():
+        if not isinstance(sides, dict):
+            continue
         for side, cases in sides.items():
+            if not isinstance(cases, dict):
+                continue
             for case, scenario in cases.items():
+                if not isinstance(scenario, dict):
+                    continue
                 for window_name in WINDOWS:
                     window = scenario.get(window_name)
                     if not isinstance(window, dict):
                         continue
-                    classes = window.get("classes", {})
+                    classes = window.get("classes")
+                    if not isinstance(classes, dict):
+                        classes = {}
                     rows.append({
                         "lane": lane,
                         "side": side,
@@ -204,24 +522,24 @@ def _metric_rollup(measurement):
                         "inclusive_lineage_cpu_delta_seconds": window.get(
                             "inclusive_lineage_cpu_delta_seconds"),
                         "simultaneous_total_rss_bytes": window.get(
-                            "simultaneous_total_rss_bytes", {}),
+                            "simultaneous_total_rss_bytes"),
                         "classes": {
                             role: {
-                                "start_processes": classes.get(role, {}).get("start_processes", 0),
-                                "end_processes": classes.get(role, {}).get("end_processes", 0),
-                                "peak_processes": classes.get(role, {}).get("peak_processes", 0),
-                                "start_rss_bytes": classes.get(role, {}).get("start_rss_bytes", 0),
-                                "end_rss_bytes": classes.get(role, {}).get("end_rss_bytes", 0),
+                                "start_processes": classes.get(role, {}).get("start_processes"),
+                                "end_processes": classes.get(role, {}).get("end_processes"),
+                                "peak_processes": classes.get(role, {}).get("peak_processes"),
+                                "start_rss_bytes": classes.get(role, {}).get("start_rss_bytes"),
+                                "end_rss_bytes": classes.get(role, {}).get("end_rss_bytes"),
                                 "peak_simultaneous_rss_bytes": classes.get(
-                                    role, {}).get("peak_simultaneous_rss_bytes", 0),
+                                    role, {}).get("peak_simultaneous_rss_bytes"),
                                 "sampled_own_cpu_delta_ticks": classes.get(
-                                    role, {}).get("sampled_own_cpu_delta_ticks", 0),
+                                    role, {}).get("sampled_own_cpu_delta_ticks"),
                                 "sampled_own_cpu_delta_seconds": classes.get(
-                                    role, {}).get("sampled_own_cpu_delta_seconds", 0),
+                                    role, {}).get("sampled_own_cpu_delta_seconds"),
                                 "reaped_child_counter_delta_ticks": classes.get(
-                                    role, {}).get("reaped_child_counter_delta_ticks", 0),
+                                    role, {}).get("reaped_child_counter_delta_ticks"),
                                 "reaped_child_counter_delta_seconds": classes.get(
-                                    role, {}).get("reaped_child_counter_delta_seconds", 0),
+                                    role, {}).get("reaped_child_counter_delta_seconds"),
                             }
                             for role in ROLES
                         },
@@ -240,18 +558,26 @@ def _metric_markdown(rows):
     ]
     short_window = {"cold_start": "cold", "warm_unchanged_12s": "warm unchanged",
                     "unrelated_event_12s": "unrelated event"}
+    def display(value, digits=2):
+        return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "unknown"
+
     for row in rows:
         classes = row["classes"]
-        counts = "/".join(str(classes[role]["peak_processes"]) for role in ROLES)
-        own = "/".join(f"{classes[role]['sampled_own_cpu_delta_seconds']:.2f}"
+        counts = "/".join(str(classes[role]["peak_processes"])
+                           if classes[role]["peak_processes"] is not None else "?"
+                           for role in ROLES)
+        own = "/".join(display(classes[role]["sampled_own_cpu_delta_seconds"])
                         for role in ROLES)
-        reaped = "/".join(f"{classes[role]['reaped_child_counter_delta_seconds']:.2f}"
+        reaped = "/".join(display(classes[role]["reaped_child_counter_delta_seconds"])
                           for role in ROLES)
         rss = "/".join(_mib(classes[role]["peak_simultaneous_rss_bytes"])
-                        for role in ROLES)
-        total = _mib(row["simultaneous_total_rss_bytes"].get("production_classes_peak"))
+                        if isinstance(classes[role]["peak_simultaneous_rss_bytes"], (int, float))
+                        else "unknown" for role in ROLES)
+        totals = row.get("simultaneous_total_rss_bytes")
+        total_value = totals.get("production_classes_peak") if isinstance(totals, dict) else None
+        total = _mib(total_value) if isinstance(total_value, (int, float)) else "unknown"
         cpu = row["production_inclusive_cpu_delta_seconds"]
-        cpu_text = f"{cpu:.3f}" if isinstance(cpu, (int, float)) else "unknown"
+        cpu_text = display(cpu, 3)
         lines.append(
             f"| {row['lane']} / {row['case']} | {row['side']} | "
             f"{short_window[row['window']]} | {counts} | {cpu_text} | "
@@ -262,42 +588,279 @@ def _metric_markdown(rows):
 def _candidate_helper_launches(measurement, side):
     total = 0
     found = False
-    for scenario in measurement.get("matrix", {}).get("carrier", {}).get(side, {}).values():
+    matrix = measurement.get("matrix")
+    carrier = matrix.get("carrier") if isinstance(matrix, dict) else None
+    scenarios = carrier.get(side) if isinstance(carrier, dict) else None
+    if not isinstance(scenarios, dict) or not scenarios:
+        return None
+    for scenario in scenarios.values():
+        if not isinstance(scenario, dict):
+            continue
         branch = scenario.get("branch_evidence", {})
-        if "total_helper_launches" in branch:
-            total += branch["total_helper_launches"]
+        if isinstance(branch, dict) and "total_helper_launches" in branch:
+            count = branch["total_helper_launches"]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                return None
+            total += count
             found = True
     return total if found else None
 
 
+def _matrix_errors(measurement, metric_rows):
+    expected = set()
+    for lane, cases in (
+            ("carrier", ("one_consumer", "fifteen_consumers")),
+            ("peer_watch", ("one_same_target", "five_same_target_plus_separate_control"))):
+        for side in ("baseline", "candidate"):
+            for case in cases:
+                for window in WINDOWS:
+                    expected.add((lane, side, case, window))
+    actual = {(row["lane"], row["side"], row["case"], row["window"])
+              for row in metric_rows}
+    errors = []
+    if actual != expected or len(metric_rows) != len(expected):
+        errors.append("measurement matrix does not contain every unique side/case/window")
+    for row in metric_rows:
+        prefix = f"{row['lane']}/{row['side']}/{row['case']}/{row['window']}"
+        for field in ("elapsed_seconds", "production_inclusive_cpu_delta_seconds",
+                      "inclusive_lineage_cpu_delta_seconds"):
+            value = row.get(field)
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or value < 0):
+                errors.append(f"{prefix} lacks {field}")
+        totals = row.get("simultaneous_total_rss_bytes")
+        total_peak = totals.get("production_classes_peak") if isinstance(totals, dict) else None
+        if (not isinstance(total_peak, (int, float)) or isinstance(total_peak, bool)
+                or not math.isfinite(total_peak) or total_peak < 0):
+            errors.append(f"{prefix} lacks total RSS")
+        for role in ROLES:
+            values = row["classes"].get(role)
+            if not isinstance(values, dict):
+                errors.append(f"{prefix} lacks {role}")
+                continue
+            for field in ("start_processes", "end_processes", "peak_processes",
+                          "start_rss_bytes", "end_rss_bytes", "peak_simultaneous_rss_bytes",
+                          "sampled_own_cpu_delta_ticks", "sampled_own_cpu_delta_seconds",
+                          "reaped_child_counter_delta_ticks", "reaped_child_counter_delta_seconds"):
+                value = values.get(field)
+                if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                        or not math.isfinite(value) or value < 0):
+                    errors.append(f"{prefix} lacks {role}.{field}")
+    return errors
+
+
+def _lifecycle_cleanup_errors(cleanup):
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "pass":
+        return ["lifecycle fixture cleanup did not pass"]
+    results = cleanup.get("results")
+    if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+        return ["lifecycle cleanup did not record its single runner fixture"]
+    row = results[0]
+    errors = []
+    if row.get("runner_pid") is None or row.get("runner_reaped") is not True:
+        errors.append("the shared runner process was not observed and reaped")
+    if row.get("runner_lock_fd_closed") is not True:
+        errors.append("the runner lock descriptor was not closed")
+    watchers = row.get("watchers")
+    if (not isinstance(watchers, list) or len(watchers) != 6
+            or not all(isinstance(item, dict) and item.get("reaped") is True for item in watchers)):
+        errors.append("all six watcher processes were not reaped")
+    return errors
+
+
+def _selected_registry_view_regression(lifecycle):
+    selected = lifecycle.get("selected_regressions")
+    if not isinstance(selected, list):
+        return False
+    return any(str(name).endswith(
+        ".test_runner_reads_once_for_five_stewards_and_separates_another_pane")
+        for name in selected)
+
+
+def _lifecycle_errors(lifecycle):
+    errors = []
+    if not isinstance(lifecycle, dict):
+        return ["lifecycle evidence is missing"]
+    if lifecycle.get("tests_run", 0) <= 0 or lifecycle.get("suite_exit_code") != 0:
+        errors.append("lifecycle suite did not complete successfully")
+    if lifecycle.get("failures") or lifecycle.get("errors"):
+        errors.append("lifecycle suite reported failures or errors")
+    fixtures = lifecycle.get("fixtures")
+    if not isinstance(fixtures, list) or len(fixtures) != 1 or not isinstance(fixtures[0], dict):
+        return errors + ["six-watch lifecycle fixture is missing or ambiguous"]
+    fixture = fixtures[0]
+    if fixture.get("watch_count") != 6 or fixture.get("same_target_count") != 5:
+        errors.append("lifecycle fixture did not exercise five shared watches and one control")
+    if fixture.get("distinct_stewards") != 6:
+        errors.append("lifecycle fixture did not retain six independent stewards")
+    runner_count = fixture.get("runner_process_count")
+    if not isinstance(runner_count, int) or isinstance(runner_count, bool) or runner_count != 1:
+        errors.append("lifecycle fixture did not observe exactly one shared runner")
+    snapshots = fixture.get("runner_session_snapshot_calls")
+    if not isinstance(snapshots, int) or isinstance(snapshots, bool) or snapshots < 1:
+        errors.append("lifecycle fixture did not record a runner session observation")
+    if fixture.get("native_result_counts") != {"idle": 5, "done": 1}:
+        errors.append("lifecycle fixture did not preserve distinct idle and done results")
+    groups = fixture.get("observation_groups")
+    grouped_ids = []
+    if not isinstance(groups, list) or len(groups) < 2:
+        errors.append("lifecycle evidence does not contain shared target observation groups")
+        groups = []
+    else:
+        group_sizes = sorted(row.get("watch_count", 0) for row in groups
+                             if isinstance(row, dict))
+        grouped_ids = [watch_id for row in groups if isinstance(row, dict)
+                       for watch_id in row.get("watch_ids", [])]
+        group_keys = [(row.get("pane"), row.get("session_id"), row.get("native_state"))
+                      for row in groups if isinstance(row, dict)]
+        target_counts = {}
+        native_counts = {}
+        for row in groups:
+            if not isinstance(row, dict):
+                continue
+            watch_ids = row.get("watch_ids")
+            if not isinstance(watch_ids, list) or row.get("watch_count") != len(watch_ids):
+                errors.append("observation group count does not match its watch identities")
+            target_key = (row.get("pane"), row.get("session_id"))
+            target_counts[target_key] = target_counts.get(target_key, 0) + row.get("watch_count", 0)
+            state = row.get("native_state")
+            native_counts[state] = native_counts.get(state, 0) + row.get("watch_count", 0)
+        if (len(set(group_keys)) != len(group_keys) or group_sizes != [1, 1, 4]
+                or sorted(target_counts.values()) != [1, 5]
+                or native_counts != {"idle": 5, "done": 1}):
+            errors.append("lifecycle groups do not preserve five shared watches, one control, and idle/done identity")
+        if len(grouped_ids) != 6 or len(set(grouped_ids)) != 6:
+            errors.append("shared observation groups do not cover six unique watches")
+    if not _selected_registry_view_regression(lifecycle):
+        errors.append("the shared pass-scoped RegistryView regression was not selected")
+
+    receipts = fixture.get("receipt_records")
+    notices = fixture.get("notice_records")
+    acknowledgements = fixture.get("ack_records")
+    if (not isinstance(receipts, dict) or len(receipts) != 6
+            or not all(value is True for value in receipts.values())):
+        errors.append("six independent receipt files were not verified")
+    if (not isinstance(notices, dict) or len(notices) != 6
+            or any(not isinstance(value, int) or isinstance(value, bool) or value != 1
+                   for value in notices.values())):
+        errors.append("six independent notices were not verified")
+    if (not isinstance(acknowledgements, dict) or len(acknowledgements) != 6
+            or not all(value is True for value in acknowledgements.values())):
+        errors.append("six independent acknowledgement files were not verified")
+    if fixture.get("receipt_count") != 6 or fixture.get("ack_count") != 6:
+        errors.append("lifecycle receipt or acknowledgement totals are incomplete")
+    if fixture.get("first_ack_isolation") is not True:
+        errors.append("the first acknowledgement isolation check is missing")
+    if fixture.get("remaining_independent_receipts") != 6:
+        errors.append("independent receipts did not remain after acknowledgement")
+    transfer_refs = fixture.get("notice_transfer_refs_present")
+    if (not isinstance(transfer_refs, dict) or len(transfer_refs) != 6
+            or not all(value is True for value in transfer_refs.values())):
+        errors.append("notice transfer references were not preserved for all six watches")
+    expected_watch_ids = set(grouped_ids)
+    duty_maps = (receipts, notices, acknowledgements, transfer_refs)
+    if all(isinstance(rows, dict) for rows in duty_maps):
+        if any(set(rows) != expected_watch_ids for rows in duty_maps):
+            errors.append("receipt, notice, ACK, and transfer records do not cover the same six watches")
+    else:
+        errors.append("watch duty records are malformed")
+    if fixture.get("acknowledged_watch") not in expected_watch_ids:
+        errors.append("the isolated first acknowledgement does not name a lifecycle watch")
+    if fixture.get("target_state_before_after") != ["working", "idle"]:
+        errors.append("target readiness transition was not observed")
+    jobs_hashes = fixture.get("jobs_sha256_before_after")
+    if (not isinstance(jobs_hashes, list) or len(jobs_hashes) != 2
+            or not jobs_hashes[0] or jobs_hashes[0] != jobs_hashes[1]):
+        errors.append("jobs content changed during lifecycle observation")
+    return errors
+
+
+def _candidate_runner_check(measurement):
+    matrix = measurement.get("matrix")
+    peer_sides = matrix.get("peer_watch") if isinstance(matrix, dict) else None
+    candidate = peer_sides.get("candidate") if isinstance(peer_sides, dict) else None
+    if not isinstance(candidate, dict) or not candidate:
+        return False, []
+    peaks = []
+    valid = True
+    for scenario in candidate.values():
+        if not isinstance(scenario, dict):
+            valid = False
+            continue
+        for window_name in WINDOWS:
+            window = scenario.get(window_name)
+            classes = window.get("classes") if isinstance(window, dict) else None
+            runner = classes.get("shared-runner") if isinstance(classes, dict) else None
+            peak = runner.get("peak_processes") if isinstance(runner, dict) else None
+            if not isinstance(peak, int) or isinstance(peak, bool) or peak > 1:
+                valid = False
+            else:
+                peaks.append(peak)
+        cold = scenario.get("cold_start")
+        cold_classes = cold.get("classes") if isinstance(cold, dict) else None
+        cold_runner = cold_classes.get("shared-runner") if isinstance(cold_classes, dict) else None
+        if not isinstance(cold_runner, dict) or cold_runner.get("peak_processes") != 1:
+            valid = False
+    return valid and bool(peaks), peaks
+
+
 def _make_handoff(report, evidence_dir, measurement, lifecycle, cleanup):
-    d1 = report["d1_source_currentness"]
+    d1 = report["d1_source_provenance"]
     d2 = report["d2_shared_observation"]
-    d3 = report["d3_independent_delivery"]
-    d4 = report["d4_matched_measurements"]
     fixture = (lifecycle.get("fixtures") or [{}])[0]
-    selected = lifecycle.get("selected_regressions", [])
     metric_rows = report["metric_windows"]
+
+    def source_line(side):
+        source = d1.get("sources", {}).get(side, {})
+        git = source.get("git", {})
+        revision = git.get("revision")
+        revision_text = (f"Git `{revision}`; dirty={git.get('dirty')}" if revision else
+                         f"Git revision unknown (discovered toplevel `{git.get('top_level')}`)")
+        manifest = source.get("archive_manifest")
+        manifest_text = (f"; manifest `{manifest.get('status')}`"
+                         if isinstance(manifest, dict) else "")
+        return (f"- {side}: `{source.get('path', 'unknown')}`; content SHA-256 "
+                f"`{source.get('content_sha256', 'unknown')}`; {revision_text}{manifest_text}.")
+
+    retained = report.get("retained_memory", {})
+    readings = retained.get("readings", {}) if isinstance(retained, dict) else {}
+    baseline = readings.get("baseline") or {}
+    candidate = readings.get("candidate") or {}
+    fixture_info = retained.get("fixture", {}) if isinstance(retained, dict) else {}
+    rss_after = (_rss_kib(baseline, "rss_after"), _rss_kib(candidate, "rss_after"))
+    rss_high = (_rss_kib(baseline, "rss_high_water"), _rss_kib(candidate, "rss_high_water"))
+    groups = fixture.get("observation_groups", [])
+    groups_text = ", ".join(
+        f"{row.get('watch_count', '?')} on {row.get('pane', '?')} ({row.get('native_state', '?')})"
+        for row in groups if isinstance(row, dict)) or "unknown"
+
+    def count(value):
+        return f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else "unknown"
+
     lines = [
         "# Final source evidence: shared readiness",
         "",
-        f"Status: **{report['status']}** for this evidence-refresh slice only; the owner retains the execute gate.",
+        f"Status: **{report['status']}** for these measured source inputs; the owner retains the execute gate.",
         "",
-        "## d1 — source currentness",
+        "## d1 — measured source provenance",
         "",
-        f"Candidate `{d1['candidate_revision']}` descends from latest confirmed `origin/main` `{d1['origin_main']}`; owner evidence confirms #688 and #692 are ancestors and records the final remote main check. Source content fingerprints are in `shared-readiness-acceptance.json` and the CPU fixture JSON.",
+        "Source content fingerprints identify the bytes measured. A Git revision is included only when Git's discovered toplevel exactly matches that supplied source root; matching worktrees also disclose dirty state.",
+        source_line("baseline"),
+        source_line("candidate"),
+        "Remote main ancestry and pull request inclusion are not evaluated by this helper; the owner checks those separately.",
         "",
-        "## d2 — shared parsing and target observation",
+        "## d2 — shared observation and retained cache",
         "",
-        f"Carrier helper launches: baseline={d2['baseline_carrier_helper_launches']}, candidate={d2['candidate_carrier_helper_launches']}. Candidate shared-runner peak is one process. The unchanged 29.36 MB registry retention fixture is reused because `dispatch_registry_cache.py` is unchanged from the sealed candidate commit: one full metadata parse of 86,471 rows on each side; retained traced allocation {d2['baseline_retained_bytes']:,} → {d2['candidate_retained_bytes']:,} bytes, post-parse RSS {d2['baseline_rss_kib']:,} → {d2['candidate_rss_kib']:,} KiB, and separate max RSS/high-water {d2['baseline_rss_high_water_kib']:,} → {d2['candidate_rss_high_water_kib']:,} KiB. This is central-cache evidence, not watcher-scaling evidence.",
-        f"The final lifecycle fixture records {fixture.get('runner_session_snapshot_calls', 'unknown')} runner session snapshots for five same-target stewards plus one separate target; candidate runner and per-class costs are counted once in each measurement window. No per-watch parser/view claim is inferred from central-cache tracing alone.",
-        "The four owner-review-focus observations were rechecked in current source: legacy pre-birth projections require fresh matching lineage; publisher reads stay inside the supplied pass context without global endpoint mutation; idle and done identities remain distinct; watcher waits consume projections without retaining a RegistryView.",
+        f"Carrier helper launches: baseline={d2.get('baseline_carrier_helper_launches')}, candidate={d2.get('candidate_carrier_helper_launches')}. Candidate peer-watch cold windows observed one runner per case. Runner session observations recorded: {fixture.get('runner_session_snapshot_calls', 'unknown')}; this is reported as measured with no exact-count gate.",
+        f"Lifecycle target groups: {groups_text}. The selected runner regression kept pass-scoped RegistryView lookups below the six-watch count, with two grouped readiness reads and six independent wake requests.",
+        f"Fresh retained-memory children parsed {count(fixture_info.get('rows'))} rows ({count(fixture_info.get('bytes'))} bytes; SHA-256 `{fixture_info.get('sha256', 'unknown')}`). Retained traced bytes: {count(baseline.get('retained_traced_bytes'))} → {count(candidate.get('retained_traced_bytes'))}; post-parse RSS: {rss_after[0] if rss_after[0] is not None else 'unknown'} → {rss_after[1] if rss_after[1] is not None else 'unknown'} KiB; separate RSS high-water: {rss_high[0] if rss_high[0] is not None else 'unknown'} → {rss_high[1] if rss_high[1] is not None else 'unknown'} KiB.",
+        "Each retained-memory reading uses the actual source cache module and a fresh one-shot child; its source and module hashes, fixture digest, parse counts, RSS, and high-water remain in the evidence directory.",
         "",
         "## d3 — separate receipts, notices, acknowledgements, and recovery",
         "",
-        f"The fresh lifecycle suite ran {lifecycle.get('tests_run', 0)} tests with {len(lifecycle.get('failures', []))} failures and {len(lifecycle.get('errors', []))} errors. Fixture result: {fixture.get('watch_count', 0)} distinct watches across {fixture.get('distinct_stewards', 0)} stewards, five on one target and one isolation control; native results remain {fixture.get('native_result_counts', {})}. Receipts={fixture.get('receipt_count', 0)}, notices={sum((fixture.get('notice_records') or {}).values())}, acknowledgements={fixture.get('ack_count', 0)}. The jobs digest remained unchanged while target evidence changed `{fixture.get('target_state_before_after', [])}`. Cleanup status: `{cleanup['lifecycle']['status']}`.",
+        f"The lifecycle suite ran {lifecycle.get('tests_run', 0)} tests with {len(lifecycle.get('failures', []))} failures and {len(lifecycle.get('errors', []))} errors. It recorded {fixture.get('watch_count', 0)} watches across {fixture.get('distinct_stewards', 0)} stewards. Receipts={fixture.get('receipt_count', 0)}, notices={sum((fixture.get('notice_records') or {}).values())}, acknowledgements={fixture.get('ack_count', 0)}. First-ACK isolation passed, all six ACK files were later written, and jobs content stayed unchanged while target evidence changed `{fixture.get('target_state_before_after', [])}`. Cleanup: `{cleanup.get('lifecycle', {}).get('status', 'missing')}`.",
         "",
-        "Selected transition coverage includes current-runner incarnation, session/pane/process-birth replacement, exact and missing receipts, live and dead claims, stale observations, lost wake/reclaim, native-result recovery, handover, and runner scan/unlock races. The exact selected test names remain in the lifecycle JSON.",
+        "Selected transition coverage includes session, pane, and process-birth replacement; exact and missing receipts; live and dead claims; stale observations; lost wake/reclaim; native-result recovery; handover; runner scan/unlock races; and the shared RegistryView runner regression.",
         "",
         "## d4 — matched CPU, process, and RSS windows",
         "",
@@ -307,9 +870,8 @@ def _make_handoff(report, evidence_dir, measurement, lifecycle, cleanup):
         "",
         "## Evidence and limits",
         "",
-        f"Acceptance command child exits: measurement={report['subprocesses']['measurement']['exit_code']}, lifecycle={report['subprocesses']['lifecycle']['exit_code']}; fixture cleanup={cleanup['measurement']['status']}/{cleanup['lifecycle']['status']}. Exact commands and stdout/stderr logs are listed in `shared-readiness-acceptance.json`.",
-        "All metrics are isolated production-entry fixtures. The CPU fixture runs source-specific production watcher and runner entrypoints; its runner receives pipe-backed snapshot data and its unrelated peer wake is a SIGUSR1 surrogate, not a measured Herdr socket event. The lifecycle runner also uses pipe-backed observation because this sandbox denies local Unix-socket bind. Host production PIDs remain inaccessible and were not declared dead. The measurement fixture counts the shared runner in production CPU/RSS and counts it once. The measured one-target versus five-same-target-plus-separate-control RSS distinction is retained in the matrix; the control makes six watcher processes in the latter case.",
-        "Runtime contract: `preflight.sh capability-info code-execute` reported `instruction-only`, with no tool contract or contract check; standard/code QA assurance is selected-checks-only, not completion evidence. Governing PRD clauses §13.37.2-(2),(10) were read. No commit or route completion marker was produced.",
+        f"Acceptance invocation: `{report['invocation']['executable']} {' '.join(report['invocation']['argv'])}` from `{report['invocation']['cwd']}`. Child commands and stdout/stderr paths are listed in `shared-readiness-acceptance.json`.",
+        "All metrics come from isolated fixtures. The CPU runner uses pipe-backed snapshot data and the unrelated peer wake uses a SIGUSR1 surrogate because local Unix-socket bind is unavailable. Host production PIDs were not inspected or declared dead. Per-class self CPU and reaped-child CPU counters overlap after process reaping.",
         "",
         f"Artifacts: `measure/readiness-cpu-fixture.json`, `measure/readiness-cpu-comparison.md`, `measure/readiness-cpu-fixture-cleanup.json`, `lifecycle/shared-readiness-lifecycle.json`, `test_logs/`, and `shared-readiness-acceptance.json` beneath `{evidence_dir}`.",
         "",
@@ -330,6 +892,155 @@ def _ordinary_ci():
             return completed.returncode
     print("paired manual baseline/candidate measurement: SKIPPED (inputs absent)")
     return 0
+
+
+def _assemble_report(evidence_dir, baseline_root, measurement_command, lifecycle_command,
+                     measurement_evidence, measurement_cleanup, lifecycle_evidence,
+                     lifecycle_cleanup, retained):
+    metric_rows = _metric_rollup(measurement_evidence)
+    matrix_errors = _matrix_errors(measurement_evidence, metric_rows)
+    provenance_errors = _source_provenance_errors(
+        measurement_evidence, baseline_root, ROOT)
+    lifecycle_errors = _lifecycle_errors(lifecycle_evidence)
+    lifecycle_errors.extend(_lifecycle_cleanup_errors(lifecycle_cleanup))
+    retained_errors = []
+    provenance = measurement_evidence.get("source_provenance", {})
+    retained_readings = retained.get("readings") if isinstance(retained, dict) else None
+    if not isinstance(retained_readings, dict):
+        retained_errors.append("fresh retained-memory readings are missing")
+        retained_readings = {}
+    fixture = retained.get("fixture", {}) if isinstance(retained, dict) else {}
+    child_pids = []
+    for side, source_root in (("baseline", baseline_root), ("candidate", ROOT)):
+        record = retained_readings.get(side)
+        source = provenance.get(side) if isinstance(provenance, dict) else None
+        if not isinstance(source, dict):
+            retained_errors.append(f"{side} source provenance is missing for retained-memory reading")
+            continue
+        try:
+            cache_sha256 = _sha256_file(Path(source_root) / CACHE_MODULE_RELATIVE)
+        except OSError:
+            cache_sha256 = None
+        if cache_sha256 is None:
+            retained_errors.append(f"{side} cache module is missing")
+        else:
+            retained_errors.extend(
+                f"{side}: {message}" for message in _retained_reading_errors(
+                    record, side=side, source_root=source_root,
+                    source_sha256=source.get("content_sha256"),
+                    cache_sha256=cache_sha256, fixture=fixture))
+        if isinstance(record, dict):
+            child_pids.append(record.get("fresh_child_pid"))
+    if (len(child_pids) != 2 or any(not isinstance(pid, int) for pid in child_pids)
+            or len(set(child_pids)) != 2):
+        retained_errors.append("baseline and candidate retained probes lack distinct child identities")
+    if not isinstance(retained, dict) or retained.get("status") != "pass":
+        retained_errors.append("fresh retained-memory probe did not pass")
+    if isinstance(retained, dict):
+        validation = retained.get("validation_errors")
+        if not isinstance(validation, dict) or any(validation.values()):
+            retained_errors.append("retained-memory evidence contains validation errors")
+
+    baseline_helpers = _candidate_helper_launches(measurement_evidence, "baseline")
+    candidate_helpers = _candidate_helper_launches(measurement_evidence, "candidate")
+    runner_valid, runner_peaks = _candidate_runner_check(measurement_evidence)
+    measurement_cleanup_complete = (isinstance(measurement_cleanup, dict)
+                                    and measurement_cleanup.get("status") == "pass")
+    lifecycle_cleanup_complete = (isinstance(lifecycle_cleanup, dict)
+                                  and lifecycle_cleanup.get("status") == "pass")
+    cleanup = {
+        "measurement": measurement_cleanup,
+        "lifecycle": lifecycle_cleanup,
+        "retained_memory": {
+            "status": retained.get("status", "missing") if isinstance(retained, dict) else "missing",
+            "evidence": retained.get("output_paths", {}) if isinstance(retained, dict) else {},
+        },
+    }
+    shared_observation_errors = []
+    if baseline_helpers is None:
+        shared_observation_errors.append("baseline helper launch data is missing")
+    if candidate_helpers != 0:
+        shared_observation_errors.append("candidate carrier launched a readiness helper")
+    if not runner_valid:
+        shared_observation_errors.append("candidate peer-watch runner evidence is missing or exceeds one runner")
+    shared_observation_errors.extend(lifecycle_errors)
+    shared_observation_errors.extend(retained_errors)
+    shared_observation_complete = not shared_observation_errors
+    cleanup_complete = measurement_cleanup_complete and lifecycle_cleanup_complete
+    subcommands_pass = (
+        measurement_command.get("exit_code") == 0
+        and lifecycle_command.get("exit_code") == 0
+        and isinstance(retained, dict)
+        and all(command.get("exit_code") == 0
+                for command in retained.get("child_commands", {}).values())
+    )
+    provenance_complete = not provenance_errors
+    status = "PASS" if (subcommands_pass and provenance_complete and not matrix_errors
+                         and shared_observation_complete and cleanup_complete) else "FAIL"
+    lifecycle_fixture = (lifecycle_evidence.get("fixtures") or [{}])[0]
+    report = {
+        "schema_version": 2,
+        "status": status,
+        "scope": "paired source measurement and lifecycle evidence; no remote ancestry judgment",
+        "invocation": {
+            "executable": sys.executable,
+            "argv": list(sys.argv),
+            "cwd": str(Path.cwd().resolve()),
+            "evidence_dir": str(Path(evidence_dir).resolve()),
+        },
+        "subprocesses": {"measurement": measurement_command,
+                         "lifecycle": lifecycle_command},
+        "d1_source_provenance": {
+            "status": "verified" if provenance_complete else "invalid",
+            "sources": provenance,
+            "validation_errors": provenance_errors,
+        },
+        "d2_shared_observation": {
+            "status": "supported" if shared_observation_complete else "incomplete or invalid",
+            "validation_errors": shared_observation_errors,
+            "baseline_carrier_helper_launches": baseline_helpers,
+            "candidate_carrier_helper_launches": candidate_helpers,
+            "candidate_peer_watch_runner_peak_processes": max(runner_peaks, default=0),
+            "runner_session_snapshot_calls": lifecycle_fixture.get(
+                "runner_session_snapshot_calls"),
+            "observation_groups": lifecycle_fixture.get("observation_groups", []),
+            "registry_view_regression_selected": _selected_registry_view_regression(
+                lifecycle_evidence),
+            "retained_memory": retained,
+        },
+        "d3_independent_delivery": {
+            "status": "complete" if not lifecycle_errors else "incomplete",
+            "validation_errors": lifecycle_errors,
+            "lifecycle_tests_run": lifecycle_evidence.get("tests_run", 0),
+            "fixture": lifecycle_fixture,
+            "selected_regressions": lifecycle_evidence.get("selected_regressions", []),
+        },
+        "d4_matched_measurements": {
+            "status": "complete" if not matrix_errors else "incomplete",
+            "validation_errors": matrix_errors,
+            "conditions": list(WINDOWS),
+            "metric_order": list(ROLES),
+            "metric_windows": len(metric_rows),
+        },
+        "fixture_cleanup": cleanup,
+        "metric_windows": metric_rows,
+        "source_sha256": _source_hashes(),
+        "source_provenance": provenance,
+        "retained_memory": retained,
+        "lifecycle_source_sha256": lifecycle_evidence.get("source_sha256", {}),
+        "limitations": [
+            "Remote main ancestry and pull request inclusion are checked by the owner outside this helper.",
+            "CPU, process, RSS, and retained-heap values are isolated fixture measurements; host production PIDs are inaccessible.",
+            "The CPU peer-watch unrelated-event window uses a test-only SIGUSR1 wake surrogate; local Unix-socket bind is unavailable.",
+            "The lifecycle runner uses pipe-backed observation; per-class self CPU and reaped-child CPU counters overlap after process reaping.",
+        ],
+    }
+    acceptance_path = Path(evidence_dir) / "shared-readiness-acceptance.json"
+    _write_json(acceptance_path, report)
+    handoff_path = Path(evidence_dir) / "final-source-evidence.md"
+    handoff_path.write_text(_make_handoff(report, evidence_dir, measurement_evidence,
+                                          lifecycle_evidence, cleanup), encoding="utf-8")
+    return report, acceptance_path, handoff_path
 
 
 def _accept(baseline_root, evidence_dir):
@@ -354,171 +1065,30 @@ def _accept(baseline_root, evidence_dir):
         measurement_dir / "readiness-cpu-fixture-cleanup.json") or {"status": "missing"}
     lifecycle_evidence = _read_json(lifecycle_dir / "shared-readiness-lifecycle.json") or {}
     lifecycle_cleanup = lifecycle_evidence.get("fixture_cleanup") or {"status": "missing"}
-    lifecycle_fixture = (lifecycle_evidence.get("fixtures") or [{}])[0]
-    retained_path = baseline_root.parent / "registry-retained-memory.json"
-    retained = _read_json(retained_path) or {}
-    baseline_retained = retained.get("baseline", {})
-    candidate_retained = retained.get("candidate", {})
-
-    baseline_helpers = _candidate_helper_launches(
-        measurement_evidence, "baseline_main_a7f77262d")
-    candidate_helpers = _candidate_helper_launches(
-        measurement_evidence, "candidate_567efc337")
-    candidate_runner_peaks = [
-        row["classes"]["shared-runner"]["peak_processes"]
-        for row in _metric_rollup(measurement_evidence)
-        if row["side"] == "candidate_567efc337"
-    ]
-    metric_rows = _metric_rollup(measurement_evidence)
-    matrix_complete = (len(metric_rows) == 24 and all(
-        row.get("production_inclusive_cpu_delta_seconds") is not None
-        and all(row["classes"][role]["peak_simultaneous_rss_bytes"] is not None
-                for role in ROLES)
-        for row in metric_rows))
-    lifecycle_complete = (
-        lifecycle_evidence.get("tests_run", 0) > 0
-        and lifecycle_evidence.get("suite_exit_code") == 0
-        and not lifecycle_evidence.get("failures")
-        and not lifecycle_evidence.get("errors")
-        and lifecycle_fixture.get("watch_count") == 6
-        and lifecycle_fixture.get("same_target_count") == 5
-        and lifecycle_fixture.get("receipt_count") == 6
-        and lifecycle_fixture.get("ack_count") == 6
-        and len(lifecycle_fixture.get("notice_records", {})) == 6
-        and all(count == 1 for count in lifecycle_fixture.get("notice_records", {}).values())
-        and all(lifecycle_fixture.get("receipt_records", {}).values())
-        and all(lifecycle_fixture.get("ack_records", {}).values())
-        and lifecycle_fixture.get("target_state_before_after") == ["working", "idle"]
-        and lifecycle_fixture.get("jobs_sha256_before_after", [None, None])[0]
-        == lifecycle_fixture.get("jobs_sha256_before_after", [None, None])[-1]
-    )
-    cleanup_status = {
-        "measurement": measurement_cleanup,
-        "lifecycle": lifecycle_cleanup,
-    }
-    cleanup_complete = (measurement_cleanup.get("status") == "pass"
-                        and lifecycle_cleanup.get("status") == "pass")
-    retained_parse_counts = [
-        baseline_retained.get("cache_metrics", {}).get("full_metadata_parses"),
-        candidate_retained.get("cache_metrics", {}).get("full_metadata_parses"),
-    ]
-    retained_rss_after = [
-        _rss_kib(baseline_retained, "rss_after"),
-        _rss_kib(candidate_retained, "rss_after"),
-    ]
-    retained_rss_high_water = [
-        _rss_kib(baseline_retained, "rss_high_water"),
-        _rss_kib(candidate_retained, "rss_high_water"),
-    ]
-    if any(value is None for value in retained_rss_high_water):
-        retained_rss_high_water = [
-            _rss_kib(baseline_retained, "maxrss_kib"),
-            _rss_kib(candidate_retained, "maxrss_kib"),
-        ]
-    d1_complete = True  # The owner currentness record is a required named input.
-    d2_complete = (candidate_helpers == 0
-                   and max(candidate_runner_peaks, default=0) == 1
-                   and lifecycle_fixture.get("runner_session_snapshot_calls") == 2
-                   and retained_parse_counts == [1, 1]
-                   and all(value is not None for value in retained_rss_after)
-                   and all(value is not None for value in retained_rss_high_water))
-    subcommands_pass = measurement["exit_code"] == 0 and lifecycle["exit_code"] == 0
-    status = "PASS" if (subcommands_pass and d1_complete and d2_complete
-                         and matrix_complete and lifecycle_complete
-                         and cleanup_complete) else "FAIL"
-
-    report = {
-        "schema_version": 1,
-        "status": status,
-        "scope": "phase 3 final-source evidence refresh; no stage-gate authority",
-        "subprocesses": {"measurement": measurement, "lifecycle": lifecycle},
-        "d1_source_currentness": {
-            "candidate_revision": "567efc33752707c72ca3a40c6a2b8a2c2dfc89cc",
-            "origin_main": "a7f77262d1f3a720a870618b3ebaa7260e2a5ceb",
-            "pull_requests_in_ancestry": ["#688", "#692"],
-            "evidence_source": "dev_logs/execute-implementation.md owner currentness record",
-        },
-        "d2_shared_observation": {
-            "baseline_carrier_helper_launches": baseline_helpers,
-            "candidate_carrier_helper_launches": candidate_helpers,
-            "candidate_shared_runner_peak_processes": max(candidate_runner_peaks, default=0),
-            "lifecycle_target_snapshot_calls": lifecycle_fixture.get(
-                "runner_session_snapshot_calls"),
-            "baseline_retained_bytes": baseline_retained.get("retained_traced_bytes"),
-            "candidate_retained_bytes": candidate_retained.get("retained_traced_bytes"),
-            "baseline_rss_kib": retained_rss_after[0],
-            "candidate_rss_kib": retained_rss_after[1],
-            "baseline_rss_high_water_kib": retained_rss_high_water[0],
-            "candidate_rss_high_water_kib": retained_rss_high_water[1],
-            "retained_memory_evidence": str(retained_path),
-            "registry_cache_source_sha256": hashlib.sha256(
-                (ROOT / "utilities" / "dispatch_registry_cache.py").read_bytes()).hexdigest(),
-            "retained_memory_evidence_reused": True,
-            "retained_full_metadata_parse_counts": retained_parse_counts,
-            "retained_memory_scope_limit": "central cache fixture; not watcher scaling",
-        },
-        "d3_independent_delivery": {
-            "lifecycle_tests_run": lifecycle_evidence.get("tests_run", 0),
-            "fixture": lifecycle_fixture,
-            "selected_regressions": lifecycle_evidence.get("selected_regressions", []),
-        },
-        "d4_matched_measurements": {
-            "status": "complete" if matrix_complete else "incomplete",
-            "conditions": list(WINDOWS),
-            "metric_order": list(ROLES),
-            "metric_windows": len(metric_rows),
-        },
-        "fixture_cleanup": cleanup_status,
-        "metric_windows": metric_rows,
-        "source_sha256": _source_hashes(),
-        "source_provenance": measurement_evidence.get("source_provenance", {}),
-        "lifecycle_source_sha256": lifecycle_evidence.get("source_sha256", {}),
-        "limitations": [
-            "All process, CPU, and RSS values are isolated fixture measurements; host production PIDs are inaccessible.",
-            "The CPU peer-watch unrelated-event window uses a test-only SIGUSR1 wake surrogate; no real Herdr socket event was measured because local Unix-socket bind is denied.",
-            "The production runner lifecycle fixture used a pipe-backed observation transport because local Unix-socket bind is denied in this sandbox.",
-            "Per-class self CPU and reaped-child CPU counters overlap after process reaping; inclusive lineage boundary deltas count transfers once.",
-            "The five same-target peer case also includes one separate-target isolation control, so it has six watcher processes.",
-        ],
-        "runtime_contract": {
-            "capability_status": "instruction-only",
-            "tool_contract": None,
-            "tool_contract_check": None,
-            "qa_assurance_scope": "selected-checks-only:not-completion-evidence",
-            "governing_prd_sections_read": ["§13.37.2-(2)", "§13.37.2-(10)"],
-        },
-        "source_recheck": {
-            "legacy_pre_birth_watch": "runner supplies current lineage; consumer accepts only after matching live PID/start, pane, harness, session, and native result; otherwise remains unknown",
-            "publisher_endpoint_context": "the readiness publisher uses the supplied pass-scoped read context and does not mutate the global Herdr session",
-            "native_result_grouping": "target identity includes native idle/done state, so differing results remain separate groups",
-            "watcher_memory_lifetime": "watcher consumes a bounded projection and does not retain a RegistryView while waiting",
-        },
-    }
-    report["d1_source_currentness"]["status"] = "confirmed by owner currentness evidence"
-    report["d2_shared_observation"]["status"] = (
-        "supported by final carrier, peer, and unchanged registry fixtures"
-        if d2_complete else "incomplete or observed mismatch")
-    report["d3_independent_delivery"]["status"] = (
-        "complete" if lifecycle_complete and cleanup_complete else "incomplete")
-
-    acceptance_path = evidence_dir / "shared-readiness-acceptance.json"
-    _write_json(acceptance_path, report)
-    handoff_path = evidence_dir / "final-source-evidence.md"
-    handoff_path.write_text(_make_handoff(report, evidence_dir, measurement_evidence,
-                                          lifecycle_evidence, cleanup_status),
-                            encoding="utf-8")
-    print(json.dumps({"status": status, "acceptance": str(acceptance_path),
-                      "handoff": str(handoff_path),
-                      "measurement_exit": measurement["exit_code"],
-                      "lifecycle_exit": lifecycle["exit_code"],
-                      "cleanup": {name: value.get("status")
-                                  for name, value in cleanup_status.items()}}, sort_keys=True))
-    return 0 if status == "PASS" else 1
+    retained = _run_retained_memory(
+        evidence_dir / "retained-memory", baseline_root, ROOT,
+        measurement_evidence.get("source_provenance", {}))
+    report, acceptance_path, handoff_path = _assemble_report(
+        evidence_dir, baseline_root, measurement, lifecycle, measurement_evidence,
+        measurement_cleanup, lifecycle_evidence, lifecycle_cleanup, retained)
+    print(json.dumps({
+        "status": report["status"],
+        "acceptance": str(acceptance_path),
+        "handoff": str(handoff_path),
+        "measurement_exit": measurement["exit_code"],
+        "lifecycle_exit": lifecycle["exit_code"],
+        "retained_memory_status": retained.get("status"),
+        "cleanup": {"measurement": measurement_cleanup.get("status"),
+                    "lifecycle": lifecycle_cleanup.get("status")},
+    }, sort_keys=True))
+    return 0 if report["status"] == "PASS" else 1
 
 
 def main(argv=None):
     if argv is None and len(sys.argv) == 3 and sys.argv[1] == "--lifecycle-child":
         return _lifecycle_child(Path(sys.argv[2]))
+    if argv is None and len(sys.argv) == 6 and sys.argv[1] == "--retained-memory-child":
+        return _retained_memory_child(*sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-root", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
