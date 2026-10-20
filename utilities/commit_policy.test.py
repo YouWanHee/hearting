@@ -313,12 +313,28 @@ class CommitPolicyTest(unittest.TestCase):
             "opencode_merge_observation", ROOT / "adapters/opencode/bin/dispatch-headless.py")
         opencode = importlib.util.module_from_spec(opencode_spec)
         opencode_spec.loader.exec_module(opencode)
-        opencode_config = json.loads(opencode.scoped_external_directory_config(
-            str(self.primary), worktree=str(self.linked), merge_observation_only=True))
-        self.assertEqual(opencode_config["permission"]["bash"]["git status *"], "allow")
-        self.assertEqual(opencode_config["permission"]["bash"]["*"] , "deny")
-        self.assertEqual(opencode_config["permission"]["edit"]["*"], "deny")
-        self.assertEqual(opencode_config["permission"]["edit"][f"{self.primary}/**"], "allow")
+        import dispatch_replacement
+        for version, source in (("1.19.0", {}),
+                                ("2.0.32", {"permissions": [], "agents": {}})):
+            with self.subTest(version=version), mock.patch.dict(os.environ, {
+                    "OPENCODE_RUNTIME_VERSION": version,
+                    "OPENCODE_CONFIG_CONTENT": json.dumps(source),
+            }, clear=False):
+                opencode_config = json.loads(opencode.scoped_external_directory_config(
+                    str(self.primary), worktree=str(self.linked), merge_observation_only=True))
+                if version.startswith("2."):
+                    self.assertNotIn("permission", opencode_config)
+                    self.assertNotIn("agent", opencode_config)
+                    self.assertIn("permissions", opencode_config)
+                    self.assertIn("agents", opencode_config)
+                recorded = dispatch_replacement._applied_permissions(SimpleNamespace(
+                    opencode_config_content=json.dumps(opencode_config)))
+                self.assertTrue(recorded["opencode_permission"])
+                permissions = recorded["opencode_permission"]
+                self.assertEqual(permissions["bash"]["git status *"], "allow")
+                self.assertEqual(permissions["bash"]["*"], "deny")
+                self.assertEqual(permissions["edit"]["*"], "deny")
+                self.assertEqual(permissions["edit"][f"{self.primary}/**"], "allow")
         self.assertEqual({name: (git_dir / name).read_bytes() for name in before}, before)
 
     def test_every_wrapper_asks_the_same_module(self):
@@ -352,7 +368,9 @@ class OpenCodeRealizationTest(unittest.TestCase):
 
     def deny(self, config, agent=None):
         import json
-        return json.loads(self.wrapper.deny_commands(json.dumps(config), commit_policy.COMMIT_COMMANDS, agent))
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}):
+            return json.loads(self.wrapper.deny_commands(
+                json.dumps(config), commit_policy.COMMIT_COMMANDS, agent))
 
     def test_the_global_and_agent_bash_rules_end_with_the_denies(self):
         denies = {"git commit": "deny", "git commit *": "deny"}
@@ -376,7 +394,8 @@ class OpenCodeRealizationTest(unittest.TestCase):
                  "artifact_root": "/tmp/canonical/artifacts",
                  "body_file": "/tmp/canonical/artifacts/dev_logs/pr-description.md"}
         commands = commit_policy.task_publish_commands(scope)
-        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "",
+                                          "OPENCODE_RUNTIME_VERSION": "1.19.0"}, clear=False):
             allowed = json.loads(self.wrapper.scoped_external_directory_config(
                 "/tmp/canonical/artifacts", task_publish_scope=scope))
         bash = allowed["permission"]["bash"]
@@ -386,13 +405,54 @@ class OpenCodeRealizationTest(unittest.TestCase):
         self.assertFalse(any("force" in command or "pr merge" in command for command in commands))
 
         with mock.patch.dict(os.environ, {
-            "OPENCODE_CONFIG_CONTENT": json.dumps({"permission": {"bash": {"*": "deny"}}})
+            "OPENCODE_CONFIG_CONTENT": json.dumps({"permission": {"bash": {"*": "deny"}}}),
+            "OPENCODE_RUNTIME_VERSION": "1.19.0",
         }, clear=False):
             denied = json.loads(self.wrapper.scoped_external_directory_config(
                 "/tmp/canonical/artifacts", task_publish_scope=scope,
             ))
         denied_bash = denied["permission"]["bash"]
         self.assertEqual(denied_bash, {"*": "deny"})
+
+    def test_v2_task_publish_projection_keeps_native_shell_rules_and_recorder_view(self):
+        import dispatch_replacement
+        scope = {"branch": "task/pr-ci", "base": "main", "route_id": "rt-task",
+                 "artifact_root": "/tmp/canonical/artifacts",
+                 "body_file": "/tmp/canonical/artifacts/dev_logs/pr-description.md"}
+        commands = commit_policy.task_publish_commands(scope)
+
+        def effect(rows, action, resource):
+            import fnmatch
+            result = None
+            for row in rows:
+                if fnmatch.fnmatchcase(action, row["action"]) and fnmatch.fnmatchcase(
+                        resource, row["resource"]):
+                    result = row["effect"]
+            return result
+
+        cases = (
+            ({"permissions": [{"action": "shell", "resource": "*", "effect": "ask"}],
+              "agents": {}}, "allow"),
+            ({"permissions": [{"action": "shell", "resource": "*", "effect": "deny"}],
+              "agents": {}}, "deny"),
+        )
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}, clear=False):
+            for source, expected in cases:
+                with self.subTest(expected=expected), mock.patch.dict(
+                        os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(source)}, clear=False):
+                    config = json.loads(self.wrapper.scoped_external_directory_config(
+                        "/tmp/canonical/artifacts", task_publish_scope=scope))
+                    self.assertNotIn("permission", config)
+                    self.assertNotIn("agent", config)
+                    self.assertIn("permissions", config)
+                    self.assertIn("agents", config)
+                    for command in commands:
+                        self.assertEqual(effect(config["permissions"], "shell", command), expected)
+                    self.assertFalse(any("force" in command or "pr merge" in command
+                                         for command in commands))
+                    applied = dispatch_replacement._applied_permissions(SimpleNamespace(
+                        opencode_config_content=json.dumps(config)))
+                    self.assertTrue(applied["opencode_permission"])
 
     def test_claude_owner_allowlist_contains_only_the_approved_task_publish_commands(self):
         import importlib.util

@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import opencode_session_runtime as runtime
 import dispatch_parent_completion as parent
+import opencode_runtime as permission_runtime
+import dispatch_replacement
 from dispatch_contract import hold_supervisor_lease
 
 spec = importlib.util.spec_from_file_location(
@@ -207,41 +209,60 @@ event('step_finish', part={'reason':'stop'})
             opencode_command=shlex.join([sys.executable, str(self.script)]),
             model=None, variant=None, opencode_agent="build", owner_runtime_turn_ordinal=0,
         )
-        events = []
-        with unittest.mock.patch.dict(os.environ, {"PERMISSION_CONFIGS": str(capture)}), \
-             unittest.mock.patch.object(commit_policy, "read_runtime_permission_context", return_value=context), \
-             unittest.mock.patch.object(commit_policy, "runtime_permission_context_is_current", return_value=True), \
-             unittest.mock.patch.object(fixture.supervisor, "emit", side_effect=events.append):
-            for ordinal, active in enumerate((False, True, False), 1):
-                marker = git_dir / "MERGE_HEAD"
-                if active:
-                    marker.write_text("fixture\n", encoding="utf-8")
-                else:
-                    marker.unlink(missing_ok=True)
-                args.owner_runtime_turn_ordinal = ordinal
-                fixture.supervisor.run_turn(args, "ignored-session", "continue", resume=ordinal > 1)
+        for version in ("1.19.0", "2.0.32"):
+            with self.subTest(version=version):
+                capture.write_text("", encoding="utf-8")
+                events = []
+                args.owner_runtime_turn_ordinal = 0
+                with unittest.mock.patch.dict(os.environ, {
+                    "PERMISSION_CONFIGS": str(capture), "OPENCODE_RUNTIME_VERSION": version,
+                }), unittest.mock.patch.object(
+                    commit_policy, "read_runtime_permission_context", return_value=context), \
+                     unittest.mock.patch.object(
+                         commit_policy, "runtime_permission_context_is_current", return_value=True), \
+                     unittest.mock.patch.object(fixture.supervisor, "emit", side_effect=events.append):
+                    for ordinal, active in enumerate((False, True, False), 1):
+                        marker = git_dir / "MERGE_HEAD"
+                        if active:
+                            marker.write_text("fixture\n", encoding="utf-8")
+                        else:
+                            marker.unlink(missing_ok=True)
+                        args.owner_runtime_turn_ordinal = ordinal
+                        fixture.supervisor.run_turn(args, "ignored-session", "continue", resume=ordinal > 1)
 
-        configs = [json.loads(line)["config"] for line in capture.read_text().splitlines()]
-        rows = [item for item in events
-                if item.get("type") == "dispatch.supervisor.permission-projection"]
-        self.assertEqual(len(configs), 3)
-        for index, config in enumerate(configs):
-            permissions = config["permission"]
-            self.assertEqual(permissions["external_directory"][str(read_root)], "allow")
-            edit = permissions["edit"]
-            if index == 1:
-                self.assertEqual(edit["*"], "deny")
-            else:
-                self.assertTrue(edit.get(str(read_root)) == "deny"
-                                or edit.get(str(read_root) + "/**") == "deny", edit)
-        self.assertEqual(configs[0]["permission"]["edit"]["*"], "allow")
-        self.assertEqual(configs[1]["permission"]["edit"]["*"], "deny")
-        self.assertEqual(configs[2]["permission"]["edit"]["*"], "allow")
-        self.assertEqual([(item["attempt_id"], item["thread_id"], item["turn_id"]) for item in rows],
-                         [(self.args.parent_attempt_id, "ses_native", str(index)) for index in (1, 2, 3)])
-        self.assertEqual([item["git_operation"] for item in rows], ["none", "merge", "none"])
-        self.assertEqual([item["file_enforcement"] for item in rows], ["tool-permission"] * 3)
-        self.assertEqual([item["network_enforcement"] for item in rows], ["none"] * 3)
+                configs = [json.loads(line)["config"] for line in capture.read_text().splitlines()]
+                rows = [item for item in events
+                        if item.get("type") == "dispatch.supervisor.permission-projection"]
+                self.assertEqual(len(configs), 3)
+                decoded = []
+                for index, config in enumerate(configs):
+                    if version.startswith("2."):
+                        self.assertNotIn("permission", config)
+                        self.assertNotIn("agent", config)
+                        self.assertIn("permissions", config)
+                        self.assertIn("agents", config)
+                    legacy = (permission_runtime.opencode_v2_to_legacy_config(config)
+                              if "permissions" in config else config)
+                    recorded = dispatch_replacement._applied_permissions(
+                        SimpleNamespace(opencode_config_content=json.dumps(config)))
+                    permissions = recorded["opencode_permission"]
+                    self.assertTrue(permission_runtime.opencode_permission_ordered_view(permissions))
+                    self.assertEqual(permissions["external_directory"][str(read_root)], "allow")
+                    edit = permissions["edit"]
+                    if index == 1:
+                        self.assertEqual(edit["*"], "deny")
+                    else:
+                        self.assertTrue(edit.get(str(read_root)) == "deny"
+                                        or edit.get(str(read_root) + "/**") == "deny", edit)
+                    decoded.append(permissions)
+                self.assertEqual(decoded[0]["edit"]["*"], "allow")
+                self.assertEqual(decoded[1]["edit"]["*"], "deny")
+                self.assertEqual(decoded[2]["edit"]["*"], "allow")
+                self.assertEqual([(item["attempt_id"], item["thread_id"], item["turn_id"]) for item in rows],
+                                 [(self.args.parent_attempt_id, "ses_native", str(index)) for index in (1, 2, 3)])
+                self.assertEqual([item["git_operation"] for item in rows], ["none", "merge", "none"])
+                self.assertEqual([item["file_enforcement"] for item in rows], ["tool-permission"] * 3)
+                self.assertEqual([item["network_enforcement"] for item in rows], ["none"] * 3)
         self.assertEqual(effective.read_bytes(), original)
 
     def test_exit_before_final_stop_is_not_success(self):
@@ -578,7 +599,9 @@ for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'r
         self.assertIn('--parent-attempt-id unassigned', preview)
         self.assertIn('preview-only.lease', preview)
         args.owner_route_binding = None
-        self.assertTrue(module.shell_command(args, self.f.base/'prompt', self.f.base/'log').startswith('opencode run '))
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}):
+            self.assertTrue(module.shell_command(
+                args, self.f.base/'prompt', self.f.base/'log').startswith('opencode run '))
 
 
     def test_input_queued_before_the_first_turn_binds_the_native_session(self):

@@ -1414,6 +1414,17 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         raise _contract_error("replacement-argv-mismatch")
 
 
+def _opencode_permission_view(applied):
+    import opencode_runtime
+    if not isinstance(applied, dict) or "opencode_permission" not in applied:
+        return []
+    try:
+        return opencode_runtime.opencode_permission_ordered_view(
+            applied.get("opencode_permission"))
+    except ValueError:
+        return []
+
+
 def require_recovery_grant_addresses(candidate, history, *, route, access=None):
     """Translate adapter grant spellings to the existing approved task addresses.
 
@@ -1422,7 +1433,6 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
     Nothing is persisted and no additional input is requested.
     """
     import execution_access as EA
-    import fnmatch
     applied = candidate.get("applied_permissions") or {}
     old_permissions = history.get("applied_permissions") or {}
     original = old_permissions.get("execution_access") or {}
@@ -1481,40 +1491,41 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
             require(value, writes)
     for value in grant.get("read_roots", []):
         require(value, reads)
-    permissions = applied.get("opencode_permission") or {}
+    import opencode_runtime
+    permissions = {}
+    if candidate.get("harness") == "opencode":
+        try:
+            permissions = opencode_runtime.normalize_opencode_permission(
+                applied.get("opencode_permission"), field="opencode_permission")
+            if not opencode_runtime.opencode_permission_ordered_view(
+                    applied.get("opencode_permission")):
+                raise ValueError("empty permission policy")
+        except (AttributeError, TypeError, ValueError):
+            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
     for category, roots in (("external_directory", reads), ("edit", writes)):
-        rules = permissions.get(category) or {}
-        if isinstance(rules, str):
-            if rules != "deny" and category != "edit":
-                raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
-            rules = {"*": rules}
-        for pattern, effect in rules.items():
+        rules = opencode_runtime.opencode_permission_rules_for_action(
+            permissions, category) or []
+        for pattern, effect in rules:
             if effect == "allow" and not (category == "edit" and pattern in {"*", "**"}):
                 require(pattern, roots, relative_to=history["worktree"] if category == "edit" else None)
         if category == "edit":
             # Native edit defaults apply within the externally scoped roots.
             # Preserve the normal launcher's '*' allow, while requiring its
             # read-only roots to retain their effective edit deny.
-            external = permissions.get("external_directory") or {}
-            if any(effect == "allow" for effect in rules.values()) and not isinstance(external, dict):
-                raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
             for root in reads:
                 if any(root == write or write in root.parents for write in writes):
                     continue
-                visible = "deny"
-                for pattern, candidate_effect in external.items():
-                    if fnmatch.fnmatchcase(str(root), pattern):
-                        visible = candidate_effect
+                visible = opencode_runtime.opencode_permission_effect(
+                    permissions, "external_directory", str(root), default="deny")
                 if visible != "allow":
                     continue
                 for path in (root, root / "__recovery_read_only_child__"):
                     forms = (str(path), os.path.relpath(path, history["worktree"]))
-                    effect = "allow"
-                    for pattern, candidate_effect in rules.items():
-                        if any(fnmatch.fnmatchcase(form, pattern) for form in forms):
-                            effect = candidate_effect
-                    if effect != "deny":
-                        raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+                    for form in forms:
+                        effect = opencode_runtime.opencode_permission_effect(
+                            permissions, "edit", form, default="allow")
+                        if effect != "deny":
+                            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
     for rule in (applied.get("claude") or {}).get("allowed_tools") or []:
         match = re.fullmatch(r"(Read|Edit|Write)(?:\(([^)]+)\))?", rule)
         if not match:
@@ -1528,8 +1539,22 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
 
 def _without_recovery_access(permissions):
     result = {key: value for key, value in permissions.items() if key != "execution_access"}
-    if isinstance(result.get("opencode_permission"), dict):
-        result["opencode_permission"] = {key: value for key, value in result["opencode_permission"].items()
+    policy = result.get("opencode_permission")
+    if isinstance(policy, dict) and isinstance(policy.get("rules"), list):
+        removed = {tuple(row) for row in policy["rules"]
+                   if isinstance(row, list) and row and row[0] in ("external_directory", "edit")}
+        kept = [row for row in policy["rules"] if tuple(row) not in removed]
+        edges = []
+        for edge in policy.get("precedence", []):
+            if (isinstance(edge, list) and len(edge) == 2
+                    and tuple(edge[0]) not in removed and tuple(edge[1]) not in removed):
+                edges.append(edge)
+        result["opencode_permission"] = {
+            "rules": kept,
+            "precedence": edges,
+        }
+    elif isinstance(policy, dict):
+        result["opencode_permission"] = {key: value for key, value in policy.items()
                                          if key not in ("external_directory", "edit")}
     return result
 
@@ -1645,24 +1670,49 @@ def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
     was invoked, and the release is ``launch_home``'s axis. Any other harness tree, such as a
     development checkout, stays a different path."""
     granted = {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
-    if not launch_home:
-        return granted
-    text = json.dumps(granted, sort_keys=True)
-    home = os.path.realpath(str(launch_home))
-    releases = os.path.dirname(home)
-    managed = os.path.basename(releases) == "releases"
-    pointer = os.path.join(os.path.dirname(releases), "current")
-    roots = {root for root in _RELEASE_TREE_PATH.findall(text)
-             if root == str(launch_home) or os.path.realpath(root) == home
-             or (managed and (root == pointer or os.path.dirname(os.path.realpath(root)) == releases))}
-    # OpenCode edit rules check the same directory relative to the worktree.
-    # Normalize only aliases of the identified launch roots, never arbitrary
-    # relative task paths or another development checkout.
-    if worktree:
-        roots.update(os.path.relpath(root, worktree) for root in tuple(roots))
-    for root in sorted(roots, key=len, reverse=True):
-        text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
-    return json.loads(text)
+    if launch_home:
+        text = json.dumps(granted, sort_keys=False)
+        home = os.path.realpath(str(launch_home))
+        releases = os.path.dirname(home)
+        managed = os.path.basename(releases) == "releases"
+        pointer = os.path.join(os.path.dirname(releases), "current")
+        roots = {root for root in _RELEASE_TREE_PATH.findall(text)
+                 if root == str(launch_home) or os.path.realpath(root) == home
+                 or (managed and (root == pointer or os.path.dirname(os.path.realpath(root)) == releases))}
+        # OpenCode edit rules check the same directory relative to the worktree.
+        # Normalize only aliases of the identified launch roots, never arbitrary
+        # relative task paths or another development checkout.
+        if worktree:
+            roots.update(os.path.relpath(root, worktree) for root in tuple(roots))
+        patterns = [re.compile(r"(?<![^\s\"'(])" + re.escape(root) + "/")
+                    for root in sorted(roots, key=len, reverse=True)]
+
+        def normalize_paths(value):
+            if isinstance(value, str):
+                for pattern in patterns:
+                    value = pattern.sub(RELEASE_ROOT_TOKEN + "/", value)
+                return value
+            if isinstance(value, list):
+                return [normalize_paths(item) for item in value]
+            if isinstance(value, dict):
+                result = {}
+                for key, item in value.items():
+                    normalized_key = normalize_paths(key) if isinstance(key, str) else key
+                    if normalized_key in result:
+                        del result[normalized_key]
+                    result[normalized_key] = normalize_paths(item)
+                return result
+            return value
+
+        granted = normalize_paths(granted)
+    if "opencode_permission" in granted:
+        try:
+            import opencode_runtime
+            granted["opencode_permission"] = opencode_runtime.opencode_permission_ordered_view(
+                granted["opencode_permission"])
+        except ValueError:
+            granted["opencode_permission"] = []
+    return granted
 
 
 def _same_verified_workspace_write_parent(previous, current) -> bool:
@@ -1707,6 +1757,12 @@ def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
     new_applied = current.get("applied_permissions") or {}
     old = granted_permissions(old_applied, previous.get("launch_home"), previous.get("worktree"))
     new = granted_permissions(new_applied, current.get("launch_home"), current.get("worktree"))
+    if previous.get("harness") == "opencode" and not _opencode_permission_view(old_applied):
+        old = dict(old)
+        old["__opencode_permission_authority__"] = "missing-predecessor"
+    if current.get("harness") == "opencode" and not _opencode_permission_view(new_applied):
+        new = dict(new)
+        new["__opencode_permission_authority__"] = "missing-candidate"
     if _same_verified_workspace_write_parent(previous, current):
         if (old_applied.get("launch_lifecycle") == "foreground-scoped"
                 and new_applied.get("launch_lifecycle") == "detached"
