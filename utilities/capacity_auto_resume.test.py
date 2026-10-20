@@ -74,6 +74,21 @@ class ArmTest(unittest.TestCase):
                                     "required_action": "resume-later", "route_id": "rt-y"},
                                    env={C.CHAIN_ENV: str(C.MAX_CHAIN)}))
 
+    def test_a_full_start_budget_after_the_bounded_wait_resumes_at_its_retry_time(self):
+        refused = {"state": "waiting-capacity", "reason": "launch-capacity-wait",
+                   "required_action": "report-capacity-wait", "route_id": "rt-budget",
+                   "retry_at": PAUSE["retry_at"]}
+        armed = self.arm(refused)
+        self.assertEqual((armed["state"], armed["cause"], armed["resume_at"]),
+                         ("armed", "launch-capacity", PAUSE["retry_at"]))
+        # The first refusal is the parent's bounded wait; inside an automatic resume nobody waits.
+        first = {**refused, "route_id": "rt-first", "required_action": "resume-after-capacity"}
+        self.assertIsNone(self.arm(first))
+        self.assertEqual(self.arm(first, env={C.CHAIN_ENV: "1"})["cause"], "launch-capacity")
+        self.assertIsNone(self.arm({**refused, "route_id": "rt-last"}, env={C.CHAIN_ENV: str(C.MAX_CHAIN)}))
+        self.assertIsNone(self.arm({**refused, "route_id": "rt-none", "retry_at": None}))
+        self.assertEqual(len(self.spawned), 2)
+
     def test_an_answer_awaiting_the_parent_is_started_at_once(self):
         armed = self.arm({"reason": C.ANSWER_REASON, "route_id": "rt-answer"})
         self.assertEqual((armed["state"], armed["cause"]), ("armed", "answer"))
@@ -295,6 +310,18 @@ class ReceiptAndNoticeTest(unittest.TestCase):
                          ("end-turn", "wait-for-auto-resume", "launch-auto-resume"))
         self.assertIn("did not start and nothing ran", result["next_step"])
 
+    def test_a_start_budget_resume_receipt_ends_the_turn_instead_of_asking_for_a_report(self):
+        import work_start
+        pause = {"state": "waiting-capacity", "reason": "launch-capacity-wait",
+                 "required_action": "report-capacity-wait", "route_id": PAUSE["route_id"],
+                 "retry_at": PAUSE["retry_at"]}
+        armed = {"record": "/x.json", "resume_at": PAUSE["retry_at"], "state": "armed", "cause": "launch-capacity"}
+        with mock.patch.object(C, "arm", return_value=armed):
+            result = work_start._arm_capacity_resume(dict(pause), "/r/route.json", "/j/jobs.log")
+        self.assertEqual((result["parent_next"], result["required_action"], result["parent_next_reason"]),
+                         ("end-turn", "wait-for-auto-resume", "launch-capacity-auto-resume"))
+        self.assertIn("worker start budget is full", result["next_step"])
+
     def test_the_owning_session_gets_one_notice(self):
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp) / "jobs.log"
@@ -314,6 +341,12 @@ class ReceiptAndNoticeTest(unittest.TestCase):
                           {"state": "running", "owner_attempt_id": "att-2"})
             claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
             self.assertIn("started again after a launch that did not start",
+                          sweep.delivery_context([(jobs.parent, claimed)]))
+            with mock.patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "sid-9"}, clear=True):
+                C._notify({**record, "retry_at": "2026-10-07T12:01:30Z", "cause": "launch-capacity"},
+                          {"state": "running", "owner_attempt_id": "att-3"})
+            claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
+            self.assertIn("started again after the worker start budget freed",
                           sweep.delivery_context([(jobs.parent, claimed)]))
             # A start that failed (here: refused, no receipt) hands the parent the command again.
             route = Path(tmp) / f"{PAUSE['route_id']}.json"
