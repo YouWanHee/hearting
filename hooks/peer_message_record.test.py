@@ -111,11 +111,11 @@ class NativeContextReceiptTest(_BaseTest):
             )
         return text, ref
 
-    def _seed_registered_message(self):
+    def _seed_registered_message(self, *, runtime=False):
         sid = "sid-native-obligation"
         attempt_id = "att-native-context-owner"
         delivery_id = "delivery-native-context"
-        duty_id = "registered-batch-native-context"
+        duty_id = "registered-batch-" + "c" * 32
         carrier = "claude-parent-runtime"
         root = self.jobs_path.parent
         owner = "retained-rewake:" + duty_id
@@ -124,6 +124,7 @@ class NativeContextReceiptTest(_BaseTest):
             "attempt_schema_version=2,dispatch_depth=1,attempt_id=" + attempt_id
             + ",parent_sid=" + sid + ",parent_harness=claude,harness=claude"
             + ",parent_completion_delivery=" + carrier + ",delivery_id=" + delivery_id
+            + ",route_id=rt-native-context,route_node=execute"
             + ",note=completed-marker,failure_class=pass\n",
             encoding="utf-8",
         )
@@ -139,19 +140,37 @@ class NativeContextReceiptTest(_BaseTest):
                           "reason": "fixture", "required_action": "inspect-done-failure",
                           "harness": "claude", "delivery_classification": "attention"}],
         }
+        receipt_digest = pending_delivery._canonical_receipt_digest(receipt)
         pending_delivery.create(
             root, recipient_kind=carrier, recipient_key=sid, delivery_id=delivery_id,
             session_generation="", session_generation_supported="0",
             attempt_ids=[attempt_id], parent_attempt_id="att-native-context-parent",
             route_id="rt-native-context", route_node="execute", receipt=receipt,
-            receipt_digest=pending_delivery._canonical_receipt_digest(receipt),
+            receipt_digest=receipt_digest,
             row_revisions={attempt_id: "fixture"},
         )
         pending_delivery.claim(root, sid, delivery_id, claim_owner=owner, lease_seconds=60)
         binding = {"duty_id": duty_id, "jobs": str(self.jobs_path.resolve()),
                    "attempt_id": attempt_id, "carrier": carrier, "recipient_sid": sid,
                    "storage_recipient": sid, "delivery_id": delivery_id, "claim_owner": owner}
-        text, ref = self._seed_message(recipient_sid=sid, refs=[duty_id])
+        if runtime:
+            producer = {
+                "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
+                "duty_id": duty_id, "jobs": str(self.jobs_path.resolve()),
+                "attempt_id": attempt_id, "carrier": carrier,
+                "delivery_id": delivery_id, "receipt_digest": receipt_digest,
+                "recipient": {"harness": "claude", "session_id": sid},
+                "route_id": "rt-native-context", "route_node": "execute",
+            }
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                text, ref = peer_message.prepare_peer_message(
+                    "[notice] runtime task completion",
+                    {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                    {"harness": "claude", "session_id": sid, "name": "receiver"},
+                    defer=True, refs=[duty_id, attempt_id, delivery_id],
+                    producer_binding=producer, receipt="native-pending")
+        else:
+            text, ref = self._seed_message(recipient_sid=sid, refs=[duty_id])
         with mock.patch.dict(os.environ, self.env, clear=True):
             peer_message.bind_dispatch_notice(ref, binding)
         return text, ref, sid, duty_id, delivery_id, root
@@ -161,6 +180,20 @@ class NativeContextReceiptTest(_BaseTest):
 
     def test_native_hook_receipt_completes_exact_registered_obligation_once(self):
         text, ref, sid, duty_id, delivery_id, root = self._seed_registered_message()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            origin = peer_message.prompt_origin(text, "claude", sid)
+            self.assertEqual(origin["kind"], "runtime-completion")
+            self.assertTrue(origin["legacy"])
+            import session_tidy
+            session_tidy.run_hook("claude", "prompt", sid,
+                                  cwd=str(self.tmp_root), prompt_text=text)
+            route_spec = importlib.util.spec_from_file_location(
+                "legacy_runtime_route_source", _UTILITIES / "capability-route.py")
+            route = importlib.util.module_from_spec(route_spec)
+            route_spec.loader.exec_module(route)
+            self.assertEqual(route._turn_peer_source("claude", sid, str(self.tmp_root)),
+                             f"runtime:completion·{origin['producer_binding']['attempt_id']}"
+                             f"/{delivery_id}")
         first = self._prompt(sid)
         self.assertEqual(first.returncode, 0, first.stderr)
         context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
@@ -180,6 +213,33 @@ class NativeContextReceiptTest(_BaseTest):
             self.assertEqual(peer_obligations.ObligationStore(root).get(duty_id)["state"], "complete")
         records = [row for row in self._all_records() if row.get("transfer_ref") == ref]
         self.assertEqual(len(records), 1)
+        duplicate = self._prompt(sid)
+        self.assertEqual(duplicate.stdout, b"")
+        self.assertEqual([row for row in self._all_records() if row.get("transfer_ref") == ref], records)
+
+    def test_runtime_completion_keeps_runtime_identity_through_native_receipt_and_ack(self):
+        text, ref, sid, duty_id, delivery_id, root = self._seed_registered_message(runtime=True)
+        self.assertIn("(runtime-from:", text)
+        self.assertNotIn("(peer-from:", text)
+        first = self._prompt(sid)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, text)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            received = peer_message._read_pending(ref)
+            transfer = peer_message._read_transfer_record(ref)
+            producer = transfer["producer_binding"]
+            self.assertEqual(received["state"], "received")
+            self.assertEqual(received["from"]["harness"], "runtime")
+            self.assertEqual(received["from"]["session_id"], None)
+            self.assertEqual(received["producer_binding"], producer)
+            self.assertEqual(transfer["from"]["harness"], "runtime")
+            self.assertEqual(pending_delivery.read(root, sid, delivery_id)["state"], "acked")
+            self.assertEqual(peer_obligations.ObligationStore(root).get(duty_id)["state"], "complete")
+        records = [row for row in self._all_records() if row.get("transfer_ref") == ref]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["from"]["harness"], "runtime")
+        self.assertEqual(records[0]["producer_binding"], producer)
         duplicate = self._prompt(sid)
         self.assertEqual(duplicate.stdout, b"")
         self.assertEqual([row for row in self._all_records() if row.get("transfer_ref") == ref], records)

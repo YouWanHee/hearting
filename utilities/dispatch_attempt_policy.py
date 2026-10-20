@@ -167,6 +167,7 @@ class RegisteredWorkObservation:
     cleanup_state: str = "settled"
     provenance: tuple[tuple[str, str], ...] = ()
     pane_relation: str = "executor"
+    delivery_state: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ def _registered_readiness(observation: RegisteredWorkObservation) -> CompletionR
                   ("owner_completion_state", observation.owner_completion_state),
                   ("cleanup_state", observation.cleanup_state),
                   ("pane_relation", observation.pane_relation),
+                  ("delivery_state", observation.delivery_state),
                   *observation.provenance)
     if (not observation.attempt_id or observation.owner_completion_state not in
             {"settled", "pending", "unknown"} or observation.cleanup_state not in
@@ -226,6 +228,34 @@ def _registered_readiness(observation: RegisteredWorkObservation) -> CompletionR
         return CompletionReadiness("unknown", "registered-work", decision.outcome,
                                    decision.action, "registered-observation-invalid",
                                    provenance)
+    if observation.pane_relation == "parent":
+        if observation.delivery_state not in {
+                "unknown", "pending", "claimed", "queued", "unverified",
+                "sent-ambiguous", "acked", "not-required"}:
+            return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                       decision.action, "registered-observation-invalid",
+                                       provenance)
+        if decision.action == "inspect-conflict" or decision.outcome == "unknown":
+            return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                       decision.action, decision.reason, provenance)
+        if decision.action in {"wait", "reconcile", "complete", "recover",
+                               "cancel", "settle-cancellation"}:
+            state = "unknown" if decision.action == "recover" else "pending"
+            return CompletionReadiness(state, "registered-work", decision.outcome,
+                                       decision.action, decision.reason, provenance)
+        if (decision.action in {"advance", "review", "inspect-failure"}
+                and decision.outcome in _SETTLED_WORK_OUTCOMES):
+            if observation.delivery_state in {"pending", "claimed", "queued",
+                                               "unverified", "sent-ambiguous"}:
+                return CompletionReadiness("pending", "registered-work", decision.outcome,
+                                           decision.action, "bound-registered-work-pending",
+                                           provenance)
+            if observation.delivery_state == "unknown":
+                return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                           decision.action, "registered-closure-unknown",
+                                           provenance)
+            return CompletionReadiness("ready", "registered-work", decision.outcome,
+                                       decision.action, decision.reason, provenance)
     if observation.owner_completion_state == "unknown" or observation.cleanup_state == "unknown":
         return CompletionReadiness("unknown", "registered-work", decision.outcome,
                                    decision.action, "registered-closure-unknown",

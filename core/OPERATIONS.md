@@ -62,18 +62,29 @@ selected route changes source prepares its execution cwd before eligibility
 evidence, sealing, publication, or launch. This applies to `compose --start`,
 framed first legs, successors, printed next-leg commands, and `direct` routes;
 an explicit primary cwd or supplied dispatch evidence is not an exemption.
-From a primary checkout, preparation fetches the remote default branch and
-creates the worktree from the commit SHA observed after that successful fetch.
+A framed start also prepares the cwd that its frame will read, even when its
+route does not itself change source. From a primary checkout,
+preparation fetches the remote default branch and creates the worktree from the
+commit SHA observed after that successful fetch.
 When the repository has no remotes, preparation uses the primary worktree's
 current `HEAD` commit without a fetch; if `HEAD` does not resolve to a commit,
 preparation fails before publication.
 An explicitly approved task linked worktree is kept with its existing changes
-and HEAD. Exact saved snapshots, cursors, receipts, and official continuations
+and HEAD. For a framed start whose cwd is an implicit linked worktree, dirty or
+unmerged state is retained as the frame's read cwd, but that retention does
+not approve a source-changing leg to work there; that still takes the existing
+approved `cwd` proposal. A clean, merged implicit linked worktree can receive a
+new allocation from the fetched remote default. Only a newly allocated frame
+worktree is carried directly into its first source-changing leg. Exact saved
+snapshots, cursors, receipts, and official continuations
 are resumed before new preparation, so resuming an existing task does not
 require another network fetch. Occupied worktree names are skipped with an
-automatically chosen suffix; preparation failure prevents route publication
-and launch and can be retried through the same start with its existing
-decision and approval. Candidate allocation checks the full Git ref namespace,
+automatically chosen suffix. Source-changing start preparation failure
+prevents route publication and launch and can be retried through the same
+start with its existing decision and approval. If framed-start preparation
+fails, framed start instead records a one-line reason and proceeds from its
+original cwd; this fallback does not change source-changing start failure
+handling. Candidate allocation checks the full Git ref namespace,
 including pseudo-refs, packed and symbolic refs, remote/tag names, branch
 prefix conflicts, and occupied paths before asking Git to resolve a short
 revision. If worktree creation fails after this invocation created its new
@@ -1062,6 +1073,10 @@ Interrupted-parent restart requires one exact pending Hearting item. Transport
 refusal preserves the delivery obligation independently of child completion.
 The native TUI owns subscriptions, questions, and approvals. Headless owners keep
 their separate supervisor. See ADAPTATION §7.1 for the carrier contract.
+Across adapters, the result record remains under the registered parent's key,
+while the current `effective_parent` receives it. Result recovery may repeat
+after interruption; peer input is reserved as pending and becomes unverified
+only at the external write boundary, so an ambiguous write is not repeated.
 
 **SD-110 runtime-owned deterministic stage advance.** At an eligible-linear
 boundary — completion gate proven, exactly one non-terminal runnable
@@ -1106,8 +1121,10 @@ Same-host foreground recovery uses the exact harness-native terminal handoff and
 the existing process receipt and completion writer. A complete Claude success
 result includes the finished turn; a PASS string, a missing leader, or an
 unreadable same-UID descendant is insufficient. A process born before the
-recorded child cannot be its descendant, but a readable positive attempt tag
-takes priority. Recovery preserves the live owner, successful siblings and original
+recorded child cannot be its descendant, nor can a process in a systemd
+`.service` unit disjoint from the cgroup recorded at launch (same cgroup
+namespace); a row without that record keeps the earlier rule, and a readable
+positive attempt tag takes priority. Recovery preserves the live owner, successful siblings and original
 execution evidence. Replacement launchers retain the selected foreground
 watchdog and cleanup grace rather than applying the detached admission timeout;
 Owner replacements use the ordinary owner selector at launch, including the
@@ -1173,6 +1190,16 @@ If another normal carrier consumes that notice first, the same bound peer payloa
 is omitted from later sends and its existing message duty settles without a false
 peer-receipt claim.
 
+The registered runtime courier transports completion content; it is not its
+author. A completion transfer uses a runtime sender and retains the verified
+duty, attempt, delivery, and exact recipient binding from the existing pending
+record. The same binding is present in the immutable transfer, pending row, and
+any message duty created for that transfer. The immutable transfer and pending
+row carry it before any carrier can receive the content. The runtime trailer
+remains distinct from a peer trailer, while exact body and recipient checks,
+native receipt, retry, and ACK continue through the existing path. A later
+retry does not replace the original binding with the courier's session.
+
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
 ledger does not overturn those settled facts. Parent delivery facts remain
@@ -1223,11 +1250,12 @@ absence of a failed check does not refuse the kept correction. Unresolved failed
 retain their closure-check ceiling, including refusal when that ceiling is spent.
 No check or extra verdict round is manufactured for an infrastructure correction.
 When the answer comes from a session
-that is not the route's parent, only the parent may launch that replacement: the
-answer stays kept and the parent receives one `answer-awaiting-parent` supervision
+that is not the route's current `effective_parent`, only that parent may launch that replacement: the
+answer stays kept and the current parent receives one `answer-awaiting-parent` supervision
 notice. The parent's carrier that delivers it (the shared prompt sweep or the
 Claude rewake) starts the route once under that session's identity
-(`dispatch_supervision.continue_for_parent`) and the notice says so; only when
+(`dispatch_supervision.continue_for_parent`) and the notice says so. If handover
+state is unreadable, the registered parent remains the existing safe fallback; only when
 nothing could be started does it name the route's start command. Other ended owners still report
 `owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
 follows the replacement lineage to the owner doing the work now.
@@ -2079,7 +2107,7 @@ append-only ledger below is the only record of them (SD-122 §13.37.2-(1)).
 | Who receives the result now? | the single `effective_parent`: the registered parent, or the last confirmed same-seat successor after a handover. |
 | Who only observes? | a `watch` holder (Fleet ⚑ shows the steward relation); observation settles no stage result (S3). |
 | Who approves? | the person; the session that received the answer writes the release/approval record (S5). |
-| Who may perform parent-only route actions? | `route_authority.owns`: the registered parent and its confirmed successor, a separate check from row 4; sending `correct` is not parent-only (§5.10a). |
+| Who may perform parent-only route actions? | `route_authority.owns`: only the current `effective_parent` (the registered parent before handover); sending `correct` is not parent-only (§5.10a). |
 
 Six invariants govern the role:
 
@@ -2120,21 +2148,40 @@ it; unknown identity does not make a successful launch fail, and the start path
 does not infer identity from newly appearing rollouts or elapsed time. Resume and
 fork keep their explicit thread targets.
 
+Window contract: every pane Hearting opens comes from
+`utilities/terminal_surface.py:open_pane`, reached through `peer-steward start`
+(another session), `hearting run pane open <command>` (a command output pane),
+`interactive-main-recovery --start` and Fleet `--window`. Peer start and
+recovery pass the Herdr reference they already checked (a project start passes
+its workspace, and no pane is split there). `pane open` and Fleet use the caller's
+Herdr pane when the shared live ownership proof holds, then the tmux server
+`$TMUX` names when it answers, else none: nothing opens and the result carries
+the command line to run by hand (exit 0). Registered workers get no surface, and
+an inherited pane label alone opens no Herdr pane. On all three harnesses it
+reads the tab's layout (for tmux, the union of its pane rects; a zoomed tmux
+window counts as irregular) and fills a 2×2 grid without focus: one pane splits
+right, two side-by-side panes split the right column down, and three panes split
+the remaining full column down. Each split uses ratio 0.5. Existing horizontal rows
+fill the equivalent grid by splitting right. A full or irregular tab first
+reuses an agent-free foreground shell with an empty visible prompt there, then
+checks the other tabs in the same workspace, newest first, using the same
+grid-split and empty-shell decision. Only when none has room does it create one
+unfocused tab. Existing tab names, layouts and sizes are preserved apart from
+filling an available grid cell. Openings in one workspace serialize on the
+peer-start claim `peer-starts/<sha256(session:workspace)>.lock`, the file pinned
+releases also take; tmux keys its claim apart in the same directory. The result
+`{surface, pane, placement, notes, view_command}` states failures as notes and
+the pane list read once right after opening (`pane-exited`,
+`pane-list-unconfirmed`); nothing is retried or closed. A person in an
+agentless Herdr shell keeps running Fleet in the current terminal.
+
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
 as its placement reference, in the Git primary checkout (the calling cwd outside
-Git) unless `--cwd` names another. On all three harnesses, `start` reads
-`herdr pane layout` and fills a 2×2 grid without focus: one pane splits right,
-two side-by-side panes split the right column down, and three panes split the
-remaining full column down. Each split uses ratio 0.5. Existing horizontal
-rows fill the equivalent grid by splitting right. `--beside` selects the reference
-tab/pane, not the direction; `--pane` retains explicit reuse. Placement in a full
-or irregular tab first reuses an agent-free foreground shell with an empty visible
-prompt there, then checks the other tabs in the same workspace, newest first,
-using the same grid-split and empty-shell decision. Only when none has room does
-it create a tab. Existing tab names and layouts are preserved apart from filling
-an available grid cell. Concurrent starts serialize placement
-through launch so they cannot claim the same shell or subdivide a stale layout.
+Git) unless `--cwd` names another. `--beside` selects the reference tab/pane,
+not the direction; `--pane` retains explicit reuse. Placement follows the window
+contract above, and `start` holds the workspace claim through launch so
+concurrent starts cannot claim the same shell or subdivide a stale layout.
 Names longer than Herdr's 32-character limit are explained before any placement
 or launch action, so a refused name leaves no extra pane.
 The start completes placement without a post-start pane move. The new pane's
@@ -2198,18 +2245,24 @@ depends on the harness. OpenCode's exact retained TUI selection can supply it;
 missing or disposed records and unsupported dead Claude/Codex identity remain
 unknown. Native source availability is not inferred from a label or saved SID.
 Replacement admission and lineage use that same parent judgment: a depth-1
-replacement may be launched by the registered parent or its ledger-confirmed
-successor. This parent judgment (`route_authority.owns`) is separate from result
+replacement may be launched only by the current `effective_parent`. If handover
+state is unreadable, the existing safe default temporarily resolves to the
+registered parent. This parent judgment (`route_authority.owns`) is separate from result
 delivery, which follows the single `effective_parent`. Parent attempt bindings remain exact, as do route, node, depth,
 sub-session and input digests. A changed parent label on a depth-1 node replay
 is accepted only for that same parent; depth-2 parent bindings stay exact.
 The launch input follows the confirmed parent's session, harness and ordinary
 completion carrier. A later handover preserves an already registered replacement
-edge and its one semantic round; it does not authorize an intermediate parent
-to launch new work.
+edge and its one semantic round; it does not authorize the former parent or an
+intermediate parent to launch new work while the handover chain is readable.
 An owner's terminal row and an acknowledged completion message do not close its
 route. Its verified open route still passes to the successor until the route's
 outcome is committed; an acknowledged message is never delivered again.
+For parent-related watch and retire readiness, a running attempt remains pending;
+a finished attempt remains pending while its exact result delivery is open.
+An exact ACK or explicit no-delivery decision makes the committed outcome ready
+without waiting for route closure. Missing or unreadable delivery evidence stays
+unknown, and executor readiness keeps its existing closure rules.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
@@ -2382,7 +2435,7 @@ acceptance and actual receipt are separate facts:
 | Runtime | Transport and acceptance | Exact native receipt | Wake and limits |
 |---|---|---|---|
 | Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. No pane send or composer read. |
-| Codex | The current exact thread/client queue accepts one sealed ref and returns its `client_message_id`. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
+| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
 | OpenCode | The plugin saves one `noReply` user message through its current client at the exact selected root SID. Its native ID marks it queued. | Only an error-free completed assistant message whose `parentID` is that ID in the same SID marks it received. | On a verified idle root, `promptAsync` continues the persisted message by ID. Busy, question, permission, child, ambiguous history or SID change cannot consume it. |
 
 Queue acceptance never means delivery or consumption. A pending retry of the same
@@ -2390,6 +2443,15 @@ sender/recipient/body reuses its ref; a changed body or recipient session gets a
 separate transfer. Lost responses reconcile against exact native history before a
 resume. Ambiguity never submits the body again. Native callbacks preserve pending
 refs when the runtime has no supported wake.
+
+For SID-bound native Codex delivery, a new foreground PID/start remains the same
+recipient when a fresh current-native observation proves the same exact thread SID
+in the pinned pane. The queue submission still uses that immutable recipient SID
+and sealed ref. A changed pane or SID, conflicting claim, or unknown current proof
+does not authorize submission. Original PID/start binding remains required for
+pane-bound sidless first input, Claude PTY input, retirement, and other
+process-owned side effects; it is not a permanent extra gate on exact-thread queue
+continuation.
 
 Sender-delay duties retain their logical body digest and match their minted
 transfer through its source digest and delay refs. Each runner checkpoint
@@ -2541,6 +2603,28 @@ checking the booked process, form and empty input; other targets use the sealed
 no-trailer ref through their native carrier. Both address only the exact new SID,
 send once and keep pending refs until exact native receipt. Neither invents a wake
 or falls back to an inherited pane prompt.
+
+For `peer-steward.py prompt`, an exact Fleet display name, its `[xx]` Fleet tag,
+and an explicit pane address may resolve to the same recipient only when each
+identifies one current pane on the selected herdr endpoint and the existing
+native identity readers prove that pane's current harness and session ID. A
+name or tag is a search key, including when it comes from a historical seat or
+registry alias; it does not prove current identity. Resolution keeps the
+selected endpoint, canonical pane, harness, and current session ID together
+through readiness, identity rechecks, native delivery, deferred resume, and the
+ledger. The original address remains a bounded diagnostic label.
+
+Prompt resolution distinguishes a complete no-match (`not-found`), multiple
+current matches or a name/tag collision (`ambiguous`), and observations that
+are missing, partial, malformed, or conflicting (`observation-unavailable` or
+`identity-unverified`). Failure diagnostics retain every known candidate pane.
+A duplicate session ID in two panes is two candidates. None of these failures
+creates a carrier submission or an
+unresolved-recipient delivery obligation. Successful resolution does not relax
+the existing exact SID/PID-birth, native state, registered-work, composer,
+form, or receive-evidence checks. A name or tag match does not expand the
+pane-only sidless first-input path, and a queued carrier result remains
+distinct from exact receiver evidence.
 
 Clear and retire retain their checked foreground/form/draft and successor safety.
 Claude peer submission uses `herdr agent prompt` only for the guarded idle plain-TUI

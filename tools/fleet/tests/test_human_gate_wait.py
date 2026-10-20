@@ -183,7 +183,7 @@ class HumanGateEndToEndTest(unittest.TestCase):
             "node": None, "state": None, "workflow_state": workflow_state, "evidence": evidence,
             "actor": "fixture", "pid": os.getpid()})
 
-    def raise_gate(self, route, ts):
+    def raise_gate(self, route, ts, extra_questions=()):
         """Register the next round's interview and raise frame-review on it."""
         route["round"] += 1
         directory = route["artifact_root"] / ("shards/frame/round-%d" % route["round"])
@@ -195,13 +195,13 @@ class HumanGateEndToEndTest(unittest.TestCase):
             "questions": [{
                 "id": "scope", "topic": "scope", "question": QUESTION_TEXT, "kind": "choice",
                 "options": [{"label": OPTION_BOTH, "means": "both"}, {"label": OPTION_ONE, "means": "one"}],
-                "recommended": 0, "why": "only the person can say"}],
+                "recommended": 0, "why": "only the person can say"}, *extra_questions],
         }
         path = directory / "interview.json"
         path.write_text(json.dumps(interview), encoding="utf-8")
         import hashlib
         self.append_journal(route, ts, "BLOCKED_HUMAN_GATE", {
-            "gate": GATE, "artifact": str(path), "interview": True, "questions": 1,
+            "gate": GATE, "artifact": str(path), "interview": True, "questions": len(interview["questions"]),
             "artifact_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
         route["interview"] = interview
         route["interview_path"] = path
@@ -274,11 +274,11 @@ class HumanGateEndToEndTest(unittest.TestCase):
         self.assertEqual(observed, [])
         self.assertNotEqual(liveness, "blocked")
 
-    def waiting_route(self, harness, sid="sid-parent-0001", **session_kwargs):
+    def waiting_route(self, harness, sid="sid-parent-0001", extra_questions=(), **session_kwargs):
         self.add_session(harness, sid, **session_kwargs)
         route = self.make_route(harness)
         self.compose(route, harness, sid, self.now - 1000)
-        self.raise_gate(route, self.now - 900)
+        self.raise_gate(route, self.now - 900, extra_questions)
         return route, sid
 
     # -- cases ------------------------------------------------------------
@@ -291,6 +291,27 @@ class HumanGateEndToEndTest(unittest.TestCase):
                 # Nothing released the gate: the journal still says blocked.
                 resolution = self.WS.human_gate_resolution(self.ledger(route).journal(), GATE)
                 self.assertEqual(resolution["status"], "blocked")
+                self.assert_quiet(harness, sid)
+                self.rows.clear()
+
+    def test_a_first_partial_native_reply_keeps_the_wait(self):
+        second = {"id": "order", "topic": "order", "question": "SENTINEL-QUESTION-2 which order first", "kind": "choice",
+                  "options": [{"label": "SENTINEL-OPTION-a", "means": "a"}, {"label": "SENTINEL-OPTION-b", "means": "b"}],
+                  "recommended": 0, "why": "only the person can say"}
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness):
+                route, sid = self.waiting_route(harness, sid="sid-%s-0002" % harness, extra_questions=(second,))
+                first_call = self.native_reply(route)                       # the restatement and the first question
+                kept = self.work_start.record_native_answer(route["record"], self.jobs, first_call)
+                self.assertEqual(kept.name, "answers.native.partial.json")
+                self.assertFalse((route["interview_path"].parent / "answers.native.json").exists())
+                self.assert_waiting(harness, sid)                           # one question is still unanswered
+                kept = self.work_start.record_native_answer(route["record"], self.jobs, [
+                    {"question": second["question"], "options": ["SENTINEL-OPTION-a", "SENTINEL-OPTION-b"],
+                     "answer": "SENTINEL-OPTION-b"}])
+                self.assertEqual(kept.name, "answers.native.json")
+                resolution = self.WS.human_gate_resolution(self.ledger(route).journal(), GATE)
+                self.assertEqual(resolution["status"], "blocked")           # nothing released the gate
                 self.assert_quiet(harness, sid)
                 self.rows.clear()
 

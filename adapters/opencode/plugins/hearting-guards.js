@@ -209,6 +209,12 @@ function isWorkerSession() {
   )
 }
 
+function mayReconnectPeerObligations() {
+  // Ordinary worker turns keep existing shared recovery available. A
+  // registered worker must not start the primary lifecycle runner from a hook.
+  return !isWorkerSession() || process.env.AGENT_DISPATCH_REGISTERED_WORKER !== "1"
+}
+
 function touchHeartbeat(slug) {
   const stateRoot = dispatchStateRoot()
   if (!slug || !stateRoot) return
@@ -1545,7 +1551,7 @@ function appendContext(output, text) {
 // own `notice` peer_message_v1 under its exact session id (same record the Claude
 // hook and the Codex hook write). Detached, fail-soft, never blocks the turn.
 function spawnPeerNotice(sid, prompt, cwd) {
-  if (!sid || !prompt || !prompt.includes("peer-from:")) return
+  if (!sid || !prompt || (!prompt.includes("peer-from:") && !prompt.includes("runtime-from:"))) return
   const tool = path.join(root, "utilities", "peer-message.py")
   const args = [tool, "receive",
     "--from-project", path.basename(cwd || ""),
@@ -1584,6 +1590,15 @@ function pendingPeerTransition(sid, options) {
     cwd: root, env: { ...process.env, AGENT_HOME: root }, encoding: "utf8", timeout: 1500,
   })
   return result.status === 0
+}
+
+function pendingPeerProcessIdentity() {
+  try {
+    const stat = readFileSync("/proc/self/stat", "utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    return split >= 0 && /^\d+$/.test(start) ? { pid: process.pid, start } : null
+  } catch { return null }
 }
 
 function reconnectPeerObligations() {
@@ -1845,12 +1860,36 @@ async function pendingPeerDelivery(ctx, sid) {
         continue
       }
       if (row.state !== "pending") continue
-      const claimed = pendingPeerCommand(sid, ["--claim", row.ref])
-      if (!claimed) return "claim-unavailable"
-      if (claimed.ref !== row.ref) return "claim-ref-mismatch"
-      if (claimed.state !== "unverified") return "claim-state-mismatch"
-      if (claimed.text !== row.text) return "claim-body-mismatch"
-      if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+      const identity = pendingPeerProcessIdentity()
+      if (!identity) return "claim-unavailable"
+      const reserveStarted = performance.now()
+      const reserved = pendingPeerCommand(sid, ["--reserve", row.ref,
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      const reserveMs = performance.now() - reserveStarted
+      pendingPeerTrace(ctx, sid, "reserve", reserved ? "reserved" : "failed", {
+        elapsed_ms: reserveMs, timeout_ms: 1500,
+      })
+      if (!reserved) return "claim-unavailable"
+      const releaseReservation = () => pendingPeerTransition(sid, ["--release-reservation", row.ref,
+        "--claim-token", reserved.rpc_claim?.token || "",
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      if (reserved.ref !== row.ref) { releaseReservation(); return "claim-ref-mismatch" }
+      if (reserved.state !== "pending") { releaseReservation(); return "claim-state-mismatch" }
+      if (reserved.text !== row.text) { releaseReservation(); return "claim-body-mismatch" }
+      if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }
+      const beginStarted = performance.now()
+      const claimed = pendingPeerCommand(sid, ["--begin-write", row.ref,
+        "--claim-token", reserved.rpc_claim?.token || "",
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      const beginMs = performance.now() - beginStarted
+      pendingPeerTrace(ctx, sid, "begin-write", claimed ? "authorized" : "failed", {
+        elapsed_ms: beginMs, timeout_ms: 1500,
+      })
+      if (!claimed || claimed.ref !== row.ref || claimed.state !== "unverified"
+          || claimed.rpc_claim?.token !== reserved.rpc_claim?.token) {
+        releaseReservation()
+        continue
+      }
       let accepted
       let persistenceResponseLost = false
       try {
@@ -2079,9 +2118,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
   if (initialize && paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
     let activated = false
     try { activated = await completionCarrier.activate(paneNativeOrigin.sid) } catch {}
-    if (!activated) reconnectPeerObligations()
+    if (!activated && mayReconnectPeerObligations()) reconnectPeerObligations()
     scheduleInitialPaneProjection(ctx, paneBinding, paneNativeOrigin.sid)
-  } else if (initialize) {
+  } else if (initialize && mayReconnectPeerObligations()) {
     reconnectPeerObligations()
   }
 
@@ -2152,7 +2191,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       if (!isWorkerSession() && sid) {
         try { activated = await completionCarrier.activate(sid) } catch {}
       }
-      if (!activated) reconnectPeerObligations()
+      if (!activated && mayReconnectPeerObligations()) reconnectPeerObligations()
     }
     if (event && event.type === "session.compacted") {
       const sid = event.properties?.sessionID || ""
@@ -2249,7 +2288,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     if (prompt) promptBySession.set(sid, prompt)
     peerGuidanceBySession.delete(sid)
     // Actual peer receipt is observed after persistence, not callback rendering.
-    if (prompt && eventSid && prompt.includes("peer-from:")) {
+    if (prompt && eventSid && (prompt.includes("peer-from:") || prompt.includes("runtime-from:"))) {
       const guidance = spawnSync(
         "python3",
         ["-c", "import importlib.util, json, sys; s=importlib.util.spec_from_file_location('peer', 'utilities/peer-message.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); d=json.load(sys.stdin); print(m.receiver_guidance(d.get('prompt', ''), d.get('recipient'), cwd=d.get('cwd')))"],

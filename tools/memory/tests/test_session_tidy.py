@@ -1929,6 +1929,167 @@ class MemoryLayerTest(TidyCase):
                             self.assertNotIn(guidance, late)
                             self.assertNotIn("[첫 답]", late)
 
+    def test_seat_lineage_three_harnesses_returns_sources_cards_and_locations(self):
+        rows = [
+            {"event": "start", "harness": "claude", "sid": "claude-old", "ts": 1,
+             "first_seen": 1, "source": "startup"},
+            {"event": "start", "harness": "claude", "sid": "claude-new", "ts": 3,
+             "first_seen": 3, "source": "clear"},
+            {"event": "handover", "harness": "claude", "sid": "claude-new",
+             "from": {"harness": "claude", "sid": "claude-old"}, "source": "clear"},
+            {"event": "start", "harness": "codex", "sid": "codex-one", "ts": 2,
+             "first_seen": 2, "source": "resume"},
+            {"event": "start", "harness": "opencode", "sid": "opencode-one", "ts": 4,
+             "first_seen": 4, "source": "fork"},
+        ]
+        cards = {("claude", "claude-old"): [
+                     {"generation": 2, "path": "/card/2.json", "status": "available"}],
+                 ("claude", "claude-new"): [
+                     {"generation": 1, "path": "/card/1.json", "status": "available"}]}
+        locations = {("claude", "claude-old"): {"path": "/raw/claude.jsonl", "status": "available"},
+                     ("claude", "claude-new"): {"path": None, "status": "missing"}}
+        projected = st._project_seat_lineage(rows, cards, locations, sid="claude-new")
+        self.assertEqual([row["sid"] for row in projected[:3]],
+                         ["claude-new", "opencode-one", "codex-one"])
+        self.assertEqual(projected[0]["source"], "clear")
+        self.assertEqual(projected[0]["relation"], "confirmed")
+        self.assertEqual(projected[2]["source"], "resume")
+        self.assertEqual(projected[2]["card"]["status"], "none")
+        self.assertEqual(projected[3]["transcript"]["status"], "available")
+
+    def test_lineage_history_expired_missing_and_unreadable_are_distinct(self):
+        rows = [{"event": "summary", "harness": "claude", "sid": name, "ts": i,
+                 "first_seen": i} for i, name in enumerate(("expired", "missing", "unreadable"), 1)]
+        cards = {("claude", "expired"): [{"generation": 7, "path": None, "status": "expired"}],
+                 ("claude", "unreadable"): [{"generation": 1, "path": "/card/bad", "status": "unreadable"}]}
+        locations = {("claude", name): {"path": None, "status": status}
+                     for name, status in (("expired", "missing"), ("missing", "missing"),
+                                          ("unreadable", "unreadable"))}
+        result = st._project_seat_lineage(rows, cards, locations)
+        by_sid = {row["sid"]: row for row in result}
+        self.assertEqual(by_sid["expired"]["card"]["status"], "expired")
+        self.assertEqual(by_sid["missing"]["card"]["status"], "none")
+        self.assertEqual(by_sid["unreadable"]["card"]["status"], "unreadable")
+        self.assertEqual(by_sid["unreadable"]["transcript"]["status"], "unreadable")
+
+    def test_lineage_query_reads_existing_cards_and_transcripts_without_state_writes(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            transcript = self.iso.root / "previous-session.jsonl"
+            transcript.write_text('{"type":"message"}\n', encoding="utf-8")
+            st.record_event(seat, "claude", "sid-old", "start", source="startup",
+                            transcript=str(transcript), cwd=str(self.cwd), now=100)
+            st.write_card(seat, "claude", "sid-old", "이전 카드", cwd=str(self.cwd), now=101)
+            st.record_event(seat, "claude", "sid-new", "start", source="clear",
+                            cwd=str(self.cwd), now=200)
+            st._append_ledger_entry(seat, {"ts": 201, "event": "handover", "harness": "claude",
+                                           "sid": "sid-new", "from": {"harness": "claude", "sid": "sid-old"},
+                                           "source": "clear"})
+            st.write_card(seat, "claude", "sid-new", "현재 카드", cwd=str(self.cwd), now=202)
+            ledger = st._ledger_path(seat).read_bytes()
+            before = {str(path.relative_to(self.state)): path.read_bytes()
+                      for path in self.state.rglob("*") if path.is_file()}
+            lineage = st.seat_lineage(seat, harness="claude", sid="sid-new")
+            after = {str(path.relative_to(self.state)): path.read_bytes()
+                     for path in self.state.rglob("*") if path.is_file()}
+        self.assertEqual(lineage[0]["relation"], "confirmed")
+        self.assertEqual(lineage[0]["card"]["generation"], 2)
+        self.assertEqual(lineage[1]["sid"], "sid-old")
+        self.assertEqual(lineage[1]["card"]["generation"], 1)
+        self.assertEqual(lineage[1]["transcript"], {"path": str(transcript), "status": "available"})
+        self.assertEqual(ledger, (self.state / "sessions" / f"{seat.key}.jsonl").read_bytes())
+        self.assertEqual(before, after)
+
+    def test_confirmed_clear_card_injection_includes_previous_transcript_within_cap(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            transcript = self.iso.root / "previous-clear.jsonl"
+            transcript.write_text('{"type":"message"}\n', encoding="utf-8")
+            st.record_event(seat, "claude", "sid-before", "start", source="startup",
+                            transcript=str(transcript), cwd=str(self.cwd), now=100)
+            st.write_card(seat, "claude", "sid-before", "진행 중: 이전 일\n세부 " * 500,
+                          cwd=str(self.cwd), now=101)
+            st._append_ledger_entry(seat, {"ts": 199, "event": "handover", "harness": "claude",
+                                           "sid": "sid-after", "from": {"harness": "claude",
+                                           "sid": "sid-before"}, "source": "clear"})
+            st.write_notice(seat, "정리 결과 한 줄", author_harness="claude", author_sid="sid-before")
+            output = st.run_hook("claude", "start", "sid-after", source="clear", cwd=str(self.cwd), now=200)
+        self.assertIn("이전 대화: claude sid-befo · 원문 ", output)
+        self.assertIn(str(transcript), output)
+        self.assertLessEqual(len(output.encode("utf-8")), st.INJECTION_MAX_BYTES)
+
+    def test_previous_transcript_footer_and_memory_stay_under_2400_utf8_bytes(self):
+        previous = {"harness": "claude", "sid": "a" * 36,
+                    "transcript": {"path": "/" + "한" * 500, "status": "available"}}
+        card = {"author": {"harness": "claude", "sid": "b" * 36},
+                "authored_at_epoch": 10, "body": "본문 " * 1200}
+        text = st.build_card_injection(card, Path("/card.json"), 10, 1600,
+                                       previous_transcript=previous)
+        self.assertIn("이전 대화: claude", text)
+        self.assertIn("원문 경로 생략", text)
+        self.assertLessEqual(len(text.encode("utf-8")), 1600)
+
+    def test_confirmed_edge_beats_chronology_for_previous_transcript(self):
+        rows = [
+            {"event": "start", "harness": "claude", "sid": "sid-a", "ts": 1, "first_seen": 1,
+             "source": "startup"},
+            {"event": "start", "harness": "claude", "sid": "sid-b", "ts": 2, "first_seen": 2,
+             "source": "startup"},
+            {"event": "start", "harness": "claude", "sid": "sid-c", "ts": 3, "first_seen": 3,
+             "source": "clear"},
+            {"event": "handover", "harness": "claude", "sid": "sid-c",
+             "from": {"harness": "claude", "sid": "sid-a"}, "source": "clear"},
+        ]
+        locations = {("claude", "sid-a"): {"path": "/raw/a.jsonl", "status": "unreadable"},
+                     ("claude", "sid-b"): {"path": "/raw/b.jsonl", "status": "available"}}
+        for harness in (None, "claude"):
+            projected = st._project_seat_lineage(rows, {}, locations, harness=harness, sid="sid-c")
+            self.assertEqual(projected[0]["predecessor"], {"harness": "claude", "sid": "sid-a"})
+            self.assertEqual(projected[1]["sid"], "sid-b")
+            self.assertIsNone(projected[1]["predecessor"])
+            previous = st._confirmed_predecessor(projected, "claude", "sid-c")
+            self.assertEqual(previous["sid"], "sid-a")
+        card = {"author": {"harness": "claude", "sid": "sid-a"}, "authored_at_epoch": 10, "body": "본문"}
+        text = st.build_card_injection(card, Path("/card.json"), 10, 2000, previous_transcript=previous)
+        self.assertIn("이전 대화: claude sid-a · 원문 읽기 불가", text)
+        self.assertNotIn("/raw/b.jsonl", text)
+        chronological = st._project_seat_lineage(rows[:3], {}, locations, sid="sid-c")
+        self.assertIsNone(st._confirmed_predecessor(chronological, "claude", "sid-c"))
+
+    def test_clear_footer_names_handover_source_not_intervening_session(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            before = self.iso.root / "before.jsonl"
+            middle = self.iso.root / "middle.jsonl"
+            for path in (before, middle):
+                path.write_text('{"type":"message"}\n', encoding="utf-8")
+            st.record_event(seat, "claude", "sid-before", "start", source="startup",
+                            transcript=str(before), cwd=str(self.cwd), now=100)
+            st.write_card(seat, "claude", "sid-before", "진행 중: 이전 일", cwd=str(self.cwd), now=101)
+            st.record_event(seat, "claude", "sid-middle", "start", source="startup",
+                            transcript=str(middle), cwd=str(self.cwd), now=150)
+            st._append_ledger_entry(seat, {"ts": 199, "event": "handover", "harness": "claude",
+                                           "sid": "sid-after", "from": {"harness": "claude",
+                                           "sid": "sid-before"}, "source": "clear"})
+            output = st.run_hook("claude", "start", "sid-after", source="clear", cwd=str(self.cwd), now=200)
+        self.assertIn(f"이전 대화: claude sid-befo · 원문 {before}", output)
+        self.assertNotIn(str(middle), output)
+        self.assertNotIn("sid-midd", output)
+        self.assertLessEqual(len(output.encode("utf-8")), st.INJECTION_MAX_BYTES)
+
+    def test_clear_footer_for_unrecorded_handover_source_reports_missing_transcript(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.write_card(seat, "claude", "sid-ghost", "진행 중: 이전 일", cwd=str(self.cwd), now=101)
+            st.record_event(seat, "claude", "sid-other", "start", source="startup",
+                            cwd=str(self.cwd), now=150)
+            st._append_ledger_entry(seat, {"ts": 199, "event": "handover", "harness": "claude",
+                                           "sid": "sid-after", "from": {"harness": "claude",
+                                           "sid": "sid-ghost"}, "source": "clear"})
+            output = st.run_hook("claude", "start", "sid-after", source="clear", cwd=str(self.cwd), now=200)
+        self.assertIn("이전 대화: claude sid-ghos · 원문 없음", output)
+        self.assertNotIn("sid-othe", output.split("이전 대화:", 1)[-1])
+
     def refs(self, n=3, batch="b1", status="applied", **more):
         rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
         return dict(batch=batch, status=status, refs=rows, **more)
@@ -2519,6 +2680,23 @@ class ClearHelperTest(TidyCase):
             self.assertNotIn(dropped, env)
         self.assertNotIn("HERDR_SOCKET_PATH", clear._helper_env({"HERDR_PANE_ID": PANE}))
 
+    def test_helper_restart_uses_only_the_reserved_codex_socket(self):
+        seat = st.Seat("pane", "a" * 32, pane=PANE, harness="codex",
+                       socket_path="/run/herdr/booked.sock")
+        req = {"schema": clear.SCHEMA, "nonce": "0123456789abcdef", "status": "reserved",
+               "seat": seat.as_dict(), "harness": "codex", "sid": "thread-A",
+               "herdr_transport": {"socket_path": seat.socket_path}}
+        clear._write_reservation(req)
+        process = mock.Mock(pid=4321)
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
+                                          "AGENT_HERDR_SESSION": "foreign"}), \
+                mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
+            self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env.get("HERDR_SOCKET_PATH"), seat.socket_path)
+        self.assertNotIn("AGENT_HERDR_SESSION", child_env)
+        self.assertNotIn("HERDR_PANE_ID", child_env)
+
     def booked(self, harness="claude", sid="sid-A"):
         with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
             seat = st.resolve_seat(harness, str(self.cwd))
@@ -2882,6 +3060,24 @@ class ContinueHelperTest(TidyCase):
                 continuer=lambda *a: self.calls.append("continue") or {"continued": "true"}, sleep=late_start)
         self.assertEqual((outcome, self.calls), ("continued", ["continue"]))
 
+    def test_same_seat_clear_injection_never_requests_handoff_accept(self):
+        seat, req = self.booked()
+        shown = []
+        def late_start(_sec):
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "start", "sid-B", source="clear", cwd=str(self.cwd),
+                            emit=shown.append)
+        with self.iso.patched_environ(self.extra):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=lambda *_a: "idle",
+                steward=lambda *_a: {"cleared": "unverified", "reason": "new-session-not-observed"},
+                continuer=lambda *a: {"continued": "true"}, sleep=late_start)
+        self.assertEqual(outcome, "continued")
+        output = "".join(shown).lower()
+        self.assertNotIn("handoff accept", output)
+        self.assertNotIn("session-tidy accept", output)
+        self.assertNotIn("peer-message accept", output)
+
     def test_no_continue_and_no_card_clear_without_typing_after_it(self):
         for kwargs in ({"no_continue": True}, {"card": False}):
             with self.subTest(**kwargs):
@@ -3224,7 +3420,7 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.effective(meta), "sid-B")
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
-            self.assertTrue(self.handover.owns(meta, "sid-A", self.jobs))     # the registered parent keeps its name
+            self.assertFalse(self.handover.owns(meta, "sid-A", self.jobs))    # the registered parent no longer owns after handover
             self.assertFalse(self.handover.owns(meta, "sid-Z", self.jobs))
         self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
         again, rows2 = self.start("sid-B", event="prompt", source="")
@@ -3458,6 +3654,200 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.jobs.read_bytes(), before)
         path.with_suffix(".outcome.json").write_text("{}")
         self.assertIsNone(self.retire("sid-B", "codex", "sid-C", "opencode", pane="test:pane-c"))
+
+    # -- seat lineage: a node-less owner and the one answer for delivery and authority ------------------
+
+    def owner_row(self, aid, status="done", parent="sid-A", route="rt-1", digest="sha256:aa"):
+        """A depth-1 owner row: it carries no ``route_node`` key at all."""
+        meta = {"attempt_id": aid, "parent_sid": parent, "parent_harness": "claude", "dispatch_depth": "1",
+                "worker_type": "owner", "route_id": route, "route_hash": digest,
+                "route_file": self.open_route(route, digest)}
+        self.rows.append(f"2026-10-01T00:00:00Z\t{status}\t/w\t/w\tslug\t" + ",".join(f"{k}={v}" for k, v in meta.items()))
+        self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
+        return meta
+
+    def frame_row(self, aid="att-frame"):
+        return self.row(aid, status="open", route="rt-2", node="frame", worker="frame", digest="sha256:bb")
+
+    def chain(self, owner_status="done"):
+        """A snapshot -> B -> B snapshot -> C by two same-seat clears; returns (owner, frame)."""
+        owner = self.owner_row("att-owner", status=owner_status)
+        frame = self.frame_row()
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.snapshot(sid="sid-B", now=st.now_epoch() - 5)
+        self.start("sid-C")
+        return owner, frame
+
+    def ledger_rows(self, pane=PANE):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            return self.handover.handover_rows(self.seat(pane))
+
+    def append_row(self, pane, row):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            path = st._ledger_path(self.seat(pane))
+            st.ensure_dir(path.parent)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "handover", **row}) + "\n")
+
+    def write_snapshot(self, pane, sid, bindings):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            seat = self.seat(pane)
+            st.atomic_write_json(self.handover._snapshot_path(seat.key), {
+                "schema": 1, "seat": seat.as_dict(), "from": {"harness": "claude", "sid": sid},
+                "at": st.now_epoch(), "bindings": bindings})
+
+    def binding(self, meta):
+        return self.handover.binding_of(self.jobs, meta)
+
+    def owns(self, meta, sid):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            return self.handover.owns(meta, sid, self.jobs)
+
+    def keys(self, bindings):
+        return {(b["route"], b["hash"], b["node"]) for b in bindings}
+
+    def test_a_finished_node_less_owner_is_carried_through_the_second_clear(self):
+        owner, frame = self.chain()
+        rows = self.ledger_rows()
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B"), ("sid-B", "sid-C")])
+        owner_key = ("rt-1", "sha256:aa", "")
+        self.assertIn(owner_key, self.keys(rows[0]["bindings"]))
+        self.assertIn(owner_key, self.keys(rows[1]["bindings"]))
+        with self.iso.patched_environ():
+            self.assertIn(owner_key, self.keys(self.handover.read_snapshot(self.seat().key)["bindings"]))
+        self.assertEqual(self.effective(owner), "sid-C")
+        self.assertEqual(self.effective(frame), "sid-C")
+
+    def test_the_second_successor_may_replace_the_finished_owner(self):
+        import route_authority
+        owner, _frame = self.chain()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(
+                self.jobs, {}, owner, current_session=lambda: "sid-C")
+            choice = route_authority.decide_continuation(
+                action="handover", status="done", metadata=owner, jobs=self.jobs,
+                facts={"actor": "sid-C", "eligible": True})
+        self.assertTrue(choice.allowed, choice)
+
+    def test_the_second_successor_resumes_an_owner_whose_route_keys_are_owner_prefixed(self):
+        import route_authority
+        owner, _frame = self.chain()
+        reported = {("owner_" + k if k in ("route_id", "route_hash", "route_file") else k): v
+                    for k, v in owner.items()}
+        self.assertEqual(self.effective(reported), "sid-C")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(
+                self.jobs, {}, reported, current_session=lambda: "sid-C")
+
+    def test_an_already_broken_chain_still_reaches_its_end(self):
+        owner = self.owner_row("att-owner")
+        frame = self.frame_row()
+        both = [self.binding(owner), self.binding(frame)]
+        self.append_row(PANE, {"ts": 1, "from": "sid-A", "sid": "sid-B", "harness": "claude",
+                               "source": "clear", "bindings": both})
+        self.append_row(PANE, {"ts": 2, "from": "sid-B", "sid": "sid-C", "harness": "claude",
+                               "source": "clear", "bindings": [self.binding(frame)]})
+        self.write_snapshot(PANE, "sid-B", [self.binding(frame)])
+        self.assertEqual(self.effective(owner), "sid-C")
+        self.assertTrue(self.owns(owner, "sid-C"))
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            recipients = dict(self.handover.storage_recipients("sid-C"))
+        self.assertIn("att-owner", recipients["sid-A"])
+
+    def test_only_the_chain_end_answers_and_a_closed_route_settles(self):
+        owner, _frame = self.chain()
+        self.assertTrue(self.owns(owner, "sid-C"))
+        self.assertFalse(self.owns(owner, "sid-A"))                    # the registered parent handed it on
+        self.assertFalse(self.owns(owner, "sid-B"))                    # B handed it on
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            owed = {aid for _key, attempts in self.handover.storage_recipients("sid-B") if attempts
+                    for aid in attempts}
+            before = {b["attempt"] for b in self.handover.current_bindings("claude", "sid-C", self.jobs)}
+            Path(owner["route_file"]).with_suffix(".outcome.json").write_text("{}")
+            after = {b["attempt"] for b in self.handover.current_bindings("claude", "sid-C", self.jobs)}
+        self.assertNotIn("att-owner", owed)
+        self.assertEqual(before, {"att-owner", "att-frame"})
+        self.assertEqual(after, {"att-frame"})                         # the settled owner drops, the open frame stays
+
+    def test_a_later_retire_wins_over_the_same_seat_chain(self):
+        owner = self.owner_row("att-owner", status="running")
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.assertIsNotNone(self.retire("sid-B", "claude", "sid-E", "codex"))
+        self.assertEqual(self.effective(owner), "sid-E")
+        self.append_row(PANE, {"ts": st.now_epoch() + 5, "from": "sid-B", "sid": "sid-C", "harness": "claude",
+                               "source": "clear", "bindings": []})
+        self.assertEqual(self.effective(owner), "sid-E")
+        self.assertFalse(self.owns(owner, "sid-C"))
+
+    def test_a_retire_row_that_does_not_bind_the_job_leaves_it_with_its_predecessor(self):
+        owner = self.owner_row("att-owner", status="running")
+        frame = self.frame_row()
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.append_row(PANE_BESIDE, {"ts": st.now_epoch() + 5, "from": "sid-B", "sid": "sid-E",
+                                      "harness": "codex", "source": "retire",
+                                      "bindings": [self.binding(frame)]})
+        self.write_snapshot(PANE_BESIDE, "sid-E", [self.binding(frame)])     # what a real retire leaves at the seat
+        self.assertEqual(self.effective(frame), "sid-E")
+        self.assertEqual(self.effective(owner), "sid-B")
+
+    def killed_or_cancelled_owner_is_handed_over(self, status):
+        import route_authority
+        owner = self.owner_row("att-owner", status=status, route=f"rt-{status}")
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 5), 1)
+        self.start("sid-B")
+        self.assertEqual(self.effective(owner), "sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(self.jobs, {}, owner, current_session=lambda: "sid-B")
+        Path(owner["route_file"]).with_suffix(".outcome.json").write_text("{}")
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 4), 0)     # a closed route settles
+
+    def test_a_killed_owner_with_an_open_route_is_handed_over(self):
+        self.killed_or_cancelled_owner_is_handed_over("killed")
+
+    def test_a_cancelled_owner_with_an_open_route_is_handed_over(self):
+        self.killed_or_cancelled_owner_is_handed_over("cancelled")
+
+    def test_lineage_reads_each_seat_ledger_once_per_read_context(self):
+        from peer_read_context import PeerReadContext
+        metas = [self.owner_row(f"att-owner-{n}", status="running", route=f"rt-{n}", digest=f"sha256:{n}{n}")
+                 for n in range(3)]
+        self.write_snapshot(PANE, "sid-A", [self.binding(metas[0])])
+        self.write_snapshot(PANE_BESIDE, "sid-A", [self.binding(metas[1])])
+        reads = mock.patch.object(st, "_read_ledger_lines", wraps=st._read_ledger_lines)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), reads as counted:
+            context = PeerReadContext()
+            for meta in metas:
+                self.handover.effective_parent(meta, self.jobs, read_context=context)
+            self.assertEqual(counted.call_count, 2)                    # one read per seat, not per attempt
+            counted.reset_mock()
+            self.handover.current_bindings("claude", "sid-A", self.jobs)
+            self.assertLessEqual(counted.call_count, 2)                # a context of its own reads each once
+
+    def test_ownership_checks_never_resolve_a_project_key(self):
+        owner, _frame = self.chain(owner_status="running")
+        keys = mock.patch.object(st, "project_key_for", wraps=st.project_key_for)
+        with self.iso.patched_environ({"CLAUDE_CODE_SESSION_ID": "sid-C"}), keys as computed:
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-B", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-X", self.jobs))
+            self.handover.storage_recipients("sid-C")
+        computed.assert_not_called()                                   # no git calls, no project-keys.json
+
+    def test_ownership_resolves_only_the_callers_own_seat_once(self):
+        owner, frame = self.chain(owner_status="running")
+        seats = mock.patch.object(self.handover, "pane_seat", wraps=self.handover.pane_seat)
+        env = {"HERDR_PANE_ID": PANE, "CLAUDE_CODE_SESSION_ID": "sid-C"}
+        with mock.patch.dict(self.handover._OWN_SEATS, clear=True), \
+                self.iso.patched_environ(env), seats as resolved:
+            for _ in range(5):
+                for meta in (owner, frame):
+                    for sid in ("sid-B", "sid-C", "sid-X"):
+                        self.handover.owns(meta, sid, self.jobs)
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+        self.assertEqual([call.args[2] for call in resolved.call_args_list], ["sid-C"])
 
     def test_a_broken_state_answers_the_registered_parent(self):
         meta = self.row("att-1")

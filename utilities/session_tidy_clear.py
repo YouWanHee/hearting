@@ -212,6 +212,10 @@ def _ensure_helper(seat_key: str, nonce: str, *, lock_wait: Optional[float] = No
             if starting.get("state") == "starting" \
                     and st.now_epoch() - float(starting.get("at", 0) or 0) < 10:
                 return True, ""
+            transport = req.get("herdr_transport") if isinstance(req.get("herdr_transport"), dict) else {}
+            socket_path = str(transport.get("socket_path") or "")
+            if socket_path and (not os.path.isabs(socket_path) or "\x00" in socket_path):
+                return False, "booking-transport-invalid"
             req["helper_start"] = {"state": "starting", "at": st.now_epoch()}
             _write_reservation(req)
     except (OSError, TimeoutError, st.StateError):
@@ -755,7 +759,7 @@ def _accept_idle_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, idle
     return "clear=scheduled" if started else f"clear=pending reason={reason}"
 
 
-def _helper_env(environ=None) -> dict:
+def _helper_env(environ=None, *, socket_path=None) -> dict:
     """The runner's clean environment plus where herdr listens.
 
     ``clean_env`` drops every ``HERDR_*`` name so a detached tidy never inherits the
@@ -766,7 +770,9 @@ def _helper_env(environ=None) -> dict:
     from session_tidy_runner import clean_env
     environ = os.environ if environ is None else environ
     env = clean_env(environ)
-    socket_path = environ.get("HERDR_SOCKET_PATH")
+    env.pop("HERDR_SOCKET_PATH", None)
+    env.pop("AGENT_HERDR_SESSION", None)
+    socket_path = environ.get("HERDR_SOCKET_PATH") if socket_path is None else socket_path
     if socket_path:
         env["HERDR_SOCKET_PATH"] = socket_path
     return env
@@ -775,10 +781,15 @@ def _helper_env(environ=None) -> dict:
 def _start_helper(seat_key: str, nonce: str) -> int:
     """Start ``run`` in its own session so neither /clear, a closing pane nor a process-group
     cleanup of the caller can take it down."""
+    req = read_reservation(seat_key)
+    transport = req.get("herdr_transport") if req and req.get("nonce") == nonce \
+        and isinstance(req.get("herdr_transport"), dict) else {}
+    socket_path = str(transport.get("socket_path") or "")
     proc = subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "run", "--seat", seat_key, "--nonce", nonce],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        close_fds=True, start_new_session=True, env=_helper_env(), cwd=str(st.ensure_dir(st.state_root())))
+        close_fds=True, start_new_session=True, env=_helper_env(socket_path=socket_path),
+        cwd=str(st.ensure_dir(st.state_root())))
     return proc.pid
 
 
@@ -982,6 +993,8 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
                 "continue_off": bool(no_continue or inherit_stop),
                 "snapshot_state": ("deferred" if compact else "pending")
                 if seat.kind in ("pane", "native") else "not-applicable"}
+            if seat.kind == "pane" and seat.harness == "codex":
+                booking["herdr_transport"] = {"socket_path": str(seat.socket_path or "")}
             if compact:
                 identity = operation_id or compact.get("identity")
                 booking.update(origin="compact", compact=compact, event_identity=identity,

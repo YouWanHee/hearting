@@ -68,7 +68,8 @@ def _message_intent_matches_transfer(record, message):
                     body.rstrip("\n").encode("utf-8")).hexdigest()
                 and message.get("refs") == ["delay-notice:" + original_ref, original_ref])
     return (intent.get("body_digest") == message.get("body_sha256")
-            and intent.get("refs", []) == message.get("refs", []))
+            and intent.get("refs", []) == message.get("refs", [])
+            and intent.get("producer_binding") == message.get("producer_binding"))
 
 
 def _with_current_message_watch_binding(message, binding, action, failure):
@@ -801,7 +802,8 @@ def retain_registered_notice(jobs, record):
     return True
 
 
-def _registered_delivery_bindings(message, roots=None, *, received_only=False, read_context=None):
+def _registered_delivery_bindings(message, roots=None, *, received_only=False,
+                                  require_current_recipient=True, read_context=None):
     if (received_only and (message.get("state") != "received"
             or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
         return
@@ -833,7 +835,6 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False, r
     identity = intent.get("identity") or {}
     if (intent.get("kind") != "registered-batch" or identity.get("jobs") != str(jobs)
             or identity.get("attempt_id") != binding.get("attempt_id")
-            or identity.get("harness") != recipient.get("harness")
             or binding.get("recipient_sid") != recipient.get("session_id")
             or intent.get("carrier") != binding.get("carrier")
             or (intent.get("notice_delivery_id")
@@ -852,13 +853,40 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False, r
                 or row.metadata.get("parent_sid") != storage
                 or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
             return
+        producer = message.get("producer_binding")
+        sender = message.get("from") or {}
+        if sender.get("harness") == "runtime":
+            expected = {
+                "schema": "registered-runtime-completion-v1",
+                "duty_id": duty["id"], "jobs": str(jobs),
+                "attempt_id": row.attempt_id, "carrier": binding["carrier"],
+                "delivery_id": delivery_id, "receipt_digest": record.get("receipt_digest"),
+                "recipient": {"harness": recipient.get("harness"),
+                              "session_id": recipient.get("session_id")},
+                "route_id": str(row.metadata.get("route_id") or ""),
+                "route_node": str(row.metadata.get("route_node") or ""),
+            }
+            if (producer != expected or sender.get("session_id") not in (None, "")
+                    or sender.get("name") != "Hearting runtime"
+                    or not {duty["id"], row.attempt_id, delivery_id}.issubset(
+                        set(message.get("refs") or []))):
+                return
+        elif producer is not None:
+            return
         if intent.get("notice_delivery_id") and record.get("receipt_digest") != intent.get("notice_digest"):
             return
-        from dispatch_seat_handover import effective_parent
+        from dispatch_seat_handover import effective_parent, effective_parent_harness
         parent = (effective_parent(row.metadata, jobs) if read_context is None else
                   effective_parent(row.metadata, jobs, read_context=read_context))
-        if parent != binding["recipient_sid"]:
-            return
+        if require_current_recipient:
+            parent_harness = (effective_parent_harness(row.metadata, jobs)
+                              if read_context is None else effective_parent_harness(
+                                  row.metadata, jobs, read_context=read_context))
+            expected_harness = (identity.get("harness", "") if parent == str(
+                row.metadata.get("parent_sid") or "") else parent_harness or identity.get("harness", ""))
+            if (parent != binding["recipient_sid"]
+                    or expected_harness != recipient.get("harness")):
+                return
         if (row.metadata.get("delivery_intent") == "1"
                 and row.metadata.get("delivery_id") == delivery_id and (
                 not row.metadata.get("delivery_receipt_digest")
@@ -874,10 +902,11 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False, r
 
 
 def registered_delivery_settled(message, *, roots=None, read_context=None):
-    """A consumed exact notice makes its deferred peer payload unnecessary."""
+    """An exact historical recipient receipt settles the immutable result record."""
     return any(record["state"] in {"acked", "rejected", "expired"}
                for _store, _duty, _row, record, _root, _storage, _delivery_id
-               in _registered_delivery_bindings(message, roots, read_context=read_context))
+               in _registered_delivery_bindings(message, roots,
+                   require_current_recipient=False, read_context=read_context))
 
 
 def received_registered_ack(jobs, record, recipient_sid) -> bool:
@@ -1377,10 +1406,13 @@ class ObligationStore:
                 observation = record.get("observation") or {}
                 expected_sender = intent.get("from") or {}
                 saved_sender = message.get("from") or {}
+                sender_keys = ("harness", "session_id", "name") if "name" in expected_sender \
+                    else ("harness", "session_id")
                 if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
                         or not _message_intent_matches_transfer(record, message)
                         or (expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
-                                                    for key in ("harness", "session_id")))):
+                                                    for key in sender_keys))
+                        or intent.get("producer_binding") != message.get("producer_binding")):
                     return False
                 if proof.get("receipt_type") == "exact-native-history":
                     native_id = proof.get("actual_message_id")
@@ -1485,8 +1517,12 @@ class ObligationStore:
                         or not _message_intent_matches_transfer(record, message)):
                     return False
                 expected_sender, saved_sender = intent.get("from") or {}, message.get("from") or {}
+                sender_keys = ("harness", "session_id", "name") if "name" in expected_sender \
+                    else ("harness", "session_id")
                 if expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
-                                           for key in ("harness", "session_id")):
+                                           for key in sender_keys):
+                    return False
+                if intent.get("producer_binding") != message.get("producer_binding"):
                     return False
                 original, saved_target = intent.get("to") or {}, message.get("to") or {}
                 if any(original.get(key) != saved_target.get(key)
@@ -1901,7 +1937,7 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         resolve_dispatch_state_root,
     )
     from dispatch_terminal_commit import owner_completion_state
-    from dispatch_seat_handover import effective_parent, effective_parent_harness
+    from dispatch_seat_handover import owns as seat_owns, effective_parent_harness
     from dispatch_registry_cache import registry_view
 
     if jobs is None:
@@ -1950,12 +1986,9 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         metadata = parse_registry_metadata(fields[5])
         executor = (metadata.get("attempt_id") in execution_attempt_ids
                     and metadata.get("harness") == harness)
-        if metadata.get("parent_sid") == session_id:
-            parent_harness = metadata.get("parent_harness")
-            parent_owned = True
-        elif include_parent:
-            parent_owned = effective_parent(metadata, jobs_path,
-                                            read_context=read_context) == session_id
+        if include_parent:
+            parent_owned = seat_owns(metadata, session_id, jobs_path,
+                                     read_context=read_context)
             parent_harness = effective_parent_harness(
                 metadata, jobs_path, read_context=read_context)
         else:
@@ -1974,12 +2007,42 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             process_reason=live.process_reason,
             terminal_observed=live.state == "reconcile-needed",
         )
-        try:
-            closure = owner_completion_state(jobs_path, status, metadata).state
-        except Exception:
-            closure = "unknown"
-        closure_state = ("settled" if closure in {"not-applicable", "complete"}
-                         else "unknown" if closure == "unknown" else "pending")
+        if parent:
+            # Parent watch/retire readiness is derived from the exact result
+            # delivery below; owner closure is a separate completion controller.
+            closure_state = "pending"
+        else:
+            try:
+                closure = owner_completion_state(jobs_path, status, metadata).state
+            except Exception:
+                closure = "unknown"
+            closure_state = ("settled" if closure in {"not-applicable", "complete"}
+                             else "unknown" if closure == "unknown" else "pending")
+        delivery_state = "unknown"
+        if parent and status == "done":
+            if metadata.get("delivery_intent") != "1":
+                delivery_state = "not-required"
+            else:
+                delivery_id = metadata.get("delivery_id")
+                expected_digest = metadata.get("delivery_receipt_digest")
+                expected_revision = metadata.get("delivery_row_revision")
+                if delivery_id and expected_digest and expected_revision:
+                    try:
+                        import dispatch_pending_delivery as pending
+                        delivery = pending.read(state_root, metadata.get("parent_sid", ""),
+                                                delivery_id)
+                        if (delivery and delivery.get("delivery_id") == delivery_id
+                                and attempt_id in delivery.get("attempt_ids", [])
+                                and delivery.get("recipient_kind") == metadata.get(
+                                    "parent_completion_delivery")
+                                and delivery.get("receipt_digest") == expected_digest
+                                and (delivery.get("row_revisions") or {}).get(attempt_id)
+                                    == expected_revision):
+                            delivery_state = (delivery.get("state") if delivery.get("state") in {
+                                "pending", "claimed", "queued", "unverified", "sent-ambiguous",
+                                "acked"} else "unknown")
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                        pass
         result.append(RegisteredWorkObservation(
             attempt_id=attempt_id, decision=decision,
             process_state=live.process_state,
@@ -1987,6 +2050,7 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             owner_completion_state=closure_state,
             cleanup_state=("pending" if metadata.get("cleanup_pending") == "1" else "settled"),
             pane_relation="executor" if executor else "parent",
+            delivery_state=delivery_state if parent else "unknown",
             provenance=(("jobs", str(jobs_path)), ("registry_status", status),
                         ("registry_state_root", str(state_root))),
         ))

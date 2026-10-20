@@ -394,7 +394,8 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
     metadata = metadata or {}
     if action == "handover" and not facts.get("eligible", False):
         return ContinuationDecision(False, "settled", next_action="settle")
-    if (action == "handover" or facts.get("actor")) and not owns(metadata, facts.get("actor"), jobs):
+    if (action == "handover" or facts.get("actor")) and not owns(
+            metadata, facts.get("actor"), jobs, read_context=facts.get("read_context")):
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
@@ -542,7 +543,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     "The same owner's input consumer is reachable or its terminal result settles.")
     if action == "handover":
         allowed = status in {"open", "running"}
-        if status == "done":
+        if status in {"done", "cancelled", "killed"}:
             import dispatch_seat_handover as handover
             allowed = (facts.get("delivery_open") if "delivery_open" in facts else
                        handover._delivery_open(jobs, metadata)) or (
@@ -794,14 +795,19 @@ def correction_source_session(environ=None) -> str:
     return session_label(environ)
 
 
-def owns(meta, session, jobs) -> bool:
-    """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if session and meta.get("parent_sid") == session:
-        return True
-    if not session or jobs is None:
+def owns(meta, session, jobs, *, read_context=None) -> bool:
+    """Only the session that answers for the attempt now (``effective_parent``).
+
+    That is the registered parent before a confirmed handover and the end of its
+    lineage after one. Unreadable handover state retains the existing
+    registered-parent fallback.
+    """
+    if not session:
         return False
     from dispatch_seat_handover import owns as seat_owns
-    return seat_owns(meta, session, jobs)
+    if read_context is None:
+        return seat_owns(meta, session, jobs)
+    return seat_owns(meta, session, jobs, read_context=read_context)
 
 
 def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
@@ -835,7 +841,7 @@ def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> boo
         return True
     if lineage and candidate.get('dispatch_depth') == '1':
         # A registered A -> B edge survives a later B -> C handover. Admission
-        # still accepts only the registered parent or the current successor.
+        # still accepts only the source's current effective parent.
         from dispatch_seat_handover import effective_parent
         current = effective_parent(source, jobs)
         return bool(current) and effective_parent(candidate, jobs) == current
