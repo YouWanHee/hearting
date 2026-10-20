@@ -1,9 +1,10 @@
 """Pure data and frame composition for the Fleet explorer."""
 
 from .frame import compose
-from .types import Frame, FocusKey, FocusRequest, FocusResult, Health, Hit, LedgerRow, NavRow, Rect, RequestTab
+from .types import (AttemptRow, Frame, FocusKey, FocusRequest, FocusResult, Health, Hit, LedgerRow, NavRow,
+                    Rect, RequestHeader, RequestLedger, RequestTab)
 
 __all__ = [
-    "Frame", "FocusKey", "FocusRequest", "FocusResult", "Health", "Hit",
-    "LedgerRow", "NavRow", "Rect", "RequestTab", "compose",
+    "AttemptRow", "Frame", "FocusKey", "FocusRequest", "FocusResult", "Health", "Hit",
+    "LedgerRow", "NavRow", "Rect", "RequestHeader", "RequestLedger", "RequestTab", "compose",
 ]
