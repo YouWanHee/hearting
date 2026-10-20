@@ -1591,8 +1591,35 @@ def release(root: str | Path, token: str) -> dict[str, Any]:
     return result
 
 
+# A reservation lives only while its launch claims or cancels it (seconds to
+# minutes). Older batch wrappers reserved without an owner witness, so one that
+# died mid-launch left its slots held with nothing to lock: measured
+# 2026-10-20, 14 of 24 dispatch slots were reservations 2 to 18 days old. One
+# whose owner witness is not held and that has outlived this bound has outlived
+# every launch that could still claim it, on any host sharing the root.
+UNCLAIMED_RESERVATION_MAX_SECONDS = 24 * 3600
+
+
+def _reservation_return(root: str | Path, reservation: dict[str, Any], now: float) -> tuple[str, str]:
+    """(state, reason) for an unclaimed reservation; only ``unheld`` returns it."""
+
+    binding = reservation.get("owner_witness")
+    if isinstance(binding, dict):
+        proof = prove_witness_unheld(root, binding)
+        if proof.state in {"unheld", "live"}:
+            return proof.state, proof.reason
+        state, reason = proof.state, proof.reason
+    else:
+        state, reason = "unknown", "no-identity-witness"
+    reserved = reservation.get("reserved_at")
+    if (isinstance(reserved, (int, float)) and not isinstance(reserved, bool)
+            and now - reserved >= UNCLAIMED_RESERVATION_MAX_SECONDS):
+        return "unheld", "unclaimed-past-launch-bound"
+    return state, reason
+
+
 def reclaim(root: str | Path, *, token: str | None = None) -> dict[str, Any]:
-    """Return capacity held by leases whose claimant is provably gone.
+    """Return capacity held by leases or reservations whose holder is gone.
 
     Why this exists: `release` requires `_local_return_proof`, which requires
     the witness handle issued *in this process* -- so only the original,
@@ -1646,6 +1673,20 @@ def reclaim(root: str | Path, *, token: str | None = None) -> dict[str, Any]:
                     reclaim_reason=proof.reason,
                 )
             reclaimed.append({**row, "state": proof.state, "reason": proof.reason})
+        for candidate, reservation in sorted(data["reservations"].items()):
+            if token is not None and candidate != token:
+                continue
+            if not isinstance(reservation, dict):
+                raise ValueError("invalid governor state: malformed reservation")
+            row = {"token": candidate, "class": reservation.get("class"), "kind": "reservation",
+                   "owner_pid": reservation.get("owner_pid"),
+                   "pid_namespace": (reservation.get("owner_identity") or {}).get("pid_namespace")}
+            state, reason = _reservation_return(root, reservation, now)
+            if state != "unheld":
+                retained.append({**row, "state": state, "reason": reason})
+                continue
+            del data["reservations"][candidate]
+            reclaimed.append({**row, "state": state, "reason": reason})
         leases = data["leases"]
         return {
             "status": "reclaimed" if reclaimed else "none",
@@ -1674,6 +1715,13 @@ def reclaimable(root: str | Path, data: dict[str, Any]) -> int:
         if isinstance(binding, dict) and prove_witness_unheld(root, binding).state == "unheld":
             total += 1
     return total
+
+
+def reclaimable_reservations(root: str | Path, data: dict[str, Any], now: float) -> int:
+    """How many unclaimed reservations a `reclaim` would return."""
+
+    return sum(isinstance(reservation, dict) and _reservation_return(root, reservation, now)[0] == "unheld"
+               for reservation in data.get("reservations", {}).values())
 
 
 def main() -> int:
@@ -1857,6 +1905,7 @@ def main() -> int:
         # occupancy is live work or dead claimants, without diffing /proc.
         print(json.dumps({**data, "identity_diagnostics": diagnostics,
                           "reclaimable_leases": reclaimable(args.root, data),
+                          "reclaimable_reservations": reclaimable_reservations(args.root, data, time.time()),
                           "start_usage": start_usage}, sort_keys=True))
     else:
         command = args.command_argv[1:] if args.command_argv[:1] == ["--"] else args.command_argv
