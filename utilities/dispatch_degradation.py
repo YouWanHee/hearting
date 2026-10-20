@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dispatch_contract import resolve_agent_home as _resolve_agent_home  # noqa: E402
 from dispatch_contract import resolve_dispatch_state_root as _resolve_dispatch_state_root  # noqa: E402
+from dispatch_contract import bounded_candidate_outcomes, candidate_detail, diagnostic_token  # noqa: E402
 
 _KINDS = {"degradation", "chain-exhausted", "leg-failure", "writer-unregistered"}
 _HOPS = {"same-harness-headless", "cross-harness-headless", "native-subagent", "inline"}
@@ -26,7 +27,7 @@ _WRITERS = {
     "dispatch-reap-watch.py",
     "dispatch_completion_join.py",
 }
-_OPTIONAL = {"fallback_ordinal", "fleet_visibility", "reason", "detail", "registered_worker", "capability", "completion_gate", "route_file", "parent", "parent_attempt_id", "parent_pid", "parent_pid_start", "harness", "attempt_trace", "prior_attempt_ids", "last_direct_failure", "child_proof", "parallel_group", "parallel_leg_index", "parallel_leg_count", "attempt_id", "exit_code", "launch_state", "event_id", "leg_class", "auxiliary_check", "parent_cross", "cause", "sole_gate", "subsession_id", "slice_manifest_sha256"}
+_OPTIONAL = {"fallback_ordinal", "fleet_visibility", "reason", "detail", "registered_worker", "capability", "completion_gate", "route_file", "parent", "parent_attempt_id", "parent_pid", "parent_pid_start", "harness", "attempt_trace", "prior_attempt_ids", "last_direct_failure", "candidate_outcomes", "candidate_outcomes_omitted", "child_proof", "parallel_group", "parallel_leg_index", "parallel_leg_count", "attempt_id", "exit_code", "launch_state", "event_id", "leg_class", "auxiliary_check", "parent_cross", "cause", "sole_gate", "subsession_id", "slice_manifest_sha256"}
 
 def _home():
     return str(_resolve_agent_home())
@@ -97,6 +98,15 @@ def record_degradation(*, route_id=None, route_node=None, route_hash=None, dispa
         for key, limit in (("reason", 160), ("detail", 512), ("attempt_trace", 2048)):
             if key in row:
                 row[key] = _clip(row[key], limit)
+        if "candidate_outcomes" in row:
+            row["candidate_outcomes"], row["candidate_outcomes_omitted"] = bounded_candidate_outcomes(
+                row["candidate_outcomes"], row.get("candidate_outcomes_omitted", 0))
+            if "detail" in row:
+                row["detail"] = candidate_detail(row.get("reason", ""), row["detail"])
+        if "last_direct_failure" in row:
+            if not isinstance(row["last_direct_failure"], str):
+                return None
+            row["last_direct_failure"] = diagnostic_token(row["last_direct_failure"], 256)
         row["event_id"] = fields.get("event_id") or _event_id(row)
         payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         filename = route_id + ".jsonl" if isinstance(route_id, str) and route_id else "_unattributed.jsonl"
