@@ -3204,6 +3204,23 @@ def _record_watch_native_result(paths, arm, result):
     return True
 
 
+def _write_watch_observation(paths, observation):
+    """Keep a transition request beside its exact durable native result."""
+    current = _read_json(paths.observation) or {}
+    current_native = current.get("native_wait") or {}
+    next_native = observation.get("native_wait") or {}
+    if (current_native.get("state") == "result"
+            and current_native.get("agent_state") in {"idle", "done"}
+            and next_native.get("state") == "result"
+            and next_native.get("agent_state") == current_native.get("agent_state")
+            and next_native.get("agent") == current_native.get("agent")):
+        request = current.get("readiness_transition")
+        if isinstance(request, dict) and "readiness_transition" not in observation:
+            observation = {**observation, "readiness_transition": request}
+    _write_json_atomic(paths.observation, observation)
+    return observation
+
+
 def _persist_watch_session(args, paths, server, session_id):
     """Bind an unbound arm under the same pane admission lock as registration."""
     arm = _read_json(paths.arm)
@@ -3690,7 +3707,7 @@ def cmd_watch_run(args):
     remaining_ms, deadline_state = _watch_timeout_remaining_ms(arm)
     if deadline_state == "unknown":
         wait_record = {"state": "unknown", "reason": "watch-timeout-deadline-unverifiable"}
-        _write_json_atomic(paths.observation, {
+        _write_watch_observation(paths, {
             **observation, "schema_version": _WATCH_SCHEMA, "watch_id": args.watch_id,
             "state": "unknown", "reason": "watch-timeout-deadline-unverifiable",
             "native_wait": wait_record,
@@ -3828,7 +3845,7 @@ def cmd_watch_run(args):
                     except OSError:
                         wait_pidfd = None
             elif wait_record.get("state") == "launching":
-                _write_json_atomic(paths.observation, {
+                _write_watch_observation(paths, {
                     **observation, "schema_version": _WATCH_SCHEMA,
                     "watch_id": args.watch_id, "state": "unknown",
                     "reason": "native-wait-launch-uncertain",
@@ -3845,7 +3862,7 @@ def cmd_watch_run(args):
                                "watch_id": args.watch_id, "state": "unknown",
                                "reason": wait_record["reason"],
                                "native_wait": wait_record, "observed_ts": _utc_now()}
-                _write_json_atomic(paths.observation, observation)
+                _write_watch_observation(paths, observation)
             else:
                 if deadline_state == "expired":
                     terminal_reason = "watch-deadline"
@@ -3861,7 +3878,7 @@ def cmd_watch_run(args):
                     "server": server, "agent": expected_agent,
                     "native_wait": wait_record, "observed_ts": _utc_now(),
                 }
-                _write_json_atomic(paths.observation, observation)
+                _write_watch_observation(paths, observation)
                 command = _herdr_argv("agent", "wait", args.target)
                 for until_state in args.until or []:
                     command.extend(("--until", until_state))
@@ -3888,7 +3905,7 @@ def cmd_watch_run(args):
                     observation = {**observation, "state": "waiting",
                                    "reason": "native-wait-running", "native_wait": wait_record,
                                    "observed_ts": _utc_now()}
-                    _write_json_atomic(paths.observation, observation)
+                    _write_watch_observation(paths, observation)
                     if hasattr(os, "pidfd_open") and wait_start:
                         try:
                             wait_pidfd = os.pidfd_open(int(wait_pid), 0)
@@ -3978,7 +3995,7 @@ def cmd_watch_run(args):
                 observation = {**(_read_json(paths.observation) or observation),
                                "state": "waiting", "reason": reason,
                                "native_wait": wait_record, "observed_ts": _utc_now()}
-                _write_json_atomic(paths.observation, observation)
+                _write_watch_observation(paths, observation)
 
         if terminal_reason:
             _write_terminal_watch_receipt(args.watch_id, arm, terminal_reason,
@@ -3992,7 +4009,7 @@ def cmd_watch_run(args):
                 # The only non-pidfd fallback remains event driven where a
                 # Herdr subscription is available; no short sleep loop is used.
                 if event_transport is None and remaining_ms is None and steward_pidfd is None:
-                    _write_json_atomic(paths.observation, {
+                    _write_watch_observation(paths, {
                         **observation, "state": "unknown",
                         "reason": "native-wait-exit-event-unavailable",
                         "native_wait": wait_record, "observed_ts": _utc_now(),
@@ -4038,7 +4055,7 @@ def cmd_watch_run(args):
                         observation = {**observation, "state": "waiting",
                                        "reason": reason, "native_wait": wait_record,
                                        "observed_ts": _utc_now()}
-                        _write_json_atomic(paths.observation, observation)
+                        _write_watch_observation(paths, observation)
                 if (wait_pidfd is not None and (wait_record or {}).get("state") == "started"):
                     ready, _, _ = select.select([wait_pidfd], [], [], 0)
                     if ready:
@@ -4061,7 +4078,7 @@ def cmd_watch_run(args):
                             observation = {**observation, "state": "waiting",
                                            "reason": reason, "native_wait": wait_record,
                                            "observed_ts": _utc_now()}
-                            _write_json_atomic(paths.observation, observation)
+                            _write_watch_observation(paths, observation)
                 if terminal_reason:
                     break
 
@@ -4085,7 +4102,7 @@ def cmd_watch_run(args):
                             observation = {**observation, "state": "unknown",
                                            "reason": "target-absence-unconfirmed",
                                            "native_wait": wait_record, "observed_ts": _utc_now()}
-                            _write_json_atomic(paths.observation, observation)
+                            _write_watch_observation(paths, observation)
                             os._exit(0)
                         break
                     if result_state in {"idle", "done"}:
@@ -4099,7 +4116,7 @@ def cmd_watch_run(args):
                             observation = {**observation, "state": "pending",
                                            "reason": readiness.reason or result_state,
                                            "native_wait": wait_record, "observed_ts": _utc_now()}
-                            _write_json_atomic(paths.observation, observation)
+                            _write_watch_observation(paths, observation)
                             awaiting_readiness = True
                     else:
                         state, agent = result_state, wait_record.get("agent") or expected_agent
@@ -4133,7 +4150,7 @@ def cmd_watch_run(args):
                         observation = {**observation, "state": "pending",
                                        "reason": readiness.reason or "shared-readiness-pending",
                                        "native_wait": wait_record, "observed_ts": _utc_now()}
-                        _write_json_atomic(paths.observation, observation)
+                        _write_watch_observation(paths, observation)
                         awaiting_readiness = True
                 if steward_pidfd is not None and steward_pidfd in ready:
                     terminal_reason = "steward-exited"
@@ -4176,16 +4193,19 @@ def cmd_watch_run(args):
             os._exit(0)
 
         if (wait_record or {}).get("state") == "result":
-            _write_json_atomic(paths.observation, {
+            _write_watch_observation(paths, {
                 **observation, "state": "settled", "reason": "native-wait-result-consumed",
                 "native_wait": wait_record, "observed_ts": _utc_now(),
             })
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         if wait_proc is not None:
             _stop_watch_wait(wait_proc, wait_proc.pid, process_start_ticks(wait_proc.pid))
-        _write_json_atomic(paths.observation, {
+        latest = _read_json(paths.observation) or observation
+        _write_watch_observation(paths, {
+            **latest,
             "schema_version": _WATCH_SCHEMA, "watch_id": args.watch_id,
             "state": "unknown", "reason": "watch-observer-unavailable",
+            **({"native_wait": wait_record} if isinstance(wait_record, dict) else {}),
             "observed_ts": _utc_now(),
         })
         os._exit(0)
@@ -4222,7 +4242,13 @@ def cmd_watch_run(args):
         "refs": list(args.ref or []),
         "observer_generation": getattr(args, "rearm_count", 0) + 1,
     }
-    _write_json_atomic(paths.receipt, receipt)
+    if state in {"idle", "done"}:
+        if not _watch_publish_ready_receipt(
+                args.target, state, arm, expected, server,
+                args.watch_id, paths, receipt):
+            os._exit(0)
+    else:
+        _write_json_atomic(paths.receipt, receipt)
     with contextlib.suppress(OSError, ValueError):
         shared_readiness.clear_watch_transition(
             peer_obligations.ObligationStore().root, args.watch_id)
@@ -5070,7 +5096,7 @@ def _bottom_form_tokens(target, window=15):
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
                     purpose="completion", target_observation=None, pane_info=None,
                     native_session_id=None, registry_append_only=False, read_context=None,
-                    server=None):
+                    server=None, authority_out=None, selected_authority=None):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session, and for a Codex TUI
@@ -5080,6 +5106,8 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
     exact by pane and shell birth: nothing can be bound to it, so its native
     turn decides. A caller holding a session needs that proof to name it."""
     try:
+        if authority_out is not None:
+            authority_out.update(rows=[], handover_keys=[])
         if target_observation is None:
             observed_state, ident, _code, _reason = _retire_target(target)
         else:
@@ -5132,7 +5160,13 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
                                     include_parent=purpose != "input",
                                     read_context=read_context,
                                     registry_append_only=(registry_append_only or bool(
-                                        read_context and read_context.registry_append_only))))
+                                        read_context and read_context.registry_append_only)),
+                                    authority_out=authority_out,
+                                    selected_rows=(selected_authority.get("rows")
+                                                   if isinstance(selected_authority, dict) else None),
+                                    expected_handover_keys=(selected_authority.get("handover_keys")
+                                                           if isinstance(selected_authority, dict)
+                                                           else None)))
         return peer_obligations.pane_readiness(
             server=server or _HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
@@ -5165,7 +5199,29 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
     return _watch_readiness_result(target, native_state, identity, result, server)
 
 
-def _watch_readiness_result(target, native_state, identity, result, server):
+@contextlib.contextmanager
+def _watch_transition_authority_lock(identity, server):
+    """Join the existing jobs and target-seat writer locks for one receipt edge."""
+    import dispatch_seat_handover
+
+    store = peer_obligations.ObligationStore()
+    jobs = store.root.parents[1] / "jobs.log"
+    lock_path = Path(str(jobs) + ".lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        socket_path = herdr_observation.socket_path_for_endpoint(server)
+        with dispatch_seat_handover.readiness_transition_lock(
+                identity.get("pane"), server, socket_path):
+            yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _watch_readiness_result(target, native_state, identity, result, server, *,
+                            require_authority=False, authority_lock_held=False):
     """Bind any runner result to the exact live pane and its native result."""
     state = result.get("state", "unknown")
     reason = result.get("reason", "shared-readiness-pending")
@@ -5200,12 +5256,46 @@ def _watch_readiness_result(target, native_state, identity, result, server):
         "harness": identity["harness"], "session_id": current_sid,
         "pid_birth": f"{current_pid}:{current_start}",
     }
+    if require_authority:
+        authority = result.get("authority")
+        if not shared_readiness.valid_watch_authority(authority):
+            return SimpleNamespace(state="unknown",
+                                   reason="shared-readiness-authority-unavailable")
+
+        def fresh_authority():
+            from peer_read_context import PeerReadContext
+            readiness = _pane_readiness(
+                target, native_state,
+                expected_harness=identity["harness"],
+                expected_sid=identity["session_id"] or "-",
+                expected_pane=identity["pane"],
+                target_observation=(observed_state, current),
+                pane_info=pane_info,
+                registry_append_only=True,
+                read_context=PeerReadContext(registry_append_only=True),
+                selected_authority=authority,
+                server=server)
+            readiness_identity = dict(getattr(readiness, "identity", ()) or ())
+            if readiness_identity != current_identity:
+                return SimpleNamespace(state="unknown",
+                                       reason="shared-readiness-identity-changed")
+            return SimpleNamespace(state=readiness.state, reason=readiness.reason,
+                                   identity=tuple(current_identity.items()))
+
+        if authority_lock_held:
+            return fresh_authority()
+        try:
+            with _watch_transition_authority_lock(identity, server):
+                return fresh_authority()
+        except (OSError, ValueError, RuntimeError):
+            return SimpleNamespace(state="unknown",
+                                   reason="shared-readiness-authority-lock-unavailable")
     return SimpleNamespace(state="ready", reason=reason,
                            identity=tuple(current_identity.items()))
 
 
 def _watch_transition_readiness(target, native_state, arm, expected, server,
-                                watch_id, paths):
+                                watch_id, paths, *, authority_lock_held=False):
     """Require a fresh runner authority read before this watch can publish ready.
 
     The long-lived target projection is only a trigger. The observer writes a
@@ -5234,7 +5324,9 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
             root, watch_id, identity, request["token"])
         if fresh is None:
             return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
-        return _watch_readiness_result(target, native_state, identity, fresh, server)
+        return _watch_readiness_result(
+            target, native_state, identity, fresh, server,
+            require_authority=True, authority_lock_held=authority_lock_held)
 
     cached = _watch_shared_readiness(target, native_state, arm, expected, server)
     if cached.state != "ready":
@@ -5257,6 +5349,35 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
         # native result remains available to the existing recovery path.
         pass
     return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
+
+
+def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
+                                 watch_id, paths, receipt):
+    """Refresh mutable authority and publish the receipt under its writer locks."""
+    latest = _read_json(paths.observation) or {}
+    wait_record = latest.get("native_wait") or {}
+    reason = "shared-readiness-authority-lock-unavailable"
+    try:
+        identity = _watch_readiness_identity(arm, native_state)
+        if identity is None:
+            reason = "shared-readiness-identity-unavailable"
+            raise ValueError(reason)
+        with _watch_transition_authority_lock(identity, server):
+            readiness = _watch_transition_readiness(
+                target, native_state, arm, expected, server,
+                watch_id, paths, authority_lock_held=True)
+            if readiness.state != "ready":
+                reason = readiness.reason or "shared-readiness-pending"
+            else:
+                _write_json_atomic(paths.receipt, receipt)
+                return True
+    except (OSError, ValueError, RuntimeError):
+        pass
+    _write_watch_observation(paths, {
+        **latest, "state": "pending", "reason": reason,
+        "native_wait": wait_record, "observed_ts": _utc_now(),
+    })
+    return False
 
 
 _FLUSH_MAX_ROWS = 4
@@ -6429,6 +6550,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         generation = None
         lineage = None
         transition_read_context = None
+        transition_authority = None
         try:
             if server not in views_by_server:
                 transport = _runner_readiness_transport(server)
@@ -6483,6 +6605,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             if transition_requests:
                 from peer_read_context import PeerReadContext
                 transition_read_context = PeerReadContext(registry_append_only=True)
+                transition_authority = {"rows": [], "handover_keys": []}
                 readiness = _pane_readiness(
                     target, native_state,
                     expected_harness=identity["harness"],
@@ -6490,7 +6613,8 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     expected_pane=identity["pane"],
                     target_observation=(observed_state, observed_ident),
                     pane_info=pane_info, registry_append_only=True,
-                    read_context=transition_read_context, server=server)
+                    read_context=transition_read_context, server=server,
+                    authority_out=transition_authority)
                 readiness_identity = dict(readiness.identity)
                 if (readiness_identity.get("server") == identity["server"]
                         and readiness_identity.get("pane") == identity["pane"]
@@ -6533,44 +6657,9 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                         {"consumer": item[2].get("consumer")}))
             ]
             if transition_consumers and transition_state == "ready":
-                # This last shared classification is immediately before the
-                # per-watch transition response. It catches authority changes
-                # that race the request-bound validation above without adding
-                # a heavy read to each watcher.
-                try:
-                    from peer_read_context import PeerReadContext
-                    boundary_context = PeerReadContext(registry_append_only=True)
-                    boundary = _pane_readiness(
-                        target, native_state,
-                        expected_harness=watch_identity["harness"],
-                        expected_sid=watch_identity["session_id"] or "-",
-                        expected_pane=watch_identity["pane"],
-                        target_observation=(observed_state, observed_ident),
-                        pane_info=pane_info, registry_append_only=True,
-                        read_context=boundary_context, server=server)
-                    boundary_identity = dict(getattr(boundary, "identity", ()) or ())
-                    if (boundary_identity.get("server") == watch_identity["server"]
-                            and boundary_identity.get("pane") == watch_identity["pane"]
-                            and boundary_identity.get("harness") == watch_identity["harness"]
-                            and boundary_identity.get("session_id", "") == watch_identity["session_id"]
-                            and boundary_identity.get("pid_birth") ==
-                                f"{lineage['shell_pid']}:{lineage['shell_start']}"):
-                        transition_state = boundary.state
-                        transition_reason = boundary.reason
-                    else:
-                        transition_state = "unknown"
-                        transition_reason = "shared-readiness-identity-changed"
-                    boundary_view = boundary_context.registry_view(jobs, append_only=True)
-                    if boundary_view is None:
-                        transition_state, transition_reason = "unknown", "registry-missing"
-                    else:
-                        transition_generation = {
-                            "path": str(jobs), "resolved": boundary_view.resolved_path,
-                            "signature": list(boundary_view.signature),
-                        }
-                except (OSError, TypeError, ValueError):
+                if not shared_readiness.valid_watch_authority(transition_authority):
                     transition_state = "unknown"
-                    transition_reason = "shared-readiness-transition-check-failed"
+                    transition_reason = "shared-readiness-authority-unbounded"
             changed = shared_readiness.publish_target_projection(
                 store.root, watch_identity,
                 {"state": projection_state, "reason": projection_reason},
@@ -6587,7 +6676,8 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     store.root, watch_id, watch_identity, transition.get("token"),
                     {"state": transition_state, "reason": transition_reason},
                     producer_pid=os.getpid(), producer_start=producer_start,
-                    incarnation=incarnation, generation=transition_generation, lineage=lineage)
+                    incarnation=incarnation, generation=transition_generation, lineage=lineage,
+                    authority=transition_authority)
                 if transition_changed:
                     _wake_watch_observer(watch_arm)
     return True

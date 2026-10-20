@@ -284,9 +284,44 @@ def _watch_transition_path(root, watch_id):
     return Path(root) / "readiness-v1" / "watch-transitions" / f"{watch_id}.json"
 
 
+def valid_watch_authority(authority):
+    """Accept only the bounded exact rows needed for a consumer freshness read."""
+    if not isinstance(authority, dict):
+        return False
+    rows = authority.get("rows")
+    keys = authority.get("handover_keys")
+    if (not isinstance(rows, list) or len(rows) > 64
+            or not isinstance(keys, list) or len(keys) > 64):
+        return False
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get("status"), str)
+                or len(row["status"]) > 32 or not isinstance(row.get("metadata"), dict)
+                or len(row["metadata"]) > 64
+                or not isinstance(row.get("completion_metadata"), dict)
+                or len(row["completion_metadata"]) > 64
+                or not isinstance(row.get("fields"), list) or len(row["fields"]) != 6
+                or any(not isinstance(field, str) or len(field) > 4096
+                       for field in row["fields"])):
+            return False
+        for mapping in (row["metadata"], row["completion_metadata"]):
+            if any(not isinstance(key, str) or len(key) > 128
+                   or not isinstance(value, str) or len(value) > 2048
+                   for key, value in mapping.items()):
+                return False
+    for key in keys:
+        if (not isinstance(key, list) or len(key) != 3
+                or any(not isinstance(value, str) or len(value) > 512 for value in key)):
+            return False
+    try:
+        return len(json.dumps(authority, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False).encode("utf-8")) <= 65536
+    except (TypeError, ValueError, UnicodeError):
+        return False
+
+
 def publish_watch_transition(root, watch_id, identity, request_token, result, *,
                              producer_pid, producer_start, incarnation,
-                             generation=None, lineage=None, now=None):
+                             generation=None, lineage=None, authority=None, now=None):
     """Publish the runner's fresh, request-bound authority check for one watch."""
     if (not isinstance(identity, dict) or not isinstance(request_token, str)
             or not request_token or len(request_token) > 128):
@@ -295,6 +330,8 @@ def publish_watch_transition(root, watch_id, identity, request_token, result, *,
     reason = result.get("reason", "") if isinstance(result, dict) else "invalid-readiness"
     if state not in {"ready", "pending", "unknown"}:
         state = "unknown"
+    if authority is not None and not valid_watch_authority(authority):
+        state, reason, authority = "unknown", "shared-readiness-authority-unbounded", None
     observed_at = time.time() if now is None else float(now)
     value = {
         "schema_version": SCHEMA_VERSION,
@@ -315,6 +352,8 @@ def publish_watch_transition(root, watch_id, identity, request_token, result, *,
                 value["lineage"] = {"shell_pid": pid, "shell_start": start}
         except (TypeError, ValueError):
             pass
+    if authority is not None:
+        value["authority"] = authority
     path = _watch_transition_path(root, watch_id)
     previous = _read_json(path)
     previous_age = None
@@ -331,7 +370,8 @@ def publish_watch_transition(root, watch_id, identity, request_token, result, *,
                    and previous.get("producer") == value["producer"]
                    and previous.get("generation") == generation
                    and previous.get("lineage") == value.get("lineage")
-                   and previous.get("result") == value["result"])
+                   and previous.get("result") == value["result"]
+                   and previous.get("authority") == value.get("authority"))
     _atomic_json(path, value)
     return changed
 
@@ -362,6 +402,9 @@ def watch_transition_result(root, watch_id, identity, request_token, *,
         return None
     result = value.get("result")
     lineage = value.get("lineage")
+    authority = value.get("authority")
+    if authority is not None and not valid_watch_authority(authority):
+        return None
     if not isinstance(result, dict) or result.get("state") not in {"ready", "pending", "unknown"}:
         return None
     pid = identity.get("shell_pid")
@@ -377,7 +420,9 @@ def watch_transition_result(root, watch_id, identity, request_token, *,
             return None
     except (ImportError, OSError, TypeError, ValueError):
         return None
-    return {**result, **({"lineage": lineage} if isinstance(lineage, dict) else {})}
+    return {**result,
+            **({"lineage": lineage} if isinstance(lineage, dict) else {}),
+            **({"authority": authority} if authority is not None else {})}
 
 
 def clear_watch_transition(root, watch_id):
