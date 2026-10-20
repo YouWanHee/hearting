@@ -37,7 +37,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
 
         self.assertFalse(second.has_invalid_utf8)
         self.assertEqual(second.lines, (prefix.decode("utf-8") + "\ufffd",))
-        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 1)
 
     def test_invalid_utf8_replacement_generation_does_not_inherit_old_status(self):
         self.jobs.write_bytes(b"t\topen\t/repo\t/wt\towner\tnote=\xff\n")
@@ -50,7 +50,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
         replacement = CACHE.registry_view(self.jobs, append_only=True)
 
         self.assertFalse(replacement.has_invalid_utf8)
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 4)
 
     def test_route_and_owner_candidates_keep_conflicts_duplicates_and_append_rows(self):
         def row(aid, extra):
@@ -158,9 +158,9 @@ class RegistryLinesCacheTest(unittest.TestCase):
         third = CACHE.registry_lines(self.jobs)
         self.assertEqual(first, second)
         self.assertEqual(second, third)
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 6)
         self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 1)
-        self.assertEqual(CACHE.metrics_snapshot()["bytes_read"], self.jobs.stat().st_size)
+        self.assertEqual(CACHE.metrics_snapshot()["bytes_read"], self.jobs.stat().st_size * 6)
 
     def test_parsed_views_are_shared_but_compatibility_dicts_are_isolated(self):
         self.jobs.write_text(
@@ -215,7 +215,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
         os.replace(staged, self.jobs)
         third = CACHE.registry_view(self.jobs)
         self.assertEqual(third.lines[0].split("\t")[1], "open")
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 3)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 6)
 
     def test_partial_final_row_is_reobserved_after_append(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1", encoding="utf-8")
@@ -225,7 +225,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
             stream.write("\na\tb\tc\td\te\tf=2\n")
         second = CACHE.registry_view(self.jobs)
         self.assertEqual(len(second.lines), 2)
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 4)
 
     def test_trusted_append_reads_only_new_bytes_and_does_not_promote_partial_row(self):
         base = "job\topen\t/repo\ttime\towner\tattempt_id=base,attempt_schema_version=2\n"
@@ -242,8 +242,9 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertIsNotNone(row)
         metrics = CACHE.metrics_snapshot()
         self.assertEqual(metrics["full_metadata_parses"], 1)
-        self.assertEqual(metrics["delta_reads"], 1)
-        self.assertEqual(metrics["delta_bytes_read"], len(suffix))
+        self.assertEqual(metrics["append_reuses"], 1)
+        self.assertEqual(metrics["delta_reads"], 0)
+        self.assertEqual(metrics["delta_bytes_read"], 0)
         self.assertEqual(metrics["metadata_rows_parsed"], 2)
         self.assertEqual(second.lines, tuple(base.splitlines() +
                                               ["job\topen\t/repo\ttime\towner\tattempt_id=néxt,attempt_schema_version=2"]))
@@ -303,6 +304,15 @@ class RegistryLinesCacheTest(unittest.TestCase):
             self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
             self.assertEqual(CACHE.metrics_snapshot()["cache_bytes"], 0)
 
+    def test_cached_raw_content_is_included_in_budget_and_released_on_clear(self):
+        content = b"a\tb\tc\td\te\tf=1\n"
+        self.jobs.write_bytes(content)
+        CACHE.registry_view(self.jobs)
+        self.assertEqual(CACHE.metrics_snapshot()["cache_bytes"], len(content))
+        CACHE.clear_cache()
+        self.assertEqual(CACHE.metrics_snapshot()["cache_bytes"], 0)
+        self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
+
     def test_append_segments_compact_indexes_without_reparsing_history(self):
         self.jobs.write_text(
             "job\topen\t/repo\ttime\towner\tattempt_id=att-000,attempt_schema_version=2\n",
@@ -321,7 +331,8 @@ class RegistryLinesCacheTest(unittest.TestCase):
         metrics = CACHE.metrics_snapshot()
         self.assertEqual(metrics["full_metadata_parses"], 1)
         self.assertEqual(metrics["metadata_rows_parsed"], 301)
-        self.assertEqual(metrics["delta_reads"], 300)
+        self.assertEqual(metrics["append_reuses"], 300)
+        self.assertEqual(metrics["delta_reads"], 0)
         self.assertGreater(metrics["segment_compactions"], 0)
 
     def test_unstable_read_retries_and_returns_only_the_new_generation(self):
@@ -339,7 +350,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
         with mock.patch.object(CACHE.os, "read", side_effect=rewrite_after_first_read):
             view = CACHE.registry_view(self.jobs)
         self.assertEqual(view.lines[0].split("\t", 1)[0], "new")
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 4)
 
     def test_failed_observation_drops_old_view_and_recovers(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
@@ -383,6 +394,130 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.jobs.write_text("x\tb\tc\td\te\tf=2\n", encoding="utf-8")
         self.assertEqual(CACHE.registry_view(alias).lines[0].split("\t", 1)[0], "x")
         self.assertEqual(CACHE.registry_view(self.jobs).lines[0].split("\t", 1)[0], "x")
+
+    def test_stat_collision_same_size_rewrite_validates_actual_bytes(self):
+        old = b"attempt\topen\t/repo\t/wt\tworker\tattempt_id=child\n"
+        new = b"attempt\tdone\t/repo\t/wt\tworker\tattempt_id=child\n"
+        self.assertEqual(len(old), len(new))
+        self.jobs.write_bytes(old)
+        signature = lambda info: (info.st_dev, 424242, info.st_size, 7, 9)
+        with mock.patch.object(CACHE, "_stat_signature", side_effect=signature):
+            first = CACHE.registry_view(self.jobs)
+            self.jobs.write_bytes(new)
+            second = CACHE.registry_view(self.jobs)
+        self.assertIsNot(first, second)
+        self.assertEqual(second.lines[0].split("\t")[1], "done")
+        self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 2)
+
+    def test_inode_collision_append_reuse_requires_entire_prefix(self):
+        old_row = b"attempt\topen\t/repo\t/wt\tworker\tattempt_id=child\n"
+        new_row = old_row.replace(b"open", b"done")
+        self.assertEqual(len(old_row), len(new_row))
+        tail = b"padding\topen\t/repo\t/wt\tworker\tnote=" + b"x" * 5000 + b"\n"
+        self.jobs.write_bytes(old_row + tail)
+        signature = lambda info: (info.st_dev, 818181, info.st_size, 11, 13)
+        with mock.patch.object(CACHE, "_stat_signature", side_effect=signature):
+            first = CACHE.registry_view(self.jobs, append_only=True)
+            staged = self.jobs.with_name("jobs.replace")
+            staged.write_bytes(new_row + tail + b"extra\topen\t/repo\t/wt\tworker\tf=1\n")
+            os.replace(staged, self.jobs)
+            second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(second.lines[0].split("\t")[1], "done")
+        self.assertIsNot(first._segments[0], second._segments[0])
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 0)
+        self.assertEqual(CACHE.metrics_snapshot()["metadata_rows_parsed"], 5)
+
+    def test_stable_read_retries_when_same_stat_snapshots_differ(self):
+        old = b"attempt\topen\t/repo\t/wt\tworker\tf=1\n"
+        new = b"attempt\tdone\t/repo\t/wt\tworker\tf=1\n"
+        self.assertEqual(len(old), len(new))
+        self.jobs.write_bytes(old)
+        signature = lambda info: (info.st_dev, 424242, info.st_size, 7, 9)
+        real_read = os.read
+        calls = [0]
+
+        def rewrite_between_passes(fd, size):
+            calls[0] += 1
+            data = real_read(fd, size)
+            if calls[0] == 2:
+                self.jobs.write_bytes(new)
+            return data
+
+        with mock.patch.object(CACHE, "_stat_signature", side_effect=signature), mock.patch.object(
+                CACHE.os, "read", side_effect=rewrite_between_passes):
+            view = CACHE.registry_view(self.jobs)
+        self.assertEqual(view.lines[0].split("\t")[1], "done")
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 4)
+        self.assertEqual(CACHE.metrics_snapshot()["bytes_read"], len(old) + 3 * len(new))
+
+    def test_permanently_unstable_observation_invalidates_cached_view(self):
+        old = b"attempt\topen\t/repo\t/wt\tworker\tf=1\n"
+        new = b"attempt\tdone\t/repo\t/wt\tworker\tf=1\n"
+        self.assertEqual(len(old), len(new))
+        self.jobs.write_bytes(old)
+        cached = CACHE.registry_view(self.jobs)
+        real_read = os.read
+        flip = [False]
+
+        def rewrite_after_each_nonempty_read(fd, size):
+            data = real_read(fd, size)
+            if data:
+                flip[0] = not flip[0]
+                self.jobs.write_bytes(new if flip[0] else old)
+            return data
+
+        signature = lambda info: (info.st_dev, 343434, info.st_size, 5, 6)
+        with (mock.patch.object(CACHE, "_stat_signature", side_effect=signature),
+              mock.patch.object(CACHE.os, "read",
+                                side_effect=rewrite_after_each_nonempty_read)):
+            with self.assertRaises(OSError):
+                CACHE.registry_view(self.jobs)
+        self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
+        recovered = CACHE.registry_view(self.jobs)
+        self.assertIsNot(cached, recovered)
+        self.assertEqual(recovered.lines[0].split("\t")[1], "open")
+
+    def test_validation_byte_metrics_match_independent_os_read_spy(self):
+        content = b"attempt\topen\t/repo\t/wt\tworker\tf=1\n"
+        self.jobs.write_bytes(content)
+        real_read = os.read
+        total = [0]
+
+        def counted_read(fd, size):
+            data = real_read(fd, size)
+            total[0] += len(data)
+            return data
+
+        with mock.patch.object(CACHE.os, "read", side_effect=counted_read):
+            CACHE.registry_view(self.jobs)
+        metrics = CACHE.metrics_snapshot()
+        self.assertEqual(metrics["content_reads"], 2)
+        self.assertEqual(metrics["bytes_read"], total[0])
+        self.assertEqual(total[0], len(content) * 2)
+
+    def test_symlink_alias_retarget_drops_old_alias_generation(self):
+        alias = Path(self.tmp.name) / "jobs-retarget.log"
+        other = Path(self.tmp.name) / "other-target.log"
+        self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
+        other.write_text("x\tb\tc\td\te\tf=2\n", encoding="utf-8")
+        alias.symlink_to(self.jobs)
+        first = CACHE.registry_view(alias)
+        alias.unlink()
+        alias.symlink_to(other)
+        second = CACHE.registry_view(alias)
+        self.assertIsNot(first, second)
+        self.assertEqual(second.lines[0].split("\t", 1)[0], "x")
+        self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 1)
+
+    def test_genuine_append_keeps_prior_segment_identity(self):
+        self.jobs.write_text("a\topen\t/repo\t/wt\tworker\tf=1\n", encoding="utf-8")
+        first = CACHE.registry_view(self.jobs, append_only=True)
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write("b\topen\t/repo\t/wt\tworker\tf=2\n")
+        second = CACHE.registry_view(self.jobs, append_only=True)
+        self.assertIs(first._segments[0], second._segments[0])
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["metadata_rows_parsed"], 2)
 
     def test_replaced_file_same_mtime_is_still_distinguished_by_size(self):
         # A same-second rewrite with a different byte count must not be

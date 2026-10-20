@@ -36,7 +36,7 @@ class PeerReadContextTest(unittest.TestCase):
         self.assertEqual(second.attempt_id, "att-b")
         self.assertEqual(again.raw, first.raw)
         metrics = CACHE.metrics_snapshot()
-        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["content_reads"], 2)
         self.assertEqual(metrics["full_metadata_parses"], 1)
 
     def test_unrelated_invalid_schema_is_ignored_and_exact_invalid_schema_fails(self):

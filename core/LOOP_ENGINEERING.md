@@ -156,15 +156,22 @@ blocking or its identity becomes uncertain. An unrelated pane event alone
 must not restart the native readiness probes while completion is impossible.
 
 Long-lived observers may retain a bounded projection of an immutable result
-while every file generation it depended on remains current. The projection
-must name those dependencies, and a missing, unreadable, retargeted, or
-unstable input discards the prior result instead of turning it into authority.
-Mutable writer documents stay separate from historical read projections.
-Append-only reuse is limited to a continuously observed file whose supported
-writer appends records; a partial byte tail remains data, not a row, until its
-newline arrives. Replacements and uncertain writes rebuild the view. Reusing
-parsed bytes avoids I/O; reusing derived decisions additionally requires
-unchanged dependencies, while live recipients, leases, claims, processes, and
+while every file generation it depended on remains current. File metadata is a
+candidate-generation hint, not proof that the bytes are unchanged: reuse a
+parsed view only after observing stable current bytes and confirming equality
+with the cached content. This validation reads the file even when parsing and
+index construction can be reused, and its I/O belongs in read-cost metrics.
+The projection must name its dependencies, and a missing, unreadable,
+retargeted, or unstable input discards the prior result instead of turning it
+into authority. Mutable writer documents stay separate from historical read
+projections. Append-only reuse is limited to a continuously observed file
+whose supported writer appends records. After stable current bytes are read,
+compare the entire cached prefix before reusing prior segments and indexes; a
+changed prefix or uncertain write rebuilds the view. A partial byte tail
+remains data, not a row, until its newline arrives. Reusing parsed segments
+avoids reparsing unchanged rows, while content validation still incurs I/O.
+Reusing derived decisions additionally requires unchanged dependencies, while
+live recipients, leases, claims, processes, and
 state transitions remain fresh observations.
 
 Documentation explains behavior and preserves the reasons for decisions. Do not

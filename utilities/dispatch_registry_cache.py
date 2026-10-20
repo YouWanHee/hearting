@@ -36,6 +36,7 @@ _METRICS = {
     "bytes_read": 0,
     "delta_reads": 0,
     "delta_bytes_read": 0,
+    "append_reuses": 0,
     "full_metadata_parses": 0,
     "metadata_rows_parsed": 0,
     "invalidations": 0,
@@ -236,7 +237,7 @@ class _RegistrySegment:
 class RegistryView:
     """Immutable segmented registry view with incremental append indexes."""
 
-    __slots__ = ("path_identity", "resolved_path", "signature", "_segments", "_tail",
+    __slots__ = ("path_identity", "resolved_path", "signature", "_raw", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
                  "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
                  "has_invalid_utf8")
@@ -246,6 +247,7 @@ class RegistryView:
         self.path_identity = path_identity
         self.resolved_path = resolved_path
         self.signature = signature
+        self._raw = raw if previous is None else previous._raw + raw
         self.last_observed_at = time.monotonic()
         self._has_duplicate_attempts = None
         if previous is None:
@@ -260,8 +262,8 @@ class RegistryView:
             self._tail = tail
             self.line_count = len(complete) + (1 if tail else 0)
         else:
-            # The caller supplied only bytes appended to a continuously observed,
-            # trusted append-only registry. Rejoin its pending UTF-8 byte tail.
+            # The caller proved the entire old prefix unchanged before supplying
+            # only its appended bytes. Rejoin the pending UTF-8 byte tail.
             combined = previous._tail + raw
             invalid_utf8, incomplete_utf8 = _utf8_status(combined)
             self._invalid_utf8_prefix = previous._invalid_utf8_prefix or invalid_utf8
@@ -435,7 +437,13 @@ class RegistryView:
         return tuple(result)
 
 
-def _stable_read(path: Path, path_identity: str, *, start: int = 0):
+def _stable_read(path: Path, path_identity: str):
+    """Read two equal full snapshots from one stable descriptor.
+
+    Metadata brackets the reads, but content equality is the evidence that a
+    stat collision did not hide an in-place rewrite. Metrics count every read
+    pass and byte, including partial reads from observations that are retried.
+    """
     last_error = None
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     for _attempt in range(_RETRIES):
@@ -448,19 +456,22 @@ def _stable_read(path: Path, path_identity: str, *, start: int = 0):
             before_signature = _stat_signature(path_before)
             if _stat_signature(fd_before) != before_signature:
                 raise OSError("registry changed before read")
-            if start < 0 or start > before_signature[2]:
-                raise OSError("registry append boundary changed")
-            if start:
-                os.lseek(fd, start, os.SEEK_SET)
-
-            chunks = []
-            size = 0
-            while True:
-                chunk = os.read(fd, _CHUNK_SIZE)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
+            snapshots = []
+            for _pass in range(2):
+                os.lseek(fd, 0, os.SEEK_SET)
+                chunks = []
+                size = 0
+                _METRICS["content_reads"] += 1
+                while True:
+                    chunk = os.read(fd, _CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    _METRICS["bytes_read"] += len(chunk)
+                if size != before_signature[2]:
+                    raise OSError("registry size changed during read")
+                snapshots.append(b"".join(chunks))
 
             fd_after = os.fstat(fd)
             path_after = path.stat()
@@ -469,10 +480,10 @@ def _stable_read(path: Path, path_identity: str, *, start: int = 0):
             if (resolved_before != resolved_after
                     or before_signature != _stat_signature(fd_after)
                     or before_signature != after_signature
-                    or size != before_signature[2] - start):
+                    or snapshots[0] != snapshots[1]):
                 raise OSError("registry changed during read")
-            return resolved_after, after_signature, b"".join(chunks)
-        except OSError as exc:
+            return resolved_after, after_signature, snapshots[1]
+        except (OSError, RuntimeError, ValueError) as exc:
             last_error = exc
         finally:
             if fd is not None:
@@ -515,38 +526,14 @@ def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str
 
 
 def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
-    """Read one full stable generation into its view and its plain text lines.
+    """Pin a content-validated view and the plain text lines of those same bytes.
 
-    The lines equal ``read_text(errors="replace").splitlines()`` of the same bytes;
-    the view's LF-segmented lines do not promise that for other line separators.
-    The view is the cached one when that generation is already cached.
+    Both scoped and unscoped observations share the content proof. The lines
+    equal ``read_text(errors="replace").splitlines()``; the view's LF-segmented
+    lines do not promise that for other line separators.
     """
-    identity = str(path.absolute())
-    with _LOCK:
-        try:
-            path.resolve(strict=True)  # a missing path fails at once, as in registry_view
-            resolved, signature, raw = _stable_read(path, identity)
-        except OSError:
-            if _drop(identity) is not None:
-                _METRICS["invalidations"] += 1
-            raise
-        _METRICS["content_reads"] += 1
-        _METRICS["bytes_read"] += len(raw)
-        cached = _CACHE.get(identity)
-        if (cached is not None and cached.resolved_path == resolved
-                and cached.signature == signature):
-            _METRICS["cache_hits"] += 1
-            _CACHE.move_to_end(identity)
-            cached.last_observed_at = time.monotonic()
-            view = cached
-        else:
-            _drop(identity)
-            _METRICS["invalidations"] += 1
-            view = RegistryView(identity, resolved, signature, raw)
-            _METRICS["full_metadata_parses"] += 1
-            _METRICS["metadata_rows_parsed"] += view.record_count
-            _remember(identity, view)
-    return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
+    view = _registry_view_fresh(path)
+    return view, tuple(view._raw.decode("utf-8", errors="replace").splitlines())
 
 
 def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
@@ -573,21 +560,17 @@ def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
 
 
 def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryView:
-    """Return the current stable view, rebuilding once when the source generation changes.
+    """Validate full contents before reusing a view or its parsed append prefix.
 
-    A failed or unstable observation invalidates the cached generation; an older
-    successful view is never returned as authority for a missing/unreadable path.
-    ``append_only`` is an assertion by a caller executing the supported dispatch
-    writer protocol: same-inode growth is used as a suffix only on that path.
-    Arbitrary files and direct rewrites must leave it false; stat size alone is
-    not evidence that an arbitrary writer preserved the old prefix.
+    Failed observations drop old authority. Metadata alone cannot distinguish
+    replacement with a recycled inode or an in-place rewrite with coarse clocks.
+    ``append_only`` permits segment reuse only after the entire prefix matches.
     """
     path = Path(jobs)
     identity = str(path.absolute())
     with _LOCK:
         try:
-            resolved = str(path.resolve(strict=True))
-            signature = _stat_signature(path.stat())
+            resolved, signature, raw = _stable_read(path, identity)
         except OSError:
             if _drop(identity) is not None:
                 _METRICS["invalidations"] += 1
@@ -595,41 +578,23 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
 
         cached = _CACHE.get(identity)
         if (cached is not None and cached.resolved_path == resolved
-                and cached.signature == signature):
+                and cached._raw == raw):
             _METRICS["cache_hits"] += 1
             _CACHE.move_to_end(identity)
             cached.last_observed_at = time.monotonic()
             return cached
 
-        can_append = bool(
-            append_only and cached is not None and cached.resolved_path == resolved
-            and cached.signature[:2] == signature[:2]
-            and signature[2] > cached.signature[2]
-            and time.monotonic() - cached.last_observed_at <= _APPEND_OBSERVATION_GAP_SECONDS
-        )
+        previous = None
+        if (append_only and cached is not None and cached.resolved_path == resolved
+                and cached.signature[:2] == signature[:2]
+                and signature[2] > cached.signature[2]
+                and time.monotonic() - cached.last_observed_at <= _APPEND_OBSERVATION_GAP_SECONDS
+                and raw[:len(cached._raw)] == cached._raw):
+            previous = cached
+            raw = raw[len(cached._raw):]
+            _METRICS["append_reuses"] += 1
         _drop(identity)
         _METRICS["invalidations"] += 1
-        previous = None
-        if can_append:
-            try:
-                observed_resolved, observed_signature, raw = _stable_read(
-                    path, identity, start=cached.signature[2]
-                )
-                if (observed_resolved == cached.resolved_path
-                        and observed_signature[:2] == cached.signature[:2]
-                        and observed_signature[2] > cached.signature[2]):
-                    resolved, signature = observed_resolved, observed_signature
-                    previous = cached
-                    _METRICS["delta_reads"] += 1
-                    _METRICS["delta_bytes_read"] += len(raw)
-                else:
-                    resolved, signature, raw = _stable_read(path, identity)
-            except OSError:
-                raise
-        else:
-            resolved, signature, raw = _stable_read(path, identity)
-        _METRICS["content_reads"] += 1
-        _METRICS["bytes_read"] += len(raw)
         view = RegistryView(identity, resolved, signature, raw, previous=previous)
         if previous is None:
             _METRICS["full_metadata_parses"] += 1
@@ -645,19 +610,19 @@ def _drop(identity: str) -> "RegistryView | None":
     global _CACHE_BYTES
     removed = _CACHE.pop(identity, None)
     if removed is not None:
-        _CACHE_BYTES -= removed.signature[2]
+        _CACHE_BYTES -= len(removed._raw)
     return removed
 
 
 def _remember(identity: str, view: RegistryView) -> None:
     """Cache one generation within the existing bounds; the caller holds ``_LOCK``."""
     global _CACHE_BYTES
-    if view.signature[2] <= _CACHE_MAX_BYTES:
+    if len(view._raw) <= _CACHE_MAX_BYTES:
         _CACHE[identity] = view
-        _CACHE_BYTES += view.signature[2]
+        _CACHE_BYTES += len(view._raw)
     while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
         _evicted_identity, evicted = _CACHE.popitem(last=False)
-        _CACHE_BYTES -= evicted.signature[2]
+        _CACHE_BYTES -= len(evicted._raw)
         _METRICS["cache_evictions"] += 1
 
 

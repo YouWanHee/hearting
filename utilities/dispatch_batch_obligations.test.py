@@ -92,7 +92,7 @@ class BatchObligationTest(unittest.TestCase):
             second = {"signature": ()}
             self.assertEqual(obligations.ensure_observers(
                 self.jobs, observer_snapshot=second, settlement_context=context), 0)
-            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2)
             self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                                 for item in first["signature"]))
             self.assertEqual(first["signature"], second["signature"])
@@ -105,7 +105,7 @@ class BatchObligationTest(unittest.TestCase):
             obligations.ensure_observers(
                 self.jobs, observer_snapshot=fourth, settlement_context=context)
 
-        self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
+        self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 6)
         self.assertEqual(settle.call_count, 2)
         self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                             for item in third["signature"]))
@@ -586,7 +586,7 @@ class BatchObligationTest(unittest.TestCase):
              mock.patch("dispatch_completion_join.settle_finished_attempt") as settle:
             obligations._resume_owner_settlements(self.jobs, context=context)
             obligations._resume_owner_settlements(self.jobs, context=context)
-            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 1)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2)
             self.assertEqual(lease.call_count, 2)
             settle.assert_not_called()
 
@@ -594,7 +594,7 @@ class BatchObligationTest(unittest.TestCase):
             with self.jobs.open("a", encoding="utf-8") as handle:
                 handle.write("t\tdone\t/repo\t/wt\tchild\tattempt_id=att-child\n")
             obligations._resume_owner_settlements(self.jobs, context=context)
-            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2)
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 4)
 
             # Lease release is checked even while the registry stamp is stable.
             lease.return_value = False
@@ -602,8 +602,8 @@ class BatchObligationTest(unittest.TestCase):
             settle.assert_called_once()
             obligations._resume_owner_settlements(self.jobs, context=context)
             self.assertEqual(settle.call_count, 2, "an unresolved unowned row stays retryable")
-            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2,
-                             "retryable settlement reuses unchanged registry content")
+            self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 8,
+                             "retryable settlement validates bytes while reusing parsed indexes")
 
     def test_owner_settlement_accepts_valid_literal_replacement_character(self):
         row = self._runtime_owner_row().replace(

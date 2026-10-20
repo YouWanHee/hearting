@@ -469,7 +469,7 @@ class ParentCloseTest(unittest.TestCase):
                                side_effect=AssertionError("full metadata reparse")):
             self.assertFalse(CLOSE.row_requested(child, self.jobs))
         metrics = CACHE.metrics_snapshot()
-        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["content_reads"], 6)
         self.assertEqual(metrics["full_metadata_parses"], 1)
 
     def test_current_incomplete_binding_still_refuses_without_intent(self):
