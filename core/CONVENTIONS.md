@@ -35,8 +35,9 @@ Intensity supplies the default recipe below; an explicit graph selects its stage
 Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using a separate execution with a different declared persona or perspective. Same-harness review is independent (allocation order in §2.1). Further legs retain declared profile and perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
 
 Dispatch depth is portable route topology, not process ancestry, runtime-native
-agent nesting, or proof of registry membership. Dispatch depth 0 is user-facing
-main ownership; dispatch depth 1 owns the capability pipeline; dispatch depth 2
+agent nesting, or proof of registry membership. Dispatch depth 0 covers all
+interactive sessions, including peers and steward sessions; dispatch depth 1 owns
+the capability pipeline; dispatch depth 2
 serves bounded review, perspective, and pipeline-stage nodes. Direct stays inline
 at dispatch depth 0. Quick is semantically one registered-headless one-shot
 conductor at dispatch depth 1 and opens no child node. Its transport/schema
@@ -272,9 +273,7 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
     continuation supervisor is one shared implementation
     (`OPERATIONS §5.12`); exactly-once advance is claim-based and restart-safe,
     and no model sleep loop or arbitrary detached shell substitutes for it.
-16. A steward session never holds launch, gate, write, or approval authority over
-    another root; peer messages are advisory and the ledger is the only record
-    (`OPERATIONS §5.14`).
+16. The steward role and its advisory relation are defined in `OPERATIONS §5.14`.
 17. Registered `code-test` results bind to the effective source subject through
     admission, registration, launch, completion, and downstream gate currency.
     Each content digest keeps its own finite verdict budget across route

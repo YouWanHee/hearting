@@ -109,19 +109,17 @@ hearting run capability-route compose --start --prompt-file <task> \
 ```
 
 Use `--shape direct` only for one atomic, reversible inline change; otherwise
-omit it and let the frame decide. Other shape-free flags are hints. Follow
-decided routes under §0.2.1; person-named stages use
-`--shape staged --graph <stage,…>`.
+omit it and let the frame decide. Other shape-free flags are hints. Follow routes
+under §0.2.1; person-named stages use `--shape staged --graph <stage,…>`.
 
-`hearting` is on PATH. `hearting run <utility>` runs that harness utility from
-`AGENT_HOME` when it is set (dev activation: that checkout), else from the
-installed release. The slug comes from the task. The stream defaults to this
-session's latest one in the artifact root, else this folder's only active one;
-otherwise name it with `--campaign-key` (a folder name or close spelling joins
-that active stream; a refusal lists the keys) or opt out with `--unassigned`.
-The runtime prepares the cycle, picks each leg's harness from live usage within
-the sealed candidates, starts frames and the owner, reuses exact attempts, and
-closes the route and cycle at success or once idle.
+`hearting` is on PATH. `hearting run <utility>` uses `AGENT_HOME` when set (dev
+activation: this checkout), else the installed release. The slug comes from the
+task. The stream defaults to this session's latest artifact-root stream, else
+this folder's only active stream; otherwise use `--campaign-key` (a folder name
+or close spelling joins the stream; refusal lists keys) or `--unassigned`. The
+runtime prepares the cycle, selects each leg's harness from live usage within
+sealed candidates, starts frames and owner, reuses attempts, and closes the
+route and cycle at success or idle.
 
 Follow the receipt. `parent_next=end-turn`: end with no wait, poll or recap;
 a runtime carrier owns it. `parent_next=bounded-wait`: run `parent_next_command`
@@ -138,6 +136,9 @@ Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallb
 --node <node> --start`: route, slug, parent and harness come from the owner's
 current route and environment, and a member of a sealed parallel group starts
 its whole group in one batch. Dispatch depth 3 is forbidden.
+
+Use this session's route by default; start an interactive peer for long work
+needing human answers or recovery.
 
 Message another session only with `hearting run peer-steward prompt
 <name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
