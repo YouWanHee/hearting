@@ -2398,7 +2398,16 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(json.loads((self.watch_root / f"{watch_id}.json").read_text())["target"],
                          "peer-a")
         self._release()
-        self.assertEqual(self._wait_for_receipt(watch_id)["target"], "peer-a")
+        deadline = time.monotonic() + 10
+        observation = self._wait_for_observation(watch_id)
+        while ((observation.get("native_wait") or {}).get("state") != "result"
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+            observation = peer_steward._read_json(
+                self.watch_root / f"{watch_id}.observation.json") or {}
+        self.assertEqual((observation.get("native_wait") or {}).get("agent_state"), "idle")
+        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists(),
+                         "without a shared endpoint projection, the accepted watch stays pending")
 
     def test_concurrent_alias_registration_is_serialized_to_one_arm(self):
         env = self._env("held")
@@ -9637,12 +9646,19 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                                "socket_path_for_endpoint", return_value="/tmp/herdr.sock"), \
                 mock.patch.object(peer_steward.peer_obligations, "ObligationStore"), \
                 mock.patch.object(peer_steward.shared_readiness, "target_result",
-                                  return_value={"state": "ready", "reason": "native-turn-ready"}), \
-                mock.patch.object(peer_steward, "_pane_readiness", return_value=ready) as fresh:
+                                  return_value={"state": "ready", "reason": "native-turn-ready",
+                                                "lineage": {"shell_pid": os.getpid(),
+                                                            "shell_start": start}}), \
+                mock.patch.object(peer_steward, "_retire_target", return_value=(
+                    "idle", {"pane": "w1:p1", "harness": "claude", "session_id": "sid-a"}, 0, "")), \
+                mock.patch.object(peer_steward, "_retire_pane_info", return_value={
+                    "shell_pid": os.getpid()}), \
+                mock.patch.object(peer_steward, "_pane_readiness",
+                                  side_effect=AssertionError("ready consumer rebuilt registry view")):
             observed = peer_steward._watch_shared_readiness(
                 "agent-a", "idle", arm, expected, "server-a")
         self.assertEqual(observed.state, "ready")
-        fresh.assert_called_once()
+        self.assertEqual(dict(observed.identity), dict(ready.identity))
 
     def test_runner_reads_once_for_five_stewards_and_separates_another_pane(self):
         from dispatch_contract import process_start_ticks

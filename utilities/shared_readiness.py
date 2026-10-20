@@ -56,6 +56,26 @@ def target_identity(*, server, endpoint, pane, harness, session_id,
             "native_state": native_state, "purpose": purpose}
 
 
+def legacy_target_identity(*, server, endpoint, pane, harness, session_id,
+                           native_state, purpose="completion"):
+    """Key an accepted pre-birth watch until the runner proves current lineage.
+
+    This identity deliberately contains no process birth. The runner must attach
+    a current ``lineage`` to every projection, and consumers validate that
+    lineage against the live endpoint before accepting ready.
+    """
+    values = (server, endpoint, pane, harness, native_state, purpose)
+    if (any(not isinstance(value, str) or not value for value in values)
+            or not isinstance(session_id, str)
+            or pane == "-" or harness not in {"claude", "codex", "opencode"}
+            or native_state not in {"idle", "done"}):
+        return None
+    return {"server": server, "endpoint": endpoint, "pane": pane,
+            "harness": harness, "session_id": session_id,
+            "shell_pid": None, "shell_start": "",
+            "native_state": native_state, "purpose": purpose}
+
+
 def _target_path(root, identity):
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     name = hashlib.sha256(encoded).hexdigest() + ".json"
@@ -158,7 +178,8 @@ def wake_runner(root):
 
 
 def publish_target_projection(root, identity, result, *, producer_pid,
-                              producer_start, incarnation, generation=None, now=None):
+                              producer_start, incarnation, generation=None,
+                              lineage=None, now=None):
     """Atomically publish readiness once for one exact pane/session/birth."""
     state = result.get("state", "unknown") if isinstance(result, dict) else "unknown"
     reason = result.get("reason", "") if isinstance(result, dict) else "invalid-readiness"
@@ -170,11 +191,20 @@ def publish_target_projection(root, identity, result, *, producer_pid,
              "observed_at": time.time() if now is None else float(now),
              "generation": generation,
              "result": {"state": state, "reason": reason if isinstance(reason, str) else ""}}
+    if isinstance(lineage, dict):
+        try:
+            pid = int(lineage.get("shell_pid"))
+            start = str(lineage.get("shell_start") or "")
+            if pid > 0 and start:
+                value["lineage"] = {"shell_pid": pid, "shell_start": start}
+        except (TypeError, ValueError):
+            pass
     path = _target_path(root, identity)
     previous = _read_json(path)
     changed = not (previous and previous.get("identity") == identity
                    and previous.get("producer") == value["producer"]
                    and previous.get("generation") == generation
+                   and previous.get("lineage") == value.get("lineage")
                    and previous.get("result") == value["result"])
     _atomic_json(path, value)
     projections = [candidate for candidate in path.parent.glob("[0-9a-f]*.json")
@@ -210,12 +240,6 @@ def target_result(root, identity, *, now=None, max_age=MAX_AGE_SECONDS):
     """Read a current target projection; missing or stale data stays unknown."""
     if not isinstance(identity, dict):
         return None
-    try:
-        from dispatch_contract import process_start_ticks
-        if str(process_start_ticks(int(identity.get("shell_pid"))) or "") != str(identity.get("shell_start")):
-            return None
-    except (ImportError, OSError, TypeError, ValueError):
-        return None
     value = _read_json(_target_path(root, identity))
     if (not value or value.get("schema_version") != SCHEMA_VERSION
             or value.get("identity") != identity):
@@ -235,7 +259,21 @@ def target_result(root, identity, *, now=None, max_age=MAX_AGE_SECONDS):
     result = value.get("result")
     if not isinstance(result, dict) or result.get("state") not in {"ready", "pending", "unknown"}:
         return None
-    return result
+    lineage = value.get("lineage")
+    pid = identity.get("shell_pid")
+    start = identity.get("shell_start")
+    if pid is None:
+        if not isinstance(lineage, dict):
+            return None
+        pid, start = lineage.get("shell_pid"), lineage.get("shell_start")
+    try:
+        from dispatch_contract import process_start_ticks
+        if (int(pid) <= 0 or not start
+                or str(process_start_ticks(int(pid)) or "") != str(start)):
+            return None
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    return {**result, **({"lineage": lineage} if isinstance(lineage, dict) else {})}
 
 
 def consumer_is_current(identity):

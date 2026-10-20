@@ -1615,10 +1615,13 @@ def _retire_process_record(pid):
         return None
 
 
-def _retire_pane_info(pane, timeout=5):
+def _retire_pane_info(pane, timeout=5, *, server=None):
     try:
-        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
-                              capture_output=True, text=True, timeout=timeout)
+        argv = (_herdr_argv("pane", "process-info", "--pane", pane) if server is None else
+                ["herdr"] + ([] if server == "default" else ["--session", server])
+                + ["pane", "process-info", "--pane", pane])
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              env=_herdr_env_for_server(server) if server is not None else None)
         payload = json.loads(proc.stdout or "")
         result = payload.get("result") if isinstance(payload, dict) else None
         info = result.get("process_info") if isinstance(result, dict) else None
@@ -5054,7 +5057,8 @@ def _bottom_form_tokens(target, window=15):
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
                     purpose="completion", target_observation=None, pane_info=None,
-                    native_session_id=None, registry_append_only=False, read_context=None):
+                    native_session_id=None, registry_append_only=False, read_context=None,
+                    server=None):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session, and for a Codex TUI
@@ -5083,7 +5087,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         native_turn = observed_state
         if native_session_id is not None:
             native_source = "native-foreground-identity"
-        native_ident = {"server": _HERDR_SESSION or "default",
+        native_ident = {"server": server or _HERDR_SESSION or "default",
                         "pane": pane, "harness": harness, "session_id": sid}
         native = (_native_opencode_turn(native_ident) if native_session_id is None else
                   _native_opencode_turn(native_ident, foreground=foreground)
@@ -5118,7 +5122,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
                                     registry_append_only=(registry_append_only or bool(
                                         read_context and read_context.registry_append_only))))
         return peer_obligations.pane_readiness(
-            server=_HERDR_SESSION or "default", pane=pane or "",
+            server=server or _HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
             identity_verified=exact, native_turn=native_turn,
             bound_work=bound, bindings_state=binding_state,
@@ -5128,23 +5132,17 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         )
     except Exception:
         return peer_obligations.pane_readiness(
-            server=_HERDR_SESSION or "default", pane="", harness="",
+            server=server or _HERDR_SESSION or "default", pane="", harness="",
             session_id="", pid_birth="", identity_verified=False,
             native_turn="unknown", bindings_state="unknown",
             provenance=(("target", target),))
 
 
 def _watch_shared_readiness(target, native_state, arm, expected, server):
-    """Consume the runner's projection; freshly verify only a candidate ready result."""
+    """Consume the runner's small result and recheck only current target lineage."""
     identity = _watch_readiness_identity(arm, native_state)
     if identity is None:
-        # Pre-projection watch records have no stored shell birth. Preserve the
-        # existing one-shot observation so those accepted duties can still
-        # settle; new arms always persist pane_identity and use the shared path.
-        return _pane_readiness(
-            target, native_state, expected_harness=expected["harness"],
-            expected_sid=expected["session_id"], expected_pane=expected["pane"],
-            registry_append_only=True)
+        return SimpleNamespace(state="unknown", reason="shared-readiness-identity-unavailable")
     try:
         result = shared_readiness.target_result(
             peer_obligations.ObligationStore().root, identity)
@@ -5152,23 +5150,41 @@ def _watch_shared_readiness(target, native_state, arm, expected, server):
         result = None
     if result is None:
         return SimpleNamespace(state="unknown", reason="shared-readiness-unavailable")
-    if result.get("state") != "ready":
-        return SimpleNamespace(state=result.get("state", "unknown"),
-                               reason=result.get("reason", "shared-readiness-pending"))
-    readiness = _pane_readiness(
-        target, native_state,
-        expected_harness=expected["harness"],
-        expected_sid=expected["session_id"],
-        expected_pane=expected["pane"], registry_append_only=True)
-    current = dict(readiness.identity)
-    shell_birth = f"{identity['shell_pid']}:{identity['shell_start']}"
-    expected_sid = "" if expected.get("session_id") == "-" else expected.get("session_id", "")
-    if (current.get("server") != server or current.get("pane") != identity["pane"]
-            or current.get("harness") != identity["harness"]
-            or current.get("session_id", "") != expected_sid
-            or current.get("pid_birth") != shell_birth):
+    state = result.get("state", "unknown")
+    reason = result.get("reason", "shared-readiness-pending")
+    if state != "ready":
+        return SimpleNamespace(state=state, reason=reason)
+    lineage = result.get("lineage")
+    if not isinstance(lineage, dict):
+        lineage = {"shell_pid": identity.get("shell_pid"),
+                   "shell_start": identity.get("shell_start")}
+    try:
+        observed_state, current, _code, _detail = _retire_target(target)
+        pane_info = _retire_pane_info(identity["pane"], server=server)
+        shell_pid = int(lineage.get("shell_pid"))
+        shell_start = str(lineage.get("shell_start") or "")
+        current_pid = int(pane_info.get("shell_pid")) if isinstance(pane_info, dict) else 0
+        current_start = str(_proc_start_ticks(current_pid) or "") if current_pid else ""
+    except (OSError, TypeError, ValueError):
+        return SimpleNamespace(state="unknown", reason="shared-readiness-lineage-unavailable")
+    current_sid = (current.get("session_id") or "") if isinstance(current, dict) else ""
+    if current_sid == "-":
+        current_sid = ""
+    expected_sid = identity.get("session_id", "")
+    if (observed_state not in {"idle", "done"}
+            or not isinstance(current, dict)
+            or current.get("pane") != identity.get("pane")
+            or current.get("harness") != identity.get("harness")
+            or current_sid != expected_sid
+            or shell_pid != current_pid or shell_start != current_start):
         return SimpleNamespace(state="unknown", reason="shared-readiness-identity-changed")
-    return readiness
+    current_identity = {
+        "server": server, "pane": identity["pane"],
+        "harness": identity["harness"], "session_id": current_sid,
+        "pid_birth": f"{current_pid}:{current_start}",
+    }
+    return SimpleNamespace(state="ready", reason=reason,
+                           identity=tuple(current_identity.items()))
 
 
 _FLUSH_MAX_ROWS = 4
@@ -6251,12 +6267,18 @@ def _watch_readiness_identity(arm, native_state):
     endpoint = herdr_observation.socket_path_for_endpoint(server)
     if not endpoint:
         return None
-    return shared_readiness.target_identity(
+    identity = shared_readiness.target_identity(
         server=server, endpoint=str(endpoint), pane=agent.get("pane"),
         harness=agent.get("harness"), session_id="" if session_id == "-" else session_id,
         shell_pid=pane_identity.get("shell_pid"),
         shell_start=pane_identity.get("shell_start"), native_state=native_state,
         purpose="completion")
+    if identity is not None:
+        return identity
+    return shared_readiness.legacy_target_identity(
+        server=server, endpoint=str(endpoint), pane=agent.get("pane"),
+        harness=agent.get("harness"), session_id="" if session_id == "-" else session_id,
+        native_state=native_state, purpose="completion")
 
 
 def _watch_readiness_pending(snapshot):
@@ -6277,7 +6299,6 @@ def _watch_readiness_pending(snapshot):
 
 def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
     """Share one post-native-result pane read across matching detached watches."""
-    global _HERDR_SESSION
     root = snapshot.get("watch_root") if isinstance(snapshot, dict) else None
     entries = snapshot.get("watches") if isinstance(snapshot, dict) else None
     if root is None or entries is None:
@@ -6297,7 +6318,9 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         identity = _watch_readiness_identity(arm, native.get("agent_state"))
         if identity is None:
             continue
-        key = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        target_key = {key: value for key, value in identity.items()
+                      if key not in {"shell_pid", "shell_start"}}
+        key = json.dumps(target_key, sort_keys=True, separators=(",", ":"))
         groups.setdefault(key, []).append((watch_id, arm, identity, native.get("agent_state")))
 
     if not groups:
@@ -6314,71 +6337,81 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             _RUNNER_READINESS_TRANSPORTS.pop(key, None)
     producer_start = process_start_ticks(os.getpid()) or ""
     jobs = store.root.parents[1] / "jobs.log"
-    previous_server = _HERDR_SESSION
-    try:
-        views_by_server = {}
-        for requests in groups.values():
-            _watch_id, arm, identity, native_state = requests[0]
-            server = identity["server"]
-            _HERDR_SESSION = None if server == "default" else server
-            agent = arm.get("agent") or {}
-            target = arm.get("target") or agent.get("name") or ""
-            reason = "shared-readiness-unavailable"
-            readiness_state = "unknown"
-            generation = None
-            try:
-                if server not in views_by_server:
-                    transport = _runner_readiness_transport(server)
-                    views_by_server[server] = transport.observe() if transport is not None else None
-                observed_state, observed_ident, _code, _reason = _target_from_readiness_view(
-                    views_by_server[server], target)
-                pane_info = _retire_pane_info(identity["pane"])
-                shell_start = (_proc_start_ticks(pane_info.get("shell_pid"))
-                               if isinstance(pane_info, dict) else None)
-                if (observed_state not in {"unknown", "herdr-unavailable", "agent-not-found"}
-                        and observed_ident.get("pane") == identity["pane"]
-                        and observed_ident.get("harness") == identity["harness"]
-                        and (observed_ident.get("session_id") or "") == identity["session_id"]
-                        and isinstance(pane_info, dict)
-                        and int(pane_info.get("shell_pid", 0)) == identity["shell_pid"]
-                        and str(shell_start or "") == identity["shell_start"]):
-                    readiness = _pane_readiness(
-                        target, native_state,
-                        expected_harness=identity["harness"],
-                        expected_sid=identity["session_id"] or "-",
-                        expected_pane=identity["pane"],
-                        target_observation=(observed_state, observed_ident),
-                        pane_info=pane_info, registry_append_only=True,
-                        read_context=read_context)
-                    readiness_identity = dict(readiness.identity)
-                    if (readiness_identity.get("server") == identity["server"]
-                            and readiness_identity.get("pane") == identity["pane"]
-                            and readiness_identity.get("harness") == identity["harness"]
-                            and readiness_identity.get("session_id", "") == identity["session_id"]
-                            and readiness_identity.get("pid_birth") ==
-                                f"{identity['shell_pid']}:{identity['shell_start']}"):
-                        readiness_state, reason = readiness.state, readiness.reason
-                    else:
-                        reason = "shared-readiness-identity-changed"
+    views_by_server = {}
+    for requests in groups.values():
+        _watch_id, arm, identity, native_state = requests[0]
+        server = identity["server"]
+        agent = arm.get("agent") or {}
+        target = arm.get("target") or agent.get("name") or ""
+        reason = "shared-readiness-unavailable"
+        readiness_state = "unknown"
+        generation = None
+        lineage = None
+        try:
+            if server not in views_by_server:
+                transport = _runner_readiness_transport(server)
+                views_by_server[server] = transport.observe() if transport is not None else None
+            observed_state, observed_ident, _code, _reason = _target_from_readiness_view(
+                views_by_server[server], target)
+            pane_info = _retire_pane_info(identity["pane"], server=server)
+            shell_pid = (int(pane_info.get("shell_pid", 0))
+                         if isinstance(pane_info, dict) else 0)
+            shell_start = _proc_start_ticks(shell_pid) if shell_pid > 0 else None
+            lineage = ({"shell_pid": shell_pid, "shell_start": str(shell_start)}
+                       if shell_pid > 0 and shell_start else None)
+            if (observed_state not in {"unknown", "herdr-unavailable", "agent-not-found"}
+                    and observed_ident.get("pane") == identity["pane"]
+                    and observed_ident.get("harness") == identity["harness"]
+                    and (observed_ident.get("session_id") or "") == identity["session_id"]
+                    and isinstance(pane_info, dict) and lineage is not None):
+                readiness = _pane_readiness(
+                    target, native_state,
+                    expected_harness=identity["harness"],
+                    expected_sid=identity["session_id"] or "-",
+                    expected_pane=identity["pane"],
+                    target_observation=(observed_state, observed_ident),
+                    pane_info=pane_info, registry_append_only=True,
+                    read_context=read_context, server=server)
+                readiness_identity = dict(readiness.identity)
+                if (readiness_identity.get("server") == identity["server"]
+                        and readiness_identity.get("pane") == identity["pane"]
+                        and readiness_identity.get("harness") == identity["harness"]
+                        and readiness_identity.get("session_id", "") == identity["session_id"]
+                        and readiness_identity.get("pid_birth") ==
+                            f"{shell_pid}:{shell_start}"):
+                    readiness_state, reason = readiness.state, readiness.reason
                 else:
-                    reason = "shared-readiness-identity-unverified"
-                view = read_context.registry_view(jobs, append_only=True)
-                if view is not None:
-                    generation = {"path": str(jobs), "resolved": view.resolved_path,
-                                  "signature": list(view.signature)}
-                else:
-                    readiness_state, reason = "unknown", "registry-missing"
-            except (OSError, TypeError, ValueError):
-                readiness_state, reason = "unknown", "shared-readiness-observation-failed"
+                    reason = "shared-readiness-identity-changed"
+            else:
+                reason = "shared-readiness-identity-unverified"
+            view = read_context.registry_view(jobs, append_only=True)
+            if view is not None:
+                generation = {"path": str(jobs), "resolved": view.resolved_path,
+                              "signature": list(view.signature)}
+            else:
+                readiness_state, reason = "unknown", "registry-missing"
+        except (OSError, TypeError, ValueError):
+            readiness_state, reason = "unknown", "shared-readiness-observation-failed"
+
+        by_identity = {}
+        for watch_id, watch_arm, watch_identity, _watch_state in requests:
+            key = json.dumps(watch_identity, sort_keys=True, separators=(",", ":"))
+            by_identity.setdefault(key, (watch_identity, []))[1].append((watch_id, watch_arm))
+        for watch_identity, consumers in by_identity.values():
+            projection_state, projection_reason = readiness_state, reason
+            expected_pid = watch_identity.get("shell_pid")
+            if (expected_pid is not None
+                    and (lineage is None or int(expected_pid) != lineage["shell_pid"]
+                         or str(watch_identity.get("shell_start")) != lineage["shell_start"])):
+                projection_state, projection_reason = "unknown", "shared-readiness-identity-changed"
             changed = shared_readiness.publish_target_projection(
-                store.root, identity, {"state": readiness_state, "reason": reason},
+                store.root, watch_identity,
+                {"state": projection_state, "reason": projection_reason},
                 producer_pid=os.getpid(), producer_start=producer_start,
-                incarnation=incarnation, generation=generation)
+                incarnation=incarnation, generation=generation, lineage=lineage)
             if changed:
-                for _watch_id, watch_arm, _identity, _state in requests:
+                for _watch_id, watch_arm in consumers:
                     _wake_watch_observer(watch_arm)
-    finally:
-        _HERDR_SESSION = previous_server
     return True
 
 
