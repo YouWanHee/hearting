@@ -10937,6 +10937,28 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
                              and (row.get("delivery") or {}).get("receipt") == self.watch_id]), 1)
         self.assertEqual(wake.call_count, 1)
 
+    def test_missing_initial_projection_ensures_the_existing_runner(self):
+        observation = dict(self.observation)
+        observation.pop("readiness_transition", None)
+        peer_steward._write_json_atomic(self.paths.observation, observation)
+        unavailable = SimpleNamespace(state="unknown", reason="shared-readiness-unavailable")
+        with mock.patch.object(peer_steward, "_watch_readiness_identity",
+                               return_value=self.identity), \
+                mock.patch.object(peer_steward, "_watch_shared_readiness",
+                                  return_value=unavailable), \
+                mock.patch.object(peer_steward.shared_readiness, "wake_runner",
+                                  return_value=False) as wake, \
+                mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                                  return_value=True) as ensure:
+            result = peer_steward._watch_transition_readiness(
+                "target-agent", "idle", self.arm,
+                {"pane": self.pane, "harness": "claude", "session_id": "target-session"},
+                self.server, self.watch_id, self.paths)
+        self.assertEqual((result.state, result.reason),
+                         ("unknown", "shared-readiness-unavailable"))
+        wake.assert_called_once_with(self.store.root)
+        ensure.assert_called_once_with(reconciliation_required=True)
+
     def test_repeated_same_transition_contention_coalesces_runner_wake(self):
         wake_fd = peer_steward.shared_readiness.open_runner_wake(self.store.root)
         try:

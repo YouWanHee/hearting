@@ -5830,6 +5830,15 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
 
     cached = _watch_shared_readiness(target, native_state, arm, expected, server)
     if cached.state != "ready":
+        if cached.reason == "shared-readiness-unavailable":
+            # A fresh native result can be the first accepted readiness duty
+            # in this state root. Start the existing runner so that it can
+            # publish the projection this observer is waiting for.
+            try:
+                shared_readiness.wake_runner(root)
+                peer_obligations.ensure_normal_runner(reconciliation_required=True)
+            except Exception:
+                pass
         return cached
 
     token = os.urandom(16).hex()
