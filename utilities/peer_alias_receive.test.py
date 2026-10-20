@@ -27,6 +27,7 @@ def module(name, path):
 
 
 pm = module("alias_peer_message", "utilities/peer-message.py")
+fixture_processes = module("alias_fixture_processes", "tools/fixture_processes.py")
 
 
 def pinned_source(path):
@@ -39,6 +40,7 @@ class AliasReceive(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(fixture_processes.reap, self.tmp.name)
         self.state = Path(self.tmp.name)
         for path in (self.state / "home", self.state / "xdg", self.state / "xdg-config",
                      self.state / "xdg-data", self.state / "artifacts", self.state / "runtime",
@@ -2369,6 +2371,126 @@ console.log(JSON.stringify({gets, saves}));
         AliasReceive._receive_actual(self, "codex", text)
         self.assertEqual(self.rows(), original)
         self.assertEqual(pm._read_pending(ref)["state"], "received")
+
+
+class AliasReceiveFixtureCleanupBoundaryTest(unittest.TestCase):
+    def _run_probe(self, mode):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is unavailable for the fixture cleanup boundary probe")
+        observations = {}
+        original_cleanup = tempfile.TemporaryDirectory.cleanup
+        writer = (
+            "import os,time\n"
+            "d=os.environ['FIXTURE_DIR']\n"
+            "open(os.path.join(d,'ready'),'w').write(str(os.getpid()))\n"
+            "i=0\n"
+            "while True:\n"
+            "    i+=1; open(os.path.join(d,'write-%d'%i),'w').close(); time.sleep(0.005)\n"
+        )
+        node_source = r'''
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+const child = spawn(process.env.FIXTURE_PYTHON, ["-c", process.env.FIXTURE_WRITER], {
+  env: process.env, detached: true, stdio: "ignore"
+});
+child.unref();
+const ready = `${process.env.FIXTURE_DIR}/ready`;
+const deadline = Date.now() + 10000;
+while (!existsSync(ready) && Date.now() < deadline)
+  await new Promise((resolve) => setTimeout(resolve, 5));
+if (!existsSync(ready)) process.exit(4);
+if (process.env.FIXTURE_HANG_NODE === "1") setInterval(() => {}, 1000);
+'''
+
+        class Probe(AliasReceive):
+            def __init__(self):
+                super().__init__("runTest")
+
+            def _launch_writer(self, *, hang=False):
+                env = {
+                    **os.environ,
+                    "FIXTURE_DIR": str(self.state),
+                    "FIXTURE_PYTHON": sys.executable,
+                    "FIXTURE_WRITER": writer,
+                }
+                if hang:
+                    env["FIXTURE_HANG_NODE"] = "1"
+                return subprocess.run(
+                    [node, "--input-type=module", "-e", node_source],
+                    cwd=ROOT, env=env, text=True, capture_output=True,
+                    timeout=3 if hang else 10,
+                )
+
+            def _record_writer(self):
+                pid = int((self.state / "ready").read_text(encoding="utf-8"))
+                start = fixture_processes._start_ticks(pid)
+                self.assertIsNotNone(start)
+                self.assertNotIn(str(self.state).encode(), Path(f"/proc/{pid}/cmdline").read_bytes())
+                observations.update(root=str(self.state), pid=pid, start=start)
+                self.assertIn(pid, fixture_processes.marked_processes(str(self.state)))
+
+            def setUp(self):
+                super().setUp()
+                if mode != "timeout":
+                    run = self._launch_writer()
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    self._record_writer()
+                if mode == "setup-error":
+                    raise RuntimeError("intentional setup failure after detached writer start")
+
+            def runTest(self):
+                if mode == "timeout":
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        self._launch_writer(hang=True)
+                    self._record_writer()
+                pid = observations["pid"]
+                self.assertIn(pid, fixture_processes.marked_processes(observations["root"]))
+                if mode == "assertion-error":
+                    self.fail("intentional body assertion failure")
+
+        def observe_before_delete(temporary_directory):
+            if temporary_directory.name == observations.get("root"):
+                pid, start = observations["pid"], observations["start"]
+                observations["remaining"] = fixture_processes.marked_processes(temporary_directory.name)
+                observations["gone_before_delete"] = fixture_processes._gone(pid, start)
+                observations["root_present_before_delete"] = Path(temporary_directory.name).is_dir()
+            return original_cleanup(temporary_directory)
+
+        result = unittest.TestResult()
+        with mock.patch.object(tempfile.TemporaryDirectory, "cleanup", observe_before_delete):
+            Probe().run(result)
+        return result, observations
+
+    def _assert_cleanup_evidence(self, observations):
+        self.assertTrue(observations["root_present_before_delete"])
+        self.assertTrue(observations["gone_before_delete"])
+        self.assertEqual(observations["remaining"], {})
+        self.assertFalse(Path(observations["root"]).exists())
+
+    def test_alias_fixture_drains_detached_writer_after_normal_body(self):
+        result, observations = self._run_probe("normal")
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self._assert_cleanup_evidence(observations)
+
+    def test_alias_fixture_preserves_body_assertion_failure_and_drains_writer(self):
+        result, observations = self._run_probe("assertion-error")
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("intentional body assertion failure", result.failures[0][1])
+        self.assertEqual(result.errors, [])
+        self._assert_cleanup_evidence(observations)
+
+    def test_alias_fixture_drains_writer_after_setup_failure(self):
+        result, observations = self._run_probe("setup-error")
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("intentional setup failure", result.errors[0][1])
+        self._assert_cleanup_evidence(observations)
+
+    def test_alias_fixture_drains_writer_after_node_timeout(self):
+        result, observations = self._run_probe("timeout")
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self._assert_cleanup_evidence(observations)
 
 
 if __name__ == "__main__":

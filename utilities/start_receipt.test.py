@@ -11,12 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'utilities'))
 import start_receipt as receipt
 from session_identity import SessionIdentity
+sys.path.insert(0, str(ROOT / 'tools'))
+import fixture_processes
 
 
 class StartReceiptTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(fixture_processes.reap, self.tmp.name)
         self.jobs = Path(self.tmp.name) / 'jobs.log'
         self.result = {'route_id': 'rt-test', 'state': 'running', 'parent_next': 'bounded-wait',
                        'parent_next_command': 'hearting run capability-route start --route rt-test --wait',
