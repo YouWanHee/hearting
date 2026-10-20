@@ -339,6 +339,52 @@ def resource_never_started(run: dict) -> bool:
             and not run.get("launch_controller") and not run.get("launch_argv"))
 
 
+def resource_process_group_quiescent(run: dict) -> bool:
+    """Prove a supervised resource's private process group has no live payloads."""
+    if resource_never_started(run):
+        return True
+    # Older resource rows did not record namespace/process-group bindings.
+    # Keep their existing exact PID/sentinel contract; the stronger group
+    # observation applies wherever the runner recorded the identity it needs.
+    if not run.get("pid_namespace") or run.get("process_group") is None:
+        return True
+    try:
+        if classify_identity(run)[0] != "exited":
+            return False
+        pid = int(run["pid"])
+        group = int(run["process_group"])
+        if pid <= 0 or group != pid:
+            return False
+        namespace = os.readlink("/proc/self/ns/pid")
+        if run.get("pid_namespace") != namespace:
+            return False
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                info = process.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if info.st_uid != os.getuid():
+                continue
+            try:
+                raw = (process / "stat").read_text(encoding="utf-8")
+                fields = raw.rsplit(") ", 1)[1].split()
+                process_group = int(fields[2])
+                process_state = fields[0]
+            except FileNotFoundError:
+                continue
+            except (OSError, IndexError, ValueError):
+                return False
+            if process_group == group and process_state != "Z":
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+
+
 def is_alive(run: dict, identity_reader=proc_identity) -> bool:
     return classify_identity(run, identity_reader=identity_reader)[0] == "working"
 

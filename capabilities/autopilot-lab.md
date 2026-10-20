@@ -148,9 +148,16 @@ remain required.
 
 The `setup` stage graph is `scaffold → smoke → full-run → run-verify → handoff`.
 `full-run` is a detached resource run, so it declares the `supervised`
-continuation and can never be the workflow terminal: the continuation supervisor
-observes its exact termination and advances to `run-verify`, and only `handoff`
-is terminal. `handoff`'s gate is satisfied by *recording the successor* — a
+continuation and can never be the workflow terminal. A successful resource exit
+is delivered to the same owner as execution evidence; polling does not complete
+the logical `full-run` stage or claim `run-verify`, even when `run.json` and
+other declared outputs already exist. The owner may continue with another
+approved resource in `full-run`. After the owner finishes the approved scope,
+its existing `start` of `run-verify` passes through the shared admission gate,
+which rechecks the live owner, exact resource result, pending corrections, and
+declared outputs before completing the stage and claiming `run-verify` once.
+There is no separate close command or proof input. Only `handoff` is terminal.
+`handoff`'s gate is satisfied by *recording the successor* — a
 registered evaluation route or attempt, or an explicit human gate — so a run that
 finishes with "evaluate it later" written in prose is not complete. The
 `full-run` carries `start_approval: full-run`; the route card obtains approval
@@ -223,7 +230,10 @@ nothing found leaves the route as before.
 `autopilot-code` and `autopilot-lab` routes, so a code route can run training
 or a benchmark without leaving its cycle. The resource runner's conditions are
 unchanged: a verified route, a hash-bound smoke attestation, config-manifest
-provenance, the governor, and the `supervised` continuation. `full-run` carries
+provenance, the governor, and the `supervised` continuation. The detached
+resource's exit is not stage completion; the owner's ordinary successor start
+completes the resource stage after its evidence is rechecked. The same rule
+applies when code borrows `full-run`. `full-run` carries
 the declared mark `start_approval: full-run`; it is data for the route card and
 the frame catalog, not a gate.
 
