@@ -217,10 +217,27 @@ class AttemptViewTests(unittest.TestCase):
                       "\x1b]unterminated", "\x1b[31unterminated", "\x00\r\x7f"):
             clean = view.sanitize(value)
             self.assertFalse(re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", clean))
-        for value in ("https://name:secret@example.test", "BEARER abc123", "Bearer \x1b[31msecret"):
+        for value in (
+            "https://name:secret@example.test/path",
+            "https://token@example.test/path",
+            "ssh://token@example.test/path",
+            "git+https://name:secret@example.test/path",
+            "contact person@example.test",
+            "aUtHoRiZaTiOn: bEaReR abc123",
+            "https://token-se\x1b[31mcret@example.test/path",
+        ):
             clean = view.sanitize(value)
-            self.assertNotRegex(clean, r"https?://[^\s/@]+:[^\s/@]+@")
             self.assertNotRegex(clean, r"(?i)Bearer\s+(?!\[redacted\])[^\s]+")
+            self.assertNotIn("name:secret", clean)
+            self.assertNotIn("token@", clean)
+            self.assertNotIn("abc123", clean)
+            self.assertNotIn("token-secret", clean)
+        self.assertIn("https://[redacted]@example.test/path", view.sanitize("https://token@example.test/path"))
+        self.assertIn("ssh://[redacted]@example.test/path", view.sanitize("ssh://token@example.test/path"))
+        self.assertIn("git+https://[redacted]@example.test/path", view.sanitize("git+https://name:secret@example.test/path"))
+        self.assertIn("person@example.test", view.sanitize("contact person@example.test"))
+        self.assertIn("bEaReR [redacted]", view.sanitize("bEaReR abc123"))
+        self.assertIn("https://[redacted]@example.test/path", view.sanitize("https://token-se\x1b[31mcret@example.test/path"))
 
     def test_full_presentation_still_sanitizes_and_preserves_assistant_prose(self):
         lines = view.format_record("claude", {"type":"assistant", "message":{"content":[

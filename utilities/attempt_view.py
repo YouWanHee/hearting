@@ -1,10 +1,4 @@
-"""Fleet-independent, read-only owner attempt transcript viewer.
-
-The ANSI and credential sanitizer is adapted from OpenRig v0.6.13
-(commit 9eeb2e42c, packages/tui/src/render.ts:1645-1646, 1671-1675),
-Apache-2.0; see OpenRig-Apache-2.0.txt. Modified for Python, full output,
-OSC/DCS/C1 control sequences, and terminal-safe handling of native records.
-"""
+"""Fleet-independent, read-only owner attempt transcript viewer."""
 from __future__ import annotations
 
 import argparse
@@ -107,8 +101,8 @@ def _registry_rows(root, contains=None, *, force=False):
     return reader.read(contains, force=force)
 
 
-_URL_AUTH = re.compile(r"(https?://)[^\s/@]+:[^\s/@]+@", re.I)
-_BEARER = re.compile(r"\bBearer\s+[^\s]+", re.I)
+_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s@]*@")
+_BEARER_TOKEN = re.compile(r"\b(Bearer)\s+[^\s]+", re.I)
 
 
 def sanitize(value: object) -> str:
@@ -157,8 +151,8 @@ def sanitize(value: object) -> str:
         out.append(" " if text[i] == "\t" else text[i])
         i += 1
     clean = "".join(out)
-    clean = _URL_AUTH.sub(r"\1[redacted]@", clean)
-    return _BEARER.sub("Bearer [redacted]", clean)
+    clean = _URL_USERINFO.sub(r"\1[redacted]@", clean)
+    return _BEARER_TOKEN.sub(r"\1 [redacted]", clean)
 
 
 def _compact(value: object) -> str:
