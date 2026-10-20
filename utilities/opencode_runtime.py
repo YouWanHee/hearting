@@ -30,6 +30,9 @@ MAX_CREDENTIAL_ROWS = 64
 MAX_AUTH_BYTES = 64 * 1024
 MAX_SESSION_MESSAGES = 64
 MAX_MESSAGE_TEXT = 2048
+MAX_SHELL_TASK_PAGE = 64
+MAX_SHELL_TASK_RECENT = 32
+MAX_SHELL_TASK_REFRESH = 64
 
 
 class OpenCodeRuntimeError(RuntimeError):
@@ -885,6 +888,205 @@ def _read_v2_messages(connection, session_id, after_seq=None):
     return messages, max_seq
 
 
+def _read_v2_shell_tasks(connection, session_id, after_seq=0, refresh_seqs=()):
+    """Bounded exact V2 shell-task catch-up plus a mutable recent-row window.
+
+    Assistant shell tool parts and native ``session_message`` shell rows are
+    separate native ID namespaces. Paging covers every row type so unrelated
+    records cannot pin the cursor; exact known mutable sequences are refreshed
+    independently of the recent-row window.
+    """
+    tables = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_message'")}
+    if "session_message" not in tables:
+        return [], {"state": "unknown", "reason": "v2-session-message-table-missing",
+                    "next_seq": after_seq, "caught_up": True, "max_seq": None}
+    columns = _table_columns(connection, "session_message")
+    if not {"session_id", "type", "seq", "data"}.issubset(columns):
+        return [], {"state": "unknown", "reason": "v2-session-message-schema-unsupported",
+                    "next_seq": after_seq, "caught_up": True, "max_seq": None}
+    created_column = '"time_created"' if "time_created" in columns else "NULL"
+    updated_column = '"time_updated"' if "time_updated" in columns else "NULL"
+    maximum = connection.execute(
+        "SELECT MAX(seq) FROM session_message WHERE session_id=?", (session_id,)).fetchone()[0]
+    maximum = maximum if isinstance(maximum, int) and not isinstance(maximum, bool) else None
+    after_seq = after_seq if isinstance(after_seq, int) and not isinstance(after_seq, bool) else 0
+    requested_refresh = []
+    refresh_gap = False
+    try:
+        refresh_values = iter(refresh_seqs or ())
+    except TypeError:
+        refresh_values = iter(())
+    seen_refresh = set()
+    for seq in refresh_values:
+        if (not isinstance(seq, int) or isinstance(seq, bool) or seq < 0
+                or seq in seen_refresh):
+            continue
+        if len(requested_refresh) >= MAX_SHELL_TASK_REFRESH:
+            refresh_gap = True
+            break
+        seen_refresh.add(seq)
+        requested_refresh.append(seq)
+    page = connection.execute(
+        "SELECT type, seq, data, " + created_column + ", " + updated_column + " FROM session_message "
+        "WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
+        (session_id, after_seq, MAX_SHELL_TASK_PAGE),
+    ).fetchall()
+    recent = connection.execute(
+        "SELECT type, seq, data, " + created_column + ", " + updated_column + " FROM session_message "
+        "WHERE session_id=? ORDER BY seq DESC LIMIT ?",
+        (session_id, MAX_SHELL_TASK_RECENT),
+    ).fetchall()
+    refreshed = []
+    if requested_refresh:
+        placeholders = ",".join("?" for _ in requested_refresh)
+        refreshed = connection.execute(
+            "SELECT type, seq, data, " + created_column + ", " + updated_column
+            + " FROM session_message WHERE session_id=? AND seq IN (" + placeholders + ")",
+            [session_id, *requested_refresh],
+        ).fetchall()
+    page = [row for row in page if isinstance(row[1], int) and not isinstance(row[1], bool)]
+    recent = [row for row in recent if isinstance(row[1], int) and not isinstance(row[1], bool)]
+    refreshed = [row for row in refreshed
+                 if isinstance(row[1], int) and not isinstance(row[1], bool)]
+    rows_by_seq = {row[1]: row for row in page}
+    rows_by_seq.update({row[1]: row for row in recent})
+    rows_by_seq.update({row[1]: row for row in refreshed})
+    tasks = {}
+    parse_reasons = []
+    mutable_seqs = set()
+    terminal_statuses = {"exited", "completed", "complete", "failed", "error",
+                         "cancelled", "canceled", "stopped"}
+    for message_type, seq, raw, created, updated in sorted(
+            rows_by_seq.values(), key=lambda row: row[1]):
+        data = _decode_json(raw)
+        if not isinstance(data, dict):
+            parse_reasons.append("session-message-json-invalid")
+            continue
+        if message_type == "shell":
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            background = metadata.get("background") is True
+            status = data.get("status") if isinstance(data.get("status"), str) else None
+            status_key = status.lower() if status else ""
+            if status_key in {"running", "starting", "queued"} or (
+                    background and status_key not in terminal_statuses):
+                mutable_seqs.add(seq)
+            if not background:
+                continue
+            native_id = data.get("shellID")
+            if not isinstance(native_id, str) or not native_id:
+                parse_reasons.append("native-shell-id-unavailable")
+                continue
+            times = data.get("time") if isinstance(data.get("time"), dict) else {}
+            output = data.get("output") if isinstance(data.get("output"), dict) else {}
+            task_key = ("session-message-shellID", native_id)
+            tasks[task_key] = {
+                "native_id": native_id,
+                "native_id_kind": "session-message-shellID",
+                "native_record_kind": "session-message-shell",
+                "name": "shell",
+                "input": {"command": data.get("command"), "background": True},
+                "native_status": status or "unknown",
+                "native_status_source": "session_message.shell.status",
+                "started_at_ms": times.get("created") if times.get("created") is not None
+                else created,
+                "start_source": "session_message.shell.time.created"
+                if times.get("created") is not None else "session_message.time_created",
+                "completed_at_ms": times.get("completed"),
+                "exit_code": data.get("exit") if isinstance(data.get("exit"), int)
+                and not isinstance(data.get("exit"), bool) else None,
+                "native_output_observed": isinstance(data.get("output"), dict),
+                "native_output_cursor": output.get("cursor")
+                if isinstance(output.get("cursor"), int) and not isinstance(output.get("cursor"), bool)
+                and output.get("cursor") >= 0 else None,
+                "native_output_size": output.get("size")
+                if isinstance(output.get("size"), int) and not isinstance(output.get("size"), bool)
+                and output.get("size") >= 0 else None,
+                "native_output_truncated": output.get("truncated")
+                if isinstance(output.get("truncated"), bool) else None,
+                "seq": seq, "time_updated": updated,
+            }
+            continue
+
+        if message_type != "assistant":
+            continue
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "tool" or part.get("name") != "shell":
+                continue
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            inputs = state.get("input") if isinstance(state.get("input"), dict) else None
+            if not isinstance(inputs, dict) or inputs.get("background") is not True:
+                continue
+            invocation_status = state.get("status")
+            if invocation_status in ("streaming", "running"):
+                mutable_seqs.add(seq)
+            times = part.get("time") if isinstance(part.get("time"), dict) else {}
+            native_id = part.get("id") or part.get("callID")
+            if not isinstance(native_id, str) or not native_id:
+                parse_reasons.append("assistant-shell-native-id-unavailable")
+                continue
+            task_key = ("assistant-tool-part", native_id)
+            tasks[task_key] = {
+                "native_id": native_id,
+                "native_id_kind": "assistant-tool-part",
+                "native_record_kind": "assistant-shell-tool-part",
+                "call_id": part.get("callID"),
+                "name": "shell",
+                "input": {"command": inputs.get("command"), "background": True},
+                "invocation_status": invocation_status,
+                "started_at_ms": times.get("ran") or times.get("created") or created,
+                "start_source": "assistant-shell-part.time.ran|created",
+                "invocation_completed_at_ms": times.get("completed"),
+                "seq": seq, "time_updated": updated,
+            }
+    last_page = max((row[1] for row in page), default=after_seq)
+    next_seq = max(after_seq, last_page)
+    caught_up = maximum is None or next_seq >= maximum
+    reason = ("multiple-session-message-observation-gaps" if len(set(parse_reasons)) > 1
+              else parse_reasons[0] if parse_reasons else
+              "pending-row-refresh-limit" if refresh_gap else None)
+    return list(tasks.values()), {"state": "partial" if reason else "observed",
+                                  "reason": reason,
+                                  "reasons": list(dict.fromkeys(parse_reasons +
+                                                   (["pending-row-refresh-limit"] if refresh_gap else []))),
+                                  "next_seq": next_seq, "caught_up": caught_up,
+                                  "max_seq": maximum,
+                                  "mutable_seqs": sorted(mutable_seqs),
+                                  "refreshed_seqs": requested_refresh}
+
+
+def read_session_shell_tasks(connection, session_id: str, *, after_seq: int = 0,
+                             refresh_seqs=()) -> dict:
+    """Read background task evidence from an already-open private DB snapshot."""
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return {"state": "unknown", "reason": "session-id-invalid", "generation": None,
+                "shell_tasks": [], "shell_cursor": {"state": "unknown", "reason": "session-id-invalid"}}
+    try:
+        candidates = _session_generation_rows(connection, session_id)
+        if not candidates:
+            return {"state": "missing", "reason": "exact-session-not-found", "generation": None,
+                    "shell_tasks": [], "shell_cursor": {"state": "missing", "reason": "exact-session-not-found",
+                                                             "caught_up": True}}
+        if len(candidates) != 1:
+            return {"state": "unknown", "reason": "session-generation-ambiguous", "generation": None,
+                    "shell_tasks": [], "shell_cursor": {"state": "unknown",
+                                                             "reason": "session-generation-ambiguous",
+                                                             "caught_up": True}}
+        generation = candidates[0][0]
+        if generation != "v2":
+            reason = "v1-background-native-record-not-observed"
+            return {"state": "unobserved", "reason": reason, "generation": generation,
+                    "shell_tasks": [], "shell_cursor": {"state": "unobserved", "reason": reason,
+                                                             "caught_up": True}}
+        tasks, cursor = _read_v2_shell_tasks(connection, session_id, after_seq, refresh_seqs)
+        return {"state": "observed", "reason": None, "generation": generation,
+                "shell_tasks": tasks, "shell_cursor": cursor}
+    except sqlite3.Error:
+        return {"state": "unknown", "reason": "database-read-failed", "generation": None,
+                "shell_tasks": [], "shell_cursor": {"state": "unknown", "reason": "database-read-failed"}}
+
+
 def _read_v1_messages(connection, session_id):
     tables = {row[0] for row in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('message','part')")}
@@ -930,7 +1132,9 @@ def _read_v1_messages(connection, session_id):
 
 def read_session_observation(session_id: str, *, db_path: str | Path | None = None,
                              generation: str | None = None,
-                             after_seq: int | None = None) -> dict:
+                             after_seq: int | None = None,
+                             shell_after_seq: int | None = 0,
+                             shell_refresh_seqs=()) -> dict:
     """Read one exact V1/V2 session with bounded, read-only schema-aware queries.
 
     Without an explicit runtime generation, only an exact sid row can select a
@@ -967,9 +1171,25 @@ def read_session_observation(session_id: str, *, db_path: str | Path | None = No
             cursor_kind = "session-message-seq-v2"
             if cursor is None and isinstance(after_seq, int) and after_seq >= 0:
                 cursor = after_seq
+            if shell_after_seq is None:
+                shell_tasks = []
+                shell_cursor = {"state": "unobserved", "reason": "detail-refresh-deferred",
+                                "next_seq": None, "caught_up": False, "max_seq": None}
+            else:
+                shell_tasks, shell_cursor = _read_v2_shell_tasks(
+                    connection, session_id, shell_after_seq, shell_refresh_seqs)
         else:
             messages, cursor = _read_v1_messages(connection, session_id)
             cursor_kind = "message-updated-v1"
+            shell_tasks = []
+            shell_cursor = {"state": "unobserved",
+                            "reason": "v1-background-native-record-not-observed",
+                            "next_seq": None, "caught_up": False, "max_seq": None}
+        try:
+            db_stat = os.stat(path)
+            db_identity = {"device": db_stat.st_dev, "inode": db_stat.st_ino}
+        except OSError:
+            db_identity = None
         return {"state": "observed", "generation": selected_generation, "table": table,
                 "session": {"id": row.get("id"), "directory": row.get("directory"),
                             "parent_id": row.get("parent_id"), "title": row.get("title"),
@@ -980,7 +1200,8 @@ def read_session_observation(session_id: str, *, db_path: str | Path | None = No
                             "tokens_output": row.get("tokens_output"),
                             "tokens_reasoning": row.get("tokens_reasoning")},
                 "messages": messages, "cursor": cursor,
-                "cursor_kind": cursor_kind}
+                "cursor_kind": cursor_kind, "shell_tasks": shell_tasks,
+                "shell_cursor": shell_cursor, "database_identity": db_identity}
     except (OSError, sqlite3.Error):
         return {"state": "unknown", "reason": "database-read-failed"}
     finally:

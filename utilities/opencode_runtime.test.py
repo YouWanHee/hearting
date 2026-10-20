@@ -207,6 +207,67 @@ class OpenCodeSessionObservationTest(unittest.TestCase):
             self.assertEqual(delta["cursor"], 2)
             self.assertEqual(db.read_bytes(), before)
 
+    def test_v2_shell_cursor_pages_all_row_types_and_refreshes_old_pending_seq(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "opencode.db"
+            session_id = "ses_shellpagefixture"
+            with sqlite3.connect(db) as con:
+                con.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, "
+                            "time_created INTEGER, time_updated INTEGER)")
+                con.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, "
+                            "type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+                con.execute("INSERT INTO session_v2 VALUES (?, ?, ?, ?)",
+                            (session_id, tmp, 1000, 1000))
+                for seq in range(1, 71):
+                    if seq == 1:
+                        kind = "shell"
+                        payload = {"metadata": {"background": True},
+                                   "time": {"created": 1792456543124},
+                                   "shellID": "sh_pending_old_window", "command": "sleep 20",
+                                   "status": "running"}
+                    else:
+                        kind = "user" if seq % 2 else "assistant"
+                        payload = {"text": "ordinary non-candidate row"}
+                    con.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                ("msg-%d" % seq, session_id, kind, seq, seq, seq,
+                                 json.dumps(payload)))
+
+            first = runtime.read_session_observation(
+                session_id, db_path=db, generation="v2", shell_after_seq=0)
+            self.assertEqual(first["shell_cursor"]["next_seq"], runtime.MAX_SHELL_TASK_PAGE)
+            self.assertFalse(first["shell_cursor"]["caught_up"])
+            self.assertEqual(first["shell_cursor"]["mutable_seqs"], [1])
+            self.assertEqual(first["shell_tasks"][0]["native_record_kind"],
+                             "session-message-shell")
+
+            completed = {"metadata": {"background": True},
+                         "time": {"created": 1792456543124, "completed": 1792456547139},
+                         "shellID": "sh_pending_old_window", "command": "sleep 20",
+                         "status": "exited", "exit": 3,
+                         "output": {"output": "private output omitted", "cursor": 17,
+                                    "size": 17, "truncated": False}}
+            with sqlite3.connect(db) as con:
+                con.execute("UPDATE session_message SET data=?, time_updated=? "
+                            "WHERE session_id=? AND seq=1",
+                            (json.dumps(completed), 1792456547139, session_id))
+
+            second = runtime.read_session_observation(
+                session_id, db_path=db, generation="v2",
+                shell_after_seq=first["shell_cursor"]["next_seq"],
+                shell_refresh_seqs=first["shell_cursor"]["mutable_seqs"])
+            cursor = second["shell_cursor"]
+            self.assertEqual(cursor["next_seq"], 70)
+            self.assertTrue(cursor["caught_up"])
+            self.assertEqual(cursor["refreshed_seqs"], [1])
+            task = second["shell_tasks"][0]
+            self.assertEqual(task["native_status"], "exited")
+            self.assertEqual(task["exit_code"], 3)
+            self.assertEqual(task["completed_at_ms"], 1792456547139)
+            self.assertEqual(task["native_output_cursor"], 17)
+            self.assertEqual(task["native_output_size"], 17)
+            self.assertFalse(task["native_output_truncated"])
+            self.assertNotIn("private output omitted", repr(task))
+
     def test_same_sid_in_both_generations_is_unknown_without_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "opencode.db"
