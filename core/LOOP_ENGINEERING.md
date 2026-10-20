@@ -111,6 +111,10 @@ consumption nor absence. First-send eligibility comes from the existing pending
 record and its claim boundary; after an attempt, the existing delivery lineage
 owns further observation. Do not turn uncertain history into a new retry rule.
 
+Observational callbacks must not delay the operation they observe. Provider
+telemetry must let the runtime consume its original response without waiting
+for a cloned body or its reader cancellation.
+
 ## 5. Remove duplicated decisions before stacking exceptions
 
 A repair does not end at letting the one failing branch pass. Find the writers,
