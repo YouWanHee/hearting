@@ -984,7 +984,9 @@ class ReplacementTest(unittest.TestCase):
                 "read": "allow",
                 "edit": {"*": "deny", "/approved/**": "allow"},
                 "external_directory": {"*": "deny", "/approved/**": "allow"},
-            }},
+            }, "agent": {"build": {"permission": {
+                "edit": {"*": "deny", "/approved/private/**": "allow"},
+            }}}},
             {"permissions": [
                 {"action": "read", "resource": "*", "effect": "allow"},
                 {"action": "edit", "resource": "*", "effect": "deny"},
@@ -993,6 +995,7 @@ class ReplacementTest(unittest.TestCase):
                 {"action": "external_directory", "resource": "/approved/**", "effect": "allow"},
             ], "agents": {"build": {"permissions": [
                 {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "/approved/private/**", "effect": "allow"},
             ]}}},
         )
         sealed = []
@@ -1000,13 +1003,17 @@ class ReplacementTest(unittest.TestCase):
             aid = f"att-opencode-policy-{index}"
             args = SimpleNamespace(**vars(self.args))
             args.attempt_id = aid
+            args.agent = "build"
             args.opencode_config_content = json.dumps(config, separators=(",", ":"))
             args.replacement_input_argv = ["--start", "--attempt-id", aid,
-                                           "--prompt-text", "the raw task"]
+                                           "--agent", args.agent, "--prompt-text", "the raw task"]
             fragment = R.seal_launch_input(args, "opencode", "the raw task")
             value = R.launch_input(self.jobs, aid, D.parse_registry_metadata(fragment))
             permission = value["applied_permissions"]["opencode_permission"]
             self.assertTrue(opencode_runtime.opencode_permission_ordered_view(permission))
+            self.assertEqual(
+                value["applied_permissions"]["opencode_selected_agent_permission"]["agent"],
+                "build")
             sealed.append(value)
         before, after = sealed
         old_permission = before["applied_permissions"]["opencode_permission"]
@@ -1021,6 +1028,29 @@ class ReplacementTest(unittest.TestCase):
             R.route_authority._granted_permission_pair(
                 {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
                 {"harness": "opencode", "applied_permissions": after["applied_permissions"]})[1])
+
+        changed_config = json.loads(json.dumps(configs[1]))
+        changed_config["agents"]["build"]["permissions"][0]["effect"] = "allow"
+        changed_args = SimpleNamespace(**vars(self.args))
+        changed_args.attempt_id = "att-opencode-selected-agent-changed"
+        changed_args.agent = "build"
+        changed_args.opencode_config_content = json.dumps(changed_config, separators=(",", ":"))
+        changed_args.replacement_input_argv = ["--start", "--attempt-id", changed_args.attempt_id,
+                                               "--agent", changed_args.agent,
+                                               "--prompt-text", "the raw task"]
+        changed_fragment = R.seal_launch_input(changed_args, "opencode", "the raw task")
+        changed = R.launch_input(self.jobs, changed_args.attempt_id,
+                                 D.parse_registry_metadata(changed_fragment))
+        self.assertEqual(
+            opencode_runtime.opencode_permission_ordered_view(
+                before["applied_permissions"]["opencode_permission"]),
+            opencode_runtime.opencode_permission_ordered_view(
+                changed["applied_permissions"]["opencode_permission"]))
+        pair = R.route_authority._granted_permission_pair(
+            {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+            {"harness": "opencode", "applied_permissions": changed["applied_permissions"]})
+        self.assertNotEqual(*pair)
+        self.assertFalse(R.route_authority.same_sealed_work(before, changed))
 
         reordered = json.loads(json.dumps(before))
         edit = reordered["applied_permissions"]["opencode_permission"]["edit"]

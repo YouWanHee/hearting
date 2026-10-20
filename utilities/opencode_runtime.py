@@ -568,6 +568,33 @@ def opencode_permission_from_config(config):
     return normalize_opencode_permission(config.get("permission")) if "permission" in config else None
 
 
+def opencode_agent_permission_from_config(config, agent):
+    """Read one selected agent's final legacy permission from a V1 or V2 config."""
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"OpenCode config is not valid JSON: {exc}") from exc
+    if not isinstance(config, Mapping):
+        raise ValueError("OpenCode config must be an object")
+    if not isinstance(agent, str) or not agent:
+        raise ValueError("OpenCode selected agent must be a nonempty string")
+    projected = (opencode_v2_to_legacy_config(config)
+                 if "permissions" in config or "agents" in config else config)
+    agents = projected.get("agent", {})
+    if agents is None:
+        agents = {}
+    if not isinstance(agents, Mapping):
+        raise ValueError("OpenCode agent config must be an object")
+    definition = agents.get(agent)
+    if definition is None:
+        return {}
+    if not isinstance(definition, Mapping):
+        raise ValueError(f"OpenCode agent {agent!r} must be an object")
+    return normalize_opencode_permission(
+        definition.get("permission"), field=f"agent.{agent}.permission")
+
+
 def model_reference(model: str | None, variant: str | None) -> str | None:
     """Encode V2's provider/model#variant without duplicating a suffix."""
     if not model:

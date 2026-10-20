@@ -165,6 +165,15 @@ def _applied_permissions(args):
     if config:
         import opencode_runtime
         result['opencode_permission'] = opencode_runtime.opencode_permission_from_config(config)
+        selected_agent = getattr(args, 'agent', None)
+        if selected_agent:
+            selected_permission = opencode_runtime.opencode_agent_permission_from_config(
+                config, selected_agent)
+            result['opencode_selected_agent_permission'] = {
+                'agent': selected_agent,
+                'permission': opencode_runtime.opencode_permission_ordered_view(
+                    selected_permission),
+            }
     for key in ('launch_lifecycle','nested_headless_network'):
         if hasattr(args,key): result[key] = getattr(args,key)
     return result
