@@ -570,7 +570,12 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 `compose` prints (capability · shape · route id · human gates) plus one clause
 of scope and proceeds in the same turn; a steward cannot approve for the user.
 Compose's notice and receipt name this confirmation method from the current
-turn's existing peer-receive observation. Unknown origin uses the card method;
+turn's existing peer-receive observation. Peer origin is known only when the
+current prompt boundary is bound to the exact validated transfer or native
+Claude envelope it contains. A previous receipt or a later notice cannot
+classify this prompt. Runtime completion transfers retain their producer
+binding and runtime source independently of the courier. Unknown or mixed
+origin uses the card method;
 the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,

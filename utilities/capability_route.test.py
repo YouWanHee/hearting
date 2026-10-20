@@ -8127,10 +8127,13 @@ class ComposeRouteTest(TestRoute):
   before=json.dumps(route,sort_keys=True)
   caller=types.SimpleNamespace(known=True,harness="codex",session_id="this-turn")
   with mock.patch("session_identity.identity",return_value=caller):
-   for origin,expected in (("peer:verifier·ref","peer-notice"),("unattributed","user-card")):
+   for origin,expected in (("peer:verifier·ref","peer-notice"),
+                           ("runtime:completion·attempt/delivery","user-card"),
+                           ("unattributed","user-card")):
     with self.subTest(origin=origin), mock.patch.object(R,"_turn_peer_source",return_value=origin):
      observed=R.compose_observations(route)
      self.assertEqual(observed["confirmation"]["method"],expected)
+     self.assertEqual(observed["confirmation"]["origin"],origin)
      self.assertIn("확인 방식 "+expected,R.compose_card(route))
   self.assertEqual(json.dumps(route,sort_keys=True),before)
   R.verify_route(route)

@@ -59,6 +59,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import stat
@@ -1677,6 +1678,45 @@ def bump_prompt_seq(seat: Seat, harness: str, sid: str, now: float) -> int:
     return seq
 
 
+def _current_request_origin(prompt_text: str, harness: str, sid: str) -> Optional[dict]:
+    """Use the common transfer reader on this prompt only; never search nearby receipts."""
+    if not prompt_text:
+        return None
+    try:
+        import importlib.util
+        path = Path(__file__).resolve().with_name("peer-message.py")
+        spec = importlib.util.spec_from_file_location("session_tidy_peer_message", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        origin = module.prompt_origin(prompt_text, harness, sid)
+        return origin if isinstance(origin, dict) else None
+    except Exception:
+        return None
+
+
+def record_prompt_origin(seat: Seat, harness: str, sid: str, sequence: int, origin: dict) -> bool:
+    """Attach validated non-content provenance to the current prompt sequence."""
+    required = {"kind", "harness", "session_id", "request_digest", "transfer_ref",
+                "transfer_body_sha256", "name"}
+    if (not isinstance(origin, dict) or not required.issubset(origin)
+            or origin.get("kind") not in {"peer", "runtime-completion"}
+            or origin.get("harness") != harness or origin.get("session_id") != sid
+            or not re.fullmatch(r"[0-9a-f]{64}", str(origin.get("request_digest") or ""))
+            or not isinstance(origin.get("transfer_ref"), str) or not origin["transfer_ref"]
+            or not isinstance(origin.get("name"), str)):
+        return False
+    path = _prompt_seq_path(seat)
+    current = read_json(path)
+    if (not isinstance(current, dict) or current.get("seq") != sequence
+            or current.get("harness") != harness or current.get("sid") != sid):
+        return False
+    current["request_origin"] = dict(origin)
+    atomic_write_json(path, current)
+    return True
+
+
 def write_notice(seat: Seat, text: str, *, author_harness: str = "", author_sid: str = "",
                  now: Optional[float] = None) -> dict:
     """Leave one result line for the seat's next start/prompt (takes the seat lock)."""
@@ -1845,6 +1885,9 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             return text
         if event == "prompt":
             sequence = bump_prompt_seq(seat, harness, sid, now)
+            request_origin = _current_request_origin(prompt_text, harness, sid)
+            if request_origin:
+                record_prompt_origin(seat, harness, sid, sequence, request_origin)
             with contextlib.suppress(BaseException):
                 import session_tidy_clear as clear
                 if not clear.observe_prompt_locked(seat, harness, sid, prompt_text, now, sequence):
