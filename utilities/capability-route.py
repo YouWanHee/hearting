@@ -6064,11 +6064,18 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         return {"passed":False,"reason":reason}
     try:
         jobs=Path(jobs) if jobs is not None else completion_dir(route["route_id"]).parents[1]/"jobs.log"
+        from dispatch_registry_cache import registry_view
+        view=registry_view(jobs)
+        if view.has_invalid_utf8 or view.has_partial_tail:
+            # Keep the existing strict decoder and incomplete-line semantics.
+            lines=jobs.read_text(encoding="utf-8").splitlines()
+            candidates=((fields,parse_registry_metadata(fields[5]))
+                        for line in lines for fields in (line.split("\t"),) if len(fields)==6)
+        else:
+            candidates=((record.fields,record.completion_metadata()) for record in
+                        view.completion_related("",route["route_id"],route["route_hash"]))
         owners=[]
-        for line in jobs.read_text(encoding="utf-8").splitlines():
-            fields=line.split("\t")
-            if len(fields)!=6: continue
-            meta=parse_registry_metadata(fields[5])
+        for fields,meta in candidates:
             if meta.get("worker_type")!="owner" or meta.get("dispatch_depth")!="1": continue
             try:
                 identity=ROUTE_IDENTITY.registered_node_identity(meta,node)

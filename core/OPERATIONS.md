@@ -2372,7 +2372,9 @@ attempt. Missing-pending recovery accepts only a notice written by the validated
 exact-ref receiver, bound to that original transfer-body digest and effective
 recipient generation. The notice-summary digest remains a separate fact, and a
 generic `received` ledger row is insufficient. Registered-batch continuation
-and handover duties retain their own settlement rules.
+and handover duties retain their own settlement rules. Owner identity readers
+reuse the generation-checked registry input; current-row and non-registry
+authority checks remain fresh and completion verdicts are not memoized.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for
