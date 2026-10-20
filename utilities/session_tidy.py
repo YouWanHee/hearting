@@ -357,6 +357,7 @@ class Seat:
     native: Optional[dict] = None
     sid: str = ""
     endpoint: str = ""
+    socket_path: str = ""   # raw transport is private; endpoint remains the key hash
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
@@ -425,10 +426,27 @@ def _real(path) -> str:
     return ""
 
 
-def _pane_seat_of(pane: str) -> Seat:
-    endpoint = _endpoint_scope()
+def _pane_seat_of(pane: str, *, endpoint: Optional[str] = None,
+                  socket_path: Optional[str] = None) -> Seat:
+    if endpoint is None:
+        endpoint = _endpoint_scope()
+    if socket_path is None:
+        socket_path = str(os.environ.get("HERDR_SOCKET_PATH") or "")
     key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
-    return Seat("pane", key, pane, "codex", "", endpoint=endpoint)
+    return Seat("pane", key, pane, "codex", "", endpoint=endpoint, socket_path=socket_path)
+
+
+def pane_seat_from_binding(binding: dict) -> Seat:
+    """Create a Codex seat only from one exact live TUI binding."""
+    pane = str(binding.get("pane") or "")
+    socket_path = str(binding.get("socket_path") or "")
+    if (not pane or not binding.get("pid") or not binding.get("pid_start")
+            or not binding.get("session_id")):
+        raise ValueError("incomplete Codex pane binding")
+    endpoint = _endpoint_scope({"HERDR_SOCKET_PATH": socket_path})
+    key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+    return Seat("pane", key, pane, "codex", "", sid=str(binding["session_id"]),
+                endpoint=endpoint, socket_path=socket_path)
 
 
 def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
@@ -452,15 +470,16 @@ def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
     if len(here) != 1:
         return []
     pane = str(here[0]["pane_id"])
+    seat = _pane_seat_of(pane)
     try:
         import session_tidy_clear
-        booking = session_tidy_clear.read_reservation(_pane_seat_of(pane).key)
+        booking = session_tidy_clear.read_reservation(seat.key)
     except BaseException:  # noqa: BLE001
         return []
     ok = bool(booking) and booking.get("harness") == "codex" and booking.get("status") in ("reserved", "unverified") \
         and booking.get("sid") not in (sid, "") \
         and (_agent_session(here[0]) == booking.get("sid")
-             or ledger_precedes(_pane_seat_of(pane), _agent_session(here[0]), str(booking.get("sid")))) \
+             or ledger_precedes(seat, _agent_session(here[0]), str(booking.get("sid")))) \
         and _real(booking.get("cwd") or "") == _real(cwd) \
         and (booking.get("seat") or {}).get("pane") == pane
     return [pane] if ok else []
@@ -482,8 +501,11 @@ def _cleared_into(sid: str) -> list[str]:
         except BaseException:  # noqa: BLE001
             continue
         pane = str(((booking or {}).get("seat") or {}).get("pane") or "")
+        booked_seat = (booking or {}).get("seat") if isinstance((booking or {}).get("seat"), dict) else {}
+        endpoint = booked_seat.get("endpoint") if isinstance(booked_seat, dict) else None
         if booking and booking.get("harness") == "codex" and booking.get("status") == "cleared" \
-                and booking.get("new_session") == sid and pane and _pane_seat_of(pane).key == key:
+                and booking.get("new_session") == sid and pane \
+                and _pane_seat_of(pane, endpoint=str(endpoint or "")).key == key:
             panes.append(pane)
     return panes
 
@@ -520,6 +542,18 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     server = env.get("AGENT_HERDR_SESSION") if live_caller else None
     socket_value = env.get("HERDR_SOCKET_PATH", "") if live_caller else ""
     endpoint_unproven = bool(harness == "codex" and server and not socket_value)
+    if live_caller and harness == "codex" and sid:
+        from pane_ownership import _caller_runtime, codex_caller_binding
+        caller, service = _caller_runtime(os.getpid(), "codex")
+        if caller is not None and service:
+            binding = codex_caller_binding(sid, environ=env)
+            if binding:
+                return pane_seat_from_binding(binding)
+            # A shared daemon's inherited pane values belong to no caller.
+            pane = ""
+            server = None
+            socket_value = ""
+            endpoint_unproven = True
     if live_caller and not endpoint_unproven and not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
     from pane_ownership import verified_pane
@@ -690,6 +724,180 @@ def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
     return max(rows, key=lambda r: r["last_seen"]) if rows else None
 
 
+def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
+                          *, harness=None, sid=None) -> list[dict]:
+    """Pure projection of already-read seat rows, cards and transcript locations."""
+    grouped = {}
+    starts = {}
+    edges = {}
+    for row in rows:
+        name, session = str(row.get("harness") or ""), str(row.get("sid") or "")
+        if not name or not session:
+            continue
+        key = (name, session)
+        if row.get("event") == "handover":
+            source = row.get("from")
+            if isinstance(source, dict):
+                source = source.get("sid") if source.get("harness") == name else None
+            if isinstance(source, str) and source and source != session:
+                edges.setdefault(key, set()).add(source)
+            continue
+        item = grouped.setdefault(key, {"sid": session, "harness": name,
+                                        "started_at": None, "source": "unknown",
+                                        "last_seen": 0})
+        seen = row.get("first_seen", row.get("ts"))
+        if isinstance(seen, (int, float)) and not isinstance(seen, bool) and seen > 0:
+            item["started_at"] = seen if item["started_at"] is None else min(item["started_at"], seen)
+        ts = row.get("ts", row.get("last_seen", 0))
+        if isinstance(ts, (int, float)) and ts >= item["last_seen"]:
+            item["last_seen"] = ts
+            source = (row.get("source") if row.get("event") == "start"
+                      else row.get("latest_start_source", row.get("start_source")))
+            if isinstance(source, str) and source in {
+                    "clear", "compact", "startup", "resume", "select", "fork"}:
+                starts[key] = (float(ts), source)
+    ordered = sorted(grouped.values(), key=lambda item: item["last_seen"], reverse=True)
+    if sid:
+        ordered.sort(key=lambda item: (item["sid"] != sid, -float(item["last_seen"])))
+    output = []
+    for item in ordered:
+        key = (item["harness"], item["sid"])
+        if key in starts:
+            item["source"] = starts[key][1]
+        card_rows = cards.get(key, [])
+        item["cards"] = card_rows
+        item["card"] = (card_rows[-1] if card_rows else
+                        {"generation": None, "path": None, "status": "none"})
+        item["transcript"] = locations.get(key) or {"path": None, "status": "missing"}
+        item["relation"] = "unknown"
+        item.pop("last_seen", None)
+        if harness and item["harness"] != harness:
+            continue
+        output.append(item)
+    for index, item in enumerate(output):
+        key = (item["harness"], item["sid"])
+        predecessors = edges.get(key, set())
+        item["predecessor"] = None
+        if len(predecessors) == 1:
+            item["relation"] = "confirmed"
+            item["predecessor"] = {"harness": item["harness"], "sid": next(iter(predecessors))}
+        elif len(predecessors) > 1:
+            item["relation"] = "unknown"
+        elif index + 1 < len(output) and output[index + 1]["harness"] == item["harness"]:
+            item["relation"] = "chronological"
+    return output
+
+
+def _lineage_card_status(path: Path) -> str:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return "unreadable"
+        with path.open("rb") as handle:
+            json.loads(handle.read(256 * 1024).decode("utf-8"))
+        return "available"
+    except FileNotFoundError:
+        return "expired"
+    except (OSError, ValueError, UnicodeError):
+        return "unreadable"
+
+
+def _lineage_transcript(harness: str, sid: str, hint: str) -> dict:
+    try:
+        import tidy_transcripts
+        path = None
+        if hint:
+            hinted = Path(hint).expanduser()
+            try:
+                info = hinted.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return {"path": str(hinted), "status": "unreadable"}
+            else:
+                if not stat.S_ISREG(info.st_mode):
+                    return {"path": str(hinted), "status": "unreadable"}
+                path = hinted
+        path = path or tidy_transcripts.locate_transcript(harness, sid, hint or None)
+        if path is None:
+            return {"path": None, "status": "missing"}
+        info = Path(path).lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return {"path": str(path), "status": "unreadable"}
+        with Path(path).open("rb") as handle:
+            handle.read(1)
+        return {"path": str(path), "status": "available"}
+    except FileNotFoundError:
+        return {"path": None, "status": "missing"}
+    except (OSError, ValueError, TypeError):
+        return {"path": None, "status": "unreadable"}
+
+
+def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
+    """Read the seat's bounded existing lineage without updating any state."""
+    rows = _read_ledger_lines(seat)
+    sessions = session_summary(seat)
+    cards, locations = {}, {}
+    for key, summary in sessions.items():
+        name, session = key
+        if harness and name != harness:
+            continue
+        author_seat = dataclasses.replace(seat, harness=name, sid=session)
+        current_path = card_json_path(author_seat)
+        history_path = state_root() / "card-history" / card_key(author_seat)
+        found = []
+        current = read_json(current_path)
+        if isinstance(current, dict) and (current.get("author") or {}).get("sid") == session:
+            found.append(current)
+        elif _lineage_card_status(current_path) == "unreadable":
+            found.append({"generation": None, "author": {"harness": name, "sid": session},
+                          "_path": current_path, "_status": "unreadable"})
+        try:
+            for path in sorted(history_path.glob("*.json")):
+                card = read_json(path)
+                if (isinstance(card, dict) and (card.get("author") or {}).get("harness") == name
+                        and (card.get("author") or {}).get("sid") == session):
+                    found.append(card)
+                elif _lineage_card_status(path) == "unreadable":
+                    with contextlib.suppress(ValueError):
+                        generation = int(path.stem)
+                        found.append({"generation": generation, "author": {"harness": name, "sid": session},
+                                      "_path": path, "_status": "unreadable"})
+        except OSError:
+            pass
+        found.sort(key=lambda card: int(card.get("generation", 0) or 0))
+        cards[key] = [{"generation": (int(card.get("generation", 0) or 0)
+                                      if card.get("generation") is not None else None),
+                       "path": str(card.get("_path") or
+                                   (current_path if card is current else
+                                    history_path / f"{int(card.get('generation', 0)):08d}.json")),
+                       "status": str(card.get("_status") or "available")} for card in found]
+        if not found:
+            generations = [row.get("card_generation") for row in rows
+                           if row.get("sid") == session and row.get("harness") == name
+                           and row.get("event") == "card"]
+            generations = [value for value in generations
+                           if isinstance(value, int) and not isinstance(value, bool)]
+            cards[key] = ([{"generation": max(generations), "path": None, "status": "expired"}]
+                          if generations else [])
+        locations[key] = _lineage_transcript(name, session, str(summary.get("transcript") or ""))
+    return _project_seat_lineage(rows, cards, locations, harness=harness, sid=sid)
+
+
+def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optional[dict]:
+    """The session an explicit handover edge names as ``sid``'s predecessor; never a neighbour."""
+    current = next((row for row in lineage
+                    if row.get("harness") == harness and row.get("sid") == sid), None)
+    identity = (current or {}).get("predecessor") if (current or {}).get("relation") == "confirmed" else None
+    if not isinstance(identity, dict) or not identity.get("harness") or not identity.get("sid"):
+        return None
+    name, session = identity["harness"], identity["sid"]
+    found = next((row for row in lineage
+                  if row.get("harness") == name and row.get("sid") == session), None)
+    return found or {"harness": name, "sid": session,
+                     "transcript": _lineage_transcript(name, session, "")}
+
+
 def _lineage_row_matches_seat(row: dict, seat: Seat) -> bool:
     if "pane" in row and row.get("pane") != seat.pane:
         return False
@@ -738,7 +946,7 @@ def _pane_repository_map(rows: list[dict], seat: Seat, resolve_gitdir) -> dict[t
             if len(values) == 1 and identity not in conflicts}
 
 
-def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str):
+def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None):
     if harness not in HARNESSES or not sid or not pane or not cwd:
         return None
     try:
@@ -750,7 +958,7 @@ def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str):
         repository = resolved[1] if isinstance(resolved, (list, tuple)) and len(resolved) > 1 else ""
         if not repository:
             return None
-        current = _pane_seat_of(pane)
+        current = _pane_seat_of(pane, endpoint=endpoint)
         current_rows = _read_ledger_lines(current)
         current_repositories = _pane_repository_map(current_rows, current, resolve_gitdir)
         if current_repositories.get((harness, sid)) != repository:
@@ -905,23 +1113,23 @@ def _confirmed_predecessors_from(inputs, harness: str, sid: str, repository: str
     return chain
 
 
-def confirmed_pane_predecessors(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+def confirmed_pane_predecessors(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None) -> list[str]:
     """Return only confirmed same-harness clear/handover predecessors for display."""
-    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    state = _pane_lineage_inputs(harness, sid, pane, cwd, endpoint=endpoint)
     if state is None:
         return []
     repository, inputs, resolver = state
     return _confirmed_predecessors_from(inputs, harness, sid, repository, resolver)
 
 
-def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None) -> list[str]:
     """Compatibility aliases plus confirmed predecessors, for display only.
 
     The compatibility join keeps its eight-recent-ID bound. Confirmed lineage is
     separate and may extend beyond that bound; neither result changes execution or
     notification identity.
     """
-    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    state = _pane_lineage_inputs(harness, sid, pane, cwd, endpoint=endpoint)
     if state is None:
         return []
     repository, inputs, resolver = state
@@ -948,16 +1156,16 @@ def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[st
     return list(dict.fromkeys([*ordered, *predecessors]))
 
 
-def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
+def session_start_source(harness: str, sid: str, pane: str, *, endpoint=None) -> Optional[str]:
     """The recorded native start source, not a new or inferred lifecycle event."""
-    return session_start_context(harness, sid, pane).get("session_start_source")
+    return session_start_context(harness, sid, pane, endpoint=endpoint).get("session_start_source")
 
 
-def session_start_context(harness: str, sid: str, pane: str) -> dict:
+def session_start_context(harness: str, sid: str, pane: str, *, endpoint=None) -> dict:
     """Return the latest native start details for this exact pane seat and session."""
     if harness not in HARNESSES or not sid or not pane:
         return {}
-    for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
+    for row in reversed(_read_ledger_lines(_pane_seat_of(pane, endpoint=endpoint))):
         if row.get("harness") != harness or row.get("sid") != sid:
             continue
         if row.get("event") != "start" and not row.get("start_at"):
@@ -992,7 +1200,8 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
                  bump_epoch: bool = False, compact_identity: str = "",
                  resume_argv=None, launch_cwd: str = "",
-                 compact_context: Optional[dict] = None) -> dict:
+                 compact_context: Optional[dict] = None,
+                 card_generation: Optional[int] = None) -> dict:
     """Append one ledger line (caller holds the seat lock). Returns the session row."""
     now = now_epoch() if now is None else now
     summary = session_summary(seat).get((harness, sid))
@@ -1018,6 +1227,8 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
                 entry["launch_cwd"] = launch_cwd
     if transcript:
         entry["transcript"] = transcript
+    if event == "card" and isinstance(card_generation, int) and not isinstance(card_generation, bool):
+        entry["card_generation"] = max(1, card_generation)
     if cwd:
         entry["cwd"] = cwd
     if event == "compact" and compact_identity:
@@ -1570,7 +1781,8 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}일 전"
 
 
-def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> str:
+def build_card_injection(card: dict, card_path: Path, now: float, cap: int,
+                         previous_transcript: Optional[dict] = None) -> str:
     """Card text within ``cap`` UTF-8 bytes; guidance is part of the fixed header."""
     author = card.get("author") or {}
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(card.get("authored_at_epoch") or now)))
@@ -1578,17 +1790,35 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> s
               f"({_ago(now - float(card.get('authored_at_epoch') or now))}, {author.get('harness', '')} "
               f"{str(author.get('sid', ''))[:8]})\n{CARD_FIRST_REPLY_GUIDANCE}")
     footer = f"카드 전문: {card_path}"
+    previous_line = ""
+    if isinstance(previous_transcript, dict):
+        prior_harness = str(previous_transcript.get("harness") or "")
+        prior_sid = str(previous_transcript.get("sid") or "")
+        location = previous_transcript.get("transcript") or {}
+        status = str(location.get("status") or "missing") if isinstance(location, dict) else "missing"
+        path = str(location.get("path") or "") if isinstance(location, dict) else ""
+        if status == "available" and path:
+            if len(path.encode("utf-8")) > 320:
+                path = "경로 생략"
+            detail = path
+        else:
+            detail = "읽기 불가" if status == "unreadable" else "없음"
+        previous_line = f"이전 대화: {prior_harness} {prior_sid[:8]} · 원문 {detail}"
     cut_note = "…(이하 생략)"
     body = card.get("body", "")
-    fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    fixed = (len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+             + (len(previous_line.encode("utf-8")) + 1 if previous_line else 0))
+    if fixed > cap and previous_line:
+        previous_line = ""
+        fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
     room = cap - fixed
     if room <= 0:
-        return _cut_bytes(f"{header}\n{footer}", cap)[0]
+        return _cut_bytes(f"{header}\n{footer}" + (f"\n{previous_line}" if previous_line else ""), cap)[0]
     if len(body.encode("utf-8")) <= room:
-        return f"{header}\n{body}\n{footer}"
+        return f"{header}\n{body}\n{footer}" + (f"\n{previous_line}" if previous_line else "")
     room -= len(cut_note.encode("utf-8")) + 1
     trimmed = _cut_bytes(body, max(0, room))[0].rstrip()
-    return f"{header}\n{trimmed}\n{cut_note}\n{footer}"
+    return f"{header}\n{trimmed}\n{cut_note}\n{footer}" + (f"\n{previous_line}" if previous_line else "")
 
 
 # ---------------------------------------------------------------------------
@@ -1761,7 +1991,12 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
             if card_due:
-                parts.append(build_card_injection(card, card_text_path(card_seat), now, room))
+                previous = None
+                if seat.kind in ("pane", "native") and card_seat.kind in ("pane", "native"):
+                    previous = _confirmed_predecessor(
+                        seat_lineage(seat, harness=harness, sid=sid), harness, sid)
+                parts.append(build_card_injection(
+                    card, card_text_path(card_seat), now, room, previous_transcript=previous))
             if memory_text:
                 parts.append(memory_text)
         if not card and handed and handover is not None:
@@ -2194,7 +2429,9 @@ def cmd_card(args) -> int:
         return 0
     seat, harness, sid = caller
     with seat_lock(seat.key):
-        record_event(seat, harness, sid, "card", cwd=cwd)
+        previous = read_latest_card(seat)
+        generation = int(previous.get("generation", 0) or 0) + 1 if previous else 1
+        record_event(seat, harness, sid, "card", cwd=cwd, card_generation=generation)
         write_card(seat, harness, sid, body, cwd=cwd, prompt_seq=read_prompt_seq(seat))
     print(f"card={card_text_path(seat)} seat={seat.key}")
     return 0

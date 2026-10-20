@@ -545,6 +545,11 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
             )
     if args.parent_session_id:
         pipe += f",parent_sid={args.parent_session_id}"
+    main_identity = _retention_main_identity(jobs, args, harness)
+    if main_identity is not None:
+        main_harness, main_pid, main_start, main_ns = main_identity
+        pipe += (f",main_runtime_harness={main_harness},main_runtime_pid={main_pid}"
+                 f",main_runtime_pid_start={main_start},main_runtime_ns={main_ns}")
     if args.parent_slug or args.parent_session_id:
         # OPERATIONS §5.10 pipe contract lists parent_cwd; without it a cross-harness
         # child whose parent_sid is synthetic can never nest in Fleet (2026-07-15).
@@ -740,6 +745,98 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
         mutation_precheck=mutation_precheck,
         preclaim=preclaim,
     )
+
+
+def _interactive_main_identity(jobs: Path, args, harness: str):
+    """Resolve an exact interactive runtime ancestor for a depth-one launch."""
+    sid = str(getattr(args, "parent_session_id", "") or "")
+    if getattr(args, "dispatch_depth", 0) != 1 or not sid:
+        return None
+    try:
+        sys.path.insert(0, str(ROOT / "utilities"))
+        from session_identity import session_ids
+        if session_ids(os.environ).get(harness, (None,))[0] != sid:
+            return None
+        if harness == "claude":
+            identity = runtime_ancestry_binding(os.getpid())
+            if identity is None:
+                return None
+            pid, start, namespace = identity
+            from fleet.collectors import claude
+            row = claude.read_registry(int(pid)) or {}
+            if (str(row.get("procStart") or "") != start
+                    or str(row.get("sessionId") or "") != sid):
+                return None
+            return harness, pid, start, namespace
+        if harness == "codex":
+            from pane_ownership import codex_caller_binding
+            binding = codex_caller_binding(sid)
+            if binding is None:
+                return None
+            pid, start = str(binding["pid"]), str(binding["pid_start"])
+            namespace = process_namespace_identity(int(pid))
+            return (harness, pid, start, namespace) if namespace else None
+        if harness == "opencode":
+            from fleet.process_identity import PROVEN, _proc_stat, process_identity
+            current, seen = os.getpid(), set()
+            for _ in range(128):
+                if current <= 1 or current in seen:
+                    break
+                seen.add(current)
+                found = process_identity(current, "opencode")
+                if (found.confidence == PROVEN and found.session_id == sid
+                        and found.source == "opencode-tui-selection"):
+                    parent, start = _proc_stat(current)
+                    namespace = process_namespace_identity(current)
+                    if parent is not None and start and process_start_ticks(current) == start and namespace:
+                        return harness, str(current), start, namespace
+                parent, _start = _proc_stat(current)
+                if parent is None:
+                    break
+                current = parent
+    except Exception:
+        return None
+    return None
+
+
+def _retention_main_identity(jobs: Path, args, harness: str):
+    """Record a depth-one identity or inherit it through explicit attempt ancestry."""
+    depth = getattr(args, "dispatch_depth", 0)
+    if depth == 1:
+        return _interactive_main_identity(jobs, args, harness)
+    if depth < 2:
+        return None
+    binding = getattr(args, "parent_binding", None)
+    attempt = str(getattr(binding, "attempt_id", "") or "")
+    if not attempt:
+        return None
+    try:
+        latest = {}
+        for line in Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            row = parse_registry_metadata(fields[5])
+            if row.get("attempt_id"):
+                latest[row["attempt_id"]] = row
+        seen = set()
+        for _ in range(32):
+            if attempt in seen:
+                return None
+            seen.add(attempt)
+            row = latest.get(attempt)
+            if row is None:
+                return None
+            names = ("main_runtime_harness", "main_runtime_pid", "main_runtime_pid_start",
+                     "main_runtime_ns")
+            if all(row.get(name) for name in names):
+                return tuple(row[name] for name in names)
+            attempt = row.get("parent_attempt_id", "")
+            if not attempt:
+                return None
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,

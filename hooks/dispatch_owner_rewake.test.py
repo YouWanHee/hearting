@@ -1719,6 +1719,59 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 duty = next(d for d in store.list() if d["intent"]["identity"]["harness"] == harness)
                 self.assertEqual(json.loads(path.read_text())["attempts"], 0)
                 agents = {"result": {"agents": []}}
+                recipient_agent = {"agent": harness, "pane_id": "w1:p9", "name": "fixture",
+                                   "agent_status": "idle",
+                                   "agent_session": {"kind": "id", "value": "session-1"}}
+                process_pid = 73101
+                process_info = {"pane_id": "w1:p9", "shell_pid": 73100,
+                                "foreground_process_group_id": process_pid,
+                                "foreground_processes": [{"pid": process_pid, "argv": [harness]}]}
+                observed_commands = []
+                native_identity_calls = []
+                codex_thread_calls = []
+
+                def external_observation(argv, **_kwargs):
+                    command = list(argv)
+                    if command[:2] == ["herdr", "--session"]:
+                        command = command[3:]
+                    elif command[:1] == ["herdr"]:
+                        command = command[1:]
+                    observed_commands.append(tuple(command))
+                    if command[:2] == ["agent", "list"]:
+                        payload = agents
+                    elif command[:2] == ["agent", "get"]:
+                        self.assertEqual(command[2], "w1:p9")
+                        payload = {"result": {"agent": recipient_agent}}
+                    elif command[:2] == ["pane", "list"]:
+                        payload = {"result": {"panes": [{
+                            "pane_id": "w1:p9", "agent": harness, "agent_status": "idle",
+                            "agent_session": {"kind": "id", "value": "session-1"},
+                            "title": "fixture", "cwd": str(self.root),
+                        }]}}
+                    elif command[:2] == ["pane", "process-info"]:
+                        self.assertEqual(command[command.index("--pane") + 1], "w1:p9")
+                        payload = {"result": {"process_info": process_info}}
+                    else:
+                        self.fail(f"unexpected herdr observation request: {command!r}")
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=json.dumps(payload), stderr="")
+
+                from types import SimpleNamespace
+                from fleet import process_identity as native_identity
+                import pane_ownership
+
+                def process_identity(pid, observed_harness):
+                    native_identity_calls.append((pid, observed_harness))
+                    if pid == process_pid and observed_harness == harness:
+                        return SimpleNamespace(confidence=native_identity.PROVEN,
+                                               session_id="session-1")
+                    return SimpleNamespace(confidence=native_identity.HARNESS_ONLY,
+                                           session_id="")
+
+                def current_codex_thread(pane, pid=None, server=None, **_kwargs):
+                    codex_thread_calls.append((pane, pid, server))
+                    return "session-1" if pane == "w1:p9" and pid == process_pid else ""
+
                 real_prompt = steward.cmd_prompt
                 delivered = []
                 sent_texts = []
@@ -1799,10 +1852,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                             mock.patch.object(steward.peer_message, "_ack_registered_delivery",
                                               side_effect=receiver_ack), \
                             mock.patch.object(steward.peer_message, "bind_dispatch_notice", side_effect=bind), \
-                            mock.patch.object(steward, "_herdr_missing", return_value=False), \
                             mock.patch.object(steward, "_current_session_identity", return_value=("sender-1", "claude")), \
                             mock.patch.object(steward, "_from_name", return_value="fixture"), \
-                            mock.patch.object(steward, "_agent_state", return_value=("idle", "w1:p9")), \
                             mock.patch.object(steward, "_pane_readiness", return_value=type(
                                 "Ready", (), {"state": "ready", "reason": ""})()), \
                             mock.patch.object(steward, "_flush_pending_for_target", return_value=(0, 0)), \
@@ -1836,11 +1887,13 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                                 prepared_refs[0])
                             repair_ack.assert_called_once_with(received)
                         return code
-                with mock.patch.object(steward.subprocess, "run", side_effect=lambda *a, **kw:
-                        type("Reply", (), {"stdout": json.dumps(agents), "returncode": 0})()), \
+                with mock.patch.object(steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                        mock.patch.object(steward.subprocess, "run", side_effect=external_observation), \
+                        mock.patch.object(native_identity, "process_identity", side_effect=process_identity), \
+                        mock.patch.object(pane_ownership, "current_codex_thread",
+                                          side_effect=current_codex_thread), \
                         mock.patch.object(rewake.pending_delivery, "claim",
                                           wraps=rewake.pending_delivery.claim) as claim_spy, \
-                        mock.patch.object(steward, "_resolve_target", return_value=(harness, "session-1", None)), \
                         mock.patch.object(steward, "cmd_prompt", side_effect=prompt) as prompt_call:
                     steward._resume_registered_obligation(duty, store)
                     prompt_call.assert_not_called()
@@ -1857,6 +1910,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                     self.assertEqual(prompt_call.call_args.kwargs["expected_recipient"], (harness, "session-1"))
                     self.assertTrue(any(call.kwargs.get("jobs") == self.jobs
                                         for call in claim_spy.call_args_list))
+                    self.assertIn(("agent", "get", "w1:p9"), observed_commands)
+                    self.assertTrue(any(command[:2] == ("pane", "process-info")
+                                        for command in observed_commands))
+                    if harness == "codex":
+                        self.assertTrue(codex_thread_calls)
+                        self.assertTrue(all(pane == "w1:p9" and pid == process_pid
+                                            for pane, pid, _server in codex_thread_calls))
+                    else:
+                        self.assertTrue(native_identity_calls)
+                        self.assertTrue(all((pid, observed_harness) == (process_pid, harness)
+                                            for pid, observed_harness in native_identity_calls))
                     if not immediate:
                         queued = store.get(duty["id"])
                         self.assertEqual(queued["state"], "pending")

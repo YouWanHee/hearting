@@ -882,6 +882,35 @@ class SameRowTest(unittest.TestCase):
         self.assertEqual(rows["codex"]["reasoning"], "high")
         self.assertEqual(rows["claude"]["supervisor_lease_nonce"], "nonce")
 
+    def test_launch_records_all_or_no_main_runtime_fields(self):
+        from unittest import mock
+        with mock.patch.object(C, "_retention_main_identity",
+                               return_value=("codex", "431", "900", "pid:[4026531836]")):
+            fields = self.row("codex", runtime_sandbox="workspace-write", effort_key="reasoning")
+        self.assertEqual((fields["main_runtime_harness"], fields["main_runtime_pid"],
+                          fields["main_runtime_pid_start"], fields["main_runtime_ns"]),
+                         ("codex", "431", "900", "pid:[4026531836]"))
+        with mock.patch.object(C, "_retention_main_identity", return_value=None):
+            absent = self.row("claude", runtime_sandbox="adapter-default", effort_key="effort")
+        self.assertFalse(any(key.startswith("main_runtime_") for key in absent))
+
+    def test_nested_main_runtime_identity_follows_only_exact_parent_attempts(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        jobs = Path(self.tmp) / "jobs.log"
+        parent = "att-parent"
+        root = "att-root"
+        jobs.write_text(
+            "2026-01-01T00:00:00Z\tdone\t/repo\t/wt\troot\tattempt_id=att-root,dispatch_depth=1,main_runtime_harness=claude,main_runtime_pid=21,main_runtime_pid_start=32,main_runtime_ns=pid:[1]\n"
+            "2026-01-01T00:00:00Z\tdone\t/repo\t/wt\tchild\tattempt_id=att-parent,parent_attempt_id=att-root,dispatch_depth=2\n",
+            encoding="utf-8")
+        args = SimpleNamespace(dispatch_depth=3, parent_binding=SimpleNamespace(attempt_id=parent))
+        with mock.patch.object(C, "_interactive_main_identity", side_effect=AssertionError):
+            self.assertEqual(C._retention_main_identity(jobs, args, "opencode"),
+                             ("claude", "21", "32", "pid:[1]"))
+        jobs.write_text(jobs.read_text().replace("parent_attempt_id=att-root", "parent_attempt_id=att-missing"))
+        self.assertIsNone(C._retention_main_identity(jobs, args, "opencode"))
+
     def test_shared_start_path_checks_projection_before_seal_and_spawn(self):
         from unittest import mock
 
