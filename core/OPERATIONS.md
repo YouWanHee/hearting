@@ -1028,9 +1028,9 @@ A legacy hash collision is diagnostic
      remote evidence cannot be refreshed, cleanup blocks instead of trusting a
      cached remote-tracking ref. It never uses `--force`, and the branch is
      retained as a rollback point.
-     An explicit local integration ref must include the target itself and must
-     have a configured upstream that is freshly fetched; an explicit remote ref
-     is checked directly against its freshly fetched remote branch.
+     Explicit local integration refs are checked for target inclusion and a
+     freshly fetched configured upstream; explicit remote refs use their
+     freshly fetched remote branch directly.
      A repository with no remote may instead pass the explicit
      `--repository-mode local-only`; this checks the selected local integration
      ref without remote evidence and records `integration_upstream=local-only`.
