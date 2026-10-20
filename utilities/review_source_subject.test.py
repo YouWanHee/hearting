@@ -224,6 +224,12 @@ class SourceSubjectTest(unittest.TestCase):
         completion_root = Path(self.temp.name) / "completion"
         cases = (
             ("unknown", None, "review-source-binding-missing"),
+            ("wrong-inline-attempt", {
+                "schema_version": SUBJECT.SCHEMA_VERSION, "digest": current_digest,
+                "epoch": 0, "inline_provenance": {
+                    "kind": "owner-inline", "attempt_id": "att-other-review",
+                    "manifest_sha256": "0" * 64,
+                }}, "review-source-binding-missing"),
             ("stale", {"schema_version": SUBJECT.SCHEMA_VERSION,
                         "digest": "0" * 64, "epoch": 0},
              "review-source-subject-changed-before-completion"),

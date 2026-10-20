@@ -730,8 +730,30 @@ def _inline_evidence_subject_unchanged(route: dict, node: dict, evidence_sha256:
                         or isinstance(subject.get("epoch"), bool)
                         or subject["epoch"] < 0):
                     unknown = True
-                elif subject["digest"] != digest or subject["epoch"] != epoch:
-                    changed = True
+                elif (not isinstance(marker.get("attempt_id"), str)
+                      or not _SAFE_ID.fullmatch(marker["attempt_id"])):
+                    unknown = True
+                else:
+                    provenance_valid = True
+                    if "inline_provenance" in subject:
+                        provenance = subject["inline_provenance"]
+                        provenance_valid = not (
+                            not isinstance(provenance, dict)
+                            or set(provenance) != {"kind", "attempt_id", "manifest_sha256"}
+                            or provenance.get("kind") != "owner-inline"
+                            or provenance.get("attempt_id") != marker["attempt_id"]
+                            or not re.fullmatch(r"[0-9a-f]{64}", str(
+                                provenance.get("manifest_sha256", "")))
+                            or marker.get("reviewer_kind") != "owner-inline"
+                            or marker.get("review_independence") != "degraded"
+                            or marker.get("reviewer_identity") != marker["attempt_id"]
+                            or marker.get("registered_worker") is not False
+                            or marker.get("execution_surface") != "inline"
+                        )
+                    if not provenance_valid:
+                        unknown = True
+                    elif subject["digest"] != digest or subject["epoch"] != epoch:
+                        changed = True
             except FileNotFoundError:
                 continue
             except (OSError, ValueError, TypeError) as exc:
