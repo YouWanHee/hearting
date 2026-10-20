@@ -251,12 +251,17 @@ opencode_runtime_projection_check() {
     printf 'check=failed\nreason=opencode-native-plugin-missing\nopencode_home=%s\nexpected=%s\n' "$opencode_home" "$opencode_home/plugins/hearting-guards.js"
     return 69
   fi
+  if [ ! -f "$opencode_home/plugins/hearting-guards/index.ts" ]; then
+    printf 'check=failed\nreason=opencode-v2-plugin-entrypoint-missing\nopencode_home=%s\nexpected=%s\n' "$opencode_home" "$opencode_home/plugins/hearting-guards/index.ts"
+    return 69
+  fi
   if [ ! -d "$opencode_home/skills" ] && [ ! -d "$opencode_home/agent-skills" ] && ! opencode_config_content_has_opencode_skills "${OPENCODE_CONFIG_CONTENT:-}"; then
     printf 'check=failed\nreason=opencode-native-skills-missing\nopencode_home=%s\nexpected=%s|%s\n' "$opencode_home" "$opencode_home/skills" "$opencode_home/agent-skills"
     return 69
   fi
   if rg -q 'adapters/claude|claude_setting|settings\.json|statusline\.sh|CLAUDE\.md|agent-modes|allowedTools|/\.claude/' \
-    "$native_agent" "$native_command" "$opencode_home/plugins/hearting-guards.js" 2>/dev/null; then
+    "$native_agent" "$native_command" "$opencode_home/plugins/hearting-guards.js" \
+    "$opencode_home/plugins/hearting-guards/index.ts" 2>/dev/null; then
     printf 'check=failed\nreason=opencode-runtime-projection-exposes-claude-surface\nopencode_home=%s\n' "$opencode_home"
     return 69
   fi

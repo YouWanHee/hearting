@@ -17,7 +17,7 @@ class TextProviderContextTest(unittest.TestCase):
             for adapter, flag in (("claude", "--effort"), ("codex", "-c"), ("opencode", "--variant")):
                 with self.subTest(adapter=adapter), mock.patch.object(
                     rt, "provider_settings", return_value={"model": "test-model", "budget": "low"}
-                ) as resolve:
+                ) as resolve, mock.patch.object(rt.opencode_runtime, "is_v2", return_value=False):
                     command = rt.provider_command(adapter, "prompt", workdir=Path(tmp), profile="light")
                     resolve.assert_called_once_with(adapter, mock.ANY, profile="light")
                     argv = command[0]
@@ -59,7 +59,7 @@ class TextProviderContextTest(unittest.TestCase):
             (source / "opencode.jsonc").write_text(original)
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(source.parent)}), mock.patch.object(
                 rt, "provider_settings", return_value={"model": "custom/model", "budget": "runtime-default"}
-            ):
+            ), mock.patch.object(rt.opencode_runtime, "is_v2", return_value=False):
                 command = rt.provider_command("opencode", "prompt", workdir=Path(tmp) / "state")
             config = json.loads((Path(command.env["XDG_CONFIG_HOME"]) / "opencode/opencode.json").read_text())
             self.assertEqual(config["provider"]["custom"]["options"]["baseURL"], "https://host/path/*ok*/")
@@ -71,6 +71,47 @@ class TextProviderContextTest(unittest.TestCase):
             self.assertEqual(command[0][command[0].index("--log-level") + 1], "WARN")
             self.assertEqual(command[1], "prompt")
             self.assertEqual((source / "opencode.jsonc").read_text(), original)
+
+    def test_opencode_v2_uses_json_cwd_and_v2_no_tools_agent(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                rt, "provider_settings",
+                return_value={"model": "opencode-go/model", "budget": "high"}), \
+             mock.patch.object(rt.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(rt.opencode_runtime, "select_automatic_model",
+                              return_value=("opencode-go/model", "high", {"state": "unknown"})):
+            workdir = Path(tmp) / "state"
+            command = rt.provider_command("opencode", "prompt", workdir=workdir, profile="light")
+            argv = command[0]
+            self.assertNotIn("--pure", argv)
+            self.assertNotIn("--dir", argv)
+            self.assertNotIn("--variant", argv)
+            self.assertNotIn("--log-level", argv)
+            self.assertEqual(argv[argv.index("--format") + 1], "json")
+            self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/model#high")
+            self.assertEqual(argv[argv.index("--agent") + 1], "hearting-fleet-titler")
+            self.assertTrue(argv[argv.index("--title") + 1].startswith("hearting-worker-"))
+            agent = workdir / ".opencode" / "agents" / "hearting-fleet-titler.md"
+            self.assertTrue(agent.is_file())
+            self.assertIn("action: execute", agent.read_text())
+            self.assertIn("effect: deny", agent.read_text())
+            config = json.loads((Path(command.env["XDG_CONFIG_HOME"])
+                                 / "opencode/opencode.json").read_text())
+            self.assertIn("permissions", config)
+            self.assertEqual(config["mcp"], {"servers": {}})
+            self.assertEqual(config["plugins"], [])
+            project_config = json.loads((workdir / ".opencode/opencode.json").read_text())
+            self.assertEqual(project_config["policies"][0],
+                             {"action": "tool.use", "resource": "*", "effect": "deny"})
+            self.assertEqual(project_config["policies"][-1]["effect"], "allow")
+            with mock.patch.object(rt.opencode_runtime, "record_model_outcome") as record, \
+                 mock.patch.object(rt.subprocess, "run", return_value=mock.Mock(
+                     returncode=0, stdout="\n".join((
+                         json.dumps({"type": "step_start", "sessionID": "ses_x"}),
+                         json.dumps({"type": "text", "sessionID": "ses_x",
+                                     "part": {"text": "TITLE: A\nNOW: B"}}), "")))):
+                self.assertEqual(rt.run_provider_cascade([command], timeout=1, env={}),
+                                 ("TITLE: A\nNOW: B", 0))
+            record.assert_called_once()
 
     def test_cascade_passes_each_child_context_without_mutating_caller(self):
         env = {"CODEX_HOME": "caller", "OPENCODE_CONFIG_CONTENT": "foreign", "KEEP": "value"}

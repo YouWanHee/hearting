@@ -34,10 +34,16 @@ from pathlib import Path
 SCHEMA = "frame_interview_v1"
 ANSWERS_SCHEMA = "frame_interview_answers_v1"
 ANSWER_ACTOR_KINDS = ("user", "supervisor", "automatic", "headless-owner", "unknown")
-ANSWERS_SHAPE = ('answers file: {"understanding_confirmed": true, "answers": {"<question id>": {"choice": 0}}} '
+ANSWER_SOURCE_GUIDANCE = ('Set "actor_kind": "user" only for the person\'s actual reply, or '
+                          '"actor_kind": "supervisor" when the depth-0 supervisor answers on the person\'s behalf '
+                          '(including adopting a recommendation). The template stays "unknown" until the source '
+                          'is explicitly recorded; unmarked answers remain unknown. Registered workers cannot '
+                          'claim user or supervisor authority. Supervisor answers release frame-review only; '
+                          'person-only start approvals keep their gates.')
+ANSWERS_SHAPE = ('answers file: {"actor_kind": "supervisor", "understanding_confirmed": true, '
+                 '"answers": {"<question id>": {"choice": 0}}} '
                  '-- choice is an option index or label ("none" plus a "note" when no option fits); '
-                 'add "correction" when understanding_confirmed is false; the acting parent sets '
-                 '"actor_kind": "user" only for the actual user reply (unmarked source is unknown)')
+                 'add "correction" when understanding_confirmed is false. ' + ANSWER_SOURCE_GUIDANCE)
 # A decision question stays open until the person answers (roles/response-policy.md).
 PENDING_ANSWER_RULE = ("Until the person answers, do not proceed and do not ask again; if the turn "
                        "ends first, end it with the question and its options restated, and use the "
@@ -379,7 +385,9 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
     else:
         for field in BRIEF_FIELDS:
             text = _text(brief.get(field)).strip()
-            if not text and field != "open":
+            # Direction briefs have no dedicated affected-users/systems section.
+            # Accept an empty draft rather than require invented scope.
+            if not text and field not in {"affected", "open"}:
                 errors.append(f"brief.{field}: missing")
     questions = interview.get("questions")
     if not isinstance(questions, list):

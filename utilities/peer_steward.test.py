@@ -2508,7 +2508,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
     def test_different_steward_seats_stay_independent_and_successor_retirement_is_separate(self):
         import contextlib
         import io
-
+        import session_tidy
         seat_by_steward = {
             "steward-1": "seat-A",
             "steward-2": "seat-B",
@@ -2542,52 +2542,50 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             return fields, watcher
 
         first, first_watcher = register("steward-1", "peer-a")
-        first_observation = self._wait_for_observation(first["watch_id"])
-        first_deadline = time.monotonic() + 10
-        while (first_observation.get("native_wait", {}).get("state") != "started"
-               and time.monotonic() < first_deadline):
-            time.sleep(0.02)
-            first_observation = json.loads((self.watch_root /
-                f"{first['watch_id']}.observation.json").read_text())
-        first_wait = first_observation["native_wait"]
-        self.assertTrue(peer_steward._pid_identity_ok(
-            first_wait["pid"], first_wait["pid_start"]))
-
         second, second_watcher = register("steward-2", "w1:p9")
         self.assertEqual((first["state"], second["state"]), ("armed", "armed"))
         self.assertNotEqual(first["watch_id"], second["watch_id"])
         self._wait_for_wait_calls(2)
 
-        # This old observer and its waiter are exact private fixture processes;
-        # freeing its lock lets the successor path settle it synchronously.
-        self.assertTrue(peer_steward._pid_identity_ok(
-            first_watcher.pid, first["pid_start"]))
-        os.kill(first_watcher.pid, signal.SIGKILL)
-        first_watcher.wait(timeout=10)
-        self.assertTrue(peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"]))
-        os.kill(first_wait["pid"], signal.SIGKILL)
-        wait_deadline = time.monotonic() + 10
-        while (time.monotonic() < wait_deadline
-               and peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"])):
-            time.sleep(0.02)
-
+        # A durable same-seat handover transfers the original watch identity.
+        # A different seat stays independent even when Herdr reports the same pane.
+        first_arm_path = self.watch_root / f"{first['watch_id']}.json"
+        first_arm = json.loads(first_arm_path.read_text())
+        seat = session_tidy.Seat("pane", "seat-A", "w1:p9", "claude")
+        first_arm["steward_seat"] = seat.as_dict()
+        peer_steward._write_json_atomic(first_arm_path, first_arm)
+        steward = first_arm["steward"]
+        carried_watch = {
+            "watch_id": first["watch_id"],
+            "origin": {"harness": steward["harness"], "sid": steward["session_id"]},
+            "holder": {"harness": "claude", "sid": "steward-3"},
+            "seat_key": seat.key, "storage_root": str(peer_steward.peer_message.peer_state_root()),
+            "server": first_arm["server"], "target": first_arm["target"],
+            "agent": dict(first_arm["agent"]), "until": list(first_arm["until"]),
+            "armed_ts": first_arm["armed_ts"], "deadline": first_arm["deadline"],
+            "lineage": [{"from": "steward-1", "to": "steward-3", "snapshot_id": "fixture"}],
+        }
+        with mock.patch.dict(os.environ, self._env("held", session_id="steward-1")):
+            with session_tidy.seat_lock(seat.key):
+                session_tidy._append_ledger_entry(seat, {
+                    "ts": session_tidy.now_epoch(), "harness": "claude", "sid": "steward-3",
+                    "event": "handover", "from": "steward-1", "seat_key": seat.key,
+                    "bindings": [], "steward": {"schema": 1, "roles": [],
+                                                   "watches": [carried_watch]},
+                })
         successor, successor_watcher = register("steward-3", "sid-fake")
-        self.assertEqual(successor["state"], "armed")
-        self.assertNotEqual(successor["watch_id"], first["watch_id"])
-        self.assertNotEqual(successor["watch_id"], second["watch_id"])
-        retired = self._wait_for_receipt(first["watch_id"])
-        self.assertEqual((retired["state"], retired["reason"]),
-                         ("superseded", "steward-replaced"))
+        self.assertEqual(successor["state"], "already-armed")
+        self.assertEqual(successor["watch_id"], first["watch_id"])
         self.assertFalse((self.watch_root / f"{second['watch_id']}.receipt.json").exists())
-        self.assertFalse((self.watch_root / f"{successor['watch_id']}.receipt.json").exists())
-        self.assertEqual(len(self._arm_records()), 3)
+        self.assertEqual(len(self._arm_records()), 2)
 
-        self._wait_for_wait_calls(3)
+        self._wait_for_wait_calls(2)
         self._release()
         self._release()
+        self._wait_for_receipt(first["watch_id"])
         self._wait_for_receipt(second["watch_id"])
-        self._wait_for_receipt(successor["watch_id"])
-        for process in (second_watcher, successor_watcher):
+        self.assertIs(first_watcher, successor_watcher)
+        for process in (first_watcher, second_watcher):
             process.wait(timeout=10)
         for process in spawned:
             if process.poll() is None:
@@ -3091,14 +3089,54 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
     def test_ack_is_created_once_then_silently_skipped(self):
         fields = self._arm(mode="idle")
         self._wait_for_receipt(fields["watch_id"])
+        with mock.patch.dict(os.environ, self._env("idle")):
+            import dispatch_seat_handover as handover
+            self.assertIsNotNone(handover.resolve_watch(fields["watch_id"]),
+                                 repr({"roots": handover._watch_roots(handover._peer_message()),
+                                       "arm": peer_steward._read_json(
+                                           peer_steward._watch_paths(fields["watch_id"]).arm),
+                                       "refs": handover.resolved_watch_references()}))
+        # Exercise cmd_ack's ordinary recovery of a canonical path left torn by
+        # an interrupted writer; the callback itself must revalidate the holder.
+        torn_ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        torn_ack.write_bytes(b'{"watch_id":')
         first = self._run("ack", fields["watch_id"], "--carrier", "claude-async-rewake")
         second = self._run("ack", fields["watch_id"], "--carrier", "userprompt-sweep")
-        self.assertEqual((first.returncode, second.returncode), (0, 0))
-        self.assertIn("ack=created", first.stdout)
-        self.assertIn("ack=already", second.stdout)
+        self.assertEqual((first.returncode, second.returncode), (0, 0),
+                         first.stdout + first.stderr + second.stdout + second.stderr)
+        self.assertIn("ack=created", first.stdout, first.stdout + first.stderr)
+        self.assertIn("ack=already", second.stdout, second.stdout + second.stderr)
         ack = json.loads((self.watch_root / f"{fields['watch_id']}.ack.json").read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], "steward-1")
+
+    def test_ack_fsync_failure_does_not_settle_original_watch_ref_until_retry(self):
+        import contextlib
+        import io
+        import dispatch_seat_handover as handover
+
+        fields = self._arm(mode="idle")
+        self._wait_for_receipt(fields["watch_id"])
+        ack = self.watch_root / f"{fields['watch_id']}.ack.json"
+        with mock.patch.dict(os.environ, self._env("idle")), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("steward-1", "claude")), \
+             mock.patch.object(peer_steward.peer_message, "settle_watch_transfers",
+                               return_value=False) as settle, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(handover.os, "fsync",
+                                   side_effect=OSError("fixture ACK fsync failure")):
+                self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                    watch_id=fields["watch_id"], carrier="fixture-carrier")), 0)
+            settle.assert_not_called()
+            self.assertFalse(ack.exists())
+
+            self.assertEqual(peer_steward.cmd_ack(SimpleNamespace(
+                watch_id=fields["watch_id"], carrier="retry-carrier")), 0)
+            settle.assert_called_once_with(fields["watch_id"], "claude", "steward-1")
+            ack_data = json.loads(ack.read_text(encoding="utf-8"))
+            self.assertEqual((ack_data["watch_id"], ack_data["harness"], ack_data["session_id"]),
+                             (fields["watch_id"], "claude", "steward-1"))
 
     def test_a_restarted_watch_line_does_not_claim_the_hook_either(self):
         """`state=rearmed` — the branch B1-a was originally raised about.
@@ -5710,6 +5748,27 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
                                    return_value=type("Ready", (), {"state": "ready", "reason": ""})()), \
                  mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
                 self.assertEqual(peer_steward._continue_look(self.seat_obj.pane, req), expected)
+
+    def test_continue_is_not_held_back_by_the_sessions_own_dispatched_work(self):
+        self.cleared()
+        req = self.booking()
+        info = {"pane_id": self.seat_obj.pane, "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        ident = {"harness": "claude", "session_id": "sid-B", "pane": self.seat_obj.pane, "name": "sup"}
+
+        def readiness(*_a, purpose="completion", **_k):
+            # A supervisor whose owners still run: pending for completion, ready for input.
+            state, reason = (("ready", "native-turn-ready") if purpose == "input"
+                             else ("pending", "bound-registered-work-pending"))
+            return type("Readiness", (), {"state": state, "reason": reason})()
+
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+             mock.patch.object(peer_steward, "_continue_native_session", return_value="sid-B"), \
+             mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
+            self.assertIsNone(peer_steward._continue_look(self.seat_obj.pane, req))
 
     def test_user_prompt_card_handoff_and_expiry_still_stop_continue(self):
         def bump(seat):
@@ -8465,6 +8524,21 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
                     marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
                     entry = marker["targets"]["observed-sid"]
                     self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))
+
+    def test_a_refused_start_names_why_the_observed_agent_was_not_adopted(self):
+        for cwd, miss in (("", "cwd-empty"), ("/elsewhere", "cwd-mismatch")):
+            with self.subTest(cwd=cwd):
+                world = self.world("claude", error="agent_pane_busy")
+                world.cwd = cwd
+                rc, line = self.invoke("claude", world)
+                self.assertIn("started=false", line)
+                self.assertIn("reason=agent_pane_busy", line)
+                self.assertIn(f"observed={miss}", line)
+                self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 0)
+        world = self.world("claude", error="agent_pane_busy")
+        rc, line = self.invoke("claude", world)
+        self.assertIn("started=true", line)
+        self.assertNotIn("observed=", line)
 
     def test_reuse_observes_existing_pane_without_another_launch_or_keyboard_input(self):
         for kind in ("claude", "codex", "opencode"):

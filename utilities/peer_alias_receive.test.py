@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,6 +233,185 @@ class AliasReceive(unittest.TestCase):
             pm.emit_peer_context(self.recipient, "PostToolUse", stream=output)
         send.assert_called_once_with(ref, timeout=0.25)
         self.assertEqual(output.getvalue(), "", "no second body delivery transport")
+
+    def test_codex_confirmed_sessionstart_clear_input_reaches_shared_handover(self):
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import pane_ownership
+        import session_tidy
+        import dispatch_seat_handover as handover
+
+        hook = module("watch_continuity_codex_sessionstart",
+                      "adapters/codex/hooks/sessionstart-lifecycle.py")
+        pane, a, b = "fixture:codex-start-seat", "start-input-A", "start-input-B"
+        base_env = {"HERDR_PANE_ID": pane, "AGENT_DISPATCH_CALLER_HARNESS": "codex"}
+        commands = []
+        with mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
+             mock.patch.object(pane_ownership, "current_codex_thread_for_caller", return_value=None):
+            with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": a}):
+                self.assertTrue(pm.mark_steward("codex", a,
+                    {"harness": "claude", "session_id": "start-target", "name": "target"},
+                    "watch", "fixture-time", source="watch"))
+                seat = session_tidy.resolve_seat("codex", str(ROOT), os.environ, a)
+                with session_tidy.seat_lock(seat.key):
+                    session_tidy.record_event(seat, "codex", a, "start", source="startup",
+                                              cwd=str(ROOT))
+                    self.assertEqual(handover.write_snapshot_locked(
+                        seat, "codex", a, jobs=self.state / "jobs.log"), 0)
+
+            with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": b}):
+                def confirmed_start(argv, **kwargs):
+                    commands.append(list(argv))
+                    self.assertIn("--harness", argv)
+                    self.assertIn("codex", argv)
+                    self.assertIn("--event", argv)
+                    self.assertIn("start", argv)
+                    self.assertIn("--session-id", argv)
+                    self.assertIn(b, argv)
+                    self.assertIn("--source", argv)
+                    self.assertIn("clear", argv)
+                    session_tidy.run_hook("codex", "start", b, source="clear",
+                                           cwd=str(ROOT), env=os.environ)
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+                with mock.patch.object(hook.subprocess, "run", side_effect=confirmed_start):
+                    self.assertEqual(hook.card_context(
+                        {"session_id": b, "source": "clear"}, str(ROOT)), "")
+                self.assertEqual(len(commands), 1)
+                rows = handover.handover_rows(seat)
+                self.assertEqual([(row["from"], row["sid"]) for row in rows], [(a, b)])
+                self.assertEqual(handover.resolved_steward_relations(
+                    "codex", b, seat_key=seat.key)[0]["origin"]["sid"], a)
+
+    def test_codex_native_queue_receives_same_watch_ref_at_confirmed_c_and_acks_c(self):
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import pane_ownership
+        import session_tidy
+        import dispatch_seat_handover as handover
+
+        pane = "fixture:watch-seat"
+        a, b, c = "codex-watch-A", "codex-watch-B", "codex-watch-C"
+        watch_id = "watch-queue-fixture"
+        base_env = {"HERDR_PANE_ID": pane, "AGENT_DISPATCH_CALLER_HARNESS": "codex"}
+        with mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
+             mock.patch.object(pane_ownership, "current_codex_thread_for_caller", return_value=None):
+            with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": a}):
+                self.assertTrue(pm.mark_steward("codex", a,
+                    {"harness": "claude", "session_id": "target-session", "name": "target"},
+                    "watch", "fixture-time", source="watch"))
+                seat = session_tidy.resolve_seat("codex", str(ROOT), os.environ, a)
+                watch_root = pm.peer_state_root() / "peer-watches"
+                watch_root.mkdir(parents=True, exist_ok=True)
+                arm = {"schema_version": 1, "watch_id": watch_id, "target": "target-name",
+                       "server": "queue-fixture", "until": ["done"],
+                       "deadline": {"wall_deadline": 9999999999, "requested_ms": 60000,
+                                    "boot_id": "fixture"}, "armed_ts": "fixture-time",
+                       "steward": {"harness": "codex", "session_id": a},
+                       "steward_seat": seat.as_dict(),
+                       "agent": {"harness": "claude", "session_id": "target-session",
+                                 "name": "target", "pane": "fixture:target"}}
+                (watch_root / f"{watch_id}.json").write_text(json.dumps(arm), encoding="utf-8")
+                with session_tidy.seat_lock(seat.key):
+                    session_tidy.record_event(seat, "codex", a, "start", source="startup",
+                                              cwd=str(ROOT))
+                    self.assertEqual(handover.write_snapshot_locked(
+                        seat, "codex", a, jobs=self.state / "jobs.log"), 0)
+
+            with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": b}):
+                session_tidy.run_hook("codex", "start", b, source="clear", cwd=str(ROOT), env=os.environ)
+                with session_tidy.seat_lock(seat.key):
+                    self.assertEqual(handover.write_snapshot_locked(
+                        seat, "codex", b, jobs=self.state / "jobs.log"), 0)
+
+            sender = {"harness": "codex", "session_id": a}
+            original_storage = {"harness": "codex", "session_id": a}
+            body = f"[peer-steward] watch_id={watch_id} state=idle target=target-name"
+            text, transfer_ref = pm.prepare_peer_message(
+                body, sender, original_storage, defer=True,
+                refs=[f"peer-watch:{watch_id}"], receipt=f"peer-steward-watch:{watch_id}")
+            transfer_before = pm._read_transfer_record(transfer_ref)
+            self.assertEqual(pm.pending_delivery_recipient(pm._read_pending(transfer_ref)),
+                             {"harness": "codex", "session_id": b})
+            self.assertEqual(handover.acknowledge_watch(watch_id, "codex", a, "stale-A"),
+                             "not-recipient")
+
+            with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": c}):
+                session_tidy.run_hook("codex", "start", c, source="clear", cwd=str(ROOT), env=os.environ)
+                recipient = {"harness": "codex", "session_id": c}
+                self.assertEqual(pm.pending_delivery_recipient(pm._read_pending(transfer_ref)), recipient)
+                self.assertEqual(pm.pending_messages(recipient)[0]["ref"], transfer_ref)
+                self.assertEqual(handover.acknowledge_watch(watch_id, "codex", b, "stale-B"),
+                                 "not-recipient")
+
+                # Fleet forward/reverse uses the same resolved holder and target.
+                sys.path.insert(0, str(ROOT / "tools"))
+                from fleet.collectors import steward as fleet_steward
+                predecessor_session = SimpleNamespace(
+                    harness="codex", session_id=a, cwd=str(ROOT), slug="steward-A",
+                    runtime_name=None, _herdr_name=None, session_aliases=[],
+                    _gpu_session_aliases=[])
+                steward_session = SimpleNamespace(
+                    harness="codex", session_id=c, cwd=str(ROOT), slug="steward-C",
+                    runtime_name=None, _herdr_name=None, session_aliases=[],
+                    _gpu_session_aliases=[])
+                target_session = SimpleNamespace(
+                    harness="claude", session_id="target-session", cwd=str(ROOT),
+                    slug="target", runtime_name="target", _herdr_name=None,
+                    session_aliases=[], _gpu_session_aliases=[])
+                marker_before = pm.steward_marker_path("codex", a).read_bytes()
+                ledger_path = session_tidy._ledger_path(seat)
+                ledger_before = ledger_path.read_bytes()
+                arm_before = (watch_root / f"{watch_id}.json").read_bytes()
+                fleet_steward.enrich([predecessor_session, steward_session, target_session],
+                                     markers=pm.read_steward_markers([self.state]))
+                self.assertFalse(predecessor_session.steward)
+                self.assertTrue(steward_session.steward)
+                self.assertEqual(steward_session.steward_targets[0]["session_id"], "target-session")
+                self.assertEqual(target_session.steward_parents[0]["session_id"], c)
+                self.assertEqual((marker_before, ledger_before, arm_before),
+                                 (pm.steward_marker_path("codex", a).read_bytes(),
+                                  ledger_path.read_bytes(),
+                                  (watch_root / f"{watch_id}.json").read_bytes()))
+
+                import codex_queue_delivery as queue
+                import codex_queue_dispatch as queue_dispatch
+                with mock.patch.object(queue_dispatch, "resolve_queue_socket", return_value="fixture-socket"), \
+                     mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+                    self.assertEqual(pm.deliver_pending_codex(transfer_ref)["status"], "queued")
+                self.assertEqual(send.call_args.kwargs["message"], text)
+                self.assertEqual(pm._read_transfer_record(transfer_ref), transfer_before)
+
+                lifecycle = module("watch_transfer_codex_lifecycle",
+                                   "adapters/codex/hooks/userprompt-lifecycle.py")
+                ack_path = watch_root / f"{watch_id}.ack.json"
+                real_write = os.write
+                writes = []
+
+                def partial_ack_then_fail(fd, data):
+                    try:
+                        target_path = os.readlink(f"/proc/self/fd/{fd}")
+                    except OSError:
+                        target_path = ""
+                    if f".{ack_path.name}." not in target_path or not target_path.endswith(".tmp"):
+                        return real_write(fd, data)
+                    writes.append(len(data))
+                    if len(writes) == 1:
+                        return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
+                    raise OSError("fixture interrupted native ACK write")
+
+                with mock.patch.object(handover.os, "write", side_effect=partial_ack_then_fail):
+                    lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
+                self.assertGreaterEqual(len(writes), 2)
+                self.assertFalse(ack_path.exists())
+                self.assertEqual(pm._read_pending(transfer_ref)["state"], "received")
+                # The next ordinary native receipt callback retries the same watch ID.
+                lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
+                pending = pm._read_pending(transfer_ref)
+                self.assertEqual((pending["state"], pending["receipt"]), ("received", "exact-peer-ref"))
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+                self.assertEqual((ack["watch_id"], ack["harness"], ack["session_id"]),
+                                 (watch_id, "codex", c))
+                self.assertEqual(handover.resolved_watch_references(
+                    "codex", c, seat_key=seat.key), [])
 
     def test_original_sender_stuck_notice_on_all_existing_tool_callbacks(self):
         for harness in ("claude", "codex", "opencode"):
@@ -704,7 +884,21 @@ const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins
 const logs = [], timers = [];
 const scope = {process: {env: {}}, isWorkerSession: () => false, Buffer,
   setTimeout: cb => {const t = {cb, unref() {}}; timers.push(t); return t}, clearTimeout: () => {}};
-vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+function paneProjectionSource(source) {
+  const start = source.indexOf("function sdkResponseData(");
+  const exportStart = source.indexOf("\nexport default {\n", start);
+  const exportEnd = source.indexOf("\n}\n\n// Invocation-time root", exportStart);
+  const end = source.indexOf("\nfunction collectPreflight", exportEnd);
+  if (start < 0 || exportStart < start || exportEnd < exportStart || end < exportEnd)
+    throw Error("OpenCode pane fixture extraction boundary changed");
+  const moduleExport = source.slice(exportStart, exportEnd + 2);
+  if (!moduleExport.includes('id: "hearting-guards"')
+      || !moduleExport.includes("setup: setupOpenCodeV2")
+      || !moduleExport.includes("AgentHarnessGuards"))
+    throw Error("OpenCode V2 plugin export contract changed");
+  return source.slice(start, exportStart) + source.slice(exportEnd + 2, end);
+}
+vm.runInNewContext(paneProjectionSource(source), scope);
 const ctx = {client: {app: {log: async ({body}) => logs.push(body)}}};
 const observation = {schema: "hearting-pane-observation-v1", reason: "report-attempts-finished",
   session_report: "exit0", metadata_report: "timeout", session_report_rc: 0};
@@ -793,7 +987,21 @@ function fixture(options = {}) {
       if (options.syncThrows) throw Object.assign(Error("synthetic sync failure"), {code: "EFAULT", errno: -14});
       return options.syncResult || {pid: 0, error: Object.assign(Error("synthetic fallback denied"), {code: "EACCES", errno: -13})};
     }};
-  vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+  function paneProjectionSource(source) {
+    const start = source.indexOf("function sdkResponseData(");
+    const exportStart = source.indexOf("\nexport default {\n", start);
+    const exportEnd = source.indexOf("\n}\n\n// Invocation-time root", exportStart);
+    const end = source.indexOf("\nfunction collectPreflight", exportEnd);
+    if (start < 0 || exportStart < start || exportEnd < exportStart || end < exportEnd)
+      throw Error("OpenCode pane fixture extraction boundary changed");
+    const moduleExport = source.slice(exportStart, exportEnd + 2);
+    if (!moduleExport.includes('id: "hearting-guards"')
+        || !moduleExport.includes("setup: setupOpenCodeV2")
+        || !moduleExport.includes("AgentHarnessGuards"))
+      throw Error("OpenCode V2 plugin export contract changed");
+    return source.slice(start, exportStart) + source.slice(exportEnd + 2, end);
+  }
+  vm.runInNewContext(paneProjectionSource(source), scope);
   return {scope, commands, children, logs, reads, timers, sync, setNow: value => {now = value},
     ctx: get => ({directory: "/fixture/project", client: {app: {log: async ({body}) => logs.push(body)},
       session: {get: get || (async () => ({data: {id: "ses_A"}}))}}}),

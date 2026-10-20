@@ -399,7 +399,7 @@ class ParentOutputEnvTest(SourceBase):
         OWNER = OWNER_T.OWNER
         stale = {"AGENT_DISPATCH_JOBS": str(jobs), PARENT_VAR: "/stale/other-route/artifacts"}
         with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw: (
-                seen.append(kw.get("env")), SimpleNamespace(returncode=0))[1]), \
+                seen.append((cmd, kw.get("env"))), SimpleNamespace(returncode=0))[1]), \
              mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
              mock.patch.object(OWNER._capacity, "capacity_scores",
                                return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
@@ -408,8 +408,14 @@ class ParentOutputEnvTest(SourceBase):
              mock.patch.dict(os.environ, OWNER_T._isolated_env(stale), clear=True), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(OWNER.main(["--dry-run", "--route-evidence", str(path), "--prompt-text", "probe"]), 0)
-        self.assertEqual(len(seen), 1)
-        self.assertNotIn(PARENT_VAR, seen[0])
+        version_probes = [(cmd, env) for cmd, env in seen
+                          if isinstance(cmd, (list, tuple)) and "--version" in cmd]
+        dispatch_calls = [(cmd, env) for cmd, env in seen
+                          if not (isinstance(cmd, (list, tuple)) and "--version" in cmd)]
+        self.assertTrue(all(cmd == ["opencode", "--version"] for cmd, _env in version_probes))
+        self.assertEqual(len(dispatch_calls), 1, [cmd for cmd, _env in seen])
+        self.assertEqual(len(seen), len(version_probes) + 1, [cmd for cmd, _env in seen])
+        self.assertNotIn(PARENT_VAR, dispatch_calls[0][1])
 
 
 NATIVE_ENV = ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",

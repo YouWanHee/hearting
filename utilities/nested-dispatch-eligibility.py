@@ -108,6 +108,22 @@ def codex_login_status(output: str) -> bool:
     )
 
 
+def opencode_auth_listed(output: str) -> bool:
+    """Accept a stored credential in either `opencode auth list` layout.
+
+    OpenCode 1.x marks each configured provider with a filled bullet; 2.x prints
+    a table whose rows end in a `stored` status column instead.
+    """
+
+    if "\u25cf" in output:
+        return True
+    return any(
+        line.split()[-1] == "stored"
+        for line in output.splitlines()
+        if len(line.split()) > 1
+    )
+
+
 def auth_check(child_harness: str, worktree: str | Path | None = None) -> tuple[bool, str]:
     """Check that the target CLI has a usable local authentication profile.
 
@@ -127,7 +143,7 @@ def auth_check(child_harness: str, worktree: str | Path | None = None) -> tuple[
                 return False
     elif child_harness == "opencode":
         command = ["opencode", "auth", "list"]
-        accepted = lambda output: "\u25cf" in output
+        accepted = opencode_auth_listed
     else:
         return False, "unknown-harness"
     if shutil.which(command[0]) is None:

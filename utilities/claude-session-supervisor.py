@@ -1128,6 +1128,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--runtime-harness", choices=("claude", "opencode"), default="claude")
     value.add_argument("--opencode-command")
     value.add_argument("--opencode-agent", default="build")
+    value.add_argument("--opencode-standalone", action="store_true",
+                       help="run each OpenCode V2 owner turn with its prepared private config")
     value.add_argument("--variant")
     value.add_argument("--worktree", required=True)
     from dispatch_contract import inherited_jobs_argument

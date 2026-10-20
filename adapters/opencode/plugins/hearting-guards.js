@@ -1,5 +1,6 @@
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { spawnSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, writeFileSync, renameSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync, readdirSync } from "node:fs"
 import { createHash } from "node:crypto"
@@ -73,6 +74,9 @@ const peerGuidanceBySession = new Map()
 // One threshold notice per native session, retained for the triggering turn so
 // an auxiliary title call cannot consume the answering model's system context.
 const contextAlertBySession = new Map()
+const v2SessionInfo = new Map()
+const v2WorkerSessions = new Set()
+const v2ActiveSession = new AsyncLocalStorage()
 
 async function contextAlert(ctx, sid, output) {
   if (!sid || isWorkerSession() || process.env.MEM_DISTILL === "1"
@@ -119,7 +123,9 @@ function showContextAlert(ctx, text) {
 }
 
 function baseDir(ctx) {
-  return ctx.worktree || ctx.directory || process.cwd()
+  const sessionID = v2ActiveSession.getStore()
+  const location = sessionID && v2SessionInfo.get(sessionID)?.location?.directory
+  return location || ctx.worktree || ctx.directory || ctx.location?.directory || process.cwd()
 }
 
 // Headless dispatch liveness probe support.
@@ -158,6 +164,8 @@ function dispatchStateRoot() {
 }
 
 function isWorkerSession() {
+  const sessionID = v2ActiveSession.getStore()
+  if (sessionID && v2WorkerSessions.has(sessionID)) return true
   return (
     (process.env.AGENT_SESSION_ROLE || "").toLowerCase() === "worker" ||
     process.env.AGENT_DISPATCH_CHILD === "1" ||
@@ -785,6 +793,211 @@ function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => 
   })
 }
 
+// OpenCode 2's Promise plugin API is distinct from the V1 returned hook map.
+// The object shape intentionally exposes both entrypoints: V1 invokes `server`,
+// while V2 registers only `setup`. Plugin.define is an identity constructor in
+// the pinned V2 implementation, so this default object is its portable result.
+async function responsePrefix(response, cap = 64 * 1024) {
+  let reader
+  let timer
+  try {
+    reader = response.clone().body?.getReader()
+    if (!reader) return new Uint8Array()
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ done: true }), 1000)
+    })
+    const chunks = []
+    let size = 0
+    while (size < cap) {
+      const { done, value } = await Promise.race([reader.read(), deadline])
+      if (done) break
+      const part = value.subarray(0, cap - size)
+      chunks.push(part)
+      size += part.byteLength
+      if (part.byteLength !== value.byteLength) break
+    }
+    const merged = new Uint8Array(size)
+    let offset = 0
+    for (const part of chunks) { merged.set(part, offset); offset += part.byteLength }
+    return merged
+  } catch { return new Uint8Array() }
+  finally {
+    clearTimeout(timer)
+    // Cancelling a tee branch may wait for the runtime's original consumer.
+    try { void reader?.cancel().catch(() => {}) } catch {}
+  }
+}
+
+async function setupOpenCodeV2(ctx) {
+  const controller = new AbortController()
+  const sessionInfo = async (sessionID) => {
+    if (!sessionID || typeof ctx.session?.get !== "function") return null
+    try {
+      const result = await ctx.session.get({ sessionID })
+      const value = result?.data ?? result
+      if (value && typeof value === "object") {
+        v2SessionInfo.set(sessionID, value)
+        return value
+      }
+    } catch {}
+    return v2SessionInfo.get(sessionID) || null
+  }
+  const markSession = async (sessionID, agent) => {
+    const info = await sessionInfo(sessionID)
+    const title = String(info?.title || "")
+    const selectedAgent = String(agent || info?.agent || "")
+    if (title.startsWith("hearting-worker-") || selectedAgent.startsWith("hearting-")) {
+      v2WorkerSessions.add(sessionID)
+    }
+    return info
+  }
+  const withSession = (sessionID, work) => v2ActiveSession.run(sessionID || "", async () => {
+    const info = await markSession(sessionID)
+    return work(info)
+  })
+  const sessionPrompt = async ({ path: target, body }) => {
+    const sessionID = target?.id
+    const text = (body?.parts || []).map((part) => part?.text || "").filter(Boolean).join("\n")
+    if (!sessionID || !text || typeof ctx.session?.prompt !== "function") return { error: true }
+    try {
+      await ctx.session.prompt({ sessionID, prompt: { text }, delivery: "steer" })
+      return { error: null, response: { ok: true } }
+    } catch (error) {
+      return { error, response: { ok: false } }
+    }
+  }
+  const legacyContext = {
+    ...ctx,
+    directory: ctx.location?.directory || "",
+    client: {
+      session: {
+        get: ({ path: target, sessionID }) => sessionInfo(sessionID || target?.id),
+        // V2 does not expose the V1 message-list method on its plugin context.
+        // Returning an empty list keeps optional enrichment unknown instead of
+        // guessing from another session or invoking a second model.
+        messages: async () => [],
+        promptAsync: sessionPrompt,
+      },
+      app: { log: (input) => ctx.app?.log?.(input) },
+      tui: { showToast: async () => {} },
+      permission: ctx.permission,
+      project: ctx.project,
+    },
+  }
+  const hooks = await AgentHarnessGuards(legacyContext, { initialize: false })
+
+  await ctx.tool.hook("execute.before", async (event) => withSession(event.sessionID, async () => {
+    const input = { tool: event.tool, sessionID: event.sessionID }
+    const output = { args: event.input || {} }
+    await hooks["tool.execute.before"]?.(input, output)
+  }))
+  await ctx.tool.hook("execute.after", async (event) => withSession(event.sessionID, async () => {
+    if (v2WorkerSessions.has(event.sessionID)) return
+    const content = event.status === "completed" ? event.result?.content : []
+    const output = { output: Array.isArray(content)
+      ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
+      metadata: event.status === "error" ? { exit: 1 } : {} }
+    await hooks["tool.execute.after"]?.(
+      { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+  }))
+  await ctx.shell.hook("create.before", async (event) => {
+    const env = event.env || {}
+    const sessionID = env.OPENCODE_SESSION_ID || ""
+    return withSession(sessionID, async () => {
+      if (v2WorkerSessions.has(sessionID)) {
+        for (const key of inheritedIdentityEnv) env[key] = ""
+        if (sessionID) env.OPENCODE_SESSION_ID = sessionID
+        return
+      }
+      await hooks["shell.env"]?.({ sessionID }, { env })
+    })
+  })
+  await ctx.session.hook("prompt", async (event) => withSession(event.sessionID, async () => {
+    if (v2WorkerSessions.has(event.sessionID)) return
+    const text = event.prompt?.text || ""
+    await hooks["chat.message"]?.(
+      { sessionID: event.sessionID, messageID: event.messageID },
+      { message: { id: event.messageID, sessionID: event.sessionID, agent: event.agent },
+        parts: text ? [{ type: "text", text }] : [] })
+  }))
+  await ctx.session.hook("context", async (event) => withSession(event.sessionID, async () => {
+    if (v2WorkerSessions.has(event.sessionID)) return
+    const output = { system: [] }
+    await hooks["experimental.chat.system.transform"]?.(
+      { sessionID: event.sessionID }, output)
+    if (Array.isArray(event.system)) {
+      for (const text of output.system) {
+        if (typeof text === "string" && text) event.system.push({ type: "text", text })
+      }
+    }
+  }))
+  await ctx.session.hook("compaction", async (event) => withSession(event.sessionID, async () => {
+    if (v2WorkerSessions.has(event.sessionID)) return
+    await hooks["experimental.session.compacting"]?.(
+      { sessionID: event.sessionID }, { ...event })
+  }))
+  await ctx.session.hook("http.response", async (event) => {
+    const model = event.model
+    const status = event.response?.status
+    if (!model?.providerID || !model?.id || !Number.isInteger(status)) return
+    // The runtime consumes the original body after this callback returns.
+    // Reading/cancelling its clone must not hold that consumer behind telemetry.
+    void (async () => {
+      const body = status >= 200 && status < 300
+        ? new Uint8Array() : await responsePrefix(event.response)
+      try {
+        const child = spawn("python3", [path.join(root, "utilities", "opencode_runtime.py"),
+          "record-provider-response", "--model", `${model.providerID}/${model.id}`,
+          "--status", String(status)], {
+          cwd: root, env: { ...process.env, AGENT_HOME: root },
+          stdio: ["pipe", "ignore", "ignore"],
+        })
+        child.on("error", () => {})
+        child.stdin.on("error", () => {})
+        child.stdin.end(body)
+      } catch { /* Eligibility telemetry remains best-effort. */ }
+    })().catch(() => {})
+  })
+
+  void (async () => {
+    try {
+      for await (const native of ctx.event.subscribe({ signal: controller.signal })) {
+        const data = native?.data || native?.properties || {}
+        const info = data.info || data.session || null
+        const sessionID = data.sessionID || info?.id || native?.sessionID || ""
+        if (!sessionID) continue
+        if (native.type === "session.deleted" && v2WorkerSessions.has(sessionID)) {
+          v2WorkerSessions.delete(sessionID)
+          v2SessionInfo.delete(sessionID)
+          continue
+        }
+        await withSession(sessionID, async (current) => {
+          if (v2WorkerSessions.has(sessionID)) return
+          const event = { ...native, properties: { ...data,
+            ...(info ? { info } : {}), sessionID } }
+          await hooks.event?.({ event })
+        })
+        if (native.type === "session.deleted") v2SessionInfo.delete(sessionID)
+      }
+    } catch {
+      // Event-stream loss is an observation gap; it does not settle a session.
+    }
+  })()
+
+  return () => {
+    controller.abort()
+    hooks.dispose?.({ silent: true })
+    v2WorkerSessions.clear()
+    v2SessionInfo.clear()
+  }
+}
+
+export default {
+  id: "hearting-guards",
+  setup: setupOpenCodeV2,
+  server: (...args) => AgentHarnessGuards(...args),
+}
+
 // Invocation-time root for identity and completion helpers (core/CORE.md §2,
 // core/ADAPTATION.md): preserve the session and inherited registry after pruning.
 // The module-time root/helper freeze the release the plugin was imported from;
@@ -1243,7 +1456,7 @@ function createCompletionCarrier(ctx) {
     // A finished turn also looks past its own records (a seat handover stores them elsewhere).
     async idle(sid) { if (!sid) return; status.set(sid, "idle"); if (sessions.has(sid)) await deliver(sid, false) },
     forget(sid) { sessions.delete(sid); status.delete(sid) },
-    dispose() { log("dispose", "", "context-disposed", { sessions: [...sessions] }); if (timer) clearInterval(timer); timer = null; sessions.clear() },
+    dispose(silent = false) { if (!silent) log("dispose", "", "context-disposed", { sessions: [...sessions] }); if (timer) clearInterval(timer); timer = null; sessions.clear() },
   }
 }
 
@@ -1793,27 +2006,33 @@ const inheritedIdentityEnv = [
   "CODEX_SESSION_ID",
 ]
 
-export const AgentHarnessGuards = async (ctx) => {
+export const AgentHarnessGuards = async (ctx, options = {}) => {
+  const initialize = options.initialize !== false
   // Record plugin-load marker once per plugin init. In a headless dispatch the
   // runtime child inherits OPENCODE_DISPATCH_SLUG, so this proves the plugin
   // was loaded by the headless runtime (dispatch-liveness.py inspects it).
-  markPluginLoaded(dispatchSlug())
-  peerIdentityLog(ctx, "plugin", "plugin-registered")
-  const paneBinding = registerPaneContext(ctx)
+  if (initialize) {
+    markPluginLoaded(dispatchSlug())
+    peerIdentityLog(ctx, "plugin", "plugin-registered")
+  }
+  const paneBinding = initialize ? registerPaneContext(ctx) : { ownsOrigin: false }
   const completionCarrier = createCompletionCarrier(ctx)
   // Restoring an existing -s/--session TUI does not emit session.created.
   // Reuse the process-bound selector; a directory/SDK root cannot pick a recipient.
-  if (paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
+  if (initialize && paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
     let activated = false
     try { activated = await completionCarrier.activate(paneNativeOrigin.sid) } catch {}
     if (!activated) reconnectPeerObligations()
     scheduleInitialPaneProjection(ctx, paneBinding, paneNativeOrigin.sid)
-  } else {
+  } else if (initialize) {
     reconnectPeerObligations()
   }
 
   return ({
-  dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
+  dispose: (settings = {}) => {
+    completionCarrier.dispose(settings.silent === true)
+    if (initialize) retirePaneContext(ctx)
+  },
   async config(input) {
     const config = input && typeof input === "object" ? input : {}
     if (contextPolicyRuntimeVersion === null) {

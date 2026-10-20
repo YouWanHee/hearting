@@ -144,6 +144,7 @@ _OPENCODE_FIXED_SYMLINKS = [
     ("agent-agents", "opencode_setting/opencode-agents"),
     ("agent-commands", "opencode_setting/opencode-commands"),
     ("plugins/hearting-guards.js", "opencode_setting/opencode-plugins/hearting-guards.js"),
+    ("plugins/hearting-guards/index.ts", "opencode_setting/opencode-plugins/hearting-guards/index.ts"),
     ("tui/hearting-tui-identity.ts", "adapters/opencode/tui/hearting-tui-identity.ts"),
     ("tui/hearting-owned-tui.json", "adapters/opencode/tui/owned-tui.json"),
     ("tui/hearting-owned-cli.json", "adapters/opencode/tui/owned-cli.json"),

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Focused no-model-call checks for OpenCode's native context-limit projection."""
+"""Focused native context-limit checks; V2's model call uses only a local fake provider."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import opencode_context_window as context
+import opencode_runtime
 
 
 MODEL = "opencode-go/deepseek-v4.1-flash"
@@ -216,120 +221,178 @@ class ModelContextLaunchTest(unittest.TestCase):
                     config_content="{}", cwd="/tmp", environ={},
                 )
 
-    def test_installed_opencode_resolves_and_consumes_merged_limits_without_a_model_call(self):
+    def test_installed_opencode_v2_standalone_worker_consumes_prepared_custom_model_config(self):
         executable = shutil.which("opencode") or "/home/Uihyeop/.opencode/bin/opencode"
         if not Path(executable).is_file():
             self.skipTest("installed OpenCode CLI is unavailable")
-        version = subprocess.run([executable, "--version"], text=True,
-                                 capture_output=True, timeout=15, check=False)
-        self.assertEqual(version.returncode, 0, version.stderr)
-        self.assertEqual(version.stdout.strip(), "1.19.0")
-
         with tempfile.TemporaryDirectory(prefix="model-context-opencode-") as temporary:
             root = Path(temporary)
-            cache_home = root / "cache"
-            (cache_home / "opencode").mkdir(parents=True)
-            shutil.copy2("/home/Uihyeop/.cache/opencode/models.json",
-                         cache_home / "opencode" / "models.json")
+            for name in ("config", "data", "state", "cache"):
+                (root / name).mkdir()
             env = {
                 "PATH": os.environ.get("PATH", ""),
                 "HOME": str(root),
                 "XDG_CONFIG_HOME": str(root / "config"),
                 "XDG_DATA_HOME": str(root / "data"),
                 "XDG_STATE_HOME": str(root / "state"),
-                # Use a disposable copy of the installed models.dev snapshot;
-                # OpenCode may refresh cache metadata during startup.
-                "XDG_CACHE_HOME": str(cache_home),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "OPENCODE_DATA_DIR": str(root / "data" / "opencode"),
             }
-            original = {
-                "model": MODEL,
-                "plugin": [],
-                "permission": {"*": "deny"},
-                "provider": {"opencode-go": {"models": {
-                    "deepseek-v4.1-flash": {
-                        "limit": {"context": 800000, "input": 480000, "output": 8192},
-                        "variants": {"max": {"reasoningEffort": "max"}},
+            version = subprocess.run([executable, "--version"], cwd=root, env=env,
+                                     text=True, capture_output=True, timeout=15, check=False)
+            self.assertEqual(version.returncode, 0, version.stderr)
+            parsed = opencode_runtime.parse_version((version.stdout or "") + "\n" +
+                                                    (version.stderr or ""))
+            if parsed is None:
+                self.skipTest("installed OpenCode version could not be identified")
+            if parsed[0] >= 2:
+                requests = []
+
+                class FakeProvider(BaseHTTPRequestHandler):
+                    protocol_version = "HTTP/1.1"
+
+                    def do_POST(self):
+                        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                        requests.append(json.loads(body))
+                        chunks = [
+                            {"id": "chatcmpl-fixture", "object": "chat.completion.chunk",
+                             "created": 0, "model": "custom-api-id",
+                             "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                                   "content": "cap-consumed"},
+                                           "finish_reason": None}]},
+                            {"id": "chatcmpl-fixture", "object": "chat.completion.chunk",
+                             "created": 0, "model": "custom-api-id",
+                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                             "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                       "total_tokens": 2}},
+                        ]
+                        payload = "".join("data: " + json.dumps(row, separators=(",", ":"))
+                                          + "\n\n" for row in chunks) + "data: [DONE]\n\n"
+                        encoded = payload.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Content-Length", str(len(encoded)))
+                        self.end_headers()
+                        self.wfile.write(encoded)
+
+                    def log_message(self, *_args):
+                        pass
+
+                provider = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+                provider.daemon_threads = True
+                provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+                provider_thread.start()
+                try:
+                    custom = {
+                        "model": "local/custom", "plugins": [],
+                        "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+                        "providers": {"local": {
+                            "package": "@opencode/ai/providers/openai-compatible",
+                            "settings": {"baseURL": f"http://127.0.0.1:{provider.server_port}/v1"},
+                            "models": {"custom": {"name": "Custom fixture",
+                                "modelID": "custom-api-id", "limit": {
+                                "context": 164000, "input": 48000, "output": 8192,
+                                }}},
+                        }},
                     }
+                    original = json.dumps(custom, separators=(",", ":"))
+                    launch_env = {**env, "OPENCODE_CONFIG_CONTENT": original}
+                    launch = context.prepare_launch_context(
+                        model="local/custom", context_window="150000",
+                        config_content=original, cwd=str(root), environ=launch_env,
+                        command=executable,
+                    )
+                    self.assertEqual(launch["native_limits"], {
+                        "context": 164000, "input": 48000, "output": 8192,
+                    })
+                    self.assertEqual(launch["applied_limits"], {
+                        "context": 150000, "input": 48000, "output": 8192,
+                    })
+                    self.assertEqual(launch["final_limits"], launch["applied_limits"])
+                    self.assertEqual(launch["execution_mode"], "standalone")
+                    self.assertEqual(launch["runtime_target"], "standalone-per-command")
+                    self.assertIsNone(launch["server_identity"])
+                    self.assertEqual(launch["location_identity"], str(root))
+                    self.assertEqual(launch["config_identity"], hashlib.sha256(
+                        launch["config_content"].encode("utf-8")).hexdigest())
+
+                    argv = opencode_runtime.run_argv(
+                        binary=executable, cwd=str(root), agent="build",
+                        model="local/custom", title="hearting-worker-native-fixture",
+                        standalone=launch["execution_mode"] == "standalone", version=parsed,
+                    ) + ["Reply with the exact word cap-consumed."]
+                    process = subprocess.Popen(
+                        argv, cwd=root, env={**launch_env,
+                                            "OPENCODE_CONFIG_CONTENT": launch["config_content"]},
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    try:
+                        stdout, stderr = process.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        try:
+                            stdout, stderr = process.communicate(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            stdout, stderr = process.communicate()
+                        self.fail("standalone fake-provider worker exceeded its bounded lease")
+                    finally:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    self.assertEqual(process.returncode, 0, stderr)
+                    events = [json.loads(line) for line in stdout.splitlines()
+                              if line.startswith("{")]
+                    self.assertTrue(any(event.get("part", {}).get("text") == "cap-consumed"
+                                         for event in events), stdout)
+                    self.assertGreaterEqual(len(requests), 1)
+                    self.assertTrue(all(row.get("model") == "custom-api-id" for row in requests))
+                    self.assertTrue(all(row.get("max_completion_tokens") == 8192
+                                        for row in requests))
+                finally:
+                    provider.shutdown()
+                    provider.server_close()
+                    provider_thread.join(timeout=3)
+                return
+
+            if parsed != (1, 19, 0):
+                self.skipTest("installed V1 consumer is not the tested 1.19.0 version")
+            cache = root / "cache" / "opencode" / "models.json"
+            cache.parent.mkdir(parents=True)
+            cache.write_text(json.dumps({"opencode-go": {"models": {
+                "deepseek-v4.1-flash": {"limit": {
+                    "context": 900000, "input": 650000, "output": 8192,
+                }}
+            }}}), encoding="utf-8")
+            original = {
+                "model": MODEL, "plugin": [], "permission": {"*": "deny"},
+                "provider": {"opencode-go": {"models": {
+                    "deepseek-v4.1-flash": {"limit": {
+                        "context": 850000, "input": 600000, "output": 4096,
+                    }, "variants": {"max": {"reasoningEffort": "max"}}}
                 }}},
             }
             launch = context.prepare_launch_context(
-                model=MODEL, context_window="800000",
-                config_content=json.dumps(original), cwd=str(root),
-                environ={**env, "OPENCODE_CONFIG_CONTENT": json.dumps(original)},
+                model=MODEL, context_window="800000", config_content=json.dumps(original),
+                cwd=str(root), environ={**env, "OPENCODE_CONFIG_CONTENT": json.dumps(original)},
                 command=executable,
             )
-            native = launch["native_limits"]
-            catalog = launch["catalog_limits"]
-            applied = launch["applied_limits"]
-            self.assertLessEqual(launch["final_limits"]["context"], applied["context"])
-            if applied["input"] is not None:
-                self.assertLessEqual(launch["final_limits"]["input"], applied["input"])
-            if applied["output"] is not None:
-                self.assertLessEqual(launch["final_limits"]["output"], applied["output"])
-            self.assertEqual(applied["context"], min(800000, native["context"]))
-            expected_input = min(applied["context"], 480000)
-            if native["input"] is not None:
-                expected_input = min(expected_input, native["input"])
-            self.assertEqual(applied["input"], expected_input)
-            self.assertEqual(applied["output"], min(
-                native["output"], original["provider"]["opencode-go"]["models"]["deepseek-v4.1-flash"]["limit"]["output"]))
-
+            self.assertEqual(launch["native_limits"], {
+                "context": 850000, "input": 600000, "output": 4096,
+            })
+            self.assertEqual(launch["final_limits"], launch["applied_limits"])
             final_env = {**env, "OPENCODE_CONFIG_CONTENT": launch["config_content"]}
             debug = subprocess.run([executable, "debug", "config"], cwd=root, env=final_env,
                                    text=True, capture_output=True, timeout=30, check=False)
             self.assertEqual(debug.returncode, 0, debug.stderr)
             resolved = json.loads(debug.stdout)
-            configured_limit = resolved["provider"]["opencode-go"]["models"]["deepseek-v4.1-flash"]["limit"]
-            self.assertEqual(configured_limit["context"], applied["context"])
-            if applied["input"] is not None:
-                self.assertEqual(configured_limit["input"], applied["input"])
-            self.assertEqual(configured_limit["output"], applied["output"])
-
-            # The models.dev snapshot supplies the baseline; OpenCode's own
-            # model list sees the final merged provider limits used by turns.
-            native_record = context._native_limits(MODEL, env=final_env)
-            self.assertEqual(native_record, catalog)
-            listed = subprocess.run([executable, "models", "opencode-go", "--verbose"],
-                                    cwd=root, env=final_env, text=True, capture_output=True,
-                                    timeout=30, check=False)
-            self.assertEqual(listed.returncode, 0, listed.stderr)
-            effective_record = next(item for item in context._json_objects(listed.stdout)
-                                    if item.get("providerID") == "opencode-go"
-                                    and item.get("id") == "deepseek-v4.1-flash")
-            self.assertEqual(effective_record["limit"]["context"], applied["context"])
-            if applied["input"] is not None:
-                self.assertEqual(effective_record["limit"]["input"], applied["input"])
-            self.assertEqual(effective_record["limit"]["output"], applied["output"])
-
-            custom = {
-                "model": "local/custom", "plugin": [], "permission": {"*": "deny"},
-                "provider": {"local": {
-                    "npm": "@ai-sdk/openai-compatible", "name": "Local fixture",
-                    "options": {"baseURL": "http://127.0.0.1:9/v1"},
-                    "models": {"custom": {"name": "Custom fixture", "limit": {
-                        "context": 64000, "input": 48000, "output": 8192,
-                    }}},
-                }},
-            }
-            custom_launch = context.prepare_launch_context(
-                model="local/custom", context_window="800000",
-                config_content=json.dumps(custom), cwd=str(root), environ=env,
-                command=executable,
-            )
-            self.assertIsNone(custom_launch["catalog_limits"]["context"])
-            self.assertEqual(custom_launch["final_limits"], {
-                "context": 64000, "input": 48000, "output": 8192,
-            })
-            custom_listed = subprocess.run(
-                [executable, "models", "local", "--verbose"], cwd=root,
-                env={**env, "OPENCODE_CONFIG_CONTENT": custom_launch["config_content"]},
-                text=True, capture_output=True, timeout=30, check=False,
-            )
-            self.assertEqual(custom_listed.returncode, 0, custom_listed.stderr)
-            custom_record = next(item for item in context._json_objects(custom_listed.stdout)
-                                 if item.get("providerID") == "local" and item.get("id") == "custom")
-            self.assertEqual(custom_record["limit"]["context"], 64000)
-            self.assertEqual(custom_record["limit"]["input"], 48000)
+            selected = resolved["provider"]["opencode-go"]["models"]["deepseek-v4.1-flash"]
+            self.assertEqual(selected["limit"], launch["applied_limits"])
+            self.assertEqual(selected["variants"], original["provider"]["opencode-go"]["models"]
+                             ["deepseek-v4.1-flash"]["variants"])
 
 
 if __name__ == "__main__":

@@ -1246,13 +1246,55 @@ class ResourcePredecessorPidReuseTest(unittest.TestCase):
             "earlier-start": {"starttime": str(int(self.live["starttime"]) + 1)},
             "unparsable-start": {"starttime": "wrong"},
             "namespace-unrecorded": {"pid_namespace": None},
-            "foreign-namespace": {"pid_namespace": "pid:[1]"},
             "no-sentinel": {"sentinel": str(self.sentinel) + ".missing"},
             "sentinel-disagrees": {"exit_code": 3},
         }
         for name, change in cases.items():
             with self.subTest(case=name):
                 self.assertFalse(RA.resource_predecessor_finished(self.row(**change)))
+
+    def test_terminal_exit_evidence_survives_a_different_pid_namespace(self):
+        import resource_run_registry as RR
+        for status, code in (("failed", 1), ("succeeded", 0)):
+            with self.subTest(status=status):
+                self.sentinel.write_text(str(code) + "\n", encoding="utf-8")
+                row = self.row(status=status, exit_code=code, pid_namespace="pid:[foreign]")
+                before = dict(row)
+                self.assertEqual(RR.classify_identity(row),
+                                 ("stale", None, "process-namespace-mismatch"))
+                self.assertTrue(RA.resource_predecessor_finished(row))
+                self.assertEqual(row, before)
+
+    def test_namespace_mismatch_cannot_replace_missing_or_contradictory_exit_evidence(self):
+        self.sentinel.write_text("1\n", encoding="utf-8")
+        cases = {
+            "running": {"status": "running"},
+            "launching": {"status": "launching"},
+            "unknown-status": {"status": "unknown"},
+            "cancelled": {"cancel_requested": True},
+            "parent-close": {"parent_close_requested": True},
+            "missing-exit": {"exit_code": None},
+            "different-exit": {"exit_code": 2},
+            "missing-sentinel": {"sentinel": str(self.sentinel) + ".missing"},
+            "inconsistent-success": {"status": "succeeded"},
+            "missing-identity": {"pid": None},
+        }
+        for name, changes in cases.items():
+            with self.subTest(case=name):
+                row = self.row(**{"status": "failed", "exit_code": 1,
+                                  "pid_namespace": "pid:[foreign]", **changes})
+                self.assertFalse(RA.resource_predecessor_finished(row))
+        self.sentinel.write_text("0\n", encoding="utf-8")
+        self.assertFalse(RA.resource_predecessor_finished(
+            self.row(status="failed", exit_code=0, pid_namespace="pid:[foreign]")))
+        self.sentinel.write_text("not an exit\n", encoding="utf-8")
+        self.assertFalse(RA.resource_predecessor_finished(
+            self.row(status="failed", exit_code=1, pid_namespace="pid:[foreign]")))
+
+    def test_live_process_is_protected_even_with_a_terminal_record_and_sentinel(self):
+        self.sentinel.write_text("1\n", encoding="utf-8")
+        self.assertFalse(RA.resource_predecessor_finished(
+            self.row(**{**self.live, "status": "failed", "exit_code": 1})))
 
 
 class NestedHostSandboxEqualityTest(unittest.TestCase):

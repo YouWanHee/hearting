@@ -139,7 +139,7 @@ def _run_git_path(global_args: list[str], cwd: str, env: dict[str, str],
         return None
     try:
         child = subprocess.Popen(
-            [*global_args, "rev-parse", "--path-format=absolute", "--git-path", path],
+            [*global_args, "rev-parse", "--git-path", path],
             cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         output, _ = child.communicate()
@@ -189,6 +189,11 @@ def _run_git_index(argv: list[str], cwd: str, env: dict[str, str], timeout: floa
     )
     if not index_path or not logical_lock:
         return None
+    # git < 2.31 has no --path-format=absolute, so bind relative answers here.
+    index_path, logical_lock = (
+        os.path.realpath(os.path.join(effective_cwd, value))
+        for value in (index_path, logical_lock)
+    )
     return {"index": index_path, "logical_lock": logical_lock, "cwd": effective_cwd}
 
 
