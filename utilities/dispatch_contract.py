@@ -9102,8 +9102,7 @@ def completion_attempt_readiness(
                 continue
         if metadata.get("attempt_id") == attempt_id:
             exact.append((fields, metadata))
-        elif (fields[1] in {"open", "running"} and metadata.get("attempt_id")
-              and not attempt_row_never_started(fields)):
+        elif fields[1] in {"open", "running"} and metadata.get("attempt_id"):
             conflicting_active.append(metadata["attempt_id"])
     if len(exact) != 1:
         return AttemptReadiness(
@@ -11618,6 +11617,20 @@ def attempt_row_never_started(fields: list[str]) -> bool:
         and not metadata.get("pid")
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
+    """Identify a never-started registration withdrawn under the jobs lock.
+
+    An unclaimed open row may still be launched. Only a terminal row explicitly
+    closed as cancelled has lost that launch authority and can leave the round
+    census without hiding a real pre-launch failure.
+    """
+
+    if len(fields) != 6 or not attempt_row_never_started(fields):
+        return False
+    metadata = parse_registry_metadata(fields[5])
+    return fields[1] in {"done", "cancelled", "killed"} and metadata.get("failure_class") == "cancelled"
 
 
 def close_refused_chain_rows(

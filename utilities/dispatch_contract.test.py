@@ -2034,7 +2034,7 @@ class DispatchContractTest(unittest.TestCase):
     if proc.poll() is None:proc.kill()
     proc.wait()
 
- def test_completion_readiness_ignores_only_proven_unstarted_siblings(self):
+ def test_completion_readiness_ignores_withdrawn_but_drains_for_active_siblings(self):
   route={"route_id":"rt-ready-fence"};node={"id":"plan","kind":"pipeline-stage"}
   marker={"attempt_id":"att-ready-main","registered_worker":True}
   exact=attempt_row({"route_id":route["route_id"],"route_node":node["id"],
@@ -2042,21 +2042,47 @@ class DispatchContractTest(unittest.TestCase):
                      "failure_class":"pass"},status="done")
   residue={"route_id":route["route_id"],"route_node":node["id"],
            "attempt_id":"att-ready-residue","launch_claimed":"0"}
+  withdrawn={**residue,"failure_class":"cancelled","launch_outcome":"never-launched"}
   cases=(
-   ({**residue},"ready"),
-   ({**residue,"launch_claimed":"1"},"draining"),
-   ({**residue,"pid":"123"},"draining"),
-   ({**residue,"launch_started":"1"},"draining"),
-   ({key:value for key,value in residue.items() if key!="launch_claimed"},"draining"),
+   (withdrawn,"done","ready"),
+   ({**residue},"open","draining"),
+   ({**residue},"running","draining"),
+   ({**residue,"launch_claimed":"1"},"open","draining"),
+   ({**residue,"pid":"123"},"open","draining"),
+   ({**residue,"launch_started":"1"},"open","draining"),
+   ({key:value for key,value in residue.items() if key!="launch_claimed"},"open","draining"),
   )
   with mock.patch.object(D,"attempt_process_quiescence",
                          return_value=D.ProcessQuiescence("quiescent","fixture")):
-   for sibling,expected in cases:
+   for sibling,status,expected in cases:
     with self.subTest(sibling=sibling):
      result=D.completion_attempt_readiness(
       route,node,marker,Path("unused"),
-      registry_lines=[exact,attempt_row(sibling,status="open")])
+      registry_lines=[exact,attempt_row(sibling,status=status)])
      self.assertEqual(result.state,expected)
+
+ def test_withdrawn_before_launch_predicate_requires_terminal_cancellation(self):
+  base={"route_id":"rt-withdrawn","route_node":"plan","attempt_id":"att-withdrawn",
+        "launch_claimed":"0","launch_outcome":"never-launched","failure_class":"cancelled"}
+  for status in ("done","cancelled","killed"):
+   self.assertTrue(D.attempt_row_withdrawn_before_launch(
+    attempt_row(base,status=status).split("\t")))
+  negatives=(
+   (attempt_row(base,status="open").split("\t")),
+   (attempt_row(base,status="running").split("\t")),
+   (attempt_row({k:v for k,v in base.items() if k!="launch_claimed"},status="done").split("\t")),
+   (attempt_row({**base,"launch_claimed":"1"},status="done").split("\t")),
+   (attempt_row({**base,"pid":"123"},status="done").split("\t")),
+   (attempt_row({**base,"launch_started":"1"},status="done").split("\t")),
+   (attempt_row({**base,"launch_outcome":"started"},status="done").split("\t")),
+   (attempt_row({k:v for k,v in base.items() if k!="failure_class"},status="done").split("\t")),
+   (attempt_row({**base,"failure_class":"contract"},status="done").split("\t")),
+   (attempt_row({**base,"failure_class":"capacity"},status="done").split("\t")),
+   (attempt_row(base,status="done").split("\t")[:5]),
+  )
+  for fields in negatives:
+   with self.subTest(fields=fields):
+    self.assertFalse(D.attempt_row_withdrawn_before_launch(fields))
 
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:

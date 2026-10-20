@@ -56,7 +56,7 @@ from dispatch_contract import (
     terminal_conflict_pending,
     completion_marker_is_current,
     completion_attempt_readiness,
-    attempt_row_never_started,
+    attempt_row_withdrawn_before_launch,
     completion_conflict_attempt,
     owner_closure_shape,
     _diff_attribution_execute_launch_head,
@@ -9053,7 +9053,7 @@ def review_round_records(lines, route_ids, node_id, *, jobs=None):
             continue
         if ROUTE_AUTHORITY.no_stage_authority(metadata):
             continue
-        if attempt_row_never_started(fields):
+        if attempt_row_withdrawn_before_launch(fields):
             continue
         rows.append((fields,metadata))
     return REVIEW_ROUND_CAP.logical_round_records(rows,jobs=jobs)

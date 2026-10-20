@@ -2336,6 +2336,81 @@ class FallbackTest(unittest.TestCase):
    metadata=F.parse_registry_metadata(fields[5])
    self.assertEqual((fields[1],metadata.get("note")),("done","never-launched"))
    self.assertEqual(metadata.get("reconcile_reason"),F.DIRECT_TIMEOUT_UNSTARTED_REASON)
+
+ def test_capped_test_timeout_settlement_restarts_same_payload_once(self):
+  import dispatch_contract as DC
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text());node=next(n for n in route["nodes"] if n["id"]=="test")
+   self.seed_predecessor_markers(path,"test");self.seed_parent()
+   self.seed_review_rounds(route,"test",1)
+   payload=self.art/"payload-count.txt"
+   calls=[]
+   first_hop=node["fallback_hops"][0]
+   only_first_hop=mock.patch.object(F,"ordered_fallback_hops",
+    return_value=([first_hop],None))
+   def timeout_then_run(_args,command):
+    calls.append(command)
+    attempt=self.arg(command,"--attempt-id")
+    if len(calls)==1:
+     metadata={
+      "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+      "execution_surface":"registered-headless","registered_worker":"1",
+      "fallback_hop":"same-harness-headless","worker_type":"test","unit":"qa/test",
+      "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+      "route_file":str(path),"completion_gate":node.get("completion_gate",""),
+      "parent_attempt_id":"att-fallback-parent","attempt_id":attempt,"launch_claimed":"0",
+      "launch_outcome":"never-launched",
+     }
+     metadata.update(SUBJECT.seal_attempt(self.jobs,route,node,attempt,worktree=self.repo))
+     with self.jobs.open("a",encoding="utf-8") as handle:
+      handle.write(f"now\topen\t{self.repo}\t{self.repo}\tfallback-test\t"+
+                   ",".join(f"{key}={value}" for key,value in metadata.items())+"\n")
+     raise subprocess.TimeoutExpired(command,1)
+    metadata={
+     "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+     "execution_surface":"registered-headless","registered_worker":"1",
+     "fallback_hop":"same-harness-headless","worker_type":"test","unit":"qa/test",
+     "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+     "route_file":str(path),"completion_gate":node.get("completion_gate",""),
+     "parent_attempt_id":"att-fallback-parent","attempt_id":attempt,"launch_claimed":"0",
+     "launch_outcome":"never-launched",
+    }
+    metadata.update(SUBJECT.seal_attempt(self.jobs,route,node,attempt,worktree=self.repo))
+    row=(f"now\topen\t{self.repo}\t{self.repo}\tfallback-test\t"+
+         ",".join(f"{key}={value}" for key,value in metadata.items()))
+    if not DC.claim_attempt_row(self.jobs,attempt,row,launch=True):
+     raise AssertionError("second payload did not acquire its exact launch claim")
+    with payload.open("a",encoding="utf-8") as handle:
+     handle.write("payload\n")
+    return SimpleNamespace(returncode=0,
+     stdout="check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n",stderr="")
+
+   first_code,first_output=self.closure_action(path,"start",patches=(
+    only_first_hop,
+    mock.patch.object(F,"run_wrapper",side_effect=timeout_then_run),))
+   self.assertNotEqual(first_code,0,first_output)
+   first_attempt=self.arg(calls[0],"--attempt-id")
+   first_row=next(line.split("\t") for line in self.jobs.read_text().splitlines()
+                  if first_attempt in line)
+   first_meta=F.parse_registry_metadata(first_row[5])
+   self.assertEqual((first_row[1],first_meta.get("note"),first_meta.get("failure_class")),
+                    ("done","never-launched","cancelled"))
+   self.assertFalse(payload.exists())
+
+   second_code,second_output=self.closure_action(path,"start",patches=(
+    only_first_hop,
+    mock.patch.object(F,"run_wrapper",side_effect=timeout_then_run),))
+   self.assertEqual(second_code,0,second_output)
+   self.assertEqual(len(calls),2)
+   self.assertNotEqual(self.arg(calls[0],"--attempt-id"),self.arg(calls[1],"--attempt-id"))
+   self.assertEqual(payload.read_text(encoding="utf-8").splitlines(),["payload"])
+   self.assertNotIn("review-round-budget-exhausted",second_output)
+   self.assertNotIn("review-verdictless-bound",second_output)
+   self.assertNotIn("attempt-identity",second_output)
+   rows=F.registry_rows(self.jobs,route["route_id"],"test")
+   self.assertEqual(sum(row.get("attempt_id")==self.arg(calls[0],"--attempt-id") for row in rows),1)
+   self.assertEqual(sum(row.get("attempt_id")==self.arg(calls[1],"--attempt-id") for row in rows),1)
  def test_legacy_parent_generation_conflict_is_typed_without_reusing_identity(self):
   route={"route_id":"rt-parent-generation"};node={"id":"plan"};row={"child_harness":"codex"}
   old=SimpleNamespace(slug="stage",parent="owner",parent_attempt_id="att-parent-old")

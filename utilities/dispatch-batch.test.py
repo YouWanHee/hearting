@@ -592,6 +592,79 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertIsNone(BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
                                                 "plan", "different-parent", BATCH.DEFAULT_PROMPT))
 
+    def test_public_group_restart_keeps_cancelled_manifest_bindings_stable(self):
+        from dispatch_replacement_batch import seal_launch_input
+
+        legs = self.legs()
+        for leg in legs:
+            self.write_existing(leg, status="done", note="cancelled-by-parent",
+                                claimed="0", live_identity=False)
+        rewritten = []
+        for line in self.jobs.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            fields[5] += ",launch_outcome=never-launched,failure_class=cancelled"
+            rewritten.append("\t".join(fields))
+        self.jobs.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+        manifest, _continuation, _partial = self.partial_continuation(legs)
+        _checked, digest, _leg_digests = BATCH.verify_manifest(manifest)
+        args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
+            slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
+            qa=None, log_dir=None, allow_degraded_independence=False)
+        seal_launch_input(self.jobs, args, self.route, manifest, digest)
+
+        def public_start():
+            output = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+                stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+                stack.enter_context(mock.patch.object(BATCH, "resolve_global_registry",
+                    return_value=SimpleNamespace(path=self.jobs)))
+                stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+                stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+                stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output",
+                    return_value=str(self.base)))
+                stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple",
+                    side_effect=resolve_side_effect))
+                stack.enter_context(mock.patch.object(BATCH, "assign_harnesses",
+                    side_effect=AssertionError("restart must retain sealed member placement")))
+                stack.enter_context(mock.patch.object(BATCH, "reserve_batch"))
+                stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+                stack.enter_context(mock.patch.dict(os.environ, {
+                    "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                    "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                    "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write"}))
+                with contextlib.redirect_stdout(output):
+                    result = BATCH.main(self.argv())
+            return result, output.getvalue()
+
+        first_code, first_output = public_start()
+        second_code, second_output = public_start()
+        self.assertEqual(first_code, 0, first_output)
+        self.assertEqual(second_code, 0, second_output)
+        for output in (first_output, second_output):
+            self.assertNotIn("batch-prior-binding-drift", output)
+            self.assertNotIn("batch-prior-manifest-ambiguous", output)
+        payload = BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
+            "plan", "att-parent-fixture", BATCH.DEFAULT_PROMPT)
+        self.assertEqual(payload["manifest"], manifest)
+        self.assertEqual([leg["attempt_id"] for leg in self.legs()],
+                         [leg["attempt_id"] for leg in legs])
+        attempt_rows = [line for line in self.jobs.read_text().splitlines()
+                        if "batch_attempt_id=" in line]
+        self.assertEqual(len(attempt_rows), len(legs))
+
+        from recovery_history import batch_input_path
+        input_path = batch_input_path(self.jobs, digest)
+        original = input_path.read_text(encoding="utf-8")
+        tampered = json.loads(original)
+        tampered["manifest"]["members"][0]["route_node"] = "foreign-node"
+        input_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaises(BATCH.BatchError):
+            BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
+                "plan", "att-parent-fixture", BATCH.DEFAULT_PROMPT)
+        input_path.write_text(original, encoding="utf-8")
+
     def test_load_route_rejects_non_object_json_before_verification(self):
         self.route_path.write_text("[]", encoding="utf-8")
         with mock.patch.object(BATCH.subprocess, "run") as verify, \
@@ -4263,7 +4336,7 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
 
 
 class NeverStartedBatchRoundAdmissionTest(unittest.TestCase):
-    def test_multiple_unstarted_registrations_do_not_block_batch_admission(self):
+    def test_multiple_withdrawn_registrations_do_not_block_batch_admission(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"
             route = {
@@ -4282,7 +4355,8 @@ class NeverStartedBatchRoundAdmissionTest(unittest.TestCase):
                     f"attempt_id=att-batch-unstarted-{index},launch_claimed=0"
                 )
                 rows.append(
-                    f"2026-10-01T00:00:0{index}Z\topen\t/r\t/w\ts\t{metadata}"
+                    f"2026-10-01T00:00:0{index}Z\tdone\t/r\t/w\ts\t{metadata},"
+                    "launch_outcome=never-launched,failure_class=cancelled,note=cancelled-by-parent"
                 )
             jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
