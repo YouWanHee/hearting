@@ -19,6 +19,9 @@ from unittest import mock
 import codex_permission_profile as profiles
 from execution_access import AccessContext, build_grant, load_request
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import fixture_processes  # noqa: E402
+
 
 def require_native_runtime(testcase):
     reason = None
@@ -42,6 +45,10 @@ class PermissionProfileTest(unittest.TestCase):
             prefix=".hearting-codex-git-", dir=checkout_root)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        # Native Codex runs and the git commits it drives can leave a child
+        # still writing under .git after the test body returns. Every such
+        # child carries this path in HOME/CODEX_HOME/TMPDIR; stop them first.
+        self.addCleanup(fixture_processes.reap, str(self.base))
         self.repo = self.base / "repo"
         self.wt = self.base / "worktree"
         self.artifact = self.base / "artifacts"
