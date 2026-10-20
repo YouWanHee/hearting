@@ -173,12 +173,18 @@ class DispatchArtifactRootTests(unittest.TestCase):
         body = prompt.read_text(encoding="utf-8")
         self.assertIn(self.canonical, body)
         self.assertIn("read-only shadow state", body)
+        return result
 
     def test_claude_scopes_add_dir_and_metadata(self):
         self.assert_registered("claude", f"--add-dir {self.canonical}")
 
     def test_codex_scopes_add_dir_and_metadata(self):
-        self.assert_registered("codex", f"--writable-root {self.canonical}")
+        result = self.assert_registered("codex")
+        # The app-server supervisor and plain `codex exec` spell the same scope differently;
+        # which one launches depends on the Codex runtime available here.
+        command = next(line for line in result.stdout.splitlines() if line.startswith("command="))
+        flag = "--writable-root" if "codex-app-server-supervisor.py" in command else "--add-dir"
+        self.assertIn(f"{flag} {self.canonical}", command)
 
     def test_opencode_scopes_external_directory_and_preserves_config(self):
         v1_existing = {
