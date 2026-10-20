@@ -7153,7 +7153,7 @@ def _next_marker_sequence(directory, node_id):
     return maximum+1
 
 def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *, repair=True,
-                              evidence_sha256=None):
+                              evidence_sha256=None, resource_execution_identity=None):
     """The one answer to "is this call a replay of the marker already on disk?".
 
     N2: this used to live only inside `write_completion_marker`, and the
@@ -7180,10 +7180,12 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
     existing=json.loads(candidate.read_text(encoding="utf-8"))
     identity={
         "evidence_sha256":evidence_sha256 if evidence_sha256 is not None else evidence_digest(evidence),
+        "resource_execution_identity":resource_execution_identity,
         **axes,
     }
     existing_identity={
         "evidence_sha256":existing.get("evidence",{}).get("sha256"),
+        "resource_execution_identity":existing.get("resource_execution_identity"),
         **{key:existing.get(key) for key in axes},
     }
     if existing_identity!=identity:
@@ -7345,7 +7347,7 @@ def write_completion_marker(
     route, node, node_id, evidence, *,
     attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
     owner_override=False, owner_chain=False, expected_evidence_sha256=None,
-    _lock_held=False,
+    resource_execution_identity=None, _lock_held=False,
 ):
     if not _lock_held:
         with _exclusive_lock(completion_dir(route["route_id"]) / f".{node_id}.completion.lock"):
@@ -7354,7 +7356,8 @@ def write_completion_marker(
                 return write_completion_marker(
                     route, node, node_id, evidence, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
                     review_claim=review_claim, jobs=jobs, owner_override=owner_override,
-                    owner_chain=owner_chain, expected_evidence_sha256=expected_evidence_sha256, _lock_held=True)
+                    owner_chain=owner_chain, expected_evidence_sha256=expected_evidence_sha256,
+                    resource_execution_identity=resource_execution_identity, _lock_held=True)
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
     if expected_evidence_sha256 is None:
@@ -7383,6 +7386,7 @@ def write_completion_marker(
     replay_candidate = _completion_marker_replay(
         route, node, node_id, evidence, axes, directory, repair=False,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+        resource_execution_identity=resource_execution_identity,
     )
     if replay_candidate is not None:
         source_subject = None
@@ -7407,6 +7411,7 @@ def write_completion_marker(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+        resource_execution_identity=resource_execution_identity,
     )
     if replayed is None and canonical_path.is_file():
         prior = json.loads(canonical_path.read_text(encoding="utf-8"))
@@ -7423,6 +7428,7 @@ def write_completion_marker(
             replayed=_completion_marker_replay(
                 route,node,node_id,evidence,axes,directory,
                 evidence_sha256=sha,
+                resource_execution_identity=resource_execution_identity,
             )
     if replayed is not None:
         replayed = _review_self_disposition_locked(
@@ -7532,6 +7538,8 @@ def write_completion_marker(
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
+        **({"resource_execution_identity":resource_execution_identity}
+           if resource_execution_identity is not None else {}),
     }
     if source_subject is not None:
         marker["source_subject"] = source_subject

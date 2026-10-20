@@ -171,11 +171,17 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertEqual(caught.exception.reason, "retry-already-claimed")
 
     def test_success_published_between_retry_proposal_and_claim_wins(self):
-        self.jobs.write_text(row("att-failed", status="done", note="completed-marker", launch_outcome="never-launched"))
-        with self.assertRaises(contract.DispatchContractError) as caught:
-            contract.claim_attempt_row(self.jobs, "att-retry", row("att-retry", automatic_retry_of="att-failed"), launch=True)
-        self.assertEqual(caught.exception.reason, "retry-predecessor-not-retryable")
-        self.assertEqual(len(self.jobs.read_text().splitlines()), 1)
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                self.jobs.write_text(row("att-failed", status="done", harness=harness,
+                                         note="completed-marker", launch_outcome="never-launched"))
+                with self.assertRaises(contract.DispatchContractError) as caught:
+                    contract.claim_attempt_row(
+                        self.jobs, "att-retry",
+                        row("att-retry", harness=harness, automatic_retry_of="att-failed"),
+                        launch=True)
+                self.assertEqual(caught.exception.reason, "retry-predecessor-not-retryable")
+                self.assertEqual(len(self.jobs.read_text().splitlines()), 1)
 
     def test_terminal_conflict_preserves_pass_blocks_consumption_and_has_exact_review_recovery(self):
         import dispatch_completion_join as join

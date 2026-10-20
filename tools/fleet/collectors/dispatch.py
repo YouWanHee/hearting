@@ -58,6 +58,7 @@ from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  #
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
+from attempt_view import owned_attempt_log_path as _shared_owned_attempt_log_path  # noqa: E402
 
 try:  # W7D read-side layout resolver; absent on a pre-cutover checkout.
     import artifact_reader  # noqa: E402
@@ -1189,65 +1190,8 @@ _ATTEMPT_PARSE_CACHE_LIMIT = 4096
 
 
 def _owned_attempt_log_path(job):
-    """Return one exact Claude/Codex/OpenCode attempt log, or fail closed.
-
-    ``--log-dir`` may place registered-worker streams either under the dispatch
-    registry or below the canonical artifact root.  ``log_file`` is registry data,
-    so accept only a real file below one of those roots whose basename binds both
-    the exact attempt id and the declared harness suffix.
-    """
-    raw = getattr(job, "_log_file", None)
-    attempt_id = getattr(job, "attempt_id", None)
-    harness = getattr(job, "harness", None)
-    if harness not in ("claude", "codex", "opencode") or not raw or not attempt_id:
-        return None
-    path = os.path.realpath(raw)
-    roots = []
-    registry_path = getattr(job, "_registry_path", None)
-    if registry_path:
-        registry_dir = os.path.dirname(os.path.realpath(registry_path))
-        roots.append(os.path.join(registry_dir, "logs"))
-        # Installed runtime registries use `<runtime>/.harness/dispatch/jobs.log`,
-        # while a wrapper with that agent home still defaults logs to the sibling
-        # hidden `.dispatch/logs` directory.
-        if os.path.basename(registry_dir) == "dispatch":
-            roots.append(os.path.join(os.path.dirname(registry_dir), ".dispatch", "logs"))
-    artifact_root = getattr(job, "artifact_root", None)
-    if artifact_root:
-        real_artifact = os.path.realpath(artifact_root)
-        roots.append(real_artifact)
-        # A launcher streams workers to $AGENT_HOME/.dispatch/logs
-        # (dispatch-liveness.sh), while a managed parent may register the row in
-        # a DIFFERENT runtime-home registry (codex managed gateway). The only
-        # row-declared anchor for that launch home is the artifact root's
-        # parent — accept exactly its .dispatch/logs subtree, nothing wider.
-        roots.append(os.path.join(os.path.dirname(real_artifact), ".dispatch", "logs"))
-    # OPERATIONS §5.10 SD-49: current wrappers seal launch_home=<resolved agent
-    # home> in the row, so the launch's default log dir needs no layout guessing.
-    # Accept exactly that home's .dispatch/logs subtree; legacy rows without the
-    # key keep the heuristic roots above.
-    launch_home = getattr(job, "_launch_home", None)
-    if launch_home:
-        roots.append(os.path.join(os.path.realpath(launch_home), ".dispatch", "logs"))
-    if not roots:
-        # Legacy compatibility only when the row carries no owning root at all.
-        # Otherwise the observer's AGENT_HOME would make one Fleet process trust
-        # a log path that the same binary launched by another user rejects.
-        roots.append(os.path.realpath(os.path.join(_registry_home(), ".dispatch", "logs")))
-    allowed = False
-    for root in roots:
-        try:
-            if os.path.commonpath((root, path)) == root:
-                allowed = True
-                break
-        except (TypeError, ValueError):
-            continue
-    if not allowed:
-        return None
-    name = os.path.basename(path)
-    if not name.endswith(".%s.jsonl" % harness) or ("." + attempt_id + ".") not in name:
-        return None
-    return path if os.path.isfile(path) else None
+    """Fleet adapter for the portable shared exact-path validator."""
+    return _shared_owned_attempt_log_path(job, fallback_home=_registry_home())
 
 
 def _owned_claude_stream_path(job):
