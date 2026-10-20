@@ -459,8 +459,8 @@ Session and prompt bridges retain `hookSpecificOutput.additionalContext` for opt
 Every pane Hearting opens comes from `open_pane` in `utilities/terminal_surface.py`:
 `hearting run peer-steward start <name> --kind <harness>` for another session,
 `hearting run pane open <command>` for a command output pane, main recovery, and
-Fleet `--window`. Peer start and recovery stay on the checked Herdr pane; `pane
-open` and Fleet use the caller's verified Herdr pane, then the tmux server
+Fleet `--window`. Peer start and recovery stay on the checked Herdr reference;
+`pane open` and Fleet use the caller's verified Herdr pane, then the tmux server
 `$TMUX` names, and otherwise open nothing and print the command line (exit 0).
 It fills the calling tab's 2×2 grid without focus: right, right-column down,
 then remaining-column down, each at ratio 0.5. A full or irregular tab reuses

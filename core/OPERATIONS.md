@@ -2122,15 +2122,16 @@ Window contract: every pane Hearting opens comes from
 `utilities/terminal_surface.py:open_pane`, reached through `peer-steward start`
 (another session), `hearting run pane open <command>` (a command output pane),
 `interactive-main-recovery --start` and Fleet `--window`. Peer start and
-recovery pass the Herdr pane they already checked. `pane open` and Fleet use the
-caller's Herdr pane when the shared live ownership proof holds, then the tmux
-server `$TMUX` names when it answers, else none: nothing opens and the result
-carries the command line to run by hand (exit 0). Registered workers get no
-surface, and an inherited pane label alone opens no Herdr pane. On all three
-harnesses it reads the tab's layout (for tmux, the union of its pane rects; a
-zoomed tmux window counts as irregular) and fills a 2×2 grid without focus: one pane splits right, two
-side-by-side panes split the right column down, and three panes split the
-remaining full column down. Each split uses ratio 0.5. Existing horizontal rows
+recovery pass the Herdr reference they already checked (a project start passes
+its workspace, and no pane is split there). `pane open` and Fleet use the caller's
+Herdr pane when the shared live ownership proof holds, then the tmux server
+`$TMUX` names when it answers, else none: nothing opens and the result carries
+the command line to run by hand (exit 0). Registered workers get no surface, and
+an inherited pane label alone opens no Herdr pane. On all three harnesses it
+reads the tab's layout (for tmux, the union of its pane rects; a zoomed tmux
+window counts as irregular) and fills a 2×2 grid without focus: one pane splits
+right, two side-by-side panes split the right column down, and three panes split
+the remaining full column down. Each split uses ratio 0.5. Existing horizontal rows
 fill the equivalent grid by splitting right. A full or irregular tab first
 reuses an agent-free foreground shell with an empty visible prompt there, then
 checks the other tabs in the same workspace, newest first, using the same
