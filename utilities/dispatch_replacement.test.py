@@ -1042,6 +1042,45 @@ class ReplacementTest(unittest.TestCase):
         empty = {"harness": "opencode", "applied_permissions": {"opencode_permission": {}}}
         self.assertNotEqual(*R.route_authority._granted_permission_pair(missing, empty))
 
+    def test_equivalent_and_conflicting_opencode_policies_after_sealed_readback(self):
+        cases = (
+            ([("*", "deny"), ("/root/**", "deny")],
+             [("/root/**", "deny"), ("*", "deny")], True),
+            ([("*", "deny")],
+             [("*", "deny"), ("/root/**", "allow"), ("*", "deny")], True),
+            ([("*", "deny"), ("/root/**", "allow"), ("/root/private/**", "deny")],
+             [("*", "deny"), ("/root/**", "allow")], False),
+            ([("*", "deny"), ("/root/**", "allow")],
+             [("/root/**", "allow"), ("*", "deny")], False),
+        )
+        for index, (legacy_rules, native_rules, equivalent) in enumerate(cases):
+            with self.subTest(index=index, equivalent=equivalent):
+                configs = ({"permission": {"edit": dict(legacy_rules)}}, {
+                    "permissions": [{"action": "edit", "resource": resource, "effect": effect}
+                                    for resource, effect in native_rules],
+                })
+                self.assertIsInstance(configs[1]["permissions"], list)
+                self.assertNotIn("permission", configs[1])
+                sealed = []
+                for side, config in enumerate(configs):
+                    args = SimpleNamespace(**vars(self.args))
+                    args.attempt_id = f"att-equivalent-policy-{index}-{side}"
+                    args.opencode_config_content = json.dumps(config)
+                    args.replacement_input_argv = ["--start", "--attempt-id", args.attempt_id,
+                                                   "--prompt-text", "the raw task"]
+                    fragment = R.seal_launch_input(args, "opencode", "the raw task")
+                    value = R.launch_input(self.jobs, args.attempt_id,
+                                           D.parse_registry_metadata(fragment))
+                    self.assertTrue(value["applied_permissions"]["opencode_permission"])
+                    sealed.append(value)
+                before, after = sealed
+                grants = [R.route_authority.granted_permissions(value["applied_permissions"])
+                          for value in sealed]
+                self.assertEqual(grants[0] == grants[1], equivalent)
+                # The same work/attempt with its grant projected by either config generation.
+                candidate = {**before, "applied_permissions": after["applied_permissions"]}
+                self.assertEqual(R.route_authority.same_sealed_work(before, candidate), equivalent)
+
     def test_replay_uses_raw_task_and_new_identity(self):
         record=self.claim();source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
         cmd=R._command(self.jobs,record,source,R.launch_input(self.jobs,'att-source',source))

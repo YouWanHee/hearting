@@ -272,8 +272,24 @@ def opencode_permission_effect(permission, action, resource, default=None):
     return effect
 
 
+@lru_cache(maxsize=1024)
+def _opencode_pattern_covers(cover, pattern):
+    """Prove containment for launcher patterns; keep unproved cases distinct."""
+    cover = re.sub(r"\*+", "*", cover.replace("\\", "/"))
+    pattern = re.sub(r"\*+", "*", pattern.replace("\\", "/"))
+    if cover == "*" or cover == pattern:
+        return True
+    if "*" not in pattern and "?" not in pattern:
+        return _opencode_pattern_matches(cover, pattern)
+    # A literal directory/command prefix followed by '*' covers any narrower
+    # pattern starting with that prefix. Other glob containments stay unknown.
+    prefix = cover[:-1]
+    return (cover.endswith("*") and "*" not in prefix and "?" not in prefix
+            and pattern.startswith(prefix))
+
+
 def opencode_permission_ordered_view(permission):
-    """Normalize grants and retain order only where matching patterns overlap."""
+    """Compare live grants, preserving precedence only for conflicting effects."""
     normalized = normalize_opencode_permission(permission)
     rows = []
     for action, setting in normalized.items():
@@ -285,11 +301,32 @@ def opencode_permission_ordered_view(permission):
             rows.append((action, resource, effect))
     if not rows:
         return []
+
+    def covers(before, after):
+        return (_opencode_pattern_covers(before[0], after[0])
+                and _opencode_pattern_covers(before[1], after[1]))
+
+    def overlaps(before, after):
+        return (_opencode_patterns_overlap(before[0], after[0])
+                and _opencode_patterns_overlap(before[1], after[1]))
+
+    live = []
+    for index, row in enumerate(rows):
+        if any(covers(later, row) for later in rows[index + 1:]):
+            continue  # A later rule decides every point this row could decide.
+        for earlier_index in range(len(live) - 1, -1, -1):
+            earlier = live[earlier_index]
+            if (earlier[2] == row[2] and covers(earlier, row)
+                    and not any(between[2] != row[2] and overlaps(between, row)
+                                for between in live[earlier_index + 1:])):
+                break  # The row repeats an unchanged earlier decision.
+        else:
+            live.append(row)
+    rows = live
     precedence = []
     for index, before in enumerate(rows):
         for after in rows[index + 1:]:
-            if (_opencode_patterns_overlap(before[0], after[0])
-                    and _opencode_patterns_overlap(before[1], after[1])):
+            if before[2] != after[2] and overlaps(before, after):
                 precedence.append((before, after))
     return {
         "rules": [list(row) for row in sorted(rows)],

@@ -110,6 +110,65 @@ class OpenCodePermissionCodecTest(unittest.TestCase):
         })
         self.assertNotEqual(first, second)
 
+    def test_redundant_equal_effect_and_shadowed_rules_compare_equal(self):
+        deny = runtime.opencode_permission_ordered_view({"edit": "deny"})
+        for rules in (
+                {"*": "deny", "/root/**": "deny"},
+                {"/root/**": "deny", "*": "deny"},
+                {"/root/**": "allow", "*": "deny"}):
+            with self.subTest(rules=rules):
+                self.assertEqual(runtime.opencode_permission_ordered_view({"edit": rules}),
+                                 deny)
+        self.assertEqual(runtime.opencode_permission_ordered_view({
+            "*": "deny", "edit": {"/root/**": "deny"},
+        }), runtime.opencode_permission_ordered_view({"*": "deny"}))
+        self.assertEqual(runtime.opencode_permission_ordered_view({
+            "edit": {"/root/**": "allow"}, "*": "deny",
+        }), runtime.opencode_permission_ordered_view({"*": "deny"}))
+        overlapping = {"/root/*": "deny", "*/file": "deny"}
+        self.assertEqual(runtime.opencode_permission_ordered_view({"edit": overlapping}),
+                         runtime.opencode_permission_ordered_view({
+                             "edit": dict(reversed(list(overlapping.items())))}))
+
+    def test_conflicting_overlaps_without_containment_stay_order_sensitive(self):
+        rules = {"/root/*": "deny", "*/file": "allow"}
+        first, second = {"edit": rules}, {"edit": dict(reversed(list(rules.items())))}
+        self.assertNotEqual(runtime.opencode_permission_ordered_view(first),
+                            runtime.opencode_permission_ordered_view(second))
+        self.assertEqual(runtime.opencode_permission_effect(first, "edit", "/root/file"), "allow")
+        self.assertEqual(runtime.opencode_permission_effect(second, "edit", "/root/file"), "deny")
+
+    def test_pruning_keeps_a_deny_after_an_intervening_allow(self):
+        restricted = {"edit": {"*": "deny", "/root/**": "allow",
+                               "/root/private/**": "deny"}}
+        widened = {"edit": {"*": "deny", "/root/**": "allow"}}
+        self.assertNotEqual(runtime.opencode_permission_ordered_view(restricted),
+                            runtime.opencode_permission_ordered_view(widened))
+        self.assertEqual(runtime.opencode_permission_effect(
+            restricted, "edit", "/root/private/file"), "deny")
+        self.assertEqual(runtime.opencode_permission_effect(
+            widened, "edit", "/root/private/file"), "allow")
+        same_allow = {"edit": {"*": "deny", "/root/**": "allow",
+                               "/root/private/**": "allow"}}
+        self.assertEqual(runtime.opencode_permission_ordered_view(same_allow),
+                         runtime.opencode_permission_ordered_view(widened))
+
+    def test_comparison_pruning_never_merges_different_last_match_results(self):
+        import itertools
+        rules = (("*", "deny"), ("/root/*", "allow"),
+                 ("/root/private/*", "deny"), ("/elsewhere", "deny"))
+        observations = {}
+        for ordered in itertools.permutations(rules):
+            rows = [{"action": "edit", "resource": resource, "effect": effect}
+                    for resource, effect in ordered]
+            expected = tuple(self.reference_effect(rows, "edit", resource) for resource in
+                             ("", "/root/file", "/root/private/file", "/elsewhere", "/other"))
+            view = runtime.opencode_permission_ordered_view({"edit": dict(ordered)})
+            key = json.dumps(view, sort_keys=True)
+            if key in observations:
+                self.assertEqual(observations[key], expected, ordered)
+            observations[key] = expected
+
     def test_interleaved_action_wildcards_and_repeated_resources_keep_last_match(self):
         rows = [
             {"action": "edit", "resource": "*", "effect": "deny"},
