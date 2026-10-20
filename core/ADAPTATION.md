@@ -675,6 +675,14 @@ Message observation and transport keep the accepted server selected throughout.
 Retire observations update only their current phase under the existing duty lock;
 stale observations cannot undo an exit claim or reopen a completed/cancelled duty.
 
+A confirmed same-seat steward handover keeps an accepted unresolved watch on the same
+watch ID, exact target, endpoint, until-set and original deadline. Its current steward and
+notification recipient follow the common confirmed holder chain. Session replacement is
+terminal only when that chain does not confirm the successor; missing or interrupted
+adoption remains pending. PID reuse, a different endpoint or pane, and a stale predecessor
+callback cannot adopt or settle the duty. Explicit release revokes role evidence without
+silently deleting an unresolved watch.
+
 On Claude, `PostToolUse(Bash)` `asyncRewake` hook `peer-steward-rewake.py` arms only from a
 same-session armed line with `wake=hook` whose receipt sits under the canonical state root,
 `join`s within one deadline computed at hook entry, acks, and exits 2. Its survival across
@@ -896,7 +904,8 @@ and was observed within 15 seconds. Missing, stale, or mismatched status stays
 unknown for retire decisions.
 
 An exact pane exit, exact closed-pane event, complete absence census, completed retire,
-confirmed steward exit/replacement, or the original explicit deadline settles the existing
-watch duty before its observer exits. A terminal receipt prevents lifecycle reconciliation
+confirmed steward exit or unconfirmed replacement, or the original explicit deadline settles the existing
+watch duty before its observer exits. A confirmed same-seat successor keeps the existing duty
+open. A terminal receipt prevents lifecycle reconciliation
 from recreating an observer. Pane closure, steward closure, agent release, goal completion,
 and successful work are distinct outcomes.

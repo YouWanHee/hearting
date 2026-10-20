@@ -546,6 +546,9 @@ class SameRepositoryRoleTest(unittest.TestCase):
         native = mock.patch.object(steward, "_native_role_sessions", return_value=[])
         native.start()
         self.addCleanup(native.stop)
+        relations = mock.patch.object(steward, "read_relations", return_value=[])
+        relations.start()
+        self.addCleanup(relations.stop)
 
     def row(self, harness, sid, cwd):
         return Session(harness=harness, pid=10, session_id=sid, session_tag=sid[:2],
