@@ -258,7 +258,29 @@ def session_id_for_derived_name(name: object, *, home: object = None) -> Optiona
     return found
 
 
+_UNSET_RECIPIENT_CONTEXT = object()
+
+
 def resolve_tag(harness: object, session_id: object, *, home: object = None) -> Optional[str]:
+    """Resolve the shared display tag using the caller's historical context.
+
+    Existing callers retain their environment-based Claude seat fallback. A
+    recipient lookup must use :func:`resolve_recipient_tag` so the sender's
+    pane and cwd cannot affect which resumed seat history is read.
+    """
+    return _resolve_tag(harness, session_id, home=home)
+
+
+def resolve_recipient_tag(harness: object, session_id: object, *, pane: object,
+                          cwd: object, home: object = None) -> Optional[str]:
+    """Resolve a tag for one recipient pane without consulting sender context."""
+    return _resolve_tag(harness, session_id, home=home,
+                        recipient_pane=pane, recipient_cwd=cwd)
+
+
+def _resolve_tag(harness: object, session_id: object, *, home: object = None,
+                 recipient_pane: object = _UNSET_RECIPIENT_CONTEXT,
+                 recipient_cwd: object = _UNSET_RECIPIENT_CONTEXT) -> Optional[str]:
     """The one 2-hex badge rule, shared by every surface that draws `[xx]`.
 
     Fleet's collectors, `peer-message.py`'s trailer alias, and the Herdr pane title all
@@ -316,7 +338,12 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
         # Keep the derived pane badge across a native resume. The alias lookup
         # is the same display-only seat history Fleet uses, never a cwd guess.
         from fleet.collectors.herdr import pane_session_aliases
-        aliases = pane_session_aliases("claude", sid, os.environ.get("HERDR_PANE_ID"), os.getcwd())
+        if recipient_pane is _UNSET_RECIPIENT_CONTEXT:
+            alias_pane, alias_cwd = os.environ.get("HERDR_PANE_ID"), os.getcwd()
+        else:
+            alias_pane = recipient_pane
+            alias_cwd = None if recipient_cwd is _UNSET_RECIPIENT_CONTEXT else recipient_cwd
+        aliases = pane_session_aliases("claude", sid, alias_pane, alias_cwd)
         tags = {derived_tag(record.get("name")) for record in records
                 if record.get("sessionId") in aliases and record.get("nameSource") == "derived"}
         tags.update(read_tag(alias, harness="claude") for alias in aliases)

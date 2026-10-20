@@ -174,6 +174,30 @@ class PaneOwnershipTest(unittest.TestCase):
                 mock.patch.object(po, "_registered_worker", return_value=False):
             self.assertEqual(self.verify(foreground.pid, "codex", current), "")
 
+    def test_current_codex_thread_rechecks_native_claim_and_process_birth(self):
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        replacement = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+        record = po._process(foreground.pid)
+        with mock.patch.object(po, "_runtime", return_value=("codex", False)), \
+                mock.patch.object(po, "_native_session", side_effect=(current, replacement)) as native, \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value=set()), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertEqual(po.current_codex_thread(
+                "wB:p3N", foreground.pid, executable=str(self.herdr)), "")
+        self.assertEqual(native.call_count, 2)
+
+        recycled = (*record[:5], "different-start")
+        with mock.patch.object(po, "_runtime", return_value=("codex", False)), \
+                mock.patch.object(po, "_process", side_effect=(record, recycled)), \
+                mock.patch.object(po, "_native_session", return_value=current) as native, \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value=set()), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertEqual(po.current_codex_thread(
+                "wB:p3N", foreground.pid, executable=str(self.herdr)), "")
+        native.assert_called_once()
+
     def test_yolo_tui_proves_its_thread_and_refuses_a_foreign_one(self):
         from fleet.collectors import codex, procscan
         foreground = self.runtime("codex", "--yolo")

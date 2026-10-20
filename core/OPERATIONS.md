@@ -2403,7 +2403,7 @@ acceptance and actual receipt are separate facts:
 | Runtime | Transport and acceptance | Exact native receipt | Wake and limits |
 |---|---|---|---|
 | Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. No pane send or composer read. |
-| Codex | The current exact thread/client queue accepts one sealed ref and returns its `client_message_id`. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
+| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
 | OpenCode | The plugin saves one `noReply` user message through its current client at the exact selected root SID. Its native ID marks it queued. | Only an error-free completed assistant message whose `parentID` is that ID in the same SID marks it received. | On a verified idle root, `promptAsync` continues the persisted message by ID. Busy, question, permission, child, ambiguous history or SID change cannot consume it. |
 
 Queue acceptance never means delivery or consumption. A pending retry of the same
@@ -2411,6 +2411,15 @@ sender/recipient/body reuses its ref; a changed body or recipient session gets a
 separate transfer. Lost responses reconcile against exact native history before a
 resume. Ambiguity never submits the body again. Native callbacks preserve pending
 refs when the runtime has no supported wake.
+
+For SID-bound native Codex delivery, a new foreground PID/start remains the same
+recipient when a fresh current-native observation proves the same exact thread SID
+in the pinned pane. The queue submission still uses that immutable recipient SID
+and sealed ref. A changed pane or SID, conflicting claim, or unknown current proof
+does not authorize submission. Original PID/start binding remains required for
+pane-bound sidless first input, Claude PTY input, retirement, and other
+process-owned side effects; it is not a permanent extra gate on exact-thread queue
+continuation.
 
 Sender-delay duties retain their logical body digest and match their minted
 transfer through its source digest and delay refs. Each runner checkpoint
@@ -2562,6 +2571,28 @@ checking the booked process, form and empty input; other targets use the sealed
 no-trailer ref through their native carrier. Both address only the exact new SID,
 send once and keep pending refs until exact native receipt. Neither invents a wake
 or falls back to an inherited pane prompt.
+
+For `peer-steward.py prompt`, an exact Fleet display name, its `[xx]` Fleet tag,
+and an explicit pane address may resolve to the same recipient only when each
+identifies one current pane on the selected herdr endpoint and the existing
+native identity readers prove that pane's current harness and session ID. A
+name or tag is a search key, including when it comes from a historical seat or
+registry alias; it does not prove current identity. Resolution keeps the
+selected endpoint, canonical pane, harness, and current session ID together
+through readiness, identity rechecks, native delivery, deferred resume, and the
+ledger. The original address remains a bounded diagnostic label.
+
+Prompt resolution distinguishes a complete no-match (`not-found`), multiple
+current matches or a name/tag collision (`ambiguous`), and observations that
+are missing, partial, malformed, or conflicting (`observation-unavailable` or
+`identity-unverified`). Failure diagnostics retain every known candidate pane.
+A duplicate session ID in two panes is two candidates. None of these failures
+creates a carrier submission or an
+unresolved-recipient delivery obligation. Successful resolution does not relax
+the existing exact SID/PID-birth, native state, registered-work, composer,
+form, or receive-evidence checks. A name or tag match does not expand the
+pane-only sidless first-input path, and a queued carrier result remains
+distinct from exact receiver evidence.
 
 Clear and retire retain their checked foreground/form/draft and successor safety.
 Claude peer submission uses `herdr agent prompt` only for the guarded idle plain-TUI
