@@ -41,6 +41,34 @@ COMPOSED = os.path.join(os.path.dirname(__file__), "fixtures", "route", "synth_c
 
 class RuntimeRootSeparationTest(unittest.TestCase):
 
+    def test_degradation_reader_consumes_maximum_candidate_row_and_partial_tail(self):
+        sys.path.insert(0, str(Path(_TOOLS_DIR).parent / 'utilities'))
+        from dispatch_degradation import record_degradation
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / 'state'
+            jobs = state / 'jobs.log'
+            shard = state / 'degradations'
+            shard.mkdir(parents=True)
+            path = shard / 'rt-large.jsonl'
+            path.write_bytes(b'malformed old row\n' * 5000)
+            candidates = [dict(ordinal=n, tuple='t'*160, attempted=True,
+                               attempt_id='a'*120, exit='65', reason='r'*160,
+                               detail='cherry-pick') for n in range(32)]
+            written = record_degradation(
+                jobs=str(jobs), route_id='rt-large', route_node='execute',
+                route_hash='sha256:fixture', dispatch_depth=2,
+                writer='stage-dispatch-fallback.py', candidate_outcomes=candidates)
+            self.assertEqual(Path(written), path)
+            last = path.read_bytes().splitlines()[-1]
+            self.assertGreater(len(last), 16*1024)
+            with path.open('ab') as out:
+                out.write(b'\xe2\x98')  # an incomplete UTF-8 append is not a record
+            job = DispatchJob(key='code', slug='large', route_id='rt-large')
+            job._registry_path = str(jobs)
+            rows = dispatch._scan_degradations({'rt-large'}, agent_home=td, jobs=[job])
+            self.assertEqual(len(rows['rt-large']), 1)
+            self.assertEqual(rows['rt-large'][0]['candidate_outcomes'], candidates)
+
     def test_claude_credentials_ignore_harness_source_root(self):
         with mock.patch.dict(os.environ, {
             "AGENT_HOME": "/release/hearting",

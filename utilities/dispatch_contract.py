@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+import unicodedata
 from typing import Callable, Iterator, Mapping, NamedTuple
 from types import MappingProxyType
 
@@ -2782,6 +2783,8 @@ PRELAUNCH_WAIT_INTERVAL_MAX_SECONDS = 2.0
 # observed (13.59.3 "관측"), and a new member here must be added by name so
 # an unclassified reason cannot silently fall through to the descent path.
 ROUTE_STATE_REFUSAL_REASONS = (
+    "unsafe-git-operation",
+    "unsafe-git-state",
     "completion-marker-missing",
     "completion-marker-integrity-broken",
     "completion-evidence-superseded",
@@ -2790,6 +2793,88 @@ ROUTE_STATE_REFUSAL_REASONS = (
     "review-verdictless-bound",
     "round-unsettled",
 )
+
+# Receipts and the ledger carry the same bounded facts, never a clipped copy
+# of a child's output. Keep this at their shared boundary, including callers
+# which write candidate evidence directly without going through fallback.
+CANDIDATE_PAYLOAD_BYTES = 32 * 1024
+_DIAGNOSTIC_COUNT_MAX = 2**31 - 1
+_DIAGNOSTIC_DETAILS = frozenset({
+    "", "merge", "rebase", "cherry-pick", "HEAD cannot be resolved",
+    "wrapper timed out", "capacity retry was stopped", "capacity death",
+    "existing retry is terminal", "existing retry has no attempt ID",
+    "duplicate attempt claimed", "duplicate claim has no row",
+    "open", "running", "done", "unknown", "watchdog fallback",
+    "the call was stopped, so the worker was stopped with it",
+    "sealed parent identity is not the live dispatch-depth-1 owner",
+    "OSError", "ValueError", "TimeoutExpired", "PermissionError", "FileNotFoundError",
+    "[detail omitted]", "detached HEAD",
+})
+
+
+def diagnostic_line(value: object, limit: int = 512) -> str:
+    """A display line cannot introduce receipt keys or terminal controls."""
+    if not isinstance(value, str):
+        return ""
+    value = "".join(" " if unicodedata.category(ch).startswith("C") else ch
+                    for ch in value[:limit * 2])
+    return " ".join(value.split())[:limit]
+
+
+def diagnostic_token(value: object, limit: int = 160) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value[:limit]
+    return value if re.fullmatch(r"[A-Za-z0-9._:/-]*", value) else ""
+
+
+def candidate_detail(reason: str, value: object) -> str:
+    """Only finite local facts may persist; unknown free text is omitted."""
+    if not isinstance(value, str):
+        return ""
+    if value in _DIAGNOSTIC_DETAILS:
+        return value
+    if reason == "unsafe-git-state" and value.startswith("detached HEAD in "):
+        return "detached HEAD"
+    return "[detail omitted]"
+
+
+def candidate_count(value: object) -> int:
+    return min(max(value, 0), _DIAGNOSTIC_COUNT_MAX) if type(value) is int else 0
+
+
+def bounded_candidate_outcomes(values: object, omitted: object = 0) -> tuple[list, int]:
+    """Normalize untrusted candidate input and bound its serialized size."""
+    count = candidate_count(omitted)
+    if not isinstance(values, list):
+        return [], count
+    count = candidate_count(count + max(0, len(values) - 32))
+    rows = []
+    for item in values[:32]:
+        if not isinstance(item, dict):
+            count = candidate_count(count + 1)
+            continue
+        attempted = item.get("attempted") is True
+        reason = diagnostic_token(item.get("reason", ""))
+        exit_code = item.get("exit", "")
+        if type(exit_code) is int:
+            exit_code = str(exit_code) if -999 <= exit_code <= 999 else ""
+        exit_code = diagnostic_token(exit_code, 16)
+        rows.append({
+            "ordinal": (item["ordinal"] if type(item.get("ordinal")) is int
+                        and 0 <= item["ordinal"] <= _DIAGNOSTIC_COUNT_MAX else 0),
+            "tuple": diagnostic_token(item.get("tuple", "")),
+            "attempted": attempted,
+            "attempt_id": diagnostic_token(item.get("attempt_id", ""), 120) if attempted else "",
+            "exit": exit_code if attempted else "",
+            "reason": reason,
+            "detail": candidate_detail(reason, item.get("detail", "")),
+        })
+    # ensure_ascii=True is the larger of the receipt and ledger encodings.
+    while len(json.dumps(rows).encode("utf-8")) > CANDIDATE_PAYLOAD_BYTES:
+        rows.pop()
+        count = candidate_count(count + 1)
+    return rows, count
 
 
 def route_state_next_action(reason: str, detail: str, route_file: str | None,

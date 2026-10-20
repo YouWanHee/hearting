@@ -1215,12 +1215,12 @@ class RealStageAdvanceServices:
             raise StageAdvanceError(
                 "stage-advance-successor-start-failed", f"{type(exc).__name__}"
             ) from exc
-        fields = FALLBACK.output_fields((completed.stdout or "") + (completed.stderr or ""))
+        fields = FALLBACK.wrapper_fields(completed)
         if completed.returncode != 0 or fields.get("check") == "failed":
             wrapper_reason = fields.get("reason") or ""
             raise StageAdvanceError(
                 _classify_wrapper_start_failure(wrapper_reason),
-                wrapper_reason or (completed.stderr or completed.stdout or "")[:200],
+                wrapper_reason or "wrapper exited without a typed refusal",
             )
         return {
             "child_spawned": fields.get("child_spawned", "1") != "0",

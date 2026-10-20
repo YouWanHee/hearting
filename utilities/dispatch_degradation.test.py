@@ -26,6 +26,83 @@ ROOT = UTILITIES.parent
 
 
 class DegradationWriterTest(unittest.TestCase):
+    def test_direct_writer_does_not_persist_raw_candidate_details_or_skip_identity(self):
+        with tempfile.TemporaryDirectory() as home:
+            candidates = [dict(ordinal=True, tuple='codex/headless', attempted=False,
+                               attempt_id='att-not-started', exit='65', reason='wrapper-exit',
+                               detail='PROMPT_SENTINEL argv=--token=ENV_SENTINEL\u2028reason=forged')]
+            path = record_degradation(
+                agent_home=home, jobs=os.path.join(home, 'dispatch/jobs.log'),
+                route_id='rt-private', route_node='execute', route_hash='sha256:fixture',
+                dispatch_depth=2, writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, candidate_outcomes_omitted=True)
+            raw = Path(path).read_text()
+            row = json.loads(raw)
+            self.assertNotIn('PROMPT_SENTINEL', raw)
+            self.assertNotIn('ENV_SENTINEL', raw)
+            self.assertEqual(row['candidate_outcomes'][0]['attempt_id'], '')
+            self.assertEqual(row['candidate_outcomes'][0]['exit'], '')
+            self.assertEqual(row['candidate_outcomes'][0]['ordinal'], 0)
+            self.assertEqual(row['candidate_outcomes_omitted'], 0)
+
+    def test_direct_writer_normalizes_invalid_and_oversized_candidate_input(self):
+        from dispatch_contract import CANDIDATE_PAYLOAD_BYTES
+        with tempfile.TemporaryDirectory() as home:
+            candidates = [None, {'ordinal': 10**100, 'tuple': ['RAW_SENTINEL'],
+                                'attempted': True, 'attempt_id': {'raw': 'RAW_SENTINEL'},
+                                'exit': {}, 'reason': {}, 'detail': {'raw': 'RAW_SENTINEL'}}]
+            candidates += [dict(ordinal=1, tuple='t'*500, attempted=True,
+                                attempt_id='a'*500, exit='1', reason='r'*500,
+                                detail='\u2603'*1000)]*35
+            path = record_degradation(
+                agent_home=home, jobs=os.path.join(home, 'dispatch/jobs.log'),
+                route_id='rt-private', route_node='execute', route_hash='sha256:fixture',
+                dispatch_depth=2, writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, candidate_outcomes_omitted=10**100)
+            raw = Path(path).read_text()
+            row = json.loads(raw)
+            self.assertNotIn('RAW_SENTINEL', raw)
+            self.assertLessEqual(len(json.dumps(row['candidate_outcomes']).encode()), CANDIDATE_PAYLOAD_BYTES)
+            self.assertLessEqual(row['candidate_outcomes_omitted'], 2**31-1)
+            self.assertEqual(row['candidate_outcomes'][0]['ordinal'], 0)
+
+    def test_candidate_outcomes_are_bounded_with_truthful_omission_count(self):
+        with tempfile.TemporaryDirectory() as home:
+            jobs = os.path.join(home, 'dispatch', 'jobs.log')
+            candidates = [{'ordinal': n, 'tuple': 't' * 500, 'attempted': False,
+                           'reason': 'skip' * 100, 'detail': 'd' * 1000}
+                          for n in range(35)]
+            path = record_degradation(
+                agent_home=home, jobs=jobs, route_id='rt-bounds', route_node='execute',
+                route_hash='sha256:fixture', dispatch_depth=2, fallback_hop='inline',
+                execution_surface='inline', writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, candidate_outcomes_omitted=2)
+            row = json.loads(Path(path).read_text().splitlines()[0])
+            self.assertEqual(len(row['candidate_outcomes']), 32)
+            self.assertEqual(row['candidate_outcomes_omitted'], 5)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['tuple']), 160)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['reason']), 160)
+            self.assertLessEqual(len(row['candidate_outcomes'][0]['detail']), 512)
+
+    def test_candidate_outcomes_keep_attempt_and_skip_separate(self):
+        with tempfile.TemporaryDirectory() as home:
+            jobs = os.path.join(home, 'dispatch', 'jobs.log')
+            candidates = [
+                {'ordinal': 1, 'tuple': 'codex/headless', 'attempted': True,
+                 'attempt_id': 'att-real', 'exit': '65',
+                 'reason': 'unsafe-git-operation', 'detail': 'cherry-pick'},
+                {'ordinal': 2, 'tuple': 'claude/headless', 'attempted': False,
+                 'attempt_id': '', 'exit': '', 'reason': 'parent-runtime-mismatch', 'detail': ''},
+            ]
+            path = record_degradation(
+                agent_home=home, jobs=jobs, route_id='rt-candidates', route_node='execute',
+                route_hash='sha256:fixture', dispatch_depth=2, fallback_hop='inline',
+                execution_surface='inline', writer='stage-dispatch-fallback.py',
+                candidate_outcomes=candidates, last_direct_failure='unsafe-git-operation:exit-65')
+            row = json.loads(Path(path).read_text().splitlines()[0])
+            self.assertEqual(row['candidate_outcomes'], candidates)
+            self.assertEqual(row['last_direct_failure'], 'unsafe-git-operation:exit-65')
+
     def setUp(self):
         # record_degradation() resolves the dispatch state root ahead of
         # agent_home/.dispatch, preferring an inherited AGENT_DISPATCH_JOBS --
