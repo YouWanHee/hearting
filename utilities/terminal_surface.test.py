@@ -226,6 +226,19 @@ class PlacementTest(_IsolatedMixin, unittest.TestCase):
                 fake = FakeHerdr([FOUR], free={"w1:p3"}, foreground=foreground, prompt=prompt)
                 self.assertEqual(self.place(fake), ("tab", "w1", None))
 
+    def test_herdr_zoom_flag_keeps_the_grid_decision(self):
+        # Herdr always reports `zoomed`; peer-steward never read it, so placement does not either.
+        fake = FakeHerdr([TWO])
+
+        def zoomed(argv):
+            result = fake(argv)
+            if argv[1:3] == ["pane", "layout"]:
+                payload = json.loads(result.stdout)
+                payload["result"]["layout"]["zoomed"] = True
+                return _done(payload)
+            return result
+        self.assertEqual(ts.place(ts.HerdrSurface(zoomed), "w1:p0"), ("split", "w1:p1", "down"))
+
     def test_irregular_tab_never_splits(self):
         fake = FakeHerdr([[(10, 2, 50, 100), (60, 2, 50, 100), (110, 2, 100, 100)]])
         self.assertEqual(self.place(fake), ("tab", "w1", None))
@@ -375,6 +388,20 @@ class OpenPaneHerdrTest(_IsolatedMixin, unittest.TestCase):
                 self.assertEqual(result.notes, expected)
                 self.assertIsNotNone(result.pane)
 
+    def test_a_raising_post_open_read_is_a_note_not_a_failure(self):
+        fake = FakeHerdr([FULL])
+        state = {"opened": False}
+
+        def run(argv):
+            if argv[1:3] == ["pane", "list"] and state["opened"]:
+                raise RuntimeError("checked socket timed out")
+            if argv[1:3] == ["pane", "run"]:
+                state["opened"] = True
+            return fake(argv)
+        result = ts.open_pane(["true"], near=ts.Near(ts.HerdrSurface(run), pane="w1:p0"))
+        self.assertEqual((result.placement, result.notes), ("split", ["pane-list-unconfirmed"]))
+        self.assertIsNotNone(result.pane)
+
     def test_only_the_session_group_exists(self):
         with self.assertRaises(ValueError):
             ts.open_pane(["true"], group="output", near=ts.Near(ts.HerdrSurface(FakeHerdr([FULL])), pane="w1:p0"))
@@ -429,6 +456,39 @@ class LockTest(_IsolatedMixin, unittest.TestCase):
         tmux = ts.TmuxSurface(socket="/tmp/s").lock_key("$1")
         self.assertEqual(tmux, hashlib.sha256(b"tmux:/tmp/s:$1").hexdigest())
         self.assertNotEqual(tmux, ts.HerdrSurface().lock_key("$1"))
+
+    def test_a_second_opener_waits_for_the_first_launch(self):
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        first_in, release, second_in = ctx.Event(), ctx.Event(), ctx.Event()
+
+        def opener(name):
+            def launch(pane, created):
+                if name == "first":
+                    first_in.set()
+                    release.wait(5)
+                else:
+                    second_in.set()
+                return True
+            ts.open_pane(launch=launch, near=ts.Near(ts.HerdrSurface(FakeHerdr([FULL])), pane="w1:p0"))
+        first = ctx.Process(target=opener, args=("first",))
+        second = ctx.Process(target=opener, args=("second",))
+        first.start()
+        try:
+            self.assertTrue(first_in.wait(5))
+            second.start()
+            self.assertFalse(second_in.wait(.3))
+            release.set()
+            self.assertTrue(second_in.wait(5))
+        finally:
+            release.set()
+            for child in (first, second):
+                if child.pid:
+                    child.join(5)
+                    if child.is_alive():
+                        child.terminate()
+                        child.join(5)
+        self.assertEqual((first.exitcode, second.exitcode), (0, 0))
 
     def test_lock_file_lives_under_the_peer_start_root_and_reenters(self):
         surface = ts.HerdrSurface()

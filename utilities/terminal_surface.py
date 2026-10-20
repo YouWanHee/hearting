@@ -308,11 +308,12 @@ class TmuxSurface:
         if pane not in ids or len(ids) != len(set(ids)):
             return None
         # Pane rects sit inside borders and status lines, so their union is the grid area.
+        # A zoomed window reports overlapping rects; it is irregular, never a grid.
         x0 = min(p["rect"]["x"] for p in panes)
         y0 = min(p["rect"]["y"] for p in panes)
         x1 = max(p["rect"]["x"] + p["rect"]["width"] for p in panes)
         y1 = max(p["rect"]["y"] + p["rect"]["height"] for p in panes)
-        return {"workspace_id": session, "tab_id": window, "zoomed": zoomed == "1", "panes": panes,
+        return {"workspace_id": session, "tab_id": window, "irregular": zoomed == "1", "panes": panes,
                 "area": {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}}
 
     def tabs(self, session):
@@ -417,7 +418,7 @@ def _empty_shell(surface, panes):
 
 def _tab_cell(surface, layout):
     """One grid/shell decision for both the reference tab and its workspace peers."""
-    split = None if layout.get("zoomed") else next_cell(layout)
+    split = None if layout.get("irregular") else next_cell(layout)
     if split:
         return "split", split[0], split[1]
     return _empty_shell(surface, layout["panes"])
@@ -550,7 +551,12 @@ def open_pane(argv=None, *, launch=None, title=None, labels=None, group="session
             notes.append("pane-launch-failed")
         # One read right after opening: it can show the pane already gone, never
         # that its command is running or visible.
-        live = surface.pane_ids(workspace)
+        try:
+            live = surface.pane_ids(workspace)
+        except Exception:
+            # A caller's runner may raise (recovery's checked socket does); the pane
+            # is already open, so an unreadable list is a doubt, not a failure.
+            live = None
         if live is None:
             notes.append("pane-list-unconfirmed")
         elif pane not in live:

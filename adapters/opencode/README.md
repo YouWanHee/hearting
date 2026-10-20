@@ -413,8 +413,9 @@ The plugin retains `experimental.chat.system.transform` for lifecycle context an
 Every pane Hearting opens comes from `open_pane` in `utilities/terminal_surface.py`:
 `hearting run peer-steward start <name> --kind <harness>` for another session,
 `hearting run pane open <command>` for a command output pane, main recovery, and
-Fleet `--window`. It uses the caller's verified Herdr pane, then the tmux server
-`$TMUX` names, and otherwise opens nothing and prints the command line (exit 0).
+Fleet `--window`. Peer start and recovery stay on the checked Herdr pane; `pane
+open` and Fleet use the caller's verified Herdr pane, then the tmux server
+`$TMUX` names, and otherwise open nothing and print the command line (exit 0).
 It fills the calling tab's 2×2 grid without focus: right, right-column down,
 then remaining-column down, each at ratio 0.5. A full or irregular tab reuses
 an agent-free, idle shell with an empty prompt, then the newest other tab with

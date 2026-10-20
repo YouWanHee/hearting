@@ -238,6 +238,48 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
                                   runner=lambda _, **kwargs: completed(payload), which=lambda _: "herdr")
         self.assertEqual(raised.exception.reason, "pane-location-missing")
 
+    def test_post_open_read_failure_keeps_the_launch(self) -> None:
+        def flaky(command, **kwargs):
+            if command[1:3] == ["pane", "list"] and "--workspace" in command:
+                raise RECOVERY.RecoveryError("herdr-invocation-failed", "timed out")
+            return Host.__call__(host, command, **kwargs)
+        host = Host(self)
+        with mock.patch.dict("os.environ", {"AGENT_PEER_LEDGER_ROOT": str(self.root / "ledger")}, clear=True):
+            result = RECOVERY.start(self.args(), runner=flaky, which=lambda _: "/usr/bin/herdr")
+        self.assertEqual((result["status"], result["notes"]), ("launch-requested", ["pane-list-unconfirmed"]))
+        self.assertTrue(any(command[1:3] == ["pane", "run"] for command in host.commands()))
+
+    def test_full_tab_reuses_an_idle_shell_without_claiming_it(self) -> None:
+        idle = {"pane_id": "w-1:p-busy3", "workspace_id": "w-1", "tab_id": "w-1:t-1", "cwd": "/tmp/elsewhere"}
+        def run_shell(command, **kwargs):
+            verb = command[1:3]
+            if verb == ["pane", "get"] and command[3] == "w-1:p-busy3":
+                return completed(json.dumps({"result": {"pane": idle}}))
+            if verb == ["pane", "process-info"] and command[-1] == "w-1:p-busy3":
+                return completed(json.dumps({"result": {"process_info": {
+                    "pane_id": "w-1:p-busy3", "shell_pid": 7, "foreground_process_group_id": 7,
+                    "foreground_processes": [{"pid": 7}]}}}))
+            if verb == ["pane", "wait-output"]:
+                return completed("{}")
+            if verb == ["pane", "process-info"]:
+                return completed(json.dumps({"error": {"code": "busy"}}), code=1)
+            return Host.__call__(host, command, **kwargs)
+        for refuse in (False, True):
+            host = Host(self, full=True, run=(lambda command: completed("", code=7)) if refuse else None)
+            with self.subTest(refuse=refuse), mock.patch.dict(
+                    "os.environ", {"AGENT_PEER_LEDGER_ROOT": str(self.root / "ledger")}, clear=True):
+                if refuse:
+                    with self.assertRaises(RECOVERY.RecoveryError) as raised:
+                        RECOVERY.start(self.args(), runner=run_shell, which=lambda _: "/usr/bin/herdr")
+                    self.assertEqual((raised.exception.reason, raised.exception.created_pane),
+                                     ("herdr-agent-start-failed", ""))
+                else:
+                    result = RECOVERY.start(self.args(), runner=run_shell, which=lambda _: "/usr/bin/herdr")
+                    self.assertEqual((result["placement"], result["pane"]["pane_id"]), ("reuse", "w-1:p-busy3"))
+                    run = next(c for c in host.commands() if c[1:3] == ["pane", "run"])
+                    self.assertEqual((run[3], shlex.split(run[-1])[1:3]), ("w-1:p-busy3", ["--cd", "/tmp/project"]))
+                self.assertFalse(any(c[1:3] in (["pane", "split"], ["tab", "create"]) for c in host.commands()))
+
     def test_agent_start_failure_is_typed(self) -> None:
         host = Host(self, run=lambda command: completed("", code=7))
         with mock.patch.dict("os.environ", {"AGENT_PEER_LEDGER_ROOT": str(self.root / "ledger")}, clear=True):
