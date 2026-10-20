@@ -8299,6 +8299,77 @@ class GateCurrency(NamedTuple):
     evidence_digest: str | None = None
 
 
+def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
+    """Bind supervised-owner marker use to the journaled owner admission.
+
+    Legacy markers keep their existing interpretation unless an exact
+    same-route reconciliation records that a poll-only marker was unconsumed.
+    New supervised-owner markers carry the resource identity that the owner
+    admitted at the existing successor-start boundary.
+    """
+    if (node.get("kind") != "resource-runner"
+            or (node.get("continuation") or {}).get("kind") != "supervised"):
+        return None
+    jobs_path = Path(jobs) if jobs else None
+    try:
+        import workflow_state as WS
+        ledger = WS.WorkflowLedger(route["route_id"], route.get("route_hash", ""), jobs=jobs_path)
+        state = ledger.read_only_state()
+        if not state.get("ledger_dir_exists"):
+            return (GateCurrency("resource-stage-not-current", "completion-marker-missing")
+                    if marker.get("resource_execution_identity") is not None else None)
+        if state.get("journal_unreadable"):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        armed_path = ledger.root / "armed" / f"{node['id']}.json"
+        armed = json.loads(armed_path.read_text(encoding="utf-8"))
+        if armed.get("predecessor_kind") != "resource":
+            return None
+        registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        row = registry["runs"][armed["predecessor_id"]]
+        if row.get("resource_policy") != "supervised-owner":
+            return None
+        raw = marker_path.read_bytes()
+        marker_sha = hashlib.sha256(raw).hexdigest()
+        marker_sequence = marker.get("sequence")
+        for entry in ledger.journal():
+            evidence = entry.get("evidence") or {}
+            if (entry.get("actor") == "resource-false-success-reconciliation"
+                    and evidence.get("marker_sha256") == marker_sha
+                    and evidence.get("marker_sequence") == marker_sequence):
+                return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        stage = state.get("nodes", {}).get(node["id"], {})
+        if stage.get("state") != "STAGE_SUCCEEDED":
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        resource_identity = marker.get("resource_execution_identity")
+        if resource_identity is None:
+            return None
+        evidence = stage.get("evidence") or {}
+        try:
+            import resource_resume as RESOURCE_RESUME
+            current_digest = RESOURCE_RESUME.row_digest(row)
+        except (ImportError, KeyError, TypeError, ValueError):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        owner_id = (row.get("owner_wait") or {}).get("parent_attempt_id")
+        output = __import__("resource_run_evidence").paths(armed).get("runtime_output")
+        if (stage.get("state") != "STAGE_SUCCEEDED"
+                or evidence.get("resource_execution_identity") != resource_identity
+                or evidence.get("identity") != resource_identity
+                or evidence.get("resource_sha256") != current_digest
+                or evidence.get("owner_attempt_id") != owner_id
+                or not (evidence.get("owner_successor_start") is True
+                        or evidence.get("owner_terminal_settlement") is True)
+                or marker.get("evidence", {}).get("path") != output):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        return None
+    except FileNotFoundError:
+        return (GateCurrency("resource-stage-not-current", "completion-marker-missing")
+                if marker.get("resource_execution_identity") is not None else None)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        if marker.get("resource_execution_identity") is not None:
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        return None
+
+
 def evidence_change_history_path(marker_path: Path, node_id: str) -> Path:
     """The append-only history of a node's evidence edits after its marker."""
     return marker_path.parent / f"{node_id}.evidence-changes.jsonl"
@@ -8575,6 +8646,10 @@ def gate_currency(
                     route_state_next_action(reason, str(node.get("id")), None, node)
                     if state == "superseded" else None,
                     provenance.evidence_digest)
+    if provenance.state in {"current", "revised-unrecorded"}:
+        resource_currency = _resource_stage_marker_current(route, node, marker, marker_path, jobs)
+        if resource_currency is not None:
+            return resource_currency
     return provenance
 
 

@@ -1716,7 +1716,10 @@ def _recorded_pid_reused(row, identity):
 
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
-    from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
+    from resource_run_registry import (
+        classify_identity, resource_never_started, resource_process_group_quiescent,
+        reboot_evidence,
+    )
     from dispatch_resource_wait import supervisor
     if resource_never_started(row):
         return True
@@ -1735,9 +1738,13 @@ def resource_predecessor_finished(row):
             and reboot_evidence(row)):
         return True
     code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    # A foreign recorded exit proves the leader's result only. Supervised
+    # resources still need the independent process-group quiescence check.
     return (code is not None and row.get("exit_code", code) == code
             and not (row.get("status") == "failed" and code == 0)
-            and not (row.get("status") == "succeeded" and code != 0))
+            and not (row.get("status") == "succeeded" and code != 0)
+            and (row.get("resource_policy") != "supervised-owner"
+                 or resource_process_group_quiescent(row)))
 
 
 def require_resource_predecessors(rows, candidate):
@@ -2589,6 +2596,95 @@ def completion_gate_fail_fields(error, route_file, route_node) -> dict:
     return fields
 
 
+def _admit_supervised_owner_resource_start(args, agent_home, jobs):
+    """Use the normal child start as the owner-controlled resource completion edge."""
+    route_file = getattr(args, "route_file", None)
+    route_node = getattr(args, "route_node", None)
+    if not route_file or not route_node:
+        return False
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        target = next((row for row in route.get("nodes", [])
+                       if isinstance(row, dict) and row.get("id") == route_node), None)
+    except (OSError, ValueError, TypeError):
+        return False
+    if target is None:
+        return False
+    supervised_resources = {
+        row.get("id") for row in route.get("nodes", [])
+        if isinstance(row, dict) and row.get("kind") == "resource-runner"
+        and (row.get("continuation") or {}).get("kind") == "supervised"
+    }
+    # Ordinary stages never open the workflow ledger here: only a start that
+    # follows a supervised resource node can be its owner-controlled edge.
+    if not supervised_resources.intersection(target.get("depends_on") or []):
+        return False
+    import dispatch_resource_wait as OWNER_RESOURCE
+    supervisor = OWNER_RESOURCE.supervisor()
+    ledger = supervisor.ledger_for(route, str(jobs))
+    armed_rows = supervisor.read_armed(ledger)
+    candidates = []
+    for predecessor in target.get("depends_on") or []:
+        node = next((row for row in route.get("nodes", [])
+                    if isinstance(row, dict) and row.get("id") == predecessor), None)
+        armed = armed_rows.get(predecessor)
+        if (node is None or node.get("kind") != "resource-runner"
+                or (node.get("continuation") or {}).get("kind") != "supervised"
+                or not armed or armed.get("predecessor_kind") != "resource"
+                or route_node not in (armed.get("successors") or [])):
+            continue
+        try:
+            registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+            row = registry["runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if row.get("resource_policy") == "supervised-owner":
+            candidates.append((predecessor, armed))
+    if not candidates:
+        return False
+    if getattr(args, "dispatch_depth", None) != 2:
+        raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
+    from dispatch_contract import (
+        DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+    )
+    import dispatch_owner_input as INPUT
+    import subprocess
+    try:
+        repo = subprocess.check_output(
+            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
+        ).strip()
+        owner = resolve_live_parent_attempt(
+            Path(jobs),
+            parent_slug=getattr(args, "parent_slug", None) or "",
+            repo=repo,
+            worktree=parent_lookup_worktree(
+                args.worktree, route_file,
+                subsession=bool(getattr(args, "subsession_id", None)),
+                parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            ),
+            expected_attempt_id=getattr(args, "parent_attempt_id", None),
+            expected_harness=getattr(args, "parent_harness", None),
+            expected_transport=getattr(args, "parent_transport", None),
+            expected_sandbox=getattr(args, "parent_sandbox", None),
+        )
+        owner_input = INPUT.inspect(jobs, owner.attempt_id)
+        if (owner_input.get("supervisor_live") is not True
+                or not owner_input.get("thread_id")
+                or owner_input.get("thread_id") == INPUT.PLACEHOLDER_THREAD):
+            raise DispatchContractError("resource-owner-session-unavailable", owner.attempt_id)
+        try:
+            supervisor.admit_owner_successor_start(
+                route, route_node, jobs, owner.attempt_id, owner_input["thread_id"],
+            )
+        except supervisor.SupervisorError as error:
+            raise DispatchContractError("resource-owner-stage-admission-blocked", str(error)) from error
+    except (DispatchContractError, INPUT.InputError, OSError, subprocess.SubprocessError) as error:
+        if isinstance(error, DispatchContractError):
+            raise
+        raise _contract_error("resource-owner-start-authority-unavailable", str(error)) from error
+    return True
+
+
 def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     """The route's completion and preview gate for one launch, the same in every wrapper.
 
@@ -2601,6 +2697,8 @@ def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     try:
         for check in before:
             check()
+        if action == "start":
+            _admit_supervised_owner_resource_start(args, agent_home, jobs)
         gate(args.route_file, args.route_node, action, agent_home, jobs, attempt_id=args.attempt_id,
              planned_revision_nodes=preview_request_nodes(args, jobs))
     except DispatchContractError as error:

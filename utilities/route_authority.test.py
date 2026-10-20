@@ -1448,6 +1448,83 @@ class ResourcePredecessorPidReuseTest(unittest.TestCase):
         self.assertFalse(RA.resource_predecessor_finished(
             self.row(**{**self.live, "status": "failed", "exit_code": 1})))
 
+    def test_foreign_failed_retry_waits_for_recorded_group_quiescence(self):
+        import signal
+        import subprocess
+        import resource_run_registry as RR
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sentinel = root / "failed.exit"
+            sentinel.write_text("23\n", encoding="utf-8")
+            child_pid_file = root / "payload.pid"
+            leader_code = (
+                "import pathlib, subprocess, sys; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); raise SystemExit(23)"
+            )
+            leader = subprocess.Popen(
+                [sys.executable, "-c", leader_code, str(child_pid_file)],
+                start_new_session=True,
+            )
+            try:
+                self.assertEqual(leader.wait(timeout=10), 23)
+                payload_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                self.assertEqual(os.getpgid(payload_pid), leader.pid)
+                os.kill(payload_pid, 0)
+                row = {
+                    "run_id": "foreign-failed",
+                    "status": "failed",
+                    "workflow_state": "FAILED_RETRYABLE",
+                    "exit_code": 23,
+                    "sentinel": str(sentinel),
+                    "pid": leader.pid,
+                    "starttime": "1",
+                    "command_hash": "recorded-command",
+                    "pid_namespace": "pid:[foreign]",
+                    "process_group": leader.pid,
+                    "resource_policy": "supervised-owner",
+                }
+                candidate = {"log": str(root / "retry.log"),
+                             "sentinel": str(root / "retry.exit")}
+                before = dict(row)
+
+                # The payload child remains alive, but this process cannot
+                # observe a group in the recorded foreign namespace.
+                self.assertFalse(RR.resource_process_group_quiescent(row))
+                with self.assertRaisesRegex(ValueError, "resource-route-body-conflict"):
+                    RA.require_resource_predecessors([row], candidate)
+                self.assertEqual(row, before)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "23\n")
+
+                os.kill(payload_pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                ended = False
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{payload_pid}/stat").read_text(encoding="utf-8")
+                        ended = state.rsplit(") ", 1)[1].split()[0] == "Z"
+                    except FileNotFoundError:
+                        ended = True
+                    if ended:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(ended, "payload child did not end")
+
+                # A positive observation from the resource's namespace makes
+                # the same retry admission path available without rewriting
+                # its failure row, sentinel, or history.
+                with mock.patch.object(RR, "resource_process_group_quiescent", return_value=True) as observe:
+                    RA.require_resource_predecessors([row], candidate)
+                observe.assert_called_once_with(row)
+                self.assertEqual(row, before)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "23\n")
+            finally:
+                try:
+                    os.killpg(leader.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class NestedHostSandboxEqualityTest(unittest.TestCase):
     """Only a matching, known workspace-write parent bounds nested Codex access."""

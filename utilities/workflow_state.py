@@ -414,6 +414,21 @@ class WorkflowLedger:
         })
         return self.state()
 
+    def record_event(self, *, evidence=None, actor="workflow-supervisor") -> dict:
+        """Append a durable fact without inventing a node or workflow transition."""
+        self._append({
+            "at": now_iso(),
+            "route_id": self.route_id,
+            "route_hash": self.route_hash,
+            "node": None,
+            "state": None,
+            "workflow_state": None,
+            "evidence": evidence,
+            "actor": actor,
+            "pid": os.getpid(),
+        })
+        return self.state()
+
     def completion_paths(self, terminal_nodes, terminal_gates):
         """Validate the full completion suffix without modifying the journal."""
         current = self.state()
@@ -482,7 +497,8 @@ class WorkflowLedger:
             os.fsync(handle.fileno())
         return True, json.loads(body)
 
-    def claims(self) -> dict:
+    def claim_history(self) -> dict:
+        """Read every immutable claim file, including claims later found unconsumed."""
         rows = {}
         if not self.claims_dir.is_dir():
             return rows
@@ -492,6 +508,23 @@ class WorkflowLedger:
             except (OSError, ValueError):
                 rows[path.stem] = {"malformed": True}
         return rows
+
+    def claims(self) -> dict:
+        """Project claims still eligible to represent current successor consumption.
+
+        A narrow same-route false-success reconciliation may prove that an
+        external successor claim never reached a child attempt. Its file stays
+        in ``claim_history`` byte for byte, while the append-only journal marks
+        only that claim as no longer current.
+        """
+        rows = self.claim_history()
+        retired = set()
+        for entry in self.journal():
+            evidence = entry.get("evidence") or {}
+            values = evidence.get("retired_successor_claims")
+            if isinstance(values, list):
+                retired.update(value for value in values if isinstance(value, str))
+        return {key: value for key, value in rows.items() if key not in retired}
 
 
 def derive_workflow_state(node_states: dict, terminal_nodes, *, terminal_gates_passed=False,
