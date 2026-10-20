@@ -430,19 +430,30 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertTrue(WS.route_node(route, 'one-shot')['verification_only'])
         self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
 
-    def test_failed_exit_in_another_pid_namespace_can_retry_without_rewriting_predecessor(self):
+    def test_failed_exit_in_another_pid_namespace_waits_for_group_observation_before_retry(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         data = json.loads(registry.read_text())
         old = data['runs']['fixture-run']
+        self.assertIsNotNone(old.get('process_group'))
         Path(old['sentinel']).write_text('1')
         old.update(status='failed', exit_code=1, pid_namespace='pid:[foreign]')
         registry.write_text(json.dumps(data))
-        before = copy.deepcopy(old), Path(old['sentinel']).read_bytes()
+        before = copy.deepcopy(old), Path(old['sentinel']).read_bytes(), registry.read_bytes()
         self.assertEqual(SUP.RR.classify_identity(old),
                          ('stale', None, 'process-namespace-mismatch'))
-        procs, receipt = self.launch(
-            route, path, jobs, registry, output,
-            self.next_body(registry, 'namespace-retry', output))
+        self.assertFalse(SUP.RR.resource_process_group_quiescent(old))
+        retry = self.next_body(registry, 'namespace-retry', output)
+        with self.assertRaisesRegex(ValueError, 'resource-route-body-conflict'):
+            self.launch(route, path, jobs, registry, output, retry)
+        self.assertEqual(registry.read_bytes(), before[2])
+        self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'fixture-run')
+
+        # The runner's ordinary retry path admits once its group helper has a
+        # positive observation that the foreign recorded group has ended.
+        with mock.patch.object(SUP.RR, 'resource_process_group_quiescent', return_value=True) as observe:
+            procs, receipt = self.launch(route, path, jobs, registry, output, retry)
+        self.assertGreaterEqual(observe.call_count, 1)
+        self.assertTrue(all(call.args[0] == old for call in observe.call_args_list))
         self.assertEqual(len(procs), 1)
         self.assertTrue(receipt['payload_spawned'])
         self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'namespace-retry')

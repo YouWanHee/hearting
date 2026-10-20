@@ -1622,13 +1622,12 @@ def resource_predecessor_finished(row):
             and reboot_evidence(row)):
         return True
     code = supervisor().runner().read_sentinel(row.get("sentinel"))
-    foreign_failed_exit = (identity == ("stale", None, "process-namespace-mismatch")
-                           and row.get("status") == "failed" and row.get("exit_code") not in (None, 0))
+    # A foreign recorded exit proves the leader's result only. Supervised
+    # resources still need the independent process-group quiescence check.
     return (code is not None and row.get("exit_code", code) == code
             and not (row.get("status") == "failed" and code == 0)
             and not (row.get("status") == "succeeded" and code != 0)
             and (row.get("resource_policy") != "supervised-owner"
-                 or foreign_failed_exit
                  or resource_process_group_quiescent(row)))
 
 
