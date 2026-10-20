@@ -250,13 +250,15 @@ class AliasReceive(unittest.TestCase):
         pane, a, b = "fixture:codex-start-seat", "start-input-A", "start-input-B"
         base_env = {"HERDR_PANE_ID": pane, "AGENT_DISPATCH_CALLER_HARNESS": "codex"}
         commands = []
-        with mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
+        with mock.patch.object(pane_ownership, "_caller_runtime", return_value=(None, False)), \
+             mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
              mock.patch.object(pane_ownership, "current_codex_thread_for_caller", return_value=None):
             with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": a}):
                 self.assertTrue(pm.mark_steward("codex", a,
                     {"harness": "claude", "session_id": "start-target", "name": "target"},
                     "watch", "fixture-time", source="watch"))
                 seat = session_tidy.resolve_seat("codex", str(ROOT), os.environ, a)
+                self.assertEqual((seat.kind, seat.pane), ("pane", pane))
                 with session_tidy.seat_lock(seat.key):
                     session_tidy.record_event(seat, "codex", a, "start", source="startup",
                                               cwd=str(ROOT))
@@ -297,13 +299,15 @@ class AliasReceive(unittest.TestCase):
         a, b, c = "codex-watch-A", "codex-watch-B", "codex-watch-C"
         watch_id = "watch-queue-fixture"
         base_env = {"HERDR_PANE_ID": pane, "AGENT_DISPATCH_CALLER_HARNESS": "codex"}
-        with mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
+        with mock.patch.object(pane_ownership, "_caller_runtime", return_value=(None, False)), \
+             mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **k: value or ""), \
              mock.patch.object(pane_ownership, "current_codex_thread_for_caller", return_value=None):
             with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": a}):
                 self.assertTrue(pm.mark_steward("codex", a,
                     {"harness": "claude", "session_id": "target-session", "name": "target"},
                     "watch", "fixture-time", source="watch"))
                 seat = session_tidy.resolve_seat("codex", str(ROOT), os.environ, a)
+                self.assertEqual((seat.kind, seat.pane), ("pane", pane))
                 watch_root = pm.peer_state_root() / "peer-watches"
                 watch_root.mkdir(parents=True, exist_ok=True)
                 arm = {"schema_version": 1, "watch_id": watch_id, "target": "target-name",
