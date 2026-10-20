@@ -689,8 +689,9 @@ def _credential_generation(row) -> str | None:
     value = row.get("value") if isinstance(row, Mapping) else None
     if not isinstance(value, Mapping):
         return None
-    material = {key: value.get(key) for key in ("type", "key", "access", "refresh")
-                if isinstance(value.get(key), str) and value.get(key)}
+    material = {key: value.get(key) for key in ("type", "key", "access", "refresh", "expires")
+                if isinstance(value.get(key), (str, int, float))
+                and not isinstance(value.get(key), bool) and value.get(key) != ""}
     if not any(key in material for key in ("key", "access", "refresh")):
         return None
     payload = json.dumps([row.get("integration_id"), row.get("source"), material],
@@ -994,6 +995,10 @@ def record_model_outcome(model: str | None, *, success=False, error=None, source
     if reason_override and not success:
         state, reason = "unavailable", str(reason_override)
     if state is None:
+        return False
+    if state == "unavailable" and not account.credential_generation:
+        # A rejection that cannot name its credential could never be released
+        # by a re-login; leave it unknown instead of excluding indefinitely.
         return False
     tools = Path(__file__).resolve().parents[1] / "tools"
     if str(tools) not in sys.path:

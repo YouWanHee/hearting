@@ -622,6 +622,31 @@ class OpenCodeAutomaticEligibilityTest(unittest.TestCase):
         self.assertEqual(evidence["observation_reason"], "credential-generation-changed")
         self.assertFalse(evidence["automatic_eligible"])
 
+    def test_a_rejection_without_a_credential_generation_is_not_persisted(self):
+        # Nothing could release it after a re-login, so it stays unknown.
+        unnamed = runtime.AccountScopeObservation("present", "account:unnamed")
+        self.assertFalse(runtime.record_model_outcome(
+            "openai/gpt-6.1-sol", error=INCIDENT_ERROR, account_observation=unnamed))
+        with sqlite3.connect(self.db) as con:
+            con.execute("DELETE FROM credential WHERE integration_id='openai'")
+        self.assertEqual(runtime.model_account_observation("openai/gpt-6.1-sol").scope, "unscoped")
+        self.assertFalse(runtime.record_model_outcome("openai/gpt-6.1-sol", error=INCIDENT_ERROR))
+        self.assertEqual(self.rows("openai"), {})
+        # A success still records, as before.
+        self.assertTrue(runtime.record_model_outcome(
+            "openai/gpt-6.1-sol", success=True, account_observation=unnamed))
+
+    def test_generation_follows_every_credential_field_but_not_the_label(self):
+        def generation(**value):
+            return runtime._credential_generation(
+                {"integration_id": "openai", "label": "x", "source": "opencode-sqlite",
+                 "value": {"type": "oauth", "access": "a", "refresh": "r", **value}})
+        self.assertNotEqual(generation(expires=1), generation(expires=2))
+        self.assertNotEqual(generation(), generation(access="b"))
+        self.assertEqual(generation(expires=1), generation(expires=1))
+        self.assertIsNone(runtime._credential_generation(
+            {"integration_id": "openai", "value": {"type": "oauth", "expires": 1}}))
+
     def test_outcome_is_credited_to_the_account_the_request_started_with(self):
         started = runtime.model_account_observation("openai/gpt-6.1-sol")
         self.put("openai-oauth", "openai", {"type": "oauth", "access": "openai-access-2",
