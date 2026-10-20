@@ -5484,6 +5484,29 @@ class DeliveryIntentWiringTest(unittest.TestCase):
                 after.get("delivery_receipt_digest"), before.get("delivery_receipt_digest")
             )
 
+    def test_w3_fleet_cancellation_keeps_its_result_and_delivery_on_late_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            jobs.write_text(self._row() + "\n", encoding="utf-8")
+            evidence = {"failure_class": "cancelled", "classifier_source": "fleet-cancel-v1",
+                        "reconcile_reason": "user-terminated"}
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "fleet-kill", evidence=evidence), "closed")
+            before = jobs.read_bytes()
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "fleet-kill", evidence=evidence), "already-terminal")
+            self.assertEqual(jobs.read_bytes(), before)
+            self.assertEqual(D.reconcile_attempt_terminal(
+                jobs, "att-w-fixture", "completed-supervisor", evidence={"failure_class": "pass"}),
+                "terminal-conflict")
+            original = D.parse_registry_metadata(before.decode().strip().split("\t", 5)[5])
+            after = D.parse_registry_metadata(jobs.read_text().strip().split("\t", 5)[5])
+            self.assertEqual((after["note"], after["failure_class"]), ("fleet-kill", "cancelled"))
+            self.assertEqual(D.committed_outcome("done", after), "cancelled")
+            self.assertTrue(D.terminal_conflict_pending(after))
+            for key in ("delivery_id", "delivery_intent", "delivery_receipt_digest"):
+                self.assertEqual(after.get(key), original.get(key))
+
     def test_w1_marker_bound_delivery_transaction_stamps_intent(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

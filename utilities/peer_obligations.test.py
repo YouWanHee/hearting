@@ -1044,6 +1044,38 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self._wait_for_death(pid)
         self._children.remove(pid)
 
+    def test_fleet_cancelled_child_no_longer_keeps_parent_pane_unknown(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        attempt = "att-f3daf5ab6f9a367410542ca045fd243d"
+        sid = "01a13de1-42a4-7e81-b64f-05839c030e39"
+        metadata = {"attempt_schema_version": "2", "attempt_id": attempt,
+                    "harness": "opencode", "worker_type": "frame", "route_node": "frame",
+                    "dispatch_depth": "1", "parent_sid": sid, "launch_started": "1",
+                    "note": "fleet-kill", "failure_class": "cancelled",
+                    "classifier_source": "fleet-cancel-v1", "reconcile_reason": "user-terminated"}
+        self.jobs.write_text("2026-10-20T00:00:00Z\tdone\trepo\t-\topencode-v2-worker-closure-frame\t"
+                             + ",".join(f"{k}={v}" for k, v in metadata.items()) + "\n")
+        before = self.jobs.read_bytes()
+        for process_state, expected in (("quiescent", "ready"), ("live", "pending"),
+                                        ("unverifiable", "unknown")):
+            with self.subTest(process_state=process_state), mock.patch(
+                    "dispatch_contract.observed_attempt_liveness", return_value=ObservedAttemptLiveness(
+                        "dead" if process_state == "quiescent" else
+                        "alive" if process_state == "live" else "unverifiable",
+                        "fixture", process_state, "fixture")):
+                work, state = obligations.bound_work_for_pane("wB:p89", "codex", sid, jobs=self.jobs)
+                self.assertEqual((len(work), state), (1, "observed"))
+                self.assertEqual(work[0].pane_relation, "parent")
+                self.assertEqual(work[0].decision.outcome, "cancelled")
+                ready = obligations.pane_readiness(
+                    server="fixture-server", pane="wB:p89", harness="codex", session_id=sid,
+                    pid_birth="pid:9@start:4", identity_verified=True, native_turn="idle",
+                    bound_work=work, bindings_state=state)
+                self.assertEqual(ready.state, expected)
+                self.assertEqual(self.jobs.read_bytes(), before)
+                if expected == "ready":
+                    self.assertEqual(ready.outcome, "cancelled")
+
     def test_bound_registered_row_overrides_idle_pane_through_real_jobs(self):
         from dispatch_contract import (ATTEMPT_SCHEMA_VERSION, claim_attempt_row,
                                        process_launch_identity, ObservedAttemptLiveness)
