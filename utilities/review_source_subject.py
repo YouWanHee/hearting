@@ -970,6 +970,9 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
         except SourceSubjectError:
             prefix = "completion-test-source" if source_test else "completion-review-source"
             return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
+        if record is None:
+            prefix = "completion-test-source" if source_test else "completion-review-source"
+            return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
         if (record.get("binding_digest") != binding_digest or _binding_digest(record) != binding_digest
                 or record.get("subject_digest") != subject.get("digest")
                 or record.get("attempt_id") != attempt_id

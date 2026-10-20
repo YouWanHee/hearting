@@ -55,7 +55,10 @@ CONTINUATION_WAIT_NOTE = (
 def _bytes(value):
     def canonical(item, path=()):
         if isinstance(item, dict):
-            preserve = any(path[index:index + 2] == ("applied_permissions", "opencode_permission")
+            preserve = any(path[index:index + 2] in {
+                               ("applied_permissions", "opencode_permission"),
+                               ("applied_permissions", "opencode_selected_agent_permission"),
+                           }
                            for index in range(max(0, len(path) - 1)))
             keys = list(item) if preserve else sorted(item)
             return {key: canonical(item[key], (*path, key)) for key in keys}
@@ -173,6 +176,9 @@ def _applied_permissions(args):
                 'agent': selected_agent,
                 'permission': opencode_runtime.opencode_permission_ordered_view(
                     selected_permission),
+                # Keep the native ordered mapping as well: recovery address
+                # checks must compose global rules followed by this override.
+                'local_policy': selected_permission,
             }
     for key in ('launch_lifecycle','nested_headless_network'):
         if hasattr(args,key): result[key] = getattr(args,key)

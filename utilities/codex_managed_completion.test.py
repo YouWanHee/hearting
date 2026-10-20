@@ -799,6 +799,119 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.assertFalse(self.control_path.exists())
 
 
+class OneSidedCachedReceiptPathTest(unittest.TestCase):
+    """Normal writer/cache/consumer path for one-sided canonical receipt fields."""
+
+    def test_terminal_writer_and_cached_outcome_reach_the_real_classifier_and_queue(self):
+        import dispatch_batch_obligations as batch
+        import dispatch_completion_join as join
+        import dispatch_contract as contract
+
+        module = load_completion_module()
+        session_id = SESSION
+        delivery_parent = "parent-session-" + hashlib.sha256(session_id.encode()).hexdigest()
+
+        class QueueSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def close(self):
+                pass
+
+        def rpc(_path, method, _params, **_kwargs):
+            if method == "thread/read":
+                return {"thread": {"id": session_id, "cwd": "/repo"}}
+            if method == "thread/queue/list":
+                return {"items": []}
+            if method == "thread/turns/list":
+                return {"turns": []}
+            return {}
+
+        for cache_shape in ("normal", "hand-edited-missing-required-action"):
+            with self.subTest(cache_shape=cache_shape), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                jobs = base / "jobs.log"
+                attempt = "att-receipt-normal" if cache_shape == "normal" else "att-receipt-edited"
+                metadata = ",".join((
+                    "attempt_schema_version=2", "dispatch_depth=1", "transport=headless",
+                    "execution_surface=registered-headless", "registered_worker=1",
+                    "fallback_hop=same-harness-headless", "worker_type=stage", "unit=qa/test",
+                    "launch_claimed=1", "launch_outcome=never-launched",
+                    "parent_completion_delivery=codex-native-queue", f"attempt_id={attempt}",
+                    f"parent_sid={session_id}", "harness=codex", "failure_class=pass",
+                ))
+                jobs.write_text(f"t\topen\t/repo\t/wt\tfixture\t{metadata}\n", encoding="utf-8")
+
+                # The production terminal writer stamps the receipt; the production
+                # materializer seals its pending ledger record.
+                self.assertTrue(contract.close_attempt_row(jobs, attempt, "completed-marker"))
+                record_path = join.materialize_after_terminal_close(jobs, attempt)
+                self.assertIsNotNone(record_path)
+                writer_receipt = json.loads(record_path.read_text(encoding="utf-8"))["receipt"]
+                writer_child = writer_receipt["children"][0]
+                self.assertNotIn("reason", writer_child)  # documented success-writer legacy shape
+                self.assertEqual((writer_receipt["job_registry"], writer_receipt["parent_attempt_id"]),
+                                 ("", ""))
+
+                raw = {"schema_version": 2, "state": "ready", "parent_session_id": session_id,
+                       "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                                     "reason": "registry-closed",
+                                     "required_action": "advance-completed"}]}
+                normalized = module.normalize_receipt(
+                    raw, jobs=jobs, parent_attempt_id=None, parent_session_id=session_id,
+                    delivery_parent_id=delivery_parent, attempts={attempt},
+                    parent_completion_delivery="codex-native-queue")
+                self.assertIn("required_action", normalized["children"][0])
+                self.assertIn("harness", normalized["children"][0])
+                cached = json.loads(json.dumps(normalized))
+                if cache_shape == "hand-edited-missing-required-action":
+                    # The normalizer rejects this shape. Persisting it below
+                    # models direct cache editing, not a supported writer.
+                    cached["children"][0].pop("required_action")
+                    self.assertIn("required_action", normalized["children"][0])
+
+                args = SimpleNamespace(
+                    jobs=jobs, attempt_id=[attempt], sealed_batch_id="batch-" + "a" * 32,
+                    parent_attempt_id=None, parent_session_id=session_id, thread_id=session_id,
+                    queue_socket=base / "queue.sock", control_socket=None, timeout=0.06,
+                    delivery_retry_interval=0.05, parent_lifetime=None,
+                )
+                duty_id, _record = batch.create(args)
+                args._obligation_id = duty_id
+                batch.update(jobs, duty_id, state="delivery-pending", reason="result-settled",
+                             outcome=cached, effective_attempts=[attempt])
+
+                classification = join.cached_batch_delivery_state(
+                    jobs, {attempt}, recipient_sid=session_id, parent_attempt_id=delivery_parent,
+                    parent_completion_delivery="codex-native-queue", cached=cached)
+                self.assertEqual(classification, "current")
+
+                # Exercise _execute_once and native queue message construction;
+                # only its external socket/session and enqueue boundary are stubbed.
+                with mock.patch.object(module.codex_queue_delivery, "DeliverySession",
+                                       side_effect=QueueSession), \
+                     mock.patch.object(module.codex_queue_delivery, "_rpc", side_effect=rpc), \
+                     mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                       return_value={"status": "queued", "queued_submission_id": "q-1",
+                                                     "already_pending": False,
+                                                     "started_after_interrupt": False}) as send:
+                    if cache_shape == "hand-edited-missing-required-action":
+                        with self.assertRaises(KeyError):
+                            module._execute_once(args)
+                        send.assert_not_called()
+                        continue
+                    result, code = module._execute_once(args)
+
+                self.assertIn((result["status"], code),
+                              (("sent-ambiguous", 74), ("retryable", 75)))
+                self.assertEqual(send.call_count, 1)
+                delivered = json.loads(send.call_args.kwargs["message"].split("\n", 2)[1])
+                delivered_child = delivered["children"][0]
+                self.assertEqual(delivered_child["reason"], "registry-closed")
+                self.assertEqual(delivered_child["required_action"], "advance-completed")
+                self.assertEqual(delivered_child["harness"], "codex")
+
+
 class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
     """SD-110 A-18: an un-negotiated (default) call to `normalize_receipt`
     takes the literal, unmodified v2 path -- golden-byte identical to the

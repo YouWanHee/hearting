@@ -829,6 +829,12 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
                                  ("integrity-broken:identity-mismatch",
                                   "completion-review-source-binding-missing"))
 
+        subject_path.unlink()
+        missing = self.currency(marker)
+        self.assertEqual((missing.state, missing.reason),
+                         ("integrity-broken:identity-mismatch",
+                          "completion-review-source-binding-missing"))
+
     def test_marker_currency_uses_sealed_registry_under_ambient_mismatch(self):
         self.current_smoke_markers("sealed-registry")
         metadata, marker = self.complete_review("att-review-sealed-registry")

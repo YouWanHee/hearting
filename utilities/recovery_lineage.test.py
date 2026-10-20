@@ -137,17 +137,75 @@ class RecoveryAuthorityTest(unittest.TestCase):
         candidate = copy.deepcopy(self.history); candidate["harness"] = "opencode"
         with patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}):
             scoped = json.loads(wrapper.scoped_external_directory_config(
-                self.route["artifact_root"], agent_home=HERE.parent, worktree=self.route["cwd"]))
+                self.route["artifact_root"], agent_home=HERE.parent, worktree=self.route["cwd"],
+                selected_agent="build"))
         candidate["applied_permissions"] = REPLACEMENT._applied_permissions(
-            Namespace(opencode_config_content=json.dumps(scoped)))
+            Namespace(opencode_config_content=json.dumps(scoped), agent="build"))
         self.assertTrue(candidate["applied_permissions"].get("opencode_permission"))
+        self.assertTrue(candidate["applied_permissions"].get("opencode_selected_agent_permission"))
         AUTHORITY.require_recovery_work(candidate, self.history, route=self.route, worker_type="owner")
-        for category, pattern in (("external_directory", "/etc/**"), ("edit", "*")):
+        for category, pattern in (("external_directory", "/etc/**"),
+                                  ("edit", str(self.root / "outside") + "/**")):
             forged = copy.deepcopy(candidate)
-            rules = forged["applied_permissions"]["opencode_permission"][category]
-            rules.pop(pattern, None); rules[pattern] = "allow"
+            if category == "edit":
+                selected = forged["applied_permissions"]["opencode_selected_agent_permission"]
+                selected["local_policy"].setdefault(category, {})[pattern] = "allow"
+                import opencode_runtime
+                selected["permission"] = opencode_runtime.opencode_permission_ordered_view(
+                    selected["local_policy"])
+            else:
+                rules = forged["applied_permissions"]["opencode_permission"][category]
+                rules.pop(pattern, None); rules[pattern] = "allow"
             with self.subTest(category=category), self.assertRaises(DispatchContractError):
                 AUTHORITY.require_recovery_work(forged, self.history, route=self.route, worker_type="owner")
+
+    def test_selected_policy_reseal_and_legacy_absence_recovery_admission(self):
+        route = dict(self.route, selection_pins={"contract_version": 1,
+                     "owner": {"harness": "opencode", "model": None, "effort": None}})
+        global_config = {"permission": {"read": "allow", "bash": "ask"}}
+
+        def candidate_for(agent, selected_definition):
+            config = dict(global_config)
+            if selected_definition is not None:
+                config["agent"] = {agent: selected_definition}
+            return {
+                **copy.deepcopy(self.history),
+                "harness": "opencode",
+                "applied_permissions": REPLACEMENT._applied_permissions(Namespace(
+                    opencode_config_content=json.dumps(config), agent=agent)),
+            }
+
+        selected_policy = {"permission": {"bash": "ask", "edit": {"*": "deny"}}}
+        previous = candidate_for("build", selected_policy)
+        renamed = candidate_for("builder", selected_policy)
+        self.assertTrue(AUTHORITY.same_sealed_work(previous, renamed))
+        AUTHORITY.require_recovery_work(
+            renamed, previous, route=route, worker_type="owner")
+
+        changed = candidate_for("builder", {"permission": {"bash": "allow",
+                                                               "edit": {"*": "deny"}}})
+        self.assertFalse(AUTHORITY.same_sealed_work(previous, changed))
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(changed, previous, route=route, worker_type="owner")
+
+        # An immutable pre-field record is not backfilled with a guessed local
+        # permission. A current launch with no selected definition or policy
+        # remains admissible under the sealed global grant.
+        legacy = candidate_for("build", None)
+        legacy["applied_permissions"].pop("opencode_selected_agent_permission")
+        for definition in (None, {}, {"mode": "primary"}):
+            with self.subTest(selected_definition=definition):
+                current = candidate_for("build", definition)
+                self.assertTrue(AUTHORITY.same_sealed_work(legacy, current))
+                AUTHORITY.require_recovery_work(
+                    current, legacy, route=route, worker_type="owner")
+
+        outside = candidate_for("build", {"permission": {
+            "edit": {str(self.root / "outside") + "/**": "allow"}}})
+        self.assertFalse(AUTHORITY.same_sealed_work(legacy, outside))
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(
+                outside, legacy, route=route, worker_type="owner")
 
     def test_cross_harness_uses_real_claude_and_codex_owner_permissions(self):
         wrappers = {}
