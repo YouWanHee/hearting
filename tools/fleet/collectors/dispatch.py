@@ -54,7 +54,7 @@ try:
 except Exception:  # a monitor must never fail to import over a bookkeeping helper
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
-from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
+from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
@@ -4310,6 +4310,26 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
         now = time.time()
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
+            observed = (j.state_evidence or {}).get("inputs", {}).get("observed_liveness") or {}
+            process_state = observed.get("process_state")
+            metadata = getattr(j, "_registry_metadata", None)
+            if isinstance(metadata, dict) and isinstance(process_state, str):
+                try:
+                    decision = decide_attempt(
+                        str(j.status or ""), metadata, process_state=process_state,
+                        process_reason=str(observed.get("process_reason") or ""),
+                        terminal_observed=bool((j.state_evidence or {}).get("inputs", {}).get("terminal_observation")),
+                        result_state=(j.state_evidence or {}).get("result_state"),
+                    )
+                    j.attempt_decision = {
+                        "outcome": decision.outcome, "action": decision.action,
+                        "responsible": decision.responsible, "reason": decision.reason,
+                        "retry_kind": decision.retry_kind,
+                        "retry_allowed": decision.retry_allowed,
+                    }
+                except (TypeError, ValueError, KeyError):
+                    # Preserve the Fleet row if historical metadata is incomplete.
+                    j.attempt_decision = None
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
         _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
     # Plan QA is display detail. Resolve it only after dedup/retention and the

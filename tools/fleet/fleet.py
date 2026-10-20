@@ -65,10 +65,7 @@ def parse_args(argv):
     p.add_argument("--demo", action="store_true",
                    help="render synthetic fixture data (all harnesses + states) for rendering checks")
     p.add_argument("--view", choices=["group", "process"], default=None,
-                   help="F-30 (v10): initial view — group (default, per-project) or process "
-                        "(per-route pipeline cards). Additive; the live TUI's `p` key toggles "
-                        "the same state either way (plan §P3 — this is --once's ONLY entry "
-                        "point into the process view, since `p` is a curses-live-only key).")
+                   help="select the legacy group or process renderer for --once")
     return p.parse_args(argv)   # argparse exits 2 on bad args (matches PRD §3 exit codes)
 
 
@@ -344,12 +341,11 @@ def main(argv=None):
     render.set_show_all(args.show_all)
     render.set_api_disabled(disabled["api_disabled"])
     render.set_hearting(hearting)
-    # F-30 (v10, plan §P3/§9): --view is additive and honors the SAME single _PROCESS_VIEW
-    # state the `p` key flips — never a second decision path. FLEET_VIEW env is the reduction
-    # fallback the plan reserves in case --view itself is judged out of scope later (§9 note 1);
-    # both stay best-effort no-ops when unset (default = the pre-v10 group view).
+    # The legacy renderer remains an explicit noninteractive compatibility path.
     view = args.view or os.environ.get("FLEET_VIEW")
-    if view:
+    legacy_once = bool(args.once and view)
+    render.set_explorer_mode(not legacy_once)
+    if legacy_once:
         render.set_process_view(view == "process")
     if args.once:
         try:
@@ -357,6 +353,7 @@ def main(argv=None):
                                       compute_hosts_refresh=compute_hosts.collect)
         finally:
             projected_collector.close()
+            render.set_explorer_mode(False)
     render.reset_scroll()   # fresh launch starts scrolled to top (belt-and-suspenders)
     if viewer_state is not None:
         render.restore_viewer_state(viewer_state)
@@ -403,7 +400,10 @@ def main(argv=None):
     live_collector.install_follower = install_follow.InstallFollower()
     live_collector.restart_argv = argv
 
-    return render.run_live(live_collector, hfilter, args.section, args.interval)
+    try:
+        return render.run_live(live_collector, hfilter, args.section, args.interval)
+    finally:
+        render.set_explorer_mode(False)
 
 
 if __name__ == "__main__":

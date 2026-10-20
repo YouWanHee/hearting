@@ -6640,6 +6640,113 @@ _REPO_FOLDABLE = []           # [{"line": idx, "repo_key": ..., "folded": bool}]
 _LAYOUT_META = {"fixed_end": 0, "body_start": 0, "body_end": 0, "legend_start": 0,
                 "fixed_priorities": {}}
 _PROCESS_LAYOUT_META = {}
+_EXPLORER_ENABLED = False
+_EXPLORER_STATE = None
+_EXPLORER_FRAME = None
+_EXPLORER_NAV_ROWS = ()
+
+
+def set_explorer_mode(enabled=True):
+    """Select the composed B surface for the default live/once entry points."""
+    global _EXPLORER_ENABLED
+    _EXPLORER_ENABLED = bool(enabled)
+
+
+def _explorer_compose(snapshot, cols, rows, state=None):
+    """Build the B frame from the current snapshot without invoking the legacy line builder."""
+    from .explorer.frame import compose
+    from .explorer.nav import build_nav
+    from .explorer.output import attempt_summary_lines
+    from .explorer.state import ExplorerState, restore
+
+    state = state if isinstance(state, ExplorerState) else restore(state)
+    selected = state.selection
+    nav_rows = build_nav(snapshot, state=state)
+    global _SELECTABLE, _EXPLORER_NAV_ROWS
+    _EXPLORER_NAV_ROWS = tuple(nav_rows)
+    targets = []
+    for index, row in enumerate(nav_rows):
+        target = row.target_ref
+        if target is None:
+            continue
+        if row.kind == "session" and _selectable_session(target):
+            targets.append(_select_entry(target, index))
+        elif row.kind == "worker" and getattr(target, "pid", None):
+            targets.append(_select_entry_job(target, index))
+    _SELECTABLE = targets
+
+    visible_rows = []
+    folded = set(state.nav_fold)
+    hidden_depth = None
+    for row in nav_rows:
+        if hidden_depth is not None and row.depth > hidden_depth:
+            continue
+        hidden_depth = None
+        visible_rows.append(row)
+        if row.identity in folded:
+            hidden_depth = row.depth
+    nav_lines = []
+    for row in visible_rows:
+        if row.kind == "section":
+            nav_lines.append(row.label)
+            continue
+        marker = "›" if row.identity == selected else " "
+        nav_lines.append("  " * min(row.depth, 3) + marker + " " + row.label)
+    jobs = list(getattr(snapshot, "jobs", ()) or ())
+    output_lines = []
+    for job in jobs:
+        summary = attempt_summary_lines(job)
+        if summary:
+            output_lines.extend(summary)
+            output_lines.append("")
+    if not output_lines:
+        output_lines = ["작업 출력 없음"]
+    system_lines = _usage_header_rows(
+        getattr(snapshot, "sessions", ()), usage_snapshots=getattr(snapshot, "usage_snapshots", None),
+        term_width=cols)
+    system_lines += _compute_host_rows(
+        term_width=cols, sessions=getattr(snapshot, "sessions", ()),
+        resources=getattr(snapshot, "resources", ()),
+        display_snapshot=getattr(snapshot, "display_snapshot", None))
+    system_text = [row if isinstance(row, str) else _snapshot_line(row)
+                   for row in system_lines]
+    output_lines = system_text + ([""] if system_text else []) + output_lines
+    ledger_lines = []
+    for job in jobs:
+        node = getattr(job, "route_node", None)
+        if node:
+            status = getattr(job, "status", None) or getattr(job, "liveness", None) or "미확인"
+            ledger_lines.append(f"{node} · {status}")
+    providers = {
+        "header": ("Fleet · 작업 장부 + 출력", "실시간 관찰 · 읽기 전용"),
+        "nav": tuple(nav_lines),
+        "ledger": tuple(ledger_lines or ("요청 장부를 선택하세요",)),
+        "output": tuple(output_lines),
+        "events": (),
+        "legend": ("↑↓ 이동  ←→ 영역/요청  Enter 펼침  Tab 영역  / 찾기  e 탐색  F 사건  s/x 종료 선택  q 닫기",),
+        "keys": ((_snapshot_line(_prompt_segs(_PROMPT, cols)) if _PROMPT else
+                  "B 탐색: ↑↓ · ←→ · Enter · Tab · / · e · F · q · s/x"),),
+    }
+    return compose(snapshot=snapshot, state=state, cols=cols, rows=rows, providers=providers)
+
+
+def _draw_explorer(stdscr, snapshot):
+    global _EXPLORER_FRAME, _EXPLORER_STATE
+    from .explorer.state import ExplorerState
+    h, w = stdscr.getmaxyx()
+    if h <= 0 or w <= 0:
+        return
+    frame = _explorer_compose(snapshot, w, h, _EXPLORER_STATE)
+    _EXPLORER_FRAME = frame
+    stdscr.erase()
+    for y, line in enumerate(frame.lines[:h]):
+        try:
+            stdscr.addstr(y, 0, line[:])
+        except Exception:
+            pass
+    refresh = getattr(stdscr, "refresh", None)
+    if callable(refresh):
+        refresh()
 
 
 def set_process_view(v):
@@ -9019,6 +9126,12 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     malformed = snapshot.malformed
     resource_diagnostics = snapshot.resource_diagnostics
     mem_snapshot = _collect_memory()
+    if _EXPLORER_ENABLED:
+        import shutil
+        size = shutil.get_terminal_size((100, 45))
+        frame = _explorer_compose(snapshot, size.columns, size.lines, _EXPLORER_STATE)
+        sys.stdout.write("\n".join(frame.lines).rstrip() + "\n")
+        return 0
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
         import shutil
@@ -10180,16 +10293,25 @@ def reset_scroll():
     _RELOAD_FRAME_AT = _RELOAD_FRAME_COMPUTE_AT = None
     _RELOAD_LAYOUT = None
     _SHELL_TTY_MODE = None
+    global _EXPLORER_STATE
+    _EXPLORER_STATE = None
 
 
 def viewer_state(live_order):
+    from .explorer.state import serialize
+    layout = dict(_RELOAD_LAYOUT) if isinstance(_RELOAD_LAYOUT, dict) else {}
+    frame = _RELOAD_FRAME
+    if _EXPLORER_ENABLED:
+        layout = {"schema_version": 2}
+        frame = None
     return {"offset": _OFFSET, "process_view": _PROCESS_VIEW, "show_all": _SHOW_ALL,
+            "explorer_state": serialize(_EXPLORER_STATE),
             "layout": _LAYOUT,
             "terminal_modes": _SHELL_TTY_MODE,
             "folds": list(_ROUTE_FOLD.items()), "select_mode": _SELECT_MODE,
             "repo_folds": list(_REPO_FOLD.items()),
-            "cursor": _CURSOR_ID, "frame": _RELOAD_FRAME,
-            "frame_layout": _RELOAD_LAYOUT,
+            "cursor": _CURSOR_ID, "frame": frame,
+            "frame_layout": layout,
             "frame_at": _RELOAD_FRAME_AT, "frame_compute_at": _RELOAD_FRAME_COMPUTE_AT,
             "order": {"groups": live_order.groups, "tiers": live_order.group_tiers,
                       "sessions": live_order.sessions}}
@@ -10200,6 +10322,12 @@ def restore_viewer_state(value):
     global _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE, _RELOAD_LAYOUT
     global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
     global _LAYOUT, _REPO_FOLD, _SELECTABLE, _FOLDABLE, _REPO_FOLDABLE
+    global _EXPLORER_STATE
+    from .explorer.state import restore
+    _EXPLORER_STATE = restore(value.get("explorer_state", value))
+    if isinstance(value.get("explorer_state"), dict):
+        _RELOAD_FRAME = None
+        _RELOAD_LAYOUT = {"schema_version": 2}
 
     def tuples(item):
         return tuple(tuples(part) for part in item) if isinstance(item, list) else item
@@ -10253,6 +10381,9 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     _HIT_VALID = False
     h, w = stdscr.getmaxyx()
     if h <= 0 or w <= 1:
+        return
+    if _EXPLORER_ENABLED:
+        _draw_explorer(stdscr, snapshot or LiveSnapshot(sessions=sessions, jobs=jobs))
         return
     stdscr.erase()
     now = time.monotonic()
@@ -10635,6 +10766,37 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
                       governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
+                continue
+            if _EXPLORER_ENABLED:
+                if _SELECT_MODE:
+                    if _handle_select_key(ch):
+                        _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
+                              live_order=live_order, resources=resources,
+                              usage_snapshots=usage_snapshots, governor=governor_snapshot,
+                              loading=(generation == 0), snapshot=snapshot)
+                        continue
+                elif ch in (ord("s"), ord("S"), ord("x"), ord("X")):
+                    if not _enter_select(_live_targets()):
+                        _set_action("no selectable rows")
+                elif ch in (ord("e"), ord("E")):
+                    from .explorer.state import reduce_key
+                    _EXPLORER_STATE = reduce_key(_EXPLORER_STATE, "e")
+                elif ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT,
+                            curses.KEY_RIGHT, ord("\t"), 9, ord("/"), ord("F"),
+                            ord("f"), curses.KEY_ENTER, 10, 13):
+                    from .explorer.state import reduce_key
+                    key = {curses.KEY_UP: "up", curses.KEY_DOWN: "down",
+                           curses.KEY_LEFT: "left", curses.KEY_RIGHT: "right",
+                           ord("\t"): "right", 9: "right", ord("/"): "/",
+                           ord("F"): "F", ord("f"): "F",
+                           curses.KEY_ENTER: "enter", 10: "enter", 13: "enter"}.get(ch)
+                    if key:
+                        _EXPLORER_STATE = reduce_key(
+                            _EXPLORER_STATE, {"key": key, "nav_rows": _EXPLORER_NAV_ROWS})
+                _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
+                      live_order=live_order, resources=resources,
+                      usage_snapshots=usage_snapshots, governor=governor_snapshot,
+                      loading=(generation == 0), snapshot=snapshot)
                 continue
             if _SELECT_MODE:
                 if _handle_select_key(ch):

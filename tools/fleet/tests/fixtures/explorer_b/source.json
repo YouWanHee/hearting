@@ -1,0 +1,643 @@
+{
+  "source_bundle": "fleet-explorer-canonical-fixture",
+  "path_root": "$FIXTURE_ROOT",
+  "capture": "Frozen canonical snapshot; personal paths tokenized; no live reads.",
+  "snapshot": {
+    "sessions": [
+      {
+        "harness": "codex",
+        "cwd": "$FIXTURE_ROOT/hearting",
+        "slug": "hearting",
+        "session_id": null,
+        "is_child": true,
+        "liveness": "unknown",
+        "route_id": "rt-9c7de648f511ddf5",
+        "route_node": "material-strategy",
+        "attempt_id": "att-6b4e40fb8fc26daba430ac166930df38bf520c490957ff92"
+      }
+    ],
+    "jobs": [
+      {
+        "key": "code",
+        "stage": null,
+        "harness": "claude",
+        "status": "open",
+        "liveness": "idle",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": null,
+        "slug": "framed-b-p3-openrig-p5-pr-branch-101049a103-leg0-owner",
+        "title": null,
+        "summary": null,
+        "note": "parked-supervised",
+        "attempt_id": "att-69814a640b08e076be18a3d648b63a4e",
+        "route_id": null,
+        "owner_route_id": "rt-caad53bdc377c0d7",
+        "route_node": null,
+        "worker_type": "owner",
+        "assigned_contract": "autopilot-code",
+        "unit": "_kernel/owner",
+        "model": "opus",
+        "elapsed_min": 75
+      },
+      {
+        "key": "code",
+        "stage": "code-execute",
+        "harness": "codex",
+        "status": "open",
+        "liveness": "unknown",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": "framed-b-p3-openrig-p5-pr-branch-101049a103-leg0-owner",
+        "slug": "framed-b-p3-openrig-p5-pr-branch-101049a103-leg0-owner-execute",
+        "title": "전체 기능 경로 매트릭스 검증",
+        "summary": "제한된 임대 시간 내에서 전체 기능 경로 매트릭스를 다시 실행하고 있다.",
+        "note": null,
+        "attempt_id": "att-e6e42dfcf1d4bb4e8075508de9bbdb059814f89651fb5584",
+        "route_id": "rt-caad53bdc377c0d7",
+        "owner_route_id": null,
+        "route_node": "execute",
+        "worker_type": "stage",
+        "assigned_contract": "code-execute",
+        "unit": "dev/backend",
+        "model": "gpt-6-luna",
+        "elapsed_min": 60
+      },
+      {
+        "key": "code",
+        "stage": null,
+        "harness": "claude",
+        "status": "open",
+        "liveness": "unknown",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": null,
+        "slug": "framed-herdr-tmux-openrig-tui-frame-h-7b29474120-owner",
+        "title": null,
+        "summary": null,
+        "note": null,
+        "attempt_id": "att-38fd853b2dcc390251ddbb1b0c070b32",
+        "route_id": null,
+        "owner_route_id": "rt-c76bc6d1526e284e",
+        "route_node": null,
+        "worker_type": "owner",
+        "assigned_contract": "autopilot-code",
+        "unit": "_kernel/owner",
+        "model": "opus",
+        "elapsed_min": 55
+      },
+      {
+        "key": "code",
+        "stage": null,
+        "harness": "claude",
+        "status": "open",
+        "liveness": "unknown",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": null,
+        "slug": "framed-owner-fleet-owner-fleet-fleet-23a9700403-owner",
+        "title": null,
+        "summary": null,
+        "note": null,
+        "attempt_id": "att-da1054dece491ff5dd64b2132b8b68ad",
+        "route_id": null,
+        "owner_route_id": "rt-652177b283574d4b",
+        "route_node": null,
+        "worker_type": "owner",
+        "assigned_contract": "autopilot-code",
+        "unit": "_kernel/owner",
+        "model": "opus",
+        "elapsed_min": 42
+      },
+      {
+        "key": "draft",
+        "stage": "material-strategy",
+        "harness": "claude",
+        "status": "open",
+        "liveness": "idle",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": null,
+        "slug": "framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner",
+        "title": null,
+        "summary": null,
+        "note": "parked-supervised",
+        "attempt_id": "att-ad605131fead711661cb52a21c9da2bd",
+        "route_id": null,
+        "owner_route_id": "rt-9c7de648f511ddf5",
+        "route_node": null,
+        "worker_type": "owner",
+        "assigned_contract": "autopilot-draft",
+        "unit": "_kernel/owner",
+        "model": "opus",
+        "elapsed_min": 9
+      },
+      {
+        "key": "draft",
+        "stage": "draft-strategy",
+        "harness": "codex",
+        "status": "open",
+        "liveness": "working",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": "framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner",
+        "slug": "framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner-material-strategy",
+        "title": "합의 브리프와 기록 기반 근거 지도·",
+        "summary": "합의된 의도와 방향 브리프, 지정된 main 코드와 실제 기록을 읽으려 하고 있습니다.",
+        "note": null,
+        "attempt_id": "att-6b4e40fb8fc26daba430ac166930df38bf520c490957ff92",
+        "route_id": "rt-9c7de648f511ddf5",
+        "owner_route_id": null,
+        "route_node": "material-strategy",
+        "worker_type": "stage",
+        "assigned_contract": "draft-strategy",
+        "unit": "research/research-survey",
+        "model": "gpt-6.1-sol",
+        "elapsed_min": 2
+      },
+      {
+        "key": "code",
+        "stage": "code-execute",
+        "harness": "codex",
+        "status": "open",
+        "liveness": "unknown",
+        "parent_sid": "b68ba0fa-8c95-4464-9774-998729d8765c",
+        "parent_slug": "framed-owner-fleet-owner-fleet-fleet-23a9700403-owner",
+        "slug": "framed-owner-fleet-owner-fleet-fleet-23a9700403-owner-execute",
+        "title": "실행 계약과 이전 인계 확인",
+        "summary": "계약과 인계 내용을 먼저 읽겠다고 밝혔습니다.",
+        "note": null,
+        "attempt_id": "att-bb34b6e832d68dc7add4bb5e62030a55801bc4971840c32e",
+        "route_id": "rt-652177b283574d4b",
+        "owner_route_id": null,
+        "route_node": "execute",
+        "worker_type": "stage",
+        "assigned_contract": "code-execute",
+        "unit": "dev/backend",
+        "model": "gpt-6-luna",
+        "elapsed_min": 0
+      }
+    ]
+  },
+  "decisions": [
+    {
+      "attempt_id": "att-69814a640b08e076be18a3d648b63a4e",
+      "decision": {
+        "outcome": "pending",
+        "action": "wait",
+        "responsible": "execution-boundary",
+        "reason": "supervisor-lease-held",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-e6e42dfcf1d4bb4e8075508de9bbdb059814f89651fb5584",
+      "decision": {
+        "outcome": "pending",
+        "action": "recover",
+        "responsible": "supervision-controller",
+        "reason": "process-namespace-unverifiable",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-38fd853b2dcc390251ddbb1b0c070b32",
+      "decision": {
+        "outcome": "pending",
+        "action": "recover",
+        "responsible": "supervision-controller",
+        "reason": "process-namespace-unverifiable",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-da1054dece491ff5dd64b2132b8b68ad",
+      "decision": {
+        "outcome": "pending",
+        "action": "recover",
+        "responsible": "supervision-controller",
+        "reason": "process-namespace-unverifiable",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-ad605131fead711661cb52a21c9da2bd",
+      "decision": {
+        "outcome": "pending",
+        "action": "wait",
+        "responsible": "execution-boundary",
+        "reason": "supervisor-lease-held",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-6b4e40fb8fc26daba430ac166930df38bf520c490957ff92",
+      "decision": {
+        "outcome": "pending",
+        "action": "wait",
+        "responsible": "execution-boundary",
+        "reason": "attempt-descendant-live",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    },
+    {
+      "attempt_id": "att-bb34b6e832d68dc7add4bb5e62030a55801bc4971840c32e",
+      "decision": {
+        "outcome": "pending",
+        "action": "recover",
+        "responsible": "supervision-controller",
+        "reason": "process-namespace-unverifiable",
+        "retry_kind": ""
+      },
+      "error": null,
+      "manual": false
+    }
+  ],
+  "registry": [
+    {
+      "line": 5691,
+      "timestamp": "2026-10-20T11:04:10.796780Z",
+      "status": "open",
+      "slug": "framed-b-p3-openrig-p5-pr-branch-101049a103-leg0-owner",
+      "attempt_id": "att-69814a640b08e076be18a3d648b63a4e",
+      "harness": "claude",
+      "route_id": null,
+      "route_node": null
+    },
+    {
+      "line": 5697,
+      "timestamp": "2026-10-20T11:18:56.080085Z",
+      "status": "open",
+      "slug": "framed-b-p3-openrig-p5-pr-branch-101049a103-leg0-owner-execute",
+      "attempt_id": "att-e6e42dfcf1d4bb4e8075508de9bbdb059814f89651fb5584",
+      "harness": "codex",
+      "route_id": "rt-caad53bdc377c0d7",
+      "route_node": "execute"
+    },
+    {
+      "line": 5699,
+      "timestamp": "2026-10-20T11:23:28.790030Z",
+      "status": "open",
+      "slug": "framed-herdr-tmux-openrig-tui-frame-h-7b29474120-owner",
+      "attempt_id": "att-38fd853b2dcc390251ddbb1b0c070b32",
+      "harness": "claude",
+      "route_id": null,
+      "route_node": null
+    },
+    {
+      "line": 5702,
+      "timestamp": "2026-10-20T11:37:14.082359Z",
+      "status": "open",
+      "slug": "framed-owner-fleet-owner-fleet-fleet-23a9700403-owner",
+      "attempt_id": "att-da1054dece491ff5dd64b2132b8b68ad",
+      "harness": "claude",
+      "route_id": null,
+      "route_node": null
+    },
+    {
+      "line": 5706,
+      "timestamp": "2026-10-20T12:10:15.101312Z",
+      "status": "open",
+      "slug": "framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner",
+      "attempt_id": "att-ad605131fead711661cb52a21c9da2bd",
+      "harness": "claude",
+      "route_id": null,
+      "route_node": null
+    },
+    {
+      "line": 5708,
+      "timestamp": "2026-10-20T12:16:57.864347Z",
+      "status": "open",
+      "slug": "framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner-material-strategy",
+      "attempt_id": "att-6b4e40fb8fc26daba430ac166930df38bf520c490957ff92",
+      "harness": "codex",
+      "route_id": "rt-9c7de648f511ddf5",
+      "route_node": "material-strategy"
+    },
+    {
+      "line": 5709,
+      "timestamp": "2026-10-20T12:18:42.240567Z",
+      "status": "open",
+      "slug": "framed-owner-fleet-owner-fleet-fleet-23a9700403-owner-execute",
+      "attempt_id": "att-bb34b6e832d68dc7add4bb5e62030a55801bc4971840c32e",
+      "harness": "codex",
+      "route_id": "rt-652177b283574d4b",
+      "route_node": "execute"
+    }
+  ],
+  "routes": [
+    {
+      "route_id": "rt-652177b283574d4b",
+      "route_hash": "sha256:652177b283574d4b397ac37a478ba39638f801a19c9cfe93fb265e2277cf6b8f",
+      "parent_cycle_id": "cyc_5313d54a7f4baa3fbbfe0741517a9c9f",
+      "frame_id": null,
+      "nodes": [
+        {
+          "id": "plan",
+          "depends_on": [],
+          "unit": "plan/plan-author",
+          "gate": null
+        },
+        {
+          "id": "execute",
+          "depends_on": [
+            "plan"
+          ],
+          "unit": "dev/backend",
+          "gate": null
+        },
+        {
+          "id": "impl-review",
+          "depends_on": [
+            "execute"
+          ],
+          "unit": "qa/code-review",
+          "gate": null
+        },
+        {
+          "id": "test",
+          "depends_on": [
+            "impl-review"
+          ],
+          "unit": "qa/test",
+          "gate": null
+        },
+        {
+          "id": "report",
+          "depends_on": [
+            "test"
+          ],
+          "unit": "editorial/report",
+          "gate": null
+        }
+      ]
+    },
+    {
+      "route_id": "rt-9c7de648f511ddf5",
+      "route_hash": "sha256:9c7de648f511ddf51f56974efe4928f243a1fbb3c681afd63d00d01359f0fcec",
+      "parent_cycle_id": "cyc_6ef8e302dd10b0ae55ccf61d6804399e",
+      "frame_id": null,
+      "nodes": [
+        {
+          "id": "material-strategy",
+          "depends_on": [],
+          "unit": "research/research-survey",
+          "gate": null
+        },
+        {
+          "id": "draft-production",
+          "depends_on": [
+            "material-strategy"
+          ],
+          "unit": "research/research-survey",
+          "gate": null
+        },
+        {
+          "id": "quality-review",
+          "depends_on": [
+            "draft-production"
+          ],
+          "unit": "editorial/review",
+          "gate": null
+        },
+        {
+          "id": "fact-verify",
+          "depends_on": [
+            "quality-review"
+          ],
+          "unit": "research/claim-verify",
+          "gate": null
+        },
+        {
+          "id": "finalize",
+          "depends_on": [
+            "fact-verify"
+          ],
+          "unit": "editorial/report",
+          "gate": null
+        }
+      ]
+    },
+    {
+      "route_id": "rt-c76bc6d1526e284e",
+      "route_hash": "sha256:c76bc6d1526e284ecc9b09b7ef12b47169038ea2fa904f5ebc8b5e5c0e79b78b",
+      "parent_cycle_id": "cyc_a3a7ce35216d6c67615ab51ff3958a1a",
+      "frame_id": null,
+      "nodes": [
+        {
+          "id": "plan",
+          "depends_on": [],
+          "unit": "plan/plan-author",
+          "gate": null
+        },
+        {
+          "id": "execute",
+          "depends_on": [
+            "plan"
+          ],
+          "unit": "dev/backend",
+          "gate": null
+        },
+        {
+          "id": "impl-review",
+          "depends_on": [
+            "execute"
+          ],
+          "unit": "qa/code-review",
+          "gate": null
+        },
+        {
+          "id": "test",
+          "depends_on": [
+            "impl-review"
+          ],
+          "unit": "qa/test",
+          "gate": null
+        },
+        {
+          "id": "report",
+          "depends_on": [
+            "test"
+          ],
+          "unit": "editorial/report",
+          "gate": null
+        }
+      ]
+    },
+    {
+      "route_id": "rt-caad53bdc377c0d7",
+      "route_hash": "sha256:caad53bdc377c0d760eead8caff3a2b6153763684368748eebf651633eb14081",
+      "parent_cycle_id": "cyc_cdca42c0fbf24f2d1854fc79c94cbbe2",
+      "frame_id": null,
+      "nodes": [
+        {
+          "id": "plan",
+          "depends_on": [],
+          "unit": "plan/plan-author",
+          "gate": null
+        },
+        {
+          "id": "plan-check",
+          "depends_on": [
+            "plan"
+          ],
+          "unit": "qa/plan-review",
+          "gate": null
+        },
+        {
+          "id": "execute",
+          "depends_on": [
+            "plan-check"
+          ],
+          "unit": "dev/backend",
+          "gate": null
+        },
+        {
+          "id": "impl-review",
+          "depends_on": [
+            "execute"
+          ],
+          "unit": "qa/code-review",
+          "gate": null
+        },
+        {
+          "id": "test",
+          "depends_on": [
+            "impl-review"
+          ],
+          "unit": "qa/test",
+          "gate": null
+        },
+        {
+          "id": "report",
+          "depends_on": [
+            "test"
+          ],
+          "unit": "editorial/report",
+          "gate": null
+        }
+      ]
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "cyc_41e03dac1f6d3fc630c71aca16e37f30"
+    },
+    {
+      "cycle_id": "cyc_5313d54a7f4baa3fbbfe0741517a9c9f"
+    }
+  ],
+  "markers": [
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "execute",
+      "attempt_id": "att-d38d30fa5feca46c110c70b3144d95452009ae04c587a8a6"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "execute",
+      "attempt_id": "att-d38d30fa5feca46c110c70b3144d95452009ae04c587a8a6"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "execute",
+      "attempt_id": "att-d38d30fa5feca46c110c70b3144d95452009ae04c587a8a6"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "impl-review",
+      "attempt_id": "att-b9bb0c872561f29ba319c83e2785beda04c72e11af181121"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "impl-review",
+      "attempt_id": "att-b9bb0c872561f29ba319c83e2785beda04c72e11af181121"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "impl-review",
+      "attempt_id": "att-b9bb0c872561f29ba319c83e2785beda04c72e11af181121"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "plan",
+      "attempt_id": "att-c9f5a7d03213cc9b1ee450f339dc5b2c62c1332cd2e3c6b8"
+    },
+    {
+      "route_id": "rt-bca10c8fd3987697",
+      "node_id": "plan",
+      "attempt_id": "att-c9f5a7d03213cc9b1ee450f339dc5b2c62c1332cd2e3c6b8"
+    }
+  ],
+  "events": [
+    {
+      "time_kst": "2026-10-20T20:04:10.796780+09:00",
+      "kind": "registry",
+      "attempt_id": "att-69814a640b08e076be18a3d648b63a4e",
+      "status": "open",
+      "note": null,
+      "route_node": null,
+      "source_line": 5691
+    },
+    {
+      "time_kst": "2026-10-20T20:18:56.080085+09:00",
+      "kind": "registry",
+      "attempt_id": "att-e6e42dfcf1d4bb4e8075508de9bbdb059814f89651fb5584",
+      "status": "open",
+      "note": null,
+      "route_node": "execute",
+      "source_line": 5697
+    },
+    {
+      "time_kst": "2026-10-20T20:23:28.790030+09:00",
+      "kind": "registry",
+      "attempt_id": "att-38fd853b2dcc390251ddbb1b0c070b32",
+      "status": "open",
+      "note": null,
+      "route_node": null,
+      "source_line": 5699
+    },
+    {
+      "time_kst": "2026-10-20T20:37:14.082359+09:00",
+      "kind": "registry",
+      "attempt_id": "att-da1054dece491ff5dd64b2132b8b68ad",
+      "status": "open",
+      "note": null,
+      "route_node": null,
+      "source_line": 5702
+    },
+    {
+      "time_kst": "2026-10-20T21:10:15.101312+09:00",
+      "kind": "registry",
+      "attempt_id": "att-ad605131fead711661cb52a21c9da2bd",
+      "status": "open",
+      "note": null,
+      "route_node": null,
+      "source_line": 5706
+    },
+    {
+      "time_kst": "2026-10-20T21:16:57.864347+09:00",
+      "kind": "registry",
+      "attempt_id": "att-6b4e40fb8fc26daba430ac166930df38bf520c490957ff92",
+      "status": "open",
+      "note": null,
+      "route_node": "material-strategy",
+      "source_line": 5708
+    },
+    {
+      "time_kst": "2026-10-20T21:18:42.240567+09:00",
+      "kind": "registry",
+      "attempt_id": "att-bb34b6e832d68dc7add4bb5e62030a55801bc4971840c32e",
+      "status": "open",
+      "note": null,
+      "route_node": "execute",
+      "source_line": 5709
+    }
+  ]
+}
