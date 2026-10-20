@@ -2280,6 +2280,27 @@ payload: receipt proves delivery, not that the receiver read the file. Retain
 payloads through receipt and handoff settlement; this checkout has no safe
 payload garbage-collection boundary, so automatic removal is not implied.
 Unknown, stale or ambiguous identities keep their original binding.
+
+Normal reconciliation may validate a historical pending row whose state is
+`received` and receipt is `exact-peer-ref` even when it predates the derived
+receiver-proof field. It rechecks the immutable transfer ref, body digest,
+sender, target, and current confirmed watch holder/generation under the existing
+mutation locks. For old version-1 transfers without `refs`, it uses the refs
+from that validated pending row. Native-history receipt still requires the
+trusted callback's matching actual native message ID and verified pending row.
+Only exact receiver evidence from the peer-ref or native-history paths
+establishes body receipt; missing-pending recovery retains its exact receiver
+provenance and original-transfer digest.
+
+The current watch holder's durable ACK settles only the watch notice's ordinary
+transport duty. `cmd_ack` revalidates the holder and ACK before the existing
+settlement path marks the pending row `received` with
+`watch-receipt-displayed`. Normal reconciliation rechecks the exact watch
+binding, generation, and durable ACK under the seat lock, then closes that
+transport duty with `delivery=not-required` and no body-receipt result. This
+does not acknowledge reading or consuming the original message body, and the
+existing registered-delivery and native-continuation callbacks remain active.
+
 An external shell may have no sender session: `unknown`/empty and null sender
 fields mean an unattributed sender, not an invalid message. Its sealed ref/body
 and exact known recipient still govern delivery and receipt. Legacy unsent rows
@@ -2341,6 +2362,30 @@ sender/recipient/body reuses its ref; a changed body or recipient session gets a
 separate transfer. Lost responses reconcile against exact native history before a
 resume. Ambiguity never submits the body again. Native callbacks preserve pending
 refs when the runtime has no supported wake.
+
+Sender-delay duties retain their logical body digest and match their minted
+transfer through its source digest and delay refs. Each runner checkpoint
+observes the disposition of its own duty.
+
+The obligation runner may cancel delivery only after an exact, complete endpoint
+observation proves that the original recipient is gone, or the original
+pane-bound process lifetime is proven dead. The cancellation closes that
+delivery attempt; it does not claim receipt or success, and it preserves the
+transfer and its evidence. Missing or unreadable rows, incomplete observations,
+unresolved identities, live claims, and still-live original recipients remain
+unknown. A watch-bound transfer retains its original ref, body digest, and
+recipient as immutable identity while delivery follows the confirmed current
+watch holder. The holder and the watch's recorded handover lineage are checked
+again under the existing seat lock through the message-duty write; a stale
+observation cannot acknowledge or cancel a successor. A later exact-ref receipt
+still records delivery against the same duty without reopening a cancelled
+attempt. Missing-pending recovery accepts only a notice written by the validated
+exact-ref receiver, bound to that original transfer-body digest and effective
+recipient generation. The notice-summary digest remains a separate fact, and a
+generic `received` ledger row is insufficient. Registered-batch continuation
+and handover duties retain their own settlement rules. Owner identity readers
+reuse the generation-checked registry input; current-row and non-registry
+authority checks remain fresh and completion verdicts are not memoized.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for

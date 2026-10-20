@@ -446,6 +446,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         original_read_record = peer_obligations._read_record
         original_store_list = peer_obligations.ObligationStore.list
         original_store_update = peer_obligations.ObligationStore.update
+        original_message_checkpoint = peer_obligations.ObligationStore.update_message_checkpoint
         original_external_reconcile = peer_steward._reconcile_external_obligations
         original_retire_handover = peer_steward._retire_handover
         import route_authority
@@ -544,6 +545,11 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             if monitoring[0] and phase[0] == "runner":
                 counts["store_update_calls"] += 1
             return original_store_update(store, duty_id, **kwargs)
+
+        def checked_message_checkpoint(store, duty_id, **kwargs):
+            if monitoring[0] and phase[0] == "runner":
+                counts["store_update_calls"] += 1
+            return original_message_checkpoint(store, duty_id, **kwargs)
 
         def checked_registry_lines(jobs):
             assert_fixture_path(jobs, "jobs registry read")
@@ -835,6 +841,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     mock.patch.object(peer_obligations, "_read_record", side_effect=checked_read_record),
                     mock.patch.object(peer_obligations.ObligationStore, "list", checked_store_list),
                     mock.patch.object(peer_obligations.ObligationStore, "update", checked_store_update),
+                    mock.patch.object(peer_obligations.ObligationStore, "update_message_checkpoint",
+                                      checked_message_checkpoint),
                     mock.patch.object(peer_steward, "_retire_handover", side_effect=checked_retire_handover),
                     mock.patch.object(route_authority, "decide_continuation", side_effect=checked_authority),
                     mock.patch.object(dispatch_seat_handover, "record_retire_handover",
@@ -855,6 +863,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                                       side_effect=checked_resume_message),
                     mock.patch.object(peer_steward, "_resume_registered_obligation",
                                       side_effect=checked_resume_registered),
+                    mock.patch.object(peer_steward.herdr_observation, "pane_census",
+                                      return_value=None),
                     mock.patch.object(peer_steward, "_retire_target",
                                       side_effect=fake_native_provider),
                     mock.patch.object(Path, "read_text", checked_path_read_text),
@@ -940,7 +950,9 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.assertLessEqual(counts["message_resumes"], 194 * counts["passes"])
         self.assertGreaterEqual(counts["registered_resumes"], 6 * counts["passes"])
         self.assertLessEqual(counts["pending_reads"], 194 * counts["passes"])
-        self.assertLessEqual(counts["transfer_record_reads"], 189 * counts["passes"])
+        # Five duties deliberately lack pending rows, so each pass also checks
+        # their immutable transfer source before retaining "pending-row-missing".
+        self.assertLessEqual(counts["transfer_record_reads"], 194 * counts["passes"])
         self.assertLessEqual(counts["attempt_row_lookups"], 8 * counts["passes"])
         self.assertLessEqual(counts["context_attempt_row_lookups"], 7 * counts["passes"])
         self.assertGreaterEqual(counts["completed_retire_recoveries"], 2)

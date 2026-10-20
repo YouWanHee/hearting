@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -50,6 +51,19 @@ class ObligationStoreTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._saved_env)
         self.temp.cleanup()
+
+    @staticmethod
+    def _exact_received(ref, digest, recipient, received_at=123.0):
+        binding = {"recipient": dict(recipient), "watches": []}
+        return {"ref": ref, "body_sha256": digest, "state": "received",
+                "to": dict(recipient), "refs": [], "receipt": "exact-peer-ref",
+                "received_at": received_at,
+                "exact_receiver_receipt": {
+                    "receipt_type": "exact-peer-ref",
+                    "provenance": "validated-peer-ref-receiver-v1",
+                    "transfer_ref": ref, "transfer_body_sha256": digest,
+                    "effective_recipient": dict(recipient),
+                    "recipient_binding": binding, "received_at": received_at}}
 
     def test_list_reuses_json_generation_and_observes_external_changes(self):
         first = self.store.create("cached-one", "message", {}, {"ref": "a" * 32})
@@ -112,6 +126,129 @@ class ObligationStoreTest(unittest.TestCase):
         default_update = self.store.update(duty["id"], state="unknown", observation=observation)
         self.assertEqual(default_update["revision"], updated["revision"] + 1)
         self.assertGreaterEqual(default_update["updated_at"], updated["updated_at"])
+
+    def test_message_receipt_requires_matching_ref_recipient_and_body_digest(self):
+        ref, digest = "a" * 32, "b" * 64
+        recipient = {"harness": "codex", "session_id": "sid-recipient"}
+        identity = {"server": "default", "pane": "", **recipient}
+        duty = self.store.create("message-" + ref, "message", identity,
+                                 {"ref": ref, "body_digest": digest,
+                                  "to": dict(recipient)})
+        received = self._exact_received(ref, digest, recipient)
+        generic = {key: value for key, value in received.items()
+                   if key != "exact_receiver_receipt"}
+        self.assertFalse(self.store.acknowledge_message_receipt(
+            duty["id"], generic, recipient))
+
+        self.assertFalse(self.store.acknowledge_message_receipt(
+            duty["id"], {**received, "ref": "c" * 32}, recipient))
+        self.assertFalse(self.store.acknowledge_message_receipt(
+            duty["id"], {**received, "body_sha256": "d" * 64}, recipient))
+        self.assertFalse(self.store.acknowledge_message_receipt(
+            duty["id"], received, {"harness": "codex", "session_id": "foreign"}))
+        self.assertEqual(self.store.get(duty["id"])["state"], "pending")
+
+        self.assertTrue(self.store.acknowledge_message_receipt(duty["id"], received, recipient))
+        settled = self.store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                         ("complete", "received", "acknowledged"))
+
+    def test_cancelled_message_keeps_late_exact_receipt_without_reopening(self):
+        ref, digest = "e" * 32, "f" * 64
+        recipient = {"harness": "claude", "session_id": "sid-late", "name": "late"}
+        identity = {"server": "default", "pane": "w1:p1", **recipient}
+        duty = self.store.create("message-" + ref, "message", identity,
+                                 {"ref": ref, "body_digest": digest,
+                                  "to": dict(recipient)})
+        pending = {"ref": ref, "body_sha256": digest, "state": "queued",
+                   "to": dict(recipient)}
+        evidence = {"kind": "recipient-session-absent", "server": "default",
+                    "harness": "claude", "session_id": "sid-late",
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "default"}
+        cancelled = self.store.cancel_message_delivery(
+            duty["id"], expected_revision=duty["revision"], ref=ref,
+            body_digest=digest, identity=identity, message=pending, evidence=evidence)
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertIsNone(cancelled["result"])
+        self.assertEqual(cancelled["delivery"], "failed")
+
+        stale = self.store.update_message_checkpoint(
+            duty["id"], expected_revision=duty["revision"], state="unknown",
+            observation={"ref": ref, "reason": "stale-runner-checkpoint"})
+        self.assertEqual(stale["state"], "cancelled")
+
+        received = self._exact_received(ref, digest, recipient, received_at=456.0)
+        self.assertTrue(self.store.acknowledge_message_receipt(duty["id"], received, recipient))
+        late = self.store.get(duty["id"])
+        self.assertEqual((late["state"], late["result"], late["delivery"]),
+                         ("cancelled", None, "acknowledged"))
+        self.assertEqual(late["observation"]["reason"], "recipient-session-absent")
+        self.assertIn("terminal_evidence", late["observation"])
+        self.assertEqual(late["observation"]["receiver_receipt"]["ref"], ref)
+
+    def test_receipt_wins_over_a_stale_terminal_cancellation(self):
+        ref, digest = "1" * 32, "2" * 64
+        recipient = {"harness": "codex", "session_id": "sid-race"}
+        identity = {"server": "default", "pane": "", **recipient}
+        duty = self.store.create("message-" + ref, "message", identity,
+                                 {"ref": ref, "body_digest": digest,
+                                  "to": dict(recipient)})
+        received = self._exact_received(ref, digest, recipient, received_at=789.0)
+        self.assertTrue(self.store.acknowledge_message_receipt(duty["id"], received, recipient))
+
+        stale = {"ref": ref, "body_sha256": digest, "state": "queued", "to": dict(recipient)}
+        evidence = {"kind": "recipient-session-absent", "server": "default",
+                    "harness": "codex", "session_id": "sid-race",
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "default"}
+        result = self.store.cancel_message_delivery(
+            duty["id"], expected_revision=duty["revision"], ref=ref,
+            body_digest=digest, identity=identity, message=stale, evidence=evidence)
+        self.assertEqual((result["state"], result["result"], result["delivery"]),
+                         ("complete", "received", "acknowledged"))
+
+    def test_exact_ack_and_terminal_cancel_race_preserves_receipt_without_reopening(self):
+        ref, digest = "3" * 32, "4" * 64
+        recipient = {"harness": "codex", "session_id": "sid-race-both"}
+        identity = {"server": "default", "pane": "", **recipient}
+        duty = self.store.create("message-" + ref, "message", identity,
+                                 {"ref": ref, "body_digest": digest,
+                                  "to": dict(recipient), "refs": []})
+        received = self._exact_received(ref, digest, recipient, received_at=987.0)
+        pending = {"ref": ref, "body_sha256": digest, "state": "queued",
+                   "to": dict(recipient), "refs": []}
+        evidence = {"kind": "recipient-session-absent", "server": "default",
+                    "harness": recipient["harness"], "session_id": recipient["session_id"],
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "default"}
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def acknowledge():
+            barrier.wait(timeout=3)
+            outcomes.append(self.store.acknowledge_message_receipt(
+                duty["id"], received, recipient))
+
+        def cancel():
+            barrier.wait(timeout=3)
+            outcomes.append(self.store.cancel_message_delivery(
+                duty["id"], expected_revision=duty["revision"], ref=ref,
+                body_digest=digest, identity=identity, message=pending, evidence=evidence))
+
+        threads = [threading.Thread(target=acknowledge), threading.Thread(target=cancel)]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=3)
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(outcomes), 2)
+        latest = self.store.get(duty["id"])
+        self.assertIn(latest["state"], {"complete", "cancelled"})
+        self.assertEqual(latest["delivery"], "acknowledged")
+        self.assertEqual(latest["result"], "received" if latest["state"] == "complete" else None)
+        self.assertEqual(latest["observation"]["receiver_receipt"]["ref"], ref)
 
     def test_inherited_batch_lease_requires_flock_and_exact_observer_row(self):
         from types import SimpleNamespace

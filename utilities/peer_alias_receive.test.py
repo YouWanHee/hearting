@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -54,6 +55,7 @@ class AliasReceive(unittest.TestCase):
         for name in ("adapters", "utilities", "tools"):
             (self.agent_home / name).symlink_to(ROOT / name, target_is_directory=True)
         inherited = dict(os.environ)
+        os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
         for key in tuple(os.environ):
             if key.startswith(("AGENT_DISPATCH_", "AGENT_ARTIFACT_", "AGENT_SESSION_", "AGENT_RUNTIME_",
                                "AGENT_THREAD_", "HERDR_")):
@@ -77,9 +79,10 @@ class AliasReceive(unittest.TestCase):
             "XDG_STATE_HOME": str(self.state / "xdg"),
             "XDG_CONFIG_HOME": str(self.state / "xdg-config"),
             "XDG_DATA_HOME": str(self.state / "xdg-data"),
+            "PYTHONPYCACHEPREFIX": str(self.state / "pycache"),
             "AGENT_ARTIFACT_ROOT": str(self.state / "artifacts"),
             "HARNESS_DATA_ROOT": str(self.state / "data"),
-            "PYTHONDONTWRITEBYTECODE": "1"})
+        })
         self.env.start()
         self.addCleanup(self.env.stop)
         self.sender = {"harness": "codex", "session_id": "01a07b2b-9108-7110-bd41-93b7ade4d9c4", "name": "동명"}
@@ -336,6 +339,9 @@ class AliasReceive(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": c}):
                 session_tidy.run_hook("codex", "start", c, source="clear", cwd=str(ROOT), env=os.environ)
+                with session_tidy.seat_lock(seat.key):
+                    self.assertEqual(handover.write_snapshot_locked(
+                        seat, "codex", c, jobs=self.state / "jobs.log"), 0)
                 recipient = {"harness": "codex", "session_id": c}
                 self.assertEqual(pm.pending_delivery_recipient(pm._read_pending(transfer_ref)), recipient)
                 self.assertEqual(pm.pending_messages(recipient)[0]["ref"], transfer_ref)
@@ -380,38 +386,142 @@ class AliasReceive(unittest.TestCase):
                 self.assertEqual(send.call_args.kwargs["message"], text)
                 self.assertEqual(pm._read_transfer_record(transfer_ref), transfer_before)
 
-                lifecycle = module("watch_transfer_codex_lifecycle",
-                                   "adapters/codex/hooks/userprompt-lifecycle.py")
-                ack_path = watch_root / f"{watch_id}.ack.json"
-                real_write = os.write
-                writes = []
+                import peer_obligations
+                store = peer_obligations.ObligationStore()
+                identity = {"server": "queue-fixture", "pane": pane,
+                            "harness": "codex", "session_id": a}
+                first_duty = store.create("message-" + transfer_ref, "message", identity,
+                    {"ref": transfer_ref, "body_digest": transfer_before["body_sha256"],
+                     "from": sender, "to": original_storage,
+                     "refs": [f"peer-watch:{watch_id}"]})
+                first_pending = pm._read_pending(transfer_ref)
+                stale_ack_binding = pm.pending_delivery_binding(
+                    first_pending, include_acked=True)
+                stale_ack = dict(first_pending, state="received", text=None, rpc_claim=None,
+                    receipt="exact-peer-ref", received_at=time.time(),
+                    exact_receiver_receipt={
+                        "receipt_type": "exact-peer-ref",
+                        "provenance": "validated-peer-ref-receiver-v1",
+                        "transfer_ref": transfer_ref,
+                        "transfer_body_sha256": transfer_before["body_sha256"],
+                        "effective_recipient": stale_ack_binding["recipient"],
+                        "recipient_binding": stale_ack_binding,
+                        "received_at": time.time()})
 
-                def partial_ack_then_fail(fd, data):
-                    try:
-                        target_path = os.readlink(f"/proc/self/fd/{fd}")
-                    except OSError:
-                        target_path = ""
-                    if f".{ack_path.name}." not in target_path or not target_path.endswith(".tmp"):
-                        return real_write(fd, data)
-                    writes.append(len(data))
-                    if len(writes) == 1:
-                        return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
-                    raise OSError("fixture interrupted native ACK write")
+                # Pause after the census has been judged against C but before
+                # the duty writer takes the existing seat lock. The real C -> D
+                # handover must make this evidence stale rather than cancel D.
+                race_text, race_ref = pm.prepare_peer_message(
+                    "watch cancellation handover race", sender, original_storage,
+                    defer=True, refs=[f"peer-watch:{watch_id}"])
+                race_pending = pm._read_pending(race_ref)
+                race_duty = store.create("message-" + race_ref, "message", identity,
+                    {"ref": race_ref, "body_digest": race_pending["body_sha256"],
+                     "from": sender, "to": original_storage,
+                     "refs": [f"peer-watch:{watch_id}"]})
+                stale_binding = pm.pending_delivery_binding(race_pending, include_acked=True)
+                stale_evidence = {"kind": "recipient-session-absent", "server": "queue-fixture",
+                    "harness": "codex", "session_id": c, "census_complete": True,
+                    "session_absent": True, "census_endpoint": "queue-fixture",
+                    "recipient_binding": stale_binding}
+                observed, resume_cancel = threading.Event(), threading.Event()
+                real_seat_lock = session_tidy.seat_lock
+                race_outcomes = []
 
-                with mock.patch.object(handover.os, "write", side_effect=partial_ack_then_fail):
-                    lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
-                self.assertGreaterEqual(len(writes), 2)
-                self.assertFalse(ack_path.exists())
-                self.assertEqual(pm._read_pending(transfer_ref)["state"], "received")
-                # The next ordinary native receipt callback retries the same watch ID.
-                lifecycle.peer_notice({"session_id": c}, text, str(ROOT))
-                pending = pm._read_pending(transfer_ref)
-                self.assertEqual((pending["state"], pending["receipt"]), ("received", "exact-peer-ref"))
-                ack = json.loads(ack_path.read_text(encoding="utf-8"))
-                self.assertEqual((ack["watch_id"], ack["harness"], ack["session_id"]),
-                                 (watch_id, "codex", c))
-                self.assertEqual(handover.resolved_watch_references(
-                    "codex", c, seat_key=seat.key), [])
+                def hold_before_seat_lock(key, **kwargs):
+                    if threading.current_thread().name == "watch-cancel-race":
+                        observed.set()
+                        if not resume_cancel.wait(5):
+                            raise TimeoutError("handover barrier was not released")
+                    return real_seat_lock(key, **kwargs)
+
+                def cancel_observed_generation():
+                    race_outcomes.append(pm.cancel_message_obligation(
+                        race_ref, duty_id=race_duty["id"],
+                        expected_revision=race_duty["revision"], identity=identity,
+                        message=race_pending, evidence=stale_evidence))
+
+                d = "codex-watch-D"
+                with mock.patch.object(session_tidy, "seat_lock", side_effect=hold_before_seat_lock):
+                    worker = threading.Thread(target=cancel_observed_generation,
+                                              name="watch-cancel-race")
+                    worker.start()
+                    self.assertTrue(observed.wait(5), "cancellation did not reach the handover boundary")
+                    with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": d}):
+                        session_tidy.run_hook("codex", "start", d, source="clear",
+                                              cwd=str(ROOT), env=os.environ)
+                    resume_cancel.set()
+                    worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(race_outcomes, ["changed"])
+                self.assertEqual(store.get(race_duty["id"])["state"], "pending")
+                self.assertFalse(store.acknowledge_message_receipt(
+                    first_duty["id"], stale_ack, {"harness": "codex", "session_id": c}))
+                self.assertEqual(store.get(first_duty["id"])["state"], "pending")
+
+                current_recipient = {"harness": "codex", "session_id": d}
+                self.assertEqual(pm.pending_delivery_recipient(pm._read_pending(transfer_ref)),
+                                 current_recipient)
+                cancel_text, cancel_ref = pm.prepare_peer_message(
+                    "watch absent successor cancellation", sender, original_storage,
+                    defer=True, refs=[f"peer-watch:{watch_id}"])
+                cancel_pending = pm._read_pending(cancel_ref)
+                cancel_duty = store.create("message-" + cancel_ref, "message", identity,
+                    {"ref": cancel_ref, "body_digest": cancel_pending["body_sha256"],
+                     "from": sender, "to": original_storage,
+                     "refs": [f"peer-watch:{watch_id}"]})
+                successor_binding = pm.pending_delivery_binding(
+                    cancel_pending, include_acked=True)
+                absent_successor = {"kind": "recipient-session-absent",
+                    "server": "queue-fixture", "harness": "codex", "session_id": d,
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "queue-fixture",
+                    "recipient_binding": successor_binding}
+                self.assertEqual(pm.cancel_message_obligation(
+                    cancel_ref, duty_id=cancel_duty["id"],
+                    expected_revision=cancel_duty["revision"], identity=identity,
+                    message=cancel_pending, evidence=absent_successor), "cancelled")
+                self.assertEqual(store.get(cancel_duty["id"])["state"], "cancelled")
+
+                with mock.patch.dict(os.environ, {**base_env, "CODEX_THREAD_ID": d}):
+                    lifecycle = module("watch_transfer_codex_lifecycle",
+                                       "adapters/codex/hooks/userprompt-lifecycle.py")
+                    ack_path = watch_root / f"{watch_id}.ack.json"
+                    real_write = os.write
+                    writes = []
+
+                    def partial_ack_then_fail(fd, data):
+                        try:
+                            target_path = os.readlink(f"/proc/self/fd/{fd}")
+                        except OSError:
+                            target_path = ""
+                        if f".{ack_path.name}." not in target_path or not target_path.endswith(".tmp"):
+                            return real_write(fd, data)
+                        writes.append(len(data))
+                        if len(writes) == 1:
+                            return real_write(fd, bytes(data[:max(1, len(data) // 2)]))
+                        raise OSError("fixture interrupted native ACK write")
+
+                    with mock.patch.object(handover.os, "write", side_effect=partial_ack_then_fail):
+                        lifecycle.peer_notice({"session_id": d}, text, str(ROOT))
+                    self.assertGreaterEqual(len(writes), 2)
+                    self.assertFalse(ack_path.exists())
+                    self.assertEqual(pm._read_pending(transfer_ref)["state"], "received")
+                    lifecycle.peer_notice({"session_id": d}, cancel_text, str(ROOT))
+                    late = store.get(cancel_duty["id"])
+                    self.assertEqual((late["state"], late["result"], late["delivery"]),
+                                     ("cancelled", None, "acknowledged"))
+                    self.assertEqual(store.get(first_duty["id"])["state"], "complete")
+                    # The next ordinary native callback retries the same watch ID.
+                    lifecycle.peer_notice({"session_id": d}, text, str(ROOT))
+                    pending = pm._read_pending(transfer_ref)
+                    self.assertEqual((pending["state"], pending["receipt"]),
+                                     ("received", "exact-peer-ref"))
+                    ack = json.loads(ack_path.read_text(encoding="utf-8"))
+                    self.assertEqual((ack["watch_id"], ack["harness"], ack["session_id"]),
+                                     (watch_id, "codex", d))
+                    self.assertEqual(handover.resolved_watch_references(
+                        "codex", d, seat_key=seat.key), [])
 
     def test_original_sender_stuck_notice_on_all_existing_tool_callbacks(self):
         for harness in ("claude", "codex", "opencode"):
@@ -1014,7 +1124,8 @@ function fixture(options = {}) {
         return json.loads(run.stdout)
 
     def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False, pending_ref=None,
-                                      bare_origin=False, selection_sid="ses_A"):
+                                      bare_origin=False, selection_sid="ses_A",
+                                      disable_intervals=False, pending_command_timeout_ms=0):
         """Run the actual AgentHarnessGuards initializer with isolated native/runtime edges."""
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
         origin_start = source.index("function ownNativePaneOrigin() {")
@@ -1050,6 +1161,7 @@ import { PassThrough } from "node:stream";
 import { spawnSync as realChildSpawnSync } from "node:child_process";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+const realClearInterval = globalThis.clearInterval.bind(globalThis);
 globalThis.__fixtureTimers = [];
 globalThis.__fixtureChildren = [];
 globalThis.__fixturePublishers = [];
@@ -1066,6 +1178,10 @@ globalThis.clearTimeout = timer => {
   if (timer?.startupTimer) { timer.cancelled = true; return; }
   return realClearTimeout(timer);
 };
+if (process.env.FIXTURE_DISABLE_INTERVALS === "1") {
+  globalThis.setInterval = (cb, ms) => ({fixtureInterval: true, cb, ms, unref() {}});
+  globalThis.clearInterval = timer => timer?.fixtureInterval ? undefined : realClearInterval(timer);
+}
 globalThis.__fixturePendingRow = process.env.FIXTURE_PENDING_ROW
   ? JSON.parse(process.env.FIXTURE_PENDING_ROW) : null;
 globalThis.__fixtureSpawnSync = (exe, args, options) => {
@@ -1076,7 +1192,13 @@ globalThis.__fixtureSpawnSync = (exe, args, options) => {
       const row = globalThis.__fixturePendingRow;
       return {status: 0, stdout: JSON.stringify(row.state === "received" ? [] : [row]), stderr: ""};
     }
-    const result = realChildSpawnSync(exe, args, options);
+    // Keep this isolated semantic fixture deterministic when repeated cold
+    // Python entrypoints contend with the full suite; production keeps its
+    // own shorter callback timeout.
+    const fixtureTimeout = Number(process.env.FIXTURE_PENDING_COMMAND_TIMEOUT_MS || 0);
+    const commandOptions = fixtureTimeout > 0 && args.some(value => String(value).endsWith("peer-message.py"))
+      ? {...(options || {}), timeout: fixtureTimeout} : options;
+    const result = realChildSpawnSync(exe, args, commandOptions);
     if (result.status === 0 && globalThis.__fixturePendingRow) {
       if (intent === "--claim") {
         globalThis.__fixturePendingRow.state = "unverified";
@@ -1149,6 +1271,8 @@ if (process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1") {
                         "FIXTURE_GUARDS": str(module_path),
                         "XDG_STATE_HOME": str(fixture_state),
                         "FIXTURE_BARE_NATIVE_ORIGIN": "1" if bare_origin else "0",
+                        "FIXTURE_DISABLE_INTERVALS": "1" if disable_intervals else "0",
+                        "FIXTURE_PENDING_COMMAND_TIMEOUT_MS": str(pending_command_timeout_ms),
                         "FIXTURE_SELECTION_SID": selection_sid})
             if pending_ref:
                 env["FIXTURE_PENDING_ROW"] = json.dumps(pm._read_pending(pending_ref))
@@ -1170,14 +1294,16 @@ if (process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1") {
         return json.loads(run.stdout)
 
     def run_pending_agent_initializer_fixture(self, body, ref=None, timeout=10, bare_origin=False,
-                                              selection_sid="ses_A"):
+                                              selection_sid="ses_A", disable_intervals=False):
         if ref is None:
             rows = pm.pending_messages({"harness": "opencode", "session_id": "ses_A"})
             if len(rows) != 1:
                 raise AssertionError(f"expected one exact pending OpenCode row, got {len(rows)}")
             ref = rows[0]["ref"]
         return self.run_agent_initializer_fixture(body, timeout=timeout, pending_ref=ref,
-                                                  bare_origin=bare_origin, selection_sid=selection_sid)
+                                                  bare_origin=bare_origin, selection_sid=selection_sid,
+                                                  disable_intervals=disable_intervals,
+                                                  pending_command_timeout_ms=5000)
 
     def test_opencode_agent_initializer_returns_before_sdk_and_publishes_resume_once(self):
         result = self.run_agent_initializer_fixture(r'''
@@ -1899,13 +2025,14 @@ console.log(JSON.stringify({saves, resumes, queued, messages, bindingBeforeIdle,
   savesAfterIdle, statusReads, sessionReads, messageReads,
   carrierArmed: carrierLogs.some(row => row.extra?.module === "hearting-completion-carrier"
     && row.extra.stage === "env" && row.extra.reason === "carrier-armed")}));
-'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)), ref=ref, bare_origin=True)
+'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)), ref=ref, bare_origin=True,
+                                                   disable_intervals=True)
         self.assertTrue(result["bindingBeforeIdle"]["bindingOwnsOrigin"], result)
         self.assertIsNone(result["bindingBeforeIdle"]["originSID"], result)
         self.assertEqual(result["saves"], 1, result)
         self.assertTrue(result["carrierArmed"], result)
         self.assertEqual(result["savesAfterIdle"], 1, result)
-        self.assertEqual(len(result["resumes"]), 1)
+        self.assertEqual(len(result["resumes"]), 1, result)
         self.assertEqual(result["resumes"][0]["body"], {"messageID": "native-message-1", "parts": []})
         self.assertEqual(result["queued"]["state"], "queued")
         self.assertEqual(result["queued"]["actual_message_id"], "native-message-1")
@@ -2010,7 +2137,8 @@ const receivedCall = globalThis.__fixtureSyncCalls.find(call => call.args.includ
 const receivedMessageID = receivedCall ? receivedCall.args[receivedCall.args.indexOf("--message-id") + 1] : null;
 console.log(JSON.stringify({gets, messageReads, pendingReads, saves, resumes, receivedMessageID}));
 '''.replace("ROOT_MODE", json.dumps(mode))
-                result = self.run_pending_agent_initializer_fixture(body, ref=ref)
+                result = self.run_pending_agent_initializer_fixture(
+                    body, ref=ref, disable_intervals=True)
                 self.assertEqual((result["saves"], result["resumes"]), (0, 0), result)
                 self.assertGreaterEqual(result["pendingReads"], 1, result)
                 if mode == "valid-null-parent":
@@ -2053,7 +2181,8 @@ await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}})
 hooks.dispose();
 console.log(JSON.stringify({saves, resumes, messageReads}));
 '''.replace("RESPONSE_MODE", json.dumps(response_mode))
-                result = self.run_pending_agent_initializer_fixture(body, ref=ref)
+                result = self.run_pending_agent_initializer_fixture(
+                    body, ref=ref, disable_intervals=True)
                 self.assertEqual((result["saves"], result["resumes"], result["messageReads"]),
                                  (1, 0, 1), result)
                 self.assertEqual(pm._read_pending(ref)["state"], "unverified")
@@ -2087,9 +2216,9 @@ const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: proc
 await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
 hooks.dispose();
 console.log(JSON.stringify({saves, resumes, userID: messages[0]?.info.id}));
-''', ref=ref)
+''', ref=ref, disable_intervals=True)
         self.assertEqual((result["saves"], result["resumes"], result["userID"]),
-                         (1, 1, "native-message-resume-failed"))
+                         (1, 1, "native-message-resume-failed"), result)
         failed_resume = pm._read_pending(ref)
         self.assertNotEqual(failed_resume["state"], "received")
         self.assertEqual(failed_resume["actual_message_id"], "native-message-resume-failed")
@@ -2130,11 +2259,11 @@ await hooks.event({event: {type: "session.status", properties: {sessionID: sid, 
 await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
 hooks.dispose();
 console.log(JSON.stringify({saves, resumes}));
-''')
+''', disable_intervals=True)
         self.assertEqual((result["saves"], result["resumes"]), (1, 1))
         row = pm._read_pending(ref)
         self.assertEqual((row["state"], row["actual_message_id"], row["receipt"]),
-                         ("received", "saved-before-lost-response", "exact-native-history"))
+                         ("received", "saved-before-lost-response", "exact-native-history"), result)
 
     def test_opencode_duplicate_history_wrong_parent_and_sid_swap_never_fabricate_receipt(self):
         recipient = {"harness": "opencode", "session_id": "ses_A"}

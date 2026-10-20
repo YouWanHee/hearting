@@ -555,6 +555,105 @@ def resolve_watch(watch_id: str, *, seat_key: Optional[str] = None,
         return None
 
 
+def watch_delivery_binding(watch_ids: Iterable[str], *, include_acked: bool = False) -> Optional[dict]:
+    """Snapshot the current holders and confirmed handover lineages for exact watches."""
+    ids = list(watch_ids)
+    if not ids or any(not isinstance(watch_id, str) or not watch_id for watch_id in ids):
+        return None
+    watches = []
+    recipient = None
+    for watch_id in ids:
+        relation = resolve_watch(watch_id, include_acked=include_acked)
+        if not isinstance(relation, dict) or relation.get("watch_id") != watch_id:
+            return None
+        holder = relation.get("holder") or {}
+        current = {"harness": holder.get("harness"), "session_id": holder.get("sid")}
+        seat_key = relation.get("seat_key")
+        lineage = relation.get("lineage") or []
+        if (current["harness"] not in {"claude", "codex", "opencode"}
+                or not isinstance(current["session_id"], str) or not current["session_id"]
+                or not isinstance(seat_key, str) or not seat_key
+                or not isinstance(lineage, list)
+                or any(not isinstance(item, dict) for item in lineage)):
+            return None
+        if recipient is not None and recipient != current:
+            return None
+        recipient = current
+        watches.append({
+            "watch_id": watch_id,
+            "seat_key": seat_key,
+            "holder": current,
+            # The writer appends each confirmed A -> B transition here. Keep
+            # that lineage as the generation; do not infer a second owner.
+            "handover_generation": list(lineage),
+        })
+    return {"recipient": recipient, "watches": watches}
+
+
+@contextlib.contextmanager
+def watch_delivery_binding_lock(binding: dict):
+    """Hold the existing seat writer locks while rechecking a watch binding."""
+    watches = binding.get("watches") if isinstance(binding, dict) else None
+    if not isinstance(watches, list) or not watches:
+        yield False
+        return
+    ids, keys = [], set()
+    for watch in watches:
+        if not isinstance(watch, dict):
+            yield False
+            return
+        watch_id, key = watch.get("watch_id"), watch.get("seat_key")
+        if (not isinstance(watch_id, str) or not watch_id
+                or not isinstance(key, str) or not key):
+            yield False
+            return
+        ids.append(watch_id)
+        keys.add(key)
+    stack = contextlib.ExitStack()
+    try:
+        import session_tidy
+        for key in sorted(keys):
+            stack.enter_context(session_tidy.seat_lock(key))
+        current = watch_delivery_binding(ids, include_acked=True)
+    except (OSError, ValueError, RuntimeError):
+        stack.close()
+        yield False
+        return
+    try:
+        yield current == binding
+    finally:
+        stack.close()
+
+
+def watch_acknowledgements_valid(binding: dict) -> bool:
+    """Confirm every exact watch in a locked current binding has a durable ACK."""
+    watches = binding.get("watches") if isinstance(binding, dict) else None
+    recipient = binding.get("recipient") if isinstance(binding, dict) else None
+    if not isinstance(watches, list) or not watches or not isinstance(recipient, dict):
+        return False
+    for watch in watches:
+        if not isinstance(watch, dict):
+            return False
+        watch_id, seat_key = watch.get("watch_id"), watch.get("seat_key")
+        if (not isinstance(watch_id, str) or not watch_id
+                or not isinstance(seat_key, str) or not seat_key):
+            return False
+        relation = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+        if not isinstance(relation, dict) or relation.get("watch_id") != watch_id:
+            return False
+        holder = relation.get("holder") or {}
+        if (holder.get("harness") != recipient.get("harness")
+                or holder.get("sid") != recipient.get("session_id")):
+            return False
+        root = Path(str(relation.get("storage_root") or ""))
+        if (not root.is_absolute()
+                or not watch_ack_valid(root / "peer-watches" / f"{watch_id}.ack.json",
+                                       watch_id, recipient.get("harness"),
+                                       recipient.get("session_id"))):
+            return False
+    return True
+
+
 def acknowledge_watch(watch_id: str, harness: str, sid: str, carrier: str) -> str:
     """Create the original watch ACK only for its revalidated current recipient."""
     try:
