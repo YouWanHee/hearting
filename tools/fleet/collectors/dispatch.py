@@ -55,6 +55,7 @@ except Exception:  # a monitor must never fail to import over a bookkeeping help
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
+import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
 
@@ -65,11 +66,13 @@ except Exception:  # a monitor must never fail to import over a read helper
 
 from .. import gitinfo
 from .. import model
-from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
+from ..model import (DONE_AFTERGLOW_MIN, ContextEvidence, DispatchJob,
+                     etime_to_min, project_of)
 from ..token_budget import (context_policy_snapshot, context_policy_used_pct,
                             parse_codex_token_count, telemetry_from_explicit)
 from . import procscan
 from . import parse_cache
+from . import shell_jobs
 
 _AUTOPILOT = re.compile(r"/autopilot-([a-z-]+)")
 _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
@@ -95,18 +98,26 @@ _MANAGED_SIDECAR_RE = re.compile(
     r"^(.*/\.harness/managed-sessions/[^/]+)/managed-sidecars/[^/]+$"
 )
 _TERMINAL_REGISTRY_STATUSES = frozenset(("done", "killed", "cancelled"))
-# F-46 (v29): a `done` row lingers this long as a display-only afterglow row — the job-row
-# mirror of the group cooling window (render `_COOL_WINDOW_MIN`). Rationale: a multi-minute
-# quick dispatch used to evaporate the instant it finished, so the user read it as "never
-# ran". `killed`/`cancelled` are NOT afterglow (they keep the existing stale/dead path):
-# an interrupted attempt is not a completion worth lingering on.
-DONE_AFTERGLOW_MIN = 15
 _PID_HOST_NAMESPACE_PROOF = "nspid-procfs-root-v1"
 _DEGRADATION_CACHE = {}
 _DEGRADATION_CACHE_LIMIT = 128
 _DEGRADATION_REQUIRED = {"schema_version", "kind", "ts", "route_id", "route_node",
                          "route_hash", "dispatch_depth", "fallback_hop",
                          "execution_surface", "writer"}
+
+
+def _pinned_registry_lines(path):
+    """Text lines of the registry generation pinned for this Fleet pass.
+
+    None outside a pass or when the pinned read failed, so each reader keeps
+    its own missing/unreadable handling.
+    """
+    if not _dispatch_registry_cache.registry_scope_active():
+        return None
+    try:
+        return _dispatch_registry_cache.registry_text_lines(Path(path))
+    except OSError:
+        return None
 
 
 def _managed_parent_dir(sidecar_log):
@@ -864,10 +875,12 @@ def _parent_extinction_rows(paths):
     for path in paths:
         per_path = {}
         try:
-            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            lines = _pinned_registry_lines(path)
+            if lines is None:
+                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        for line in content.splitlines():
+        for line in lines:
             fields = line.split("\t")
             if len(fields) != 6:
                 continue
@@ -1676,6 +1689,16 @@ def _enrich_claude_stream_session(job, fast_first=False):
     if not session_id:
         return
     job._runtime_session_id = session_id
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    else:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_claude_jobs(telemetry_path, session_id=session_id,
+                                        attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            telemetry_path, ("claude", os.path.abspath(telemetry_path), session_id, job.attempt_id))
 
 
 def _codex_attempt_thread_ids(lines):
@@ -1970,6 +1993,18 @@ def _enrich_codex_attempt_session(job, fast_first=False):
         except OSError:
             pass
     job.exec_tool = parsed.get("exec_tool")
+    if thread_id and not fast_first:
+        job.shell_jobs = shell_jobs.observe_jobs(
+            shell_jobs.read_codex_jobs(path, session_id=thread_id, attempt_id=job.attempt_id),
+            attempt_id=job.attempt_id)
+        job.shell_job_observation = shell_jobs.source_status(
+            path, ("codex", os.path.abspath(path), thread_id, job.attempt_id))
+    elif thread_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+    elif parsed.get("thread_ambiguity"):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "multiple-attempt-thread-ids"}
 
 
 def _parse_opencode_attempt_tail(path):
@@ -2090,10 +2125,22 @@ _OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
 
 def _enrich_opencode_native_activity(job, session_id, fast_first=False):
     """Observe only the attempt-private DB; first publication remains log-only."""
-    if fast_first or not session_id or not _native_home_admitted(job):
+    if fast_first:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "detail-refresh-deferred"}
+        return
+    if not session_id:
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "exact-session-id-unresolved"}
+        return
+    if not _native_home_admitted(job):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unobserved", "reason": "private-runtime-not-admitted"}
         return
     runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
     if not isinstance(runtime, str) or not os.path.isabs(runtime):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "attempt-private-runtime-unresolved"}
         return
     db = os.path.join(runtime, "data", "opencode", "opencode.db")
     try:
@@ -2102,19 +2149,43 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
         if (not signatures[""] or signatures["-journal"] or
                 sum(info[2] for suffix, info in signatures.items()
                     if info and suffix in ("", "-wal")) > _OPENCODE_ACTIVITY_BYTES):
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": "unavailable",
+                                         "reason": "private-db-missing-or-over-read-cap"}
             return
-        key = (db, session_id)
+        from . import opencode as opencode_collector
+        attempt_id = getattr(job, "attempt_id", None)
+        key = (db, session_id, attempt_id)
         cached = _OPENCODE_ACTIVITY_CACHE.get(key)
-        if cached and cached[0] == signatures:
-            activity = cached[1]
+        same_source = bool(cached and cached[0] == signatures)
+        cached_shell = cached[2] if same_source and len(cached) > 2 else None
+        shell_complete = bool(
+            isinstance(cached_shell, dict)
+            and (cached_shell.get("shell_cursor") or {}).get("caught_up"))
+        if same_source and shell_complete:
+            activity, shell_observation = cached[1], cached_shell
         else:
             with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
                 deadline = time.monotonic() + .05
                 connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
-                activity = refresh_title.read_opencode_activity(connection, session_id)
+                activity = cached[1] if same_source else refresh_title.read_opencode_activity(
+                    connection, session_id)
+                opencode_runtime = opencode_collector._opencode_v2_runtime()
+                page = opencode_runtime.read_session_shell_tasks(
+                    connection, session_id,
+                    after_seq=opencode_collector._v2_shell_cursor(db, session_id, attempt_id),
+                    refresh_seqs=opencode_collector._v2_shell_refresh_seqs(
+                        db, session_id, attempt_id))
+                signature = signatures.get("")
+                identity = ({"device": signature[0], "inode": signature[1]}
+                            if isinstance(signature, tuple) and len(signature) >= 2 else None)
+                shell_observation = dict(page, database_identity=identity)
             if signatures != refresh_title._opencode_source_signatures(db):
+                job.shell_jobs = []
+                job.shell_job_observation = {"state": "unavailable",
+                                             "reason": "private-db-changed-during-snapshot"}
                 return
-            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity)
+            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity, shell_observation)
             if len(_OPENCODE_ACTIVITY_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
                 _OPENCODE_ACTIVITY_CACHE.pop(next(iter(_OPENCODE_ACTIVITY_CACHE)))
         job.exec_tool = None
@@ -2124,7 +2195,20 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
             job.exec_tool = {"name": label} if label else None
         if activity.get("summary"):
             job._native_now = (activity["summary"], activity.get("summary_ts"))
+        observed = shell_observation
+        if observed.get("state") == "observed" and observed.get("generation") == "v2":
+            opencode_collector._attach_v2_shell_tasks(
+                job, observed, db, session_id,
+                tree=getattr(job, "_proc_tree", None),
+                kids=getattr(job, "_proc_kids", None),
+                native_data_root=os.path.join(runtime, "data", "opencode"))
+        else:
+            job.shell_jobs = []
+            job.shell_job_observation = {"state": observed.get("state", "unknown"),
+                                         "reason": observed.get("reason", "private-v2-db-unavailable")}
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        job.shell_jobs = []
+        job.shell_job_observation = {"state": "unavailable", "reason": "private-db-read-failed"}
         return
 
 
@@ -2355,7 +2439,9 @@ def _scan_degradations(route_ids, agent_home=None, tail=64, jobs=()):
         else:
             try:
                 with open(path, "rb") as stream:
-                    stream.seek(max(0, st.st_size - 256 * tail))
+                    # One bounded candidate record can exceed the old 16KiB
+                    # default window. Include that whole row, still bounded.
+                    stream.seek(max(0, st.st_size - max(65536, 256 * tail)))
                     raw = stream.read().splitlines()[-tail:]
                 rows = []
                 for line in raw:
@@ -2499,17 +2585,98 @@ def resolve_plan_qa_artifact(job):
         roots.extend((root, os.path.join(root, ".agent_reports"),
                       os.path.join(root, ".claude_reports")))
     candidates = set()
+    route_id = value("route_id") or value("owner_route_id")
+    cycle_id = value("cycle_id") or value("cycle")
+
+    def inside(path, root):
+        try:
+            return os.path.commonpath((os.path.realpath(path), os.path.realpath(root))) == os.path.realpath(root)
+        except (OSError, ValueError):
+            return False
+
+    def add_cycle_plans(root):
+        if not ((isinstance(route_id, str) and route_id)
+                or (isinstance(cycle_id, str) and cycle_id)):
+            return
+        cycles_dir = os.path.join(root, ".runtime", "artifact-producer", "v1", "cycles")
+        if not os.path.isdir(cycles_dir) or not inside(cycles_dir, root):
+            return
+        selected = []
+        if cycle_id:
+            if isinstance(cycle_id, str) and re.fullmatch(r"cyc_[A-Za-z0-9_-]+", cycle_id):
+                selected.append(os.path.join(cycles_dir, cycle_id + ".json"))
+        elif isinstance(route_id, str) and route_id:
+            hint_path = os.path.join(cycles_dir, ".cycle-routes-index.json")
+            hints = _read_cycle_hints(hint_path)
+            names = hints.get(route_id, ()) if isinstance(hints, dict) else ()
+            for name in names:
+                if (not isinstance(name, str) or os.path.basename(name) != name
+                        or not name.endswith(".json")):
+                    continue
+                selected.append(os.path.join(cycles_dir, name))
+        for record_path in dict.fromkeys(selected):
+            if not inside(record_path, cycles_dir):
+                continue
+            record = _read_cycle_record(record_path)
+            if (not isinstance(record, dict)
+                    or (route_id and record.get("route_id") != route_id)
+                    or (cycle_id and record.get("cycle_id") != cycle_id)):
+                continue
+            campaign_id = record.get("campaign_id")
+            cycle = record.get("cycle_id")
+            if not isinstance(campaign_id, str) or not isinstance(cycle, str):
+                continue
+            campaign_path = os.path.join(root, ".runtime", "artifact-producer", "v1",
+                                         "campaigns", campaign_id + ".json")
+            campaign = _read_cycle_record(campaign_path)
+            campaign_dirs = []
+            campaigns_root = os.path.join(root, "campaigns")
+            if (inside(campaigns_root, root) and isinstance(campaign, dict)
+                    and campaign.get("campaign_id") == campaign_id
+                    and isinstance(campaign.get("locator"), str)):
+                campaign_dir = os.path.join(campaigns_root, campaign["locator"])
+                if inside(campaign_dir, campaigns_root):
+                    campaign_dirs.append(campaign_dir)
+            # Legacy readable layout is derived only from the validated stable ID.
+            legacy_campaign = os.path.join(campaigns_root, campaign_id)
+            if inside(legacy_campaign, campaigns_root):
+                campaign_dirs.append(legacy_campaign)
+            for campaign_dir in dict.fromkeys(campaign_dirs):
+                cpath = os.path.join(campaign_dir, "campaign.json")
+                if os.path.isfile(cpath):
+                    persisted = _read_cycle_record(cpath)
+                    if isinstance(persisted, dict) and persisted.get("campaign_id") != campaign_id:
+                        continue
+                cycle_dirs = [os.path.join(campaign_dir, record["locator"])
+                              if isinstance(record.get("locator"), str) else "",
+                              os.path.join(campaign_dir, "cycles", cycle)]
+                for cycle_dir in cycle_dirs:
+                    if (not cycle_dir or not inside(cycle_dir, campaign_dir)
+                            or not inside(cycle_dir, root)):
+                        continue
+                    plans = os.path.join(cycle_dir, "artifacts", "plans")
+                    if (os.path.isdir(plans) and inside(plans, cycle_dir)
+                            and inside(plans, root)):
+                        try:
+                            with os.scandir(plans) as entries:
+                                for entry in entries:
+                                    if (entry.name.endswith("_" + slug)
+                                            and entry.is_dir(follow_symlinks=False)):
+                                        candidates.add(os.path.realpath(entry.path))
+                        except OSError:
+                            pass
+
     for root in dict.fromkeys(roots):
-        if not (os.path.isdir(os.path.join(root, "campaigns"))
-                or os.path.isdir(os.path.join(root, "plans"))):
-            continue
-        # W7D: cycle plans dirs plus the legacy top-level plans/ read-only fallback.
-        matches = (artifact_reader.glob_bucket(Path(root), "plans", "*_%s" % slug)
-                   if artifact_reader is not None
-                   else glob.glob(os.path.join(root, "plans", "*_%s" % slug)))
-        for path in (str(m) for m in matches):
-            if os.path.isdir(path):
-                candidates.add(os.path.realpath(path))
+        add_cycle_plans(root)
+        legacy = os.path.join(root, "plans")
+        if os.path.isdir(legacy) and inside(legacy, root):
+            try:
+                with os.scandir(legacy) as entries:
+                    for entry in entries:
+                        if entry.name.endswith("_" + slug) and entry.is_dir(follow_symlinks=False):
+                            candidates.add(os.path.realpath(entry.path))
+            except OSError:
+                pass
     if len(candidates) != 1:
         return None
     pd = next(iter(candidates))
@@ -2542,7 +2709,7 @@ _QA_DEFAULT = {
 
 
 def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role=None,
-                 artifact_root=None, lookup_plan=True):
+                 artifact_root=None, lookup_plan=True, *, job=None):
     """Layered qa resolver, first-hit precedence: argv > jobslog(pipe) > plan artifact >
     CONVENTIONS default. Returns (qa, source) — source in argv|jobslog|plan|default|None."""
     if argv_qa:
@@ -2551,9 +2718,14 @@ def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role
         return pipe_qa, "jobslog"
     v = None
     if lookup_plan:
-        v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
+        context = (dict(job) if isinstance(job, dict) else {
+            name: getattr(job, name, None)
+            for name in ("route_id", "owner_route_id", "cycle_id", "cycle")
+        })
+        context.update({"cwd": jcwd, "slug": slug, "key": key,
                                       "artifact_root": artifact_root,
                                       "capability": capability, "worker_role": worker_role})
+        v = resolve_plan_qa_artifact(context)
     if v:
         return v, "plan"
     v = _QA_DEFAULT.get(key)
@@ -2692,8 +2864,10 @@ def _scan_registry_evidence(paths):
         path_result = {}
         path_attempts = {}
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.read().splitlines()
+            rows = _pinned_registry_lines(path)
+            if rows is None:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    rows = f.read().splitlines()
         except OSError:
             continue
         for registry_order, line in enumerate(rows):
@@ -3083,8 +3257,10 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     malformed = 0
     seen_attempts = set() if seen_attempts is None else seen_attempts
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            rows = f.read().splitlines()
+        rows = _pinned_registry_lines(path)
+        if rows is None:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                rows = f.read().splitlines()
     except FileNotFoundError:
         return jobs, 0
     # Reconcile each job to its LATEST row before deciding live-ness. Identity key = slug,
@@ -3342,8 +3518,10 @@ def _jobs_log_fields(paths):
     for path in paths:
         path_fields = {}
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.read().splitlines()
+            rows = _pinned_registry_lines(path)
+            if rows is None:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    rows = f.read().splitlines()
         except FileNotFoundError:
             continue
         path_attempts = {}
@@ -3520,7 +3698,8 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
     def _rows_for(path):
         if path not in rows_by_path:
             try:
-                rows_by_path[path] = registry.read_rows(_Path(path))
+                rows_by_path[path] = registry.read_rows(
+                    _Path(path), lines=_pinned_registry_lines(path))
             except Exception:
                 rows_by_path[path] = []
         return rows_by_path[path]
@@ -3605,7 +3784,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
         return
     try:
         from pathlib import Path as _Path
-        rows = registry.read_rows(_Path(jobs_path))
+        rows = registry.read_rows(_Path(jobs_path), lines=_pinned_registry_lines(jobs_path))
     except Exception:
         return
     newest = {}
@@ -3674,7 +3853,9 @@ def _pending_delivery_counts(paths):
     intent_rows = set()
     for path in paths:
         try:
-            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = _pinned_registry_lines(path)
+            if lines is None:
+                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for line in lines:
@@ -4140,7 +4321,7 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
             j.qa, j.qa_source = effective_qa(
                 None, None, j.cwd, j.slug, j.key,
                 getattr(j, "capability_owner", None), j.worker_role,
-                artifact_root=j.artifact_root)
+                artifact_root=j.artifact_root, job=j)
     # F-15c(a): a registry-only row (source="jobs") that turns out to be genuinely working
     # re-derives its breadcrumb from the real plan artifacts instead of the raw jobs.log
     # status word ("open"/"running") — otherwise a live job with real progress shows a
@@ -4178,10 +4359,14 @@ _ARTIFACT_READ_CACHE = artifact_reader.ReadCache() if artifact_reader is not Non
 
 def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """One inventory observation per root/tick; unchanged records reuse it live."""
+    from contextlib import ExitStack
     args = (jobs_path, harness_filter, session_rows, fast_first)
-    if artifact_reader is None:
-        return _collect(*args)
-    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+    import artifact_producer
+    with ExitStack() as stack:
+        if artifact_reader is not None:
+            stack.enter_context(artifact_reader.read_scope(_ARTIFACT_READ_CACHE))
+        stack.enter_context(artifact_producer.artifact_index_observation_scope())
+        stack.enter_context(_dispatch_registry_cache.registry_read_scope())
         return _collect(*args)
 
 

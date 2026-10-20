@@ -113,6 +113,48 @@ class TextProviderContextTest(unittest.TestCase):
                                  ("TITLE: A\nNOW: B", 0))
             record.assert_called_once()
 
+    def test_opencode_v2_unverified_model_runs_only_for_an_explicit_provider(self):
+        unverified = ("openai/gpt-6.1-sol", "xhigh",
+                      {"state": "unknown", "reason": "provider-model-unverified",
+                       "automatic_eligible": False})
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                rt, "provider_settings",
+                return_value={"model": "openai/gpt-6.1-sol", "budget": "xhigh"}), \
+             mock.patch.object(rt.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(rt.opencode_runtime, "select_automatic_model",
+                               return_value=unverified):
+            workdir = Path(tmp) / "state"
+            self.assertIsNone(rt.provider_command("opencode", "prompt", workdir=workdir,
+                                                  profile="deep"))
+            command = rt.provider_command("opencode", "prompt", workdir=workdir,
+                                          profile="deep", explicit_provider=True)
+            self.assertEqual(command[0][command[0].index("--model") + 1],
+                             "openai/gpt-6.1-sol#xhigh")
+
+    def test_title_pin_is_the_only_explicit_provider(self):
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("FLEET_TITLE_COMMAND", "FLEET_TITLE_MODEL")}
+        for pinned, expected in (("opencode", True), ("", False)):
+            with self.subTest(pinned=pinned), \
+                 mock.patch.dict(os.environ, {**env, "FLEET_TITLE_PROVIDER": pinned}, clear=True), \
+                 mock.patch.object(rt, "selected_providers", return_value=("opencode",)), \
+                 mock.patch.object(rt, "provider_command", return_value=None) as command:
+                rt._resolve_commands("prompt")
+                self.assertEqual(command.call_args.kwargs["explicit_provider"], expected)
+
+    def test_cached_and_ranked_orders_read_the_shared_automatic_rule(self):
+        cases = (([{"model": "openai/gpt-6.1-sol", "state": "unknown",
+                    "reason": "provider-model-unverified"}], False),
+                 ([{"model": "openai/gpt-6.1-sol", "state": "unknown"},
+                   {"model": "opencode-go/model", "state": "unknown"}], True),
+                 ([{"model": "opencode-go/model", "state": "unavailable"}], False))
+        for rows, expected in cases:
+            with self.subTest(rows=rows), mock.patch.object(
+                    rt, "provider_settings", return_value={"model": "m/x", "budget": "high"}), \
+                 mock.patch.object(rt.opencode_runtime, "automatic_candidates",
+                                   return_value=rows):
+                self.assertEqual(rt._opencode_models_eligible("deep"), expected)
+
     def test_cascade_passes_each_child_context_without_mutating_caller(self):
         env = {"CODEX_HOME": "caller", "OPENCODE_CONFIG_CONTENT": "foreign", "KEEP": "value"}
         command = rt._ProviderCommand(["provider"], "prompt", None,

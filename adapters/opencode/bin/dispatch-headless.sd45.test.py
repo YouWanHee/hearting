@@ -63,8 +63,9 @@ class NestedRuntimeTest(unittest.TestCase):
 def isolated_dispatch_env(**updates):
     inherited = {
         key: value for key, value in os.environ.items()
-        if key not in {"AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_MODEL_GOVERNOR_ROOT"}
-        and not key.startswith(("AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))
+        if key not in {"AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID",
+                       "AGENT_MODEL_GOVERNOR_ROOT"}
+        and not key.startswith(("AGENT_ARTIFACT_", "AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))
     }
     inherited.update(updates)
     return inherited

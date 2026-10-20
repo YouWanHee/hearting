@@ -14,6 +14,18 @@ AGENT_HOME="${AGENT_HOME:-${CLAUDE_HOME:-$HOME/.claude}}"
 # CLAUDE_CONFIG_DIR/~/.claude만 보므로 tap도 유실된다. 도구 조회(session_handle.py,
 # refresh_title.py)만 AGENT_HOME을 쓴다.
 SL_STATE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Bytecode beside an immutable release would break "byte-identical to the release
+# it was built from"; keep the cache, put it in state (same rule as harness.sh).
+if [ -z "${PYTHONPYCACHEPREFIX:-}" ] && [ -z "${PYTHONDONTWRITEBYTECODE:-}" ]; then
+  _state_root=${HARNESS_STATE_ROOT:-${XDG_STATE_HOME:+$XDG_STATE_HOME/hearting}}
+  if [ -z "$_state_root" ] && [ -n "${HOME:-}" ]; then
+    _state_root=$HOME/.local/state/hearting
+  fi
+  if [ -n "$_state_root" ]; then
+    export PYTHONPYCACHEPREFIX="$_state_root/pycache"
+  fi
+  unset _state_root
+fi
 input=$(cat)
 printf '%s' "$input" > "$SL_STATE_HOME/.statusline-last.json" 2>/dev/null || true  # 디버그·필드 탐사용 (최신 입력 1건)
 

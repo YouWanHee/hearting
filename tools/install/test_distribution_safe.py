@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import select
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -1023,6 +1025,114 @@ class ReleasePycachePruneTest(unittest.TestCase):
             distribution._cleanup_releases(set())
         self.assertTrue(old.is_dir())
         self.assertTrue((cache / "old.pyc").is_file())
+
+
+class ManagedRuntimeAdoptionTest(unittest.TestCase):
+    REQUIRED = {
+        "hearting/harness-manifest.json": "{}\n",
+        "hearting/core/CORE.md": "# core\n",
+        "hearting/tools/install/harness.sh": "#!/bin/sh\n",
+        "hearting/tools/install/installer.py": "# fixture\n",
+        "hearting/tools/install/distribution.py": "# fixture\n",
+        "hearting/utilities/compute-hosts": "#!/bin/sh\n",
+        "hearting/utilities/compute-hosts.py": "#!/usr/bin/env python3\n",
+        "hearting/tools/fleet/fleet.sh": "#!/bin/sh\n",
+        "hearting/tools/memory/mem.py": "#!/usr/bin/env python3\n",
+        "hearting/tools/memory/protocol_v2.py": "#!/usr/bin/env python3\n",
+        "hearting/tools/memory/git_exchange_v2.py": "#!/usr/bin/env python3\n",
+        "hearting/tools/memory/sync_v2.py": "#!/usr/bin/env python3\n",
+        "hearting/tools/memory/migration_v2.py": "#!/usr/bin/env python3\n",
+    }
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        base = Path(self.temporary.name).resolve()
+        source = base / "source"
+        source.mkdir()
+        self.assets = base / "assets"
+        self.assets.mkdir()
+        self.index = base / "release.json"
+        self.environment = fixture_env.build_environment(
+            base / "fixture", source, base={"PATH": os.environ.get("PATH", "")}
+        )
+        fixture_env.prepare_environment(self.environment)
+        self.environment["HARNESS_TEST_PLATFORM"] = "linux"
+        self.environment["HARNESS_SCHEDULER_NO_ACTIVATE"] = "1"
+        self.environment["HARNESS_ALLOW_FILE_RELEASES"] = "1"
+        self.environment["HARNESS_RELEASE_INDEX_URL"] = self.index.as_uri()
+        self.patch = mock.patch.dict(os.environ, self.environment, clear=True)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.activations = []
+        for name, replacement in (
+            ("_activate_release", self._fake_activate),
+            ("_probe_command", lambda command: (False, "probe unavailable")),
+        ):
+            patcher = mock.patch.object(distribution, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _make_release(self, version: str) -> None:
+        archive = self.assets / f"{version}.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            files = dict(self.REQUIRED)
+            files["hearting/RELEASE_VERSION"] = version + "\n"
+            for name, text in files.items():
+                payload = text.encode()
+                info = tarfile.TarInfo(name)
+                info.mode = 0o755 if name.endswith((".sh", "/compute-hosts")) else 0o644
+                info.size = len(payload)
+                bundle.addfile(info, io.BytesIO(payload))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        checksum = self.assets / f"{version}.sha256"
+        checksum.write_text(digest + "  hearting.tar.gz\n")
+        self.index.write_text(json.dumps({
+            "tag_name": version,
+            "assets": [
+                {"name": "hearting.tar.gz", "browser_download_url": archive.as_uri()},
+                {"name": "hearting.tar.gz.sha256", "browser_download_url": checksum.as_uri()},
+            ],
+        }))
+
+    def _record_activation(self, release_root: Path, runtime: str) -> None:
+        path = distribution._runtime_home(runtime) / ".harness/activation.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"mode": "packaged", "source_root": str(release_root)}))
+
+    def _fake_activate(self, release_root, runtimes) -> dict:
+        selected = list(runtimes)
+        self.activations.append((Path(release_root).name, tuple(selected)))
+        for runtime in selected:
+            self._record_activation(Path(release_root), runtime)
+        return {"runtimes": selected, "session_action": {}}
+
+    def _bootstrap_claude_codex_then_activate_opencode(self) -> None:
+        self._make_release("v1.0.0")
+        installed = distribution.bootstrap("example/harness", "latest", ["claude", "codex"], False)
+        self.assertEqual(distribution.managed_status()["runtimes"], ["claude", "codex"])
+        # A runtime enabled after the first install activates against the current release.
+        self._record_activation(Path(installed["release_root"]), "opencode")
+        self.activations.clear()
+
+    def test_runtime_activated_after_install_is_adopted(self) -> None:
+        self._bootstrap_claude_codex_then_activate_opencode()
+        same = distribution.update()
+        self.assertEqual(same["status"], "up-to-date")
+        self.assertEqual(distribution.managed_status()["runtimes"], ["claude", "codex", "opencode"])
+        self._make_release("v1.1.0")
+        distribution.update()
+        self.assertEqual(self.activations, [("v1.1.0", ("claude", "codex", "opencode"))])
+        status = distribution.managed_status()
+        self.assertEqual(status["version"], "v1.1.0")
+        self.assertEqual(status["runtimes"], ["claude", "codex", "opencode"])
+
+    def test_explicit_runtime_update_keeps_recorded_runtimes(self) -> None:
+        self._bootstrap_claude_codex_then_activate_opencode()
+        self._make_release("v1.1.0")
+        distribution.update(runtimes=["opencode"])
+        self.assertEqual(self.activations, [("v1.1.0", ("opencode",))])
+        self.assertEqual(distribution.managed_status()["runtimes"], ["claude", "codex", "opencode"])
 
 
 class ActivationFailureDiagnosticTest(unittest.TestCase):

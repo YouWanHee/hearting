@@ -299,8 +299,9 @@ class OwnerGrantStartTest(unittest.TestCase):
                             for key in ("mode", "mode_flag", "allowed_tools", "inherited_default_mode")
                         }
                     else:
-                        snapshot["opencode_permission"] = json.loads(
-                            args.opencode_config_content).get("permission")
+                        import dispatch_replacement
+                        snapshot["opencode_permission"] = dispatch_replacement._applied_permissions(
+                            args).get("opencode_permission")
                     self.native_settings[attempt] = snapshot
                 return command
             stack.enter_context(mock.patch.object(wrapper, "shell_command", side_effect=fixture_runner))

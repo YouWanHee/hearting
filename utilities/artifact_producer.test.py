@@ -6026,6 +6026,34 @@ class HistoricalObservationCacheTest(ProducerTestBase):
         self.assertEqual(fresh.manifest_row("cyc_fixture")["manifest_digest"], replacement_digest)
         self.assertGreaterEqual(P._HISTORICAL_OBSERVATIONS.metrics_snapshot()["hits"], 1)
 
+    def test_fleet_observation_scope_pins_root_projection_until_scope_exit(self):
+        digest = "sha256:" + "a" * 64
+
+        def document(value):
+            return P.artifact_index.IndexDocument(
+                schema_version=1, artifact_root_id=ROOT_ID, stable_ids={}, routes={},
+                event_ids={}, streams={}, manifests={"cyc_fixture": {
+                    "manifest_id": "man_fixture", "manifest_revision_id": "mrev_fixture",
+                    "cycle_id": "cyc_fixture", "manifest_digest": value,
+                    "idempotency_key": "cyc_fixture",
+                }}, cycles={"cyc_fixture": {
+                    "campaign_id": "camp_fixture", "cycle_path": "campaigns/camp_fixture/cyc_fixture",
+                    "manifest_digest": value,
+                }})
+
+        P._HISTORICAL_OBSERVATIONS.clear()
+        adm._write_index(self.root, document(digest))
+        with mock.patch.object(P.artifact_index, "_parse_owned", wraps=P.artifact_index._parse_owned) as parse:
+            with P.artifact_index_observation_scope():
+                first = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
+                adm._write_index(self.root, document("sha256:" + "b" * 64))
+                same = P._artifact_index_observation(self.root, route_ids=["rt-other"])
+                self.assertEqual(same.matching_cycle_ids, ())
+                self.assertEqual(parse.call_count, 1)
+            fresh = P._artifact_index_observation(self.root, cycle_id="cyc_fixture")
+        self.assertIsNot(first, fresh)
+        self.assertEqual(fresh.manifest_row("cyc_fixture")["manifest_digest"], "sha256:" + "b" * 64)
+
 
 class RouteLineageBindingTest(ProducerTestBase):
     """SD-155/D-120 (artifact-path-contract A-25): a route's verified lineage

@@ -500,7 +500,12 @@ def _limit_models(profile, models, env):
 
 
 def _opencode_model_state(profile, env):
-    """Hard harness hold only when every automatic provider/model is confirmed unavailable."""
+    """Automatic placement admits OpenCode only while one automatic candidate is eligible.
+
+    Confirmed rejections and providers Hearting cannot verify both leave the
+    candidate out (`opencode_runtime.automatic_eligible`). The hold is not a
+    usage limit with a reset: another harness is selected, nothing waits.
+    """
     if not profile:
         return None
     try:
@@ -513,11 +518,21 @@ def _opencode_model_state(profile, env):
             selected["model"], selected["budget"], environ=env)
     except Exception:
         return None
-    if candidates and all(row.get("state") == "unavailable" for row in candidates):
-        causes = sorted({f"{row.get('model', '').split('/', 1)[0]}-{row.get('reason') or 'unavailable'}"
-                         for row in candidates})
-        return "limited(provider-model-unavailable:" + "+".join(causes) + ")"
-    return None
+    if not candidates or any(opencode_runtime.automatic_eligible(row.get("model"), row)
+                             for row in candidates):
+        return None
+    causes = sorted({f"{row.get('model', '').split('/', 1)[0]}-{row.get('reason') or 'unavailable'}"
+                     for row in candidates})
+    kind = ("provider-model-unavailable" if all(row.get("state") == "unavailable" for row in candidates)
+            else "provider-model-unverified")
+    return f"limited({kind}:" + "+".join(causes) + ")"
+
+
+def model_hold(harness, profile, *, env=None):
+    """The provider/model hold `usage_states(profile=...)` applies to `harness`, or None."""
+    if harness != "opencode":
+        return None
+    return _opencode_model_state(profile, os.environ if env is None else env)
 
 
 def _scope_covers(model_scope, model):

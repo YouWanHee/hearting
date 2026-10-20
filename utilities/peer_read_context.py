@@ -19,6 +19,7 @@ class PeerReadContext:
         self._handover_ledgers = {}
         self._recipient_censuses = {}
         self._transfer_roots = None
+        self._peer_notice_records = None
 
     def transfer_roots(self, loader):
         """Reuse candidate ledger roots for exact per-message transfer reads.
@@ -30,6 +31,12 @@ class PeerReadContext:
             roots, _source = loader()
             self._transfer_roots = tuple(Path(root) for root in roots)
         return self._transfer_roots
+
+    def peer_notice_records(self, loader):
+        """Reuse the append-only peer receipt scan within this runner pass."""
+        if self._peer_notice_records is None:
+            self._peer_notice_records = tuple(loader())
+        return self._peer_notice_records
 
     def recipient_census(self, endpoint, loader):
         """Reuse one endpoint's recipient listing within a single read pass."""

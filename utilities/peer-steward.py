@@ -1090,6 +1090,9 @@ def _observed_start_agent(args, deadline=None, wait=False):
                 return None
             cwd = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
             if cwd and os.path.realpath(str(agent.get("cwd") or "")) != cwd:
+                # Not this start. Name the miss so a refused start receipt explains
+                # why the pane's agent was not adopted (herdr may report no cwd).
+                args.observed_miss = "cwd-mismatch" if agent.get("cwd") else "cwd-empty"
                 return None
             name = agent.get("name")
             if name and name != args.name:
@@ -1572,6 +1575,7 @@ def _start_in_pane(args):
         f"managed={managed}"
         + (f" ready=false reason={trust_wait}" if trust_wait else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
+        + (f" observed={args.observed_miss}" if not started and getattr(args, "observed_miss", None) else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
@@ -1889,7 +1893,7 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
         _HERDR_SESSION = old_server
 
 
-def _resume_retire_obligation(duty, store):
+def _resume_retire_obligation(duty, store, *, read_context=None):
     global _HERDR_SESSION
     intent = duty.get("intent") or {}
     ident = dict((duty.get("intent") or {}).get("identity") or {})
@@ -1956,7 +1960,8 @@ def _resume_retire_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
-                                    expected_sid=observed["session_id"])
+                                    expected_sid=observed["session_id"],
+                                    read_context=read_context)
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
                          expected_phases={"waiting"},
@@ -2412,6 +2417,37 @@ def _watch_paths(watch_id, root=None):
     )
 
 
+def _prepare_watch_notice(watch_id, arm, receipt):
+    """Queue one stable exact-ref notice under the original steward identity."""
+    steward = (arm or {}).get("steward") or {}
+    steward_seat = (arm or {}).get("steward_seat") or {}
+    harness, sid = steward.get("harness"), steward.get("session_id")
+    if (harness not in {"claude", "codex", "opencode"}
+            or not peer_message.usable_session_id(sid)
+            or steward_seat.get("kind") not in {"pane", "native"}
+            or not steward_seat.get("key")):
+        return None
+    agent = (receipt or {}).get("agent") or (arm or {}).get("agent") or {}
+    target = agent.get("name") or agent.get("session_id") or (arm or {}).get("target") or "unknown"
+    body = (f"[peer-steward] watch_id={watch_id} state={(receipt or {}).get('state', 'unknown')} "
+            f"target={target}; exact watch receipt is available")
+    sender = {"harness": harness, "session_id": sid}
+    if steward.get("project"):
+        sender["project"] = steward["project"]
+    recipient = {"harness": harness, "session_id": sid}
+    try:
+        _text, transfer_ref = peer_message.prepare_peer_message(
+            body, sender, recipient, defer=True, refs=[f"peer-watch:{watch_id}"],
+            receipt=f"peer-steward-watch:{watch_id}")
+        current = _read_json(_watch_paths(watch_id).arm) or dict(arm or {})
+        if current.get("notice_transfer_ref") != transfer_ref:
+            _write_json_atomic(_watch_paths(watch_id).arm,
+                               {**current, "notice_transfer_ref": transfer_ref})
+        return transfer_ref
+    except Exception:  # noqa: BLE001 - status/reconnect remains the ordinary fallback
+        return None
+
+
 def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
     """Settle one exact watch after its observer has the watch lock."""
     paths = _watch_paths(watch_id)
@@ -2442,6 +2478,7 @@ def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+    _prepare_watch_notice(watch_id, arm, receipt)
     return receipt
 
 
@@ -2911,13 +2948,43 @@ def _watch_arm_scope_matches(arm, server, steward_sid, until, agent):
         return False
     steward = arm.get("steward") or {}
     if steward.get("session_id") != steward_sid:
-        return False
+        if not _confirmed_watch_successor(arm.get("watch_id"), arm, steward_sid):
+            return False
     if tuple(sorted(arm.get("until") or [])) != tuple(sorted(until or [])):
         return False
     expected = arm.get("agent") or {}
     return all(expected.get(key) not in {None, "", "-"}
                and expected.get(key) == agent.get(key)
                for key in ("harness", "pane"))
+
+
+def _confirmed_watch_successor(watch_id, arm, requested_sid=None, *, include_acked=False):
+    """A watch follows only the exact successor stored by the common seat resolver."""
+    steward = (arm or {}).get("steward") or {}
+    seat_key = ((arm or {}).get("steward_seat") or {}).get("key")
+    if not watch_id or not seat_key:
+        return None
+    try:
+        import dispatch_seat_handover as handover
+        relation = handover.resolve_watch(str(watch_id), seat_key=seat_key,
+                                          include_acked=include_acked)
+    except Exception:
+        return None
+    if not isinstance(relation, dict):
+        return None
+    if any(relation.get(field) != (arm or {}).get(field) for field in
+           ("server", "target", "agent", "until", "deadline", "origin")):
+        # Arms predating the optional persisted `origin` compare against their
+        # original steward tuple below; no name or pane alias fills the gap.
+        if any(relation.get(field) != (arm or {}).get(field) for field in
+               ("server", "target", "agent", "until", "deadline")):
+            return None
+    holder = relation.get("holder") or {}
+    if holder.get("harness") != steward.get("harness"):
+        return None
+    if requested_sid is not None and holder.get("sid") != requested_sid:
+        return None
+    return relation
 
 
 def _watch_arm_matches(arm, server, steward_sid, until, agent):
@@ -3393,7 +3460,10 @@ def cmd_watch(args):
                 old_agent = old_arm.get("agent") or {}
                 if all(old_agent.get(key) == agent.get(key)
                        for key in ("pane", "harness", "session_id")):
-                    superseded.append((old_id, old_arm))
+                    # A role successor or an unconfirmed callback never retires
+                    # the predecessor's accepted duty. Same-seat transfer is
+                    # settled by the original watch and its shared resolver.
+                    continue
 
         foreground = _retire_foreground(agent["pane"], agent["harness"], strict=False)
         foreground_identity = ({key: foreground.get(key) for key in
@@ -3656,7 +3726,10 @@ def cmd_watch_run(args):
                 steward_reason = _watch_terminal_from_view(
                     initial_view, steward_agent, server, event_transport)
                 if steward_reason == "session-replaced":
-                    terminal_reason = "steward-replaced"
+                    # Session replacement can precede the ordinary confirmed
+                    # start callback. Keep this accepted duty pending until the
+                    # shared seat lineage resolves; unknown is not terminal.
+                    _confirmed_watch_successor(args.watch_id, arm)
                 elif steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                     terminal_reason = "steward-exited"
 
@@ -3672,7 +3745,7 @@ def cmd_watch_run(args):
                 elif native_record and native_record.get("sessionId") == (arm.get("steward") or {}).get("session_id"):
                     steward_pidfd = os.pidfd_open(native_pid, 0)
                 elif native_record and native_record.get("sessionId"):
-                    terminal_reason = "steward-replaced"
+                    _confirmed_watch_successor(args.watch_id, arm)
             except (AttributeError, OSError, TypeError, ValueError):
                 # Missing native proof stays unknown. A PID number or missing
                 # session record alone is never used as a death vote.
@@ -4040,8 +4113,7 @@ def cmd_watch_run(args):
                         steward_reason = _watch_terminal_from_view(
                             view, steward_agent, server, event_transport)
                         if steward_reason == "session-replaced":
-                            terminal_reason = "steward-replaced"
-                            break
+                            _confirmed_watch_successor(args.watch_id, arm)
                         if steward_reason in {"pane-absent", "pane-closed", "pane-exited"}:
                             terminal_reason = "steward-exited"
                             break
@@ -4121,6 +4193,8 @@ def cmd_watch_run(args):
         paths.observation.unlink()
     except FileNotFoundError:
         pass
+
+    _prepare_watch_notice(args.watch_id, arm, receipt)
 
     _record(
         to_harness=agent.get("harness", "unknown"),
@@ -4488,7 +4562,19 @@ def _status_entry(watch_id, arm, root):
             "refs": receipt.get("refs") or [],
         }
     arm = arm or {"watch_id": watch_id}
-    if paths.ack.exists():
+    recipient = {"harness": (arm.get("steward") or {}).get("harness"),
+                 "session_id": (arm.get("steward") or {}).get("session_id")}
+    resolved = _confirmed_watch_successor(watch_id, arm, include_acked=True)
+    if resolved:
+        holder = resolved.get("holder") or {}
+        recipient = {"harness": holder.get("harness"), "session_id": holder.get("sid")}
+    try:
+        import dispatch_seat_handover as handover
+        acked = handover.watch_ack_valid(paths.ack, watch_id,
+                                         recipient.get("harness"), recipient.get("session_id"))
+    except Exception:
+        acked = False
+    if acked:
         state = "acked"
     elif receipt is not None:
         state = "receipt"
@@ -4506,6 +4592,7 @@ def _status_entry(watch_id, arm, root):
         "wake": arm.get("wake", "-"),
         "armed_ts": arm.get("armed_ts", "-"),
         "steward": arm.get("steward") or {},
+        "recipient": recipient,
         "watcher": {"pid": watcher.get("pid", "-"), "pid_start": watcher.get("pid_start", "-")},
         "receipt": str(paths.receipt),
         "ack": str(paths.ack),
@@ -4517,6 +4604,16 @@ def _status_entry(watch_id, arm, root):
     }
 
 
+def _watch_notice_pending(watch_id, recipient):
+    """A queued exact native notice owns the display/ACK path for this receipt."""
+    try:
+        ref = f"peer-watch:{watch_id}"
+        return any(ref in (row.get("refs") or ())
+                   for row in peer_message._pending_rows(recipient=recipient))
+    except Exception:
+        return False
+
+
 def cmd_status(args):
     root = _watch_root()
     entries = _watch_entries(root)
@@ -4524,10 +4621,13 @@ def cmd_status(args):
         entries = [(w, a) for w, a in entries if w == args.watch]
     rows = [_status_entry(w, a, root) for w, a in entries]
     if args.undelivered:
-        sid, _harness = _current_session_identity()
+        sid, harness = _current_session_identity()
         rows = [
             row for row in rows
-            if row["state"] == "receipt" and (row["steward"] or {}).get("session_id") == sid
+            if row["state"] == "receipt"
+            and (row.get("recipient") or {}).get("session_id") == sid
+            and (row.get("recipient") or {}).get("harness") == harness
+            and not _watch_notice_pending(row["watch_id"], row.get("recipient") or {})
         ]
     if args.json:
         print(json.dumps({"watch_root": str(root), "watches": rows}, ensure_ascii=False))
@@ -4575,28 +4675,20 @@ def cmd_rearm(args):
 
 
 def cmd_ack(args):
-    """The single O_EXCL ack implementation.
-
-    A second carrier is expected and is not an error: wake is at-least-once,
-    display is idempotent. If `FileExistsError` ever escaped here, a carrier
-    that lost the race would exit 0 where it must exit 2.
-    """
-    paths = _watch_paths(args.watch_id)
-    session_id, _harness = _current_session_identity()
-    try:
-        fd = os.open(str(paths.ack), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
+    """Publish or validate the shared exact-recipient ACK before settling its ref."""
+    session_id, harness = _current_session_identity()
+    import dispatch_seat_handover as handover
+    outcome = handover.acknowledge_watch(args.watch_id, harness, session_id, args.carrier)
+    if outcome == "created":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
+        print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    elif outcome == "already":
+        peer_message.settle_watch_transfers(args.watch_id, harness, session_id)
         print(f"watch_id={args.watch_id} ack=already")
-        return 0
-    except OSError as exc:
-        print(f"watch_id={args.watch_id} ack=failed reason=errno-{exc.errno}", file=sys.stderr)
-        return 0
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"carrier": args.carrier, "session_id": session_id, "ts": _utc_now()},
-            fh, ensure_ascii=False,
-        )
-    print(f"watch_id={args.watch_id} ack=created carrier={args.carrier}")
+    elif outcome == "not-recipient":
+        print(f"watch_id={args.watch_id} ack=not-recipient")
+    else:
+        print(f"watch_id={args.watch_id} ack=failed reason=unresolved-recipient", file=sys.stderr)
     return 0
 
 _PROMPT_VERIFY_TIMEOUT_MS = 8000      # bounded native /clear command invocation
@@ -4940,7 +5032,7 @@ def _bottom_form_tokens(target, window=15):
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
                     purpose="completion", target_observation=None, pane_info=None,
-                    native_session_id=None, registry_append_only=False):
+                    native_session_id=None, registry_append_only=False, read_context=None):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session, and for a Codex TUI
@@ -5000,7 +5092,9 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
                                     pane or "", harness or "", sid or "",
                                     execution_attempt_ids=execution_ids,
                                     include_parent=purpose != "input",
-                                    registry_append_only=registry_append_only))
+                                    read_context=read_context,
+                                    registry_append_only=(registry_append_only or bool(
+                                        read_context and read_context.registry_append_only))))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
@@ -5025,6 +5119,95 @@ _FLUSH_STUCK_HOURS = 1.0
 
 def _message_obligation_id(ref):
     return "message-" + ref
+
+
+def _census_session_presence(census, session_id, server):
+    """Return True/False only for a complete, well-shaped exact-endpoint census."""
+    if (census is None or census.complete is not True
+            or census.endpoint != herdr_observation.endpoint_name(server)
+            or not isinstance(session_id, str) or not session_id):
+        return None
+    for pane in census.panes:
+        session = pane.get("agent_session")
+        if session is None:
+            continue
+        if not isinstance(session, dict):
+            return None
+        value = session.get("value")
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None
+        if value == session_id:
+            return True
+    return False
+
+
+def _message_terminal_evidence(duty, row, observed, reason):
+    """Prove only an exact recipient loss or death of its pane-bound process."""
+    intent = duty.get("intent") or {}
+    identity = intent.get("identity") or {}
+    original = (row or {}).get("to") or intent.get("to") or {}
+    server = identity.get("server") or "default"
+    pane_bound = peer_message._valid_pane_bound_endpoint(original)
+    recipient = peer_message.pending_delivery_recipient(row) if row else None
+    recipient_binding = (peer_message.pending_delivery_binding(row, include_acked=True)
+                         if row else None)
+    if (recipient_binding is None and row
+            and not any(isinstance(ref, str) and ref.startswith("peer-watch:")
+                        for ref in row.get("refs") or ())
+            and pane_bound):
+        recipient_binding = {"recipient": dict(original), "watches": []}
+    if recipient_binding is None:
+        return None
+    if pane_bound:
+        proof = peer_message.pending_first_input_process(row)
+        if proof is None:
+            return None
+        try:
+            namespace = os.readlink("/proc/self/ns/pid")
+            if proof.get("pid_namespace") != namespace:
+                return None
+            from dispatch_contract import process_identity_disposition
+            disposition = process_identity_disposition(proof["pid"], proof["start"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if disposition != "dead":
+            return None
+        evidence = {"kind": "first-input-process-dead", "server": server,
+                    "process": proof, "process_disposition": disposition,
+                    "recipient_binding": recipient_binding}
+        if recipient is not None:
+            census = herdr_observation.pane_census(session=server)
+            presence = _census_session_presence(census, recipient.get("session_id"), server)
+            if presence is not False:
+                return None
+            evidence.update({"harness": recipient.get("harness"),
+                             "recipient_session_id": recipient.get("session_id"),
+                             "recipient_session_absent": True,
+                             "census_complete": True, "session_absent": True,
+                             "census_endpoint": census.endpoint,
+                             "census_observed_at": census.observed_at})
+        return evidence
+
+    if recipient is None:
+        return None
+    expected_pane = identity.get("pane") or original.get("pane_id")
+    if (reason is None and observed.get("harness") == recipient.get("harness")
+            and observed.get("session_id") == recipient.get("session_id")
+            and (not expected_pane or observed.get("pane") == expected_pane)):
+        return None
+    census = herdr_observation.pane_census(session=server)
+    presence = _census_session_presence(census, recipient.get("session_id"), server)
+    if presence is not False:
+        return None
+    return {"kind": "recipient-session-absent", "server": server,
+            "harness": recipient.get("harness"),
+            "session_id": recipient.get("session_id"),
+            "census_complete": True, "session_absent": True,
+            "census_endpoint": census.endpoint,
+            "census_observed_at": census.observed_at,
+            "recipient_binding": recipient_binding}
 
 
 def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None, handoff_acceptance=False):
@@ -5154,12 +5337,16 @@ def _resume_message_obligation(duty, store, *, read_context=None):
     duty_id = duty["id"]
 
     def checkpoint(**changes):
+        nonlocal duty
         # This duty came from the current read pass. If the requested checkpoint
         # is already present, skip the lock and record reread as well as the write.
-        # A concurrent advance is preserved because this path never writes it back.
+        # The message-specific CAS preserves concurrent receipts and terminal rows.
         if all(duty.get(key) == value for key, value in changes.items()):
             return duty
-        return store.update(duty_id, skip_unchanged=True, **changes)
+        duty = store.update_message_checkpoint(
+            duty_id, expected_revision=duty.get("revision"),
+            skip_unchanged=True, **changes)
+        return duty
 
     target = intent.get("target")
     # Later checkpoints replace the observation but carry the minted delay
@@ -5199,6 +5386,13 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         checkpoint(state="unknown", observation={"ref": ref, "reason": "pending-row-unreadable"})
         return
     if row is None:
+        if not intent.get("handoff_acceptance"):
+            recovered = peer_message.recover_missing_pending_receipt(
+                ref, intent, roots=roots, read_context=read_context)
+            if recovered is not None:
+                received, recipient = recovered
+                if store.acknowledge_message_receipt(duty_id, received, recipient):
+                    return
         checkpoint(state="unknown", observation={"ref": ref, "reason": "pending-row-missing"})
         return
     if intent.get("handoff_acceptance"):
@@ -5230,12 +5424,12 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                    observation={"ref": ref, "reason": "dispatch-notice-consumed"})
         return
     if row.get("state") == "received":
-        checkpoint(state="complete", result="received", delivery="acknowledged", cleanup="complete",
-                   observation={"ref": ref, "reason": "exact-peer-ref"})
-        return
-    if row.get("state") in {"queued", "unverified"}:
-        checkpoint(state="unknown", observation={"ref": ref, "transport_state": row["state"],
-                                                   "reason": row.get("receipt", "delivery-unconfirmed")})
+        peer_message.acknowledge_message_obligations(row)
+        current = store.get(duty_id)
+        if current and current.get("state") in {"complete", "cancelled"}:
+            return
+        checkpoint(state="unknown", observation={
+            "ref": ref, "reason": "received-binding-unverified"})
         return
     identity = (duty.get("intent") or {}).get("identity") or {}
     # Identity is held outside mutable observations. The accepted target stays
@@ -5248,6 +5442,29 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
         expected_pane = identity.get("pane") or ""
         pane_bound = peer_message._valid_pane_bound_endpoint(recipient)
+        terminal_evidence = _message_terminal_evidence(duty, row, ident, reason)
+        if terminal_evidence is not None:
+            outcome = peer_message.cancel_message_obligation(
+                ref, duty_id=duty_id, expected_revision=duty.get("revision"),
+                identity=identity, message=row, evidence=terminal_evidence)
+            if outcome == "cancelled":
+                return
+            if outcome == "received":
+                return
+            if outcome in {"changed", "missing"}:
+                return
+            if outcome == "inflight":
+                checkpoint(state="unknown", observation={"ref": ref,
+                           "reason": "delivery-inflight"})
+                return
+        if row.get("state") in {"queued", "unverified"}:
+            # Keep the acceptance receipt intact when a fresh target check is
+            # still inconclusive. It is not a receive, and another pass will
+            # reobserve the target without rewriting this unchanged evidence.
+            checkpoint(state="unknown", observation={"ref": ref,
+                       "transport_state": row["state"],
+                       "reason": row.get("receipt", "delivery-unconfirmed")})
+            return
         if (reason or ident.get("harness") != recipient.get("harness")
                 or (expected_pane and ident.get("pane") != expected_pane)
                 or (not pane_bound and ident.get("session_id") != recipient.get("session_id"))):
@@ -5294,7 +5511,8 @@ def _resume_message_obligation(duty, store, *, read_context=None):
             recipient = peer_message.pending_delivery_recipient(bound)
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
-                                    expected_sid=recipient.get("session_id"), purpose="input")
+                                    expected_sid=recipient.get("session_id"), purpose="input",
+                                    read_context=read_context)
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
                 checkpoint(state="unknown" if readiness.state == "unknown" else "pending",
@@ -5993,7 +6211,7 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
             elif kind == "retire":
                 with peer_obligations.legacy_runner_lock(store) as acquired:
                     if acquired:
-                        _resume_retire_obligation(duty, store)
+                        _resume_retire_obligation(duty, store, read_context=read_context)
             elif kind == "registered-batch":
                 _resume_registered_obligation(duty, store, read_context=read_context)
         except Exception:
@@ -6001,6 +6219,16 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
                 store.update(duty["id"], observer_error="observer-unavailable")
             except Exception:
                 pass
+
+
+def _runner_lock_current(store, lock_fd):
+    """The lock this runner holds is still the state root's runner lock file."""
+    try:
+        held = os.fstat(lock_fd)
+        current = os.stat(store.root / peer_obligations.RUNNER_LOCK_NAME)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
 
 
 def cmd_obligation_runner(args):
@@ -6018,6 +6246,10 @@ def cmd_obligation_runner(args):
     previous_signature = None
     settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     while True:
+        if not _runner_lock_current(store, args.lock_fd):
+            # Its state root was removed or replaced (e.g. a finished test's
+            # temporary home): no producer can reach this runner any more.
+            return 0
         store.begin_read_pass()
         duties = store.list()
         from peer_read_context import PeerReadContext

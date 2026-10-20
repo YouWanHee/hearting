@@ -43,7 +43,9 @@ def _activity(row):
     evidence = getattr(row, "_context_evidence", None)
     return (getattr(row, "_detail_activity_key", None), getattr(row, "updated_at", None),
             getattr(row, "summary_ts", None), getattr(evidence, "sequence", None),
-            json.dumps((getattr(row, "exec_child", None), getattr(row, "exec_tool", None)),
+            json.dumps((getattr(row, "exec_child", None), getattr(row, "exec_tool", None),
+                        getattr(row, "shell_jobs", None),
+                        getattr(row, "shell_job_observation", None)),
                        sort_keys=True, default=str))
 
 
@@ -119,7 +121,7 @@ def _enrich(snapshot):
                 job.qa, job.qa_source = dispatch.effective_qa(
                     None, None, job.cwd, job.slug, job.key,
                     getattr(job, "capability_owner", None), job.worker_role,
-                    artifact_root=job.artifact_root)
+                    artifact_root=job.artifact_root, job=job)
         except Exception:
             job._details_error = True
     _adopt_child_titles(sessions, jobs)
@@ -159,12 +161,17 @@ def enrich(snapshot):
     """One artifact inventory/cache scope for the entire passive detail pass."""
     global _DETAIL_READ_CACHE
     from .collectors import dispatch
+    from contextlib import ExitStack
+    import artifact_producer
+    import dispatch_registry_cache
     reader = dispatch.artifact_reader
-    if reader is None:
-        return _enrich(snapshot)
-    if _DETAIL_READ_CACHE is None:
+    if reader is not None and _DETAIL_READ_CACHE is None:
         _DETAIL_READ_CACHE = reader.ReadCache()
-    with reader.read_scope(_DETAIL_READ_CACHE):
+    with ExitStack() as stack:
+        if reader is not None:
+            stack.enter_context(reader.read_scope(_DETAIL_READ_CACHE))
+        stack.enter_context(artifact_producer.artifact_index_observation_scope())
+        stack.enter_context(dispatch_registry_cache.registry_read_scope())
         return _enrich(snapshot)
 
 
@@ -281,6 +288,11 @@ def merge(basic, detail):
                 # to an unchanged observation, but cannot erase current evidence.
                 if not isinstance(row, Session) and current.exec_tool is None:
                     current.exec_tool = getattr(previous, "exec_tool", None)
+                if not getattr(row, "shell_jobs", None):
+                    current.shell_jobs = list(getattr(previous, "shell_jobs", None) or [])
+                if (not getattr(row, "shell_job_observation", None)
+                        and getattr(previous, "shell_job_observation", None)):
+                    current.shell_job_observation = previous.shell_job_observation
             # Empty success means no summary is available yet, not detail failure.
             # Route-neighbourhood changes gate projections separately from NOW.
             current._details_pending = not same_activity

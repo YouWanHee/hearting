@@ -36,6 +36,7 @@ You are a bounded worker, not the user-facing main session.
   requested task. Integration pushes, main merges, releases,
   installations, and worktree cleanup remain supervisor responsibilities.
 
+<!-- worker-terminal-contract:start -->
 Your terminal final output consists of exactly these three newline-delimited
 fields, with only their values replaced, nothing before them and nothing after them:
 
@@ -55,3 +56,4 @@ meet its gate or slice. Use `BLOCKED` when no judgment was reached: missing
 authority, input or runtime state, or items left unfinished; the blocker line
 names what remains. `artifact: -` is allowed only for atomic read-only support
 with no durable output.
+<!-- worker-terminal-contract:end -->

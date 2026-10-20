@@ -748,6 +748,58 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertIn({"action": "edit", "resource": "*", "effect": "ask"},
                       denied["agents"]["build"]["permissions"])
 
+    def test_opencode_v2_action_interleaving_and_alias_collisions_keep_native_effects(self) -> None:
+        import fnmatch
+        readonly = self.root / "readonly-interleaved"
+        readonly.mkdir()
+        source = {
+            "permissions": [
+                {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "*", "resource": str(readonly), "effect": "allow"},
+                {"action": "e*", "resource": str(readonly), "effect": "deny"},
+                {"action": "edit", "resource": "*", "effect": "deny"},
+            ],
+            "agents": {"build": {"permissions": [
+                {"action": "edit", "resource": "*", "effect": "allow"},
+                {"action": "*", "resource": str(readonly), "effect": "allow"},
+                {"action": "e*", "resource": str(readonly), "effect": "deny"},
+            ]}},
+        }
+
+        def effect(rows, action, resource):
+            value = None
+            for row in rows:
+                if fnmatch.fnmatchcase(action, row["action"]) and fnmatch.fnmatchcase(
+                        resource, row["resource"]):
+                    value = row["effect"]
+            return value
+
+        with mock.patch.object(self.opencode.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(source)}):
+            native = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), worktree=str(self.worktree), selected_agent="build"))
+        self.assertNotIn("permission", native)
+        self.assertNotIn("agent", native)
+        self.assertIn("permissions", native)
+        self.assertIn("agents", native)
+        agent_rows = native["agents"]["build"]["permissions"]
+        self.assertEqual(effect(native["permissions"], "edit", str(readonly)), "deny")
+        self.assertEqual(effect(agent_rows, "edit", str(readonly)), "deny")
+        self.assertEqual(effect(native["permissions"], "execute", str(readonly)), "deny")
+        self.assertEqual(effect(agent_rows, "execute", str(readonly)), "deny")
+
+        for setting_order, expected in (
+                (("write", "patch"), "deny"), (("patch", "write"), "allow")):
+            permission = {name: {"src/**": "allow" if name == "write" else "deny"}
+                          for name in setting_order}
+            encoded = self.opencode._opencode_legacy_to_v2_config({
+                "permission": {**permission, "bash": "allow", "task": {"agent/*": "deny"}}})
+            self.assertNotIn("permission", encoded)
+            self.assertIn("permissions", encoded)
+            self.assertEqual(effect(encoded["permissions"], "edit", "src/file"), expected)
+            self.assertEqual(effect(encoded["permissions"], "shell", "git status"), "allow")
+            self.assertEqual(effect(encoded["permissions"], "subagent", "agent/build"), "deny")
+
     def test_read_overlay_keeps_contract_deny_inside_selected_agent(self) -> None:
         readonly = self.root / "readonly-data"
         readonly.mkdir()

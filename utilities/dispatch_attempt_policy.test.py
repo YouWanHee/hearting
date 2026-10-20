@@ -70,6 +70,50 @@ class DeferredCompletionStatesTest(unittest.TestCase):
         )
 
 
+class FleetCancellationTest(unittest.TestCase):
+    def metadata(self, **changes):
+        # The terminal fields written by Fleet's close_registry_row, as seen
+        # on the opencode-v2-worker-closure-frame attempt that blocked retire.
+        values = {"note": "fleet-kill", "failure_class": "cancelled",
+                  "classifier_source": "fleet-cancel-v1",
+                  "reconcile_reason": "user-terminated"}
+        values.update(changes)
+        return values
+
+    def test_typed_fleet_kill_is_a_committed_cancellation(self):
+        for status in ("done", "killed", "cancelled"):
+            with self.subTest(status=status):
+                self.assertEqual(POLICY.committed_outcome(status, self.metadata()), "cancelled")
+
+    def test_open_or_untyped_fleet_kill_is_not_a_committed_cancellation(self):
+        for status in ("open", "running"):
+            self.assertEqual(POLICY.committed_outcome(status, self.metadata()), "pending")
+        for failure_class in ("", "runtime"):
+            self.assertEqual(POLICY.committed_outcome(
+                "done", self.metadata(failure_class=failure_class)), "unknown")
+
+    def test_killed_owner_neither_retries_nor_advances(self):
+        from route_authority import decide_continuation, retry_predecessor
+        metadata = self.metadata(worker_type="owner", launch_started="1",
+                                 attempt_id="att-fleet-cancelled-owner")
+        decision = POLICY.decide_attempt("done", metadata, process_state="quiescent")
+        self.assertEqual((decision.outcome, decision.action), ("cancelled", "inspect-failure"))
+        self.assertFalse(decision.retry_allowed)
+        self.assertEqual(retry_predecessor([{**metadata, "_status": "done"}]), "")
+        replacement = decide_continuation(action="replacement-progress", status="done",
+            metadata=metadata, facts={"record": {}})
+        self.assertFalse(replacement.allowed)
+        self.assertEqual(replacement.next_action, "settle")
+
+    def test_cancellation_does_not_hide_live_or_unknown_execution(self):
+        for process_state, action in (("live", "wait"), ("unverifiable", "recover")):
+            with self.subTest(process_state=process_state):
+                decision = POLICY.decide_attempt(
+                    "done", self.metadata(), process_state=process_state)
+                self.assertEqual((decision.outcome, decision.action), ("cancelled", action))
+                self.assertFalse(decision.retry_allowed)
+
+
 class PolicyCompletionDeferredIsNotFallbackTest(unittest.TestCase):
     def test_pending_deferred_row_asks_for_completion_not_retry(self):
         decision = POLICY.decide_attempt(

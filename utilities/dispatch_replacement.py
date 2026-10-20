@@ -53,7 +53,21 @@ CONTINUATION_WAIT_NOTE = (
 
 
 def _bytes(value):
-    return (json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))+'\n').encode()
+    def canonical(item, path=()):
+        if isinstance(item, dict):
+            preserve = any(path[index:index + 2] in {
+                               ("applied_permissions", "opencode_permission"),
+                               ("applied_permissions", "opencode_selected_agent_permission"),
+                           }
+                           for index in range(max(0, len(path) - 1)))
+            keys = list(item) if preserve else sorted(item)
+            return {key: canonical(item[key], (*path, key)) for key in keys}
+        if isinstance(item, list):
+            return [canonical(value, path) for value in item]
+        return item
+
+    return (json.dumps(canonical(value), sort_keys=False, ensure_ascii=False,
+                       separators=(',', ':'))+'\n').encode()
 
 
 def _digest(value):
@@ -152,8 +166,20 @@ def _applied_permissions(args):
         result['execution_access'] = json.loads(json.dumps(dataclasses.asdict(grant), default=str))
     config = getattr(args, 'opencode_config_content', None)
     if config:
-        parsed = json.loads(config)
-        result['opencode_permission'] = parsed.get('permission')
+        import opencode_runtime
+        result['opencode_permission'] = opencode_runtime.opencode_permission_from_config(config)
+        selected_agent = getattr(args, 'agent', None)
+        if selected_agent:
+            selected_permission = opencode_runtime.opencode_agent_permission_from_config(
+                config, selected_agent)
+            result['opencode_selected_agent_permission'] = {
+                'agent': selected_agent,
+                'permission': opencode_runtime.opencode_permission_ordered_view(
+                    selected_permission),
+                # Keep the native ordered mapping as well: recovery address
+                # checks must compose global rules followed by this override.
+                'local_policy': selected_permission,
+            }
     for key in ('launch_lifecycle','nested_headless_network'):
         if hasattr(args,key): result[key] = getattr(args,key)
     return result
@@ -221,17 +247,19 @@ def _reseal_allowed(jobs, aid, path, payload, *, lines=None, prior=None):
     same_work = route_authority.same_sealed_work(previous, stored)
     if not same_work:
         detail = route_authority.permission_mismatch_detail(previous, stored)
-        if detail:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', detail)
-    if not same_work:
         reservation = source_reservation(jobs, prior) if prior else None
         record = _read(_record_path(jobs, reservation['family_id'])) if reservation else None
         if not record or record.get('replacement_attempt_id') != aid:
+            if detail:
+                raise DC.DispatchContractError('replacement-input-tuple-mismatch', detail)
             return False
         _, source, replay = validate_claim_source(jobs, lines, record)
         _, current_route = _route(jobs, prior, source)
-        if not route_authority.same_sealed_work(previous, stored,
-                recovery=(record, source, replay, current_route)):
+        same_work = route_authority.same_sealed_work(
+            previous, stored, recovery=(record, source, replay, current_route))
+        if not same_work:
+            if detail:
+                raise DC.DispatchContractError('replacement-input-tuple-mismatch', detail)
             return False
     rows = []
     for line in lines:

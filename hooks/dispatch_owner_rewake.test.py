@@ -1725,14 +1725,13 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 prepared_refs = []
                 real_write = rewake.pending_delivery._write_unlocked
                 real_receiver_ack = steward.peer_message._ack_registered_delivery
-                ack_failure = {"remaining": (
-                    (2 if harness == "codex" else 1)
-                    if recovery in {"repeat-receive", "courier-reentry"} else 0
-                )}
+                # Retain a storage outage for the whole initial native callback,
+                # including its exact duplicate receipts. The next callback or
+                # courier reentry runs outside this prompt's write patch.
+                ack_failure = recovery in {"repeat-receive", "courier-reentry"}
                 crash_failure = {"remaining": 1 if recovery == "crash-before-ack" else 0}
                 def write_record(path, value):
-                    if ack_failure["remaining"] and value.get("state") == "acked":
-                        ack_failure["remaining"] -= 1
+                    if ack_failure and value.get("state") == "acked":
                         raise OSError("simulated received-delivery ACK write failure")
                     return real_write(path, value)
                 def receiver_ack(received):

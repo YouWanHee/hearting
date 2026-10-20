@@ -893,6 +893,7 @@ def _build_bundle(runtime: str, source_root: Path, revision: str, scope: str) ->
     bundle_source = bundle / "source"
     metadata_path = bundle / "bundle.json"
     linked = _managed_release_source(source_root, revision)
+    _prune_dead_release_bundles(runtime, scope, bundle)
     if metadata_path.exists() and bundle_source.is_dir():
         metadata = _load_json(metadata_path) or {}
         if bool(metadata.get("source_link")) == linked and (
@@ -942,6 +943,66 @@ def _build_bundle(runtime: str, source_root: Path, revision: str, scope: str) ->
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return bundle_source
+
+
+def _prune_dead_release_bundles(runtime: str, scope: str, keep: Path) -> None:
+    """Retire linked bundles whose managed release no longer exists.
+
+    A linked bundle is one symlink to its release, so once that release is
+    removed the bundle holds nothing but a dangling link. Only a plain bundle
+    directory that this activation marked `source_link` is eligible; copied
+    bundles, staging directories, foreign entries, bundles whose link still
+    resolves and the recorded active bundle are left alone. Cleanup is best
+    effort and never fails an activation.
+    """
+    try:
+        state_dir = paths.harness_state_dir(runtime, scope)
+        bundles = state_dir / "bundles"
+        if not bundles.is_dir() or bundles.is_symlink():
+            return
+        active = (_load_json(_state_path(runtime, scope)) or {}).get("active_root")
+        active_bundle = Path(active).parent if isinstance(active, str) and active else None
+        keep_root = keep.resolve(strict=False)
+        active_root = active_bundle.resolve(strict=False) if active_bundle else None
+        for entry in sorted(bundles.iterdir()):
+            try:
+                if entry.name.startswith(".") or entry.is_symlink() or not entry.is_dir():
+                    continue
+                if entry.resolve(strict=False) in {keep_root, active_root}:
+                    continue
+                source = entry / "source"
+                metadata_path = entry / "bundle.json"
+                if not source.is_symlink() or metadata_path.is_symlink() or not metadata_path.is_file():
+                    continue
+                if {child.name for child in entry.iterdir()} != {"source", "bundle.json"}:
+                    continue
+                metadata = _load_json(metadata_path)
+                if not metadata or (
+                    metadata.get("schema") != SCHEMA
+                    or metadata.get("runtime") != runtime
+                    or metadata.get("source_link") is not True
+                    or not isinstance(metadata.get("source_root"), str)
+                    or not isinstance(metadata.get("source_revision"), str)
+                    or not metadata["source_revision"].startswith("release:")
+                    or not isinstance(metadata.get("checksum"), str)
+                ):
+                    continue
+                if source.resolve(strict=False) != Path(metadata["source_root"]).resolve(strict=False):
+                    continue
+                try:
+                    source.stat()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue
+                else:
+                    continue
+                # destructive-ok: reason=retire one linked runtime bundle whose release was removed; boundary=one real bundle directory below runtime state bundles holding only its exact source and bundle metadata entries
+                _remove_path(entry)
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
 def _desired_entries(

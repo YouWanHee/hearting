@@ -41,7 +41,7 @@ from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
-                    session_parent_visible)
+                    current_background_shell_jobs, session_parent_visible)
 from . import gitinfo, titles
 from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
@@ -5265,6 +5265,34 @@ def _context_content_width(term_width):
     return max(1, term_width - inset - 1)
 
 
+def _background_shell_tail(entity, *, now, width):
+    jobs = current_background_shell_jobs(
+        getattr(entity, "shell_jobs", None) or (), now=now)
+    if not jobs or width <= 0:
+        return None
+    count = len(jobs)
+    count_only = "⚙ %d" % count
+    if _dw(count_only) > width:
+        return None
+    latest = jobs[0]
+    elapsed_s = latest.get("elapsed_s")
+    elapsed = ("%ds" % elapsed_s if isinstance(elapsed_s, int)
+               and not isinstance(elapsed_s, bool) and 0 <= elapsed_s < 60 else
+               fmt_min(elapsed_s // 60) if isinstance(elapsed_s, int)
+               and not isinstance(elapsed_s, bool) and elapsed_s >= 60 else "?")
+    count_suffix = " (+%d)" % (count - 1) if count > 1 else ""
+    command = latest.get("command_display") or latest.get("command")
+    if isinstance(command, str) and command:
+        fixed = "⚙  " + elapsed + count_suffix
+        command_width = width - _dw(fixed)
+        if command_width > 0:
+            clipped = _clip_w(command, command_width)
+            candidate = "⚙ " + clipped + " " + elapsed + count_suffix
+            if clipped and _dw(candidate) <= width:
+                return candidate
+    return count_only
+
+
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
                         indent_width=None, muted=False, now_key="now_sub"):
     """One ``<herdr|tty> <gauge> <value>   NOW`` row for every live card.
@@ -5360,6 +5388,18 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
+    collection_now = time.time()
+    base_width = sum(_dw(text) for text, _key in segs)
+    shell_column = (max(base_width, _NAME_COL)
+                    if not now_text and not exec_segs else base_width)
+    separator = "  " if now_text or exec_segs else ""
+    shell_start = shell_column + _dw(separator)
+    total_width = term_width or _SUMMARY_FALLBACK_W
+    shell_text = _background_shell_tail(
+        entity, now=collection_now, width=max(0, total_width - shell_start))
+    if shell_text:
+        segs.append((" " * max(0, shell_start - base_width), None))
+        segs.append((shell_text, "g_work_off"))
     if muted:
         # A dispatch detail row is supporting telemetry. Keep its full information density,
         # but collapse every colored segment to the same dim weight as the dispatch identity.
@@ -7481,12 +7521,16 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                 row += [("·" * _GAUGE_W, "dim"), ("   —", "dim")]
                 row.append(("]", "dim"))
             else:
-                row.append(("provider availability unknown" if h == "opencode"
+                row.append(("Go usage unavailable" if h == "opencode"
                             else "no usage api — plan quota is console-only", "dim"))
             rows.append((row, None))
             continue
         r5, r7, rms, _mt, rrs, rwins, freshness, err, provider_rows, error_reason = rl[h]
         if err in {"auth", "subscription-missing", "missing-credential", "unknown"}:
+            if h == "opencode":
+                row.append(("Go usage unavailable", "dim"))
+                rows.append((row, None))
+                continue
             detail = _opencode_availability_text({"providers": provider_rows})
             if err == "auth" and error_reason == "credential-expired" and "Go key expired" not in detail:
                 detail = "Go key expired; " + detail
@@ -7499,17 +7543,20 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             row.append(("usage api — " + detail, "dim"))
             rows.append((row, None))
             continue
-        if h == "opencode" and provider_rows:
-            row.append((" — " + _opencode_availability_text({"providers": provider_rows}), "dim"))
-            if r5 is None and r7 is None and not rms and not rwins:
-                rows.append((row, None))
-                continue
         rs5, rs7 = (rrs or (None, None))[0], (rrs or (None, None))[1]
         gauges = (list(rwins) if rwins else
                   [("5h", r5, rs5), ("week", r7, rs7)])
         if not rwins and h == "codex" and r5 is None:
             gauges = gauges[1:]
         gauges += [(lbl, v, None) for lbl, v in (rms or [])]
+        if h == "opencode":
+            gauges = [(lbl, value, reset) for lbl, value, reset in gauges
+                      if {"7d": "week", "wk": "week", "mo": "month"}.get(
+                          str(lbl).strip(), str(lbl).strip()) in {"5h", "week", "month"}]
+            if not any(value is not None for _lbl, value, _reset in gauges):
+                row.append(("Go usage unavailable", "dim"))
+                rows.append((row, None))
+                continue
         cells = [[], [], []]
         for lbl, value, reset in gauges:
             lbl = str(lbl).strip()

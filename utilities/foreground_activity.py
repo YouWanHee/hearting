@@ -30,6 +30,7 @@ class ForegroundActivityContext:
     transcript_roots: tuple[Path, ...] = ()
     jobs: Path | None = None
     runtime_executable: str = ""
+    opencode_db: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ def resolve_activity_policy(worker_type: str | None) -> ActivityPolicy:
 def make_activity_context(policy: ActivityPolicy, *, worker_type: str, harness: str,
                           log_path: Path, jobs: Path, metadata: Mapping[str, str],
                           runtime_executable: str,
-                          transcript_roots: tuple[Path, ...] = ()) -> ForegroundActivityContext | None:
+                          transcript_roots: tuple[Path, ...] = (),
+                          opencode_db: Path | None = None) -> ForegroundActivityContext | None:
     if worker_type == "owner" or policy.window_seconds is None:
         return None
     return ForegroundActivityContext(
@@ -70,6 +72,7 @@ def make_activity_context(policy: ActivityPolicy, *, worker_type: str, harness: 
         log_path=Path(log_path), metadata=dict(metadata), jobs=Path(jobs),
         transcript_roots=transcript_roots,
         runtime_executable=runtime_executable,
+        opencode_db=opencode_db,
     )
 
 
@@ -88,6 +91,7 @@ def build_activity_context(*, worker_type: str, harness: str, log_path: Path,
                 print(f"warning={warning}", file=sys.stderr)
             return None
         roots = ()
+        opencode_db = None
         if harness == "claude":
             from claude_project_dir import encode_project_dir
             project = Path(environment["CLAUDE_CONFIG_DIR"]) / "projects" / encode_project_dir(worktree)
@@ -95,9 +99,15 @@ def build_activity_context(*, worker_type: str, harness: str, log_path: Path,
         elif harness == "codex":
             roots = (Path(environment["CODEX_HOME"]) / "sessions",)
         elif harness == "opencode":
-            runtime = Path(launch_metadata["opencode_runtime_dir"])
-            data = runtime / "data" / "opencode"
-            roots = (data / "opencode.db", data / "opencode.db-wal")
+            from opencode_runtime import opencode_db_path
+            runtime = launch_metadata.get("opencode_runtime_dir")
+            if runtime:
+                data = Path(runtime) / "data" / "opencode"
+                roots = (data / "opencode.db", data / "opencode.db-wal")
+            else:
+                # Shared storage is not an attempt-owned file. Only changes to
+                # the exact session bound by this attempt's log prove activity.
+                opencode_db = opencode_db_path(environment)
         else:
             raise ValueError(f"unsupported foreground activity harness: {harness}")
         metadata = {
@@ -110,6 +120,7 @@ def build_activity_context(*, worker_type: str, harness: str, log_path: Path,
             policy, worker_type=worker_type, harness=harness,
             log_path=Path(log_path), jobs=Path(jobs), metadata=metadata,
             runtime_executable=harness, transcript_roots=roots,
+            opencode_db=opencode_db,
         )
         for warning in policy.warnings:
             print(f"warning={warning}", file=sys.stderr)
@@ -151,6 +162,25 @@ class ForegroundActivityMonitor:
         self._process_baseline = None
         self._file_baseline = None
         self._lease_baseline = False
+        self._session_baseline = None
+
+    def _opencode_session_state(self):
+        if self.context.opencode_db is None:
+            return None
+        from opencode_server_log import bind_session
+        from opencode_runtime import read_session_observation
+        session = bind_session(self.context.log_path)
+        if not session:
+            return None
+        observation = read_session_observation(
+            session, db_path=self.context.opencode_db, shell_after_seq=None)
+        if observation.get("state") != "observed":
+            return None
+        # Do not include the shared DB/WAL stat or session title. Other workers
+        # and background title generation must not reset this attempt's clock.
+        identity = (session, observation.get("database_identity"))
+        progress = json.dumps(observation.get("messages", []), sort_keys=True)
+        return identity, hashlib.sha256(progress.encode()).hexdigest()
 
     def _files(self):
         states = {}
@@ -311,6 +341,8 @@ class ForegroundActivityMonitor:
         reasons = []
         try:
             files = self._files()
+            session_state = self._opencode_session_state()
+            session_uncertain = self.context.opencode_db is not None and session_state is None
             table = self._processes()
             members = self._members(table)
             runtime_lineage = self._runtime_lineage(table, members)
@@ -321,9 +353,14 @@ class ForegroundActivityMonitor:
                 self._file_baseline = files
                 self._process_baseline = cpu
                 self._lease_baseline = lease
-                return ActivityObservation(False, False, ("baseline",))
+                self._session_baseline = session_state
+                return ActivityObservation(False, session_uncertain, ("baseline",))
             if files != self._file_baseline:
                 reasons.append("attempt-file-change")
+            if (session_state is not None and self._session_baseline is not None
+                    and session_state[0] == self._session_baseline[0]
+                    and session_state[1] != self._session_baseline[1]):
+                reasons.append("exact-opencode-session-change")
             old = self._process_baseline
             for key, (self_ticks, children_ticks) in cpu.items():
                 previous = old.get(key)
@@ -341,6 +378,11 @@ class ForegroundActivityMonitor:
             self._file_baseline = files
             self._process_baseline = cpu
             self._lease_baseline = lease
-            return ActivityObservation(bool(reasons), False, tuple(dict.fromkeys(reasons)))
+            self._session_baseline = session_state
+            if session_uncertain:
+                reasons.append("opencode-session-unobserved")
+            return ActivityObservation(
+                any(reason != "opencode-session-unobserved" for reason in reasons),
+                session_uncertain, tuple(dict.fromkeys(reasons)))
         except Exception as exc:
             return ActivityObservation(True, True, (f"observation-uncertain: {type(exc).__name__}: {exc}",))
