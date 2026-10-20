@@ -558,11 +558,23 @@ def verify_request_identity(request, route):
     if (route.get("route_hash") != digest or route.get("route_id") != route_identity.route_id_from_hash(digest)
             or Path(route.get("artifact_root", "")).resolve() != Path(request.artifact_root).resolve()):
         raise TerminalCommitError("route-identity-unverified", "canonical-route-identity")
-    rows = []
-    for line in Path(request.jobs).read_text().splitlines():
-        fields = line.split("\t")
-        if len(fields) == 6:
-            rows.append((fields, dispatch_contract.parse_registry_metadata(fields[5])))
+    from dispatch_registry_cache import registry_view
+    view = registry_view(Path(request.jobs))
+    if view.has_invalid_utf8 or view.has_partial_tail:
+        # Preserve the legacy reader's strict decoding and final-line behavior.
+        rows = []
+        for line in Path(request.jobs).read_text().splitlines():
+            fields = line.split("\t")
+            if len(fields) == 6:
+                rows.append((fields, dispatch_contract.parse_registry_metadata(fields[5])))
+    else:
+        # Candidates are raw input, not a cached owner-completion decision.
+        selected = {record.order: record for record in view.completion_related(
+            request.owner_attempt_id, route["route_id"], "")}
+        selected.update((record.order, record) for record in
+                        view.completion_attempt_records(request.owner_attempt_id))
+        rows = [(selected[order].fields, selected[order].completion_metadata())
+                for order in sorted(selected)]
     binding = validate_owner_route(jobs=request.jobs, route_file=request.route_file,
                                    owner_attempt_id=request.owner_attempt_id)
     owners = [(fields, meta) for fields, meta in rows if meta.get("worker_type") == "owner"

@@ -60,6 +60,7 @@ class Verdict:
         head: str = "",
         branch: str = "",
         upstream: str = "none",
+        integration_commit: str = "",
         stale_rows: int = 0,
         active_pids: list[int] | None = None,
         process_scan: str = "unknown",
@@ -73,6 +74,7 @@ class Verdict:
         self.head = head
         self.branch = branch
         self.upstream = upstream
+        self.integration_commit = integration_commit
         self.stale_rows = stale_rows
         self.active_pids = active_pids if active_pids is not None else []
         self.process_scan = process_scan
@@ -160,6 +162,68 @@ def default_integration_ref(primary: Path) -> str:
         ).returncode == 0:
             return candidate
     raise RuntimeError("no local integration branch; pass --integration-ref")
+
+
+def remote_ref_identity(primary: Path, full_ref: str) -> tuple[str, str] | None:
+    prefix = "refs/remotes/"
+    if not full_ref.startswith(prefix):
+        return None
+    remote_names = run(["git", "-C", str(primary), "remote"], check=False)
+    if remote_names.returncode != 0:
+        return None
+    tail = full_ref[len(prefix) :]
+    matches = [
+        name for name in remote_names.stdout.splitlines()
+        if name and tail.startswith(f"{name}/")
+    ]
+    if not matches:
+        return None
+    remote = max(matches, key=len)
+    branch = tail[len(remote) + 1 :]
+    if not branch:
+        return None
+    return remote, branch
+
+
+def remote_default_branch(primary: Path, remote: str = "origin") -> str:
+    result = run(
+        ["git", "-C", str(primary), "ls-remote", "--symref", remote, "HEAD"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "remote query failed").strip()
+        raise RuntimeError(f"cannot query {remote} default branch: {detail}")
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 1)
+        if (
+            len(fields) == 2
+            and fields[1] == "HEAD"
+            and fields[0].startswith("ref: refs/heads/")
+        ):
+            branch = fields[0][len("ref: refs/heads/") :]
+            if branch:
+                return branch
+    raise RuntimeError(f"{remote} does not advertise a default branch")
+
+
+def fetch_remote_commit(primary: Path, remote: str, branch: str) -> str:
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    refspec = f"+refs/heads/{branch}:{tracking_ref}"
+    fetched = run(
+        ["git", "-C", str(primary), "fetch", "--no-tags", remote, refspec],
+        check=False,
+    )
+    if fetched.returncode != 0:
+        detail = (fetched.stderr or fetched.stdout or "fetch failed").strip()
+        raise RuntimeError(f"cannot fetch {remote}/{branch}: {detail}")
+    resolved = run(
+        ["git", "-C", str(primary), "rev-parse", "--verify", f"{tracking_ref}^{{commit}}"],
+        check=False,
+    )
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        detail = (resolved.stderr or resolved.stdout or "fetched commit is unavailable").strip()
+        raise RuntimeError(f"cannot resolve fetched {remote}/{branch}: {detail}")
+    return resolved.stdout.strip()
 
 
 def git_operation(worktree: Path) -> str:
@@ -266,7 +330,10 @@ def evaluate(
     if not entries:
         raise RuntimeError("git reported no registered worktrees")
     primary = entries[0].path
-    chosen_ref = integration_ref or default_integration_ref(primary)
+    if repository_mode == "local-only":
+        chosen_ref = integration_ref or default_integration_ref(primary)
+    else:
+        chosen_ref = integration_ref or "origin/HEAD"
     verdict = Verdict(
         path=target,
         primary=primary,
@@ -307,51 +374,140 @@ def evaluate(
     if operation != "none":
         verdict.reasons.append(f"git-operation-{operation}")
 
-    ref_check = run(
-        ["git", "-C", str(primary), "rev-parse", "--verify", f"{chosen_ref}^{{commit}}"],
-        check=False,
-    )
-    if ref_check.returncode != 0:
-        verdict.reasons.append("integration-ref-missing")
-    else:
-        merged = run(
-            ["git", "-C", str(primary), "merge-base", "--is-ancestor", entry.head, chosen_ref],
+    if repository_mode == "local-only":
+        ref_check = run(
+            ["git", "-C", str(primary), "rev-parse", "--verify", f"{chosen_ref}^{{commit}}"],
             check=False,
         )
-        if merged.returncode != 0:
-            verdict.reasons.append("unmerged")
-
-        upstream_result = run(
-            [
-                "git",
-                "-C",
-                str(primary),
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                f"{chosen_ref}@{{upstream}}",
-            ],
-            check=False,
-        )
-        if repository_mode == "local-only":
-            verdict.upstream = "local-only"
-        elif upstream_result.returncode != 0 or not upstream_result.stdout.strip():
-            verdict.reasons.append("no-upstream-configured")
+        verdict.upstream = "local-only"
+        if ref_check.returncode != 0:
+            verdict.reasons.append("integration-ref-missing")
         else:
-            verdict.upstream = upstream_result.stdout.strip()
-            counts = run(
+            verdict.integration_commit = ref_check.stdout.strip()
+            merged = run(
                 [
-                    "git",
-                    "-C",
-                    str(primary),
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    f"{verdict.upstream}...{chosen_ref}",
-                ]
-            ).stdout.split()
-            if len(counts) != 2 or counts != ["0", "0"]:
-                verdict.reasons.append("integration-not-pushed")
+                    "git", "-C", str(primary), "merge-base", "--is-ancestor",
+                    entry.head, verdict.integration_commit,
+                ],
+                check=False,
+            )
+            if merged.returncode == 1:
+                verdict.reasons.append("unmerged")
+            elif merged.returncode != 0:
+                raise RuntimeError("cannot verify worktree HEAD against local integration ref")
+    else:
+        remote: str | None = None
+        branch: str | None = None
+        local_ref: str | None = None
+        require_local_inclusion = False
+        display_ref = chosen_ref
+
+        if integration_ref is None:
+            remote = "origin"
+            branch = remote_default_branch(primary, remote)
+            local_ref = f"refs/heads/{branch}"
+            display_ref = f"{remote}/{branch}"
+        else:
+            symbolic_ref = run(
+                ["git", "-C", str(primary), "rev-parse", "--symbolic-full-name", integration_ref],
+                check=False,
+            )
+            full_ref = symbolic_ref.stdout.strip()
+            if symbolic_ref.returncode != 0 or not full_ref:
+                verdict.reasons.append("integration-ref-missing")
+            else:
+                identity = remote_ref_identity(primary, full_ref)
+                if identity is not None:
+                    remote, branch = identity
+                    local_ref = f"refs/heads/{branch}"
+                elif full_ref.startswith("refs/heads/"):
+                    local_ref = full_ref
+                    require_local_inclusion = True
+                    local_branch = full_ref[len("refs/heads/") :]
+                    upstream_result = run(
+                        [
+                            "git", "-C", str(primary), "rev-parse", "--symbolic-full-name",
+                            f"{local_branch}@{{upstream}}",
+                        ],
+                        check=False,
+                    )
+                    upstream_ref = upstream_result.stdout.strip()
+                    identity = remote_ref_identity(primary, upstream_ref)
+                    if upstream_result.returncode != 0 or identity is None:
+                        verdict.reasons.append("no-upstream-configured")
+                    else:
+                        remote, branch = identity
+                else:
+                    verdict.reasons.append("no-upstream-configured")
+
+        if remote is not None and branch is not None:
+            remote_commit = fetch_remote_commit(primary, remote, branch)
+            verdict.integration_ref = display_ref
+            verdict.integration_commit = remote_commit
+            verdict.upstream = f"{remote}/{branch}"
+
+            merged = run(
+                [
+                    "git", "-C", str(primary), "merge-base", "--is-ancestor",
+                    entry.head, remote_commit,
+                ],
+                check=False,
+            )
+            if merged.returncode == 1:
+                verdict.reasons.append("unmerged")
+            elif merged.returncode != 0:
+                raise RuntimeError("cannot verify worktree HEAD against fetched remote commit")
+
+            local_result = run(
+                ["git", "-C", str(primary), "rev-parse", "--verify", f"{local_ref}^{{commit}}"],
+                check=False,
+            ) if local_ref else None
+            if local_result is not None and local_result.returncode == 0:
+                local_commit = local_result.stdout.strip()
+                if not local_commit:
+                    raise RuntimeError("cannot resolve local integration commit")
+                if require_local_inclusion:
+                    local_merged = run(
+                        [
+                            "git", "-C", str(primary), "merge-base", "--is-ancestor",
+                            entry.head, local_commit,
+                        ],
+                        check=False,
+                    )
+                    if local_merged.returncode == 1:
+                        if "unmerged" not in verdict.reasons:
+                            verdict.reasons.append("unmerged")
+                    elif local_merged.returncode != 0:
+                        raise RuntimeError("cannot verify worktree HEAD against local integration ref")
+                counts_result = run(
+                    [
+                        "git", "-C", str(primary), "rev-list", "--left-right", "--count",
+                        f"{remote_commit}...{local_commit}",
+                    ],
+                    check=False,
+                )
+                if counts_result.returncode != 0:
+                    raise RuntimeError("cannot compare local integration commits with fetched remote")
+                counts = counts_result.stdout.split()
+                if len(counts) != 2:
+                    raise RuntimeError("Git returned invalid integration ahead/behind counts")
+                try:
+                    behind, local_ahead = (int(value) for value in counts)
+                except ValueError as error:
+                    raise RuntimeError("Git returned invalid integration ahead/behind counts") from error
+                if behind < 0 or local_ahead < 0:
+                    raise RuntimeError("Git returned invalid integration ahead/behind counts")
+                if local_ahead > 0:
+                    verdict.reasons.append("integration-not-pushed")
+            elif local_ref is not None:
+                local_ref_exists = run(
+                    ["git", "-C", str(primary), "show-ref", "--verify", "--quiet", local_ref],
+                    check=False,
+                )
+                if require_local_inclusion or local_ref_exists.returncode == 0:
+                    raise RuntimeError("cannot resolve local integration ref")
+                if local_ref_exists.returncode != 1:
+                    raise RuntimeError("cannot verify local integration ref existence")
 
     verdict.stale_rows, registered_pids = parse_registry(jobs, target)
     scan_kind, cwd_pids = process_cwds(target)
@@ -441,6 +597,7 @@ def emit(verdict: Verdict, status: str, reconciled: int = 0) -> None:
     print(f"primary_worktree={verdict.primary}")
     print(f"integration_ref={verdict.integration_ref}")
     print(f"integration_upstream={verdict.upstream}")
+    print(f"integration_commit={verdict.integration_commit or '-'}")
     print(f"repository_mode={verdict.repository_mode}")
     print(f"head={verdict.head or '-'}")
     print(f"branch={verdict.branch or '-'}")
@@ -580,6 +737,7 @@ def main(argv: list[str]) -> int:
             "primary_worktree": str(verdict.primary),
             "integration_ref": verdict.integration_ref,
             "integration_upstream": verdict.upstream,
+            "integration_commit": verdict.integration_commit,
             "repository_mode": verdict.repository_mode,
             "head": verdict.head,
             "branch": verdict.branch,

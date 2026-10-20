@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -94,6 +95,23 @@ from dispatch_contract import (  # noqa: E402
 _HISTORICAL_OBSERVATIONS = ObservationContext(
     max_entries=48, max_weight=32 * 1024 * 1024
 )
+_ARTIFACT_INDEX_PASS: contextvars.ContextVar = contextvars.ContextVar(
+    "artifact_index_observation_scope", default=None
+)
+
+
+@contextlib.contextmanager
+def artifact_index_observation_scope():
+    """Pin each root's first immutable index projection for one observer pass."""
+    current = _ARTIFACT_INDEX_PASS.get()
+    if current is not None:
+        yield
+        return
+    token = _ARTIFACT_INDEX_PASS.set({})
+    try:
+        yield
+    finally:
+        _ARTIFACT_INDEX_PASS.reset(token)
 # Large parsed documents must not evict the small consistency facts and
 # index projections that unchanged historical owners reuse.
 _HISTORICAL_PROJECTIONS = ObservationContext(
@@ -844,6 +862,7 @@ def _artifact_index_observation(root: Path, *, cycle_id: str | None = None,
     path = artifact_admission._index_path(root)
     route_key = None if route_ids is None else tuple(sorted(set(route_ids)))
     key = ("artifact-index-projection", str(root))
+    pass_observations = _ARTIFACT_INDEX_PASS.get()
 
     def load():
         payload = json.loads(stable_read_bytes(path).decode("utf-8"))
@@ -910,9 +929,21 @@ def _artifact_index_observation(root: Path, *, cycle_id: str | None = None,
         )
 
     size_weight = lambda value: value.weight
-    observed = _HISTORICAL_OBSERVATIONS.memoize(
-        key, [path], load, weight=size_weight
-    )
+    if pass_observations is not None and str(root) in pass_observations:
+        observed = pass_observations[str(root)]
+        if isinstance(observed, Exception):
+            raise observed
+    else:
+        try:
+            observed = _HISTORICAL_OBSERVATIONS.memoize(
+                key, [path], load, weight=size_weight
+            )
+        except Exception as exc:
+            if pass_observations is not None:
+                pass_observations[str(root)] = exc
+            raise
+        if pass_observations is not None:
+            pass_observations[str(root)] = observed
     if route_key is None:
         return observed
     wanted_routes = set(route_key or ())

@@ -50,6 +50,69 @@ class WrapperCommonTest(unittest.TestCase):
             source = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
             target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
+    def test_guard_refusal_keeps_typed_reason_and_bounded_detail(self):
+        stderr = '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n'
+        self.assertEqual(C._route_guard_refusal(stderr),
+                         ("unsafe-git-operation", "cherry-pick"))
+        self.assertEqual(C._route_guard_refusal('{"reason":{},"detail":"x"}'),
+                         ("worker-route-validation-failed", "guard output lacked a typed refusal"))
+        self.assertEqual(C._route_guard_refusal('broken'),
+                         ("worker-route-validation-failed", "guard output lacked a typed refusal"))
+        self.assertEqual(C._route_guard_refusal('{"status":"blocked","reason":"safe","detail":"x\\ny"}'),
+                         ("safe", "x y"))
+
+    def test_guard_detail_cannot_inject_receipt_fields_or_terminal_controls(self):
+        detail = 'cherry-pick\u2028reason=forged\x1b[31m\x00\x85started=1'
+        reason, bounded = C._route_guard_refusal(json.dumps(
+            dict(status='blocked', reason='unsafe-git-operation', detail=detail)))
+        self.assertEqual(reason, 'unsafe-git-operation')
+        self.assertEqual(len(bounded.splitlines()), 1)
+        self.assertNotIn('\x1b', bounded)
+        self.assertNotIn('\x00', bounded)
+
+    def test_guard_parser_rejects_mixed_output_and_non_ascii_reasons(self):
+        refusal = dict(status='blocked', reason='unsafe-git-operation', detail='cherry-pick')
+        generic = ('worker-route-validation-failed', 'guard output lacked a typed refusal')
+        for value in [json.dumps(refusal)+'\nraw log',
+                      json.dumps(refusal)+'\n'+json.dumps(refusal),
+                      json.dumps({**refusal, 'reason': 'unsaf\u00e9-git-operation'})]:
+            with self.subTest(value=value):
+                self.assertEqual(C._route_guard_refusal(value), generic)
+
+    def test_guard_parser_checks_exit_and_existing_identity_without_new_inputs(self):
+        refusal = dict(status='blocked', reason='future-refusal', detail='future detail',
+                       route_id='rt-other')
+        generic = ('worker-route-validation-failed', 'guard output lacked a typed refusal')
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), returncode=1), generic)
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), route_id='rt-current'), generic)
+        refusal['route_id'] = 'unknown'
+        self.assertEqual(C._route_guard_refusal(json.dumps(refusal), route_id='rt-current'),
+                         ('future-refusal', 'future detail'))
+
+    def test_route_validation_receipt_uses_guard_reason(self):
+        from unittest import mock
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            route = Path(temp) / 'route.json'
+            route.write_text(json.dumps({'schema_version': 2}))
+            args = argparse.Namespace(route_id='rt-fixture', route_hash='sha256:fixture',
+                route_node='execute', registry_digest='fixture', write_scope='source/**',
+                route_file=str(route), worktree=temp, artifact_root=temp,
+                capability='autopilot-code', intensity='standard', unit='dev/backend',
+                action='start', model_role='fast implementer', model_profile='balanced',
+                attempt_id=None)
+            result = subprocess.CompletedProcess([], 65, '',
+                '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n')
+            out = io.StringIO()
+            with mock.patch.object(C, 'validate_runtime_requirements'), \
+                 mock.patch.object(C, 'validate_route_mode_axes'), \
+                 mock.patch.object(C.subprocess, 'run', return_value=result), \
+                 redirect_stdout(out):
+                self.assertEqual(C.validate_route_record(args, marker_gate=lambda *_: None), 65)
+            self.assertIn('reason=unsafe-git-operation\n', out.getvalue())
+            self.assertIn('detail=cherry-pick\n', out.getvalue())
+            self.assertNotIn('reason=worker-route-validation-failed', out.getvalue())
+
     def test_every_wrapper_keeps_the_old_names_as_the_shared_functions(self):
         for harness in ("claude", "codex", "opencode"):
             wrapper = load(harness)

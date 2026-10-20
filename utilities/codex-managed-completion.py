@@ -27,7 +27,6 @@ from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
     CompletionDeferred,
     CODEX_QUEUE_PARENT_DELIVERY,
-    canonical_receipt_digest,
     MANAGED_SESSION_PARENT_DELIVERY,
     OPEN_STATES,
     advance_delivery_timing,
@@ -914,6 +913,7 @@ def deliver_with_retry(
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            args._time_budget_spent = True
             return {
                 "schema_version": 1,
                 "status": "retryable",
@@ -1167,6 +1167,17 @@ def _native_queue_delivery_once(
                 failure_reason=retry_failure, retry_base_delay_seconds=retry_base)
 
 
+def _courier_retry_wait(exc) -> float | None:
+    """Seconds until the ledger's courier backoff admits the next claim."""
+    if (not isinstance(exc, pending_delivery.PendingDeliveryError)
+            or exc.reason != "pending-delivery-retry-deferred"):
+        return None
+    try:
+        return max(0.0, int(exc.detail.partition("remaining_ns=")[2]) / 1e9)
+    except ValueError:
+        return None
+
+
 def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
     from peer_read_context import PeerReadContext
     deadline = time.monotonic() + max(0.0, args.timeout)
@@ -1181,6 +1192,7 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
             if stopped:
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         session = None
+        courier_wait = None
         try:
             path = args.queue_socket or resolve_queue_socket()
             rows = current_session_children(args.jobs, args.thread_id, attempts,
@@ -1202,6 +1214,7 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
                 CompletionError) as exc:
             result = {"schema_version": 1, "status": "retryable", "reason": str(exc),
                       "thread_id": args.thread_id}
+            courier_wait = _courier_retry_wait(exc)
         finally:
             if session is not None:
                 session.close()
@@ -1210,6 +1223,12 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
             if stopped:
                 return {"schema_version": 1, "status": "retryable", "reason": stopped}
         remaining = deadline - time.monotonic()
+        if remaining > 0 and courier_wait is not None:
+            # The ledger's own courier backoff names the next admissible
+            # claim. Waking before it only repeats this pass's registry reads,
+            # and its changing remaining time is not a new observation.
+            time.sleep(min(max(courier_wait, delay), remaining))
+            continue
         if remaining > 0:
             observation = (result.get("status"), result.get("reason"),
                            result.get("client_user_message_id"), bool(submitted))
@@ -1220,6 +1239,7 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
                 delay = min(15.0, delay * 1.7)
             last_observation = observation
             time.sleep(min(delay, remaining))
+    args._time_budget_spent = True
     return result
 
 
@@ -1432,20 +1452,29 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             obligation = batch_obligations.read(args.jobs, duty_id) or obligation
             normalized = obligation.get("outcome") if obligation else recovered
     if duty_id and normalized is not None and args.parent_session_id:
-        from dispatch_completion_join import current_batch_receipt_projection
+        from dispatch_completion_join import cached_batch_delivery_state
         effective = set((obligation or {}).get("effective_attempts") or attempts)
-        current_receipt = current_batch_receipt_projection(
+        cached_state = cached_batch_delivery_state(
             args.jobs, effective, recipient_sid=args.parent_session_id,
             parent_attempt_id=delivery_parent_id(args),
             parent_completion_delivery=(CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
                                         else MANAGED_SESSION_PARENT_DELIVERY),
+            cached=normalized,
         )
-        if (current_receipt is None
-                or canonical_receipt_digest(current_receipt) != canonical_receipt_digest(normalized)):
-            _update_duty(args, duty_id, state="unknown", reason="cached-outcome-identity-unavailable",
+        if cached_state == "resolved":
+            # The per-child ledger already closed this delivery; nothing is
+            # left for this observer to send or to keep waiting on.
+            _update_duty(args, duty_id, state="complete", reason="delivery-resolved",
+                         delivery="resolved", effective_attempts=sorted(effective))
+            return {"schema_version": 1, "status": "accepted",
+                    "reason": "delivery-resolved"}, 0
+        if cached_state != "current":
+            reason = {"unmaterialized": "cached-outcome-delivery-unmaterialized",
+                      "partial": "cached-outcome-delivery-partial"}.get(
+                          cached_state, "cached-outcome-identity-unavailable")
+            _update_duty(args, duty_id, state="unknown", reason=reason,
                          delivery="pending", effective_attempts=sorted(effective))
-            return {"schema_version": 1, "status": "retryable",
-                    "reason": "cached-outcome-identity-unavailable"}, 75
+            return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
     if normalized is None:
         wait_for_session_launch_claims(args, attempts)
         watcher: HumanGateWatcher | None = None
@@ -1509,6 +1538,7 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             attempts, _replaced_attempts = adopt_receipt(args.jobs, attempts, receipt)
             if receipt.get("state") == "watch-expired":
                 reason = receipt.get("reason") or "watch-deadline"
+                args._time_budget_spent = reason == "watch-deadline"
                 if reason == "watch-deadline" and args.parent_session_id:
                     _await_notice_ack(
                         args.jobs.resolve(strict=False).parent, args.parent_session_id,
@@ -1563,6 +1593,7 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if normalized.get("state") == "watch-expired":
             reason = normalized.get("reason") or "watch-deadline"
             if reason == "watch-deadline":
+                args._time_budget_spent = True
                 reason = "termination-pending"
             if duty_id:
                 _update_duty(args, duty_id, state="unknown", reason=reason,
@@ -1737,6 +1768,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise ObserverOwnershipLost("completion-observer-ownership-lost")
         status = result.get("status") if isinstance(result, dict) else None
         current = batch_obligations.read(args.jobs, args._obligation_id) or {}
+        if current.get("state") not in batch_obligations._PENDING:
+            return result, code
         if current.get("outcome") is not None:
             if status == "accepted":
                 _update_duty(args, args._obligation_id,
@@ -1766,9 +1799,17 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if still_owner:
             current = batch_obligations.read(args.jobs, args._obligation_id) or {}
             if current.get("state") in batch_obligations._PENDING:
-                batch_obligations.handoff_observer(
-                    args.jobs, args._obligation_id, lease,
-                    service_current=service_current)
+                if getattr(args, "_time_budget_spent", False):
+                    # Only a generation that used its whole observation budget
+                    # passes its retained lease straight to a successor.
+                    batch_obligations.handoff_observer(
+                        args.jobs, args._obligation_id, lease,
+                        service_current=service_current)
+                else:
+                    # Any other pending end (an immediate retryable, an error,
+                    # a stopped recipient) returns to the existing runner and
+                    # its bounded backoff, never an immediate successor loop.
+                    batch_obligations.request_runner(args.jobs)
         # Keep this descriptor open until the command exits. The successor,
         # when launched, shares the same open file description and therefore
         # retains the flock as this process returns its receipt.

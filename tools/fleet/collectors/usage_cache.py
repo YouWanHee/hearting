@@ -137,8 +137,12 @@ def record_attempt(harness, now=None):
 
 
 def record_provider(harness, provider, model, account_scope, state, reason=None,
-                    now=None, source=None):
-    """Persist exact provider eligibility beside usage without refreshing quota age."""
+                    now=None, source=None, *, credential_generation=None):
+    """Persist exact provider eligibility beside usage without refreshing quota age.
+
+    ``credential_generation`` is an opaque digest of the credential the outcome
+    was observed with; readers holding a different one treat the row as unknown.
+    """
     if (harness != "opencode" or not isinstance(provider, str) or not provider
             or not isinstance(model, str) or not model
             or state not in ("usable", "unavailable")):
@@ -163,6 +167,8 @@ def record_provider(harness, provider, model, account_scope, state, reason=None,
         providers[key] = {"provider": provider, "model": model,
                           "account_scope": account_scope or "unscoped", "state": state,
                           "reason": reason, "observed_at": now, "source": source}
+        if isinstance(credential_generation, str) and credential_generation:
+            providers[key]["credential_generation"] = credential_generation
         item["providers"] = providers
         item["attempted_at"] = now
         fd, temp = tempfile.mkstemp(prefix=".%s." % harness, dir=directory, text=True)
@@ -182,8 +188,13 @@ def record_provider(harness, provider, model, account_scope, state, reason=None,
 
 
 def read_provider(harness, provider, model, account_scope, *, now=None,
-                  usable_max_age=STALE_MAX):
-    """Read provider state independently of the quota window's freshness."""
+                  usable_max_age=STALE_MAX, credential_generation=None):
+    """Read provider state independently of the quota window's freshness.
+
+    A row recorded with another credential generation no longer describes the
+    current credential (re-login or refresh), so it reads as unknown. Rows
+    without a generation keep their existing meaning.
+    """
     now = time.time() if now is None else float(now)
     try:
         with open(_path(harness), encoding="utf-8") as fh:
@@ -201,9 +212,15 @@ def read_provider(harness, provider, model, account_scope, *, now=None,
     observed = row.get("observed_at")
     if isinstance(observed, bool) or not isinstance(observed, (int, float)) or observed > now:
         return {"state": "unknown", "reason": "observation-invalid", "observed_at": None}
+    recorded = row.get("credential_generation")
+    if recorded and credential_generation and recorded != credential_generation:
+        return {"state": "unknown", "reason": "credential-generation-changed",
+                "observed_at": observed}
     if row["state"] == "usable" and now - observed > usable_max_age:
         return {"state": "unknown", "reason": "observation-stale", "observed_at": observed}
-    return dict(row)
+    result = dict(row)
+    result.pop("credential_generation", None)
+    return result
 
 
 def provider_records(harness, account_scopes=None):

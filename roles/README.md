@@ -68,6 +68,9 @@ the shared dispatch selector own current provider/account/model availability;
 they apply that evidence before automatic ranking while preserving an explicit
 pin and its native failure.
 
+The peer-steward is an advisory session role outside the delegation catalog.
+`core/OPERATIONS.md §5.14` defines its relations, same-seat succession and watch duties.
+
 ## Behavior Contract (separate from the role catalog)
 
 Beyond the delegation-role catalog above, this directory also holds the

@@ -545,6 +545,30 @@ class BatchObligationTest(unittest.TestCase):
         obligations.update(self.jobs, duty_id, state="complete")
         self.assertFalse(obligations.has_unowned_work(self.jobs))
 
+    def test_runner_signature_ignores_observer_relaunches_but_not_duty_progress(self):
+        # The runner resets its bounded backoff on a signature change. Its own
+        # relaunch of a still-pending duty (a new observer PID, live or gone)
+        # is not new work; a duty state or delivery change is.
+        duty_id, _record = obligations.create(self.args)
+        obligations.update(self.jobs, duty_id, state="delivery-pending", delivery="retryable",
+                           observer={"pid": os.getpid(),
+                                     "pid_start": obligations._pid_start(os.getpid())})
+        first = obligations.pending_observer_signature(self.jobs)
+        obligations.update(self.jobs, duty_id, reason="observing",
+                           observer={"pid": 2 ** 22 + 7, "pid_start": "1"})
+        self.assertEqual(obligations.pending_observer_signature(self.jobs), first)
+        obligations.update(self.jobs, duty_id, delivery="sent-ambiguous")
+        self.assertNotEqual(obligations.pending_observer_signature(self.jobs), first)
+
+    def test_request_runner_uses_the_common_carrier_recovery_entry(self):
+        with mock.patch("peer_obligations.request_dispatch_reconciliation",
+                        return_value=True) as request:
+            self.assertTrue(obligations.request_runner(self.jobs))
+        request.assert_called_once_with(self.jobs.resolve().parent)
+        with mock.patch("peer_obligations.request_dispatch_reconciliation",
+                        side_effect=OSError("unavailable")):
+            self.assertFalse(obligations.request_runner(self.jobs))
+
     def test_owner_settlement_scan_reuses_unchanged_registry_but_rechecks_leases(self):
         from dispatch_contract import SUPERVISOR_LEASE_KIND
 

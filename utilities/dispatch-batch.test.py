@@ -2426,14 +2426,15 @@ class DispatchBatchTest(unittest.TestCase):
             ("kill switch active", "model-worker-governor-denied"),
             ("", "model-worker-governor-denied"),
         ):
-            with self.subTest(marker=marker, expected=expected):
+            with self.subTest(marker=marker, expected=expected), \
+                    tempfile.TemporaryDirectory() as governor_root:
                 with mock.patch.object(
                     BATCH.subprocess, "run",
                     return_value=self._governor_subprocess_result(stderr=marker),
                 ):
                     with self.assertRaises(BATCH.BatchError) as ctx:
                         BATCH.reserve_batch(
-                            Path("/tmp/governor"), Path("/tmp/root"),
+                            Path("/tmp/governor"), Path(governor_root),
                             [{"attempt_id": "att-x"}],
                             manifest={"parallel_group": "plan"},
                             manifest_digest="sha256:" + "a" * 64,
@@ -4484,6 +4485,29 @@ class PlainSlotReservationTest(unittest.TestCase):
                 [sys.executable, str(self.GOVERNOR), "--root", td, "status"],
                 text=True, capture_output=True, check=True).stdout)
             self.assertEqual(status["reservations"], {})
+
+    def test_a_dead_wrappers_slots_are_reclaimable_and_a_live_ones_are_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            mine = self._reserve(Path(td), 1)
+            script = (
+                "import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('b', {str(PATH)!r})\n"
+                "b = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(b)\n"
+                f"print(*b.reserve_plain_slots(__import__('pathlib').Path({str(self.GOVERNOR)!r}),"
+                f" __import__('pathlib').Path({td!r}), [{{}}, {{}}]))\n"
+            )
+            done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                                  timeout=120, start_new_session=True)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            dead = done.stdout.split()
+            state = json.loads(Path(td, "state.json").read_text())
+            self.assertTrue(all("owner_witness" in state["reservations"][t] for t in mine + dead))
+            reclaimed = json.loads(subprocess.run(
+                [sys.executable, str(self.GOVERNOR), "--root", td, "reclaim"],
+                text=True, capture_output=True, check=True).stdout)
+            self.assertEqual(sorted(row["token"] for row in reclaimed["reclaimed"]), sorted(dead))
+            self.assertEqual([row["token"] for row in reclaimed["retained"]], mine)
 
 
 class SelfParentAndForegroundNoticeTest(unittest.TestCase):

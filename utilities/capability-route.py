@@ -6064,11 +6064,18 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         return {"passed":False,"reason":reason}
     try:
         jobs=Path(jobs) if jobs is not None else completion_dir(route["route_id"]).parents[1]/"jobs.log"
+        from dispatch_registry_cache import registry_view
+        view=registry_view(jobs)
+        if view.has_invalid_utf8 or view.has_partial_tail:
+            # Keep the existing strict decoder and incomplete-line semantics.
+            lines=jobs.read_text(encoding="utf-8").splitlines()
+            candidates=((fields,parse_registry_metadata(fields[5]))
+                        for line in lines for fields in (line.split("\t"),) if len(fields)==6)
+        else:
+            candidates=((record.fields,record.completion_metadata()) for record in
+                        view.completion_related("",route["route_id"],route["route_hash"]))
         owners=[]
-        for line in jobs.read_text(encoding="utf-8").splitlines():
-            fields=line.split("\t")
-            if len(fields)!=6: continue
-            meta=parse_registry_metadata(fields[5])
+        for fields,meta in candidates:
             if meta.get("worker_type")!="owner" or meta.get("dispatch_depth")!="1": continue
             try:
                 identity=ROUTE_IDENTITY.registered_node_identity(meta,node)
@@ -7364,20 +7371,38 @@ def write_completion_marker(
         owner_override=owner_override, owner_chain=owner_chain,
     )
     from review_source_subject import SourceSubjectError, is_implementation_review, marker_subject
-    try:
-        source_subject = marker_subject(
-            route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
-            jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
-        )
-    except SourceSubjectError as exc:
-        # Only an implementation review consumes its source subject as evidence.
-        # Another scoped node's subject is optional epoch history: when its tree
-        # cannot be observed, the marker records none (legacy-unknown).
-        if (is_implementation_review(route, node) or exc.reason not in {
-                "review-source-git-unavailable", "review-source-worktree-unavailable",
-                "review-source-scope-unavailable"}):
-            raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+    inline_review_write = (
+        is_implementation_review(route, node)
+        and review_identity.get("reviewer_kind") == "owner-inline"
+        and axes.get("registered_worker") is False
+        and axes.get("execution_surface") == "inline"
+    )
+    # An exact attempt replay is historical even after source drift. Every
+    # writer path checks its immutable evidence/axes/history before asking for
+    # a fresh source binding, so callers share the same replay decision.
+    replay_candidate = _completion_marker_replay(
+        route, node, node_id, evidence, axes, directory, repair=False,
+        evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+    )
+    if replay_candidate is not None:
         source_subject = None
+    else:
+        try:
+            source_subject = marker_subject(
+                route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
+                jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
+                owner_inline=inline_review_write,
+                evidence_sha256=sha if inline_review_write else None,
+            )
+        except SourceSubjectError as exc:
+            # Only an implementation review consumes its source subject as evidence.
+            # Another scoped node's subject is optional epoch history: when its tree
+            # cannot be observed, the marker records none (legacy-unknown).
+            if (is_implementation_review(route, node) or exc.reason not in {
+                    "review-source-git-unavailable", "review-source-worktree-unavailable",
+                    "review-source-scope-unavailable"}):
+                raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+            source_subject = None
     replayed=_completion_marker_replay(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,
@@ -10359,6 +10384,14 @@ def _git(cwd, *args):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _git_common_dir(cwd):
+    """Absolute common git dir; git < 2.31 lacks --path-format, so absolutize a relative answer."""
+    value = _git(cwd, "rev-parse", "--git-common-dir")
+    if not value:
+        return value
+    return value if os.path.isabs(value) else os.path.normpath(os.path.join(str(cwd), value))
+
+
 def _worktree_git(cwd, *args):
     """Run one preparation command, retaining stderr for a fail-closed receipt."""
     try:
@@ -10397,7 +10430,7 @@ def _primary_worktree(cwd, common):
                   if line.startswith("worktree ")]
     for candidate in candidates:
         root = _git(candidate, "rev-parse", "--show-toplevel")
-        candidate_common = _git(candidate, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        candidate_common = _git_common_dir(candidate)
         if root and candidate_common and os.path.realpath(candidate_common) == os.path.realpath(common):
             if OWNER_WRITE_ADVISORY.git_topology(root) == "primary":
                 return os.path.realpath(root)
@@ -10444,7 +10477,7 @@ def _prepared_record_worktree(record, common, relative):
     path = Path(record.get("path") or "")
     if not path.is_dir():
         return None
-    actual_common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    actual_common = _git_common_dir(path)
     symbolic = _git(path, "symbolic-ref", "-q", "HEAD")
     head = _git(path, "rev-parse", "HEAD")
     branch = str(record.get("branch") or "")
@@ -10566,7 +10599,7 @@ def _ref_namespace_conflict(top, branch, *, allow_local_branch=False):
     valid = _worktree_git(top, "check-ref-format", "--branch", branch)
     if valid.returncode != 0:
         return True
-    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = _git_common_dir(top)
     if not common:
         return True
     # Git's revision DWIM checks these namespaces, while pseudo-ref files live
@@ -10677,7 +10710,7 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
         return {"state": "skipped", "reason": "non-git-cwd"}
     if topology not in ("primary", "linked"):
         return {"state": "failed", "reason": "git-topology-unresolved", "cwd": original}
-    common = _git(source_top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = _git_common_dir(source_top)
     if not common:
         return {"state": "failed", "reason": "git-common-dir-unresolved", "cwd": original}
     common = os.path.realpath(common)
@@ -11009,7 +11042,7 @@ def caller_open_route(cwd):
         # Prefer the exact persisted allocation, including an automatically selected collision
         # suffix. Retain the old slug path only as a read-only compatibility lookup for legacy routes.
         top = _git(here, "rev-parse", "--show-toplevel")
-        common = _git(here, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        common = _git_common_dir(here)
         allocated = _recorded_preparation_roots(artifact_root, common) if common else []
         def moved(row):
             if not top:

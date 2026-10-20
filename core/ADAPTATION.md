@@ -675,6 +675,14 @@ Message observation and transport keep the accepted server selected throughout.
 Retire observations update only their current phase under the existing duty lock;
 stale observations cannot undo an exit claim or reopen a completed/cancelled duty.
 
+A confirmed same-seat steward handover keeps an accepted unresolved watch on the same
+watch ID, exact target, endpoint, until-set and original deadline. Its current steward and
+notification recipient follow the common confirmed holder chain. Session replacement is
+terminal only when that chain does not confirm the successor; missing or interrupted
+adoption remains pending. PID reuse, a different endpoint or pane, and a stale predecessor
+callback cannot adopt or settle the duty. Explicit release revokes role evidence without
+silently deleting an unresolved watch.
+
 On Claude, `PostToolUse(Bash)` `asyncRewake` hook `peer-steward-rewake.py` arms only from a
 same-session armed line with `wake=hook` whose receipt sits under the canonical state root,
 `join`s within one deadline computed at hook entry, acks, and exits 2. Its survival across
@@ -786,7 +794,7 @@ a conductor can die mid-pipeline (session end, crash, limit) leaving either a pl
 
 A single-session mutation stage whose sealed route declares `commit_expected: true` edits the assigned source worktree and commits its validated changes. Declared parallel sub-sessions (`subsession_id` or `stage_authority=0`) remain no-commit; their owner closes the stage gate and then commits. This applies equally to Claude, Codex, and OpenCode. Artifact output paths never redirect source edits into an artifact overlay.
 
-Commit-expected Codex owners and stages receive only the per-worktree Git metadata directory and common `objects`, `refs`, and `logs`; common `config` and `hooks` remain read-only. Modern Codex protects resolved Git metadata even when legacy `--add-dir` / `writableRoots` list it (measured with codex-cli 0.160.0). When the native named-permissions surface is available, the adapter projects those existing exact grants into an invocation-local profile extending `:workspace`, without overriding it again through legacy thread/turn sandbox fields. Older runtimes retain the legacy grant projection; profile discovery never adds a launch refusal or requires user configuration. Actual sandbox execution, rather than argv, establishes commit support.
+Commit responsibility includes Git reference cleanup after cherry-pick, revert, and branch or tag deletion. Git 2.43 creates `packed-refs.lock` in the common Git directory and atomically renames it, so a linked worktree's named Codex permission profile grants that common directory write. It carves out common `config` and `hooks` as read-only, plus existing primary and sibling metadata (`info`, `config.worktree`, `modules`, `HEAD`, `index`, and `worktrees`) as read-only; the assigned worktree's metadata is re-granted write beneath `worktrees`. Only existing optional carve-outs are listed, since Codex creates placeholders for absent paths and can disrupt Git. The common-root grant can create previously absent top-level entries; this is the same residual exposure accepted for the primary commit profile, not exact-file permission. Modern Codex protects resolved Git metadata even when legacy `--add-dir` / `writableRoots` list it (measured with codex-cli 0.160.0). The common-root grant applies only to the invocation-local named profile extending `:workspace`; legacy writable roots retain the narrow per-worktree and common `objects`, `refs`, and `logs` grants because they cannot express read-only carve-outs. A supported Codex App Server owner starts with an invocation-local read-only profile and selects its named profile through `turn/start.permissions` only after revalidating the bound route and current Git state; when an operation is active or Git state is unknown, the owner selects the read-only profile, then selects the authorized commit profile after the worktree settles. The profile selector and legacy `sandboxPolicy` are mutually exclusive. Older or unrecognized runtimes keep the existing revalidated sandbox projection, with no new launch refusal or user setup. Profile discovery never adds a launch refusal or requires user configuration. Actual sandbox execution, rather than argv, establishes commit and cleanup support.
 
 Nested Codex homes live under the canonical registry's state directory (`homes/codex/<worktree-hash>.<release-hash>`, one per worktree and release so owners of two releases in one worktree never re-link each other's home), outside the source checkout. Existing auth/config are linked read-only; new launches never create a source-local `.dispatch/codex-home` link. Legacy links remain readable for liveness without being recreated.
 
@@ -896,7 +904,8 @@ and was observed within 15 seconds. Missing, stale, or mismatched status stays
 unknown for retire decisions.
 
 An exact pane exit, exact closed-pane event, complete absence census, completed retire,
-confirmed steward exit/replacement, or the original explicit deadline settles the existing
-watch duty before its observer exits. A terminal receipt prevents lifecycle reconciliation
+confirmed steward exit or unconfirmed replacement, or the original explicit deadline settles the existing
+watch duty before its observer exits. A confirmed same-seat successor keeps the existing duty
+open. A terminal receipt prevents lifecycle reconciliation
 from recreating an observer. Pane closure, steward closure, agent release, goal completion,
 and successful work are distinct outcomes.

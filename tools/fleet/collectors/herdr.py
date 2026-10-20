@@ -656,6 +656,13 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                 value = getattr(other, field, None)
                 if value is not None:
                     setattr(owner, field, value)
+            if (owner.session_id == other.session_id
+                    and getattr(owner, "attempt_id", None) == getattr(other, "attempt_id", None)):
+                from . import shell_jobs
+                owner.shell_jobs = shell_jobs.merge_jobs(
+                    getattr(owner, "shell_jobs", None), getattr(other, "shell_jobs", None))
+                owner.shell_job_observation = (getattr(owner, "shell_job_observation", None)
+                                               or getattr(other, "shell_job_observation", None))
     if companions:
         sessions[:] = [s for s in sessions if id(s) not in companions]
     for s in sessions:

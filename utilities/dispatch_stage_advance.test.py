@@ -1110,6 +1110,46 @@ class WrapperFailureClassificationTest(unittest.TestCase):
     honest no-credential limitation `stage-advance-installed-layout.test.sh`
     already documents for A-1 and keeps unchanged."""
 
+    def test_real_successor_consumer_keeps_stderr_out_of_receipt_and_failure_detail(self):
+        services = SA.RealStageAdvanceServices()
+        route = make_route([node('a'), node('b', depends_on=('a',))])
+        sandbox = Sandbox()
+        try:
+            route_file = sandbox.write_route(route)
+            request = make_request(sandbox, route_file, predecessor_node='a')
+            claim = SA.StageAdvanceClaim(
+                stage_advance_id='sadv-fixture', claim_key=(route['route_hash'], 'b', 0),
+                successor_attempt_id='att-real', replayed=False)
+            cases = [
+                (0, 'check=ok\nchild_spawned=1\nattempt_id=att-real\ncandidate_outcomes=[]\n',
+                 'check=failed\nreason=fallback-chain-exhausted\nattempt_id=att-forged\n'
+                 'candidate_outcomes=["PROMPT_SENTINEL"]\n', None, None),
+                (65, 'check=failed\nreason=unsafe-git-operation\nchild_spawned=0\n',
+                 'check=ok\nreason=fallback-chain-exhausted\n',
+                 'stage-advance-successor-start-failed', 'unsafe-git-operation'),
+                (1, '', 'PROMPT_SENTINEL argv=--token=ENV_SENTINEL\n',
+                 'stage-advance-successor-start-failed', 'wrapper exited without a typed refusal'),
+            ]
+            for code, stdout, stderr, reason, detail in cases:
+                with self.subTest(code=code):
+                    completed = SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+                    with mock.patch.object(SA.subprocess, 'run', return_value=completed):
+                        if reason:
+                            with self.assertRaises(SA.StageAdvanceError) as caught:
+                                services.start_successor(request, claim=claim, successor=node('b'),
+                                                         slug='slug', prompt_file=route_file)
+                            self.assertEqual(caught.exception.reason, reason)
+                            self.assertEqual(caught.exception.detail, detail)
+                        else:
+                            result = services.start_successor(request, claim=claim, successor=node('b'),
+                                                              slug='slug', prompt_file=route_file)
+                            self.assertTrue(result['child_spawned'])
+                            self.assertEqual(result['attempt_id'], 'att-real')
+                            self.assertEqual(result['raw']['candidate_outcomes'], '[]')
+                            self.assertNotIn('PROMPT_SENTINEL', json.dumps(result))
+        finally:
+            sandbox.close()
+
     def test_launch_compatibility_mismatch_reasons(self):
         for reason in ("launch-runtime-root-mismatch", "launch-compatibility-tuple-required"):
             with self.subTest(reason=reason):

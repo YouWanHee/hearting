@@ -67,6 +67,23 @@ class NestedEligibilityTest(unittest.TestCase):
              mock.patch.object(N.subprocess, "run", return_value=result):
             self.assertEqual(N.auth_check("codex"), (False, "auth-unavailable"))
 
+    def test_opencode_auth_accepts_v1_bullets_and_v2_stored_rows(self):
+        v1 = "\u250c  Credentials\n\u2502\n\u25cf  OpenCode Go api\n\u2514  1 credentials\n"
+        v2 = ("OpenCode Go       API key                     stored\n"
+              "OpenAI            OAuth                       stored\n")
+        for output in (v1, v2):
+            result = mock.Mock(returncode=0, stdout=output, stderr="")
+            with mock.patch.object(N.shutil, "which", return_value="/bin/opencode"), \
+                 mock.patch.object(N.subprocess, "run", return_value=result):
+                self.assertEqual(N.auth_check("opencode"), (True, ""))
+
+    def test_opencode_auth_rejects_listing_without_stored_credential(self):
+        for returncode, output in ((0, ""), (0, "No credentials\n"), (1, "OpenCode Go  API key  stored\n")):
+            result = mock.Mock(returncode=returncode, stdout=output, stderr="")
+            with mock.patch.object(N.shutil, "which", return_value="/bin/opencode"), \
+                 mock.patch.object(N.subprocess, "run", return_value=result):
+                self.assertEqual(N.auth_check("opencode"), (False, "auth-unavailable"))
+
     def test_auth_and_headless_checks_are_bounded(self):
         with mock.patch.object(N.shutil, "which", return_value="/bin/codex"), \
              mock.patch.object(

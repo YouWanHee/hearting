@@ -37,6 +37,60 @@ _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
+_MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
+_LEGACY_PENDING_RECEIPT_PROVENANCE = "validated-legacy-pending-receipt-v1"
+
+
+def _message_watch_ids(refs):
+    if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+        return None
+    return [ref[len("peer-watch:"):]
+            for ref in refs if ref.startswith("peer-watch:")]
+
+
+def _message_intent_matches_transfer(record, message):
+    if not isinstance(message, dict):
+        return False
+    intent = record.get("intent") or {}
+    observation = record.get("observation") or {}
+    ref = intent.get("ref") or observation.get("transfer_ref") or observation.get("ref")
+    if ref != message.get("ref"):
+        return False
+    original_ref = intent.get("delay_notice_for")
+    if original_ref and not intent.get("ref"):
+        body = intent.get("body")
+        return (isinstance(original_ref, str)
+                and re.fullmatch(r"[0-9a-f]{32}", original_ref) is not None
+                and record.get("id") == "delay-" + original_ref
+                and isinstance(body, str) and bool(body)
+                and intent.get("body_digest") == hashlib.sha256(body.encode("utf-8")).hexdigest()
+                and message.get("source_sha256") == hashlib.sha256(
+                    body.rstrip("\n").encode("utf-8")).hexdigest()
+                and message.get("refs") == ["delay-notice:" + original_ref, original_ref])
+    return (intent.get("body_digest") == message.get("body_sha256")
+            and intent.get("refs", []) == message.get("refs", []))
+
+
+def _with_current_message_watch_binding(message, binding, action, failure):
+    refs = message.get("refs", []) if isinstance(message, dict) else None
+    watch_ids = _message_watch_ids(refs)
+    if watch_ids is None:
+        return failure
+    watches = binding.get("watches") if isinstance(binding, dict) else None
+    if not watch_ids:
+        return failure if isinstance(watches, list) and watches else action()
+    if (not isinstance(watches, list)
+            or [watch.get("watch_id") for watch in watches if isinstance(watch, dict)] != watch_ids):
+        return failure
+    try:
+        import dispatch_seat_handover as handover
+        guard = handover.watch_delivery_binding_lock(binding)
+    except (ImportError, OSError, ValueError, RuntimeError):
+        return failure
+    with guard as current:
+        if not current:
+            return failure
+        return action()
 
 
 class ObligationError(ValueError):
@@ -1233,6 +1287,334 @@ class ObligationStore:
         finally:
             os.close(fd)
             self._invalidate_list_record(duty_id)
+
+    def update_message_checkpoint(self, duty_id: str, *, expected_revision: int,
+                                  state: str | None = None,
+                                  observation: dict | None = None,
+                                  result: str | None = None,
+                                  delivery: str | None = None,
+                                  cleanup: str | None = None,
+                                  skip_unchanged: bool = False) -> dict:
+        """Apply one message observation only to the row this pass inspected."""
+        if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
+            raise ObligationError("peer-obligation-state-invalid")
+        path = self._record_path(duty_id)
+        fd = self._lock(duty_id)
+        try:
+            record = _read_record(path)
+            if record is None:
+                raise ObligationError("peer-obligation-missing")
+            if (record.get("intent", {}).get("kind") != "message"
+                    or record.get("state") in {"complete", "cancelled"}
+                    or record.get("revision") != expected_revision):
+                return record
+            if result is not None and record.get("result") not in {None, result}:
+                raise ObligationError("peer-obligation-result-conflict")
+            if observation is not None:
+                current = record.get("observation") or {}
+                observation = dict(observation)
+                for key in ("native_receiving_turn", "native_request_context",
+                            "native_request_context_conflict", "continuation_prepared",
+                            "continuation_id", "continuation_source_turn",
+                            "continuation_source"):
+                    if key in current:
+                        observation[key] = current[key]
+            changed = False
+            for key, value in (("state", state), ("observation", observation),
+                               ("result", result), ("delivery", delivery),
+                               ("cleanup", cleanup)):
+                if value is not None and record.get(key) != value:
+                    record[key] = value
+                    changed = True
+            if skip_unchanged and not changed:
+                return record
+            record["revision"] = int(record.get("revision", 0)) + 1
+            record["updated_at"] = time.time()
+            _write_atomic(path, record)
+            return record
+        finally:
+            os.close(fd)
+            self._invalidate_list_record(duty_id)
+
+    def acknowledge_message_receipt(self, duty_id: str, message: dict,
+                                    recipient: dict) -> bool:
+        """Attach an exact receiver receipt without reopening a terminal duty."""
+        if not isinstance(message, dict) or message.get("state") != "received":
+            return False
+        ref = message.get("ref")
+        body_digest = message.get("body_sha256")
+        if not isinstance(ref, str) or not isinstance(body_digest, str):
+            return False
+        proof = message.get("exact_receiver_receipt")
+        binding = proof.get("recipient_binding") if isinstance(proof, dict) else None
+        effective = proof.get("effective_recipient") if isinstance(proof, dict) else None
+        if (not isinstance(proof, dict)
+                or (proof.get("receipt_type"), proof.get("provenance")) not in {
+                    ("exact-peer-ref", _MESSAGE_RECEIVER_PROVENANCE),
+                    ("exact-peer-ref", _LEGACY_PENDING_RECEIPT_PROVENANCE),
+                    ("exact-native-history", "validated-codex-native-history-v1"),
+                    ("exact-native-history", "validated-opencode-native-history-v1")}
+                or message.get("receipt") != proof.get("receipt_type")
+                or proof.get("transfer_ref") != ref
+                or proof.get("transfer_body_sha256") != body_digest
+                or not isinstance(binding, dict)
+                or not isinstance(effective, dict)
+                or any(effective.get(key) != recipient.get(key)
+                       for key in ("harness", "session_id"))
+                or (binding.get("recipient") or {}) != effective):
+            return False
+        path = self._record_path(duty_id)
+        if not path.exists():
+            return False
+
+        def mutate():
+            fd = self._lock(duty_id)
+            try:
+                record = _read_record(path)
+                if record is None:
+                    return False
+                intent = record.get("intent") or {}
+                observation = record.get("observation") or {}
+                expected_sender = intent.get("from") or {}
+                saved_sender = message.get("from") or {}
+                if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
+                        or not _message_intent_matches_transfer(record, message)
+                        or (expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
+                                                    for key in ("harness", "session_id")))):
+                    return False
+                if proof.get("receipt_type") == "exact-native-history":
+                    native_id = proof.get("actual_message_id")
+                    if (not isinstance(native_id, str) or not native_id
+                            or message.get("actual_message_id") != native_id):
+                        return False
+                original = intent.get("to") or {}
+                saved_target = message.get("to") or {}
+                target_keys = ("harness", "session_id", "pane_id")
+                if any(original.get(key) != saved_target.get(key) for key in target_keys):
+                    return False
+                watch_ids = _message_watch_ids(message.get("refs", []))
+                if watch_ids is None:
+                    return False
+                if not watch_ids:
+                    if original.get("harness") != recipient.get("harness"):
+                        return False
+                    pane_bound = original.get("session_id") is None
+                    if pane_bound:
+                        if (not original.get("pane_id")
+                                or recipient.get("pane_id") != original.get("pane_id")
+                                or not isinstance(recipient.get("session_id"), str)
+                                or not recipient.get("session_id")):
+                            return False
+                    elif original.get("session_id") != recipient.get("session_id"):
+                        return False
+                elif (not isinstance(binding.get("watches"), list)
+                        or [watch.get("watch_id") for watch in binding["watches"]
+                            if isinstance(watch, dict)] != watch_ids):
+                    return False
+                received = {
+                    "ref": ref,
+                    "body_digest": body_digest,
+                    "recipient": {key: recipient.get(key) for key in target_keys},
+                    "receipt": message.get("receipt"),
+                    "provenance": proof.get("provenance"),
+                    "recipient_binding": copy.deepcopy(binding),
+                    "received_at": message.get("received_at"),
+                }
+                if proof.get("notice_body_sha256") is not None:
+                    received["notice_body_sha256"] = proof["notice_body_sha256"]
+                updated_observation = dict(observation)
+                if updated_observation.get("receiver_receipt") == received \
+                        and record.get("delivery") == "acknowledged":
+                    return True
+                updated_observation["receiver_receipt"] = received
+                record["observation"] = updated_observation
+                record["delivery"] = "acknowledged"
+                if record.get("state") not in {"complete", "cancelled"}:
+                    if record.get("result") not in {None, "received"}:
+                        return False
+                    record["state"] = "complete"
+                    record["result"] = "received"
+                    record["cleanup"] = "complete"
+                record["revision"] = int(record.get("revision", 0)) + 1
+                record["updated_at"] = time.time()
+                _write_atomic(path, record)
+                return True
+            finally:
+                os.close(fd)
+                self._invalidate_list_record(duty_id)
+
+        return _with_current_message_watch_binding(message, binding, mutate, False)
+
+    def settle_message_transport(self, duty_id: str, message: dict, binding: dict) -> bool:
+        """Close transport only after the exact current watch holder durably ACKed."""
+        if (not isinstance(message, dict) or message.get("state") != "received"
+                or message.get("receipt") != "watch-receipt-displayed"):
+            return False
+        ref, body_digest = message.get("ref"), message.get("body_sha256")
+        if not isinstance(ref, str) or not isinstance(body_digest, str):
+            return False
+        refs = message.get("refs")
+        watch_ids = _message_watch_ids(refs)
+        watches = binding.get("watches") if isinstance(binding, dict) else None
+        recipient = binding.get("recipient") if isinstance(binding, dict) else None
+        if (not watch_ids or not isinstance(watches, list) or not isinstance(recipient, dict)
+                or [watch.get("watch_id") for watch in watches if isinstance(watch, dict)] != watch_ids):
+            return False
+        saved_binding = message.get("watch_receipt_binding")
+        if saved_binding is not None and saved_binding != binding:
+            return False
+        path = self._record_path(duty_id)
+        if not path.exists():
+            return False
+
+        def mutate():
+            try:
+                import dispatch_seat_handover as handover
+                if not handover.watch_acknowledgements_valid(binding):
+                    return False
+            except (ImportError, OSError, ValueError, RuntimeError):
+                return False
+            fd = self._lock(duty_id)
+            try:
+                record = _read_record(path)
+                if record is None:
+                    return False
+                intent = record.get("intent") or {}
+                observation = record.get("observation") or {}
+                if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
+                        or not _message_intent_matches_transfer(record, message)):
+                    return False
+                expected_sender, saved_sender = intent.get("from") or {}, message.get("from") or {}
+                if expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
+                                           for key in ("harness", "session_id")):
+                    return False
+                original, saved_target = intent.get("to") or {}, message.get("to") or {}
+                if any(original.get(key) != saved_target.get(key)
+                       for key in ("harness", "session_id", "pane_id")):
+                    return False
+                if (not isinstance(recipient.get("harness"), str)
+                        or not isinstance(recipient.get("session_id"), str)
+                        or not recipient.get("session_id")):
+                    return False
+                if record.get("delivery") == "acknowledged":
+                    return record.get("state") in {"complete", "cancelled"}
+                receipt = {
+                    "ref": ref,
+                    "recipient": dict(recipient),
+                    "receipt": "watch-receipt-displayed",
+                    "recipient_binding": copy.deepcopy(binding),
+                    "received_at": message.get("received_at"),
+                }
+                updated_observation = dict(observation)
+                if (updated_observation.get("watch_transport_receipt") == receipt
+                        and record.get("delivery") == "not-required"):
+                    return True
+                updated_observation["watch_transport_receipt"] = receipt
+                record["observation"] = updated_observation
+                record["delivery"] = "not-required"
+                record["cleanup"] = "complete"
+                if record.get("state") not in {"complete", "cancelled"}:
+                    record["state"] = "complete"
+                record["revision"] = int(record.get("revision", 0)) + 1
+                record["updated_at"] = time.time()
+                _write_atomic(path, record)
+                return True
+            finally:
+                os.close(fd)
+                self._invalidate_list_record(duty_id)
+
+        return _with_current_message_watch_binding(message, binding, mutate, False)
+
+    def cancel_message_delivery(self, duty_id: str, *, expected_revision: int,
+                                ref: str, body_digest: str, identity: dict,
+                                message: dict, evidence: dict) -> dict | None:
+        """Close only the exact still-current message delivery proven impossible."""
+        path = self._record_path(duty_id)
+
+        def mutate():
+            fd = self._lock(duty_id)
+            try:
+                record = _read_record(path)
+                if record is None:
+                    return None
+                intent = record.get("intent") or {}
+                observation = record.get("observation") or {}
+                if (record.get("state") in {"complete", "cancelled"}
+                        or record.get("revision") != expected_revision
+                        or intent.get("kind") != "message"
+                        or intent.get("handoff_acceptance")
+                        or ref != (message or {}).get("ref")
+                        or body_digest != (message or {}).get("body_sha256")
+                        or not _message_intent_matches_transfer(record, message)
+                        or intent.get("identity") != identity):
+                    return record
+                if (observation.get("native_receiving_turn")
+                        or observation.get("continuation_prepared")
+                        or record.get("delivery") == "acknowledged"):
+                    return record
+                original = intent.get("to") or {}
+                saved_target = (message or {}).get("to") or {}
+                if any(original.get(key) != saved_target.get(key)
+                       for key in ("harness", "session_id", "pane_id")):
+                    return record
+                if evidence.get("server") != (identity.get("server") or "default"):
+                    return record
+                if evidence.get("kind") not in {"recipient-session-absent", "first-input-process-dead"}:
+                    return record
+                endpoint = identity.get("server") or "default"
+                recipient_binding = evidence.get("recipient_binding")
+                effective = ((recipient_binding or {}).get("recipient")
+                             if isinstance(recipient_binding, dict) else None)
+                watch_ids = _message_watch_ids((message or {}).get("refs", []))
+                if watch_ids is None:
+                    return record
+                if watch_ids:
+                    if (not isinstance(recipient_binding, dict)
+                            or [watch.get("watch_id") for watch in recipient_binding.get("watches", [])
+                                if isinstance(watch, dict)] != watch_ids):
+                        return record
+                else:
+                    effective = (message or {}).get("bound_to") or original
+                if not isinstance(effective, dict):
+                    return record
+                if evidence.get("kind") == "recipient-session-absent":
+                    if (evidence.get("census_complete") is not True
+                            or evidence.get("session_absent") is not True
+                            or evidence.get("census_endpoint") != endpoint
+                            or evidence.get("session_id") != effective.get("session_id")
+                            or evidence.get("harness") != effective.get("harness")):
+                        return record
+                else:
+                    proof = (message or {}).get("first_input_process")
+                    if (evidence.get("process_disposition") != "dead"
+                            or evidence.get("process") != proof):
+                        return record
+                    if (effective.get("session_id") is not None
+                            and (evidence.get("census_complete") is not True
+                                 or evidence.get("session_absent") is not True
+                                 or evidence.get("census_endpoint") != endpoint
+                                 or evidence.get("recipient_session_id") != effective.get("session_id"))):
+                        return record
+                updated_observation = dict(observation)
+                updated_observation.update({
+                    "ref": ref,
+                    "reason": evidence["kind"],
+                    "terminal_evidence": dict(evidence),
+                })
+                record["state"] = "cancelled"
+                record["delivery"] = "failed"
+                record["cleanup"] = "complete"
+                record["observation"] = updated_observation
+                record["revision"] = int(record.get("revision", 0)) + 1
+                record["updated_at"] = time.time()
+                _write_atomic(path, record)
+                return record
+            finally:
+                os.close(fd)
+                self._invalidate_list_record(duty_id)
+
+        binding = evidence.get("recipient_binding") if isinstance(evidence, dict) else None
+        return _with_current_message_watch_binding(message, binding, mutate, None)
 
     def claim_phase(self, duty_id: str, expected: set[str], new_phase: str,
                     *, state: str = "pending", extra: dict | None = None) -> dict | None:
