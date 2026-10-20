@@ -23,6 +23,98 @@ import session_tidy as st
 
 
 class PaneOwnershipTest(unittest.TestCase):
+    def test_codex_runtime_skips_config_values_before_service_command(self):
+        cases = (
+            (["codex", "-c", "foo=app-server", "app-server"], True),
+            (["codex", "--config", "foo=app-server", "tui"], False),
+            (["codex", "--config=foo=app-server", "resume", "sid"], False),
+            (["codex", "--model", "app-server", "tui"], False),
+            (["codex", "--model", "o3", "app-server"], True),
+            (["codex", "tui", "prompt", "app-server"], False),
+        )
+        for argv, service in cases:
+            with self.subTest(argv=argv), mock.patch.object(
+                    Path, "read_bytes",
+                    return_value=b"\0".join(part.encode() for part in argv) + b"\0"):
+                self.assertEqual(po._runtime(123), ("codex", service))
+
+    def test_codex_daemon_binding_ignores_inherited_pane_and_fails_closed(self):
+        sid = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        binding = {"pid": 1234, "pid_start": "77", "session_id": sid,
+                   "pane": "w:p1", "socket_path": "/tmp/herdr.sock"}
+        with mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(po, "_caller_runtime", return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_tui_process_bindings", return_value=[binding]), \
+                mock.patch.object(po, "_process", return_value=(1234, 1, 1, 0, 0, "77")):
+            got = po.codex_caller_binding(sid, pid=99, environ={
+                "CODEX_THREAD_ID": sid, "HERDR_PANE_ID": "foreign", "HERDR_SOCKET_PATH": "/tmp/foreign"})
+        self.assertEqual(got, binding)
+        with mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(po, "_caller_runtime", return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_tui_process_bindings", return_value=[binding, dict(binding, pane="w:p2")]):
+            self.assertIsNone(po.codex_caller_binding(
+                sid, pid=99, environ={"CODEX_THREAD_ID": sid, "HERDR_PANE_ID": "w:p1"}))
+
+    def test_pane_seat_from_binding_uses_the_bound_socket_not_inherited_environment(self):
+        binding = {"pid": 1, "pid_start": "2", "session_id": "t-A",
+                   "pane": "w:p1", "socket_path": "/run/herdr/one.sock"}
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/other.sock"}):
+            seat = st.pane_seat_from_binding(binding)
+        expected_endpoint = st._endpoint_scope({"HERDR_SOCKET_PATH": binding["socket_path"]})
+        self.assertEqual((seat.pane, seat.endpoint, seat.socket_path),
+                         ("w:p1", expected_endpoint, binding["socket_path"]))
+        self.assertNotEqual(seat.key, st._pane_seat_of("w:p1").key)
+
+    def test_daemon_enqueue_and_start_hook_share_bound_endpoint(self):
+        import session_tidy_clear as clear
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        successor = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+        bindings = {
+            current: {"pid": 1234, "pid_start": "77", "session_id": current,
+                      "pane": "w:p1", "socket_path": "/run/herdr/actual.sock"},
+            successor: {"pid": 1234, "pid_start": "77", "session_id": successor,
+                        "pane": "w:p1", "socket_path": "/run/herdr/actual.sock"},
+        }
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(temp) / "state"),
+                                             "XDG_CONFIG_HOME": str(Path(temp) / "config"),
+                                             "CODEX_THREAD_ID": current, "HERDR_PANE_ID": "foreign-pane",
+                                             "HERDR_SOCKET_PATH": "/run/herdr/foreign.sock"}, clear=True), \
+                mock.patch.object(po, "_caller_runtime",
+                                  return_value=((99, 1, 1, 0, 0, "1"), True)), \
+                mock.patch.object(po, "codex_caller_binding", side_effect=lambda sid, **_kw: bindings.get(sid)), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("codex", temp, sid=current)
+            self.assertEqual((seat.kind, seat.pane, seat.socket_path),
+                             ("pane", "w:p1", "/run/herdr/actual.sock"))
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "codex", current, "앞 세대 카드", cwd=temp)
+            self.assertEqual(clear.schedule_for_enqueue(seat, "codex", current, temp), "clear=scheduled")
+            request = clear.read_reservation(seat.key)
+            self.assertEqual(request["herdr_transport"], {"socket_path": "/run/herdr/actual.sock"})
+            os.environ["CODEX_THREAD_ID"] = successor
+            shown = []
+            text = st.run_hook("codex", "start", successor, source="clear", cwd=temp, emit=shown.append)
+            self.assertIn("앞 세대 카드", text)
+            self.assertEqual(st.resolve_seat("codex", temp, sid=successor).key, seat.key)
+
+    def test_confirmed_clear_lookup_uses_the_booking_endpoint(self):
+        import session_tidy_clear as clear
+        binding = {"pid": 1234, "pid_start": "77", "session_id": "thread-A",
+                   "pane": "w:p1", "socket_path": "/run/herdr/booked.sock"}
+        seat = st.pane_seat_from_binding(binding)
+        booking = {"harness": "codex", "status": "cleared", "new_session": "thread-B",
+                   "seat": seat.as_dict()}
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(temp) / "state"),
+                                             "HERDR_SOCKET_PATH": "/run/herdr/inherited.sock"}, clear=True), \
+                mock.patch.object(clear, "clear_dir", return_value=Path(temp)), \
+                mock.patch.object(clear, "read_reservation", return_value=booking):
+            (Path(temp) / f"{seat.key}.json").write_text("{}")
+            self.assertEqual(st._cleared_into("thread-B"), ["w:p1"])
+            self.assertEqual(st._pane_seat_of("w:p1", endpoint=seat.endpoint).key, seat.key)
+
     def test_import_adds_tools_path_for_isolated_utilities_entrypoint(self):
         utilities = str(ROOT / "utilities")
         script = (
