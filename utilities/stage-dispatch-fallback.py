@@ -48,15 +48,19 @@ from dispatch_lifecycle import (  # noqa: E402
     run_forwarding_termination,
     select_launch_lifecycle,
 )
-# Spawn-confirm window: how long a `--start` call may synchronously watch a
-# healthy child before it owes its caller a launch receipt.
-DIRECT_TIMEOUT_DEFAULT = 45.0
+# Spawn wait accommodates the observed slow adapter startup. Healthy children
+# still receive a launch receipt after the separate short confirmation window.
+DIRECT_TIMEOUT_DEFAULT = 300.0
+LAUNCH_CONFIRM_DEFAULT = 45.0
+DIRECT_TIMEOUT_UNSTARTED_REASON = "direct-timeout-proven-never-started"
 
 from dispatch_contract import (  # noqa: E402
     PRELAUNCH_PROCESS_BLOCK_REASONS,
     ROUTE_STATE_REFUSAL_REASONS,
     DispatchContractError,
+    attempt_row_never_started,
     attempt_process_quiescence,
+    close_attempt_row_if,
     parse_registry_metadata,
     resolve_agent_home,
     resolve_dispatch_state_root,
@@ -904,7 +908,9 @@ def registry_route_rows(jobs: Path, route_ids) -> list[dict[str, str]]:
         metadata = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
         if metadata.get("route_id") not in wanted:
             continue
-        rows.append({**metadata, "_status": fields[1], "_slug": fields[4], "_order": str(order)})
+        rows.append({**metadata, "_status": fields[1], "_slug": fields[4],
+                     "_order": str(order),
+                     "_never_started": attempt_row_never_started(fields)})
     return rows
 
 
@@ -922,7 +928,7 @@ def own_registered_attempt(args: argparse.Namespace, route: dict, node: dict) ->
     if args.action != "start":
         return None
     rows = [row for row in registry_rows(args.jobs, route["route_id"], node["id"])
-            if row["_status"] == "open" and row.get("launch_claimed") == "0" and not row.get("pid")
+            if row["_status"] == "open" and row.get("_never_started") is True
             and row["_slug"] == args.slug and row.get("parent_attempt_id", "") == (args.parent_attempt_id or "")]
     return rows[0].get("attempt_id") if len(rows) == 1 else None
 
@@ -954,6 +960,57 @@ def registry_has_attempt(jobs: Path, attempt_id: str) -> bool:
         if metadata.get("attempt_id") == attempt_id:
             return True
     return False
+
+
+def settle_direct_timeout_attempt(jobs: Path, route: dict, node: dict, attempt_id: str) -> str:
+    """Return absent, unstarted, or unknown for one exact timed-out launch row.
+
+    A live registration is closed only by the shared jobs-lock primitive, which
+    rechecks its route identity and the canonical never-started fence predicate.
+    """
+    try:
+        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "unknown" if jobs.exists() else "absent"
+    matches = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == attempt_id:
+            matches.append((fields, metadata))
+    if not matches:
+        return "absent"
+    if len(matches) != 1:
+        return "unknown"
+    fields, metadata = matches[0]
+    if (metadata.get("route_id") != route.get("route_id")
+            or metadata.get("route_node") != node.get("id")):
+        return "unknown"
+    if (fields[1] in {"done", "killed", "cancelled"}
+            and attempt_row_never_started(fields)
+            and metadata.get("note") == "never-launched"
+            and metadata.get("reconcile_reason") == DIRECT_TIMEOUT_UNSTARTED_REASON):
+        return "unstarted"
+    if fields[1] not in {"open", "running"} or not attempt_row_never_started(fields):
+        return "unknown"
+
+    def still_exact_unstarted(current):
+        current_meta = parse_registry_metadata(current[5])
+        return (current_meta.get("attempt_id") == attempt_id
+                and current_meta.get("route_id") == route.get("route_id")
+                and current_meta.get("route_node") == node.get("id")
+                and current[1] in {"open", "running"}
+                and attempt_row_never_started(current))
+
+    closed = close_attempt_row_if(
+        jobs, attempt_id, "never-launched", still_exact_unstarted,
+        evidence={"launch_outcome": "never-launched",
+                  "reconcile_reason": DIRECT_TIMEOUT_UNSTARTED_REASON,
+                  "failure_class": "cancelled"},
+    )
+    return "unstarted" if closed else "unknown"
 
 
 def _report_launched(args, route, node, allocation_context, row, hop, ordinal, attempt_id,
@@ -1235,6 +1292,33 @@ def retry_attempt_identity(failed_attempt_id: str) -> str:
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return "att-" + digest[:48]
+
+
+def retry_proven_unstarted_identity(
+    jobs: Path, route_id: str, node_id: str, attempt_id: str
+) -> str:
+    """Advance past exact terminal identities closed after a proven no-start timeout.
+
+    Open registrations remain reusable by register/start. Only the specific
+    lock-closed timeout outcome advances identity; real failures, parent
+    cancellations, and uncertain rows keep their existing retry policy.
+    """
+    current = attempt_id
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        matches = [row for row in registry_rows(jobs, route_id, node_id)
+                   if row.get("attempt_id") == current]
+        if len(matches) != 1:
+            return current
+        row = matches[0]
+        if (row.get("_status") not in {"done", "killed", "cancelled"}
+                or row.get("_never_started") is not True
+                or row.get("note") != "never-launched"
+                or row.get("reconcile_reason") != DIRECT_TIMEOUT_UNSTARTED_REASON):
+            return current
+        current = retry_attempt_identity(current)
+    return current
 
 
 def capacity_attempt_identity(args, route, node, row, ordinal, model):
@@ -1547,10 +1631,10 @@ def launch_confirm_deadline_seconds(args) -> float:
     (`progress_window_seconds * watchdog_max_windows`, 300*12 = 1h by default),
     so a detached child that stayed healthy kept the launcher polling for an
     hour and the owner's foreground call died before ever seeing
-    `registered=1/started=1/child_spawned=1`. Bound it by the spawn-confirm
-    window (`--direct-timeout`) instead: early death and capacity death still
-    surface here, while everything after launch belongs to the watchdog,
-    orphan watch, and the completion supervisor.
+    `registered=1/started=1/child_spawned=1`. Keep it bounded by the internal
+    launch-confirm ceiling even when `--direct-timeout` is extended for slow
+    spawn: early death and capacity death still surface here, while everything
+    after launch belongs to the watchdog, orphan watch, and completion supervisor.
     """
 
     budget = max(0.1, float(args.progress_window_seconds)) * max(
@@ -1559,7 +1643,7 @@ def launch_confirm_deadline_seconds(args) -> float:
     confirm = float(getattr(args, "direct_timeout", None) or DIRECT_TIMEOUT_DEFAULT)
     if confirm <= 0:
         return budget
-    return min(budget, confirm)
+    return min(budget, confirm, LAUNCH_CONFIRM_DEFAULT)
 
 
 def live_attempt_row(jobs: Path, route_id: str, node_id: str, attempt_id: str):
@@ -2429,6 +2513,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 if args.automatic_retry_of and attempt_id == args.automatic_retry_of:
                     # This very tuple just failed: its successor is a new attempt.
                     attempt_id = retry_attempt_identity(attempt_id)
+                attempt_id = retry_proven_unstarted_identity(
+                    args.jobs, route["route_id"], node["id"], attempt_id)
                 legacy_reason = legacy_parent_generation_conflict(
                     args.jobs,
                     legacy_attempt_identity(args, route, node, row, ordinal),
@@ -2543,9 +2629,18 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                                         **_last_failure_fields(direct_failures), **extra)
                 except subprocess.TimeoutExpired as exc:
                     attempts.append(f"{ordinal}:{key}:direct-timeout:attempt-{attempt_id}")
+                    timeout_state = settle_direct_timeout_attempt(
+                        args.jobs, route, node, attempt_id)
+                    if timeout_state == "unstarted":
+                        _candidate_outcome(
+                            candidate_outcomes, ordinal, key, attempted=False,
+                            reason="direct-timeout-before-launch-fence",
+                            detail="the exact unclaimed registration was closed under the jobs lock",
+                        )
+                        continue
                     _failed_attempt(candidate_outcomes, direct_failures, ordinal, key,
                                     attempt_id, "timeout", "direct-timeout", "wrapper timed out")
-                    if registry_has_attempt(args.jobs, attempt_id):
+                    if timeout_state == "unknown":
                         record_degradation(
                             route_id=route.get("route_id"), route_node=node.get("id"),
                             route_hash=route.get("route_hash"),

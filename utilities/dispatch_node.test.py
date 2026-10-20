@@ -1124,6 +1124,27 @@ class ReviewRoundCapTest(unittest.TestCase):
             prior = N.prior_round_attempts(jobs, "rt-fixture", "plan-check")
         self.assertEqual(len(prior), 2)
 
+    def test_unstarted_registration_residue_does_not_spend_or_bind_rounds(self):
+        registrations = "".join(
+            f"2026-10-01T00:00:0{i}Z\topen\t/repo\t/wt\tstage\t"
+            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            f"route_id=rt-fixture,route_node=plan-check,attempt_id=att-unstarted-{i},"
+            "launch_claimed=0\n"
+            for i in (1, 2)
+        )
+        code, printed = self._run("plan-check", 0, rows=registrations)
+        self.assertEqual(code, 0, printed)
+        self.assertNotIn("review-round-budget-exhausted", "\n".join(printed))
+        self.assertNotIn("review-verdictless-bound", "\n".join(printed))
+
+        # The residue adds no rounds, while the real blocking verdict still
+        # consumes exactly one unit and opens the ordinary correction round.
+        rows = self._rows("plan-check", 1) + registrations
+        code, printed = self._run("plan-check", 1, rows=rows)
+        self.assertEqual(code, 0, printed)
+        self.assertIn("correction_round=2", printed)
+
     def test_exact_attempt_exclusion_keeps_older_rounds_with_the_same_slug(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"

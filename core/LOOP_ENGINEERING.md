@@ -208,6 +208,13 @@ refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no
 supported way forward is a defect in the path, not a task for the operator.
 
+An attempt registration is not work that reached the launch fence. Round
+censuses and completion conflict checks use the shared never-started proof, so
+an unclaimed row with no PID or started evidence cannot consume a work round or
+hold a completed result open. Timeout cleanup closes only that exact row while
+the proof still holds under the registry lock; claimed, identified, started,
+and unobservable rows remain with reconciliation.
+
 A caller-identity refusal records who may not launch; it does not settle the
 existing recovery duty. An explicit start may re-enter the same exact claim
 when its successor has no row or has launch-fence proof that it never started,

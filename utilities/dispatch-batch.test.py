@@ -4262,6 +4262,43 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
 
 
 
+class NeverStartedBatchRoundAdmissionTest(unittest.TestCase):
+    def test_multiple_unstarted_registrations_do_not_block_batch_admission(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            route = {
+                "route_id": "rt-batch-unstarted",
+                "effective_intensity": "standard",
+                "continuation_budget": {"review_round_cap": 2},
+                "nodes": [],
+            }
+            node = {"id": "plan-check", "kind": "pipeline-stage", "depends_on": []}
+            rows = []
+            for index in (1, 2):
+                metadata = (
+                    "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                    "execution_surface=registered-headless,registered_worker=1,"
+                    f"route_id={route['route_id']},route_node={node['id']},"
+                    f"attempt_id=att-batch-unstarted-{index},launch_claimed=0"
+                )
+                rows.append(
+                    f"2026-10-01T00:00:0{index}Z\topen\t/r\t/w\ts\t{metadata}"
+                )
+            jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+            prior = BATCH.DISPATCH_NODE.prior_round_attempts(
+                jobs, route["route_id"], node["id"]
+            )
+            admission = BATCH.DISPATCH_NODE.admit_round(
+                route, node, jobs, owner_attempt_id="att-batch-owner"
+            )
+
+            self.assertEqual(prior, [])
+            self.assertEqual(admission.budget.state, "admit")
+            self.assertEqual(admission.budget.verdict_rounds, 0)
+            self.assertEqual(admission.budget.verdictless_streak, 0)
+
+
 class NodeLaunchCommandTest(unittest.TestCase):
     """`--qa` is dispatch-node.py's own option; after `--` it is refused as an override."""
 
