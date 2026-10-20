@@ -58,6 +58,128 @@ class AttemptViewTests(unittest.TestCase):
         for value in ("not-json", "3", "[]", "{}", 7, ["x"]):
             self.assertTrue(view.format_record("claude", value))
 
+    def test_opencode_run_json_part_envelopes(self):
+        tool = view.format_record("opencode", {"type": "tool_use", "part": {
+            "tool": "read", "callID": "c1", "state": {
+                "status": "completed", "input": {"path": "a"}, "output": "one\ntwo"}}})
+        self.assertEqual([line.kind for line in tool], ["tool", "output"])
+        self.assertIn("one\ntwo", tool[1].text)
+        receipt = view.format_record("opencode", {"type": "tool_use", "part": {
+            "tool": "bash", "callID": "c2", "state": {"status": "running"}}})
+        self.assertEqual(len(receipt), 1)
+        self.assertIn("tool bash running", receipt[0].text)
+        self.assertEqual(view.format_record("opencode", {"type": "step_start", "part": {}}), [])
+        self.assertEqual(len(view.format_record("opencode", {"type": "step_finish", "part": {
+            "reason": "done", "tokens": {"input": 2, "output": 3}}})), 1)
+        self.assertEqual(view.format_record("opencode", {"type": "text", "part": {"text": "reply"}})[0].kind,
+                         "message")
+        self.assertEqual(view.format_record("opencode", {"type": "user", "part": {"text": "prompt"}})[0].kind,
+                         "prompt")
+        self.assertEqual(view.format_record("opencode", {"type": "reasoning", "part": {"text": "why"}})[0].kind,
+                         "thinking")
+
+    def test_opencode_v1_and_v2_rows_share_run_json_normalizer(self):
+        v1 = {"cursor": 4, "role": "assistant", "data": {"type": "tool", "tool": "read",
+              "callID": "c1", "state": {"status": "completed", "input": {"path": "a"},
+              "output": "v1\noutput"}}}
+        v2 = {"cursor": 5, "role": "assistant", "data": {"content": [{"type": "tool", "id": "c2",
+              "name": "read", "state": {"status": "completed", "input": {"path": "b"},
+              "content": [{"type": "text", "text": "v2\noutput"}]}}]}}
+        normalized_v1 = view.normalize_opencode_db_row(v1, "v1")
+        normalized_v2 = view.normalize_opencode_db_row(v2, "v2")
+        self.assertEqual(normalized_v1[0]["type"], "tool_use")
+        self.assertEqual(normalized_v2[0]["type"], "tool_use")
+        for event, expected in ((normalized_v1[0], "v1\noutput"), (normalized_v2[0], "v2\noutput")):
+            lines = view.format_record("opencode", event)
+            self.assertEqual(lines[-1].kind, "output")
+            self.assertIn(expected, lines[-1].text)
+
+    def test_claude_hidden_attachment_and_rate_limit_shapes(self):
+        for kind in ("last-prompt", "atis-latch", "mode", "api-request", "api-request-shape"):
+            self.assertEqual(view.format_record("claude", {"type": kind, "private": "secret"}), [])
+        self.assertEqual(view.format_record("claude", {"type": "assistant", "message": {
+            "content": [{"type": "thinking", "thinking": ""}]}}), [])
+        attachment = {"type": "attachment", "attachment": {"type": "image", "data": "private-email"}}
+        self.assertEqual(view.format_record("claude", attachment), [view.Line("attachment", "attachment: image")])
+        import contextlib, io
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): view._format_present("claude", [json.dumps(attachment)], {}, full=False)
+        self.assertNotIn("private-email", output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): view._format_present("claude", [json.dumps(attachment)], {}, full=True)
+        self.assertIn("private-email", output.getvalue())
+        rate = view.format_record("claude", {"type": "rate_limit_event", "status": "limited", "resets_at": 123})
+        self.assertEqual(len(rate), 1)
+        self.assertIn("limited", rate[0].text)
+        self.assertIn("123", rate[0].text)
+
+    def test_codex_known_event_shapes_never_fall_through_unknown(self):
+        records = [
+            {"type": "error", "message": "outer error"},
+            {"type": "turn.failed", "message": "failed"},
+            {"type": "item.completed", "item": {"type": "error", "message": "item error"}},
+            {"type": "item.completed", "item": {"type": "file_change", "changes": [
+                {"path": "src/a.py", "kind": "add"}]}},
+            {"type": "webSearch", "query": "query text"},
+            {"type": "item.completed", "item": {"type": "fileChange", "files": [
+                {"new_path": "src/b.py", "status": "modify"}]}},
+            {"type": "web_search", "search_query": "snake query"},
+            {"type": "item.completed", "item": {"type": "reasoning", "id": "hidden-id"}},
+            {"type": "item.completed", "item": {"type": "userMessage", "id": "u1"}},
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.started", "turn_id": "t1"},
+            {"type": "turn.completed", "turn_id": "t1"},
+        ]
+        records += [{"type": "item.completed", "item": {"type": kind, "id": "id1", "detail": "x"}}
+                    for kind in ("sleep", "contextCompaction", "imageView", "subAgentActivity",
+                                 "collabAgentToolCall", "mcpToolCall")]
+        for record in records:
+            lines = view.format_record("codex", record)
+            if record is records[7]:
+                self.assertEqual(lines, [])  # Empty reasoning is deliberately hidden.
+                continue
+            self.assertTrue(lines, record)
+            self.assertTrue(all(line.kind != "unknown" for line in lines), record)
+        self.assertNotIn("hidden-id", " ".join(line.text for line in view.format_record("codex", records[7])))
+        self.assertIn("src/a.py", " ".join(line.text for line in view.format_record("codex", records[3])))
+        self.assertIn("query text", " ".join(line.text for line in view.format_record("codex", records[4])))
+        self.assertIn("src/b.py", " ".join(line.text for line in view.format_record("codex", records[5])))
+        self.assertIn("snake query", " ".join(line.text for line in view.format_record("codex", records[6])))
+
+    def test_unknown_presentation_is_bounded_but_full_formatter_is_not(self):
+        record = {"type": "future-event", "payload": "x" * 500}
+        line = view.format_record("claude", record)[0]
+        self.assertEqual(len(line.text), len("· future-event ") + len(json.dumps(record, ensure_ascii=False, separators=(",", ":"))))
+        import contextlib, io
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): view._present([line])
+        shown = output.getvalue().rstrip("\n")
+        self.assertLessEqual(len(shown.split("… (+")[0]), 300)
+        self.assertIn(f"(+{len(line.text) - 300}자 생략", shown)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): view._present([line], full=True)
+        self.assertIn("x" * 500, output.getvalue())
+
+    def test_supervisor_banner_uses_parsed_envelope_type_only(self):
+        self.assertFalse(view._has_session_envelope(['{"type":"message","text":"supervisor.session"}']))
+        self.assertTrue(view._has_session_envelope(['{"type":"dispatch.supervisor.session-announced"}']))
+
+    def test_codex_never_gets_cleaned_native_transcript_banner(self):
+        import contextlib, io, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "owner.jsonl"
+            path.write_text('{"type":"message","text":"supervisor.session"}\n')
+            source = view.Source(path, "codex")
+            candidate = (Path(folder), ["2026", "done", "repo", folder, "owner", ""],
+                         {"attempt_id": "att-codex", "harness": "codex"})
+            output = io.StringIO()
+            with mock.patch.object(view, "_attempt_prefix_matches", return_value=[candidate]), \
+                 mock.patch.object(view, "resolve_sources", return_value=([source], None)), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(view.main(["att-codex"]), 0)
+            self.assertNotIn("감독 기록만 남음", output.getvalue())
+
     def test_control_sequence_and_secret_matrix(self):
         for value in ("\x1b]8;;https://a\x07link\x1b]8;;\x07", "\x1b]52;c;secret\x1b\\",
                       "\x1bPsecret\x1b\\", "\x9d52;c;secret\x9c", "\x90x\x9c",
@@ -404,7 +526,9 @@ class LocalSamples(unittest.TestCase):
                                 if line.kind == "unknown":
                                     unknown+=1
                                     name = (record.get("type") or record.get("kind") or record.get("method") or "unknown") if isinstance(record, dict) else "non-object"
-                                    unknown_types[str(name)] += 1
+                                    item = record.get("item") if isinstance(record, dict) and isinstance(record.get("item"), dict) else {}
+                                    subtype = item.get("type") or "-"
+                                    unknown_types[(harness, str(name), str(subtype))] += 1
                         except Exception:
                             formatter_errors+=1
                             print(f"formatter: exception: {path}:{number}")
@@ -413,7 +537,9 @@ class LocalSamples(unittest.TestCase):
                 print(f"unreadable: disappeared or unreadable path: {path}:1")
         print(f"LocalSamples files={len(files)} lines={total} non_json={non_json} unknown={unknown} "
               f"unreadable={len(unreadable)} formatter_exceptions={formatter_errors} sanitizer_findings={unsafe}")
-        print("LocalSamples top_unknown=" + ", ".join(f"{name}:{count}" for name, count in unknown_types.most_common(10)))
+        print("LocalSamples top_unknown=" + ", ".join(
+            f"{harness}/{name}/{subtype}:{count}"
+            for (harness, name, subtype), count in unknown_types.most_common(15)))
         self.assertGreater(len(files), 0)
         self.assertEqual(formatter_errors, 0)
         self.assertEqual(unsafe, 0)

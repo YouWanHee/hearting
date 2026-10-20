@@ -164,7 +164,8 @@ def _compact(value: object) -> str:
 
 _HIDDEN_TYPES = {"token_usage", "thinking_tokens", "tool_progress", "api-request-blob",
                  "cost-state", "queue-operation", "dispatch.supervisor.token_usage",
-                 "supervisor.token_usage"}
+                 "supervisor.token_usage", "last-prompt", "atis-latch", "mode",
+                 "api-request", "api-request-shape"}
 
 
 def _supervisor_type(kind):
@@ -203,7 +204,14 @@ def format_record(harness: str, record: object) -> list[Line]:
         add("notice", record.get("text") or record.get("reason"), "notice")
     elif harness == "claude":
         message = record.get("message") if isinstance(record.get("message"), dict) else record
-        if kind in ("assistant", "user") or record.get("message"):
+        if kind == "attachment":
+            attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else record
+            add("attachment", attachment.get("type") or "unknown", "attachment")
+        elif kind == "rate_limit_event":
+            fields = [f"{key}={record[key]}" for key in ("status", "resets_at", "reset_at", "resetsAt", "resetAt", "rate_limit_type")
+                      if record.get(key) is not None]
+            add("rate_limit_event", " ".join(fields) or "status unknown", "notice")
+        elif kind in ("assistant", "user") or record.get("message"):
             content = message.get("content")
             if isinstance(content, str):
                 add("assistant" if kind == "assistant" else "user", content, "message" if kind == "assistant" else "prompt")
@@ -217,29 +225,101 @@ def format_record(harness: str, record: object) -> list[Line]:
                     elif ptype == "tool_use":
                         add("tool " + str(part.get("name", "")), part.get("input"), "tool")
                     elif ptype == "tool_result": add("tool output", part.get("content"), "output")
+                    elif ptype == "attachment": add("attachment", part.get("type") or "unknown", "attachment")
                     else: add(str(ptype or "content"), part, "unknown")
         elif kind == "result": add("result", record, "result")
     elif harness == "codex":
         item = record.get("item") if isinstance(record.get("item"), dict) else record
         itype = str(item.get("type") or kind)
-        if itype in ("agent_message", "user_message", "userMessage"):
+        if kind in ("error", "turn.failed") or itype == "error":
+            message = (record.get("message") or record.get("error") or record.get("reason")
+                       or item.get("message") or item.get("error") or item.get("text"))
+            add("error", message or "Codex reported an error", "notice")
+        elif itype in ("agent_message", "user_message", "userMessage"):
             add("assistant" if "agent" in itype else "user", item.get("text") or item.get("message"), "message" if "agent" in itype else "prompt")
+            if not result:
+                add("userMessage", "본문 없음", "prompt")
         elif itype in ("command_execution", "commandExecution"):
             add("command", item.get("command") or item.get("cmd"), "tool")
             add("output", item.get("aggregated_output") or item.get("aggregatedOutput") or item.get("output"), "output")
-            add("exit", item.get("exit_code") or item.get("exitCode"), "result")
-        elif itype in ("reasoning", "file_change", "fileChange"):
-            add(itype, item.get("text") or item.get("id") or "본문 없음", "unknown")
+            exit_code = item.get("exit_code") if item.get("exit_code") is not None else item.get("exitCode")
+            add("exit", exit_code, "result")
+        elif itype in ("reasoning",):
+            add("reasoning", item.get("text"), "thinking")
+        elif itype in ("file_change", "fileChange"):
+            changes = item.get("changes") or item.get("files")
+            if isinstance(changes, list) and changes:
+                for change in changes:
+                    if isinstance(change, dict):
+                        path = (change.get("path") or change.get("file") or change.get("filename")
+                                or change.get("new_path") or change.get("old_path"))
+                        kind_name = (change.get("kind") or change.get("type") or change.get("change_type")
+                                     or change.get("status"))
+                        add("file change", " ".join(str(x) for x in (kind_name, path) if x), "result")
+                    else:
+                        add("file change", change, "result")
+            else:
+                add("file change", item.get("text") or item.get("id") or "change recorded", "result")
+        elif itype in ("web_search", "webSearch"):
+            add("web search", item.get("query") or item.get("search_query") or item.get("searchQuery") or item.get("text"), "tool")
+        elif kind in ("thread.started", "turn.started", "turn.completed"):
+            add(kind, record.get("thread_id") or record.get("turn_id") or record.get("status") or "", "result")
+            if not result: result.append(Line("result", kind))
+        elif itype in ("sleep", "contextCompaction", "imageView", "subAgentActivity",
+                       "collabAgentToolCall", "mcpToolCall"):
+            keys = {
+                "sleep": ("duration_ms", "durationMs", "duration", "ms"),
+                "contextCompaction": ("summary", "reason", "trigger", "tokens"),
+                "imageView": ("path", "url", "detail"),
+                "subAgentActivity": ("agent_id", "agentId", "status", "message"),
+                "collabAgentToolCall": ("tool", "name", "status", "call_id", "callId"),
+                "mcpToolCall": ("server", "tool", "name", "status"),
+            }[itype]
+            fields = [f"{key}={_compact(item[key])[:100]}" for key in keys if item.get(key) is not None]
+            detail = " ".join(fields)[:240] if fields else "recorded"
+            add(itype, detail, "result")
         elif "text" in item:
             add(itype, item.get("text"), "message")
     elif harness == "opencode":
-        if kind in ("text", "message", "assistant", "user"): add(kind, record.get("text") or record.get("content"), "prompt" if kind == "user" else "message")
+        part = record.get("part") if isinstance(record.get("part"), dict) else record
+        if kind in ("text", "message", "assistant", "user"):
+            value = part.get("text") or part.get("content")
+            add(kind, value, "prompt" if kind == "user" else "message")
         elif kind in ("tool_use", "tool"):
-            add("tool " + str(record.get("name") or record.get("tool") or ""), record.get("input"), "tool")
-            add("output", record.get("output") or record.get("state"), "output")
-        elif kind in ("reasoning", "step-start", "step-finish", "result"):
-            add(kind, record.get("text") or record, "thinking" if kind == "reasoning" else kind)
-    if not result and kind not in ("system", "init", "heartbeat"):
+            state = part.get("state") if isinstance(part.get("state"), dict) else part
+            name = part.get("name") or part.get("tool") or ""
+            status = state.get("status")
+            tool_input = state.get("input")
+            if tool_input is not None:
+                add("tool " + str(name), tool_input, "tool")
+            elif status is not None:
+                result.append(Line("result", sanitize(f"tool {name} {status}")))
+            output = state.get("output") or state.get("error")
+            if isinstance(output, dict): output = output.get("message") or output.get("text") or _compact(output)
+            if isinstance(output, list):
+                output = "\n".join(str(block.get("text", "")) for block in output
+                                    if isinstance(block, dict) and block.get("type") == "text")
+            add("output", output, "output")
+        elif kind in ("step_start", "step-start"):
+            pass
+        elif kind in ("step_finish", "step-finish"):
+            state = part.get("state") if isinstance(part.get("state"), dict) else part
+            reason = state.get("reason") or part.get("reason")
+            totals = state.get("tokens") or part.get("tokens") or state.get("cost") or part.get("cost")
+            summary = " ".join(str(value) for value in (reason, totals) if value not in (None, "", {}))
+            add("step_finish", summary or "completed", "result")
+        elif kind == "reasoning":
+            add("thinking", part.get("text") or part.get("reason"), "thinking")
+        elif kind == "result":
+            add("result", part.get("text") or part.get("message") or part.get("status") or "completed", "result")
+    silent = (kind in ("system", "init", "heartbeat", "step_start", "step-start")
+              or harness == "claude" and kind == "assistant"
+              and isinstance(message.get("content"), list)
+              and all(isinstance(part, dict) and part.get("type") == "thinking"
+                      and not part.get("thinking") for part in message["content"])
+              or harness == "codex" and itype == "reasoning"
+              or kind in _HIDDEN_TYPES)
+    if not result and not silent:
         result.append(Line("unknown", sanitize(f"· {kind} {_compact(record)}")))
     return result
 
@@ -372,7 +452,7 @@ def _announced(log, attempt):
         except (ValueError, TypeError): continue
         if not isinstance(row, dict): continue
         typ = str(row.get("type", ""))
-        if "supervisor.session" in typ or typ in ("dispatch.supervisor.session", "session"):
+        if _supervisor_type(typ) in ("session", "session.announced"):
             if row.get("parent_attempt_id") not in (None, attempt): continue
             sid = row.get("session_id") or row.get("sessionId") or row.get("sid")
             event_cwd = row.get("cwd")
@@ -445,52 +525,65 @@ def _find_children(parent_attempt):
     return children
 
 
+def normalize_opencode_db_row(row, generation):
+    """Map one native DB row to the OpenCode run-json event envelope."""
+    data, role = row.get("data"), row.get("role")
+    if not isinstance(data, dict):
+        return [{"type": "unknown", "part": data if data is not None else row.get("raw")}]
+
+    def event(kind, part):
+        return {"type": kind, "part": part}
+
+    def tool_event(part):
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        output = state.get("output") or state.get("error")
+        if isinstance(output, dict): output = output.get("message") or output.get("text") or _compact(output)
+        if isinstance(output, list):
+            output = "\n".join(str(block.get("text", "")) for block in output
+                                if isinstance(block, dict) and block.get("type") == "text")
+        if output is None and isinstance(state.get("content"), list):
+            output = "\n".join(str(block.get("text", "")) for block in state["content"]
+                                if isinstance(block, dict) and block.get("type") == "text")
+        return event("tool_use", {"tool": part.get("tool") or part.get("name"),
+                                   "callID": part.get("callID") or part.get("id"),
+                                   "state": {"status": state.get("status"),
+                                             "input": state.get("input", part.get("input")),
+                                             "output": output,
+                                             "error": state.get("error") if output is None else None}})
+
+    if generation == "v1":
+        kind = data.get("type")
+        if kind == "tool": return [tool_event(data)]
+        if kind == "text": return [event("user" if role == "user" else "text", {"text": data.get("text")})]
+        if kind == "reasoning": return [event("reasoning", {"text": data.get("text") or data.get("reason")})]
+        if kind in ("step-start", "step_start"): return [event("step_start", data)]
+        if kind in ("step-finish", "step_finish"): return [event("step_finish", data)]
+        return [event("unknown", {"part": data})]
+    if role == "user": return [event("user", {"text": data.get("text") or ""})]
+    if role != "assistant" or not isinstance(data.get("content"), list):
+        return [event("unknown", {"part": data})]
+    events = []
+    for part in data["content"]:
+        if not isinstance(part, dict):
+            events.append(event("unknown", {"part": part})); continue
+        kind = part.get("type")
+        if kind == "tool": events.append(tool_event(part))
+        elif kind in ("text", "reasoning"):
+            events.append(event(kind, {"text": part.get("text")}))
+        elif kind in ("step-start", "step_start"): events.append(event("step_start", part))
+        elif kind in ("step-finish", "step_finish"): events.append(event("step_finish", part))
+        else: events.append(event("unknown", {"part": part}))
+    return events
+
+
 def _sqlite_records(path: Path, sid: str):
     from opencode_runtime import read_session_parts
     snapshot = read_session_parts(sid, db_path=path)
     if snapshot.get("state") != "observed":
         yield {"type": "notice", "text": snapshot.get("reason", "database unavailable")}
         return
-    generation = snapshot["generation"]
     for row in snapshot["parts"]:
-        data, role = row.get("data"), row.get("role")
-        if data is None:
-            yield {"type": "unknown", "raw": row.get("raw")}
-            continue
-        if generation == "v2":
-            if role == "user":
-                yield {"type": "user", "text": data.get("text", "") if isinstance(data, dict) else data}
-            elif role == "assistant" and isinstance(data, dict):
-                for part in data.get("content", []):
-                    if not isinstance(part, dict):
-                        yield {"type": "unknown", "part": part}; continue
-                    kind = part.get("type")
-                    if kind in ("text", "reasoning"):
-                        yield {"type": kind, "text": part.get("text")}
-                    elif kind == "tool":
-                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
-                        blocks = state.get("content")
-                        output = "\n".join(str(block.get("text", "")) for block in blocks
-                                            if isinstance(block, dict) and block.get("type") == "text") \
-                            if isinstance(blocks, list) else state.get("output") or state.get("error")
-                        yield {"type": "tool", "name": part.get("name"),
-                               "input": state.get("input"), "output": output,
-                               "status": state.get("status")}
-                    else:
-                        yield {"type": "unknown", "part": part}
-        elif isinstance(data, dict):
-            kind = data.get("type")
-            if kind == "text": yield {"type": role or "text", "text": data.get("text")}
-            elif kind == "tool":
-                state = data.get("state") if isinstance(data.get("state"), dict) else {}
-                yield {"type": "tool", "name": data.get("tool") or data.get("name"),
-                       "input": state.get("input"), "output": state.get("output") or state.get("content"),
-                       "status": state.get("status")}
-            elif kind == "reasoning": yield {"type": "reasoning", "text": data.get("text") or data.get("reason")}
-            elif kind in ("step-start", "step-finish"): yield data
-            else: yield {"type": "unknown", "part": data}
-        else:
-            yield {"type": "unknown", "part": data}
+        yield from normalize_opencode_db_row(row, snapshot["generation"])
 
 
 def read_new(source: Source, cursor: Cursor) -> tuple[list[object], Cursor]:
@@ -525,45 +618,31 @@ def _follow_db(source, state):
         signature = _compact(row)
         if state["rows"].get(key) == signature: continue
         state["rows"][key] = signature
-        if snapshot["generation"] == "v2" and row.get("role") == "assistant":
-            data = row.get("data")
-            parts = data.get("content", []) if isinstance(data, dict) else []
-            for index, part in enumerate(parts):
-                if not isinstance(part, dict): continue
-                entity_key = (key, index)
-                typ = part.get("type")
-                if typ == "tool":
-                    toolstate = part.get("state") if isinstance(part.get("state"), dict) else {}
-                    blocks = toolstate.get("content")
-                    output = "\n".join(str(block.get("text", "")) for block in blocks
-                                        if isinstance(block, dict) and block.get("type") == "text") \
-                        if isinstance(blocks, list) else toolstate.get("output") or toolstate.get("error")
-                    previous = entities.get(entity_key)
-                    current = {"type": "tool", "name": part.get("name"),
-                               "input": toolstate.get("input"), "output": output,
-                               "status": toolstate.get("status")}
-                    entities[entity_key] = current
-                    record = current
-                    if previous:
-                        if previous.get("status") != current.get("status"):
-                            changed.append(Line("result", sanitize(f"tool {current['name']} status: {current['status']}")))
-                        old_output = previous.get("output") or ""
-                        new_output = current.get("output") or ""
-                        delta = new_output[len(old_output):] if isinstance(new_output, str) and new_output.startswith(old_output) else new_output
-                        if delta:
-                            changed.extend(format_record("opencode", {"type":"tool", "name":current["name"], "output":delta}))
-                        continue
-                elif typ in ("text", "reasoning"):
-                    value = part.get("text") or ""
-                    previous = entities.get(entity_key, "")
-                    entities[entity_key] = value
-                    delta = value[len(previous):] if isinstance(value, str) and value.startswith(previous) else value
-                    if not delta: continue
-                    record = {"type": typ, "text": delta}
-                else: continue
-                changed.extend(format_record("opencode", record))
-        else:
-            changed.extend(format_record("opencode", row.get("data") or {"type":"unknown", "raw":row.get("raw")}))
+        for index, record in enumerate(normalize_opencode_db_row(row, snapshot["generation"])):
+            entity_key = (key, index)
+            part = record.get("part") if isinstance(record.get("part"), dict) else {}
+            if snapshot["generation"] == "v2" and record.get("type") == "tool_use":
+                previous = entities.get(entity_key)
+                entities[entity_key] = record
+                if previous:
+                    old_state = previous.get("part", {}).get("state", {})
+                    new_state = part.get("state", {})
+                    old_output, new_output = old_state.get("output") or "", new_state.get("output") or ""
+                    if old_state.get("status") != new_state.get("status"):
+                        changed.append(Line("result", sanitize(f"tool {part.get('tool')} {new_state.get('status')}")))
+                    delta = new_output[len(old_output):] if isinstance(new_output, str) and new_output.startswith(old_output) else new_output
+                    if delta:
+                        changed.extend(format_record("opencode", {"type": "tool_use", "part": {
+                            "tool": part.get("tool"), "state": {"output": delta}}}))
+                    continue
+            elif snapshot["generation"] == "v2" and record.get("type") in ("text", "reasoning"):
+                value = part.get("text") or ""
+                previous = entities.get(entity_key, "")
+                entities[entity_key] = value
+                delta = value[len(previous):] if isinstance(value, str) and value.startswith(previous) else value
+                if not delta: continue
+                record = {"type": record["type"], "part": {"text": delta}}
+            changed.extend(format_record("opencode", record))
     state["cursor"] = max(state["cursor"], snapshot.get("cursor", state["cursor"]))
     if snapshot["generation"] == "v1" and state["cursor"]:
         pending.add(state["cursor"])
@@ -574,6 +653,9 @@ def _follow_db(source, state):
 def _present(lines, full=False):
     for line in lines:
         text=line.text
+        if line.kind == "unknown" and not full and len(text) > 300:
+            omitted = len(text) - 300
+            text = text[:300] + f"… (+{omitted}자 생략, --full)"
         chunks=text.splitlines() or [text]
         if line.kind in ("prompt", "output") and not full and len(chunks)>24:
             omitted=len(chunks)-24
@@ -615,8 +697,27 @@ def _format_present(harness, raw_rows, state, full=False, prefix=""):
                 if ident is not None and ident in state["messages"]: continue
                 if ident is not None: state["messages"].add(ident)
                 lines.extend(format_record(harness, item)); continue
+        if harness == "claude" and full and isinstance(record, dict) and record.get("type") == "attachment":
+            attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else record
+            payload = {key: value for key, value in attachment.items() if key != "type"}
+            lines.extend(format_record(harness, record))
+            if payload:
+                lines.append(Line("output", sanitize("attachment payload: " + _compact(payload))))
+            continue
         lines.extend(format_record(harness, record))
     _present([Line(line.kind, prefix + line.text) for line in lines], full)
+
+
+def _has_session_envelope(rows):
+    for raw in rows:
+        try:
+            record = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        if isinstance(record, dict) and _supervisor_type(str(record.get("type", ""))) in (
+                "session", "session.announced"):
+            return True
+    return False
 
 
 def main(argv=None, *, clock=None, sleep=None) -> int:
@@ -692,6 +793,7 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
         print(sanitize(error), file=sys.stderr); return 2
     cursors = {}
     owner_log_rows = []
+    native_source_shown = False
     with ExitStack() as stack:
         for source in sources:
             if source.kind != "log":
@@ -711,16 +813,23 @@ def main(argv=None, *, clock=None, sleep=None) -> int:
                 except Exception:
                     _present([Line("notice", "native source could not be admitted")], args.full)
                     continue
+            if source.kind == "claude":
+                native_source_shown = True
             cursors[source] = Cursor(source.path)
             if source.kind == "opencode-db":
                 fresh, cursors[source] = read_new(source, cursors[source])
+                native_source_shown = not any(
+                    isinstance(line, Line) and line.kind == "notice" and
+                    (line.text.startswith("OpenCode DB:") or line.text.startswith("source unavailable:"))
+                    for line in fresh)
                 _present(fresh, args.full)
             else:
                 initial_rows, cursors[source] = read_new(source, cursors[source])
                 if source == sources[0]: owner_log_rows = initial_rows
                 if "present_state" not in locals(): present_state = {"started": set(), "messages": set()}
                 _format_present(source.harness, initial_rows, present_state, args.full)
-        if len(sources) == 1 and any("supervisor.session" in raw for raw in owner_log_rows):
+        if sources and sources[0].harness in ("claude", "opencode") and not native_source_shown \
+                and _has_session_envelope(owner_log_rows):
             print("감독 기록만 남음")
         if args.follow and not log_only:
             seen_children=set()
