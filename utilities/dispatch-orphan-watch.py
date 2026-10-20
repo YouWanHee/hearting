@@ -31,9 +31,14 @@ from dispatch_supervisor_terminal import (
     classify_supervisor_log,
     reconcile_supervisor_terminal,
 )
+from runtime_observation import file_generation
 
 
 OPEN = {"open", "running"}
+# A parent close normally marks the watched row, which changes jobs.log. This
+# finite backstop keeps a close intent recorded only outside the registry
+# (attachments and adopted advances) visible to an otherwise idle watcher.
+CLOSE_INTENT_BACKSTOP_SECONDS = 30.0
 
 
 def process_start(pid: int) -> str | None:
@@ -48,6 +53,10 @@ def attempt_record(
     except OSError:
         return None, {}
     for line in lines:
+        # Only a line containing the id can carry attempt_id=<id>; skip the
+        # metadata parse of every other row of a large registry.
+        if attempt_id not in line:
+            continue
         fields = line.split("\t")
         if len(fields) != 6:
             continue
@@ -55,6 +64,43 @@ def attempt_record(
         if meta.get("attempt_id") == attempt_id:
             return fields[1], meta
     return None, {}
+
+
+class RegistryObservation:
+    """Re-run registry judgments only when their inputs can have changed.
+
+    The owner PID stays a per-interval ``/proc`` check. The watched row is
+    re-read when the jobs.log generation changes; the parent-close judgment
+    re-runs when that row changes or the close-intent backstop elapses.
+    """
+
+    def __init__(self, jobs: Path, attempt_id: str, *,
+                 backstop: float = CLOSE_INTENT_BACKSTOP_SECONDS):
+        self.jobs, self.attempt_id, self.backstop = jobs, attempt_id, backstop
+        self.generation = None
+        self.status: str | None = None
+        self.metadata: dict[str, str] = {}
+        self.close_requested = False
+        self.judged_at: float | None = None
+
+    def refresh(self, *, force: bool = False):
+        import route_parent_close
+        try:
+            generation = file_generation(self.jobs)
+        except OSError:
+            generation = None
+        row_changed = False
+        if force or generation is None or generation != self.generation:
+            self.generation = generation
+            status, metadata = attempt_record(self.jobs, self.attempt_id)
+            row_changed = (status, metadata) != (self.status, self.metadata)
+            self.status, self.metadata = status, metadata
+        now = time.monotonic()
+        if (force or row_changed or self.judged_at is None
+                or now - self.judged_at >= self.backstop):
+            self.close_requested = route_parent_close.row_requested(self.metadata, self.jobs)
+            self.judged_at = now
+        return self.status, self.metadata, self.close_requested
 
 
 def attempt_status(jobs: Path, attempt_id: str) -> str | None:
@@ -281,10 +327,14 @@ def reconcile_exact_exit(args) -> int:
 
 
 def watch(args) -> int:
+    import route_parent_close
+    registry = RegistryObservation(args.jobs, args.attempt_id)
+    closing = False
     while True:
-        status, metadata = attempt_record(args.jobs, args.attempt_id)
-        import route_parent_close
-        if route_parent_close.row_requested(metadata, args.jobs):
+        # A close in progress is re-judged every interval, as before.
+        status, metadata, close_requested = registry.refresh(force=closing)
+        closing = close_requested
+        if close_requested:
             result = route_parent_close.recover_attempt(args.jobs, metadata)
             if result and result.get("state") == "cancelled":
                 _remove_supervisor_state(args)

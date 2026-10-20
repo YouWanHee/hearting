@@ -433,6 +433,24 @@ class NativePeerObservationTest(unittest.TestCase):
         self.assertEqual(result["status"], "consumed")
         rpc.assert_not_called()
 
+    def test_matched_consumption_carries_the_confirmed_turn_status(self):
+        # A consumed completion is retained with its receiving turn's status.
+        # Without it, proven consumption stayed sent-ambiguous until expiry.
+        entry = self.entry("turn-1", "item-1", 1, CLIENT_ID)
+        _home, endpoint, _state, _history, _rollout = native_fixture(
+            self.root, entries=[entry], projected_ordinal=10)
+
+        observation = QUEUE._observe_peer_message(
+            endpoint, THREAD, CLIENT_ID, timeout=1, expected_message="peer")
+        self.assertEqual(observation.status, "matched")
+        self.assertEqual((observation.turn["id"], observation.turn["status"]),
+                         ("turn-1", "completed"))
+        with mock.patch.object(QUEUE, "_rpc") as rpc:
+            result = self.send(endpoint)
+        self.assertEqual((result["status"], result["turn_id"], result["turn_status"]),
+                         ("consumed", "turn-1", "completed"))
+        rpc.assert_not_called()
+
     def test_rollout_and_native_control_safety_checks_remain_strict(self):
         cases = []
 
