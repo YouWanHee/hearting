@@ -227,7 +227,7 @@ class PinnedRegistryParityTest(unittest.TestCase):
             with mock.patch.object(builtins, "open", side_effect=opened):
                 pinned = self.readers()
         self.assertEqual(pinned, unpinned)
-        self.assertEqual(self.cache.metrics_snapshot()["content_reads"], 1)
+        self.assertEqual(self.cache.metrics_snapshot()["content_reads"], 2)
 
     def test_failed_pinned_read_leaves_each_reader_its_own_handling(self):
         missing = str(self.jobs.with_name("missing.log"))

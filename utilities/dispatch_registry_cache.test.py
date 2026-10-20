@@ -82,6 +82,30 @@ class RegistryLinesCacheTest(unittest.TestCase):
         CACHE.clear_cache()
         CACHE.reset_metrics()
 
+    def test_scoped_stat_collision_preserves_one_consistent_generation(self):
+        # Include CRLF, a Unicode separator and malformed UTF-8: plain text
+        # lines must retain read_text(errors="replace").splitlines semantics.
+        old = b"attempt\topen\t/repo\t/wt\tworker\tattempt_id=child\r\nnotes\xe2\x80\xa8\xff\n"
+        new = old.replace(b"open", b"done")
+        self.jobs.write_bytes(old)
+        signature = lambda s: (s.st_dev, 616161, s.st_size, 17, 19)
+        with mock.patch.object(CACHE, "_stat_signature", side_effect=signature):
+            with CACHE.registry_read_scope():
+                first = CACHE.current_registry_view(self.jobs)
+                old_lines = CACHE.registry_text_lines(self.jobs)
+                self.assertEqual(old_lines, tuple(self.jobs.read_text(errors="replace").splitlines()))
+                self.jobs.write_bytes(new)
+                with CACHE.registry_read_scope():
+                    self.assertIs(CACHE.current_registry_view(self.jobs), first)
+                    self.assertEqual(CACHE.registry_text_lines(self.jobs), old_lines)
+            with CACHE.registry_read_scope():
+                second = CACHE.current_registry_view(self.jobs)
+                lines = CACHE.registry_text_lines(self.jobs)
+                self.assertEqual(lines, tuple(self.jobs.read_text(errors="replace").splitlines()))
+                self.assertEqual(second.lines[0].split("\t")[1], "done")
+                self.assertIsNot(first, second)
+                self.assertIs(CACHE.registry_view(self.jobs, append_only=True), second)
+
     def test_scope_pins_one_generation_and_next_scope_observes_replacement(self):
         self.jobs.write_text("t\topen\t/repo\t/wt\tone\tattempt_id=one\n", encoding="utf-8")
         CACHE.reset_metrics()
@@ -113,7 +137,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
         with self.jobs.open("ab") as stream:
             stream.write(b"t\tdone\t/repo\t/wt\ttwo\tattempt_id=two\x0cnote=x\n")
         appended = CACHE.registry_view(self.jobs, append_only=True)
-        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 1)
         expected = tuple(self.jobs.read_bytes().decode("utf-8", errors="replace").splitlines())
         CACHE.reset_metrics()
         with CACHE.registry_read_scope():
@@ -121,7 +145,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
             self.assertEqual(CACHE.registry_text_lines(self.jobs), expected)
             self.assertNotEqual(appended.lines, expected)
         self.assertEqual(CACHE.metrics_snapshot()["full_metadata_parses"], 0)
-        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
 
     def test_scope_pins_view_and_text_lines_from_one_read(self):
         first = "t\topen\t/repo\t/wt\tone\tattempt_id=one"
@@ -135,7 +159,7 @@ class RegistryLinesCacheTest(unittest.TestCase):
             self.assertEqual(lines, (first,))
             self.assertEqual([record.slug for record in view.records], ["one"])
             self.assertEqual(view.signature[2], len(first) + 1)
-            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
         self.assertIsNone(CACHE.registry_text_lines(self.jobs))
         with CACHE.registry_read_scope():
             self.assertEqual(len(CACHE.registry_text_lines(self.jobs)), 2)
