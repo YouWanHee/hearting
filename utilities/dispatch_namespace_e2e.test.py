@@ -754,7 +754,7 @@ class NamespaceE2E(unittest.TestCase):
                 "--unit", node["unit"],
                 "--model-role", node["role"],
                 "--model-profile", node["model_profile"],
-                "--foreground-timeout", "10",
+                "--foreground-timeout", "60",
                 "--prompt-text", "fixture",
             ]
             marker_root = dispatch_contract.dispatch_state_root(jobs) / "completion" / route["route_id"]
@@ -837,7 +837,11 @@ class NamespaceE2E(unittest.TestCase):
                     packaged.wait(timeout=5)
 
             self.addCleanup(cleanup_packaged)
-            deadline = time.monotonic() + 5
+            # The Codex launch runs several Python helpers before the worker
+            # starts; on a loaded CI runner that alone has taken over 5s. The
+            # loop leaves as soon as the sentinel appears or the wrapper exits,
+            # and --foreground-timeout above stays well past this bound.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if sentinel.is_file() and fake_pid_file.is_file():
                     break
