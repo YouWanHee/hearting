@@ -80,24 +80,45 @@ def _dispatch():
     return dispatch
 
 
-def read_attempts(jobs_path, parent_sid, live_jobs=None):
+def _registry_paths(jobs_path):
+    """One registry path, several, or None for the registries Fleet itself observes."""
+    if jobs_path is None:
+        return tuple(path for path in _dispatch()._candidate_jobs_paths() if path)
+    if isinstance(jobs_path, (str, bytes, os.PathLike)):
+        return (jobs_path,)
+    return tuple(jobs_path)
+
+
+def session_entries(jobs_path, parent_sid):
+    """Every registry line (number, fields, meta) naming ``parent_sid`` as its parent, in file order."""
+    dispatch = _dispatch()
+    entries, number = [], 0
+    for path in _registry_paths(jobs_path):
+        try:
+            lines = dispatch._dispatch_registry_cache.registry_view(Path(path)).lines
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            number += 1
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            meta = dispatch._parse_pipe_meta(fields[5] or "")
+            if meta.get("parent_sid") == parent_sid:
+                entries.append((number, fields, meta))
+    return entries
+
+
+def read_attempts(jobs_path, parent_sid, live_jobs=None, *, entries=None):
     """Latest registry row per attempt for one main session, with Fleet's own decision/liveness."""
     dispatch = _dispatch()
-    try:
-        lines = dispatch._dispatch_registry_cache.registry_view(Path(jobs_path)).lines
-    except FileNotFoundError:
-        return []
+    if entries is None:
+        entries = session_entries(jobs_path, parent_sid)
     live = live_jobs or {}
     latest = {}
-    for number, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = dispatch._parse_pipe_meta(fields[5] or "")
-        if meta.get("parent_sid") != parent_sid:
-            continue
+    for number, fields, meta in entries:
         latest[meta.get("attempt_id") or fields[4]] = (number, fields, meta)
     rows = []
     for key, (number, fields, meta) in latest.items():
@@ -121,6 +142,41 @@ def read_attempts(jobs_path, parent_sid, live_jobs=None):
             liveness=(_get(job, "liveness") if job is not None else None) or "unknown",
             decision=decision, meta=meta))
     return sorted(rows, key=lambda row: row.line)
+
+
+EVENT_LIMIT = 24
+
+
+def read_events(entries, tag=None, limit=EVENT_LIMIT):
+    """The newest registry lines of the focused session as event records (what each line says, nothing more)."""
+    records = []
+    for number, fields, meta in entries[-limit:]:
+        records.append({"time_kst": fields[0], "kind": "registry", "tag": tag,
+                        "attempt_id": meta.get("attempt_id") or fields[4], "status": fields[1],
+                        "route_node": meta.get("route_node") or None, "harness": meta.get("harness") or None,
+                        "worker_type": meta.get("worker_type") or None, "note": meta.get("note") or None,
+                        "line": number})
+    return tuple(records)
+
+
+def derive_artifact_root(rows):
+    """The artifact root the selected session's routes live under: the root its route files name, else the env's."""
+    counts = {}
+    for row in rows:
+        for key in ("owner_route_file", "route_file"):
+            path = row.meta.get(key)
+            if not path:
+                continue
+            parts = Path(path).parts
+            if len(parts) >= 4 and parts[-2] == "routes" and parts[-3] == ".runtime":
+                root = str(Path(*parts[:-3]))
+                counts[root] = counts.get(root, 0) + 1
+        explicit = row.meta.get("artifact_root")
+        if explicit and Path(explicit, ".runtime").is_dir():
+            counts[explicit] = counts.get(explicit, 0) + 1
+    if counts:
+        return max(counts, key=lambda root: counts[root])
+    return os.environ.get("AGENT_ARTIFACT_ROOT") or ""
 
 
 def _epoch(stamp):
@@ -254,6 +310,11 @@ def read_obligations(state_roots, session_id, now, cache):
     return tuple(items)
 
 
+def nav_tag(session):
+    tag = _get(session, "session_tag")
+    return str(tag) if tag else None
+
+
 def _as_mapping(value):
     value = value() if callable(value) else value
     if value is None:
@@ -263,7 +324,7 @@ def _as_mapping(value):
     return {_get(job, "attempt_id"): job for job in value if _get(job, "attempt_id")}
 
 
-def collect_focus(request, *, jobs_path, artifact_root, route_loader=None, now=None,
+def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=None, now=None,
                   live_jobs=None, snapshot=None, state_roots=None, cache=None):
     """Read everything the selected main session's request tabs, ledger and overview need.
 
@@ -283,7 +344,10 @@ def collect_focus(request, *, jobs_path, artifact_root, route_loader=None, now=N
             state_roots = []
     live = _as_mapping(live_jobs)
     key = request.key
-    rows = read_attempts(jobs_path, key.sid, live)
+    entries = session_entries(jobs_path, key.sid)
+    rows = read_attempts(jobs_path, key.sid, live, entries=entries)
+    if not artifact_root:
+        artifact_root = derive_artifact_root(rows)
     errors = []
 
     wanted = key.request_id
@@ -323,16 +387,24 @@ def collect_focus(request, *, jobs_path, artifact_root, route_loader=None, now=N
         errors.append(f"ledger: {type(exc).__name__}")
         request_ledger, ledger_rows = None, ()
 
+    sources = []
     try:
         obligations = read_obligations(state_roots, key.sid, wall, cache)
+        sources.append(("obligations", Health("success", wall)))
     except Exception as exc:
         obligations = None
         errors.append(f"obligations: {type(exc).__name__}")
+        sources.append(("obligations", Health("failed", None, type(exc).__name__)))
+    session = None
+    if snapshot is not None:
+        from . import nav
+        session = nav.find_session(snapshot, key.sid)
+    events = read_events(entries, nav_tag(session))
 
     result = FocusResult(
         key=key, epoch=request.epoch, snapshot_generation=request.snapshot_generation,
         tabs=tabs, ledger=ledger_rows, header=header, request_ledger=request_ledger,
-        obligations=obligations, open_results=open_results,
+        obligations=obligations, open_results=open_results, events=events, sources=tuple(sources),
         health=Health("partial" if errors else "success", wall, "; ".join(errors) or None))
     if snapshot is not None:
         lines = build_overview(snapshot, result, sid=key.sid)
@@ -343,7 +415,7 @@ def collect_focus(request, *, jobs_path, artifact_root, route_loader=None, now=N
 class FocusReader:
     """``SelectionReader`` provider with one source cache for the process lifetime."""
 
-    def __init__(self, jobs_path, artifact_root, *, route_loader=None, live_jobs=None,
+    def __init__(self, jobs_path=None, artifact_root=None, *, route_loader=None, live_jobs=None,
                  snapshot=None, state_roots=None, now=None):
         self.jobs_path = jobs_path
         self.artifact_root = artifact_root
@@ -460,5 +532,5 @@ class SelectionPump:
             return Health("failed", None, pump.get("last_error"))
         return Health("loading")
 
-    def stop(self):
-        self._pump.stop()
+    def stop(self, join_timeout=1.0):
+        self._pump.stop(join_timeout=join_timeout)

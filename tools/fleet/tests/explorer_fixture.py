@@ -194,3 +194,22 @@ def scene_frame(fx, scene, cols, rows=45):
 
     return compose(fx.snapshot, result, state, cols, rows, providers={"ledger": fails},
                    last_good=healthy, now=fx.now)
+
+
+def model_snapshot(fx):
+    """The fixture snapshot with real ``Session`` / ``DispatchJob`` rows and a pid + start time on every
+    process, so the s/x entry builders and the old group renderer can read it like a live one."""
+    from tools.fleet.model import DispatchJob, Session
+    raw = fx.snapshot
+    sessions, jobs = [], []
+    for index, row in enumerate(raw.sessions):
+        row = dict(row)
+        row["proc_start"] = row.get("proc_start") or str(1000 + index)
+        sessions.append(Session(**row))
+    for index, row in enumerate(raw.jobs):
+        row = dict(row)
+        row["key"] = row.get("key") or row.get("attempt_id") or row.get("slug")
+        row["pid"] = row.get("pid") or 700000 + index
+        row["proc_start"] = row.get("proc_start") or str(5000 + index)
+        jobs.append(DispatchJob(**row))
+    return SimpleNamespace(**{**vars(raw), "sessions": sessions, "jobs": jobs})

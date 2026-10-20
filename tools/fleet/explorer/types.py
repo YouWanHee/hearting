@@ -191,6 +191,9 @@ class Frame:
     geometry: Tuple[int, int] = (0, 0)
     good_at: Tuple[Tuple[str, float], ...] = ()
     page: str = ""
+    # First visible navigation row drawn, and how far each scroll slot may go (slot, max offset).
+    nav_offset: int = 0
+    scroll_max: Tuple[Tuple[str, int], ...] = ()
 
     def region(self, name: str) -> Optional[Rect]:
         return dict(self.regions).get(name)

@@ -199,6 +199,8 @@ def request_header(tabs, attempts):
 
 
 def header_text(header):
+    if header is None:
+        return "요청 ?"
     return (f"요청 {header.total} · 열림 {header.open} · "
             f"최신 실패 {header.latest_failed} · 검토 {header.review}")
 

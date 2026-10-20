@@ -11,6 +11,7 @@ from collections.abc import Mapping
 
 REGIONS = ("nav", "ledger", "output", "tabs", "relations", "system")
 WIDE_NAV_COLS = 100
+PID_PREFIX = "pid:"               # a schema-1 kill cursor, resolved to a navigation row by ``settle``
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class ExplorerState:
     keep: tuple = ()
     history: tuple = ()
     searching: bool = False
+    focus: str = ""
 
     def scroll_map(self):
         return dict(self.scrolls)
@@ -89,14 +91,29 @@ def restore(value=None):
             nav_open=_strings(data.get("nav_open")),
             keep=_strings(data.get("keep")),
             history=_strings(data.get("history")),
+            focus=str(data.get("focus") or ""),
         )
 
-    # Schema 1 cursor identities are the closest available nav selection evidence.
-    cursor = _mapping(data.get("cursor"))
+    # Schema 1 cursor identities are the closest available nav selection evidence: an
+    # ``_entry_id`` mapping, or the (pid, proc_start) pair the old kill cursor was.
+    raw_cursor = data.get("cursor")
+    cursor = _mapping(raw_cursor)
     selection = cursor.get("_entry_id") or cursor.get("entry_id") or ""
-    folds = data.get("folds") or data.get("repo_folds") or ()
-    if isinstance(folds, Mapping):
-        folds = [key for key, folded in folds.items() if folded]
+    if (not selection and isinstance(raw_cursor, (list, tuple)) and raw_cursor
+            and isinstance(raw_cursor[0], int) and not isinstance(raw_cursor[0], bool)):
+        start = raw_cursor[1] if len(raw_cursor) > 1 and raw_cursor[1] is not None else ""
+        selection = f"{PID_PREFIX}{raw_cursor[0]}:{start}"
+    folds = []
+    for source in (data.get("folds"), data.get("repo_folds")):
+        if isinstance(source, Mapping):
+            folds.extend(key for key, folded in source.items() if folded)
+        elif isinstance(source, (list, tuple)):
+            for item in source:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    if item[1] and isinstance(item[0], str):
+                        folds.append(item[0])
+                elif isinstance(item, str):
+                    folds.append(item)
     offsets = {}
     if "offset" in data:
         offsets["nav"] = data.get("offset")
@@ -141,6 +158,7 @@ def serialize(state):
         "tab_order": list(state.tab_order),
         "keep": list(state.keep),
         "history": list(state.history),
+        "focus": state.focus,
         "frame_layout": {"schema_version": 2},
     }
 
@@ -160,6 +178,123 @@ def reconcile(state, tabs):
     preferred = old[old_index + 1:] + list(reversed(old[:old_index]))
     selected = next((identity for identity in preferred if identity in identities), identities[0])
     return replace(state, tab=selected, tab_order=tuple(identities))
+
+
+# -- settling against the navigation --------------------------------------------------------------
+
+# Rows that exist only once the focused session's request data has been read.
+_REQUEST_ROWS = ("request:", "stages:", "stage:", "requests-other:", "worker:")
+
+
+def _row_session(rows, identity):
+    """The session row at or above ``identity`` (its fold parents lead up to it), else None."""
+    by_id = {row.identity: row for row in rows}
+    row = by_id.get(identity)
+    seen = set()
+    while row is not None and row.identity not in seen:
+        if row.kind == "session":
+            return row
+        seen.add(row.identity)
+        row = by_id.get(row.parent)
+    return None
+
+
+def _session_ref(row):
+    return row.identity[len("session:"):]
+
+
+def _legacy_pid_row(rows, token):
+    pid, _, start = token[len(PID_PREFIX):].partition(":")
+    for row in rows:
+        target = row.target_ref
+        if target is None:
+            continue
+        cursor_pid = target.get("pid") if isinstance(target, Mapping) else getattr(target, "pid", None)
+        cursor_start = target.get("proc_start") if isinstance(target, Mapping) else getattr(target, "proc_start", None)
+        if str(cursor_pid) == pid and (not start or str(cursor_start) == start):
+            return row
+    return None
+
+
+def _fold_identities(folds, rows):
+    """Fold keys as navigation identities: schema-1 repo keys (paths / names) become project rows."""
+    from . import nav
+    known = {row.identity for row in rows}
+    projects = {row.identity for row in rows if row.kind == "project"}
+    result = []
+    for key in folds:
+        if key in known or not ("/" in key or f"project:{key}" in projects):
+            result.append(key)
+            continue
+        name = nav.project_name(key) if "/" in key else key
+        if f"project:{name}" in projects:
+            result.append(f"project:{name}")
+    return tuple(dict.fromkeys(result))
+
+
+def settle(state, rows, tabs=None):
+    """Resolve the state against the navigation rows it is about to be drawn with; pure.
+
+    A schema-1 kill cursor (``pid:...``) or ``harness:sid`` selection becomes the nearest nav
+    row, repo folds become project folds, an empty or vanished selection falls back to the first
+    session, ``focus`` follows the selected row's session, and — once ``tabs`` (the focused
+    session's request tabs) are known — a vanished request tab moves to its nearest surviving
+    neighbor or the overview. Request-level selections are left alone while ``tabs`` is None:
+    those rows exist only after the selected scope has been read.
+    """
+    state = coerce(state)
+    rows = tuple(rows or ())
+    identities = {row.identity for row in rows}
+    selection = state.selection
+    if selection.startswith(PID_PREFIX):
+        row = _legacy_pid_row(rows, selection)
+        selection = row.identity if row is not None else ""
+    elif selection and selection not in identities:
+        if f"session:{selection}" in identities:
+            selection = f"session:{selection}"
+        elif not selection.startswith(_REQUEST_ROWS):
+            selection = ""                         # request rows are judged below, once tabs are known
+    sessions = [row for row in rows if row.kind == "session"]
+    if not selection and sessions:
+        selection = sessions[0].identity
+    focus = state.focus
+    held = _row_session(rows, selection)
+    if held is not None:
+        focus = _session_ref(held)
+    elif not any(_session_ref(row) == focus for row in sessions):
+        focus = _session_ref(sessions[0]) if sessions else focus
+    state = replace(state, selection=selection, focus=focus,
+                    nav_fold=_fold_identities(state.nav_fold, rows))
+    if tabs is not None:
+        before = state.tab
+        state = reconcile(state, tabs)
+        if state.tab != before:
+            state = replace(state, stage="")
+        ids = {str(getattr(tab, "identity", tab.get("identity", "") if isinstance(tab, Mapping) else ""))
+               for tab in tabs}
+        if state.tab and state.tab not in ids:
+            state = replace(state, tab="", stage="")          # nothing left to neighbor: the overview
+        if selection.startswith(_REQUEST_ROWS[:3]) and selection.split(":", 2)[1] not in ids:
+            fallback = f"request:{state.tab}" if state.tab and f"request:{state.tab}" in identities else \
+                _row_session_identity(rows, focus)
+            state = replace(state, selection=fallback or state.selection)
+        elif selection.startswith("worker:") and selection not in identities:
+            state = replace(state, selection=_row_session_identity(rows, focus) or state.selection)
+    return state
+
+
+def _row_session_identity(rows, focus):
+    return next((row.identity for row in rows if row.kind == "session" and _session_ref(row) == focus), "")
+
+
+def focus_key(state):
+    """The selected-scope key the pump reads for: session, request tab and stage."""
+    from .types import FocusKey
+    state = coerce(state)
+    harness, _, sid = state.focus.partition(":")
+    if not sid:
+        return None
+    return FocusKey(harness, sid, state.tab, state.stage if state.tab else "")
 
 
 # -- keyboard ------------------------------------------------------------------------------------
@@ -294,14 +429,15 @@ def reduce_key(state, key, frame=None):
         current = offsets.get(slot, 0)
         viewport = int(event.get("viewport") or _viewport(frame, state.active_region) or 1)
         delta = {"up": -1, "k": -1, "down": 1, "j": 1, "pageup": -viewport, "pagedown": viewport}.get(key, 0)
+        limit = event.get("max_scroll", dict(getattr(frame, "scroll_max", ()) or ()).get(slot))
         if key == "home":
             current = 0
         elif key == "end":
-            current = max(0, int(event.get("max_scroll", current)))
+            current = max(0, int(limit if limit is not None else current))
         else:
             current = max(0, current + delta)
-            if "max_scroll" in event:
-                current = min(current, max(0, int(event["max_scroll"])))
+            if limit is not None:
+                current = min(current, max(0, int(limit)))
         offsets[slot] = current
         return replace(state, scrolls=tuple(sorted(offsets.items())))
     if key in ("enter", "\n"):

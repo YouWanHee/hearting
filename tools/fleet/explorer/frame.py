@@ -10,7 +10,7 @@ rows and their age, and every other region keeps being redrawn.
 import inspect
 from typing import Iterable
 
-from . import events, ledger, nav, overview, requests, system
+from . import events, focus, ledger, nav, overview, requests, system
 from .output import cell_width, clip, render_output
 from .state import coerce
 from .types import Frame, Hit, Rect
@@ -173,6 +173,18 @@ def _body_slot(state):
 
 # -- default region content -----------------------------------------------------------------------
 
+def _waiting(focus_result, now):
+    """What a region that has no data yet says: still reading, never read successfully, or last-good age."""
+    health = getattr(focus_result, "health", None)
+    return (focus.status_text(health, now) if health is not None else "") or "읽는 중"
+
+
+def _unread(focus_result):
+    """True for a placeholder result that carries no data (still loading, or never read successfully)."""
+    health = getattr(focus_result, "health", None)
+    return getattr(health, "state", "") in ("loading", "failed")
+
+
 def _matching_ledger(focus_result, state):
     view = getattr(focus_result, "request_ledger", None)
     return view if view is not None and state.tab and view.request_id == state.tab else None
@@ -217,7 +229,7 @@ def _body_lines(page, snapshot, focus_result, state, now):
             failures=requests.open_result_lines(getattr(focus_result, "open_results", ()) or ()))
     view = _matching_ledger(focus_result, state)
     if view is None:
-        return ("읽는 중",)
+        return (_waiting(focus_result, now),)
     return ledger.history_lines(view) if page == "history" else ledger.ledger_lines(view, state.stage or None)
 
 
@@ -231,10 +243,13 @@ def _head_text(snapshot, focus_result):
     sid = nav._focus_sid(focus_result)
     session = nav.find_session(snapshot, sid) if sid else None
     header = getattr(focus_result, "header", None)
+    if _unread(focus_result):
+        header = False                          # a session is selected; its request counts are not read yet
     if session is None or header is None:
         return "요청 ? · 선택한 세션 없음"
     return requests.head_line(nav._get(session, "session_tag"), nav.role_name(session),
-                              nav.project_name(nav._get(session, "cwd", "project"), _resolver(snapshot)), header)
+                              nav.project_name(nav._get(session, "cwd", "project"), _resolver(snapshot)),
+                              header or None)
 
 
 def _tab_text(focus_result, state, width):
@@ -243,14 +258,14 @@ def _tab_text(focus_result, state, width):
     return requests.tab_bar(tabs, active=state.tab, selected=selected or None, keep=state.keep, width=width)
 
 
-def _output_lines(snapshot, focus_result, state, rect):
+def _output_lines(snapshot, focus_result, state, rect, now=None):
     records = tuple(getattr(focus_result, "output", ()) or ())
     scroll = dict(state.scrolls).get(f"output:{state.tab}", 0)
     if records:
         return render_output(records, rect.w, rect.h, scroll=scroll)
     view = _matching_ledger(focus_result, state)
     if view is None:
-        return ("읽는 중",)
+        return (_waiting(focus_result, now),)
     return ledger.summary_lines(view, state.stage or None)
 
 
@@ -285,6 +300,8 @@ def compose(snapshot=None, focus_result=None, state=None, cols=100, rows=45, *, 
     previous, good_at = _previous(last_good)
     current, errors, key_of = {}, [], {}
     nav_rows = ()
+    nav_offset = 0
+    extent = {}
 
     def default(name, rect):
         if name == "header":
@@ -297,9 +314,12 @@ def compose(snapshot=None, focus_result=None, state=None, cols=100, rows=45, *, 
             lines = _body_lines(page, snapshot, focus_result, state, now)
             if split and rect.w <= NARROW_LEDGER + 3 and _matching_ledger(focus_result, state) is not None:
                 lines = ledger.narrow_ledger_lines(_matching_ledger(focus_result, state))
+            extent[_body_slot(state)] = max(0, len(lines) - rect.h)
             return _scroll(lines, state, _body_slot(state), rect.h)
         if name == "output":
-            return _output_lines(snapshot, focus_result, state, rect)
+            records = tuple(getattr(focus_result, "output", ()) or ())
+            extent[f"output:{state.tab}"] = max(0, len(records) - rect.h)
+            return _output_lines(snapshot, focus_result, state, rect, now)
         if name == "separator":
             return (SEPARATOR_CHAR * rect.w,)
         if name == "events":
@@ -327,13 +347,14 @@ def compose(snapshot=None, focus_result=None, state=None, cols=100, rows=45, *, 
     failed = set()
 
     def draw_nav(rect):
-        nonlocal nav_rows
+        nonlocal nav_rows, nav_offset
         if "nav" in providers:
             return _call(providers["nav"], rect, snapshot, focus_result, state, now)
         all_rows = nav.build_nav(snapshot, focus_result, state, width=rect.w,
                                  project_resolver=_resolver(snapshot))
         nav_rows = tuple(nav.visible_rows(all_rows, state))
-        text, _offset = nav.nav_lines(nav_rows, state, rect.w, rect.h)
+        text, nav_offset = nav.nav_lines(nav_rows, state, rect.w, rect.h)
+        extent["nav"] = max(0, len(nav_rows) - max(0, rect.h - 3))
         return text
 
     order = ("header", "nav", "request", "tabs", "ledger", "output", "separator", "events", "legend", "keys")
@@ -397,8 +418,11 @@ def compose(snapshot=None, focus_result=None, state=None, cols=100, rows=45, *, 
         if rect.w and rect.h:
             _put(canvas, rect.x, rect.y, rect.w, rect.h, current.get(name, ()))
     lines = tuple("".join(char for char in row if char != "\x00") for row in canvas)
+    window = max(0, nav_rect.h - 3)
+    drawn = nav_rows[nav_offset:nav_offset + window]
     hits = tuple(Hit(Rect(nav_rect.x, nav_rect.y + 2 + i, nav_rect.w, 1), row.identity)
-                 for i, row in enumerate(nav_rows[:max(0, nav_rect.h - 3)])) if nav_rect.w else ()
+                 for i, row in enumerate(drawn)) if (nav_rect.w and "nav" not in failed) else ()
     return Frame(lines=lines, regions=tuple(regions.items()), hits=hits, nav_rows=nav_rows,
                  last_good=tuple(new_good.items()), good_at=tuple(new_time.items()), errors=tuple(errors),
-                 geometry=(cols, rows), page=page)
+                 geometry=(cols, rows), page=page, nav_offset=nav_offset,
+                 scroll_max=tuple(sorted(extent.items())))

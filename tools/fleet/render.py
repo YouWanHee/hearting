@@ -6644,6 +6644,10 @@ _EXPLORER_ENABLED = False
 _EXPLORER_STATE = None
 _EXPLORER_FRAME = None
 _EXPLORER_NAV_ROWS = ()
+_EXPLORER_ALL_ROWS = ()      # every navigation row, folded or not: the s/x target map is built from these
+_EXPLORER_RESULT = None      # the accepted selected-scope result; never one read for another session
+_EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
+_EXPLORER_SIZE = None
 
 
 def set_explorer_mode(enabled=True):
@@ -6652,101 +6656,279 @@ def set_explorer_mode(enabled=True):
     _EXPLORER_ENABLED = bool(enabled)
 
 
-def _explorer_compose(snapshot, cols, rows, state=None):
-    """Build the B frame from the current snapshot without invoking the legacy line builder."""
-    from .explorer.frame import compose
-    from .explorer.nav import build_nav
-    from .explorer.output import attempt_summary_lines
-    from .explorer.state import ExplorerState, restore
+class _ExplorerView:
+    """The published snapshot plus the few values render itself owns (GPU hosts, stable session order,
+    the cached project resolver). Read-only: attribute lookups fall through to the snapshot."""
 
-    state = state if isinstance(state, ExplorerState) else restore(state)
-    selected = state.selection
-    nav_rows = build_nav(snapshot, state=state)
-    global _SELECTABLE, _EXPLORER_NAV_ROWS
-    _EXPLORER_NAV_ROWS = tuple(nav_rows)
+    def __init__(self, base, **extras):
+        self.__dict__["_base"] = base
+        self.__dict__["_extras"] = extras
+
+    def __getattr__(self, name):
+        extras = self.__dict__["_extras"]
+        if name in extras:
+            return extras[name]
+        return getattr(self.__dict__["_base"], name)
+
+
+def _explorer_view(snapshot):
+    """What the explorer providers read: the snapshot, with no file/DB/git read behind any value."""
+    global _EXPLORER_ORDER
+    from .explorer import nav
+    extras = {}
+    if getattr(snapshot, "compute_hosts", None) is None:
+        hosts, age = _fresh_compute_hosts()
+        if hosts is not None:
+            extras["compute_hosts"] = hosts
+            if getattr(snapshot, "unregistered_gpu", None) is None:
+                try:
+                    extras["unregistered_gpu"] = _compute_hosts.unregistered_gpu(
+                        hosts, getattr(snapshot, "resources", ()) or (), frozenset(), age or 0.0)
+                except Exception:
+                    extras["unregistered_gpu"] = ()
+    if getattr(snapshot, "session_order", None) is None:
+        mains = [nav._get(s, "session_id", "sid", "id") for s in (getattr(snapshot, "sessions", ()) or ())
+                 if nav.is_main(s)]
+        present = {str(sid) for sid in mains if sid}
+        order = [sid for sid in _EXPLORER_ORDER if sid in present]
+        order += [str(sid) for sid in mains if sid and str(sid) not in set(order)]
+        _EXPLORER_ORDER = order
+        extras["session_order"] = tuple(order)
+    display = getattr(snapshot, "display_snapshot", None)
+    if display is not None and getattr(snapshot, "project_of", None) is None:
+        extras["project_of"] = lambda cwd: _project_for_display(cwd, display)
+    return _ExplorerView(snapshot, **extras) if extras else snapshot
+
+
+def _explorer_targets(nav_rows):
+    """The s/x target map: the navigation's session and worker rows, through the existing entry
+    builders (``_selectable_session`` / ``_select_entry`` / ``_select_entry_job``). Requests, steps,
+    ledger, output, relations, duties, events and the system section never get one, and a row whose
+    process cannot be read is not a target (fail closed)."""
     targets = []
     for index, row in enumerate(nav_rows):
         target = row.target_ref
         if target is None:
             continue
-        if row.kind == "session" and _selectable_session(target):
-            targets.append(_select_entry(target, index))
-        elif row.kind == "worker" and getattr(target, "pid", None):
-            targets.append(_select_entry_job(target, index))
-    _SELECTABLE = targets
+        try:
+            if row.kind == "session" and getattr(target, "pid", None) and _selectable_session(target) and (
+                    _SHOW_ALL or session_parent_visible(target)):
+                entry = _select_entry(target, index)
+            elif row.kind == "worker" and getattr(target, "pid", None):
+                entry = _select_entry_job(target, index)
+            else:
+                continue
+        except Exception:
+            continue
+        entry["nav_id"] = row.identity
+        targets.append(entry)
+    return targets
 
-    visible_rows = []
-    folded = set(state.nav_fold)
-    hidden_depth = None
-    for row in nav_rows:
-        if hidden_depth is not None and row.depth > hidden_depth:
-            continue
-        hidden_depth = None
-        visible_rows.append(row)
-        if row.identity in folded:
-            hidden_depth = row.depth
-    nav_lines = []
-    for row in visible_rows:
-        if row.kind == "section":
-            nav_lines.append(row.label)
-            continue
-        marker = "›" if row.identity == selected else " "
-        nav_lines.append("  " * min(row.depth, 3) + marker + " " + row.label)
-    jobs = list(getattr(snapshot, "jobs", ()) or ())
-    output_lines = []
-    for job in jobs:
-        summary = attempt_summary_lines(job)
-        if summary:
-            output_lines.extend(summary)
-            output_lines.append("")
-    if not output_lines:
-        output_lines = ["작업 출력 없음"]
-    system_lines = _usage_header_rows(
-        getattr(snapshot, "sessions", ()), usage_snapshots=getattr(snapshot, "usage_snapshots", None),
-        term_width=cols)
-    system_lines += _compute_host_rows(
-        term_width=cols, sessions=getattr(snapshot, "sessions", ()),
-        resources=getattr(snapshot, "resources", ()),
-        display_snapshot=getattr(snapshot, "display_snapshot", None))
-    system_text = [row if isinstance(row, str) else _snapshot_line(row)
-                   for row in system_lines]
-    output_lines = system_text + ([""] if system_text else []) + output_lines
-    ledger_lines = []
-    for job in jobs:
-        node = getattr(job, "route_node", None)
-        if node:
-            status = getattr(job, "status", None) or getattr(job, "liveness", None) or "미확인"
-            ledger_lines.append(f"{node} · {status}")
-    providers = {
-        "header": ("Fleet · 작업 장부 + 출력", "실시간 관찰 · 읽기 전용"),
-        "nav": tuple(nav_lines),
-        "ledger": tuple(ledger_lines or ("요청 장부를 선택하세요",)),
-        "output": tuple(output_lines),
-        "events": (),
-        "legend": ("↑↓ 이동  ←→ 영역/요청  Enter 펼침  Tab 영역  / 찾기  e 탐색  F 사건  s/x 종료 선택  q 닫기",),
-        "keys": ((_snapshot_line(_prompt_segs(_PROMPT, cols)) if _PROMPT else
-                  "B 탐색: ↑↓ · ←→ · Enter · Tab · / · e · F · q · s/x"),),
-    }
-    return compose(snapshot=snapshot, state=state, cols=cols, rows=rows, providers=providers)
+
+def _explorer_state_for(state, cols):
+    from .explorer.state import ExplorerState, initial_state, restore
+    if isinstance(state, ExplorerState):
+        return state
+    return restore(state) if state is not None else initial_state(cols)
+
+
+def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_good=None, now=None,
+                      providers=None):
+    """Thin adapter: snapshot + the accepted FocusResult + the viewer state -> explorer providers ->
+    ``frame.compose``. The frame is the whole screen; the legacy line builder is never called."""
+    from .explorer import frame as explorer_frame, nav
+    from .explorer.state import settle
+    global _SELECTABLE, _EXPLORER_NAV_ROWS, _EXPLORER_STATE, _EXPLORER_ALL_ROWS
+    state = _explorer_state_for(state, cols)
+    view = _explorer_view(snapshot)
+    resolver = getattr(view, "project_of", None)
+    resolver = resolver if callable(resolver) else None
+    nav_width = explorer_frame._layout(cols, rows, state.nav_visible, state.active_region)["nav"].w
+
+    def all_rows(current, result):
+        return nav.build_nav(view, result, current, width=nav_width, project_resolver=resolver)
+
+    rows_now = all_rows(state, focus_result)
+    state = settle(state, rows_now)
+    accepted = None
+    if focus_result is not None and f"{focus_result.key.harness}:{focus_result.key.sid}" == state.focus:
+        accepted = focus_result
+        if accepted.health.state in ("success", "partial"):
+            rows_now = all_rows(state, accepted)
+            state = settle(state, rows_now, accepted.tabs)
+    _EXPLORER_STATE = state
+    frame = explorer_frame.compose(
+        view, accepted, state, cols, rows, providers=providers,
+        last_good=last_good if last_good is not None else _EXPLORER_FRAME,
+        now=time.time() if now is None else now)
+    _EXPLORER_NAV_ROWS = tuple(frame.nav_rows)
+    _EXPLORER_ALL_ROWS = tuple(rows_now)
+    _SELECTABLE = _explorer_targets(rows_now)
+    return frame
+
+
+def _explorer_key_name(ch, searching=False):
+    """The reducer key a curses code stands for; ``None`` when the explorer does not use it.
+    While the ``/`` search is open, printable characters are text, never commands."""
+    named = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_LEFT: "left",
+             curses.KEY_RIGHT: "right", curses.KEY_PPAGE: "pageup", curses.KEY_NPAGE: "pagedown",
+             curses.KEY_HOME: "home", curses.KEY_END: "end", curses.KEY_ENTER: "enter", 10: "enter",
+             13: "enter", 9: "tab", _ESC: "escape",
+             curses.KEY_BACKSPACE: "backspace", 127: "backspace", 8: "backspace"}
+    if hasattr(curses, "KEY_BTAB"):
+        named[curses.KEY_BTAB] = "btab"
+    if ch in named:
+        return named[ch]
+    if searching:
+        return "text:" + chr(ch) if isinstance(ch, int) and 32 <= ch < 127 else None
+    plain = {ord("/"): "/", ord("e"): "e", ord("E"): "e", ord("F"): "F", ord("f"): "F",
+             ord("k"): "up", ord("j"): "down"}
+    return plain.get(ch)
+
+
+def _explorer_keys_provider(width):
+    """The key row while a confirmation or the kill selection is open; ``None`` keeps the default row."""
+    if _PROMPT is not None:
+        text = _snapshot_line(_prompt_segs(_PROMPT, width))
+    elif _SELECT_MODE:
+        text = "종료 선택 · ↑↓ 이동 · x 종료 요청 · Esc 취소 · q 끝"
+    else:
+        return None
+    return lambda rect: (text,)
+
+
+def _explorer_row_y(frame, entry):
+    """Screen row of a target's navigation row, or None when it is folded away or scrolled out."""
+    nav_rect = frame.region("nav")
+    if nav_rect is None or not nav_rect.w:
+        return None
+    index = next((i for i, row in enumerate(frame.nav_rows) if row.identity == entry.get("nav_id")), None)
+    if index is None:
+        return None
+    slot = index - frame.nav_offset
+    if 0 <= slot < max(0, nav_rect.h - 3):
+        return nav_rect.y + 2 + slot
+    return None
+
+
+def _explorer_hit_geometry(frame, snapshot, size):
+    """Publish the click map of exactly this paint: target rows of the navigation only."""
+    global _CLICK_ROWS, _CLICK_SPANS, _PROMPT_HITS, _HIT_VALID, _HIT_SIZE, _HIT_SNAPSHOT_ID
+    nav_rect = frame.region("nav")
+    _CLICK_ROWS, _CLICK_SPANS = {}, {}
+    for entry in _SELECTABLE:
+        y = _explorer_row_y(frame, entry)
+        if y is not None:
+            _CLICK_ROWS[y] = entry
+            _CLICK_SPANS[y] = [(nav_rect.x, nav_rect.x + nav_rect.w)]
+    _PROMPT_HITS = []
+    keys = frame.region("keys")
+    if _PROMPT is not None and keys is not None and keys.h:
+        _PROMPT_HITS = _prompt_hit_boxes(_prompt_segs(_PROMPT, size[1]), keys.y, size[1])
+    _HIT_SIZE = size
+    _HIT_SNAPSHOT_ID = id(snapshot) if snapshot is not None else None
+    _HIT_VALID = tuple(frame.geometry) == (size[1], size[0])
+
+
+def _explorer_click_current(size, snapshot):
+    """A click is adopted only for the paint it was aimed at: same size, same snapshot."""
+    return bool(_HIT_VALID and _HIT_SIZE == tuple(size)
+                and _HIT_SNAPSHOT_ID == (id(snapshot) if snapshot is not None else None))
+
+
+def _explorer_reveal(state, rows):
+    """Open the folds that hide the selected row, so the kill cursor is never on an unseen row."""
+    from dataclasses import replace
+    by_id = {row.identity: row for row in rows}
+    row, opened = by_id.get(state.selection), set()
+    while row is not None and row.parent in by_id:
+        parent = by_id[row.parent]
+        if parent.open is False:
+            opened.add(parent.identity)
+        row = parent
+    if not opened:
+        return state
+    return replace(state, nav_open=tuple(sorted(set(state.nav_open) | opened)),
+                   nav_fold=tuple(x for x in state.nav_fold if x not in opened))
 
 
 def _draw_explorer(stdscr, snapshot):
-    global _EXPLORER_FRAME, _EXPLORER_STATE
-    from .explorer.state import ExplorerState
+    global _EXPLORER_FRAME, _EXPLORER_STATE, _EXPLORER_SIZE, _CURSOR_ID
+    from dataclasses import replace
+    from .explorer.state import reduce_key
     h, w = stdscr.getmaxyx()
     if h <= 0 or w <= 0:
         return
-    frame = _explorer_compose(snapshot, w, h, _EXPLORER_STATE)
+    state = _explorer_state_for(_EXPLORER_STATE, w)
+    if _EXPLORER_SIZE is not None and _EXPLORER_SIZE != (h, w):
+        state = reduce_key(state, {"key": "resize", "cols": w})
+    _EXPLORER_SIZE = (h, w)
+    if _SELECT_MODE:
+        # The kill cursor is a navigation row: move the selection onto it so the viewport follows.
+        cursor = next((e for e in _SELECTABLE if _entry_id(e) == _CURSOR_ID), None)
+        if cursor is not None and cursor.get("nav_id") and cursor["nav_id"] != state.selection:
+            state = _explorer_reveal(replace(state, selection=cursor["nav_id"]), _EXPLORER_ALL_ROWS)
+    keys = _explorer_keys_provider(w)
+    frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT,
+                              providers={"keys": keys} if keys else None)
     _EXPLORER_FRAME = frame
     stdscr.erase()
     for y, line in enumerate(frame.lines[:h]):
         try:
-            stdscr.addstr(y, 0, line[:])
+            stdscr.addstr(y, 0, line)
         except Exception:
             pass
+    if _SELECT_MODE:
+        cursor = next((e for e in _SELECTABLE if _entry_id(e) == _CURSOR_ID), None)
+        y = _explorer_row_y(frame, cursor) if cursor is not None else None
+        nav_rect = frame.region("nav")
+        if y is not None:
+            try:
+                stdscr.chgat(y, nav_rect.x, nav_rect.w, curses.A_REVERSE)
+            except Exception:
+                pass
+    _explorer_hit_geometry(frame, snapshot, (h, w))
     refresh = getattr(stdscr, "refresh", None)
     if callable(refresh):
         refresh()
+
+
+class _SelectionFeed:
+    """Viewer state -> SelectionPump. A changed selection (session, tab or stage) selects and forces a
+    read; every tick polls. No result for the current scope yet draws the previous result of the same
+    session; the curses thread never waits for the pump."""
+
+    def __init__(self, pump):
+        self.pump = pump
+        self.key = None
+        self.last = None
+
+    def update(self, state, generation, now_mono):
+        from .explorer.state import focus_key
+        from .explorer.types import FocusResult, Health
+        key = focus_key(state)
+        if key is None:
+            self.key, changed, self.last = None, self.last is not None, None
+            return None, changed
+        if key != self.key:
+            self.key = key
+            self.pump.select(key, generation)
+            self.pump.request(force=True)
+        else:
+            self.pump.request_due(now=now_mono)
+        result = self.pump.poll()
+        if result is None and self.last is not None and self.last.key.sid == key.sid:
+            result = self.last
+        if result is None:
+            status = self.pump.status(now_mono)
+            if status.state in ("loading", "failed"):
+                result = FocusResult(key, 0, generation, health=status)
+        changed = result != self.last
+        self.last = result
+        return result, changed
+
+    def stop(self):
+        self.pump.stop()
 
 
 def set_process_view(v):
@@ -9089,6 +9271,28 @@ def _snapshot_line(segs, colored=False, colors=256):
     return "".join(out)
 
 
+def _explorer_once_frame(snapshot, cols, rows, state=None, reader=None):
+    """The default ``--once`` screen: the same providers and compose as the live view. There is no pump
+    here and no curses thread, so the selected scope is read once, synchronously, before composing."""
+    from .explorer.focus import FocusReader
+    from .explorer.state import focus_key
+    from .explorer.types import FocusRequest
+    global _EXPLORER_RESULT
+    state = _explorer_state_for(state if state is not None else _EXPLORER_STATE, cols)
+    frame = _explorer_compose(snapshot, cols, rows, state, None)
+    key = focus_key(_EXPLORER_STATE)
+    result = None
+    if key is not None:
+        reader = reader or FocusReader(live_jobs=lambda: list(getattr(snapshot, "jobs", ()) or ()),
+                                       snapshot=lambda: snapshot)
+        try:
+            result = reader(FocusRequest(key, 1, 0))
+        except Exception:
+            result = None
+    _EXPLORER_RESULT = result
+    return _explorer_compose(snapshot, cols, rows, _EXPLORER_STATE, result)
+
+
 def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     global _GIT_TELEMETRY
     governor_read = background_read(_collect_governor)
@@ -9129,7 +9333,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     if _EXPLORER_ENABLED:
         import shutil
         size = shutil.get_terminal_size((100, 45))
-        frame = _explorer_compose(snapshot, size.columns, size.lines, _EXPLORER_STATE)
+        snapshot.governor, snapshot.memory = governor_snapshot, mem_snapshot
+        frame = _explorer_once_frame(snapshot, size.columns, size.lines)
         sys.stdout.write("\n".join(frame.lines).rstrip() + "\n")
         return 0
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
@@ -10293,8 +10498,8 @@ def reset_scroll():
     _RELOAD_FRAME_AT = _RELOAD_FRAME_COMPUTE_AT = None
     _RELOAD_LAYOUT = None
     _SHELL_TTY_MODE = None
-    global _EXPLORER_STATE
-    _EXPLORER_STATE = None
+    global _EXPLORER_STATE, _EXPLORER_RESULT, _EXPLORER_FRAME, _EXPLORER_SIZE
+    _EXPLORER_STATE = _EXPLORER_RESULT = _EXPLORER_FRAME = _EXPLORER_SIZE = None
 
 
 def viewer_state(live_order):
@@ -10325,9 +10530,6 @@ def restore_viewer_state(value):
     global _EXPLORER_STATE
     from .explorer.state import restore
     _EXPLORER_STATE = restore(value.get("explorer_state", value))
-    if isinstance(value.get("explorer_state"), dict):
-        _RELOAD_FRAME = None
-        _RELOAD_LAYOUT = {"schema_version": 2}
 
     def tuples(item):
         return tuple(tuples(part) for part in item) if isinstance(item, list) else item
@@ -10346,6 +10548,9 @@ def restore_viewer_state(value):
                      for row in value.get("frame") or []]
     layout_meta = value.get("frame_layout")
     _RELOAD_LAYOUT = dict(layout_meta) if isinstance(layout_meta, dict) else None
+    if _EXPLORER_ENABLED:
+        _RELOAD_FRAME = None                    # an old frame is never replayed on the B surface
+        _RELOAD_LAYOUT = {"schema_version": 2}
     _SELECTABLE = []
     _FOLDABLE = []
     _REPO_FOLDABLE = []
@@ -10581,8 +10786,61 @@ def _configure_input(curses_mod, env):
                 pass
 
 
+_EXPLORER_TEXT = bytearray()   # a partly received UTF-8 character typed into the / search
+
+
+def _explorer_searching():
+    return bool(_EXPLORER_ENABLED and getattr(_EXPLORER_STATE, "searching", False))
+
+
+def _explorer_text_key(ch):
+    """'text:<c>' for a byte typed into the search; multi-byte characters arrive one byte at a time."""
+    global _EXPLORER_TEXT
+    if isinstance(ch, int) and 32 <= ch < 127:
+        _EXPLORER_TEXT = bytearray()
+        return "text:" + chr(ch)
+    if isinstance(ch, int) and 128 <= ch < 256:
+        _EXPLORER_TEXT.append(ch)
+        try:
+            text = bytes(_EXPLORER_TEXT).decode("utf-8")
+        except UnicodeDecodeError:
+            if len(_EXPLORER_TEXT) >= 4:
+                _EXPLORER_TEXT = bytearray()
+            return None
+        _EXPLORER_TEXT = bytearray()
+        return "text:" + text
+    return None
+
+
+def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
+    """One input event on the B surface. s/x and the mouse reach only the navigation's session and
+    worker rows (``_SELECTABLE``); p, w, a, c and Space change nothing here."""
+    global _EXPLORER_STATE
+    from .explorer.state import reduce_key
+    state = _explorer_state_for(_EXPLORER_STATE, (size or (0, 100))[1])
+    if ch == curses.KEY_MOUSE:
+        mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
+        if mx is not None and size is not None and _explorer_click_current(size, snapshot):
+            _handle_mouse_event(mx, my, bstate)
+        return
+    if state.searching:
+        key = _explorer_text_key(ch) or _explorer_key_name(ch, searching=False)
+        if key in ("up", "down", "enter", "escape", "backspace") or (key or "").startswith("text:"):
+            _EXPLORER_STATE = reduce_key(state, key, frame=_EXPLORER_FRAME)
+        return
+    if _SELECT_MODE and _handle_select_key(ch):
+        return
+    if ch in (ord("s"), ord("S"), ord("x"), ord("X")):
+        if not _SELECT_MODE and not _enter_select(_live_targets()):
+            _set_action("no selectable rows")
+        return
+    key = _explorer_key_name(ch)
+    if key:
+        _EXPLORER_STATE = reduce_key(state, key, frame=_EXPLORER_FRAME)
+
+
 def _loop(stdscr, collect_all, hfilter, section, interval):
-    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID
+    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT
     curses.curs_set(0)
     _init_colors()
     live_order = _RESUME_ORDER or _LiveOrderState()
@@ -10662,6 +10920,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         compute_host_pump = RefreshPump(
             compute_host_refresh, compute_host_interval, name="fleet-gpu-refresh")
         compute_host_pump.start()
+    latest_view = [snapshot]
+    selection_feed = None
+    if _EXPLORER_ENABLED:
+        from .explorer.focus import FocusReader, SelectionPump
+        selection_feed = _SelectionFeed(SelectionPump(
+            FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
+                        snapshot=lambda: latest_view[0]), interval))
     sessions, jobs = snapshot.sessions, snapshot.jobs
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots
@@ -10715,6 +10980,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 detail_generation, latest_detail = detail_update
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
+                latest_view[0] = snapshot
                 _HIT_VALID = False
                 sessions, jobs = snapshot.sessions, snapshot.jobs
                 resources = snapshot.resources
@@ -10731,8 +10997,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     set_compute_hosts(compute_host_snapshot)
                     _HIT_VALID = False
             _BLINK_ON = _blink_phase(now)
+            if selection_feed is not None:
+                focus_result, focus_changed = selection_feed.update(_EXPLORER_STATE, generation, now_mono)
+                if focus_changed:
+                    _EXPLORER_RESULT = focus_result
+                    _HIT_VALID = False
 
-            if ch in (ord("q"), ord("Q")):
+            if ch in (ord("q"), ord("Q")) and not _explorer_searching():
                 return 0
             # Idle input boundary only: never discard a key or an in-flight action.
             if (install_target is not None and ch == curses.ERR
@@ -10759,7 +11030,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 if ch == curses.KEY_MOUSE:
                     mx, my, bstate = (mouse_event if mouse_event is not None
                                       else _getmouse_event())
-                    if mx is not None:
+                    if mx is not None and (hit_current or not _EXPLORER_ENABLED):
                         _handle_mouse_event(mx, my, bstate)
                 else:
                     _handle_prompt_key(ch)
@@ -10768,31 +11039,15 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                       governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
                 continue
             if _EXPLORER_ENABLED:
-                if _SELECT_MODE:
-                    if _handle_select_key(ch):
-                        _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
-                              live_order=live_order, resources=resources,
-                              usage_snapshots=usage_snapshots, governor=governor_snapshot,
-                              loading=(generation == 0), snapshot=snapshot)
-                        continue
-                elif ch in (ord("s"), ord("S"), ord("x"), ord("X")):
-                    if not _enter_select(_live_targets()):
-                        _set_action("no selectable rows")
-                elif ch in (ord("e"), ord("E")):
-                    from .explorer.state import reduce_key
-                    _EXPLORER_STATE = reduce_key(_EXPLORER_STATE, "e")
-                elif ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT,
-                            curses.KEY_RIGHT, ord("\t"), 9, ord("/"), ord("F"),
-                            ord("f"), curses.KEY_ENTER, 10, 13):
-                    from .explorer.state import reduce_key
-                    key = {curses.KEY_UP: "up", curses.KEY_DOWN: "down",
-                           curses.KEY_LEFT: "left", curses.KEY_RIGHT: "right",
-                           ord("\t"): "right", 9: "right", ord("/"): "/",
-                           ord("F"): "F", ord("f"): "F",
-                           curses.KEY_ENTER: "enter", 10: "enter", 13: "enter"}.get(ch)
-                    if key:
-                        _EXPLORER_STATE = reduce_key(
-                            _EXPLORER_STATE, {"key": key, "nav_rows": _EXPLORER_NAV_ROWS})
+                _explorer_handle(ch, mouse_event, (h, w), snapshot)
+                if ch in (ord("r"), ord("R")) and not _explorer_searching():
+                    pump.request(force=True)
+                    detail_pump.request(force=True)
+                    if compute_host_pump is not None:
+                        compute_host_pump.request(force=True)
+                    if selection_feed is not None:
+                        selection_feed.pump.request(force=True)
+                _poll_pending_kill()
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources,
                       usage_snapshots=usage_snapshots, governor=governor_snapshot,
@@ -10840,6 +11095,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                   live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
                   governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     finally:
+        if selection_feed is not None:
+            selection_feed.stop()
         pump.stop(join_timeout=1.0)
         detail_pump.stop(join_timeout=1.0)
         if compute_host_pump is not None:
