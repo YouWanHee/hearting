@@ -94,6 +94,22 @@ def frame_task_text(route):
     lines = [request["text"].rstrip(), "", "## Routing hints (suggestions, never orders)", ""]
     hints = request.get("routing_hints") or {}
     lines += [f"- {key}: {value}" for key, value in sorted(hints.items())] or ["- none"]
+    prepared = route.get("framed_worktree") or {}
+    if prepared:
+        state = prepared.get("state")
+        cwd = prepared.get("cwd") or route.get("cwd")
+        if state == "reused" and prepared.get("reason") == "approved-linked-task":
+            basis = (f"explicitly chosen linked checkout {cwd} at {route.get('source_commit') or 'unknown HEAD'}; "
+                     "a source-changing leg works here only when the proposal sets this cwd")
+        elif state in {"created", "reused"}:
+            basis = f"prepared {cwd} at {prepared.get('base_sha') or prepared.get('base') or 'unknown HEAD'}"
+        elif state == "retained-linked":
+            basis = (f"retained linked checkout {cwd} ({prepared.get('reason') or 'reason unavailable'}); "
+                     "a source-changing leg works here only when the proposal sets this cwd")
+        else:
+            detail = " ".join(str(prepared.get("detail") or prepared.get("reason") or "unavailable").split())
+            basis = f"preparation unavailable ({detail}); using {route.get('cwd')}"
+        lines += ["", f"Frame read basis: {basis}. This is observational context, not an approval request."]
     lines += ["", "## Part catalogue", "",
               "Every capability, its modes and its stage parts (`id`, unit and unit choices, inputs and outputs,",
               "`shareable`, `start_approval`, human gates, and the parts another capability may borrow as",
