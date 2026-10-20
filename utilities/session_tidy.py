@@ -425,10 +425,14 @@ def _real(path) -> str:
     return ""
 
 
-def _pane_seat_of(pane: str) -> Seat:
-    endpoint = _endpoint_scope()
+def _pane_seat_of(pane: str, *, endpoint: Optional[str] = None,
+                  socket_path: Optional[str] = None) -> Seat:
+    if endpoint is None:
+        endpoint = _endpoint_scope()
+    if socket_path is None:
+        socket_path = str(os.environ.get("HERDR_SOCKET_PATH") or "")
     key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
-    return Seat("pane", key, pane, "codex", "", endpoint=endpoint)
+    return Seat("pane", key, pane, "codex", "", endpoint=endpoint, socket_path=socket_path)
 
 
 def pane_seat_from_binding(binding: dict) -> Seat:
@@ -465,15 +469,16 @@ def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
     if len(here) != 1:
         return []
     pane = str(here[0]["pane_id"])
+    seat = _pane_seat_of(pane)
     try:
         import session_tidy_clear
-        booking = session_tidy_clear.read_reservation(_pane_seat_of(pane).key)
+        booking = session_tidy_clear.read_reservation(seat.key)
     except BaseException:  # noqa: BLE001
         return []
     ok = bool(booking) and booking.get("harness") == "codex" and booking.get("status") in ("reserved", "unverified") \
         and booking.get("sid") not in (sid, "") \
         and (_agent_session(here[0]) == booking.get("sid")
-             or ledger_precedes(_pane_seat_of(pane), _agent_session(here[0]), str(booking.get("sid")))) \
+             or ledger_precedes(seat, _agent_session(here[0]), str(booking.get("sid")))) \
         and _real(booking.get("cwd") or "") == _real(cwd) \
         and (booking.get("seat") or {}).get("pane") == pane
     return [pane] if ok else []
@@ -495,8 +500,11 @@ def _cleared_into(sid: str) -> list[str]:
         except BaseException:  # noqa: BLE001
             continue
         pane = str(((booking or {}).get("seat") or {}).get("pane") or "")
+        booked_seat = (booking or {}).get("seat") if isinstance((booking or {}).get("seat"), dict) else {}
+        endpoint = booked_seat.get("endpoint") if isinstance(booked_seat, dict) else None
         if booking and booking.get("harness") == "codex" and booking.get("status") == "cleared" \
-                and booking.get("new_session") == sid and pane and _pane_seat_of(pane).key == key:
+                and booking.get("new_session") == sid and pane \
+                and _pane_seat_of(pane, endpoint=str(endpoint or "")).key == key:
             panes.append(pane)
     return panes
 
@@ -908,7 +916,7 @@ def _pane_repository_map(rows: list[dict], seat: Seat, resolve_gitdir) -> dict[t
             if len(values) == 1 and identity not in conflicts}
 
 
-def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str):
+def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None):
     if harness not in HARNESSES or not sid or not pane or not cwd:
         return None
     try:
@@ -920,7 +928,7 @@ def _pane_lineage_inputs(harness: str, sid: str, pane: str, cwd: str):
         repository = resolved[1] if isinstance(resolved, (list, tuple)) and len(resolved) > 1 else ""
         if not repository:
             return None
-        current = _pane_seat_of(pane)
+        current = _pane_seat_of(pane, endpoint=endpoint)
         current_rows = _read_ledger_lines(current)
         current_repositories = _pane_repository_map(current_rows, current, resolve_gitdir)
         if current_repositories.get((harness, sid)) != repository:
@@ -1075,23 +1083,23 @@ def _confirmed_predecessors_from(inputs, harness: str, sid: str, repository: str
     return chain
 
 
-def confirmed_pane_predecessors(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+def confirmed_pane_predecessors(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None) -> list[str]:
     """Return only confirmed same-harness clear/handover predecessors for display."""
-    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    state = _pane_lineage_inputs(harness, sid, pane, cwd, endpoint=endpoint)
     if state is None:
         return []
     repository, inputs, resolver = state
     return _confirmed_predecessors_from(inputs, harness, sid, repository, resolver)
 
 
-def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str, *, endpoint=None) -> list[str]:
     """Compatibility aliases plus confirmed predecessors, for display only.
 
     The compatibility join keeps its eight-recent-ID bound. Confirmed lineage is
     separate and may extend beyond that bound; neither result changes execution or
     notification identity.
     """
-    state = _pane_lineage_inputs(harness, sid, pane, cwd)
+    state = _pane_lineage_inputs(harness, sid, pane, cwd, endpoint=endpoint)
     if state is None:
         return []
     repository, inputs, resolver = state
@@ -1118,16 +1126,16 @@ def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[st
     return list(dict.fromkeys([*ordered, *predecessors]))
 
 
-def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
+def session_start_source(harness: str, sid: str, pane: str, *, endpoint=None) -> Optional[str]:
     """The recorded native start source, not a new or inferred lifecycle event."""
-    return session_start_context(harness, sid, pane).get("session_start_source")
+    return session_start_context(harness, sid, pane, endpoint=endpoint).get("session_start_source")
 
 
-def session_start_context(harness: str, sid: str, pane: str) -> dict:
+def session_start_context(harness: str, sid: str, pane: str, *, endpoint=None) -> dict:
     """Return the latest native start details for this exact pane seat and session."""
     if harness not in HARNESSES or not sid or not pane:
         return {}
-    for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
+    for row in reversed(_read_ledger_lines(_pane_seat_of(pane, endpoint=endpoint))):
         if row.get("harness") != harness or row.get("sid") != sid:
             continue
         if row.get("event") != "start" and not row.get("start_at"):

@@ -99,6 +99,22 @@ class PaneOwnershipTest(unittest.TestCase):
             self.assertIn("앞 세대 카드", text)
             self.assertEqual(st.resolve_seat("codex", temp, sid=successor).key, seat.key)
 
+    def test_confirmed_clear_lookup_uses_the_booking_endpoint(self):
+        import session_tidy_clear as clear
+        binding = {"pid": 1234, "pid_start": "77", "session_id": "thread-A",
+                   "pane": "w:p1", "socket_path": "/run/herdr/booked.sock"}
+        seat = st.pane_seat_from_binding(binding)
+        booking = {"harness": "codex", "status": "cleared", "new_session": "thread-B",
+                   "seat": seat.as_dict()}
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(temp) / "state"),
+                                             "HERDR_SOCKET_PATH": "/run/herdr/inherited.sock"}, clear=True), \
+                mock.patch.object(clear, "clear_dir", return_value=Path(temp)), \
+                mock.patch.object(clear, "read_reservation", return_value=booking):
+            (Path(temp) / f"{seat.key}.json").write_text("{}")
+            self.assertEqual(st._cleared_into("thread-B"), ["w:p1"])
+            self.assertEqual(st._pane_seat_of("w:p1", endpoint=seat.endpoint).key, seat.key)
+
     def test_import_adds_tools_path_for_isolated_utilities_entrypoint(self):
         utilities = str(ROOT / "utilities")
         script = (
