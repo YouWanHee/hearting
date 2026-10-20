@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,9 +20,62 @@ if _TOOLS_DIR not in sys.path:
 from fleet import projection, render
 from fleet.collectors import dispatch as fleet_dispatch
 from fleet.model import DispatchJob
+import fixture_processes
+
+
+def fixture_tempdir(stack, *, prefix):
+    raw = stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix))
+    stack.callback(fixture_processes.reap, raw)
+    return raw
 
 
 class OpenCodeContextPluginTest(unittest.TestCase):
+    def test_runtime_completion_uses_the_existing_opencode_prompt_and_history_path(self):
+        if not NODE:
+            self.skipTest("node is unavailable")
+        with tempfile.TemporaryDirectory(prefix="opencode-runtime-origin-") as raw:
+            script = f'''import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import {{ syncBuiltinESMExports }} from "node:module";
+import {{ pathToFileURL }} from "node:url";
+const spawnSyncCalls = [], spawnCalls = [];
+childProcess.spawnSync = (command, args, options = {{}}) => {{
+  spawnSyncCalls.push({{ command, args, options }});
+  const isPeerPending = String(args?.[0] || "").endsWith("peer-message.py") && args?.[1] === "pending";
+  return {{ status: 0, stdout: isPeerPending ? "[]" : "", stderr: "" }};
+}};
+childProcess.spawn = (command, args, options = {{}}) => ({{
+  on() {{}}, unref() {{}}, stdin: {{ end(body) {{ spawnCalls.push({{ command, args, options, body }}); }} }}
+}});
+syncBuiltinESMExports();
+const {{ AgentHarnessGuards }} = await import(pathToFileURL(process.env.PLUGIN_PATH));
+const hooks = await AgentHarnessGuards({{ directory: process.env.HOME,
+  worktree: process.env.HOME, client: {{}} }}, {{ initialize: false }});
+const prompt = "[notice] task complete\\n\\n(runtime-from: runtime [?] Hearting runtime ; ref=" + "a".repeat(32) + ")";
+await hooks["chat.message"]({{ sessionID: "opencode-runtime", messageID: "native-runtime-message" }},
+  {{ parts: [{{ type: "text", text: prompt }}] }});
+const receive = spawnCalls.find((call) => call.args[0].endsWith("peer-message.py")
+  && call.args[1] === "receive");
+assert.ok(receive, "runtime-from is accepted by the OpenCode receiver prefilter");
+assert.equal(receive.body, prompt);
+const guidance = spawnSyncCalls.find((call) => call.args[0] === "-c"
+  && call.args[1].includes("receiver_guidance"));
+assert.ok(guidance, "the common reader checks the runtime envelope on this prompt");
+assert.equal(JSON.parse(guidance.options.input).prompt, prompt);
+assert.equal(guidance.options.input.includes("peer-from"), false);
+hooks.dispose?.({{ silent: true }});
+'''
+            env = {**os.environ, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+                   "HOME": raw, "XDG_CONFIG_HOME": str(Path(raw) / ".config"),
+                   "XDG_DATA_HOME": str(Path(raw) / ".data"), "XDG_STATE_HOME": str(Path(raw) / ".state"),
+                   "AGENT_HOME": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1",
+                   "AGENT_SESSION_ROLE": "", "AGENT_DISPATCH_CHILD": "",
+                   "AGENT_DISPATCH_DEPTH": "", "OPENCODE_DISPATCH_SLUG": "",
+                   "FLEET_TITLE_REFRESH": "", "HERDR_PANE_ID": ""}
+            result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
+                                    env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_idle_observer_is_detached_before_summary_checkpoint_and_peer_consumers(self):
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text(encoding="utf-8")
         helper_start = source.index("function spawnIdleObserver(")
@@ -44,7 +98,8 @@ class OpenCodeContextPluginTest(unittest.TestCase):
         self.assertIn("completionCarrier.idle(eventSid).catch", idle)
 
     def test_held_idle_observer_does_not_hold_the_opencode_event_consumer(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-held-idle-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-held-idle-")
             root = Path(raw)
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -79,6 +134,7 @@ console.log(JSON.stringify({{ elapsed_ms: performance.now() - started }}));
                 "XDG_DATA_HOME": str(root / "data"),
                 "XDG_STATE_HOME": str(root / "state"),
                 "XDG_CACHE_HOME": str(root / "cache"),
+                "PYTHONPYCACHEPREFIX": str(root / "cache" / "pycache"),
                 "AGENT_HOME": str(ROOT),
                 "OPENCODE_VERSION": "1.19.0",
                 "OBSERVER_PID_FILE": str(observer_pid),
@@ -110,7 +166,8 @@ console.log(JSON.stringify({{ elapsed_ms: performance.now() - started }}));
                         time.sleep(0.01)
 
     def test_real_plugin_config_hook_caps_only_loaded_provider_and_hides_auth_values(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-context-hook-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-context-hook-")
             home = Path(raw)
             xconfig, xdata, xstate, xcache = [home / name for name in ("config", "data", "state", "cache")]
             runtime = xconfig / "opencode"
@@ -175,6 +232,7 @@ console.log(JSON.stringify({{ after, again, disabled, restricted, policy, intera
             env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home), "XDG_CONFIG_HOME": str(xconfig),
                    "XDG_DATA_HOME": str(xdata), "XDG_STATE_HOME": str(xstate),
                    "XDG_CACHE_HOME": str(home / "cache"), "HEARTING_OPENCODE_MODELS_CACHE": str(xcache / "opencode"),
+                   "PYTHONPYCACHEPREFIX": str(xcache / "pycache"),
                    "FLEET_SESSION_REGISTRY_DIR": str(xstate / "agent-fleet" / "sessions"),
                    "AGENT_HOME": str(ROOT), "AGENT_SESSION_ROLE": "worker",
                    "AGENT_DISPATCH_ATTEMPT_ID": "att-context", "OPENCODE_VERSION": "1.19.0"}
@@ -241,10 +299,13 @@ console.log(JSON.stringify({{ after, again, disabled, restricted, policy, intera
             self.assertGreaterEqual(result["elapsed_ms"], 0)
 
     def test_helper_failure_keeps_original_plugin_config(self):
-        with tempfile.TemporaryDirectory(prefix="opencode-context-failure-") as raw:
+        with ExitStack() as stack:
+            raw = fixture_tempdir(stack, prefix="opencode-context-failure-")
             home = Path(raw)
             runtime = home / "config/opencode"
             (runtime / "agent-config").mkdir(parents=True)
+            for name in ("data", "state", "cache"):
+                (home / name).mkdir(parents=True, exist_ok=True)
             (runtime / "agent-config/models.conf").write_text("broken config\n")
             config = {"model": "openai/gpt", "provider": {"openai": {"models": {}}}}
             script = f'''import {{ AgentHarnessGuards }} from {json.dumps((ROOT / "adapters/opencode/plugins/hearting-guards.js").as_uri())};
@@ -252,7 +313,10 @@ const hooks = await AgentHarnessGuards({{ directory: process.cwd(), worktree: pr
 const config = {json.dumps(config)}; const result = await hooks.config(config);
 console.log(JSON.stringify({{ same: result === config, config: result }}));
 '''
-            env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home), "XDG_CONFIG_HOME": str(home / "config"),
+            env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(home),
+                   "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
+                   "XDG_STATE_HOME": str(home / "state"), "XDG_CACHE_HOME": str(home / "cache"),
+                   "PYTHONPYCACHEPREFIX": str(home / "cache" / "pycache"),
                    "AGENT_HOME": str(ROOT), "AGENT_SESSION_ROLE": "worker"}
             run = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
                                  env=env, text=True, capture_output=True, timeout=10)

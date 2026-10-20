@@ -560,4 +560,9 @@ approval defaults. Cross-launch propagation is not implemented by this slice.
 
 - **Runtime support:** the existing `session.idle` event carries a session id. The shared observer reads the latest completed assistant message for that exact id from the OpenCode database, using its reported context tokens, provider and model.
 - **Adapter realization:** a provider/session-qualified idle booking uses the same fixed due time, exact seat and one-send claim as the other adapters. The helper withholds a card request when the herdr session identity cannot be matched to the idle session. Clear follows only after the main session's card and queue receipt; the successor receives a status-only prompt.
+
 - **Cache evidence:** the local OpenCode config sets no explicit model or provider. The selected provider/model and cache lifetime come from the completed message only where reported; no generic OpenCode cache TTL is assumed, and the current idle event path uses the configured wait.
+
+## Parent authority and peer transport
+
+Parent-only route actions use the shared current `effective_parent`. A readable handover chain grants them to its last confirmed recipient; an unreadable handover keeps the existing registered-parent fallback. The OpenCode plugin reserves a pending delivery under its verified process identity, rechecks the native root, then marks the exact claim unverified immediately before `client.prompt(noReply: true)`. Each transition has its own 1500 ms subprocess bound; exact native history remains the only response-loss reconciliation.

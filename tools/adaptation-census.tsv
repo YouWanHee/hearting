@@ -75,6 +75,8 @@ shared-utility-deferred	spec_merge.py
 shared-utility-deferred	ship-parent-deploy.py
 shared-utility-deferred	ship_parent_deploy.py
 shared-utility-deferred	transcript_turn.py
+shared-utility-deferred	terminal_surface.py
+shared-utility-deferred	pane.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
 shared-utility-deferred	start_receipt.py
@@ -103,6 +105,8 @@ utility-deferred	artifact_relayout.py
 utility-deferred	artifact_residue.py
 utility-deferred	artifact_resplit.py
 utility-deferred	artifact_workflow_groups.py
+utility-deferred	attempt-view.py
+utility-deferred	attempt_view.py
 utility-deferred	capability-grounding.sh
 utility-deferred	capability-route.py
 utility-deferred	capability_route.test.py

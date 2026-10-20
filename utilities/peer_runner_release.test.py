@@ -115,6 +115,28 @@ def _runner_fixture_start_record():
 _runner_fixture_start_record()
 '''
         fixture_wrapper = '''
+import pane_ownership as _runner_fixture_pane_ownership
+
+_runner_fixture_current_codex_thread = _runner_fixture_pane_ownership.current_codex_thread
+def _runner_fixture_codex_thread(pane, pid=None, **kwargs):
+    if pane == "fixture-pane":
+        return os.environ.get("RUNNER_FIXTURE_NATIVE_SESSION_ID", "")
+    return _runner_fixture_current_codex_thread(pane, pid, **kwargs)
+_runner_fixture_pane_ownership.current_codex_thread = _runner_fixture_codex_thread
+
+_runner_fixture_retire_foreground = _retire_foreground
+def _runner_fixture_foreground(pane, harness, *, strict=True, info=None):
+    if pane == "fixture-pane" and harness == "codex":
+        observed = info or _retire_pane_info(pane)
+        processes = (observed or {}).get("foreground_processes") or ()
+        pid = processes[0].get("pid") if processes and isinstance(processes[0], dict) else 1
+        return {"pid": pid, "start": "fixture-birth", "argv": ["codex"],
+                "shell_pid": (observed or {}).get("shell_pid", 1),
+                "shell_start": "fixture-shell-birth"}
+    return _runner_fixture_retire_foreground(
+        pane, harness, strict=strict, info=info)
+_retire_foreground = _runner_fixture_foreground
+
 _production_resume_message_obligation = _resume_message_obligation
 
 def _fixture_resume_message_obligation(duty, store, *, read_context=None):
@@ -282,6 +304,7 @@ print(json.dumps(result))
             "RUNNER_FIXTURE_ACK_MARKER": str(self.ack_marker),
             "RUNNER_FIXTURE_OBSERVATION": str(self.b_observation),
             "RUNNER_FIXTURE_SUBMISSIONS": str(self.submissions),
+            "RUNNER_FIXTURE_NATIVE_SESSION_ID": self.recipient["session_id"],
         }
 
     def _point_current(self, target):

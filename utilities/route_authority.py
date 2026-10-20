@@ -394,7 +394,8 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
     metadata = metadata or {}
     if action == "handover" and not facts.get("eligible", False):
         return ContinuationDecision(False, "settled", next_action="settle")
-    if (action == "handover" or facts.get("actor")) and not owns(metadata, facts.get("actor"), jobs):
+    if (action == "handover" or facts.get("actor")) and not owns(
+            metadata, facts.get("actor"), jobs, read_context=facts.get("read_context")):
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
@@ -542,7 +543,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     "The same owner's input consumer is reachable or its terminal result settles.")
     if action == "handover":
         allowed = status in {"open", "running"}
-        if status == "done":
+        if status in {"done", "cancelled", "killed"}:
             import dispatch_seat_handover as handover
             allowed = (facts.get("delivery_open") if "delivery_open" in facts else
                        handover._delivery_open(jobs, metadata)) or (
@@ -794,14 +795,19 @@ def correction_source_session(environ=None) -> str:
     return session_label(environ)
 
 
-def owns(meta, session, jobs) -> bool:
-    """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if session and meta.get("parent_sid") == session:
-        return True
-    if not session or jobs is None:
+def owns(meta, session, jobs, *, read_context=None) -> bool:
+    """Only the session that answers for the attempt now (``effective_parent``).
+
+    That is the registered parent before a confirmed handover and the end of its
+    lineage after one. Unreadable handover state retains the existing
+    registered-parent fallback.
+    """
+    if not session:
         return False
     from dispatch_seat_handover import owns as seat_owns
-    return seat_owns(meta, session, jobs)
+    if read_context is None:
+        return seat_owns(meta, session, jobs)
+    return seat_owns(meta, session, jobs, read_context=read_context)
 
 
 def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
@@ -835,7 +841,7 @@ def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> boo
         return True
     if lineage and candidate.get('dispatch_depth') == '1':
         # A registered A -> B edge survives a later B -> C handover. Admission
-        # still accepts only the registered parent or the current successor.
+        # still accepts only the source's current effective parent.
         from dispatch_seat_handover import effective_parent
         current = effective_parent(source, jobs)
         return bool(current) and effective_parent(candidate, jobs) == current
@@ -1332,7 +1338,7 @@ def recovery_node_task(record, source, history, *, attempt_id, route, node, harn
     return recovery_task(record, source, history)
 
 
-def _work_options(argv):
+def _work_options(argv, *, harness=None):
     """Read stored semantic options, without synthesizing a new original argv."""
     values = []; index = 0
     while index < len(argv):
@@ -1340,7 +1346,8 @@ def _work_options(argv):
         group = token.split("=", 1) if "=" in token else [token]
         if "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
             index += 1; group.append(argv[index])
-        if key not in RECOVERY_SELECTION_OPTIONS:
+        if (key not in RECOVERY_SELECTION_OPTIONS
+                and not (harness == "opencode" and key == "--agent")):
             values.append(group)
         index += 1
     return sorted(values, key=lambda value: value[0])
@@ -1394,11 +1401,23 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     if route:
         current.update({"--route-id": route["route_id"], "--route-hash": route["route_hash"]})
     for flag, expected in current.items():
-        if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
+        if ((flag in RECOVERY_SELECTION_OPTIONS
+             or (candidate.get("harness") == "opencode" and flag == "--agent"))
+                and flag in options and options[flag] != [str(expected)]):
             raise _contract_error("replacement-argv-mismatch", flag)
     sealed, granted = _granted_permission_pair(history, candidate)
     cross_owner = owner and candidate.get("harness") != history.get("harness")
     if cross_owner:
+        require_recovery_grant_addresses(candidate, history, route=route, access=access)
+    elif (candidate.get("harness") == "opencode"
+          and "opencode_selected_agent_permission" not in
+              (history.get("applied_permissions") or {})
+          and _opencode_selected_permission_view(
+              candidate.get("applied_permissions") or {}).get("rules")):
+        # A legacy launch did not seal selected-agent policy. Do not infer it
+        # from today's config; bound any present candidate file grants by the
+        # same approved worktree/read roots before allowing the optional field
+        # to be absent from one side of the equality comparison.
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
     if access:
         if (granted.get("execution_access") or {}).get("request_sha256") != access["request_sha256"]:
@@ -1410,19 +1429,109 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     if not cross_owner and granted != sealed:
         detail = permission_mismatch_detail(history, candidate)
         raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
-    if not owner and _work_options(candidate.get("argv", [])) != _work_options(history.get("argv", [])):
+    if (not owner and _work_options(candidate.get("argv", []), harness=candidate.get("harness"))
+            != _work_options(history.get("argv", []), harness=history.get("harness"))):
         raise _contract_error("replacement-argv-mismatch")
 
 
 def _opencode_permission_view(applied):
     import opencode_runtime
     if not isinstance(applied, dict) or "opencode_permission" not in applied:
-        return []
+        try:
+            return _opencode_selected_permission_view(applied or {}).get("rules", [])
+        except (AttributeError, TypeError, ValueError):
+            return []
     try:
-        return opencode_runtime.opencode_permission_ordered_view(
+        view = opencode_runtime.opencode_permission_ordered_view(
             applied.get("opencode_permission"))
+        return view or _opencode_selected_permission_view(applied).get("rules", [])
     except ValueError:
         return []
+
+
+def _opencode_policy_view(permission):
+    """Normalize either a raw policy or its sealed ordered-view form."""
+    import opencode_runtime
+    if (isinstance(permission, dict) and set(permission) == {"rules", "precedence"}
+            and isinstance(permission.get("rules"), list)
+            and isinstance(permission.get("precedence"), list)):
+        rules = []
+        for row in permission["rules"]:
+            if (not isinstance(row, (list, tuple)) or len(row) != 3
+                    or not all(isinstance(value, str) and value for value in row)):
+                raise ValueError("invalid ordered OpenCode rule")
+            rules.append(tuple(row))
+        known = set(rules)
+        precedence = []
+        for edge in permission["precedence"]:
+            if (not isinstance(edge, (list, tuple)) or len(edge) != 2
+                    or any(not isinstance(row, (list, tuple)) or len(row) != 3
+                           for row in edge)):
+                raise ValueError("invalid ordered OpenCode precedence")
+            before, after = tuple(edge[0]), tuple(edge[1])
+            if before not in known or after not in known:
+                raise ValueError("unbound OpenCode precedence")
+            precedence.append((before, after))
+        return {
+            "rules": [list(row) for row in sorted(set(rules))],
+            "precedence": [[list(before), list(after)]
+                           for before, after in sorted(set(precedence))],
+        }
+    return opencode_runtime.opencode_permission_ordered_view(permission)
+
+
+def _opencode_selected_permission_view(applied):
+    """Return selected rules without the agent label, which is not a grant."""
+    if not isinstance(applied, dict) or "opencode_selected_agent_permission" not in applied:
+        return {}
+    record = applied.get("opencode_selected_agent_permission")
+    if not isinstance(record, dict) or "permission" not in record:
+        raise ValueError("invalid selected OpenCode policy record")
+    permission = record.get("local_policy", record.get("permission"))
+    view = _opencode_policy_view(permission)
+    return view if isinstance(view, dict) else {"rules": [], "precedence": []}
+
+
+def _effective_opencode_policy(applied):
+    """Compose the sealed global policy followed by the selected local override."""
+    import opencode_runtime
+    global_view = _opencode_policy_view((applied or {}).get("opencode_permission"))
+    selected_view = _opencode_selected_permission_view(applied or {})
+    global_rows = [tuple(row) for row in global_view.get("rules", [])]
+    selected_rows = [tuple(row) for row in selected_view.get("rules", [])]
+    rows = global_rows + selected_rows
+    precedence = {
+        (tuple(edge[0]), tuple(edge[1]))
+        for view in (global_view, selected_view)
+        for edge in view.get("precedence", [])
+    }
+    # The native launcher applies selected-agent rows after the global rows.
+    # Add only precedence that can decide a shared action/resource; unrelated
+    # rules remain in their own policy order.
+    for before in global_rows:
+        for after in selected_rows:
+            if (before[2] != after[2]
+                    and opencode_runtime._opencode_patterns_overlap(before[0], after[0])
+                    and opencode_runtime._opencode_patterns_overlap(before[1], after[1])):
+                precedence.add((before, after))
+    return rows, precedence
+
+
+def _opencode_effect_from_policy(rows, precedence, action, resource, default):
+    import opencode_runtime
+    matching = [row for row in rows
+                if opencode_runtime._opencode_pattern_matches(row[0], action)
+                and opencode_runtime._opencode_pattern_matches(row[1], resource)]
+    if not matching:
+        return default
+    applicable = set(matching)
+    final = [row for row in matching
+             if not any(before == row and after in applicable
+                        for before, after in precedence)]
+    effects = {row[2] for row in final}
+    # A malformed or ambiguous order must be treated as potentially allowed
+    # by the caller's recovery deny check.
+    return next(iter(effects)) if len(effects) == 1 else "allow"
 
 
 def require_recovery_grant_addresses(candidate, history, *, route, access=None):
@@ -1493,6 +1602,7 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
         require(value, reads)
     import opencode_runtime
     permissions = {}
+    policy_rows, policy_precedence = [], set()
     if candidate.get("harness") == "opencode":
         try:
             permissions = opencode_runtime.normalize_opencode_permission(
@@ -1500,11 +1610,12 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
             if not opencode_runtime.opencode_permission_ordered_view(
                     applied.get("opencode_permission")):
                 raise ValueError("empty permission policy")
+            policy_rows, policy_precedence = _effective_opencode_policy(applied)
         except (AttributeError, TypeError, ValueError):
             raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
     for category, roots in (("external_directory", reads), ("edit", writes)):
-        rules = opencode_runtime.opencode_permission_rules_for_action(
-            permissions, category) or []
+        rules = [(row[1], row[2]) for row in policy_rows
+                 if opencode_runtime._opencode_pattern_matches(row[0], category)]
         for pattern, effect in rules:
             if effect == "allow" and not (category == "edit" and pattern in {"*", "**"}):
                 require(pattern, roots, relative_to=history["worktree"] if category == "edit" else None)
@@ -1515,15 +1626,15 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
             for root in reads:
                 if any(root == write or write in root.parents for write in writes):
                     continue
-                visible = opencode_runtime.opencode_permission_effect(
-                    permissions, "external_directory", str(root), default="deny")
+                visible = _opencode_effect_from_policy(
+                    policy_rows, policy_precedence, "external_directory", str(root), "deny")
                 if visible != "allow":
                     continue
                 for path in (root, root / "__recovery_read_only_child__"):
                     forms = (str(path), os.path.relpath(path, history["worktree"]))
                     for form in forms:
-                        effect = opencode_runtime.opencode_permission_effect(
-                            permissions, "edit", form, default="allow")
+                        effect = _opencode_effect_from_policy(
+                            policy_rows, policy_precedence, "edit", form, "allow")
                         if effect != "deny":
                             raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
     for rule in (applied.get("claude") or {}).get("allowed_tools") or []:
@@ -1539,8 +1650,9 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
 
 def _without_recovery_access(permissions):
     result = {key: value for key, value in permissions.items() if key != "execution_access"}
-    policy = result.get("opencode_permission")
-    if isinstance(policy, dict) and isinstance(policy.get("rules"), list):
+    def without_file_rules(policy):
+        if not isinstance(policy, dict) or not isinstance(policy.get("rules"), list):
+            return policy
         removed = {tuple(row) for row in policy["rules"]
                    if isinstance(row, list) and row and row[0] in ("external_directory", "edit")}
         kept = [row for row in policy["rules"] if tuple(row) not in removed]
@@ -1549,13 +1661,23 @@ def _without_recovery_access(permissions):
             if (isinstance(edge, list) and len(edge) == 2
                     and tuple(edge[0]) not in removed and tuple(edge[1]) not in removed):
                 edges.append(edge)
-        result["opencode_permission"] = {
+        return {
             "rules": kept,
             "precedence": edges,
         }
+    policy = result.get("opencode_permission")
+    if isinstance(policy, dict) and isinstance(policy.get("rules"), list):
+        result["opencode_permission"] = without_file_rules(policy)
     elif isinstance(policy, dict):
         result["opencode_permission"] = {key: value for key, value in policy.items()
                                          if key not in ("external_directory", "edit")}
+    selected = result.get("opencode_selected_agent_permission")
+    if isinstance(selected, dict):
+        local = without_file_rules(selected.get("permission"))
+        if not isinstance(local, dict) or not local.get("rules"):
+            result.pop("opencode_selected_agent_permission", None)
+        else:
+            result["opencode_selected_agent_permission"] = {"permission": local}
     return result
 
 
@@ -1600,7 +1722,10 @@ def _recorded_pid_reused(row, identity):
 
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
-    from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
+    from resource_run_registry import (
+        classify_identity, resource_never_started, resource_process_group_quiescent,
+        reboot_evidence,
+    )
     from dispatch_resource_wait import supervisor
     if resource_never_started(row):
         return True
@@ -1619,9 +1744,13 @@ def resource_predecessor_finished(row):
             and reboot_evidence(row)):
         return True
     code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    # A foreign recorded exit proves the leader's result only. Supervised
+    # resources still need the independent process-group quiescence check.
     return (code is not None and row.get("exit_code", code) == code
             and not (row.get("status") == "failed" and code == 0)
-            and not (row.get("status") == "succeeded" and code != 0))
+            and not (row.get("status") == "succeeded" and code != 0)
+            and (row.get("resource_policy") != "supervised-owner"
+                 or resource_process_group_quiescent(row)))
 
 
 def require_resource_predecessors(rows, candidate):
@@ -1712,6 +1841,17 @@ def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
                 granted["opencode_permission"])
         except ValueError:
             granted["opencode_permission"] = []
+    if "opencode_selected_agent_permission" in granted:
+        try:
+            granted["opencode_selected_agent_permission"] = {
+                "permission": _opencode_selected_permission_view(granted)
+            }
+        except (AttributeError, TypeError, ValueError):
+            # Keep malformed policy evidence unequal and omit only the agent
+            # label, which is not itself a permission grant.
+            selected = dict(granted["opencode_selected_agent_permission"] or {})
+            selected.pop("agent", None)
+            granted["opencode_selected_agent_permission"] = selected
     return granted
 
 
@@ -1751,12 +1891,70 @@ def _same_verified_workspace_write_parent(previous, current) -> bool:
     return True
 
 
+def _legacy_selected_nonfile_grants_bounded(old_applied, new_applied) -> bool:
+    """Prove candidate selected non-file allows were already granted globally."""
+    import opencode_runtime
+    try:
+        selected = _opencode_selected_permission_view(new_applied).get("rules", [])
+        global_policy = _opencode_policy_view((old_applied or {}).get("opencode_permission"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not isinstance(global_policy, dict):
+        global_policy = {"rules": [], "precedence": []}
+    global_rows = [tuple(row) for row in global_policy.get("rules", [])]
+    precedence = {
+        (tuple(edge[0]), tuple(edge[1]))
+        for edge in global_policy.get("precedence", [])
+    }
+
+    def covers(cover, pattern):
+        # OpenCode's legacy `tool *` action spelling also matches bare `tool`.
+        if cover.endswith(" *") and pattern == cover[:-2]:
+            return True
+        return opencode_runtime._opencode_pattern_covers(cover, pattern)
+
+    def overlaps(left, right):
+        return (opencode_runtime._opencode_patterns_overlap(left[0], right[0])
+                and opencode_runtime._opencode_patterns_overlap(left[1], right[1]))
+
+    for row in selected:
+        action, resource, effect = tuple(row)
+        if effect != "allow" or action in {"edit", "external_directory"}:
+            continue
+        covers_all = [global_row for global_row in global_rows
+                      if global_row[2] == "allow"
+                      and covers(global_row[0], action)
+                      and covers(global_row[1], resource)]
+        blockers = [global_row for global_row in global_rows
+                    if global_row[2] != "allow" and overlaps(global_row, row)]
+        if not any(all((blocker, global_row) in precedence for blocker in blockers)
+                   for global_row in covers_all):
+            return False
+    return True
+
+
 def _granted_permission_pair(previous, current) -> tuple[dict, dict]:
     """Compare effective grants, collapsing only a proven nested Codex sandbox layer."""
     old_applied = previous.get("applied_permissions") or {}
     new_applied = current.get("applied_permissions") or {}
     old = granted_permissions(old_applied, previous.get("launch_home"), previous.get("worktree"))
     new = granted_permissions(new_applied, current.get("launch_home"), current.get("worktree"))
+    selected_key = "opencode_selected_agent_permission"
+    if selected_key not in old_applied and selected_key in new_applied:
+        same_opencode_history = (previous.get("harness") == "opencode"
+                                 and current.get("harness") == "opencode")
+        if (not same_opencode_history
+                or _legacy_selected_nonfile_grants_bounded(old_applied, new_applied)):
+            # The immutable legacy input did not record this field. Omit only
+            # non-file grants already covered by its global policy; file grants
+            # retain their separate approved-address check.
+            old.pop(selected_key, None)
+            new.pop(selected_key, None)
+    elif selected_key not in new_applied:
+        # Preserve compatibility when the current launch omits the optional
+        # record; that absence supplies no candidate selected policy to compare.
+        old.pop(selected_key, None)
+        new.pop(selected_key, None)
     if previous.get("harness") == "opencode" and not _opencode_permission_view(old_applied):
         old = dict(old)
         old["__opencode_permission_authority__"] = "missing-predecessor"
@@ -1832,7 +2030,28 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
 def same_sealed_work(previous, current, *, recovery=None) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
     old_grants, new_grants = _granted_permission_pair(previous, current)
-    exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
+    old_applied = previous.get("applied_permissions") or {}
+    new_applied = current.get("applied_permissions") or {}
+    selected_key = "opencode_selected_agent_permission"
+    if (current.get("harness") == "opencode"
+            and selected_key not in old_applied and selected_key in new_applied):
+        try:
+            selected_view = _opencode_selected_permission_view(new_applied)
+            has_candidate_allow = any(row[2] == "allow" for row in selected_view.get("rules", []))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if has_candidate_allow:
+            route = recovery[3] if recovery is not None else None
+            access = recovery[0].get("execution_access") if recovery is not None else None
+            from dispatch_contract import DispatchContractError
+            try:
+                require_recovery_grant_addresses(
+                    current, previous, route=route, access=access)
+            except DispatchContractError:
+                return False
+    exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS
+                 if key != "argv")
+            and _same_reseal_argv(previous, current)
             and old_grants == new_grants)
     if exact or recovery is None:
         return exact
@@ -1848,6 +2067,32 @@ def same_sealed_work(previous, current, *, recovery=None) -> bool:
     except DispatchContractError:
         return False
     return True
+
+
+def _same_reseal_argv(previous, current) -> bool:
+    """Ignore only OpenCode's agent label; its recorded policy is compared separately."""
+    old = previous.get("argv", [])
+    new = current.get("argv", [])
+    if previous.get("harness") != "opencode" or current.get("harness") != "opencode":
+        return old == new
+
+    def without_agent(argv):
+        result = []
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            if token.startswith("--agent="):
+                index += 1
+                continue
+            if (token == "--agent" and index + 1 < len(argv)
+                    and not argv[index + 1].startswith("--")):
+                index += 2
+                continue
+            result.append(token)
+            index += 1
+        return result
+
+    return without_agent(old) == without_agent(new)
 
 
 # ---------------------------------------------------------------------------
@@ -1909,10 +2154,10 @@ def declared_subsession(args) -> bool:
 
 
 def new_owner_request(previous_row, *, jobs=None, task=None):
-    """A changed sealed assignment after a settled failure, without rewriting it."""
+    """A changed sealed assignment after a settled attempt, without rewriting it."""
     if (jobs is None or not isinstance(task, str) or not task.strip()
             or previous_row.get("_status") not in {"done", "closed"}
-            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+            or committed_outcome(previous_row["_status"], previous_row) not in {"failed", "succeeded"}):
         return False
     from dispatch_contract import (
         DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
@@ -2357,6 +2602,95 @@ def completion_gate_fail_fields(error, route_file, route_node) -> dict:
     return fields
 
 
+def _admit_supervised_owner_resource_start(args, agent_home, jobs):
+    """Use the normal child start as the owner-controlled resource completion edge."""
+    route_file = getattr(args, "route_file", None)
+    route_node = getattr(args, "route_node", None)
+    if not route_file or not route_node:
+        return False
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        target = next((row for row in route.get("nodes", [])
+                       if isinstance(row, dict) and row.get("id") == route_node), None)
+    except (OSError, ValueError, TypeError):
+        return False
+    if target is None:
+        return False
+    supervised_resources = {
+        row.get("id") for row in route.get("nodes", [])
+        if isinstance(row, dict) and row.get("kind") == "resource-runner"
+        and (row.get("continuation") or {}).get("kind") == "supervised"
+    }
+    # Ordinary stages never open the workflow ledger here: only a start that
+    # follows a supervised resource node can be its owner-controlled edge.
+    if not supervised_resources.intersection(target.get("depends_on") or []):
+        return False
+    import dispatch_resource_wait as OWNER_RESOURCE
+    supervisor = OWNER_RESOURCE.supervisor()
+    ledger = supervisor.ledger_for(route, str(jobs))
+    armed_rows = supervisor.read_armed(ledger)
+    candidates = []
+    for predecessor in target.get("depends_on") or []:
+        node = next((row for row in route.get("nodes", [])
+                    if isinstance(row, dict) and row.get("id") == predecessor), None)
+        armed = armed_rows.get(predecessor)
+        if (node is None or node.get("kind") != "resource-runner"
+                or (node.get("continuation") or {}).get("kind") != "supervised"
+                or not armed or armed.get("predecessor_kind") != "resource"
+                or route_node not in (armed.get("successors") or [])):
+            continue
+        try:
+            registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+            row = registry["runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if row.get("resource_policy") == "supervised-owner":
+            candidates.append((predecessor, armed))
+    if not candidates:
+        return False
+    if getattr(args, "dispatch_depth", None) != 2:
+        raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
+    from dispatch_contract import (
+        DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+    )
+    import dispatch_owner_input as INPUT
+    import subprocess
+    try:
+        repo = subprocess.check_output(
+            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
+        ).strip()
+        owner = resolve_live_parent_attempt(
+            Path(jobs),
+            parent_slug=getattr(args, "parent_slug", None) or "",
+            repo=repo,
+            worktree=parent_lookup_worktree(
+                args.worktree, route_file,
+                subsession=bool(getattr(args, "subsession_id", None)),
+                parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            ),
+            expected_attempt_id=getattr(args, "parent_attempt_id", None),
+            expected_harness=getattr(args, "parent_harness", None),
+            expected_transport=getattr(args, "parent_transport", None),
+            expected_sandbox=getattr(args, "parent_sandbox", None),
+        )
+        owner_input = INPUT.inspect(jobs, owner.attempt_id)
+        if (owner_input.get("supervisor_live") is not True
+                or not owner_input.get("thread_id")
+                or owner_input.get("thread_id") == INPUT.PLACEHOLDER_THREAD):
+            raise DispatchContractError("resource-owner-session-unavailable", owner.attempt_id)
+        try:
+            supervisor.admit_owner_successor_start(
+                route, route_node, jobs, owner.attempt_id, owner_input["thread_id"],
+            )
+        except supervisor.SupervisorError as error:
+            raise DispatchContractError("resource-owner-stage-admission-blocked", str(error)) from error
+    except (DispatchContractError, INPUT.InputError, OSError, subprocess.SubprocessError) as error:
+        if isinstance(error, DispatchContractError):
+            raise
+        raise _contract_error("resource-owner-start-authority-unavailable", str(error)) from error
+    return True
+
+
 def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     """The route's completion and preview gate for one launch, the same in every wrapper.
 
@@ -2369,6 +2703,8 @@ def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     try:
         for check in before:
             check()
+        if action == "start":
+            _admit_supervised_owner_resource_start(args, agent_home, jobs)
         gate(args.route_file, args.route_node, action, agent_home, jobs, attempt_id=args.attempt_id,
              planned_revision_nodes=preview_request_nodes(args, jobs))
     except DispatchContractError as error:

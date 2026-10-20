@@ -34,7 +34,7 @@ another adapter.
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
 - Run harness utilities as `hearting run <utility>` (Routing and Execution); a checkout-relative call is for dev activation only (`AGENT_HOME` is that checkout itself).
-- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch`; its armed line carries the same `parent_next=` directive a launch receipt does, and `join`/`status`/`rearm`/`ack` read the watcher's disk receipt. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` seals a ref for the exact sender, recipient session and body digest, then uses the receiver's native carrier. `prompted=queued` means the ref is pending or accepted by a native queue; only `prompted=true` with exact native receipt means it was received. Claude's plain interactive TUI may keep the ref pending until its next native callback. A blocked target is never sent to. Peer steering does not inspect a composer or type through a pane/PTY; never call `herdr agent prompt` or `pane send-text` directly.
+- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch`; its armed line carries the next-action field `parent_next=` (§5.10a), and `join`/`status`/`rearm`/`ack` read the watcher's disk receipt. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` seals a ref for the exact sender, recipient session and body digest, then uses the receiver's native carrier. `prompted=queued` means the ref is pending or accepted by a native queue; only `prompted=true` with exact native receipt means it was received. Claude's plain interactive TUI may keep the ref pending until its next native callback. A blocked target is never sent to. Peer steering does not inspect a composer or type through a pane/PTY; never call `herdr agent prompt` or `pane send-text` directly.
 
 ## Routing and Execution
 
@@ -44,20 +44,17 @@ hearting run capability-route compose --start --prompt-file <task> \
   [--shape direct] [--campaign-key <stream>]
 ```
 
-Use `--shape direct` only for one atomic, reversible inline change; otherwise
-omit it and let the frame decide. Other shape-free flags are hints. Follow
-decided routes under §0.2.1; person-named stages use
-`--shape staged --graph <stage,…>`.
+Shape-free flags are hints. Follow decided routes under §0.2.1; person-named
+stages use `--shape staged --graph <stage,…>`.
 
-`hearting` is on PATH. `hearting run <utility>` runs that harness utility from
-`AGENT_HOME` when it is set (dev activation: that checkout), else from the
-installed release. The slug comes from the task. The stream defaults to this
-session's latest one in the artifact root, else this folder's only active one;
-otherwise name it with `--campaign-key` (a folder name or close spelling joins
-that active stream; a refusal lists the keys) or opt out with `--unassigned`.
-The runtime prepares the cycle, picks each leg's harness from live usage within
-the sealed candidates, starts frames and the owner, reuses exact attempts, and
-closes the route and cycle at success or once idle.
+`hearting` is on PATH. `hearting run <utility>` uses `AGENT_HOME` when set (dev
+activation: that checkout), else the installed release. The slug comes from the
+task. The stream defaults to this session's latest artifact-root stream, else
+this folder's only active one; otherwise use `--campaign-key` (a folder name or
+close spelling joins that stream; refusal lists keys) or `--unassigned`. The
+runtime prepares the cycle, selects each leg's harness from live usage within
+sealed candidates, starts frames and owner, reuses exact attempts, and closes
+the route and cycle at success or idle.
 
 Follow the receipt. `parent_next=end-turn`: end with no wait, poll or recap;
 a runtime carrier owns it. `parent_next=bounded-wait`: run `parent_next_command`
@@ -72,8 +69,12 @@ starts the owner.
 
 Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py"
 --node <node> --start`: route, slug, parent and harness come from the owner's
-current route and environment, and a member of a sealed parallel group starts
-its whole group in one batch. Dispatch depth 3 is forbidden.
+route and environment, and a member of a sealed parallel group starts its
+whole group in one batch. Dispatch depth 3 is forbidden.
+
+Default to this session's route; start an interactive peer with `hearting run
+peer-steward start` only for long work needing human answers or recovery.
+Command output panes use `hearting run pane open <command>`.
 
 Message another session only with `hearting run peer-steward prompt
 <name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.

@@ -586,6 +586,9 @@ def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str 
     handed = existing.get("session_id") != session and _handed_to(jobs, existing.get("attempt_id"), session)
     if existing.get("session_id") != session and not handed:
         return "foreign-session"
+    metadata = _row_metadata(jobs, existing.get("attempt_id"))
+    if metadata is not None and not seat_handover.owns(metadata, session, jobs):
+        return "foreign-session"       # the arming session handed the owner on and no longer answers for it
     arms = existing.get("arms")
     if not isinstance(arms, int):
         return "unreadable"
@@ -598,9 +601,10 @@ def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str 
         return "unreadable"
     if _holder_alive(existing.get("holder")) and not handed:
         return "held-live"
-    if state == "gate-wake-sent" and _gate_record_open(jobs, existing.get("session_id") or session,
-                                                       existing.get("gate_delivery_id")):
-        return "gate-open"
+    if state == "gate-wake-sent" and _gate_record_open(
+            jobs, (metadata or {}).get("parent_sid") or existing.get("session_id") or session,
+            existing.get("gate_delivery_id")):
+        return "gate-open"      # the gate record lives under the owner row's recipient key, not the arming session's
     return None  # waiting with a dead holder, lapsed, or a gate that has closed
 
 

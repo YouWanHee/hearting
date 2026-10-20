@@ -512,7 +512,8 @@ class ObligationStoreTest(unittest.TestCase):
                        "recipient_sid": "sid", "storage_recipient": "sid",
                        "delivery_id": delivery_id, "claim_owner": owner}}
         row = SimpleNamespace(status="done", attempt_id="att-owner",
-                              metadata={"parent_sid": "sid", "parent_completion_delivery": "claude-parent-runtime",
+                              metadata={"parent_sid": "sid", "parent_harness": "claude",
+                                        "parent_completion_delivery": "claude-parent-runtime",
                                         "delivery_intent": "1",
                                         "delivery_id": "delivery-final",
                                         "delivery_receipt_digest": "digest-final",
@@ -573,16 +574,22 @@ class ObligationStoreTest(unittest.TestCase):
             successor_owner = "retained-rewake:" + successor_duty["id"]
             records["delivery-successor"] = record(
                 "delivery-successor", "claimed", "digest-successor", "rev-successor")
-            successor_transfer = {"state": "received", "receipt": "exact-native-history",
+            prior_recipient_transfer = {"state": "received", "receipt": "exact-native-history",
                 "ref": "c" * 32, "refs": [successor_duty["id"]],
-                "to": {"harness": "claude", "session_id": "successor"},
+                "to": {"harness": "claude", "session_id": "successor-b"},
                 "dispatch_notice": {"duty_id": successor_duty["id"], "jobs": identity["jobs"],
                     "attempt_id": "att-owner", "carrier": "claude-parent-runtime",
-                    "recipient_sid": "successor", "storage_recipient": "sid",
+                    "recipient_sid": "successor-b", "storage_recipient": "sid",
                     "delivery_id": "delivery-successor", "claim_owner": successor_owner}}
-            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"):
+            current_recipient_transfer = {**prior_recipient_transfer, "ref": "d" * 32,
+                "to": {"harness": "claude", "session_id": "successor-c"},
+                "dispatch_notice": {**prior_recipient_transfer["dispatch_notice"],
+                                    "recipient_sid": "successor-c"}}
+            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor-c"):
+                self.assertFalse(obligations.acknowledge_registered_delivery(
+                    prior_recipient_transfer, roots=[self.root]))
                 self.assertTrue(obligations.acknowledge_registered_delivery(
-                    successor_transfer, roots=[self.root]))
+                    current_recipient_transfer, roots=[self.root]))
             self.assertEqual(records["delivery-successor"]["state"], "acked")
             ack.reset_mock()
 
@@ -755,8 +762,8 @@ class ObligationStoreTest(unittest.TestCase):
                 duty, record, answers = self._parent_handover(harness)
                 sent = []
                 armed = []
-                def courier(args, expected_recipient, on_prepared):
-                    sent.append((expected_recipient, Path(args.body_file).read_text()))
+                def courier(args, expected_recipient, on_prepared, producer_binding=None):
+                    sent.append((expected_recipient, Path(args.body_file).read_text(), producer_binding))
                     on_prepared("a" * 32)
                     return 0
                 census = {"result": {"agents": [{"agent": harness, "pane_id": "w1:p5",
@@ -778,6 +785,8 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertEqual(len(sent), 1)
                     self.assertEqual(sent[0][0], (harness, "idle-parent"))
                     self.assertIn("scheduled the route's start under the parent's identity", sent[0][1])
+                    self.assertEqual(sent[0][2]["schema"], "registered-runtime-completion-v1")
+                    self.assertEqual(sent[0][2]["attempt_id"], "att-stopped-owner")
                     self.assertEqual(armed[0]["session_id"], "idle-parent")
                     exact = pending.read(self.root, "idle-parent", record["delivery_id"])
                     self.assertEqual(exact["state"], "sent-ambiguous")
@@ -1253,6 +1262,82 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
             work, state = obligations.bound_work_for_pane(
                 "w2:p7", "claude", "successor", jobs=self.jobs)
             self.assertEqual((len(work), state), (1, "observed"))
+
+    def test_parent_watch_uses_exact_delivery_without_rechecking_owner_closure(self):
+        from dispatch_contract import ATTEMPT_SCHEMA_VERSION, ObservedAttemptLiveness
+        import dispatch_pending_delivery as pending
+        jobs = self.root / "parent-delivery-jobs.log"
+        receipt = {"schema_version": 1, "attempt_id": "att-parent-delivery",
+                   "route_id": "rt-parent-delivery", "route_node": "execute"}
+        receipt_digest = pending._canonical_receipt_digest(receipt)
+        metadata = {
+            "attempt_schema_version": str(ATTEMPT_SCHEMA_VERSION), "dispatch_depth": "1",
+            "transport": "headless", "execution_surface": "registered-headless",
+            "registered_worker": "1", "fallback_hop": "same-harness-headless",
+            "harness": "codex", "worker_type": "dev/backend",
+            "owner_route_id": "rt-parent-delivery", "owner_route_hash": "sha256:" + "b" * 64,
+            "route_node": "execute", "attempt_id": "att-parent-delivery", "parent_sid": "sid-a",
+            "parent_harness": "codex", "failure_class": "pass", "note": "completed-marker",
+            "delivery_intent": "1", "delivery_id": "delivery-parent",
+            "delivery_receipt_digest": receipt_digest,
+            "delivery_row_revision": "revision-parent",
+            "parent_completion_delivery": "codex-native-queue",
+        }
+        jobs.write_text("2026-10-20T00:00:00Z\tdone\trepo\t-\tchild\t" + ",".join(
+            f"{key}={value}" for key, value in metadata.items()) + "\n")
+        pending.create(
+            root=jobs.parent, recipient_kind="codex-native-queue", recipient_key="sid-a",
+            delivery_id="delivery-parent", session_generation="",
+            session_generation_supported="0", attempt_ids=["att-parent-delivery"],
+            parent_attempt_id="att-parent-owner", route_id="rt-parent-delivery",
+            route_node="execute", receipt=receipt,
+            receipt_digest=receipt_digest,
+            row_revisions={"att-parent-delivery": "revision-parent"},
+        )
+
+        def observe():
+            with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
+                            return_value=(("rt-parent-delivery", "sha256:" + "b" * 64, "execute"),)), \
+                 mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-current"), \
+                 mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
+                 mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("dead", "fixture", "quiescent", "fixture")), \
+                 mock.patch("dispatch_terminal_commit.owner_completion_state",
+                            side_effect=AssertionError(
+                                "parent readiness must not inspect owner closure")):
+                work, state = obligations.bound_work_for_pane(
+                    "w3:p7", "codex", "sid-current", jobs=jobs)
+            ready = obligations.pane_readiness(
+                server="fixture", pane="w3:p7", harness="codex",
+                session_id="sid-current", pid_birth="pid:9@start:4",
+                identity_verified=True, native_turn="idle", bound_work=work,
+                bindings_state=state)
+            return work, state, ready
+
+        work, state, ready = observe()
+        self.assertEqual((len(work), state), (1, "observed"))
+        self.assertEqual((work[0].pane_relation, work[0].delivery_state), ("parent", "pending"))
+        self.assertEqual(ready.state, "pending")
+
+        pending.claim(jobs.parent, "sid-a", "delivery-parent",
+                      claim_owner="parent-watch-test", lease_seconds=30)
+        claimed_work, _claimed_state, claimed_ready = observe()
+        self.assertEqual((claimed_work[0].delivery_state, claimed_ready.state),
+                         ("claimed", "pending"))
+
+        pending.ack(jobs.parent, "sid-a", "delivery-parent", acked_by="recipient-consumed")
+        acked_work, _acked_state, acked_ready = observe()
+        self.assertEqual((acked_work[0].delivery_state, acked_ready.state), ("acked", "ready"))
+
+        # A fresh ACK cannot satisfy a different result revision in jobs.log.
+        fields = jobs.read_text(encoding="utf-8").rstrip("\n").split("\t")
+        fields[5] = fields[5].replace(
+            "delivery_row_revision=revision-parent",
+            "delivery_row_revision=revision-replaced")
+        jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+        mismatched_work, _mismatch_state, mismatched_ready = observe()
+        self.assertEqual((mismatched_work[0].delivery_state, mismatched_ready.state),
+                         ("unknown", "unknown"))
 
 
 if __name__ == "__main__":

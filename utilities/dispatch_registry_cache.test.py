@@ -309,6 +309,16 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(second.handover_candidates("old"), ())
         self.assertEqual(len(second.handover_candidates("new")), 1)
 
+    def test_handover_index_keeps_node_less_owner_bindings(self):
+        self.jobs.write_text(
+            "job\tdone\t/repo\ttime\towner\tattempt_id=owner-one,parent_sid=sid-A,worker_type=owner,"
+            "owner_route_id=rt-1,owner_route_hash=sha256:aa\n", encoding="utf-8")
+        view = CACHE.registry_view(self.jobs, append_only=True)
+        found = view.handover_candidates("sid-B", {("rt-1", "sha256:aa", "")})
+        self.assertEqual([(status, record.handover_metadata()["parent_sid"]) for status, record in found],
+                         [("done", "sid-A")])
+        self.assertEqual(view.handover_candidates("sid-B", {("rt-1", "sha256:other", "")}), ())
+
     def test_append_after_observation_gap_rebuilds_instead_of_using_old_prefix(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
         first = CACHE.registry_view(self.jobs, append_only=True)

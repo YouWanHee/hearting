@@ -321,11 +321,15 @@ def resource_evidence(armed):
         # Gone but unsettled means the observation could not be persisted; refuse.
         return {"terminal": False, "reason": f"resource-unsettled:{status}", "liveness": liveness,
                 "identity": identity}
+    quiescent = (RR.resource_process_group_quiescent(row)
+                 if row.get("resource_policy") == "supervised-owner" and liveness == "exited"
+                 else None)
     return {
         "terminal": True,
         "succeeded": status == "succeeded",
         "identity": identity,
         "liveness": liveness,
+        "quiescent": quiescent,
         "exit_code": row.get("exit_code"),
         "sentinel": row.get("sentinel"),
         "sentinel_present": bool(row.get("sentinel")) and Path(str(row["sentinel"])).is_file(),
@@ -758,6 +762,331 @@ def _comparable_armed(prior, record):
     return {**{key: record.get(key) for key in ARMED_NODE_KEYS_ADDED if key not in prior}, **prior}
 
 
+def _resource_owner_matches(left, right):
+    left_owner, right_owner = left.get("owner_wait") or {}, right.get("owner_wait") or {}
+    return (left.get("resource_policy") == right.get("resource_policy") == "supervised-owner"
+            and left.get("route") == right.get("route")
+            and left.get("node") == right.get("node")
+            and left.get("jobs") == right.get("jobs")
+            and left.get("parent_attempt_id") == right.get("parent_attempt_id")
+            and left_owner.get("parent_attempt_id") == right_owner.get("parent_attempt_id")
+            and left_owner.get("session_id") == right_owner.get("session_id")
+            and left_owner.get("route_id") == right_owner.get("route_id")
+            and left_owner.get("route_hash") == right_owner.get("route_hash")
+            and left_owner.get("jobs") == right_owner.get("jobs")
+            and all(left.get(key) == right.get(key) for key in (
+                "config_ref", "config_sha256", "source_commit", "source_dirty",
+                "source_git_state", "config_layout")))
+
+
+def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_session_id,
+                                value, input_module):
+    parent, target = input_module._target(armed["jobs"], owner_attempt_id)
+    owner = resource_row.get("owner_wait") or {}
+    return not (
+        value is None or value.get("target") != target
+        or value.get("thread_id") != owner_session_id
+        or owner.get("session_id") != owner_session_id
+        or owner.get("route_id") != armed.get("route_id")
+        or owner.get("route_hash") != armed.get("route_hash")
+        or owner.get("jobs") != str(Path(armed["jobs"]).resolve())
+        or parent.status not in {"open", "running"}
+        or parent.metadata.get("attempt_id") != owner_attempt_id
+        or owner.get("parent_attempt_id") != owner_attempt_id
+        or str(owner.get("owner_pid")) != parent.metadata.get("pid")
+        or owner.get("owner_start") != parent.metadata.get("pid_start")
+        or not input_module.supervisor_lease_is_held(armed["jobs"], parent.metadata)
+        or any(item.get("state") == "queued" for item in value.get("requests", []))
+    )
+
+
+def _owner_input_is_current(armed, resource_row, owner_attempt_id, owner_session_id):
+    """Read the live owner and queued corrections under the existing input lock."""
+    import dispatch_owner_input as INPUT
+    try:
+        with INPUT._locked(armed["jobs"], owner_attempt_id) as (_, value):
+            return _owner_input_matches_locked(
+                armed, resource_row, owner_attempt_id, owner_session_id, value, INPUT,
+            )
+    except (INPUT.InputError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _successor_registry_snapshot_unstarted(route, armed):
+    """Return stable jobs bytes only when no declared successor has started."""
+    import dispatch_contract as DC
+    try:
+        jobs_path = Path(armed["jobs"])
+        before = jobs_path.read_bytes()
+        lines = before.decode("utf-8", errors="strict").splitlines()
+    except (OSError, UnicodeError, KeyError, TypeError):
+        return None
+    targets = set(armed.get("successors") or [])
+    if not targets:
+        return None
+    from dispatch_replacement import never_started
+    for line in lines:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 6:
+            return None
+        metadata = DC.parse_registry_metadata(fields[5])
+        if metadata.get("route_id") != route.get("route_id"):
+            continue
+        node_id = metadata.get("route_node") or metadata.get("node")
+        if node_id not in targets:
+            continue
+        if metadata.get("route_hash") != route.get("route_hash"):
+            return None
+        if not never_started(fields[1], metadata):
+            return None
+    try:
+        return before if jobs_path.read_bytes() == before else None
+    except OSError:
+        return None
+
+
+def _legacy_poll_marker(route, armed, evidence):
+    """Validate the exact historical poll marker without granting it current use."""
+    import dispatch_contract as DC
+    try:
+        node = WS.route_node(route, armed["node"])
+        output = RUN_EVIDENCE.paths(armed)["runtime_output"]
+        directory = route_module().completion_dir(route["route_id"], jobs=armed["jobs"])
+        path = directory / f"{armed['node']}.json"
+        raw = path.read_bytes()
+        marker = json.loads(raw)
+        sequence = marker.get("sequence")
+        history = directory / f"{armed['node']}.{sequence}.json"
+        if (node is None or marker.get("route_id") != route["route_id"]
+                or marker.get("route_hash") != route.get("route_hash")
+                or marker.get("node_id") != armed["node"]
+                or marker.get("evidence", {}).get("path") != output
+                or marker.get("resource_execution_identity") is not None
+                or not isinstance(sequence, int) or sequence < 1
+                or history.read_bytes() != raw):
+            return None
+        schema_ok, _ = DC._marker_schema_identity_ok(route, node, marker, path, observe=True)
+        currency = DC.evidence_currency(route, node, path, marker, observe=True, jobs=armed["jobs"])
+        if (not schema_ok or currency.state != "current"
+                or not DC._marker_link_current(route, node, marker, path)):
+            return None
+        return {"path": path, "marker": marker, "bytes": raw,
+                "sha256": hashlib.sha256(raw).hexdigest()}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _legacy_continuation_attempt(armed, prior_row, candidate=None):
+    """Find the same owner's exact next resource, not an inferred run-id pattern."""
+    import resource_run_registry as RR
+    try:
+        registry = Path(armed["resource_registry"])
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        rows = data.get("runs")
+        if not isinstance(rows, dict):
+            return None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if candidate is not None:
+        candidates = [candidate]
+    else:
+        candidates = [row for run_id, row in rows.items()
+                      if isinstance(row, dict) and run_id != armed.get("predecessor_id")
+                      and row.get("route") == armed.get("route_file")
+                      and row.get("node") == armed.get("node")]
+    valid = []
+    for row in candidates:
+        if (not isinstance(row, dict) or row.get("run_id") == armed.get("predecessor_id")
+                or not _resource_owner_matches(prior_row, row)):
+            continue
+        try:
+            after_previous = float(row.get("started_at")) >= float(prior_row.get("ended_at"))
+        except (TypeError, ValueError):
+            after_previous = False
+        never_started_candidate = RR.resource_never_started(row)
+        reserved_before_release = (
+            candidate is not None and row.get("status") == "launching"
+            and not any(row.get(key) is not None for key in
+                        ("pid", "starttime", "command_hash", "process_group", "launch_state")))
+        if after_previous and (never_started_candidate or reserved_before_release):
+            valid.append(row)
+    if candidate is not None:
+        return valid[0] if len(valid) == 1 else None
+    # A newer started or unknown run makes absence unprovable, even if another
+    # later retry has a never-started receipt.
+    newer = [row for run_id, row in rows.items() if isinstance(row, dict)
+             and run_id != armed.get("predecessor_id")
+             and row.get("route") == armed.get("route_file")
+             and row.get("node") == armed.get("node")
+             and row.get("parent_attempt_id") == prior_row.get("parent_attempt_id")]
+    if not newer or len(valid) != len(newer):
+        return None
+    return max(valid, key=lambda row: float(row.get("started_at", 0)))
+
+
+def _resume_legacy_resource_retraction(route, ledger, armed, event):
+    """Finish the existing legal recovery path after an interrupted journal append."""
+    node_id = armed["node"]
+    evidence = {"resource_false_success_retracted": True,
+                "resource_identity": event.get("resource_identity"),
+                "marker_sha256": event.get("marker_sha256"),
+                "retired_successor_claims": event.get("retired_successor_claims", [])}
+    state = ledger.state()
+    stage_state = state["nodes"].get(node_id, {}).get("state")
+    if stage_state == "STAGE_SUCCEEDED":
+        latest = next((entry for entry in reversed(ledger.journal())
+                       if entry.get("node") == node_id and entry.get("state")), {})
+        prior = latest.get("evidence") or {}
+        if (latest.get("actor") != "poll"
+                or prior.get("identity") != event.get("resource_identity")
+                or prior.get("awaiting_next_resource") is True):
+            return False
+        ledger.record(node_id, "FAILED_RETRYABLE", evidence=evidence,
+                      actor="resource-false-success-reconciliation")
+        stage_state = "FAILED_RETRYABLE"
+    if stage_state == "FAILED_RETRYABLE":
+        latest = next((entry for entry in reversed(ledger.journal())
+                       if entry.get("node") == node_id and entry.get("state")), {})
+        if (latest.get("actor") != "resource-false-success-reconciliation"
+                or (latest.get("evidence") or {}).get("resource_false_success_retracted") is not True):
+            return False
+        ledger.record(node_id, "READY", evidence=evidence,
+                      actor="resource-false-success-reconciliation")
+        stage_state = "READY"
+    if stage_state == "READY":
+        ledger.record(node_id, "RUNNING", evidence=evidence,
+                      actor="resource-false-success-reconciliation")
+        stage_state = "RUNNING"
+    if stage_state != "RUNNING":
+        stage = ledger.state()["nodes"].get(node_id, {})
+        if ((stage.get("evidence") or {}).get("identity") != event.get("resource_identity")
+                or (stage.get("evidence") or {}).get("awaiting_next_resource") is not True):
+            return False
+    workflow = ledger.state().get("workflow_state")
+    if workflow in {"STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING"}:
+        ledger.set_workflow_state("FAILED_RETRYABLE", evidence=evidence,
+                                  actor="resource-false-success-reconciliation")
+        workflow = "FAILED_RETRYABLE"
+    if workflow == "FAILED_RETRYABLE":
+        latest = next((entry for entry in reversed(ledger.journal())
+                       if entry.get("workflow_state")), {})
+        if ((latest.get("evidence") or {}).get("resource_false_success_retracted") is not True):
+            workflow_evidence = latest.get("evidence") or {}
+            if (latest.get("actor") != "poll"
+                    or workflow_evidence.get("node") != node_id):
+                return False
+            ledger.set_workflow_state("FAILED_RETRYABLE", evidence=evidence,
+                                      actor="resource-false-success-reconciliation")
+        ledger.set_workflow_state("READY", evidence=evidence,
+                                  actor="resource-false-success-reconciliation")
+        workflow = "READY"
+    if workflow == "READY":
+        ledger.set_workflow_state("RUNNING", evidence=evidence,
+                                  actor="resource-false-success-reconciliation")
+    return ledger.state()["nodes"].get(node_id, {}).get("state") == "RUNNING"
+
+
+def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candidate=None):
+    """Retract only a poll success contradicted by the same owner's unstarted next run."""
+    if armed.get("predecessor_kind") != "resource" or armed.get("successor_external") is not True:
+        return False
+    if resource_continuation_cancelled(route, ledger):
+        return False
+    try:
+        registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        prior_row = registry["runs"][armed["predecessor_id"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if prior_row.get("resource_policy") != "supervised-owner":
+        return False
+    evidence = resource_evidence(armed)
+    checked = _checked_resource_row(armed, evidence) if evidence.get("terminal") else None
+    if (checked is None or evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
+            or evidence.get("liveness") != "exited" or evidence.get("sentinel_present") is not True
+            or evidence.get("quiescent") is False):
+        return False
+    stage = ledger.state()["nodes"].get(armed["node"], {})
+    workflow_state = ledger.state().get("workflow_state")
+    if workflow_state in {"CANCELLED", "FAILED_TERMINAL", "COMPLETE", "BLOCKED_HUMAN_GATE"}:
+        return False
+    if any(row.get("state") in WS.vocabulary()["failure_states"]
+           for node, row in ledger.state()["nodes"].items() if node != armed["node"]):
+        return False
+    owner = prior_row.get("owner_wait") or {}
+    owner_id, session_id = owner.get("parent_attempt_id"), owner.get("session_id")
+    if not owner_id or prior_row.get("parent_attempt_id") != owner_id:
+        return False
+    continuation = _legacy_continuation_attempt(armed, prior_row, candidate)
+    if continuation is None:
+        return False
+    marker = _legacy_poll_marker(route, armed, evidence)
+    jobs_snapshot = _successor_registry_snapshot_unstarted(route, armed)
+    if marker is None or jobs_snapshot is None:
+        return False
+    existing_event = next((entry.get("evidence") or {} for entry in reversed(ledger.journal())
+                           if entry.get("actor") == "resource-false-success-reconciliation"
+                           and (entry.get("evidence") or {}).get("marker_sha256") == marker["sha256"]
+                           and (entry.get("evidence") or {}).get("resource_identity") == evidence.get("identity")), None)
+    stage = ledger.state()["nodes"].get(armed["node"], {})
+    latest = next((entry for entry in reversed(ledger.journal())
+                   if entry.get("node") == armed["node"] and entry.get("state")), {})
+    if existing_event is None and (
+            stage.get("state") != "STAGE_SUCCEEDED"
+            or latest.get("actor") != "poll"
+            or (latest.get("evidence") or {}).get("identity") != evidence.get("identity")
+            or (latest.get("evidence") or {}).get("awaiting_next_resource") is True):
+        return False
+    if existing_event is not None and (
+            existing_event.get("owner_attempt_id") != owner_id
+            or existing_event.get("owner_session_id") != session_id):
+        return False
+    if workflow_state == "FAILED_RETRYABLE":
+        latest_workflow = next((entry for entry in reversed(ledger.journal())
+                                if entry.get("workflow_state")), {})
+        workflow_evidence = latest_workflow.get("evidence") or {}
+        if (existing_event is None and latest_workflow.get("actor") != "poll"):
+            return False
+        if (existing_event is None and workflow_evidence.get("node") != armed["node"]):
+            return False
+    active_claims = ledger.claims()
+    retired_claims = []
+    for key, claim in active_claims.items():
+        if claim.get("predecessor") != armed["node"]:
+            continue
+        if (claim.get("route_id") != route.get("route_id")
+                or claim.get("predecessor_identity") != evidence.get("identity")
+                or claim.get("successor") not in armed.get("successors", [])):
+            return False
+        retired_claims.append(key)
+    if existing_event is None and not _owner_input_is_current(armed, prior_row, owner_id, session_id):
+        return False
+    try:
+        current_marker_bytes = marker["path"].read_bytes()
+        current_jobs_bytes = Path(armed["jobs"]).read_bytes()
+        current_resource = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        current_row = current_resource["runs"][armed["predecessor_id"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if (current_marker_bytes != marker["bytes"] or current_jobs_bytes != jobs_snapshot
+            or RESOURCE_RESUME.row_digest(current_row) != evidence.get("resource_sha256")
+            or not _resource_owner_matches(prior_row, continuation)):
+        return False
+    event = existing_event
+    if event is None:
+        event = {"resource_identity": evidence["identity"],
+                 "marker_sequence": marker["marker"]["sequence"],
+                 "marker_sha256": marker["sha256"],
+                 "retired_successor_claims": retired_claims,
+                 "successors": list(armed.get("successors") or []),
+                 "owner_attempt_id": owner_id, "owner_session_id": session_id,
+                 "jobs_registry_sha256": hashlib.sha256(jobs_snapshot).hexdigest(),
+                 "continuation_run_id": continuation.get("run_id")}
+        ledger.record_event(evidence=event, actor="resource-false-success-reconciliation")
+    return _resume_legacy_resource_retraction(route, ledger, armed, event)
+
+
 def replace_resource_predecessor(route, ledger, prior, record, resource):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
@@ -773,8 +1102,18 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
     missing = artifact_evidence(prior)
     state = ledger.state()
     stage = state["nodes"].get(prior["node"], {})
+    latest = next((entry for entry in reversed(ledger.journal())
+                   if entry.get("node") == prior["node"] and entry.get("state")), {})
+    if (old is not None and old.get("resource_policy") == "supervised-owner"
+            and (stage.get("state") == "STAGE_SUCCEEDED"
+                 or (stage.get("state") == "FAILED_RETRYABLE"
+                     and latest.get("actor") == "resource-false-success-reconciliation"))):
+        reconcile_legacy_supervised_resource_success(route, ledger, prior, candidate=resource)
+        state = ledger.state()
+        stage = state["nodes"].get(prior["node"], {})
     if (old is None or not OWNER_RESOURCE.resource_execution_finished(old)
-            or (evidence.get("succeeded") and (not missing.get("checked") or
+            or (evidence.get("succeeded") and old.get("resource_policy") != "supervised-owner"
+                and (not missing.get("checked") or
                 (not missing.get("missing") and not (stage.get("evidence") or {}).get("runtime_only_output"))))
             or stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}
             or state["workflow_state"] not in {"RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}
@@ -834,7 +1173,8 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
         evidence = latest.get("evidence") or {}
         artifacts = evidence.get("artifacts") or {}
         if (evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
-                or not ((artifacts.get("reason") == "declared-artifact-missing" and artifacts.get("missing"))
+                or not (evidence.get("awaiting_next_resource") is True
+                        or (artifacts.get("reason") == "declared-artifact-missing" and artifacts.get("missing"))
                         or evidence.get("runtime_only_output") is True)
                 or armed.get("predecessor_kind") != "resource"):
             continue
@@ -855,10 +1195,14 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
                 continue
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        resolved = {**evidence, "artifacts": current_artifacts}
+        resolved = {**evidence, "artifacts": current_artifacts,
+                    "owner_terminal_settlement": True,
+                    "owner_attempt_id": owner_attempt_id,
+                    "resource_execution_identity": evidence.get("identity")}
         resolved.pop("awaiting_next_resource", None)
         route_module().write_completion_marker(route, WS.route_node(route, node), node,
-            Path(RUN_EVIDENCE.paths(armed)["runtime_output"]), jobs=jobs)
+            Path(RUN_EVIDENCE.paths(armed)["runtime_output"]), jobs=jobs,
+            resource_execution_identity=evidence.get("identity"))
         if stage.get("state") == "FAILED_RETRYABLE":
             ledger.record(node, "READY", evidence=resolved, actor="completion-controller")
         for state in WS.completion_transition_path(
@@ -890,6 +1234,10 @@ def _evaluate(route, ledger, armed, results):
     if (armed["predecessor_kind"] == "resource" and evidence.get("terminal") and evidence.get("succeeded")
             and evidence.get("liveness") != "exited"):
         results.append({"node": node_id, "action": "wait", "reason": "resource-identity-unproven"})
+        return
+    if (armed["predecessor_kind"] == "resource" and evidence.get("terminal")
+            and evidence.get("quiescent") is False):
+        results.append({"node": node_id, "action": "wait-draining", "reason": "resource-process-group-active"})
         return
     if (evidence.get("resource_sha256") and evidence.get("terminal")
             and evidence.get("succeeded") and evidence.get("liveness") == "exited"):
@@ -927,6 +1275,19 @@ def _evaluate(route, ledger, armed, results):
         results.append(row)
         return
     runtime_only = runtime_output.get("runtime_only") is True
+    if (row_data is not None and row_data.get("resource_policy") == "supervised-owner"
+            and kind == "supervised"):
+        # A resource is one execution inside an owner-controlled logical stage.
+        # Its output document can be prepared before the payload starts, so only
+        # the owner's existing successor start may settle the stage.
+        evidence["awaiting_next_resource"] = True
+        evidence["runtime_only_output"] = runtime_only
+        previous = ledger.state()["nodes"].get(node_id, {}).get("evidence")
+        if previous != evidence:
+            ledger.record(node_id, "RUNNING", evidence=evidence, actor="poll")
+        row["action"] = "wait-next-resource"
+        results.append(row)
+        return
     if ((artifacts.get("checked") and artifacts.get("missing")) or
             (runtime_only and row_data is not None and row_data.get("resource_policy") == "supervised-owner")):
         if row_data is not None and row_data.get("resource_policy") == "supervised-owner":
@@ -1007,6 +1368,153 @@ def _evaluate(route, ledger, armed, results):
     results.append(row)
 
 
+def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_session_id):
+    """Settle supervised-owner resources only at their live owner's ordinary start."""
+    route_node = WS.route_node(route, successor)
+    if route_node is None:
+        raise SupervisorError("resource-successor-route-node-missing")
+    import dispatch_owner_input as INPUT
+    ledger = ledger_for(route, str(jobs))
+    admitted = False
+    with ledger.lock():
+        if resource_continuation_cancelled(route, ledger):
+            raise SupervisorError("resource-owner-continuation-cancelled")
+        armed_rows = read_armed(ledger)
+        for predecessor in route_node.get("depends_on") or []:
+            armed = armed_rows.get(predecessor)
+            if (not armed or armed.get("predecessor_kind") != "resource"
+                    or successor not in (armed.get("successors") or [])):
+                continue
+            try:
+                data = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+                row = data["runs"][armed["predecessor_id"]]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if row.get("resource_policy") != "supervised-owner":
+                continue
+            owner = row.get("owner_wait") or {}
+            if (armed.get("route_id") != route.get("route_id")
+                    or armed.get("route_hash") != route.get("route_hash")
+                    or armed.get("route_file") != str(Path(armed["route_file"]).resolve())
+                    or armed.get("jobs") != str(Path(jobs).resolve())
+                    or owner.get("parent_attempt_id") != owner_attempt_id
+                    or row.get("parent_attempt_id") != owner_attempt_id
+                    or owner.get("session_id") != owner_session_id
+                    or armed.get("successor_external") is not True
+                    or armed.get("successor_command") is not None):
+                raise SupervisorError("resource-owner-successor-binding-conflict")
+            stage = ledger.state()["nodes"].get(predecessor, {})
+            stage_evidence = stage.get("evidence") or {}
+            if stage.get("state") == "STAGE_SUCCEEDED":
+                owner_settled = (
+                    stage_evidence.get("owner_attempt_id") == owner_attempt_id
+                    and stage_evidence.get("resource_execution_identity") == stage_evidence.get("identity")
+                    and (stage_evidence.get("owner_successor_start") is True
+                         or stage_evidence.get("owner_terminal_settlement") is True)
+                )
+                if not owner_settled and reconcile_legacy_supervised_resource_success(route, ledger, armed):
+                    # The old marker is now history. The ordinary read-only
+                    # marker gate below will refuse this start and the owner can
+                    # continue the approved resource sequence on the same route.
+                    continue
+                if not owner_settled:
+                    continue
+            elif stage.get("state") != "RUNNING":
+                continue
+            try:
+                with INPUT._locked(armed["jobs"], owner_attempt_id) as (_, value):
+                    if not _owner_input_matches_locked(
+                            armed, row, owner_attempt_id, owner_session_id, value, INPUT):
+                        raise SupervisorError("resource-owner-input-unavailable")
+                    if stage.get("state") == "STAGE_SUCCEEDED":
+                        marker_path = route_module().completion_dir(
+                            route["route_id"], jobs=jobs,
+                        ) / f"{predecessor}.json"
+                        try:
+                            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            raise SupervisorError("resource-owner-marker-unavailable")
+                        import dispatch_contract as DC
+                        if not DC.completion_marker_is_current(
+                                route, WS.route_node(route, predecessor), marker_path,
+                                marker, jobs=jobs):
+                            raise SupervisorError("resource-owner-marker-not-current")
+                        workflow = ledger.state().get("workflow_state")
+                        if WS.can_transition(workflow, "STAGE_SUCCEEDED", ledger.registry_path):
+                            ledger.set_workflow_state("STAGE_SUCCEEDED", evidence={"node": predecessor},
+                                                      actor="owner-successor-start")
+                        _claim_owner_successors(route, ledger, armed, predecessor, stage_evidence)
+                        admitted = True
+                        continue
+                    if _admit_owner_resource_stage_locked(
+                            route, ledger, armed, predecessor, jobs, owner_attempt_id,
+                            owner_session_id,
+                    ):
+                        admitted = True
+            except INPUT.InputError as error:
+                raise SupervisorError("resource-owner-input-unavailable") from error
+    return admitted
+
+
+def _admit_owner_resource_stage_locked(route, ledger, armed, predecessor, jobs,
+                                       owner_attempt_id, owner_session_id):
+    """Settle one verified resource while the ledger and owner-input locks are held."""
+    evidence = resource_evidence(armed)
+    checked = _checked_resource_row(armed, evidence) if evidence.get("terminal") else None
+    if (checked is None or evidence.get("succeeded") is not True
+            or evidence.get("exit_code") != 0 or evidence.get("liveness") != "exited"
+            or evidence.get("sentinel_present") is not True
+            or evidence.get("quiescent") is not True):
+        return False
+    try:
+        output = resource_output_evidence(route, armed, evidence)
+    except (OSError, ValueError, SupervisorError) as error:
+        raise SupervisorError(str(error)) from error
+    artifacts = artifact_evidence(armed)
+    if not artifacts.get("checked") or artifacts.get("missing"):
+        return False
+    if _checked_resource_row(armed, evidence) is None:
+        raise SupervisorError("resource-evidence-changed")
+    evidence = {**evidence, "artifacts": artifacts,
+                "runtime_only_output": output.get("runtime_only") is True,
+                "owner_successor_start": True,
+                "owner_attempt_id": owner_attempt_id,
+                "owner_session_id": owner_session_id,
+                "resource_execution_identity": evidence["identity"]}
+    route_module().write_completion_marker(
+        route, WS.route_node(route, predecessor), predecessor,
+        Path(output["runtime_output"]), jobs=jobs,
+        resource_execution_identity=evidence["identity"],
+    )
+    if _checked_resource_row(armed, evidence) is None:
+        raise SupervisorError("resource-evidence-changed")
+    if ledger.state()["nodes"].get(predecessor, {}).get("state") == "RUNNING":
+        ledger.record(predecessor, "STAGE_SUCCEEDED", evidence=evidence,
+                      actor="owner-successor-start")
+    workflow = ledger.state().get("workflow_state")
+    if WS.can_transition(workflow, "STAGE_SUCCEEDED", ledger.registry_path):
+        ledger.set_workflow_state("STAGE_SUCCEEDED", evidence={"node": predecessor},
+                                  actor="owner-successor-start")
+    _claim_owner_successors(route, ledger, armed, predecessor, evidence)
+    return True
+
+
+def _claim_owner_successors(route, ledger, armed, node_id, evidence):
+    claims = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
+    if claims:
+        current = ledger.state().get("workflow_state")
+        if WS.can_transition(current, "NEXT_REGISTERED", ledger.registry_path):
+            ledger.set_workflow_state("NEXT_REGISTERED",
+                                      evidence={"node": node_id, "successors": armed["successors"]},
+                                      actor="owner-successor-start")
+        if any(item.get("started") for item in claims):
+            current = ledger.state().get("workflow_state")
+            if WS.can_transition(current, "NEXT_RUNNING", ledger.registry_path):
+                ledger.set_workflow_state("NEXT_RUNNING", evidence={"node": node_id},
+                                          actor="owner-successor-start")
+    return claims
+
+
 def _poll_once_locked(route, ledger):
     import route_parent_close
     closing = route_parent_close.ledger_intent(route, ledger)
@@ -1030,6 +1538,9 @@ def _poll_once_locked(route, ledger):
     results = []
     for node_id, armed in sorted(read_armed(ledger).items()):
         state = ledger.state()["nodes"].get(node_id, {}).get("state")
+        if (state == "STAGE_SUCCEEDED" and armed.get("predecessor_kind") == "resource"):
+            if reconcile_legacy_supervised_resource_success(route, ledger, armed):
+                state = ledger.state()["nodes"].get(node_id, {}).get("state")
         if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
             results.append({"node": node_id, "action": "settled", "state": state})
             continue

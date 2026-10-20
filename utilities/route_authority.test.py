@@ -56,8 +56,7 @@ class Case1ParentSessionTest(unittest.TestCase):
             jobs = Path(td) / "jobs.log"
             handover = {"from": "codex-sid", "sid": successor_sid, "harness": successor_harness,
                         "bindings": [HANDOVER.binding_of(jobs, self.OWNER)], "ts": 1}
-            with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
-                 mock.patch.object(HANDOVER, "handover_rows", return_value=[handover]):
+            with mock.patch.object(HANDOVER, "_lineage_seats", return_value={"seat": [handover]}):
                 return RA.owns(self.OWNER, successor_sid, jobs)
 
     def test_the_registered_session_owns_its_route(self):
@@ -74,6 +73,63 @@ class Case1ParentSessionTest(unittest.TestCase):
         # RA-2 (stage 2): a recorded handover row moves the parent role across harnesses.
         self.assertTrue(self._owns_after("codex-sid-after-clear", "codex"))
         self.assertTrue(self._owns_after("claude-sid", "claude"))
+
+    def test_only_current_recipient_owns_after_two_handovers(self):
+        jobs = Path("/tmp/registered-parent-handover-jobs")
+        binding = HANDOVER.binding_of(jobs, self.OWNER)
+        rows = [
+            {"from": "codex-sid", "sid": "claude-sid", "harness": "claude",
+             "bindings": [binding], "ts": 1},
+            {"from": "claude-sid", "sid": "opencode-sid", "harness": "opencode",
+             "bindings": [binding], "ts": 2},
+        ]
+        with mock.patch.object(HANDOVER, "_lineage_seats", return_value={"seat": rows}):
+            self.assertFalse(RA.owns(self.OWNER, "codex-sid", jobs))
+            self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
+            self.assertTrue(RA.owns(self.OWNER, "opencode-sid", jobs))
+
+    def test_old_parent_cannot_write_a_second_snapshot_but_current_successor_can(self):
+        import session_tidy as tidy
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        jobs = root / "jobs.log"
+        binding = HANDOVER.binding_of(jobs, self.OWNER)
+        seat = tidy.Seat("pane", "snapshot-lineage-seat", "w9:pSnapshot")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}):
+            snapshot = {"schema": HANDOVER.SCHEMA, "seat": seat.as_dict(),
+                        "from": {"harness": "codex", "sid": "codex-sid"},
+                        "at": 1, "bindings": [binding], "snapshot_id": "snapshot-a"}
+            tidy.atomic_write_json(HANDOVER._snapshot_path(seat.key), snapshot)
+            ledger = tidy._ledger_path(seat)
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            ledger.write_text(json.dumps({"event": "handover", "from": "codex-sid",
+                "sid": "successor", "harness": "codex", "ts": 2,
+                "bindings": [binding]}) + "\n")
+            before_snapshot, before_ledger = (HANDOVER._snapshot_path(seat.key).read_bytes(),
+                                               ledger.read_bytes())
+            with mock.patch.object(HANDOVER, "_confirmed_clear", return_value=True), \
+                 mock.patch.object(tidy, "session_summary", return_value={
+                     ("codex", "third"): {"first_seen": 3}}):
+                self.assertIsNone(HANDOVER.record_locked(
+                    seat, "codex", "third", "start", "clear", 3))
+            self.assertEqual(HANDOVER._snapshot_path(seat.key).read_bytes(), before_snapshot)
+            self.assertEqual(ledger.read_bytes(), before_ledger)
+
+            # The current recipient can take a fresh snapshot and hand it on.
+            snapshot.update({"from": {"harness": "codex", "sid": "successor"},
+                             "at": 3, "snapshot_id": "snapshot-b"})
+            tidy.atomic_write_json(HANDOVER._snapshot_path(seat.key), snapshot)
+            with mock.patch.object(HANDOVER, "_confirmed_clear", return_value=True), \
+                 mock.patch.object(tidy, "session_summary", return_value={
+                     ("codex", "third"): {"first_seen": 4}}):
+                row = HANDOVER.record_locked(seat, "codex", "third", "start", "clear", 4)
+            self.assertEqual((row["from"], row["sid"]), ("successor", "third"))
+
+    def test_unreadable_handover_keeps_registered_parent_safe_default(self):
+        jobs = Path("/tmp/registered-parent-unreadable-jobs")
+        with mock.patch.object(HANDOVER, "_lineage_seats", side_effect=OSError("unreadable")):
+            self.assertTrue(RA.owns(self.OWNER, "codex-sid", jobs))
+            self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
 
     def test_a_non_owner_cannot_start_the_replacement_owner(self):
         with self.assertRaises(DC.DispatchContractError) as refused:
@@ -273,8 +329,11 @@ class OwnerPinChangeTest(unittest.TestCase):
     def start_pin(self, values, *, caller=("codex", "codex-sid"), owner_parent="codex-sid", probed=None):
         router = _load("route_authority_capability_route", "utilities/capability-route.py")
         import work_start
-        rows = {"att-owner": ("done", {"worker_type": "owner", "owner_route_id": self.route["route_id"],
-                                       "parent_sid": owner_parent, "attempt_id": "att-owner"})}
+        rows = {"att-owner": ("done", {"dispatch_depth": "1", "worker_type": "owner",
+                                       "owner_route_id": self.route["route_id"],
+                                       "owner_route_hash": self.route["route_hash"],
+                                       "parent_harness": "codex", "parent_sid": owner_parent,
+                                       "attempt_id": "att-owner"})}
         probe = {"tuples": [_tuple("codex", "codex")] + (self.probed if probed is None else probed), "candidates": []}
         with mock.patch.dict(os.environ, self.isolated_env(), clear=True), \
              mock.patch.object(RA, "caller_identity", return_value=caller), \
@@ -308,21 +367,75 @@ class OwnerPinChangeTest(unittest.TestCase):
             self.assertIn(reason, str(refused.exception))
         self.assertEqual(RA.pin_changes(self.route), [])
 
-    def test_a_peer_message_at_this_turn_is_the_recorded_source(self):
+    def test_confirmed_handover_refuses_old_parent_pin_and_allows_successor(self):
+        import session_tidy as tidy
+        jobs = Path(self.temp.name) / "jobs.log"
+        meta = {"attempt_id": "att-owner", "dispatch_depth": "1", "worker_type": "owner",
+                "parent_sid": "codex-sid", "parent_harness": "codex",
+                "owner_route_id": self.route["route_id"], "owner_route_hash": self.route["route_hash"]}
+        jobs.write_text("now\trunning\t/w\t/w\towner\t" +
+                        ",".join(f"{key}={value}" for key, value in meta.items()) + "\n")
+        seat = tidy.Seat("pane", "fixture-pin-successor", "w9:pSuccessor")
+        binding = HANDOVER.binding_of(jobs, meta)
+        with mock.patch.dict(os.environ, self.isolated_env(), clear=True):
+            tidy.atomic_write_json(HANDOVER._snapshot_path(seat.key), {
+                "schema": HANDOVER.SCHEMA,
+                "seat": {"kind": "pane", "key": seat.key, "pane": seat.pane},
+                "from": {"sid": "codex-sid"}, "bindings": [binding],
+            })
+            ledger = tidy._ledger_path(seat)
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            ledger.write_text(json.dumps({"event": "handover", "from": "codex-sid",
+                "sid": "successor", "harness": "codex", "ts": 2,
+                "bindings": [binding]}) + "\n")
+            self.assertEqual(HANDOVER.effective_parent(meta, jobs), "successor")
+            with self.assertRaisesRegex(ValueError, "start-pin-parent-only"):
+                self.start_pin(["owner=claude"], caller=("codex", "codex-sid"))
+            result, _readiness = self.start_pin(["owner=claude"], caller=("codex", "successor"))
+        self.assertTrue(result["changed"])
+        self.assertEqual(RA.pin_changes(self.route)[-1]["by"],
+                         {"harness": "codex", "session_id": "successor"})
+
+    def test_only_the_exact_current_prompt_transfer_sets_peer_source(self):
         router = _load("route_authority_capability_route_source", "utilities/capability-route.py")
         peer = _load("route_authority_peer_message", "utilities/peer-message.py")
         import argparse, session_tidy, time
         with mock.patch.dict(os.environ, self.isolated_env(), clear=True):
             self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
+            sender = {"harness": "claude", "session_id": "peer-sid", "name": "hearting-4d"}
+            recipient = {"harness": "codex", "session_id": "codex-sid"}
+            body = "[steer] exact current request"
+            text, ref = peer.prepare_peer_message(body, sender, recipient, defer=True, refs=["route-current"])
+            origin = peer.prompt_origin(text, "codex", "codex-sid")
+            self.assertEqual((origin["kind"], origin["transfer_ref"]), ("peer", ref))
+            session_tidy.run_hook("codex", "prompt", "codex-sid", cwd="/w", prompt_text=text)
             seat = session_tidy.resolve_seat("codex", "/w", os.environ, "codex-sid", "")
-            session_tidy.bump_prompt_seq(seat, "codex", "codex-sid", time.time())
+            seq = session_tidy.read_prompt_seq(seat)
+            marker = session_tidy.prompt_state(seat)
+            self.assertEqual(marker["request_origin"]["transfer_ref"], ref)
+            self.assertNotIn(body, json.dumps(marker))
+            expected = "peer:hearting-4d·" + ref
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), expected)
+            with mock.patch.object(peer.time, "gmtime", return_value=time.gmtime(marker["at"])):
+                peer.cmd_record(argparse.Namespace(
+                    from_harness="opencode", from_session_id="unrelated-sid", from_name="unrelated", from_project="p",
+                    to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
+                    status="received", receipt="exact-peer-ref", ref=["f" * 32], transfer_ref=None,
+                    body_file=None, body_stdin=False, body_text="herdr steer received"))
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), expected)
+            session_tidy.run_hook("codex", "prompt", "codex-sid", cwd="/w",
+                                  prompt_text="separate user request")
+            next_seq = session_tidy.read_prompt_seq(seat)
+            self.assertGreater(next_seq, seq)
             self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
-            peer.cmd_record(argparse.Namespace(
-                from_harness="claude", from_session_id="sup-sid", from_name="hearting-4d", from_project="p",
-                to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
-                status="received", receipt="exact-peer-ref", ref=["0123456789abcdef0123456789abcdef"], transfer_ref="0123456789abcdef0123456789abcdef",
-                body_file=None, body_stdin=False, body_text="herdr steer received"))
-            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "peer:hearting-4d·0123456789abcdef0123456789abcdef")
+            future = time.gmtime(time.time() + 900)
+            with mock.patch.object(peer.time, "gmtime", return_value=future):
+                peer.cmd_record(argparse.Namespace(
+                    from_harness="claude", from_session_id="late-peer", from_name="late", from_project="p",
+                    to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
+                    status="received", receipt="exact-peer-ref", ref=["e" * 32], transfer_ref=None,
+                    body_file=None, body_stdin=False, body_text="late notice"))
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
             self.assertEqual(router._turn_peer_source("codex", "other-sid", "/w"), "unattributed")
 
     def test_only_pin_targets_change_and_other_routes_rows_are_ignored(self):
@@ -495,6 +608,36 @@ class Case4RetryLinkTest(unittest.TestCase):
             replacement._directory(jobs).joinpath("inputs", args.attempt_id + ".json").write_text("{}")
             self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
 
+    def test_changed_request_after_success_is_new_work_but_same_request_is_not(self):
+        import dispatch_replacement as replacement
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            attempt_id = "att-success"
+            args = SimpleNamespace(attempt_id=attempt_id, jobs_path=jobs, worktree=td,
+                                   replacement_input_argv=["--slug", "execute"])
+            old_task = "Close migration fixtures and import integration."
+            row = {"_status": "done", "attempt_id": attempt_id,
+                   "note": "completed-marker", "failure_class": "pass",
+                   "launch_outcome": "never-launched"}
+            row.update(DC.parse_registry_metadata(
+                replacement.seal_launch_input(args, "codex", old_task)))
+            changed = "Close historical/current conflict and actual DB parity."
+            with mock.patch.object(DC, "attempt_process_quiescence",
+                                   return_value=SimpleNamespace(state="quiescent")):
+                self.assertTrue(RA.new_owner_request(row, jobs=jobs, task=changed))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=old_task))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task="  Close migration\n fixtures and import integration.  "))
+                self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=None))
+                self.assertEqual(RA.retry_predecessor([row], jobs=jobs, task=changed), "")
+                for task in (None, old_task, "  Close migration\n fixtures and import integration.  "):
+                    self.assertEqual(RA.retry_predecessor([row], jobs=jobs, task=task), "")
+                self.assertFalse(RA.new_owner_request({**row, "terminal_conflict": "1"},
+                                                      jobs=jobs, task=changed))
+            for state in ("live", "unverifiable"):
+                with mock.patch.object(DC, "attempt_process_quiescence",
+                                       return_value=SimpleNamespace(state=state)):
+                    self.assertFalse(RA.new_owner_request(row, jobs=jobs, task=changed))
+
     def test_changed_task_cannot_skip_an_open_unlaunched_transport_successor(self):
         latest = {"_status": "open", "launch_claimed": "0", "attempt_id": "att-gap-two",
                   "automatic_retry_of": "att-gap-one"}
@@ -616,6 +759,58 @@ class Case5ReadRootsTest(unittest.TestCase):
                              "applied_permissions": applied}
                 with self.subTest(applied=applied), self.assertRaises(DC.DispatchContractError):
                     RA.require_recovery_grant_addresses(candidate, history, route=route)
+
+    def test_selected_agent_recovery_grants_use_global_then_local_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifact = root / "worktree", root / "artifact"
+            install, readonly = root / "install", root / "records"
+            for path in (worktree, artifact, install / "core", install / "utilities", readonly):
+                path.mkdir(parents=True, exist_ok=True)
+            history = {
+                "harness": "codex", "worktree": str(worktree),
+                "jobs": str(root / "state" / "jobs.log"),
+                "applied_permissions": {"execution_access": {
+                    "writable_roots": [], "read_roots": [str(readonly)],
+                    "network": "not-requested",
+                }},
+            }
+            route = {"cwd": str(worktree), "artifact_root": str(artifact),
+                     "work_request": {"text": ""}}
+            global_policy = {
+                "external_directory": {
+                    "*": "deny", str(worktree) + "/**": "allow",
+                    str(artifact) + "/**": "allow", str(readonly) + "/**": "allow",
+                },
+                "edit": {
+                    "*": "deny", str(worktree) + "/**": "allow",
+                    str(readonly) + "/**": "deny",
+                },
+            }
+
+            def recorded(local_policy):
+                config = {"permission": global_policy,
+                          "agent": {"build": {"permission": local_policy}}}
+                applied = DR._applied_permissions(SimpleNamespace(
+                    opencode_config_content=json.dumps(config), agent="build"))
+                return {"harness": "opencode", "launch_home": str(install),
+                        "applied_permissions": applied}
+
+            RA.require_recovery_grant_addresses(recorded({}), history, route=route)
+            outside = str(root / "outside") + "/**"
+            cases = {
+                "selected-edit-outside": {"edit": {outside: "allow"}},
+                "selected-external-directory-outside": {
+                    "external_directory": {"*": "deny", outside: "allow"}},
+                # This later selected path rule overrides the global
+                # read-only deny for the same resource.
+                "selected-edit-writes-read-only-root": {
+                    "edit": {str(readonly) + "/**": "allow"}},
+            }
+            for name, local_policy in cases.items():
+                with self.subTest(case=name), self.assertRaises(DC.DispatchContractError):
+                    RA.require_recovery_grant_addresses(
+                        recorded(local_policy), history, route=route)
 
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
@@ -1395,6 +1590,83 @@ class ResourcePredecessorPidReuseTest(unittest.TestCase):
         self.sentinel.write_text("1\n", encoding="utf-8")
         self.assertFalse(RA.resource_predecessor_finished(
             self.row(**{**self.live, "status": "failed", "exit_code": 1})))
+
+    def test_foreign_failed_retry_waits_for_recorded_group_quiescence(self):
+        import signal
+        import subprocess
+        import resource_run_registry as RR
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sentinel = root / "failed.exit"
+            sentinel.write_text("23\n", encoding="utf-8")
+            child_pid_file = root / "payload.pid"
+            leader_code = (
+                "import pathlib, subprocess, sys; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); raise SystemExit(23)"
+            )
+            leader = subprocess.Popen(
+                [sys.executable, "-c", leader_code, str(child_pid_file)],
+                start_new_session=True,
+            )
+            try:
+                self.assertEqual(leader.wait(timeout=10), 23)
+                payload_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                self.assertEqual(os.getpgid(payload_pid), leader.pid)
+                os.kill(payload_pid, 0)
+                row = {
+                    "run_id": "foreign-failed",
+                    "status": "failed",
+                    "workflow_state": "FAILED_RETRYABLE",
+                    "exit_code": 23,
+                    "sentinel": str(sentinel),
+                    "pid": leader.pid,
+                    "starttime": "1",
+                    "command_hash": "recorded-command",
+                    "pid_namespace": "pid:[foreign]",
+                    "process_group": leader.pid,
+                    "resource_policy": "supervised-owner",
+                }
+                candidate = {"log": str(root / "retry.log"),
+                             "sentinel": str(root / "retry.exit")}
+                before = dict(row)
+
+                # The payload child remains alive, but this process cannot
+                # observe a group in the recorded foreign namespace.
+                self.assertFalse(RR.resource_process_group_quiescent(row))
+                with self.assertRaisesRegex(ValueError, "resource-route-body-conflict"):
+                    RA.require_resource_predecessors([row], candidate)
+                self.assertEqual(row, before)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "23\n")
+
+                os.kill(payload_pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                ended = False
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{payload_pid}/stat").read_text(encoding="utf-8")
+                        ended = state.rsplit(") ", 1)[1].split()[0] == "Z"
+                    except FileNotFoundError:
+                        ended = True
+                    if ended:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(ended, "payload child did not end")
+
+                # A positive observation from the resource's namespace makes
+                # the same retry admission path available without rewriting
+                # its failure row, sentinel, or history.
+                with mock.patch.object(RR, "resource_process_group_quiescent", return_value=True) as observe:
+                    RA.require_resource_predecessors([row], candidate)
+                observe.assert_called_once_with(row)
+                self.assertEqual(row, before)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "23\n")
+            finally:
+                try:
+                    os.killpg(leader.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class NestedHostSandboxEqualityTest(unittest.TestCase):

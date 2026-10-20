@@ -898,7 +898,8 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         identity = {"parent_attempt_id": "att-parent"}
         child = {"attempt_id": "att-child", "readiness": "pending", "reason": "process-unverifiable"}
         with mock.patch.object(JOIN.time, "time", return_value=1000):
-            JOIN.write_join_observation(self.jobs, identity, [child], elapsed=31, recovery_results={})
+            JOIN.write_join_observation(self.jobs, identity, [child], elapsed=31,
+                                        recovery_results={}, eligible_attempt_ids={"att-child"})
         record = JOIN.read_join_observation(self.jobs, identity, now=1001)
         self.assertEqual(record["state"], "attention")
         self.assertFalse(self.jobs.exists())
@@ -906,8 +907,10 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(JOIN.read_join_observation(self.jobs, {"parent_attempt_id": "att-other"}, now=1001), {})
         child["readiness"] = "ready"
         with mock.patch.object(JOIN.time, "time", return_value=1002):
-            JOIN.write_join_observation(self.jobs, identity, [child], elapsed=33, recovery_results={})
+            JOIN.write_join_observation(self.jobs, identity, [child], elapsed=33,
+                                        recovery_results={}, eligible_attempt_ids=set())
         self.assertEqual(JOIN.read_join_observation(self.jobs, identity, now=1003)["state"], "ready")
+
 
     def test_display_write_failure_does_not_terminate_supervision(self):
         self.jobs.write_text(self.receiptless_row())
@@ -5657,6 +5660,245 @@ class MixedBatchDeliveryStateTest(unittest.TestCase):
         self.records[second] = {**self.records[second], "state": "acked",
                                 "acked_by": "codex-native-prompt:thread-parent"}
         self.assertEqual(self.state(), "resolved")
+
+
+class ProcessUnverifiableNoticeTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.jobs = self.root / "jobs.log"
+
+    def test_short_unverifiable_window_does_not_notice_old_join(self):
+        attempt, parent = "att-short-unverifiable", "att-parent"
+        namespace = D.process_namespace_identity()
+        metadata = {
+            "attempt_id": attempt, "pid": "99999999",
+            "pid_start": D.process_start_ticks(os.getpid()), "pgid": "99999999",
+            "pid_scope": "namespace-local", "pid_ns": "pid:[999999999]",
+            "pid_observer_ns": namespace, "harness": "claude",
+            "parent_sid": "sess-short-unverifiable",
+            "parent_completion_delivery": "claude-parent-runtime",
+            "route_id": "rt-short-unverifiable", "route_node": "execute",
+            "registered_worker": "1", "worker_type": "stage",
+        }
+        live_metadata = dict(metadata, pid=str(os.getpid()), pgid=str(os.getpid()),
+                             pid_start=D.process_start_ticks(os.getpid()),
+                             pid_ns=namespace, pid_observer_ns=namespace)
+        live = JOIN.current_children
+        self.jobs.write_text(row("open", attempt, parent, "execute",
+                                 process_metadata=live_metadata), encoding="utf-8")
+        initial = live(self.jobs, parent)
+        ready_metadata = dict(metadata, launch_outcome="governed-process-reaped")
+        proof = D.QuiescenceProof(
+            True, "cancellation-quiescence-proven", attempt, "exact-teardown",
+            int(ready_metadata["pgid"]), "empty", "empty", True,
+            D._cancellation_quiescence_binding_digest(ready_metadata),
+        )
+        with mock.patch.object(D, "attempt_governed_process_quiescence",
+                               return_value=D.ProcessQuiescence("quiescent", "fixture")), \
+             mock.patch.object(D, "prove_attempt_quiescence", return_value=proof):
+            cleanup = D._terminal_cleanup_values(ready_metadata)
+        self.assertIn("cleanup_receipt_digest", cleanup)
+
+        clock = {"t": 0.0, "phase": 0}
+        phase_rows = [
+            (0.0, row("open", attempt, parent, "execute", process_metadata=live_metadata)),
+            (61.0, row("done", attempt, parent, "execute", process_metadata=ready_metadata)),
+            (65.0, row("done", attempt, parent, "execute", process_metadata=ready_metadata)),
+            (66.0, row("done", attempt, parent, "execute",
+                        process_metadata=dict(ready_metadata, **cleanup))),
+        ]
+        owner_metadata = {
+            "attempt_id": parent, "parent_sid": "sess-short-unverifiable-owner",
+            "parent_completion_delivery": "claude-parent-runtime",
+            "owner_route_id": "rt-short-unverifiable", "harness": "claude",
+        }
+
+        def registry_content(child_line):
+            return row("open", parent, "-", "owner", process_metadata=owner_metadata) + child_line
+
+        def refresh(_attempts):
+            phase = min(clock["phase"], len(phase_rows) - 1)
+            clock["t"], content = phase_rows[phase]
+            clock["phase"] += 1
+            self.jobs.write_text(registry_content(content), encoding="utf-8")
+            return live(self.jobs, parent)
+
+        def sleep(_seconds):
+            clock["t"] = 61.0
+
+        context_module = __import__("runtime_observation")
+        context = context_module.ObservationContext(max_entries=8)
+        identity = {"parent_attempt_id": parent}
+        observed_reasons = []
+        write_observation = JOIN.write_join_observation
+
+        def record_observation(*args, **kwargs):
+            observed_reasons.extend(child["reason"] for child in args[2])
+            return write_observation(*args, **kwargs)
+
+        with mock.patch.object(JOIN.time, "monotonic", side_effect=lambda: clock["t"]), \
+             mock.patch.object(JOIN.time, "sleep", side_effect=sleep), \
+             mock.patch.object(JOIN, "write_join_observation", side_effect=record_observation):
+            receipt = JOIN._join_snapshot(
+                jobs=self.jobs, initial=initial, refresh=refresh, identity=identity,
+                interval=0.01, timeout=100, liveness_command=None,
+                liveness_probe_timeout=1.0, env=None, recovery=None,
+                observation_jobs=self.jobs, observation_context=context,
+            )
+
+        self.assertEqual(receipt["state"], "ready")
+        self.assertEqual(receipt["children"][0]["reason"], "registry-closed")
+        self.assertIn("process-unverifiable", observed_reasons, observed_reasons)
+        self.assertIn("registry-closed", observed_reasons, observed_reasons)
+        records = list((self.root / "pending-delivery").glob("*/*.json"))
+        notices = [json.loads(path.read_text(encoding="utf-8")) for path in records
+                   if json.loads(path.read_text(encoding="utf-8")).get("receipt", {}).get("reason")
+                   == "process-unverifiable"]
+        self.assertEqual(len(notices), 0)
+
+    def test_unverifiable_child_is_noticed_at_30_seconds_and_only_once(self):
+        attempt, sibling, parent = "att-long-unverifiable", "att-live-sibling", "att-parent"
+        namespace = D.process_namespace_identity()
+        owner = row("open", parent, "-", "owner", process_metadata={
+            "attempt_id": parent, "parent_sid": "sess-long-unverifiable-owner",
+            "parent_completion_delivery": "claude-parent-runtime",
+            "owner_route_id": "rt-long-unverifiable", "harness": "claude",
+        })
+        child_metadata = {
+            "pid": "99999999", "pid_start": D.process_start_ticks(os.getpid()),
+            "pgid": "99999999", "pid_scope": "namespace-local",
+            "pid_ns": "pid:[999999999]", "pid_observer_ns": namespace,
+            "launch_outcome": "governed-process-reaped", "harness": "claude",
+        }
+        live_metadata = dict(child_metadata, pid=str(os.getpid()), pgid=str(os.getpid()),
+                             pid_ns=namespace, pid_observer_ns=namespace)
+        sibling_metadata = {
+            "pid": str(os.getpid()), "pid_start": D.process_start_ticks(os.getpid()),
+            "pgid": str(os.getpid()), "pid_scope": "namespace-local",
+            "pid_ns": namespace, "pid_observer_ns": namespace,
+        }
+        child_line = row("done", attempt, parent, "execute", process_metadata=child_metadata)
+        live_line = row("open", attempt, parent, "execute", process_metadata=live_metadata)
+        sibling_line = row("open", sibling, parent, "sibling", process_metadata=sibling_metadata)
+        sibling_done_line = row("done", sibling, parent, "sibling", process_metadata=sibling_metadata)
+        self.jobs.write_text(owner + live_line + sibling_line, encoding="utf-8")
+        initial = JOIN.current_children(self.jobs, parent)
+        clock = {"t": 0.0, "phase": 0}
+        ticks = [0.0, 60.9, 61.0, 90.9, 91.0, 122.0, 123.0]
+        child_lines = [live_line, live_line, child_line, child_line, child_line, child_line, child_line]
+        sibling_lines = [sibling_line, sibling_line, sibling_line, sibling_done_line,
+                         sibling_done_line, sibling_done_line, sibling_done_line]
+        observation_states = []
+
+        def refresh(_attempts):
+            clock["t"] = ticks[min(clock["phase"], len(ticks) - 1)]
+            clock["phase"] += 1
+            phase = clock["phase"] - 1
+            self.jobs.write_text(owner + child_lines[phase] + sibling_lines[phase],
+                                 encoding="utf-8")
+            return JOIN.current_children(self.jobs, parent)
+
+        def observe(*args, **kwargs):
+            result = original_observe(*args, **kwargs)
+            value = JOIN.read_join_observation(self.jobs, {"parent_attempt_id": parent}, now=time.time())
+            observation_states.append((clock["t"], value.get("state"), value.get("elapsed_seconds")))
+            return result
+
+        original_observe = JOIN.write_join_observation
+        context = __import__("runtime_observation").ObservationContext(max_entries=8)
+        with mock.patch.object(JOIN.time, "monotonic", side_effect=lambda: clock["t"]), \
+             mock.patch.object(JOIN.time, "sleep"), \
+             mock.patch.object(JOIN, "write_join_observation", side_effect=observe):
+            receipt = JOIN._join_snapshot(
+                jobs=self.jobs, initial=initial, refresh=refresh,
+                identity={"parent_attempt_id": parent}, interval=0.01, timeout=123,
+                liveness_command=None, liveness_probe_timeout=1.0, env=None,
+                recovery=None, observation_jobs=self.jobs, observation_context=context,
+            )
+
+        records = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in (self.root / "pending-delivery").glob("*/*.json")]
+        notices = [record["receipt"] for record in records
+                   if record.get("receipt", {}).get("kind") == "supervision"
+                   and record["receipt"].get("reason") == "process-unverifiable"]
+        self.assertEqual(receipt["state"], "timeout")
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["monitored_attempt_ids"], [attempt])
+        at_threshold = [item for item in observation_states if item[0] == 91.0]
+        self.assertTrue(at_threshold, observation_states)
+        self.assertEqual(at_threshold[-1][1:], ("attention", 91.0))
+        self.assertTrue(any(t == 90.9 and state == "waiting" for t, state, _ in observation_states),
+                        observation_states)
+
+    def test_short_unverifiable_child_does_not_notice_while_sibling_runs(self):
+        attempt, sibling, parent = "att-short-child", "att-live-sibling", "att-parent"
+        namespace = D.process_namespace_identity()
+        owner_metadata = {
+            "attempt_id": parent, "parent_sid": "sess-short-child-owner",
+            "parent_completion_delivery": "claude-parent-runtime",
+            "owner_route_id": "rt-short-child", "harness": "claude",
+        }
+        owner = row("open", parent, "-", "owner", process_metadata=owner_metadata)
+        live_metadata = {
+            "pid": str(os.getpid()), "pid_start": D.process_start_ticks(os.getpid()),
+            "pgid": str(os.getpid()), "pid_scope": "namespace-local",
+            "pid_ns": namespace, "pid_observer_ns": namespace,
+        }
+        child_metadata = dict(live_metadata, harness="claude", launch_outcome="governed-process-reaped")
+        unverifiable = dict(child_metadata, pid="99999999", pgid="99999999",
+                            pid_ns="pid:[999999999]")
+        receipt_metadata = dict(unverifiable)
+        proof = D.QuiescenceProof(
+            True, "cancellation-quiescence-proven", attempt, "exact-teardown",
+            int(receipt_metadata["pgid"]), "empty", "empty", True,
+            D._cancellation_quiescence_binding_digest(receipt_metadata),
+        )
+        with mock.patch.object(D, "attempt_governed_process_quiescence",
+                               return_value=D.ProcessQuiescence("quiescent", "fixture")), \
+             mock.patch.object(D, "prove_attempt_quiescence", return_value=proof):
+            receipt_cleanup = D._terminal_cleanup_values(receipt_metadata)
+        sibling_metadata = dict(live_metadata)
+        live_child = row("open", attempt, parent, "execute", process_metadata=child_metadata)
+        child_waiting = row("done", attempt, parent, "execute", process_metadata=unverifiable)
+        child_ready = row("done", attempt, parent, "execute",
+                          process_metadata=dict(receipt_metadata, **receipt_cleanup))
+        sibling_line = row("open", sibling, parent, "sibling", process_metadata=sibling_metadata)
+        clock = {"t": 0.0, "phase": 0}
+        states = [(0.0, live_child), (61.0, child_waiting), (65.0, child_waiting),
+                  (66.0, child_ready), (67.0, child_ready)]
+        self.jobs.write_text(owner + live_child + sibling_line, encoding="utf-8")
+        initial = JOIN.current_children(self.jobs, parent)
+
+        def refresh(_attempts):
+            clock["t"], child_line = states[min(clock["phase"], len(states) - 1)]
+            clock["phase"] += 1
+            self.jobs.write_text(owner + child_line + sibling_line, encoding="utf-8")
+            return JOIN.current_children(self.jobs, parent)
+
+        context = __import__("runtime_observation").ObservationContext(max_entries=8)
+        with mock.patch.object(D, "attempt_governed_process_quiescence",
+                               return_value=D.ProcessQuiescence("quiescent", "fixture")), \
+             mock.patch.object(D, "prove_attempt_quiescence", return_value=proof), \
+             mock.patch.object(JOIN.time, "monotonic", side_effect=lambda: clock["t"]), \
+             mock.patch.object(JOIN.time, "sleep"):
+            receipt = JOIN._join_snapshot(
+                jobs=self.jobs, initial=initial, refresh=refresh,
+                identity={"parent_attempt_id": parent}, interval=0.01, timeout=67,
+                liveness_command=None, liveness_probe_timeout=1.0, env=None,
+                recovery=None, observation_jobs=self.jobs, observation_context=context,
+            )
+
+        records = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in (self.root / "pending-delivery").glob("*/*.json")]
+        notices = [record for record in records
+                   if record.get("receipt", {}).get("kind") == "supervision"
+                   and record["receipt"].get("reason") == "process-unverifiable"]
+        self.assertEqual(receipt["state"], "timeout")
+        by_attempt = {child["attempt_id"]: child for child in receipt["children"]}
+        self.assertEqual(by_attempt[sibling]["reason"], "process-alive")
+        self.assertEqual(len(notices), 0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -210,6 +214,41 @@ class ResourceRegistryTest(unittest.TestCase):
         unreadable = {**row, "pid": os.getpid()}
         self.assertEqual(registry.classify_identity(
             unreadable, lambda _pid: None)[0], "stale")
+
+    def test_supervised_success_waits_for_its_recorded_process_group_to_drain(self):
+        leader = subprocess.Popen(
+            [sys.executable, "-c", "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])"],
+            start_new_session=True,
+        )
+        identity = registry.proc_identity(leader.pid)
+        self.assertIsNotNone(identity)
+        namespace = os.readlink("/proc/self/ns/pid")
+        leader.wait(timeout=5)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        sentinel = Path(temporary.name) / "run.exit"
+        sentinel.write_text("0")
+        row = {
+            **identity, "run_id": "supervised-process-group",
+            "resource_policy": "supervised-owner", "status": "succeeded",
+            "workflow_state": "STAGE_SUCCEEDED", "exit_code": 0,
+            "process_group": leader.pid, "pid_namespace": namespace,
+            "sentinel": str(sentinel),
+        }
+        try:
+            self.assertEqual(registry.classify_identity(row)[0], "exited")
+            self.assertFalse(registry.resource_process_group_quiescent(row))
+            os.killpg(leader.pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while not registry.resource_process_group_quiescent(row):
+                self.assertLess(time.monotonic(), deadline, "payload child remained in its process group")
+                time.sleep(0.01)
+            self.assertTrue(registry.resource_process_group_quiescent(row))
+        finally:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_owned_zombie_requires_exact_kernel_and_controller_identity(self):
         pid = 999999999

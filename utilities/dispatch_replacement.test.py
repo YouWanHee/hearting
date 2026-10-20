@@ -305,12 +305,13 @@ class ReplacementTest(unittest.TestCase):
         meta={**self.meta,'dispatch_depth':'1'}
         with mock.patch.object(work_start,'_current_parent_session_id',return_value='parent'):
             R._authorized(self.jobs,{},meta)
-        with mock.patch.object(work_start,'_current_parent_session_id',return_value='successor'):
+        self.handover(successor='successor', harness='codex')
+        with mock.patch.object(work_start,'_current_parent_session_id',return_value='parent'):
             with self.assertRaises(D.DispatchContractError) as refused:
                 R._authorized(self.jobs,{},meta)
             self.assertEqual(refused.exception.reason,'replacement-parent-identity-unproven')
-            with mock.patch('dispatch_seat_handover.owns',side_effect=lambda m,session,jobs=None:session=='successor'):
-                R._authorized(self.jobs,{},meta)
+        with mock.patch.object(work_start,'_current_parent_session_id',return_value='successor'):
+            R._authorized(self.jobs,{},meta)
 
     def test_concurrent_consumers_share_one_claim_and_original_failure(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -984,7 +985,9 @@ class ReplacementTest(unittest.TestCase):
                 "read": "allow",
                 "edit": {"*": "deny", "/approved/**": "allow"},
                 "external_directory": {"*": "deny", "/approved/**": "allow"},
-            }},
+            }, "agent": {"build": {"permission": {
+                "edit": {"*": "deny", "/approved/private/**": "allow"},
+            }}}},
             {"permissions": [
                 {"action": "read", "resource": "*", "effect": "allow"},
                 {"action": "edit", "resource": "*", "effect": "deny"},
@@ -993,6 +996,7 @@ class ReplacementTest(unittest.TestCase):
                 {"action": "external_directory", "resource": "/approved/**", "effect": "allow"},
             ], "agents": {"build": {"permissions": [
                 {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "/approved/private/**", "effect": "allow"},
             ]}}},
         )
         sealed = []
@@ -1000,13 +1004,17 @@ class ReplacementTest(unittest.TestCase):
             aid = f"att-opencode-policy-{index}"
             args = SimpleNamespace(**vars(self.args))
             args.attempt_id = aid
+            args.agent = "build"
             args.opencode_config_content = json.dumps(config, separators=(",", ":"))
             args.replacement_input_argv = ["--start", "--attempt-id", aid,
-                                           "--prompt-text", "the raw task"]
+                                           "--agent", args.agent, "--prompt-text", "the raw task"]
             fragment = R.seal_launch_input(args, "opencode", "the raw task")
             value = R.launch_input(self.jobs, aid, D.parse_registry_metadata(fragment))
             permission = value["applied_permissions"]["opencode_permission"]
             self.assertTrue(opencode_runtime.opencode_permission_ordered_view(permission))
+            self.assertEqual(
+                value["applied_permissions"]["opencode_selected_agent_permission"]["agent"],
+                "build")
             sealed.append(value)
         before, after = sealed
         old_permission = before["applied_permissions"]["opencode_permission"]
@@ -1021,6 +1029,29 @@ class ReplacementTest(unittest.TestCase):
             R.route_authority._granted_permission_pair(
                 {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
                 {"harness": "opencode", "applied_permissions": after["applied_permissions"]})[1])
+
+        changed_config = json.loads(json.dumps(configs[1]))
+        changed_config["agents"]["build"]["permissions"][0]["effect"] = "allow"
+        changed_args = SimpleNamespace(**vars(self.args))
+        changed_args.attempt_id = "att-opencode-selected-agent-changed"
+        changed_args.agent = "build"
+        changed_args.opencode_config_content = json.dumps(changed_config, separators=(",", ":"))
+        changed_args.replacement_input_argv = ["--start", "--attempt-id", changed_args.attempt_id,
+                                               "--agent", changed_args.agent,
+                                               "--prompt-text", "the raw task"]
+        changed_fragment = R.seal_launch_input(changed_args, "opencode", "the raw task")
+        changed = R.launch_input(self.jobs, changed_args.attempt_id,
+                                 D.parse_registry_metadata(changed_fragment))
+        self.assertEqual(
+            opencode_runtime.opencode_permission_ordered_view(
+                before["applied_permissions"]["opencode_permission"]),
+            opencode_runtime.opencode_permission_ordered_view(
+                changed["applied_permissions"]["opencode_permission"]))
+        pair = R.route_authority._granted_permission_pair(
+            {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+            {"harness": "opencode", "applied_permissions": changed["applied_permissions"]})
+        self.assertNotEqual(*pair)
+        self.assertFalse(R.route_authority.same_sealed_work(before, changed))
 
         reordered = json.loads(json.dumps(before))
         edit = reordered["applied_permissions"]["opencode_permission"]["edit"]
@@ -1041,6 +1072,74 @@ class ReplacementTest(unittest.TestCase):
         missing = {"harness": "opencode", "applied_permissions": {}}
         empty = {"harness": "opencode", "applied_permissions": {"opencode_permission": {}}}
         self.assertNotEqual(*R.route_authority._granted_permission_pair(missing, empty))
+
+    def test_selected_permission_legacy_reseal_is_bounded_and_name_independent(self):
+        def launch(attempt, agent, config):
+            args = SimpleNamespace(**vars(self.args))
+            args.attempt_id = attempt
+            args.agent = agent
+            args.opencode_config_content = json.dumps(config, separators=(",", ":"))
+            args.replacement_input_argv = ["--start", "--attempt-id", attempt,
+                                           "--agent", agent, "--prompt-text", "the raw task"]
+            fragment = R.seal_launch_input(args, "opencode", "the raw task")
+            return args, fragment
+
+        def open_row(attempt):
+            self.write({"attempt_id": attempt, "launch_claimed": "0",
+                        "launch_started": "0"}, status="open", append=True)
+
+        def remove_historical_selected_field(attempt):
+            path = R._directory(self.jobs) / "inputs" / (attempt + ".json")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["applied_permissions"].pop("opencode_selected_agent_permission", None)
+            R._replace_record(path, record)
+
+        same_policy = {"permission": {"bash": "ask", "edit": {"*": "deny"}}}
+        rename_config = {"permission": {"read": "allow", "bash": "ask"},
+                         "agent": {"build": same_policy, "builder": same_policy}}
+        attempt = "att-selected-agent-reseal"
+        _args, _fragment = launch(attempt, "build", rename_config)
+        open_row(attempt)
+        renamed_args, renamed_fragment = launch(attempt, "builder", rename_config)
+        self.assertTrue(renamed_fragment)
+        renamed = R.launch_input(self.jobs, attempt, D.parse_registry_metadata(renamed_fragment))
+        self.assertEqual(renamed["applied_permissions"]["opencode_selected_agent_permission"]["agent"],
+                         "builder")
+
+        changed_config = json.loads(json.dumps(rename_config))
+        changed_config["agent"]["builder"]["permission"]["bash"] = "allow"
+        renamed_args.opencode_config_content = json.dumps(changed_config, separators=(",", ":"))
+        with self.assertRaises(D.DispatchContractError):
+            R.seal_launch_input(renamed_args, "opencode", "the raw task")
+
+        # Old immutable input without the optional field admits a current
+        # selected definition with no policy, without fabricating old rules.
+        legacy_config = {"permission": {"read": "allow", "edit": {"*": "deny"}}}
+        legacy_attempt = "att-selected-agent-legacy-empty"
+        legacy_args, _legacy_fragment = launch(legacy_attempt, "build", legacy_config)
+        open_row(legacy_attempt)
+        remove_historical_selected_field(legacy_attempt)
+        no_policy = {**legacy_config, "agent": {"build": {"mode": "primary"}}}
+        self.assertTrue(launch(legacy_attempt, "build", no_policy)[1])
+
+        # A candidate allow is checked against the sealed worktree even when
+        # the historical selected-policy record is absent.
+        bounded_attempt = "att-selected-agent-legacy-bounded"
+        _bounded_args, _bounded_fragment = launch(bounded_attempt, "build", legacy_config)
+        open_row(bounded_attempt)
+        remove_historical_selected_field(bounded_attempt)
+        inside = {**legacy_config, "agent": {"build": {"permission": {
+            "edit": {str(self.root) + "/**": "allow"}}}}}
+        self.assertTrue(launch(bounded_attempt, "build", inside)[1])
+
+        outside_attempt = "att-selected-agent-legacy-outside"
+        _outside_args, _outside_fragment = launch(outside_attempt, "build", legacy_config)
+        open_row(outside_attempt)
+        remove_historical_selected_field(outside_attempt)
+        outside = {**legacy_config, "agent": {"build": {"permission": {
+            "edit": {str(self.root.parent / "outside") + "/**": "allow"}}}}}
+        with self.assertRaises(D.DispatchContractError):
+            launch(outside_attempt, "build", outside)
 
     def test_equivalent_and_conflicting_opencode_policies_after_sealed_readback(self):
         cases = (
@@ -3209,6 +3308,39 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as unsettled:
             self.snapshot(states, readiness="unsettled")
         self.assertEqual(unsettled.exception.reason, "replacement-completion-unsettled")
+
+    def test_unproven_refusal_carries_the_node_judgement_and_its_supported_action(self):
+        import shlex
+        evidence = str(self.root / "spec dir" / "eval-spec.md")
+        marker = {**self.markers["impl-review"], "evidence": {"path": evidence, "sha256": "old"}}
+        (self.completion / "impl-review.json").write_text(json.dumps(marker), encoding="utf-8")
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("revised-unrecorded", "completion-evidence-revised-unrecorded")
+        with self.assertRaises(D.DispatchContractError) as revised:
+            self.snapshot(states)
+        error = revised.exception
+        self.assertEqual((error.reason, error.detail), ("replacement-completion-unproven", "impl-review"))
+        self.assertEqual(error.completion, {
+            "completion_node": "impl-review", "completion_currency": "revised-unrecorded",
+            "completion_reason": "completion-evidence-revised-unrecorded",
+            "completion_evidence": evidence})
+        self.assertIn("capability-route.py revise --route rt-reuse --node impl-review "
+                      f"--evidence {shlex.quote(evidence)} ", error.next_step)
+        self.assertIn("cannot change that", error.next_step)
+        self.assertFalse(getattr(error, "retry_when", ""))
+
+        states["impl-review"] = ("integrity-broken:history-conflict", "completion-marker-history-conflict")
+        with self.assertRaises(D.DispatchContractError) as broken:
+            self.snapshot(states)
+        self.assertNotIn("revise", broken.exception.next_step)
+        self.assertIn("Inspect that node's completion marker", broken.exception.next_step)
+
+        # Waiting does clear an unsettled completion, so it keeps no next_step of its own.
+        states["impl-review"] = ("current", "completion-marker-verified")
+        with self.assertRaises(D.DispatchContractError) as unsettled:
+            self.snapshot(states, readiness="unsettled")
+        self.assertFalse(hasattr(unsettled.exception, "next_step"))
 
     def test_merge_index_snapshot_is_pending_only_while_merge_is_observed(self):
         git = ["git", "-C", str(self.root)]

@@ -349,6 +349,29 @@ class PaneContinuityTest(unittest.TestCase):
              mock.patch.object(session_handle.os, "getcwd", return_value=str(self.repo)):
             self.assertEqual(session_handle.resolve_tag("claude", "current"), "4d")
 
+    def test_recipient_tag_uses_recipient_pane_and_cwd_across_resume(self):
+        self.record("claude", "sender-old", pane="w:sender", now=100)
+        self.record("claude", "current", pane="w:sender", now=200)
+        self.record("claude", "recipient-old", pane="w:recipient", now=100)
+        self.record("claude", "current", pane="w:recipient", now=200)
+        home = self.root / "claude-recipient"
+        sessions = home / "sessions"
+        sessions.mkdir(parents=True)
+        for pid, sid, name in (("11", "sender-old", "sender-4c"),
+                               ("12", "recipient-old", "recipient-3a")):
+            (sessions / f"{pid}.json").write_text(json.dumps(
+                {"sessionId": sid, "name": name, "nameSource": "derived"}),
+                encoding="utf-8")
+        with mock.patch.dict(os.environ, {
+                "HERDR_PANE_ID": "w:sender", "CLAUDE_CONFIG_DIR": str(home),
+                "FLEET_TITLE_STATE_DIR": str(self.root / "titles")}), \
+                mock.patch.object(session_handle.os, "getcwd", return_value=str(self.repo)):
+            # The compatibility API retains its caller-seat behavior.
+            self.assertEqual(session_handle.resolve_tag("claude", "current"), "4c")
+            # A recipient lookup follows only that recipient's resumed seat.
+            self.assertEqual(session_handle.resolve_recipient_tag(
+                "claude", "current", pane="w:recipient", cwd=str(self.repo)), "3a")
+
     def test_resume_source_is_in_the_actual_herdr_session_command_for_all_harnesses(self):
         for harness in ("claude", "codex", "opencode"):
             with mock.patch.object(herdr_projection.shutil, "which", return_value="/fixture/herdr"), \
