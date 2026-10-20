@@ -129,6 +129,7 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
                      mock.patch.object(OWNER, "derive_frame_route_binding", return_value=binding), \
                      mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={}), \
                      mock.patch.object(OWNER.os, "access", return_value=True), \
+                     mock.patch.object(OWNER, "select_launch_lifecycle", return_value="detached"), \
                      mock.patch.object(OWNER.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as launch, \
                      contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(OWNER.main([]), 0)
@@ -183,6 +184,7 @@ class FrameTopDeclarationTest(unittest.TestCase):
                  mock.patch.object(OWNER, "_declares_top", probe), \
                  mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={}), \
                  mock.patch.object(OWNER.os, "access", return_value=True), \
+                 mock.patch.object(OWNER, "select_launch_lifecycle", return_value="detached"), \
                  mock.patch.object(OWNER.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as launch, \
                  contextlib.redirect_stdout(out):
                 code = OWNER.main([])

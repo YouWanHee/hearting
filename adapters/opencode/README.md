@@ -26,6 +26,36 @@ Native guard plugin projection is materialized under `adapters/opencode/plugins/
 Capability support still keeps explicit `preflight.sh` wrappers as fallback for
 guards and tool-contract reporting.
 
+## OpenCode 1.x and 2.x runtime boundary
+
+The adapter keeps the V1 invocation and legacy `auth.json` path. V2 uses
+`opencode run --format json` with the worktree as process cwd and
+`provider/model#variant`; it does not pass V1 `--pure`, `--dir`, or
+`--variant` flags. V2's shared service owns credentials, configuration,
+sessions, permissions, and tool execution. Dispatch clients use the normal
+service discovery path without linking or copying `opencode.db`; V1 retains
+its isolated worker home and read-only legacy auth link. For V2 Go usage,
+Hearting reads the active OpenCode OAuth first, then an OpenCode Go API key
+only when that OAuth credential is absent, with legacy auth.json as the
+compatibility tier. A present credential rejection is never bypassed.
+
+The V1 server hook map remains in `plugins/hearting-guards.js`. V2 loads the
+Promise server plugin from `plugins/hearting-guards/index.ts`; the two
+entrypoints share the guard implementation. V2 worker sessions carry an
+internal session title/agent marker so a shared server can suppress worker
+lifecycle hooks even though its process environment belongs to the service.
+The separate V2 terminal client plugin API (`cli.json` and
+`@opencode/plugin/tui`) is not the server plugin API. Compatibility of the
+external Herdr TUI plugin remains unverified.
+
+V2 configuration uses `permissions`, `plugins`, and the V2 skill-location
+shape. The installer projects both plugin entrypoints, and worker permission
+projection translates existing scoped rules into V2 ordered rules. Quota
+headroom is separate from provider/account/model execution status. Automatic
+fallback uses only source-declared candidates after confirmed unavailability;
+explicit model pins remain exact. An expired Go credential or missing Go
+entitlement does not mark Zen or OpenAI unavailable.
+
 ## Worker bootstrap boundary
 
 Headless dispatch wraps generated and caller-supplied assignments with the
@@ -51,7 +81,7 @@ full masking.
 | Native skills | `adapters/opencode/skills/` |
 | Native agents | `adapters/opencode/agents/` |
 | Native commands | `adapters/opencode/commands/` |
-| Native guard plugin | `adapters/opencode/plugins/hearting-guards.js` |
+| Native guard plugin | `adapters/opencode/plugins/hearting-guards.js` (V1), `adapters/opencode/plugins/hearting-guards/index.ts` (V2) |
 | Capabilities | `capabilities/README.md` |
 | Role profiles | `roles/README.md` |
 | Hook and guard scripts | `hooks/`, `utilities/` |
@@ -69,7 +99,7 @@ full masking.
 | role mode | Run `adapters/opencode/bin/preflight.sh mode-info <family/mode>` before using a `roles/units/` fragment; portable modes can be used directly, tool-contract modes require equivalent tools, unsupported modes report `fallback=reference-only` when no OpenCode-native runtime surface exists |
 | adapter bootstrap | `adapters/opencode/AGENTS.md` reaches a session as the auto-loaded `AGENTS.md` in the global config home, and must not also be listed in `instructions[]` (`core/ADAPTATION.md §6.1`); then load `core/CORE.md` plus task-relevant shared docs; do not treat `CLAUDE.md` as portable bootstrap |
 | agent home | Set `AGENT_HOME` to the installed harness directory |
-| permission model | Run `adapters/opencode/bin/preflight.sh permissions`; use OpenCode native `permission` config and plugin hooks, not Claude `allowedTools` |
+| permission model | Run `adapters/opencode/bin/preflight.sh permissions`; V1 uses `permission` and V2 uses ordered `permissions` plus plugin hooks; neither consumes Claude `allowedTools` |
 | MCP config | Run `adapters/opencode/bin/preflight.sh mcp [--check]`; use OpenCode native `opencode mcp`/config surfaces, not Claude `settings.json` MCP payloads |
 | artifact root | primary-checkout canonical `.agent_reports` via `utilities/artifact-root.sh`; linked-worktree snapshots are read-only; legacy fallback only at the canonical root |
 | worktree cleanup | `preflight.sh worktree-cleanup`; dry-run first, apply only after merge + integrated verification + push |
@@ -77,7 +107,7 @@ full masking.
 | harness status snapshot | Run `adapters/opencode/bin/preflight.sh status [cwd] [session-id]` for read-only artifact, notes, worktree, and git-risk signals. This does not replace OpenCode native model/context/session UI |
 | token self-regulation v2 | Phase 2 automatic hook accounting and the Phase 3 isolated experiment CLI are deferred. Shared Fleet modules may be inspected as portable source, but OpenCode projects no token-budget utility, production hook, activation flag, or runtime-config mutation |
 | adapter readiness | Run `adapters/opencode/bin/preflight.sh doctor` to check manifest freshness, native projections, and boundary rules in one command |
-| headless dispatch | Tool-contract check: `adapters/opencode/bin/preflight.sh headless --check <worktree>` verifies the worktree, `opencode run` availability, and installed OpenCode runtime projection (`hearting`, native Skills path, native Agents, native Commands, and guard plugin). Use `adapters/opencode/bin/preflight.sh dispatch --dry-run|--register|--start --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--agent <agent>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings)` to build the command and register open jobs. The optional worker mode is a non-owner projection that must equal the selected portable unit; `_kernel/owner` rejects a stage mode and accepts a route-sealed owner profile alone. Route-bound profiles select the complete user `~/.config/opencode/agent-config/models.conf` when valid and otherwise the complete shipped `config/models.conf`. Installation seeds the user copy once and never rewrites or removes it. Caller model/variant replacement is rejected, and substantive registered `mini` is denied. OpenCode declares its own `balanced-deep`, `light` and `mini` tiers (no deep tier: `deep` and `top` collapse onto balanced-deep), records `profile_granularity` per profile (`full`, `collapsed-deep-to-balanced-deep`, `collapsed-balanced-to-light`, `collapsed-top-to-balanced-deep`), applies a route-sealed `compose --pin` model (`model_source=pin`), and omits `--variant` when the resolved value is `runtime-default`. Registry/Fleet rows keep capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same runtime projection check before launching. Use `liveness` while waiting and `harvest --mark-done` after main-session harvest; merge and cleanup remain outside the wrapper |
+| headless dispatch | Tool-contract check: `adapters/opencode/bin/preflight.sh headless --check <worktree>` verifies the worktree, `opencode run` availability, and installed OpenCode runtime projection (`hearting`, native Skills path, native Agents, native Commands, and guard plugin). Use `adapters/opencode/bin/preflight.sh dispatch --dry-run|--register|--start --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--agent <agent>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings)` to build the command and register open jobs. The optional worker mode is a non-owner projection that must equal the selected portable unit; `_kernel/owner` rejects a stage mode and accepts a route-sealed owner profile alone. Route-bound profiles select the complete user `~/.config/opencode/agent-config/models.conf` when valid and otherwise the complete shipped `config/models.conf`. Installation seeds the user copy once and never rewrites or removes it. Caller model/variant replacement is rejected, and substantive registered `mini` is denied. OpenCode declares its own `balanced-deep`, `light` and `mini` tiers (no deep tier: `deep` and `top` collapse onto balanced-deep), records `profile_granularity` per profile (`full`, `collapsed-deep-to-balanced-deep`, `collapsed-balanced-to-light`, `collapsed-top-to-balanced-deep`), applies a route-sealed `compose --pin` model (`model_source=pin`), V1 omits `--variant` for `runtime-default`; V2 omits the `#variant` suffix. Registry/Fleet rows keep capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same runtime projection check before launching. Use `liveness` while waiting and `harvest --mark-done` after main-session harvest; merge and cleanup remain outside the wrapper |
 | QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps portable QA levels from `core/CONVENTIONS.md` to OpenCode assurance scope, selected-pass reviewer budgets, external-adversary requirements, max rounds, and inline fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` means these budgets do not open stages or depth by themselves |
 | material browser fetch | Tool-contract check: `adapters/opencode/bin/preflight.sh browser-fetch --check <url>` verifies rendered browser access through the adapter-owned Playwright launcher before using `roles/units/material/browser-fetch.md`. Exit 69 means the local browser stack is unavailable |
 | material data script | Tool-contract check: `adapters/opencode/bin/preflight.sh data-script --check <script.py>` verifies generated Python analysis scripts through the adapter-owned launcher before using `roles/units/material/data-script.md` |

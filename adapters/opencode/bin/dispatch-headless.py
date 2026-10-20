@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 import opencode_context_window as opencode_context
+import opencode_runtime
 from worker_runtime_home import prepare_worker_home
 from dispatch_contract import (
     _atomic_registry_replace,
@@ -519,6 +520,21 @@ def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     selected = _select_model_settings(args)
+    if (selected.get("source") in {"profile", "role"}
+            and opencode_runtime.is_v2()):
+        original = selected["model"]
+        model, variant, evidence = opencode_runtime.select_automatic_model(
+            original, selected["variant"])
+        if evidence.get("state") == "unavailable" and model == original:
+            raise ModelSelectionError(
+                "opencode-model-unavailable",
+                f"provider={original.split('/', 1)[0]} reason={evidence.get('reason', 'unavailable')}",
+            )
+        if model != original:
+            selected = {**selected, "model": model, "variant": variant,
+                        "source": selected["source"] + "+provider-fallback",
+                        "provider_fallback_from": original,
+                        "provider_fallback_reason": evidence.get("reason") or "primary-unavailable"}
     return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 
@@ -547,6 +563,16 @@ def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
     config_root = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME") or Path.home()) / ".config")
     inventory = env.get("COMPUTE_HOSTS_CONFIG") or config_root / "hearting/compute-hosts.yaml"
     values = {"COMPUTE_HOSTS_CONFIG": str(Path(inventory).expanduser().absolute())}
+    try:
+        v2_runtime = opencode_runtime.is_v2()
+    except Exception:
+        v2_runtime = False
+    if v2_runtime:
+        # V2 owns credentials and sessions in its normal shared service. Let
+        # the CLI discover that service through the user's existing XDG
+        # service registration; never link/copy opencode.db into attempt state.
+        values.update(OPENCODE_DB=None, OPENCODE_AUTH=None, OPENCODE_DATA_DIR=None)
+        return values
     for kind in ("data", "cache", "state", "config"):
         directory = runtime / kind
         if not directory.resolve().is_relative_to(state_root):
@@ -620,6 +646,110 @@ def _add_task_publish_bash_rules(permission: dict, commands: tuple[str, ...], *,
     return True
 
 
+_V1_TO_V2_PERMISSION = {"bash": "shell", "task": "subagent",
+                       "write": "edit", "patch": "edit"}
+
+
+def _permission_object_to_rules(value, action):
+    if isinstance(value, str):
+        return [{"action": action, "resource": "*", "effect": value}]
+    if isinstance(value, dict):
+        return [{"action": action, "resource": str(resource), "effect": effect}
+                for resource, effect in value.items() if isinstance(effect, str)]
+    return []
+
+
+def _opencode_v2_to_legacy_config(config):
+    """Normalize V2 ordered permissions for the shared scoped projection code."""
+    value = dict(config)
+    permission = value.get("permission", {})
+    if isinstance(permission, str):
+        permission = {"*": permission}
+    if not isinstance(permission, dict):
+        permission = {}
+    else:
+        permission = dict(permission)
+    rules = value.get("permissions", [])
+    if isinstance(rules, list):
+        for row in rules:
+            if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
+                                                    for k in ("action", "resource", "effect")):
+                continue
+            action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
+            current = permission.get(action)
+            if isinstance(current, str):
+                current = {"*": current}
+            elif not isinstance(current, dict):
+                current = {}
+            current = dict(current)
+            current[row["resource"]] = row["effect"]
+            permission[action] = current
+    v2_agents = value.get("agents") if isinstance(value.get("agents"), dict) else {}
+    v1_agents = value.get("agent") if isinstance(value.get("agent"), dict) else {}
+    agents = {**v2_agents, **v1_agents}
+    legacy_agents = {}
+    for name, definition in agents.items():
+        if not isinstance(definition, dict):
+            legacy_agents[name] = definition
+            continue
+        item = dict(definition)
+        agent_rules = item.get("permissions", [])
+        agent_permission = item.get("permission", {})
+        if isinstance(agent_permission, str):
+            agent_permission = {"*": agent_permission}
+        if not isinstance(agent_permission, dict):
+            agent_permission = {}
+        agent_permission = dict(agent_permission)
+        if isinstance(agent_rules, list):
+            for row in agent_rules:
+                if not isinstance(row, dict) or not all(isinstance(row.get(k), str)
+                                                        for k in ("action", "resource", "effect")):
+                    continue
+                action = {"shell": "bash", "subagent": "task"}.get(row["action"], row["action"])
+                current = agent_permission.get(action)
+                if isinstance(current, str):
+                    current = {"*": current}
+                elif not isinstance(current, dict):
+                    current = {}
+                current = dict(current)
+                current[row["resource"]] = row["effect"]
+                agent_permission[action] = current
+        item.pop("permissions", None)
+        item["permission"] = agent_permission
+        legacy_agents[name] = item
+    value.pop("permissions", None)
+    value.pop("agents", None)
+    value["permission"] = permission
+    if legacy_agents:
+        value["agent"] = legacy_agents
+    return value
+
+
+def _opencode_legacy_to_v2_config(config):
+    """Emit V2 ordered permission rules after the shared scoped policy is applied."""
+    value = dict(config)
+    def rules(permission):
+        result = []
+        for tool, setting in (permission or {}).items():
+            action = _V1_TO_V2_PERMISSION.get(tool, tool)
+            result.extend(_permission_object_to_rules(setting, action))
+        return result
+    permission = value.pop("permission", {})
+    value["permissions"] = rules(permission)
+    agents = value.pop("agent", {})
+    if isinstance(agents, dict):
+        normalized = {}
+        for name, definition in agents.items():
+            if not isinstance(definition, dict):
+                normalized[name] = definition
+                continue
+            item = dict(definition)
+            item["permissions"] = rules(item.pop("permission", {}))
+            normalized[name] = item
+        value["agents"] = normalized
+    return value
+
+
 def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
@@ -633,6 +763,7 @@ def scoped_external_directory_config(
     task_publish_scope: dict[str, str] | None = None,
     merge_observation_only: bool = False,
 ) -> str:
+    v2 = opencode_runtime.is_v2()
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
         config = json.loads(raw) if raw else {}
@@ -640,6 +771,8 @@ def scoped_external_directory_config(
         raise ValueError(f"OPENCODE_CONFIG_CONTENT is not valid JSON: {e}") from e
     if not isinstance(config, dict):
         raise ValueError("OPENCODE_CONFIG_CONTENT must contain a JSON object")
+    if v2:
+        config = _opencode_v2_to_legacy_config(config)
 
     permission = config.get("permission")
     if permission is None:
@@ -911,6 +1044,8 @@ def scoped_external_directory_config(
         selected["permission"] = local
         agents[selected_agent] = selected
         config["agent"] = agents
+    if v2:
+        config = _opencode_legacy_to_v2_config(config)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -921,7 +1056,10 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
     `bash` entry moves last; a selected agent's permissions merge after the
     global ones, so it receives the same rules.
     """
+    v2 = opencode_runtime.is_v2()
     config = json.loads(config_content) if config_content else {}
+    if v2:
+        config = _opencode_v2_to_legacy_config(config)
 
     def with_denies(permission):
         if isinstance(permission, str):
@@ -943,6 +1081,8 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
         selected["permission"] = with_denies(selected.get("permission"))
         agents[selected_agent] = selected
         config["agent"] = agents
+    if v2:
+        config = _opencode_legacy_to_v2_config(config)
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1035,6 +1175,8 @@ def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> N
 
 
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
+    settings = args.resolved_model_settings
+    standalone = settings.get("context_window_execution_mode") == "standalone"
     if _supervised_owner(args):
         lease = (supervisor_lease_path(args.jobs_path, args.attempt_id) if args.attempt_id
                  else dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease")
@@ -1048,27 +1190,29 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         if route:
             cmd += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
         cmd += ["--opencode-agent", args.agent]
+        if standalone:
+            cmd.append("--opencode-standalone")
         if args.resolved_model_settings["source"] != "inherit":
             cmd += ["--model", args.resolved_model_settings["model"],
                     "--variant", args.resolved_model_settings["variant"]]
         return (" ".join(shlex.quote(x) for x in cmd)
                 + f" < {shlex.quote(str(prompt_path))} >> {shlex.quote(str(log_path))} 2>&1")
-    cmd = [
-        "opencode",
-        "run",
-        "--dir",
-        args.worktree,
-        "--format",
-        "json",
-        "--agent",
-        args.agent,
-    ]
-    if args.resolved_model_settings["source"] != "inherit":
-        cmd += ["--model", args.resolved_model_settings["model"]]
-        if args.resolved_model_settings["variant"] != "runtime-default":
-            cmd += ["--variant", args.resolved_model_settings["variant"]]
-    prompt_arg = f'"$(cat -- {shlex.quote(str(prompt_path))})"'
-    return " ".join(shlex.quote(x) for x in cmd) + f" {prompt_arg} >> {shlex.quote(str(log_path))} 2>&1"
+    title = ("hearting-worker-" + str(args.attempt_id)
+             if opencode_runtime.is_v2() and getattr(args, "attempt_id", None) else None)
+    cmd = opencode_runtime.run_argv(
+        binary="opencode", cwd=args.worktree, agent=args.agent,
+        model=(settings["model"] if settings["source"] != "inherit" else None),
+        variant=(settings["variant"] if settings["source"] != "inherit" else None),
+        title=title,
+        standalone=standalone,
+    )
+    prompt_arg = f'"$(cat -- {shlex.quote(os.path.abspath(prompt_path))})"'
+    # V2 dropped `--dir`: the worker's Location is its process cwd, and a worker left
+    # in the caller's directory edits there and sees the worktree as an outside path.
+    enter = (f"cd -- {shlex.quote(args.worktree)} && "
+             if args.worktree and "--dir" not in cmd else "")
+    return (enter + " ".join(shlex.quote(x) for x in cmd)
+            + f" {prompt_arg} >> {shlex.quote(os.path.abspath(log_path))} 2>&1")
 
 
 def _effective_parent_cwd(args):
@@ -1556,54 +1700,6 @@ def main(argv: list[str]) -> int:
         except (DispatchContractError, OSError) as exc:
             return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
                         detail=str(exc), child_spawned="0")
-    if action == "start":
-        native_env = {**os.environ, **args.nested_runtime_env,
-                      "OPENCODE_CONFIG_CONTENT": args.opencode_config_content}
-        try:
-            context_capture = opencode_context.prepare_launch_context(
-                model=args.resolved_model_settings["model"],
-                context_window=args.resolved_model_settings["context_window"],
-                config_content=args.opencode_config_content,
-                cwd=args.worktree,
-                environ=native_env,
-            )
-        except opencode_context.OpenCodeContextError as exc:
-            return fail("opencode-context-limit-unavailable", 69,
-                        detail=str(exc), child_spawned="0")
-        args.opencode_config_content = str(context_capture["config_content"])
-        catalog_limits = context_capture["catalog_limits"]
-        configured_limits = context_capture["configured_limits"]
-        native_limits = context_capture["native_limits"]
-        applied_limits = context_capture["applied_limits"]
-        final_limits = context_capture["final_limits"]
-        args.resolved_model_settings.update({
-            "context_window_native_model": str(context_capture["model"]),
-            "context_window_catalog_limit_context": str(catalog_limits["context"]),
-            "context_window_configured_limit_context": "absent" if configured_limits["context"] is None else str(configured_limits["context"]),
-            "context_window_configured_limit_input": "absent" if configured_limits["input"] is None else str(configured_limits["input"]),
-            "context_window_configured_limit_output": "absent" if configured_limits["output"] is None else str(configured_limits["output"]),
-            "context_window_native_limit_context": str(native_limits["context"]),
-            "context_window_native_limit_input": "absent" if native_limits["input"] is None else str(native_limits["input"]),
-            "context_window_native_limit_output": "absent" if native_limits["output"] is None else str(native_limits["output"]),
-            "context_window_applied_limit_context": str(applied_limits["context"]),
-            "context_window_applied_limit_input": "absent" if applied_limits["input"] is None else str(applied_limits["input"]),
-            "context_window_final_limit_context": "absent" if final_limits["context"] is None else str(final_limits["context"]),
-            "context_window_final_limit_input": "absent" if final_limits["input"] is None else str(final_limits["input"]),
-            "context_window_final_limit_output": "absent" if final_limits["output"] is None else str(final_limits["output"]),
-            "context_policy_state": context_capture["compaction_policy"]["state"],
-            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
-                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
-            "context_policy_trigger": ("absent" if context_capture["compaction_policy"]["trigger_tokens"] is None
-                                       else str(context_capture["compaction_policy"]["trigger_tokens"])),
-            "context_policy_output_allowance": ("absent" if context_capture["compaction_policy"]["output_allowance_tokens"] is None
-                                                 else str(context_capture["compaction_policy"]["output_allowance_tokens"])),
-            "context_policy_configured_reserve": ("absent" if context_capture["compaction_policy"]["configured_reserve_tokens"] is None
-                                                  else str(context_capture["compaction_policy"]["configured_reserve_tokens"])),
-            "context_policy_effective_reserve": ("absent" if context_capture["compaction_policy"]["effective_reserve_tokens"] is None
-                                                 else str(context_capture["compaction_policy"]["effective_reserve_tokens"])),
-            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
-            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
-        })
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -1639,6 +1735,14 @@ def main(argv: list[str]) -> int:
                 if args.command_attempt_id else f"{args.slug}.opencode.jsonl")
     log_path = log_dir / log_name
     args.log_path = log_path
+    if action == "start":
+        # V2 execution mode is selected at the existing command-construction
+        # boundary. The later context probe must confirm this mode before spawn.
+        v2_execution = opencode_runtime.is_v2()
+        args.resolved_model_settings["context_window_execution_mode"] = (
+            "standalone" if v2_execution else "shared-service")
+        args.resolved_model_settings["context_window_runtime_target"] = (
+            "standalone-per-command" if v2_execution else "shared-service")
     command = shell_command(args, prompt_path, log_path)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
@@ -1780,27 +1884,6 @@ def main(argv: list[str]) -> int:
                 "supervised" if _supervised_owner(args) else "poll"
             ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
-            **commit_policy.runtime_permission_context_env(
-                args, adapter="opencode",
-                agent_home=str(args.agent_home),
-                opencode_config_base=args.opencode_config_base_content,
-                report_bundle_root=(str(args.report_bundle_root)
-                                    if args.report_bundle_root is not None else None),
-                execution_access_roots=[
-                    str(value) for value in (
-                        args.execution_access_grant.additional_writable_roots
-                        if args.execution_access_grant is not None else ()
-                    )
-                ],
-                execution_access_read_roots=[
-                    str(value) for value in (
-                        args.execution_access_grant.read_roots
-                        if args.execution_access_grant is not None else ()
-                    )
-                ],
-                contract_read_roots=[str(value) for value in args.contract_read_roots],
-                selected_agent=str(args.agent),
-            ),
             **args.nested_runtime_env,
             # Headless liveness contract: the OpenCode runtime child exposes
             # the dispatch slug to the plugin, which records a plugin-load
@@ -1812,7 +1895,119 @@ def main(argv: list[str]) -> int:
         args.worker_runtime_env = prepare_worker_home(args.agent_home, 'opencode',
                                                      args.worker_type, args.attempt_id,
                                                      env=dispatch_env)
-        dispatch_env.update(args.worker_runtime_env)
+        for key, value in args.worker_runtime_env.items():
+            if value is None:
+                dispatch_env.pop(key, None)
+            else:
+                dispatch_env[key] = value
+        try:
+            context_capture = opencode_context.prepare_launch_context(
+                model=args.resolved_model_settings["model"],
+                variant=args.resolved_model_settings.get("variant"),
+                context_window=args.resolved_model_settings["context_window"],
+                config_content=str(dispatch_env.get("OPENCODE_CONFIG_CONTENT") or "{}"),
+                cwd=args.worktree,
+                environ=dispatch_env,
+            )
+            selected_mode = args.resolved_model_settings.get("context_window_execution_mode")
+            observed_mode = context_capture.get("execution_mode")
+            if observed_mode is not None and observed_mode != selected_mode:
+                raise opencode_context.OpenCodeContextError(
+                    "OpenCode runtime version changed between command selection and limit verification"
+                )
+            if observed_mode == "standalone":
+                # Owner permission refresh starts from the original config on
+                # every turn. Carry only the verified selected-model limits in
+                # that base so each fresh permission projection retains them.
+                permission_base, permission_limits = opencode_context.apply_context_override(
+                    args.opencode_config_base_content,
+                    str(context_capture["model"]),
+                    args.resolved_model_settings["context_window"],
+                    context_capture["native_limits"],
+                    provider_key="providers",
+                    provider_keys=("providers", "provider"),
+                )
+                if permission_limits != context_capture["applied_limits"]:
+                    raise opencode_context.OpenCodeContextError(
+                        "OpenCode owner permission base differs from verified context limits"
+                    )
+                args.opencode_config_base_content = permission_base
+        except opencode_context.OpenCodeContextError as exc:
+            annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": "never-launched"})
+            cancel_governor_reservation(governor, governor_root, reservation_token)
+            close_job_row(
+                jobs, args.slug, args.worktree,
+                "opencode-context-limit-unavailable", "", args.attempt_id,
+            )
+            return fail("opencode-context-limit-unavailable", 69,
+                        detail=str(exc), attempt_id=args.attempt_id, child_spawned="0")
+        args.opencode_config_content = str(context_capture["config_content"])
+        dispatch_env["OPENCODE_CONFIG_CONTENT"] = args.opencode_config_content
+        catalog_limits = context_capture["catalog_limits"]
+        configured_limits = context_capture["configured_limits"]
+        native_limits = context_capture["native_limits"]
+        applied_limits = context_capture["applied_limits"]
+        final_limits = context_capture["final_limits"]
+        def limit_receipt(value):
+            return "absent" if value is None else str(value)
+        args.resolved_model_settings.update({
+            "context_window_native_model": str(context_capture["model"]),
+            "context_window_native_variant": str(context_capture.get("variant") or "absent"),
+            "context_window_native_application": str(
+                context_capture.get("native_application") or "unavailable"),
+            "context_window_execution_mode": str(
+                context_capture.get("execution_mode") or "shared-service"),
+            "context_window_runtime_target": str(
+                context_capture.get("runtime_target") or "shared-service"),
+            "context_window_catalog_limit_context": limit_receipt(catalog_limits["context"]),
+            "context_window_configured_limit_context": limit_receipt(configured_limits["context"]),
+            "context_window_configured_limit_input": limit_receipt(configured_limits["input"]),
+            "context_window_configured_limit_output": limit_receipt(configured_limits["output"]),
+            "context_window_native_limit_context": limit_receipt(native_limits["context"]),
+            "context_window_native_limit_input": limit_receipt(native_limits["input"]),
+            "context_window_native_limit_output": limit_receipt(native_limits["output"]),
+            "context_window_applied_limit_context": limit_receipt(applied_limits["context"]),
+            "context_window_applied_limit_input": limit_receipt(applied_limits["input"]),
+            "context_window_applied_limit_output": limit_receipt(applied_limits["output"]),
+            "context_window_final_limit_context": limit_receipt(final_limits["context"]),
+            "context_window_final_limit_input": limit_receipt(final_limits["input"]),
+            "context_window_final_limit_output": limit_receipt(final_limits["output"]),
+            "context_window_server_identity": str(context_capture.get("server_identity") or "unavailable"),
+            "context_window_location_identity": str(context_capture.get("location_identity") or "unavailable"),
+            "context_window_config_identity": str(context_capture.get("config_identity") or "unavailable"),
+            "context_policy_state": context_capture["compaction_policy"]["state"],
+            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
+                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
+            "context_policy_trigger": limit_receipt(context_capture["compaction_policy"]["trigger_tokens"]),
+            "context_policy_output_allowance": limit_receipt(context_capture["compaction_policy"]["output_allowance_tokens"]),
+            "context_policy_configured_reserve": limit_receipt(context_capture["compaction_policy"]["configured_reserve_tokens"]),
+            "context_policy_effective_reserve": limit_receipt(context_capture["compaction_policy"]["effective_reserve_tokens"]),
+            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
+            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
+        })
+        # Serialize the supervisor refresh base only after native limits have
+        # been verified and, for standalone V2, merged into the original base.
+        dispatch_env.update(commit_policy.runtime_permission_context_env(
+            args, adapter="opencode",
+            agent_home=str(args.agent_home),
+            opencode_config_base=args.opencode_config_base_content,
+            report_bundle_root=(str(args.report_bundle_root)
+                                if args.report_bundle_root is not None else None),
+            execution_access_roots=[
+                str(value) for value in (
+                    args.execution_access_grant.additional_writable_roots
+                    if args.execution_access_grant is not None else ()
+                )
+            ],
+            execution_access_read_roots=[
+                str(value) for value in (
+                    args.execution_access_grant.read_roots
+                    if args.execution_access_grant is not None else ()
+                )
+            ],
+            contract_read_roots=[str(value) for value in args.contract_read_roots],
+            selected_agent=str(args.agent),
+        ))
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
@@ -1922,8 +2117,13 @@ def main(argv: list[str]) -> int:
         launch_metadata["opencode_context_window_request"] = str(
             args.resolved_model_settings.get("context_window", ""))
         for key in (
-                "context_window_native_model",
-                "context_window_final_limit_context", "context_window_final_limit_input",
+                "context_window_native_model", "context_window_native_variant",
+                "context_window_native_application", "context_window_execution_mode",
+                "context_window_runtime_target", "context_window_server_identity",
+                "context_window_location_identity", "context_window_config_identity",
+                "context_window_applied_limit_context", "context_window_applied_limit_input",
+                "context_window_applied_limit_output", "context_window_final_limit_context",
+                "context_window_final_limit_input",
                 "context_window_final_limit_output", "context_policy_state",
                 "context_policy_runtime_version",
                 "context_policy_enabled", "context_policy_trigger",
@@ -1945,9 +2145,13 @@ def main(argv: list[str]) -> int:
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
-        launch_metadata["opencode_runtime_dir"] = str(
-            Path(dispatch_env["XDG_DATA_HOME"]).parent)
-        launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
+        # Only an attempt-private runtime (V1 worker home or nested isolation) has
+        # its own data home; a V2 worker uses the shared one, and readers fall back.
+        if (args.worker_runtime_env.get("XDG_DATA_HOME")
+                or args.nested_runtime_env.get("XDG_DATA_HOME")):
+            launch_metadata["opencode_runtime_dir"] = str(
+                Path(dispatch_env["XDG_DATA_HOME"]).parent)
+        launch_metadata["runtime_home"] = dispatch_env.get("OPENCODE_CONFIG_DIR") or "shared-service"
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         # Nested runtime and worker-home overlays are already applied above.
@@ -2297,12 +2501,17 @@ def main(argv: list[str]) -> int:
     print(f"variant={settings['variant']}")
     print(f"context_window_requested={settings['context_window']}")
     print(f"context_window_source={settings['context_window_source']}")
-    print(f"context_window_native_application=OPENCODE_CONFIG_CONTENT:provider-model-limit")
-    for key in ("context_window_native_model", "context_window_catalog_limit_context",
+    for key in ("context_window_native_application", "context_window_execution_mode",
+                "context_window_runtime_target"):
+        print(f"{key}={settings.get(key, 'not-launched')}")
+    for key in ("context_window_native_model", "context_window_native_variant",
+                "context_window_server_identity", "context_window_location_identity",
+                "context_window_config_identity", "context_window_catalog_limit_context",
                 "context_window_configured_limit_context", "context_window_configured_limit_input",
                 "context_window_configured_limit_output", "context_window_native_limit_context",
                 "context_window_native_limit_input", "context_window_native_limit_output",
                 "context_window_applied_limit_context", "context_window_applied_limit_input",
+                "context_window_applied_limit_output",
                 "context_window_final_limit_context", "context_window_final_limit_input",
                 "context_window_final_limit_output"):
         print(f"{key}={settings.get(key, 'not-launched')}")

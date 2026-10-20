@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import paths
@@ -71,7 +72,7 @@ def _auto_loaded_bootstrap():
     return None
 
 
-def _merge_config(existing, our_instructions, our_skills_path):
+def _merge_config(existing, our_instructions, our_skills_path, *, v2=False):
     """Merge harness skill paths, and the bootstrap only when nothing else loads it.
 
     Return ``(merged, changed, blocked, detail)``. Create missing keys, append
@@ -111,7 +112,24 @@ def _merge_config(existing, our_instructions, our_skills_path):
             merged["instructions"] = instructions + [our_instructions]
             changed = True
 
-    # skills.paths
+    # V1 uses skills.paths. V2 accepts a list of skill locations and
+    # normalizes the legacy object during migration; emit the native V2 list
+    # while preserving every existing path.
+    if v2:
+        skills = merged.get("skills", [])
+        if isinstance(skills, dict) and set(skills) <= {"paths"}:
+            skills = skills.get("paths", [])
+        if not isinstance(skills, list):
+            return (existing, False, True,
+                    "opencode.json 'skills' value has an incompatible V2 type — refusing to merge")
+        skills = list(skills)
+        if our_skills_path not in skills:
+            skills.append(our_skills_path)
+            changed = True
+        merged["skills"] = skills
+        return (merged, changed, False, "merged" if changed else "unchanged")
+
+    # V1 skills.paths
     if "skills" not in merged:
         merged["skills"] = {"paths": [our_skills_path]}
         changed = True
@@ -155,6 +173,15 @@ def install(scope="global", plugin=False, dry_run=False):
     Report semantic conflicts as blocked without rolling back prior symlinks.
     """
     entries = projector.plan(["opencode"], scope=scope)["opencode"]
+
+    utilities = Path(__file__).resolve().parents[3] / "utilities"
+    if str(utilities) not in sys.path:
+        sys.path.insert(0, str(utilities))
+    try:
+        import opencode_runtime
+        v2 = opencode_runtime.is_v2()
+    except Exception:
+        v2 = False
 
     actions = []
     blocked = False
@@ -313,7 +340,7 @@ def install(scope="global", plugin=False, dry_run=False):
                     existing = json.load(f)
 
             merged, changed, conflict, detail = _merge_config(
-                existing, our_instructions, our_skills_path
+                existing, our_instructions, our_skills_path, v2=v2
             )
 
             if conflict:

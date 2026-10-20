@@ -3,6 +3,7 @@ import json
 import importlib.util
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class WorkerHomes(unittest.TestCase):
     def setUp(self):
+        runtime_version = patch.dict(os.environ, {'OPENCODE_RUNTIME_VERSION': '1.19.0'})
+        runtime_version.start()
+        self.addCleanup(runtime_version.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.source = self.base / 'user'
@@ -57,6 +61,7 @@ class WorkerHomes(unittest.TestCase):
             'utilities/dispatch-defaults.py',
             'utilities/dispatch_allocation.py',
             'utilities/claude_credential_recovery.py',
+            'utilities/opencode_runtime.py',
             'capabilities/topologies.json',
             'profiles/templates/bootstrap-codex.md',
             'profiles/templates/bootstrap-claude.md',
@@ -895,6 +900,39 @@ class WorkerHomes(unittest.TestCase):
         self.assertEqual(actual['permission']['skill'], {'*': 'deny'})
         self.assertEqual((home / 'plugins').resolve(), (self.source / 'plugins').resolve())
         self.assertEqual(env['OPENCODE_DISABLE_CLAUDE_CODE_PROMPT'], '1')
+
+    def test_opencode_v2_worker_uses_shared_service_without_db_or_auth_links(self):
+        data_home = self.base / 'v2-data'
+        data_dir = data_home / 'opencode'
+        data_dir.mkdir(parents=True)
+        with sqlite3.connect(data_dir / 'opencode.db') as connection:
+            connection.execute('CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, '
+                               'label TEXT, value TEXT, active INTEGER, time_created INTEGER, time_updated INTEGER)')
+        config_source = self.base / 'v2-config'
+        config_source.mkdir()
+        (config_source / 'opencode.json').write_text(json.dumps({
+            'permissions': [{'action': 'shell', 'resource': '*', 'effect': 'ask'}],
+            'plugins': ['user-plugin'],
+            'mcp': {'servers': {'user-server': {'type': 'local', 'command': ['tool']}}},
+        }))
+        env = {**self.env, 'HOME': str(self.base), 'XDG_DATA_HOME': str(data_home),
+               'XDG_CONFIG_HOME': str(self.base / 'config'),
+               'XDG_STATE_HOME': str(self.base / 'state'),
+               'XDG_CACHE_HOME': str(self.base / 'cache'),
+               'OPENCODE_CONFIG_DIR': str(config_source)}
+        with patch.dict(os.environ, {'OPENCODE_RUNTIME_VERSION': '2.0.32'}):
+            result = prepare_worker_home(ROOT, 'opencode', 'stage', 'v2-worker', env=env,
+                                         destination=self.base / 'v2-worker-home')
+        self.assertNotIn('XDG_DATA_HOME', result)
+        self.assertNotIn('OPENCODE_CONFIG_DIR', result)
+        home = Path(result['HEARTING_WORKER_HOME'])
+        projected = json.loads((home / 'opencode.json').read_text())
+        self.assertIn('permissions', projected)
+        self.assertNotIn('permission', projected)
+        self.assertEqual(projected['plugins'], [])
+        self.assertEqual(projected['mcp'], {'servers': {}})
+        self.assertFalse((home / 'runtime/data/opencode/auth.json').exists())
+        self.assertFalse((home / 'runtime/data/opencode/opencode.db').exists())
 
     def test_opencode_all_worker_types_override_snapshot_without_changing_user_config(self):
         config = {'snapshot': True, 'permission': {'bash': {'secret *': 'deny'}}}

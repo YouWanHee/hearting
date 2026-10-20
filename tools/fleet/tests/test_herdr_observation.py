@@ -1,7 +1,9 @@
 """Event-revision reuse for Fleet's optional Herdr process observations."""
 import json
+import os
 from collections import Counter
 from concurrent.futures import Future
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -13,6 +15,45 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from fleet.collectors import herdr  # noqa: E402
+
+
+@dataclass(frozen=True)
+class TestView:
+    endpoint: str
+    socket_path: str
+    generation: int
+    revision: int
+    panes: tuple = ()
+    pane_revisions: dict = None
+    terminal: dict = None
+    agents: tuple = ()
+    observed_at: float = 1.0
+    complete: bool = True
+
+
+def _module_for(socket_path="/isolated/herdr.sock", endpoint="fleet-named"):
+    class Module:
+        @staticmethod
+        def endpoint_name(value=None):
+            return value or endpoint
+
+        @staticmethod
+        def socket_path_for_endpoint(_session=None):
+            return socket_path
+
+        class ObservationTransport:
+            def __init__(self, selected_endpoint, selected_socket, **_kwargs):
+                self.endpoint = selected_endpoint
+                self.socket_path = selected_socket
+                self.close_count = 0
+
+            def observe(self):
+                raise AssertionError("observation runs through background_read")
+
+            def close(self):
+                self.close_count += 1
+
+    return Module
 
 
 class PaneProcessReuseTest(unittest.TestCase):
@@ -80,41 +121,272 @@ class PaneProcessReuseTest(unittest.TestCase):
                                           "pane", "process-info", "--pane", "w1:p1"]])
 
     def test_pending_socket_observation_never_blocks_or_spawns_duplicate_readers(self):
-        old_transports = dict(herdr._OBSERVATION_TRANSPORTS)
-        old_futures = dict(herdr._OBSERVATION_FUTURES)
-        herdr._OBSERVATION_TRANSPORTS.clear()
-        herdr._OBSERVATION_FUTURES.clear()
+        old = {name: dict(getattr(herdr, name)) for name in (
+            "_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+            "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING")}
+        for name in old:
+            getattr(herdr, name).clear()
         self.addCleanup(lambda: (herdr.close_observations(),
-                                herdr._OBSERVATION_TRANSPORTS.update(old_transports),
-                                herdr._OBSERVATION_FUTURES.update(old_futures)))
-        view = SimpleNamespace(endpoint="fleet-named", complete=True)
-        class Module:
-            @staticmethod
-            def endpoint_name(value=None):
-                return value or "fleet-named"
-
-            @staticmethod
-            def socket_path_for_endpoint(_session=None):
-                return "/isolated/herdr.sock"
-
-            class ObservationTransport:
-                def __init__(self, *_args, **_kwargs):
-                    pass
-
-                def observe(self):
-                    raise AssertionError("the transport must run through background_read")
-
-                def close(self):
-                    pass
-
+                                [getattr(herdr, name).update(rows) for name, rows in old.items()]))
+        view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1)
         future = Future()
-        with mock.patch.object(herdr, "_observation_module", return_value=Module), \
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
              mock.patch.object(herdr, "background_read", return_value=future) as start_read:
             self.assertIsNone(herdr.observation_view())
             self.assertIsNone(herdr.observation_view())
             start_read.assert_called_once()
             future.set_result(view)
             self.assertIs(herdr.observation_view(), view)
+            self.assertIs(herdr.observation_view(), view)
+            start_read.assert_called_once()
+
+    def test_last_complete_view_is_shared_while_one_next_read_runs(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, second = Future(), Future()
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, second]) as start_read:
+            self.assertIsNone(herdr.observation_view())
+            first_view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1)
+            first.set_result(first_view)
+            self.assertIs(herdr.observation_view(), first_view)
+
+            key = ("fleet-named", "/isolated/herdr.sock")
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            stale = herdr.observation_view()
+            self.assertEqual(stale.panes, first_view.panes)
+            self.assertFalse(stale.complete)
+            self.assertEqual(start_read.call_count, 2)
+            self.assertEqual(herdr._observation_error(), "herdr refresh pending")
+
+            same_stale = herdr.observation_view()
+            self.assertFalse(same_stale.complete)
+            self.assertEqual(start_read.call_count, 2)
+            second_view = TestView("fleet-named", "/isolated/herdr.sock", 2, 1)
+            second.set_result(second_view)
+            self.assertIs(herdr.observation_view(), second_view)
+
+    def test_failed_refresh_keeps_old_rows_but_marks_view_incomplete(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, failed = Future(), Future()
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, failed]):
+            self.assertIsNone(herdr.observation_view())
+            view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1,
+                            panes=({"pane_id": "w1:p1"},))
+            first.set_result(view)
+            self.assertIs(herdr.observation_view(), view)
+            key = ("fleet-named", "/isolated/herdr.sock")
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            pending = herdr.observation_view()
+            self.assertFalse(pending.complete)
+            failed.set_exception(OSError("socket lost"))
+            unhealthy = herdr.observation_view()
+            self.assertEqual(unhealthy.panes, view.panes)
+            self.assertFalse(unhealthy.complete)
+            self.assertIn("OSError: socket lost", herdr._observation_error())
+
+    def test_incomplete_cached_agent_sid_cannot_confirm_presence_or_absence(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, pending, refreshed = Future(), Future(), Future()
+        agent = {"agent": "codex", "agent_session": {"agent": "codex", "value": "thread-current"}}
+
+        def attach(session_id):
+            session = SimpleNamespace(harness="codex", session_id=session_id, pid=4312,
+                                      proc_start=None, cwd="/project", is_child=False,
+                                      app_server=False, mem_worker=False, detached=False)
+            health = herdr.enrich([session])
+            return session.herdr_attached, health
+
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, pending, refreshed]):
+            self.assertIsNone(herdr.observation_view())
+            first.set_result(TestView("fleet-named", "/isolated/herdr.sock", 1, 1,
+                                       agents=(agent,)))
+            self.assertTrue(herdr.observation_view().complete)
+
+            key = ("fleet-named", "/isolated/herdr.sock")
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            stale = herdr.observation_view()
+            self.assertFalse(stale.complete)
+            current, health = attach("thread-current")
+            self.assertIsNone(current)
+            self.assertFalse(health["complete"])
+            absent, health = attach("thread-other")
+            self.assertIsNone(absent)
+            self.assertFalse(health["complete"])
+
+            pending.set_exception(OSError("socket lost"))
+            failed = herdr.observation_view()
+            self.assertFalse(failed.complete)
+            current, health = attach("thread-current")
+            self.assertIsNone(current)
+            self.assertFalse(health["complete"])
+            absent, health = attach("thread-other")
+            self.assertIsNone(absent)
+            self.assertFalse(health["complete"])
+
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            self.assertFalse(herdr.observation_view().complete)
+            refreshed.set_result(TestView("fleet-named", "/isolated/herdr.sock", 2, 1,
+                                           agents=(agent,)))
+            self.assertTrue(herdr.observation_view().complete)
+            current, health = attach("thread-current")
+            self.assertIs(current, True)
+            self.assertTrue(health["complete"])
+
+    def test_pending_and_failed_cached_pane_pid_cannot_confirm_current_attachment(self):
+        old_pane_cache = herdr._PANE_INFO_CACHE.copy()
+        herdr._PANE_INFO_CACHE.clear()
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+
+        def restore():
+            herdr.close_observations()
+            herdr._PANE_INFO_CACHE.clear()
+            herdr._PANE_INFO_CACHE.update(old_pane_cache)
+
+        self.addCleanup(restore)
+        first, pending = Future(), Future()
+        pane = {"pane_id": "w1:p1", "agent": "codex", "cwd": "/project",
+                "agent_session": {"agent": "codex", "value": "thread-current"}}
+        agent = {"agent": "codex", "pane_id": "w1:p1",
+                 "agent_session": {"agent": "codex", "value": "thread-current"}}
+        view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1,
+                        panes=(pane,), pane_revisions={"w1:p1": 0}, agents=(agent,))
+        cache_key = (view.endpoint, view.socket_path, view.generation, 0, "w1:p1")
+        herdr._PANE_INFO_CACHE[cache_key] = {
+            "shell_pid": 4000,
+            "foreground_processes": [{"pid": 4312, "name": "codex"}],
+        }
+
+        def attach_from_cached_view():
+            session = SimpleNamespace(harness="codex", session_id="thread-other", pid=4312,
+                                      proc_start="pid-start-before-reuse", cwd="/project",
+                                      is_child=False, app_server=False, mem_worker=False,
+                                      detached=False)
+            health = herdr.enrich([session])
+            return session, health
+
+        observation_reads = iter((first, pending))
+
+        def background_read(read):
+            try:
+                return next(observation_reads)
+            except StopIteration:
+                result = Future()
+                try:
+                    result.set_result(read())
+                except Exception as exc:
+                    result.set_exception(exc)
+                return result
+
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+                mock.patch.object(herdr, "background_read", side_effect=background_read):
+            self.assertIsNone(herdr.observation_view())
+            first.set_result(view)
+            self.assertTrue(herdr.observation_view().complete)
+
+            key = (view.endpoint, view.socket_path)
+            herdr._OBSERVATION_LAST_STARTED[key] -= 1.0
+            stale = herdr.observation_view()
+            self.assertFalse(stale.complete)
+            stale_pids = herdr.pane_evidence(stale.panes, observation=stale)
+            self.assertIn(4312, stale_pids[1])
+            self.assertFalse(stale_pids.complete)
+            with mock.patch("fleet.collectors.procscan.read_proc_start",
+                            return_value="pid-start-after-reuse"):
+                session, health = attach_from_cached_view()
+            self.assertIsNone(session.herdr_attached)
+            self.assertFalse(health["complete"])
+
+            pending.set_exception(OSError("socket lost"))
+            failed = herdr.observation_view()
+            self.assertFalse(failed.complete)
+            failed_pids = herdr.pane_evidence(failed.panes, observation=failed)
+            self.assertIn(4312, failed_pids[1])
+            self.assertFalse(failed_pids.complete)
+            with mock.patch("fleet.collectors.procscan.read_proc_start",
+                            return_value="pid-start-after-reuse"):
+                session, health = attach_from_cached_view()
+            self.assertIsNone(session.herdr_attached)
+            self.assertFalse(health["complete"])
+
+    def test_refresh_discards_old_generation_and_close_clears_cached_views(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, refreshed = Future(), Future()
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, refreshed]) as start_read:
+            self.assertIsNone(herdr.observation_view())
+            old_view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1)
+            first.set_result(old_view)
+            self.assertIs(herdr.observation_view(), old_view)
+            self.assertIsNone(herdr.observation_view(refresh=True))
+            self.assertEqual(start_read.call_count, 2)
+            self.assertIsNone(herdr.observation_view())
+            new_view = TestView("fleet-named", "/isolated/herdr.sock", 2, 1)
+            refreshed.set_result(new_view)
+            self.assertIs(herdr.observation_view(), new_view)
+            herdr.close_observations()
+            self.assertFalse(herdr._OBSERVATION_VIEWS)
+            self.assertFalse(herdr._OBSERVATION_FUTURES)
+
+    def test_refresh_requested_during_read_reconnects_after_that_read_finishes(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, forced = Future(), Future()
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, forced]) as start_read:
+            self.assertIsNone(herdr.observation_view())
+            self.assertIsNone(herdr.observation_view(refresh=True))
+            old_view = TestView("fleet-named", "/isolated/herdr.sock", 1, 1)
+            first.set_result(old_view)
+            # A later ordinary consumer completes the pending refresh request;
+            # it must not publish the just-finished pre-refresh generation.
+            self.assertIsNone(herdr.observation_view())
+            self.assertFalse(herdr._OBSERVATION_VIEWS)
+            self.assertEqual(start_read.call_count, 2)
+            self.assertIsNone(herdr.observation_view())
+            new_view = TestView("fleet-named", "/isolated/herdr.sock", 2, 1)
+            forced.set_result(new_view)
+            self.assertIs(herdr.observation_view(), new_view)
+
+    def test_same_endpoint_on_different_socket_paths_keeps_separate_views(self):
+        for name in ("_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+                     "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING"):
+            getattr(herdr, name).clear()
+        self.addCleanup(herdr.close_observations)
+        first, second = Future(), Future()
+        module_a, module_b = _module_for("/sockets/a.sock"), _module_for("/sockets/b.sock")
+        with mock.patch.object(herdr, "_observation_module", side_effect=[
+                module_a, module_a, module_b, module_b]), \
+             mock.patch.object(herdr, "background_read", side_effect=[first, second]) as start_read:
+            with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/sockets/a.sock"}):
+                self.assertIsNone(herdr.observation_view())
+                view_a = TestView("fleet-named", "/sockets/a.sock", 1, 1)
+                first.set_result(view_a)
+                self.assertIs(herdr.observation_view(), view_a)
+            with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/sockets/b.sock"}):
+                self.assertIsNone(herdr.observation_view())
+                view_b = TestView("fleet-named", "/sockets/b.sock", 1, 1)
+                second.set_result(view_b)
+                self.assertIs(herdr.observation_view(), view_b)
+        self.assertEqual(start_read.call_count, 2)
+        self.assertEqual(set(herdr._OBSERVATION_VIEWS.values()), {view_a, view_b})
 
 
 if __name__ == "__main__":

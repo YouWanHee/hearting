@@ -4884,6 +4884,20 @@ class DrainReceiptDeniedEnvironTest(unittest.TestCase):
    with D.process_table_scan_scope():                   # the batch scan reads the same judgement
     self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
 
+ def test_an_unreadable_user_service_manager_is_outside_the_attempt(self):
+  # `systemd --user` and `(sd-pam)` are non-dumpable and may restart after the attempt began.
+  uid=os.getuid()
+  real=Path.read_text
+  target=f"/proc/{self.late.pid}/cgroup"
+  def read_text(path,*args,**kwargs):
+   if str(path)==target:
+    return f"0::/user.slice/user-{uid}.slice/user@{uid}.service/init.scope\n"
+   return real(path,*args,**kwargs)
+  with self.denied(),mock.patch.object(Path,"read_text",read_text):
+   self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+   with D.process_table_scan_scope():
+    self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+
  def test_an_unreadable_process_under_a_same_uid_parent_stays_unverifiable(self):
   # What an attempt's own descendant looks like: its parent runs as the attempt's user.
   with self.denied(),self.parent_uid(os.getuid()):

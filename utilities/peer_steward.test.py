@@ -5711,6 +5711,27 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
                  mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):
                 self.assertEqual(peer_steward._continue_look(self.seat_obj.pane, req), expected)
 
+    def test_continue_is_not_held_back_by_the_sessions_own_dispatched_work(self):
+        self.cleared()
+        req = self.booking()
+        info = {"pane_id": self.seat_obj.pane, "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        ident = {"harness": "claude", "session_id": "sid-B", "pane": self.seat_obj.pane, "name": "sup"}
+
+        def readiness(*_a, purpose="completion", **_k):
+            # A supervisor whose owners still run: pending for completion, ready for input.
+            state, reason = (("ready", "native-turn-ready") if purpose == "input"
+                             else ("pending", "bound-registered-work-pending"))
+            return type("Readiness", (), {"state": state, "reason": reason})()
+
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+             mock.patch.object(peer_steward, "_continue_native_session", return_value="sid-B"), \
+             mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
+            self.assertIsNone(peer_steward._continue_look(self.seat_obj.pane, req))
+
     def test_user_prompt_card_handoff_and_expiry_still_stop_continue(self):
         def bump(seat):
             with self.st.seat_lock(seat.key):

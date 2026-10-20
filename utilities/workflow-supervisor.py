@@ -627,12 +627,13 @@ def _claim_successors(route, ledger, armed, node_id, successors, evidence=None):
 
 def _checked_resource_row(armed, evidence, *, require_success=True):
     """Recheck the existing exit tuple at the resource admission boundary."""
+    from route_authority import resource_predecessor_finished
     row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
             or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
             or (require_success and evidence.get("exit_code") != 0)
-            or (RR.classify_identity(row)[0] != "exited"
-                and (require_success or not RR.resource_never_started(row)))):
+            or (RR.classify_identity(row)[0] != "exited" if require_success
+                else not resource_predecessor_finished(row))):
         return None
     return row
 

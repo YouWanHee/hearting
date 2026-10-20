@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 from dispatch_contract import supervisor_lease_path
+import opencode_runtime
 
 
 MAX_EVENT_BYTES = 2 * 1024 * 1024
@@ -110,17 +111,20 @@ def bind_session(args, session: str) -> None:
 
 def command(args, session: str) -> list[str]:
     override = getattr(args, "opencode_command", None)
-    result = shlex.split(override) if override else ["opencode", "run"]
-    result += ["--dir", args.worktree, "--format", "json",
-               "--agent", getattr(args, "opencode_agent", "build")]
-    if session:
-        result += ["--session", session]
-    if args.model:
-        result += ["--model", args.model]
-    variant = getattr(args, "variant", None)
-    if variant and variant != "runtime-default":
-        result += ["--variant", variant]
-    return result
+    prefix = shlex.split(override) if override else ["opencode"]
+    if not prefix:
+        raise OpenCodeTransportError("opencode-command-empty")
+    binary = prefix[-1]
+    argv = opencode_runtime.run_argv(
+        binary=binary, cwd=args.worktree,
+        agent=getattr(args, "opencode_agent", "build"), model=args.model,
+        variant=getattr(args, "variant", None), session=session or None,
+        standalone=bool(getattr(args, "opencode_standalone", False)),
+        title=("hearting-worker-" + str(args.parent_attempt_id)
+               if not session and opencode_runtime.is_v2(binary) else None),
+    )
+    # Preserve a configured launcher prefix (for wrappers such as `env VAR=...`).
+    return prefix[:-1] + argv
 
 
 def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict, int]:
@@ -162,6 +166,10 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
     final_text = ""
     terminal_stop = False
     runtime_error = None
+    binary_parts = shlex.split(getattr(args, "opencode_command", None) or "opencode")
+    runtime_binary = binary_parts[-1] if binary_parts else "opencode"
+    native_opencode = Path(runtime_binary).name == "opencode"
+    modern = opencode_runtime.is_v2(runtime_binary)
     buffer = b""
     oversized = False
     deadline = time.monotonic() + args.turn_timeout
@@ -174,7 +182,16 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
             return  # Native CLI diagnostics are not result evidence.
         if not isinstance(value, dict):
             return
+        # Keep the supervisor's established V1 event envelope exactly intact;
+        # the reusable normalizer is used by passive consumers, while this
+        # identity-bearing stream validates the raw event before forwarding it.
         native = value.get("sessionID")
+        kind = value.get("type")
+        if not native:
+            if kind == "error":
+                runtime_error = opencode_runtime.safe_provider_error(value.get("error"))
+                return
+            raise OpenCodeTransportError("opencode-event-session-missing")
         if not isinstance(native, str) or not SESSION_ID.fullmatch(native):
             raise OpenCodeTransportError("opencode-event-session-missing")
         if session and session != native:
@@ -186,7 +203,6 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
                   "parent_attempt_id": args.parent_attempt_id,
                   "session_id": session, "cwd": args.worktree})
             publish_permission_projection()
-        kind = value.get("type")
         part = value.get("part") or {}
         if kind == "text":
             final_text = part.get("text", "")
@@ -196,7 +212,7 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
         elif kind == "step_finish":
             terminal_stop = part.get("reason") == "stop"
         elif kind == "error":
-            runtime_error = value.get("error") or {"message": "opencode-runtime-error"}
+            runtime_error = opencode_runtime.safe_provider_error(value.get("error"))
         elif kind == "tool_use":
             # Progress has no authority to finish the owner. Keep model prose,
             # outputs and intermediate stop events out of the terminal log.
@@ -246,13 +262,23 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
                 process.kill()
                 process.wait()
             process.stdout.close()
-    if not session:
+    if not session and not runtime_error:
         raise OpenCodeTransportError("opencode-session-not-observed")
-    if not runtime_error and (not terminal_stop or not isinstance(final_text, str)):
+    # V2's JSON stream contains step/text/error/tool events, not a terminal
+    # stop event. The v2.0.32 CLI waits for session.wait() before returning;
+    # require the exact session, an error-free final text, and a successful
+    # return from that native wait. V1 still requires its explicit final stop.
+    if modern and code == 0 and isinstance(final_text, str) and final_text.strip() and not runtime_error:
+        terminal_stop = True
+    if session and not runtime_error and (not terminal_stop or not isinstance(final_text, str)):
         raise OpenCodeTransportError("opencode-final-stop-missing")
-    result = {"type": "result", "runtime": "opencode", "session_id": session,
+    result = {"type": "result", "runtime": "opencode", "session_id": session or "",
               "subtype": "error_during_execution" if runtime_error or code else "success",
               "is_error": bool(runtime_error or code), "result": final_text}
     if runtime_error:
         result["error"] = runtime_error
+        if native_opencode:
+            opencode_runtime.record_model_outcome(args.model, error=runtime_error)
+    elif native_opencode and session and code == 0:
+        opencode_runtime.record_model_outcome(args.model, success=True)
     return result, code

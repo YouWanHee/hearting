@@ -333,8 +333,9 @@ class RelationLineBudgetTest(unittest.TestCase):
 class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     """F-101g-(7) — with no connection-layer fields set at all (ledger absent), a
     fixed 3-session render must stay byte-identical to the pre-F-101 golden captured
-    on `a1f16631` (see plan.md §5, procedure step 3). These goldens are never
-    regenerated here; a mismatch is a real regression, not a stale fixture.
+    on `a1f16631` (see plan.md §5, procedure step 3), except for explicitly recorded
+    intentional output changes below. Each exception changes only its named captured
+    bytes; a mismatch elsewhere is a real regression, not a stale fixture.
     Exception on record: 2026-09-04 the opencode row's source-absence message was
     corrected ("plan quota is console-only" → "opencode-go key not found") after the
     Go usage API shipped upstream (#31084/PR #2879) — the four r7 goldens were
@@ -355,7 +356,12 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     Fleet labels; only the three legend lines change in these four goldens.
     Exception on record: 2026-10-12 the approved per-repository mouse fold adds
     the open-repository arrow to each heading. Only those three heading prefixes
-    change in these four goldens; absent connection rows remain absent."""
+    change in these four goldens; absent connection rows remain absent.
+    Exception on record: 2026-10-19 provider status without an account observation now
+    reads `provider availability unknown`, avoiding the unsupported inference that an
+    OpenCode Go API key is missing. At each captured width only the OpenCode usage row
+    changes from `no usage api — opencode-go key not found` to that exact status (the
+    width-60 capture contains its previously clipped text); all other bytes are kept."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

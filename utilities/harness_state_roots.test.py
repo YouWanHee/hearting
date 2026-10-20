@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import harness_state_roots as H  # noqa: E402
 from dispatch_contract import dispatch_state_root  # noqa: E402
+from dispatch_summary import summary_writable_dirs  # noqa: E402
 
 
 class HarnessStateRootsTest(unittest.TestCase):
@@ -61,15 +62,18 @@ class HarnessStateRootsTest(unittest.TestCase):
                              ("spec_read_marker_required", H.spec_read_marker_required),
                              ("registry_writable_launch", H.registry_writable_launch),
                              ("_spec_grounding_dir", H.spec_grounding_dir),
-                             ("_core_grounding_dir", H.core_grounding_dir)):
+                             ("_core_grounding_dir", H.core_grounding_dir),
+                             ("summary_writable_dirs", summary_writable_dirs)):
             with self.subTest(name=name):
                 self.assertIs(getattr(codex, name), shared)
         ledger = Path(self._tmp.name) / "fresh-ledger"
+        titles = Path(self._tmp.name) / "titles"
         with mock.patch.dict("os.environ", {"FLEET_ROUTE_CHAIN_DIR": str(ledger)}), \
-                mock.patch.object(codex, "owner_root", return_value=Path(self._tmp.name) / "titles"):
+                mock.patch.object(codex, "summary_writable_dirs", return_value=(titles,)):
             self.assertFalse(ledger.exists())
             codex.ensure_owner_writable_dirs(self.args(nested_headless_network=True))
             self.assertTrue(ledger.is_dir())
+            self.assertTrue(titles.is_dir())
 
     def test_only_an_adapter_that_confines_writes_opens_them(self):
         # The rule is shared; opening the directories is the realization of an

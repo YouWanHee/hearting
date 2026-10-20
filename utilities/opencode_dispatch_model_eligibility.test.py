@@ -55,9 +55,15 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {
             "AGENT_HOME": str(ROOT),
             "XDG_CONFIG_HOME": str(self.tmp / "no-such-runtime-config"),
+            "XDG_DATA_HOME": str(self.tmp / "no-such-runtime-data"),
+            "OPENCODE_RUNTIME_VERSION": "1.19.0",
         })
         env.start()
         self.addCleanup(env.stop)
+        store = mock.patch.object(WRAPPER.opencode_runtime, "credential_store_present",
+                                  return_value=False)
+        store.start()
+        self.addCleanup(store.stop)
 
     def top_route(self) -> str:
         path = self.tmp / "route-top.json"
@@ -146,6 +152,28 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
         with self.assertRaises(WRAPPER.ModelSelectionError) as combined:
             WRAPPER.resolve_model_settings(selection(inherit=True, profile="deep"))
         self.assertEqual(combined.exception.reason, "invalid-dispatch-model-selection")
+
+    def test_v2_automatic_profile_uses_only_configured_unavailable_fallbacks(self):
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model",
+                               return_value=("openai/gpt-6.1-sol", "runtime-default",
+                                             {"state": "unknown", "reason": "no-observation"})) as select:
+            result = WRAPPER.resolve_model_settings(selection(profile="balanced-deep", role="deep maker"))
+        select.assert_called_once()
+        self.assertEqual(result["model"], "openai/gpt-6.1-sol")
+        self.assertEqual(result["variant"], "runtime-default")
+        self.assertEqual(result["source"], "profile+provider-fallback")
+        self.assertNotIn(("opencode/beam-free", "runtime-default"),
+                         WRAPPER.opencode_runtime.automatic_model_fallbacks())
+
+    def test_explicit_model_remains_exact_even_when_provider_cache_rejects_it(self):
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model") as select:
+            result = WRAPPER.resolve_model_settings(selection(
+                model="opencode-go/muse-spark-1.3-contributor", variant="xhigh"))
+        select.assert_not_called()
+        self.assertEqual(result["model"], "opencode-go/muse-spark-1.3-contributor")
+        self.assertEqual(result["source"], "explicit")
 
 
 if __name__ == "__main__":
