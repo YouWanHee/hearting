@@ -105,6 +105,46 @@ class NativeSessionTest(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "api_key_expired")
         self.assertNotIn("secret-token", json.dumps(result))
 
+    def test_v2_typed_auth_rejection_is_recorded_and_stays_a_replaceable_runtime_death(self):
+        # The exact stream of the replacement owner that died on 2026-10-20:
+        # OpenCode 2.0.32 types the provider failure and carries no status.
+        import sqlite3
+        import dispatch_supervisor_terminal as terminal
+        incident = {"type": "provider.auth", "message": "Request failed: 401"}
+        db = self.root / "opencode.db"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, "
+                        "label TEXT, value TEXT, active INTEGER, time_created INTEGER, "
+                        "time_updated INTEGER)")
+            con.execute("INSERT INTO credential VALUES ('oai', 'openai', 'Default', ?, 1, 1, 1)",
+                        (json.dumps({"type": "oauth", "access": "openai-access",
+                                     "refresh": "openai-refresh"}),))
+        native = self.root / "bin" / "opencode"  # only a native binary records outcomes
+        native.parent.mkdir()
+        native.write_text("#!" + sys.executable + "\nimport json, sys\nsys.stdin.read()\n"
+                          "print(json.dumps({'type':'error','sessionID':'','error':%r}), flush=True)\n"
+                          "sys.exit(1)\n" % incident)
+        native.chmod(0o755)
+        self.args.opencode_command = str(native)
+        self.args.model = "openai/gpt-6.1-sol"
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32",
+                                                   "OPENCODE_DB": str(db)}):
+            result, code = runtime.run_turn(self.args, "question", emit=self.events.append)
+            evidence = runtime.opencode_runtime.model_availability("openai/gpt-6.1-sol")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["error"], incident)  # no status is synthesized
+        cache = json.loads((self.root / "state/agent-fleet/usage/opencode.json").read_text())
+        recorded = {row["model"]: (row["state"], row["reason"])
+                    for row in cache["providers"].values() if row["provider"] == "openai"}
+        self.assertEqual(recorded, {"gpt-6.1-sol": ("unavailable", "authentication-rejected"),
+                                    "*": ("unavailable", "authentication-rejected")})
+        self.assertNotIn("openai-access", json.dumps(cache))
+        self.assertEqual((evidence["state"], evidence["automatic_eligible"]),
+                         ("unavailable", False))
+        verdict = terminal.classify_session_result(result, code, runtime="opencode")
+        self.assertEqual((verdict.note, verdict.failure_class, verdict.api_status),
+                         ("dead-runtime-error", "runtime", ""))
+
     def test_exact_session_resume_and_only_final_step_is_returned(self):
         self.program("""
 session = sys.argv[sys.argv.index('--session') + 1] if '--session' in sys.argv else None
