@@ -281,7 +281,8 @@ for path in [repo/'.git/config',repo/'.git/hooks/pre-commit',repo/'source.txt',w
         self.assertNotEqual(old_result.returncode, 0, old_output)
         self.assertRegex(
             old_output,
-            r"(?is)(packed-refs\.lock.*permission denied|permission denied.*packed-refs\.lock)",
+            r"(?is)(packed-refs\.lock.*(?:permission denied|read-only file system)"
+            r"|(?:permission denied|read-only file system).*packed-refs\.lock)",
             old_output)
         self.assertIn(victim_ref, self.git("for-each-ref", "--format=%(refname)"))
         self.assertFalse((common / "packed-refs.lock").exists())
