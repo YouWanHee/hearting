@@ -3572,6 +3572,9 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         def run(argv, **kwargs):
             if calls is not None:
                 calls.append(argv)
+            if argv[:3] == ["herdr", "agent", "list"]:
+                agent = payload["result"]["agent"]
+                return _herdr_json({"result": {"agents": [agent]}})
             if argv[:3] == ["herdr", "agent", "get"]:
                 return _herdr_json(payload)
             if argv[:3] == ["herdr", "pane", "process-info"]:
@@ -3591,6 +3594,116 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             ["herdr", "pane", "send-keys"], ["herdr", "agent", "send-text"],
             ["herdr", "agent", "send-keys"],
         )]
+
+    @staticmethod
+    def _inventory_row(harness="claude", sid="sid-child", name="child", pane="w1:pX"):
+        return {"agent": harness, "name": name, "pane_id": pane,
+                "agent_session": ({"agent": harness, "kind": "id", "value": sid}
+                                  if sid else None)}
+
+    @staticmethod
+    def _current_target(harness="claude", sid="sid-child", name="child", pane="w1:pX"):
+        return "idle", {"harness": harness, "session_id": sid or "-",
+                         "name": name, "pane": pane}, 0, None
+
+    def test_name_tag_and_pane_addresses_pin_the_same_current_recipient(self):
+        row = self._inventory_row()
+        target = self._current_target()
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([row], None)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=target), \
+             mock.patch.object(peer_steward, "_process_session", return_value="sid-child"), \
+             mock.patch.object(peer_steward, "_prompt_fleet_tag", return_value=("3e", None)):
+            resolved = [peer_steward._resolve_prompt_target(address)
+                        for address in ("child", "[3e]", "w1:pX")]
+        identities = [(item[0]["harness"], item[0]["session_id"], item[0]["pane"])
+                      for item in resolved]
+        self.assertEqual(identities, [("claude", "sid-child", "w1:pX")] * 3)
+        self.assertTrue(all(item[1] is None for item in resolved))
+
+    def test_unnamed_herdr_row_does_not_hide_an_exact_named_recipient(self):
+        rows = [self._inventory_row(), self._inventory_row(
+            harness="claude", sid="sid-unnamed", name=None, pane="w1:pU")]
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target",
+                               return_value=self._current_target()), \
+             mock.patch.object(peer_steward, "_process_session", return_value="sid-child"):
+            resolved = peer_steward._resolve_prompt_target("child")
+        self.assertIsNone(resolved[1])
+        self.assertEqual((resolved[0]["harness"], resolved[0]["session_id"],
+                          resolved[0]["pane"]), ("claude", "sid-child", "w1:pX"))
+
+    def test_same_pane_duplicate_observation_merges_optional_name_and_identity(self):
+        rows = [self._inventory_row(sid=None, name=None), self._inventory_row()]
+        collapsed = peer_steward._prompt_collapse_rows([
+            peer_steward._prompt_inventory_fields(row) for row in rows])
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual((collapsed[0]["name"], collapsed[0]["session_id"]),
+                         ("child", "sid-child"))
+
+    def test_duplicate_name_and_tag_candidates_return_every_pane_without_selecting(self):
+        rows = [self._inventory_row(pane="w1:pA"), self._inventory_row(pane="w1:pB")]
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_process_session", return_value="sid-child"), \
+             mock.patch.object(peer_steward, "_prompt_fleet_tag", return_value=("3e", None)), \
+             mock.patch.object(peer_steward, "_retire_target") as current:
+            name_result = peer_steward._resolve_prompt_target("child")
+            tag_result = peer_steward._resolve_prompt_target("[3e]")
+        self.assertEqual(name_result[1:], ("target-name-ambiguous", ["w1:pA", "w1:pB"]))
+        self.assertEqual(tag_result[1:], ("fleet-tag-ambiguous", ["w1:pA", "w1:pB"]))
+        current.assert_not_called()
+
+    def test_missing_name_or_tag_and_failed_inventory_report_distinct_reasons(self):
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([], None)):
+            name_result = peer_steward._resolve_prompt_target("absent-peer")
+            tag_result = peer_steward._resolve_prompt_target("[ff]")
+        self.assertEqual(name_result[1:], ("target-name-not-found", []))
+        self.assertEqual(tag_result[1:], ("fleet-tag-not-found", []))
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(None, "herdr-agent-list-unavailable")):
+            unavailable = peer_steward._resolve_prompt_target("absent-peer")
+        self.assertEqual(unavailable[1:], ("herdr-agent-list-unavailable", []))
+
+    def test_tag_resolution_and_identity_observation_fail_closed(self):
+        rows = [self._inventory_row(pane="w1:pX"), self._inventory_row(
+            harness="codex", sid="thread-other", name="other", pane="w1:pY")]
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None), \
+             mock.patch.object(peer_steward, "_retire_target") as current:
+            result = peer_steward._resolve_prompt_target("[3e]")
+        self.assertEqual(result[1:], ("target-observation-unavailable", ["w1:pX", "w1:pY"]))
+        current.assert_not_called()
+
+        replacement = self._current_target(sid="sid-new")
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([self._inventory_row()], None)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=replacement), \
+             mock.patch.object(peer_steward, "_process_session", return_value="sid-new"):
+            result = peer_steward._resolve_prompt_target("child")
+        self.assertEqual(result[1:], ("target-identity-changed", ["w1:pX"]))
+
+    def test_ambiguous_prompt_returns_candidates_before_creating_or_sending(self):
+        rows = [self._inventory_row(pane="w1:pA"), self._inventory_row(pane="w1:pB")]
+        args = peer_steward.build_parser().parse_args(["prompt", "child", "do not guess"])
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("sid-steward", "claude")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="steward"), \
+             mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
+             mock.patch.object(peer_steward.peer_message, "prepare_peer_message") as prepare, \
+             mock.patch.object(peer_steward, "_herdr_prompt") as send, \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.cmd_prompt(args)
+        self.assertEqual(rc, 5)
+        self.assertIn('candidate_panes=["w1:pA","w1:pB"]', printed.call_args[0][0])
+        prepare.assert_not_called()
+        send.assert_not_called()
 
     def test_opencode_prompt_keeps_its_native_callback_path(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -3642,6 +3755,9 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
              mock.patch.object(peer_steward, "_resolve_target",
                                return_value=("claude", "sid-child", "child")), \
+             mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([self._inventory_row()], None)), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None), \
              mock.patch.object(peer_steward, "_agent_state",
                                return_value=(state, "w1:pX")), \
              mock.patch.object(peer_steward, "_retire_target",
@@ -3678,6 +3794,12 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
              mock.patch.object(peer_steward, "_resolve_target",
                                return_value=("codex", None, "fresh")), \
+             mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([self._inventory_row(
+                                   harness="codex", sid=None, name="fresh")], None)), \
+             mock.patch.object(peer_steward, "_retire_target",
+                               return_value=self._current_target(
+                                   harness="codex", sid=None, name="fresh")), \
              mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:pX")), \
              mock.patch.object(peer_steward, "_first_input_foreground_proof", return_value=proof), \
              mock.patch.object(peer_steward, "_sidless_idle_prompt_guard", guard), \
@@ -5392,6 +5514,12 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
         self.enterContext(mock.patch("builtins.print"))
 
     def run_herdr(self, argv, **kwargs):
+        if argv[:3] == ["herdr", "agent", "list"]:
+            return _herdr_json({"result": {"agents": [
+                {"agent": self.harness, "agent_status": "working", "name": "child",
+                 "pane_id": "w1:pX", "agent_session": {
+                     "agent": self.harness, "kind": "id", "value": self.sid}}
+            ]}})
         if argv[:3] == ["herdr", "agent", "get"]:
             return _herdr_json(_agent_json(self.harness, self.sid, "child", status="working"))
         return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
