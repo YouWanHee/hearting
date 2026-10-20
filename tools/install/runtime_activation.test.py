@@ -712,12 +712,15 @@ class LinkedReleaseBundleTest(unittest.TestCase):
             source, _ = self._build(release, home)
             bundle = source.parent
             real_stat = os.stat
+            target_stat_denials = []
             def denied(path, *args, **kwargs):
-                if Path(path) == source:
+                if Path(path) == source and kwargs.get("follow_symlinks", True):
+                    target_stat_denials.append(Path(path))
                     raise PermissionError("fixture stat denied")
                 return real_stat(path, *args, **kwargs)
             with mock.patch.object(activation.os, "stat", side_effect=denied):
                 self._build(self._release(root, "v2.1.0"), home)
+            self.assertTrue(target_stat_denials, "fixture must reach the followed source target")
             self.assertTrue(bundle.exists())
 
     def test_discarding_a_linked_bundle_never_removes_the_release(self):
