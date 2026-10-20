@@ -721,16 +721,22 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         import codex_permission_profile
         with mock.patch.object(codex_permission_profile, "named_profiles_available",
                                return_value=True):
-            profile = module.commit_profile_config(
-                str(self.repo), owner_args.writable_root, owner_args.sandbox,
-                owner_args.network_access,
+            profile = codex_permission_profile.owner_turn_profile_config(
+                str(self.repo), owner_args.writable_root,
+                owner_args.owner_runtime_base_sandbox,
             )
         self.assertIsNotNone(profile)
-        self.assertEqual(profile["default_permissions"], codex_permission_profile.PROFILE_NAME)
+        self.assertEqual(profile["default_permissions"],
+                         codex_permission_profile.OWNER_OBSERVE_PROFILE_NAME)
         self.assertTrue(profile["permissions"][codex_permission_profile.PROFILE_NAME]
                         ["network"]["enabled"])
         profile_filesystem = profile["permissions"][codex_permission_profile.PROFILE_NAME]["filesystem"]
-        self.assertEqual(profile_filesystem[str((primary_repo / ".git").resolve())], "read")
+        # A linked worktree may write the common Git dir so ref cleanup can take
+        # packed-refs.lock; shared config, hooks and primary metadata stay read-only.
+        primary_git = (primary_repo / ".git").resolve()
+        self.assertEqual(profile_filesystem[str(primary_git)], "write")
+        for name in ("config", "hooks", "HEAD", "index"):
+            self.assertEqual(profile_filesystem[str(primary_git / name)], "read")
         self.assertTrue(all(profile_filesystem[path] == "write"
                             for path in owner_args.writable_root))
 
@@ -738,6 +744,12 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
             runtime_env, attempt, named_profile=profile, approval="on-request")
         self.assertEqual(session[1].native_permission_profile, profile)
         self.assertEqual(session[5][2:], module.config_arguments(profile))
+        session[1].turn_permissions_supported = True
+        session[1].owner_turn_permission_profiles = {
+            "observation": codex_permission_profile.OWNER_OBSERVE_PROFILE_NAME,
+            "commit": codex_permission_profile.PROFILE_NAME,
+            "commit_no_network": codex_permission_profile.OWNER_COMMIT_NO_NETWORK_PROFILE_NAME,
+        }
 
         conflict = subprocess.run(
             ["git", "-C", str(self.repo), "merge", "--no-commit", "--no-ff",
@@ -775,20 +787,11 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         self.assertEqual([turn["threadId"] for turn in turns], [session[3], session[3]])
         for turn in turns:
             self.assertNotIn("approvalPolicy", turn)
-        self.assertEqual(turns[0]["sandboxPolicy"], {
-            "type": "readOnly", "networkAccess": False,
-        })
-        git_roots = [str(path) for path in commit_policy.commit_git_metadata_dirs(
-            argparse.Namespace(worker_type="owner", dispatch_depth=1,
-                               worktree=str(self.repo)))
-        ]
-        self.assertEqual(turns[1]["sandboxPolicy"], {
-            "type": "workspaceWrite",
-            "writableRoots": [str(self.repo), *git_roots],
-            "networkAccess": True,
-            "excludeTmpdirEnvVar": False,
-            "excludeSlashTmp": False,
-        })
+        self.assertEqual(turns[0]["permissions"],
+                         codex_permission_profile.OWNER_OBSERVE_PROFILE_NAME)
+        self.assertNotIn("sandboxPolicy", turns[0])
+        self.assertEqual(turns[1]["permissions"], codex_permission_profile.PROFILE_NAME)
+        self.assertNotIn("sandboxPolicy", turns[1])
         self.assertFalse(session[1].owner_runtime_permission_state["observation_only"])
 
 
