@@ -3655,6 +3655,200 @@ class SeatHandoverTest(TidyCase):
         path.with_suffix(".outcome.json").write_text("{}")
         self.assertIsNone(self.retire("sid-B", "codex", "sid-C", "opencode", pane="test:pane-c"))
 
+    # -- seat lineage: a node-less owner and the one answer for delivery and authority ------------------
+
+    def owner_row(self, aid, status="done", parent="sid-A", route="rt-1", digest="sha256:aa"):
+        """A depth-1 owner row: it carries no ``route_node`` key at all."""
+        meta = {"attempt_id": aid, "parent_sid": parent, "parent_harness": "claude", "dispatch_depth": "1",
+                "worker_type": "owner", "route_id": route, "route_hash": digest,
+                "route_file": self.open_route(route, digest)}
+        self.rows.append(f"2026-10-01T00:00:00Z\t{status}\t/w\t/w\tslug\t" + ",".join(f"{k}={v}" for k, v in meta.items()))
+        self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
+        return meta
+
+    def frame_row(self, aid="att-frame"):
+        return self.row(aid, status="open", route="rt-2", node="frame", worker="frame", digest="sha256:bb")
+
+    def chain(self, owner_status="done"):
+        """A snapshot -> B -> B snapshot -> C by two same-seat clears; returns (owner, frame)."""
+        owner = self.owner_row("att-owner", status=owner_status)
+        frame = self.frame_row()
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.snapshot(sid="sid-B", now=st.now_epoch() - 5)
+        self.start("sid-C")
+        return owner, frame
+
+    def ledger_rows(self, pane=PANE):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            return self.handover.handover_rows(self.seat(pane))
+
+    def append_row(self, pane, row):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            path = st._ledger_path(self.seat(pane))
+            st.ensure_dir(path.parent)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "handover", **row}) + "\n")
+
+    def write_snapshot(self, pane, sid, bindings):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            seat = self.seat(pane)
+            st.atomic_write_json(self.handover._snapshot_path(seat.key), {
+                "schema": 1, "seat": seat.as_dict(), "from": {"harness": "claude", "sid": sid},
+                "at": st.now_epoch(), "bindings": bindings})
+
+    def binding(self, meta):
+        return self.handover.binding_of(self.jobs, meta)
+
+    def owns(self, meta, sid):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            return self.handover.owns(meta, sid, self.jobs)
+
+    def keys(self, bindings):
+        return {(b["route"], b["hash"], b["node"]) for b in bindings}
+
+    def test_a_finished_node_less_owner_is_carried_through_the_second_clear(self):
+        owner, frame = self.chain()
+        rows = self.ledger_rows()
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B"), ("sid-B", "sid-C")])
+        owner_key = ("rt-1", "sha256:aa", "")
+        self.assertIn(owner_key, self.keys(rows[0]["bindings"]))
+        self.assertIn(owner_key, self.keys(rows[1]["bindings"]))
+        with self.iso.patched_environ():
+            self.assertIn(owner_key, self.keys(self.handover.read_snapshot(self.seat().key)["bindings"]))
+        self.assertEqual(self.effective(owner), "sid-C")
+        self.assertEqual(self.effective(frame), "sid-C")
+
+    def test_the_second_successor_may_replace_the_finished_owner(self):
+        import route_authority
+        owner, _frame = self.chain()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(
+                self.jobs, {}, owner, current_session=lambda: "sid-C")
+            choice = route_authority.decide_continuation(
+                action="handover", status="done", metadata=owner, jobs=self.jobs,
+                facts={"actor": "sid-C", "eligible": True})
+        self.assertTrue(choice.allowed, choice)
+
+    def test_the_second_successor_resumes_an_owner_whose_route_keys_are_owner_prefixed(self):
+        import route_authority
+        owner, _frame = self.chain()
+        reported = {("owner_" + k if k in ("route_id", "route_hash", "route_file") else k): v
+                    for k, v in owner.items()}
+        self.assertEqual(self.effective(reported), "sid-C")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(
+                self.jobs, {}, reported, current_session=lambda: "sid-C")
+
+    def test_an_already_broken_chain_still_reaches_its_end(self):
+        owner = self.owner_row("att-owner")
+        frame = self.frame_row()
+        both = [self.binding(owner), self.binding(frame)]
+        self.append_row(PANE, {"ts": 1, "from": "sid-A", "sid": "sid-B", "harness": "claude",
+                               "source": "clear", "bindings": both})
+        self.append_row(PANE, {"ts": 2, "from": "sid-B", "sid": "sid-C", "harness": "claude",
+                               "source": "clear", "bindings": [self.binding(frame)]})
+        self.write_snapshot(PANE, "sid-B", [self.binding(frame)])
+        self.assertEqual(self.effective(owner), "sid-C")
+        self.assertTrue(self.owns(owner, "sid-C"))
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            recipients = dict(self.handover.storage_recipients("sid-C"))
+        self.assertIn("att-owner", recipients["sid-A"])
+
+    def test_only_the_chain_end_answers_and_a_closed_route_settles(self):
+        owner, _frame = self.chain()
+        self.assertTrue(self.owns(owner, "sid-C"))
+        self.assertFalse(self.owns(owner, "sid-A"))                    # the registered parent handed it on
+        self.assertFalse(self.owns(owner, "sid-B"))                    # B handed it on
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            owed = {aid for _key, attempts in self.handover.storage_recipients("sid-B") if attempts
+                    for aid in attempts}
+            before = {b["attempt"] for b in self.handover.current_bindings("claude", "sid-C", self.jobs)}
+            Path(owner["route_file"]).with_suffix(".outcome.json").write_text("{}")
+            after = {b["attempt"] for b in self.handover.current_bindings("claude", "sid-C", self.jobs)}
+        self.assertNotIn("att-owner", owed)
+        self.assertEqual(before, {"att-owner", "att-frame"})
+        self.assertEqual(after, {"att-frame"})                         # the settled owner drops, the open frame stays
+
+    def test_a_later_retire_wins_over_the_same_seat_chain(self):
+        owner = self.owner_row("att-owner", status="running")
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.assertIsNotNone(self.retire("sid-B", "claude", "sid-E", "codex"))
+        self.assertEqual(self.effective(owner), "sid-E")
+        self.append_row(PANE, {"ts": st.now_epoch() + 5, "from": "sid-B", "sid": "sid-C", "harness": "claude",
+                               "source": "clear", "bindings": []})
+        self.assertEqual(self.effective(owner), "sid-E")
+        self.assertFalse(self.owns(owner, "sid-C"))
+
+    def test_a_retire_row_that_does_not_bind_the_job_leaves_it_with_its_predecessor(self):
+        owner = self.owner_row("att-owner", status="running")
+        frame = self.frame_row()
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.append_row(PANE_BESIDE, {"ts": st.now_epoch() + 5, "from": "sid-B", "sid": "sid-E",
+                                      "harness": "codex", "source": "retire",
+                                      "bindings": [self.binding(frame)]})
+        self.write_snapshot(PANE_BESIDE, "sid-E", [self.binding(frame)])     # what a real retire leaves at the seat
+        self.assertEqual(self.effective(frame), "sid-E")
+        self.assertEqual(self.effective(owner), "sid-B")
+
+    def killed_or_cancelled_owner_is_handed_over(self, status):
+        import route_authority
+        owner = self.owner_row("att-owner", status=status, route=f"rt-{status}")
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 5), 1)
+        self.start("sid-B")
+        self.assertEqual(self.effective(owner), "sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            route_authority.require_replacement_parent(self.jobs, {}, owner, current_session=lambda: "sid-B")
+        Path(owner["route_file"]).with_suffix(".outcome.json").write_text("{}")
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 4), 0)     # a closed route settles
+
+    def test_a_killed_owner_with_an_open_route_is_handed_over(self):
+        self.killed_or_cancelled_owner_is_handed_over("killed")
+
+    def test_a_cancelled_owner_with_an_open_route_is_handed_over(self):
+        self.killed_or_cancelled_owner_is_handed_over("cancelled")
+
+    def test_lineage_reads_each_seat_ledger_once_per_read_context(self):
+        from peer_read_context import PeerReadContext
+        metas = [self.owner_row(f"att-owner-{n}", status="running", route=f"rt-{n}", digest=f"sha256:{n}{n}")
+                 for n in range(3)]
+        self.write_snapshot(PANE, "sid-A", [self.binding(metas[0])])
+        self.write_snapshot(PANE_BESIDE, "sid-A", [self.binding(metas[1])])
+        reads = mock.patch.object(st, "_read_ledger_lines", wraps=st._read_ledger_lines)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), reads as counted:
+            context = PeerReadContext()
+            for meta in metas:
+                self.handover.effective_parent(meta, self.jobs, read_context=context)
+            self.assertEqual(counted.call_count, 2)                    # one read per seat, not per attempt
+            counted.reset_mock()
+            self.handover.current_bindings("claude", "sid-A", self.jobs)
+            self.assertLessEqual(counted.call_count, 2)                # a context of its own reads each once
+
+    def test_ownership_checks_never_resolve_a_project_key(self):
+        owner, _frame = self.chain(owner_status="running")
+        keys = mock.patch.object(st, "project_key_for", wraps=st.project_key_for)
+        with self.iso.patched_environ({"CLAUDE_CODE_SESSION_ID": "sid-C"}), keys as computed:
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-B", self.jobs))
+            self.assertFalse(self.handover.owns(owner, "sid-X", self.jobs))
+            self.handover.storage_recipients("sid-C")
+        computed.assert_not_called()                                   # no git calls, no project-keys.json
+
+    def test_ownership_resolves_only_the_callers_own_seat_once(self):
+        owner, frame = self.chain(owner_status="running")
+        seats = mock.patch.object(self.handover, "pane_seat", wraps=self.handover.pane_seat)
+        env = {"HERDR_PANE_ID": PANE, "CLAUDE_CODE_SESSION_ID": "sid-C"}
+        with mock.patch.dict(self.handover._OWN_SEATS, clear=True), \
+                self.iso.patched_environ(env), seats as resolved:
+            for _ in range(5):
+                for meta in (owner, frame):
+                    for sid in ("sid-B", "sid-C", "sid-X"):
+                        self.handover.owns(meta, sid, self.jobs)
+            self.assertTrue(self.handover.owns(owner, "sid-C", self.jobs))
+        self.assertEqual([call.args[2] for call in resolved.call_args_list], ["sid-C"])
+
     def test_a_broken_state_answers_the_registered_parent(self):
         meta = self.row("att-1")
         with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):

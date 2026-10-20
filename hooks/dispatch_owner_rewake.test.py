@@ -3542,6 +3542,35 @@ class GateCloseRearmTest(GateCarrierTest):
         self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace("att-gate-owner", "att-other-done"), encoding="utf-8")
         self.assertIsNone(rewake.registry_launch(self.call()))
 
+    def test_the_chain_end_rearms_what_the_cleared_arming_session_left_after_two_clears(self):
+        # Registered parent A (`session-gate`) -> B -> C by same-seat /clear. B armed the wake and spent it on
+        # a gate record stored under A's key (the owner row's recipient key); B no longer answers for the owner.
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-B", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        self.assertTrue(rewake.settle_arm(claim, "gate-wake-sent", gate_delivery_id=delivery_id))
+        path = rewake.arm_path(self.jobs, "att-gate-owner")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(holder=DEAD_HOLDER, arms=2)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        resolver = lambda meta, jobs=None, **kw: "session-C" if meta.get("parent_sid") == "session-gate" else meta.get("parent_sid")
+        lineage = (mock.patch.object(rewake.seat_handover, "effective_parent", side_effect=resolver),
+                   mock.patch.object(rewake.seat_handover, "owns",
+                                     side_effect=lambda meta, session, jobs=None, **kw:
+                                     meta.get("parent_sid") == session or resolver(meta, jobs) == session))
+        with lineage[0], lineage[1]:
+            existing = rewake._read_arm(path)
+            # Safety unchanged: while the gate record under A's key is open, nobody re-arms.
+            self.assertEqual(rewake._reclaim_refusal(existing, self.jobs, "session-C"), "gate-open")
+            rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+            self.assertIsNone(rewake._reclaim_refusal(existing, self.jobs, "session-C"))
+            self.assertEqual(rewake._reclaim_refusal(existing, self.jobs, "session-B"), "foreign-session")
+            self.assertEqual([a for a, _age in rewake._session_owner_rows(self.jobs, "session-C")], ["att-gate-owner"])
+            self.assertEqual(rewake._session_owner_rows(self.jobs, "session-B"), [])
+            taken = rewake.claim_arm(self.jobs, "att-gate-owner", "session-C", fresh=False)
+            self.assertIsInstance(taken, rewake.ArmClaim)
+            self.assertEqual((taken.session_id, taken.arms), ("session-C", 3))
+
     def test_a_missing_or_unnamed_gate_record_counts_as_open(self):
         # Review R1 B2: only a record that was read and is closed re-arms; an
         # unnamed or *missing* record is no closing evidence. The holder is

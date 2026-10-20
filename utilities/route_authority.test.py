@@ -56,8 +56,7 @@ class Case1ParentSessionTest(unittest.TestCase):
             jobs = Path(td) / "jobs.log"
             handover = {"from": "codex-sid", "sid": successor_sid, "harness": successor_harness,
                         "bindings": [HANDOVER.binding_of(jobs, self.OWNER)], "ts": 1}
-            with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
-                 mock.patch.object(HANDOVER, "handover_rows", return_value=[handover]):
+            with mock.patch.object(HANDOVER, "_lineage_seats", return_value={"seat": [handover]}):
                 return RA.owns(self.OWNER, successor_sid, jobs)
 
     def test_the_registered_session_owns_its_route(self):
@@ -84,8 +83,7 @@ class Case1ParentSessionTest(unittest.TestCase):
             {"from": "claude-sid", "sid": "opencode-sid", "harness": "opencode",
              "bindings": [binding], "ts": 2},
         ]
-        with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
-             mock.patch.object(HANDOVER, "handover_rows", return_value=rows):
+        with mock.patch.object(HANDOVER, "_lineage_seats", return_value={"seat": rows}):
             self.assertFalse(RA.owns(self.OWNER, "codex-sid", jobs))
             self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
             self.assertTrue(RA.owns(self.OWNER, "opencode-sid", jobs))
@@ -129,7 +127,7 @@ class Case1ParentSessionTest(unittest.TestCase):
 
     def test_unreadable_handover_keeps_registered_parent_safe_default(self):
         jobs = Path("/tmp/registered-parent-unreadable-jobs")
-        with mock.patch.object(HANDOVER, "_seats_for_binding", side_effect=OSError("unreadable")):
+        with mock.patch.object(HANDOVER, "_lineage_seats", side_effect=OSError("unreadable")):
             self.assertTrue(RA.owns(self.OWNER, "codex-sid", jobs))
             self.assertFalse(RA.owns(self.OWNER, "claude-sid", jobs))
 

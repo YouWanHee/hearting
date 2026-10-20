@@ -184,7 +184,7 @@ class _RegistrySegment:
             route = metadata.get("owner_route_id") or metadata.get("route_id") or ""
             digest = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
             node = metadata.get("route_node") or ""
-            if route and digest and node:
+            if route and digest:     # an owner row has no route node: it binds as (route, hash, "")
                 self.handover_by_binding.setdefault((route, digest, node), {})[attempt] = (status, record)
             if (metadata.get("dispatch_depth") == "1" and metadata.get("worker_type") == "owner"
                     and metadata.get("harness") == "opencode"

@@ -6,7 +6,10 @@ person's choices when the tool call ends; each harness's post-tool hook passes t
 here (`--claude`, `--codex`, `--opencode`). When one of this session's routes has its
 frame-review gate waiting on a registered question that the reply answers, the reply is kept
 beside the question (`work_start.record_native_answer`) and the next `start` takes it, so the
-caller does not copy the answer into a file. Anything else is left alone; this never blocks.
+caller does not copy the answer into a file. The replies of one interview may span several
+calls (a tool shows only a few questions at once): the rows so far wait in a partial file
+beside the question until every registered question has an answer. Anything else is left
+alone; this never blocks.
 """
 from __future__ import annotations
 
@@ -121,11 +124,20 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001 -- a reply that cannot be kept is answered by hand as before
         return 0
     if kept is not None and harness in ("claude", "codex"):
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": (f"The person's answer to the registered frame question is kept at {kept}. "
-                                  "Run resume_command (or a bare `capability-route start`) to continue; "
-                                  "no answers file is needed.")}}))
+        import frame_interview as FI
+        if kept.name == FI.NATIVE_PARTIAL_NAME:
+            try:
+                remaining = len(json.loads(kept.read_text(encoding="utf-8"))["missing"])
+            except (OSError, ValueError, KeyError, TypeError):
+                return 0
+            context = (f"The person's answers so far are kept beside the registered frame question; {remaining} "
+                       "registered question(s) remain. Ask them verbatim in the next native question call; "
+                       "the runtime combines the calls.")
+        else:
+            context = (f"The person's answer to the registered frame question is kept at {kept}. "
+                       "Run resume_command (or a bare `capability-route start`) to continue; "
+                       "no answers file is needed.")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
     return 0
 
 
