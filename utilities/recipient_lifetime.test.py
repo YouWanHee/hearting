@@ -19,7 +19,7 @@ class RecipientLifetimeTest(unittest.TestCase):
         (proc / "ns").mkdir(parents=True)
         (proc / "stat").write_text(f"{number} (claude) S " + " ".join(["0"] * 18 + [str(number)]))
         (proc / "cmdline").write_bytes(b"\0".join(x.encode() for x in argv) + b"\0")
-        os.symlink("/ns/pid-host", proc / "ns" / "pid")
+        os.symlink("pid:[4026531836]", proc / "ns" / "pid")
         os.symlink(exe, proc / "exe")
         if home is None:
             home = root.parent / f"home-{number}" / ".claude"
@@ -29,7 +29,20 @@ class RecipientLifetimeTest(unittest.TestCase):
 
     def _fake_proc_root(self, root):
         (root / "self" / "ns").mkdir(parents=True)
-        os.symlink("/ns/pid-host", root / "self" / "ns" / "pid")
+        os.symlink("pid:[4026531836]", root / "self" / "ns" / "pid")
+
+    def test_fake_proc_non_initial_observer_namespace_is_incomplete_without_processes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            (root / "self" / "ns" / "pid").unlink()
+            os.symlink("pid:[4026532999]", root / "self" / "ns" / "pid")
+
+            complete, holders, reasons = claude_session_census(proc_root=root)
+
+            self.assertFalse(complete)
+            self.assertEqual(holders, set())
+            self.assertEqual(reasons, {"observer-not-in-initial-pid-namespace"})
 
     def test_exact_positive_evidence_and_successor_precedence(self):
         self.assertEqual(recipient_state(
@@ -69,8 +82,8 @@ class RecipientLifetimeTest(unittest.TestCase):
             (root / "self" / "ns").mkdir(parents=True)
             (home / "sessions").mkdir(parents=True)
             (home / ".statusline").mkdir(parents=True)
-            os.symlink("/ns/pid-host", root / "self" / "ns" / "pid")
-            os.symlink("/ns/pid-host", process / "ns" / "pid")
+            os.symlink("pid:[4026531836]", root / "self" / "ns" / "pid")
+            os.symlink("pid:[4026531836]", process / "ns" / "pid")
             os.symlink("/usr/bin/claude", process / "exe")
             (process / "stat").write_text("123 (claude) S " + " ".join(["0"] * 18 + ["42"]))
             (process / "cmdline").write_bytes(b"claude\0")
@@ -100,8 +113,8 @@ class RecipientLifetimeTest(unittest.TestCase):
             (root / "self" / "ns").mkdir(parents=True)
             (home / "sessions").mkdir(parents=True)
             (home / ".statusline").mkdir(parents=True)
-            os.symlink("/ns/pid-host", root / "self" / "ns" / "pid")
-            os.symlink("/ns/pid-host", process / "ns" / "pid")
+            os.symlink("pid:[4026531836]", root / "self" / "ns" / "pid")
+            os.symlink("pid:[4026531836]", process / "ns" / "pid")
             os.symlink("/usr/bin/claude", process / "exe")
             (process / "stat").write_text("123 (claude) S " + " ".join(["0"] * 18 + ["42"]))
             (process / "cmdline").write_bytes(b"claude\0--resume\0wanted-sid\0")

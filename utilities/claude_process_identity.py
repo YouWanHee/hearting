@@ -65,6 +65,7 @@ def _proc_start(stat_text: str) -> str:
 
 
 _EMBEDDED_HELPERS = {"rg", "ugrep"}
+_INITIAL_PID_NAMESPACE = "pid:[4026531836]"
 
 
 def _native_claude_executable(executable: str) -> bool:
@@ -267,6 +268,8 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
     holders = set()
     try:
         host_namespace = os.readlink(root / "self" / "ns" / "pid")
+        if host_namespace != _INITIAL_PID_NAMESPACE:
+            return False, holders, {"observer-not-in-initial-pid-namespace"}
         pids = sorted(item.name for item in root.iterdir() if item.name.isdecimal())
     except OSError:
         return False, holders, {"proc-inventory-unavailable"}
