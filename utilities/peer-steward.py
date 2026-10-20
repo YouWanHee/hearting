@@ -6090,6 +6090,16 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
                 pass
 
 
+def _runner_lock_current(store, lock_fd):
+    """The lock this runner holds is still the state root's runner lock file."""
+    try:
+        held = os.fstat(lock_fd)
+        current = os.stat(store.root / peer_obligations.RUNNER_LOCK_NAME)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+
 def cmd_obligation_runner(args):
     """Existing peer steward, scoped to accepted duties and stopped when they settle."""
     store = peer_obligations.ObligationStore(args.state_root)
@@ -6105,6 +6115,10 @@ def cmd_obligation_runner(args):
     previous_signature = None
     settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     while True:
+        if not _runner_lock_current(store, args.lock_fd):
+            # Its state root was removed or replaced (e.g. a finished test's
+            # temporary home): no producer can reach this runner any more.
+            return 0
         store.begin_read_pass()
         duties = store.list()
         from peer_read_context import PeerReadContext
