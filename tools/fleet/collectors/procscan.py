@@ -631,6 +631,99 @@ def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
     return result
 
 
+def exec_children(pid, tree=None, kids=None, min_age=0,
+                  max_depth=_EXEC_MAX_DEPTH, expected_start=None, attempt_id=None,
+                  limit=64):
+    """Enumerate bounded, independently identity-checked work branches.
+
+    This additive observer shares F-47's helper filtering and transparent
+    wrapper descent. Unlike ``exec_child`` it does not choose one longest
+    sibling. ``expected_start`` pins the root generation; every parent edge is
+    rechecked before a result is returned. Attempt tags are an additional
+    filter only when an exact attempt was supplied.
+    """
+    if tree is None:
+        tree = proc_tree()
+    if kids is None:
+        kids = children_index(tree)
+    root_identity = _exec_identity(pid) if expected_start is not None else None
+    if expected_start is not None and (
+            root_identity is None or root_identity[1] != str(expected_start)):
+        return []
+    root_entry = tree.get(pid)
+    max_age = None
+    if root_entry is not None and root_entry[1] > EXEC_BOOT_GRACE_SEC:
+        max_age = root_entry[1] - EXEC_BOOT_GRACE_SEC
+
+    def eligible(child, age_floor=0, cohort_max=None):
+        entry = tree.get(child)
+        if entry is None:
+            return None
+        _ppid, age, comm = entry
+        if age < age_floor or (cohort_max is not None and age > cohort_max):
+            return None
+        if _exec_is_helper(child, comm):
+            return None
+        if attempt_id is not None and (
+                (read_environ(child).get("AGENT_DISPATCH_ATTEMPT_ID") or None) != attempt_id):
+            return None
+        return child, age, comm
+
+    results, seen = [], set()
+    direct = [item for child in kids.get(pid, ())
+              if (item := eligible(child, min_age, max_age)) is not None]
+    direct.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+    for call_pid, call_age, call_comm in direct:
+        stack = [(call_pid, call_age, call_comm, [pid, call_pid])]
+        while stack and len(results) < max(1, min(int(limit), 128)):
+            cur_pid, cur_age, cur_comm, path = stack.pop()
+            if len(path) > max_depth + 2 or len(set(path)) != len(path):
+                continue
+            transparent = _exec_is_wrapper(cur_pid, cur_comm) or cur_comm in EXEC_WAIT_COMMS
+            descendants = []
+            if transparent:
+                for child in kids.get(cur_pid, ()):
+                    item = eligible(child)
+                    if item is not None:
+                        descendants.append(item)
+                descendants.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+            if descendants:
+                for child, age, comm in reversed(descendants):
+                    stack.append((child, age, comm, path + [child]))
+                continue
+            if transparent and cur_comm not in _EXEC_WRAPPER_COMMS and cur_comm not in EXEC_WAIT_COMMS:
+                continue
+            if cur_pid in seen:
+                continue
+            kind = "wait" if transparent else "work"
+            identities = {}
+            if expected_start is not None:
+                valid = True
+                for node in path:
+                    identity = _exec_identity(node)
+                    if identity is None or (node != pid and identity[0] != path[path.index(node) - 1]):
+                        valid = False
+                        break
+                    identities[node] = identity
+                if not valid:
+                    continue
+                if any(_exec_identity(node) != identities[node] for node in path):
+                    continue
+            evidence = {"pid": cur_pid, "comm": cur_comm,
+                        "etime_s": call_age, "leaf_etime_s": cur_age,
+                        "kind": kind, "child_pid": call_pid}
+            if expected_start is not None:
+                evidence.update(ownership_verified=True, root_pid=pid,
+                               root_start=str(expected_start),
+                               proc_start=identities[cur_pid][1],
+                               attempt_id=attempt_id,
+                               ancestry=[{"pid": node, "ppid": identities[node][0],
+                                          "start": identities[node][1]} for node in path])
+            results.append(evidence)
+            seen.add(cur_pid)
+    return results
+
+
 def _pid_ttys():
     """{pid: 'pts/N'} controlling tty per process (separate cheap ps so the main _ps_lines
     contract, shared with the dispatch scan, stays untouched). '?' (no tty) is kept as-is."""
@@ -860,6 +953,10 @@ def scan(harness_filter=None):
                                    attempt_id=env.get("AGENT_DISPATCH_ATTEMPT_ID") or None)
                         if proc_start is not None else None),
         )
+        # Shared process snapshot for targeted output-writer correlation. These
+        # private references are excluded from public dataclass serialization.
+        sess._proc_tree = tree
+        sess._proc_kids = kids
         sess._tty = pid_tty.get(pid)
         sess._invocation_mode = invocation_mode(comm, _read_argv(pid))
         sessions.append(sess)

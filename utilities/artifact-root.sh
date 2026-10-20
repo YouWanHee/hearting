@@ -75,7 +75,14 @@ if command -v git >/dev/null 2>&1 \
   # The ordinary common directory names the primary checkout directly.
   # Enumerating every linked checkout can wait on unrelated NAS paths long
   # enough to exhaust session-tidy's path-resolution timeout.
-  common=$(git -C "$start" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+  # git < 2.31 has no --path-format and would echo the option as an extra line,
+  # so ask plainly and make a relative answer absolute against "$start".
+  common=$(git -C "$start" rev-parse --git-common-dir 2>/dev/null) || common=""
+  case "$common" in
+    /*) ;;
+    "") ;;
+    *) common=$start/$common ;;
+  esac
   primary=""
   case "$common" in
     */.git)

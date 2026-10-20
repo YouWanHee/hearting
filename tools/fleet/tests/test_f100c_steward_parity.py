@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -428,6 +429,92 @@ class StewardCollectorTest(unittest.TestCase):
         self.assertEqual([target["session_id"] for target in parent.steward_targets], ["local"])
         self.assertEqual(local.steward_parents[0]["session_id"], "self")
         self.assertIsNone(foreign.steward_parents)
+
+    def test_many_session_refresh_reads_relation_ledger_once_and_keeps_exact_lineage(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "utilities"))
+        import dispatch_seat_handover as handover
+        import session_tidy
+
+        with tempfile.TemporaryDirectory(prefix="fleet-steward-refresh-") as tmp:
+            base = Path(tmp)
+            peer_root = base / "peer"
+            marker_path = peer_root / "peer-steward" / "codex" / "old-steward.json"
+            marker_path.parent.mkdir(parents=True)
+            marker = {
+                "schema_version": 1, "harness": "codex", "session_id": "old-steward",
+                "generation": "generation-current", "seat_key": "fixture-seat",
+                "targets": {"target": {"harness": "claude", "session_id": "target",
+                    "name": "target", "kind": "watch", "source": "watch", "ts": "1"}},
+            }
+            marker_path.write_text(json.dumps(marker), encoding="utf-8")
+            target = marker["targets"]["target"]
+            current_relation = {
+                "generation": "generation-current",
+                "origin": {"harness": "codex", "sid": "old-steward"},
+                "holder": {"harness": "codex", "sid": "successor"},
+                "targets": [target], "lineage": [{"from": "old-steward", "to": "successor"}],
+                "seat_key": "fixture-seat", "released": False,
+            }
+            foreign_relation = {
+                "generation": "generation-foreign",
+                "origin": {"harness": "opencode", "sid": "foreign-steward"},
+                "holder": {"harness": "opencode", "sid": "foreign-steward"},
+                "targets": [{"harness": "claude", "session_id": "foreign-target",
+                             "name": "foreign-target", "kind": "watch", "source": "watch"}],
+                "lineage": [], "seat_key": "fixture-seat", "released": False,
+            }
+            ledger = base / "xdg-state" / "hearting" / "session-tidy" / "sessions" / "fixture-seat.jsonl"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(json.dumps({"event": "handover", "sid": "successor",
+                "from": "old-steward", "seat_key": "fixture-seat",
+                "steward": {"schema": 1,
+                            "roles": [current_relation, foreign_relation], "watches": []}}) + "\n",
+                encoding="utf-8")
+
+            successor = Session(harness="codex", pid=1, session_id="successor", cwd="/x")
+            target_session = Session(harness="claude", pid=2, session_id="target", cwd="/x")
+            foreign_parent = Session(harness="opencode", pid=3,
+                                     session_id="foreign-steward", cwd="/foreign")
+            foreign_target = Session(harness="claude", pid=4,
+                                     session_id="foreign-target", cwd="/x")
+            fillers = [Session(harness="codex", pid=10 + index,
+                               session_id=f"unrelated-{index}", cwd="/x")
+                       for index in range(48)]
+            sessions = [successor, target_session, foreign_parent, foreign_target, *fillers]
+
+            pm = handover._peer_message()
+            environ = {"AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                       "XDG_STATE_HOME": str(base / "xdg-state"),
+                       "AGENT_DISPATCH_JOBS": str(base / "dispatch" / "jobs.log"),
+                       "HOME": str(base / "home"), "PYTHONDONTWRITEBYTECODE": "1"}
+            with mock.patch.dict(os.environ, environ), \
+                 mock.patch.object(handover, "_peer_message", return_value=pm), \
+                 mock.patch.object(pm, "steward_marker_roots",
+                                   return_value=([peer_root], "test-fixture")), \
+                 mock.patch.object(handover, "resolved_steward_relations",
+                                   wraps=handover.resolved_steward_relations) as resolver, \
+                 mock.patch.object(session_tidy, "_read_ledger_lines",
+                                   wraps=session_tidy._read_ledger_lines) as ledger_reads:
+                markers = pm.read_steward_markers([peer_root])
+                steward.enrich(sessions, markers=markers)
+                self.assertEqual(resolver.call_count, 1)
+                self.assertEqual(ledger_reads.call_count, 1)
+                self.assertTrue(successor.steward)
+                self.assertEqual([entry["session_id"] for entry in successor.steward_targets],
+                                 ["target"])
+                self.assertEqual(target_session.steward_parents[0]["session_id"], "successor")
+                self.assertFalse(foreign_parent.steward)
+                self.assertIsNone(foreign_target.steward_parents)
+                self.assertTrue(all(not row.steward for row in fillers))
+
+                # Standalone helpers keep their documented fresh-read behavior.
+                self.assertEqual([entry["session_id"] for entry in steward.role_targets(
+                    "codex", "successor", markers=markers, cwd="/x", sessions=sessions)],
+                    ["target"])
+                self.assertEqual((resolver.call_count, ledger_reads.call_count), (2, 2))
+                self.assertTrue(steward.role_flag("codex", "successor", markers=markers,
+                                                  _targets=[target]))
+                self.assertEqual((resolver.call_count, ledger_reads.call_count), (3, 3))
 
     def test_join_is_exact_on_harness_and_session_id(self):
         sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x"),

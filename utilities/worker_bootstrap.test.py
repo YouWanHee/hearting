@@ -126,6 +126,17 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertNotIn("# Worker Type: Owner", rendered)
         self.assertNotIn("# Worker Type: Review", rendered)
 
+    def test_recurring_terminal_contract_is_the_kernel_section_only(self):
+        contract = W.worker_terminal_contract(ROOT)
+        self.assertIn(contract, W.render_worker_bootstrap(ROOT, "stage"))
+        self.assertIn(W.handoff_template(), contract)
+        self.assertIn("runtime_wait: registered-children", contract)
+        self.assertIn("assigned completion", contract)
+        self.assertIn("no judgment was reached", contract)
+        self.assertNotIn("Portable Worker Kernel", contract)
+        self.assertNotIn("memory lifecycle", contract)
+        self.assertNotIn("worker-terminal-contract:", W.render_worker_bootstrap(ROOT, "stage"))
+
     def test_task_publication_scope_stays_with_the_approved_owner(self):
         owner = W.render_worker_bootstrap(ROOT, "owner")
         self.assertIn("When the sealed entry scope is `complete`", owner)

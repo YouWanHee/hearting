@@ -262,6 +262,19 @@ def _adopt_child_titles(sessions, jobs):
             job.summary_ts = getattr(source, 'summary_ts', None)
         if getattr(job, 'subagents', None) is None:
             job.subagents = getattr(source, 'subagents', None)
+        source_attempt = getattr(source, "attempt_id", None)
+        job_attempt = getattr(job, "attempt_id", None)
+        source_sid = getattr(source, "session_id", None)
+        runtime_sid = getattr(job, "_runtime_session_id", None)
+        if (source_sid and (runtime_sid is None or runtime_sid == source_sid)
+                and source_attempt == job_attempt):
+            from . import shell_jobs
+            job.shell_jobs = shell_jobs.merge_jobs(
+                getattr(job, "shell_jobs", None), getattr(source, "shell_jobs", None))
+            current_observation = getattr(job, "shell_job_observation", None)
+            if (not isinstance(current_observation, dict)
+                    or current_observation.get("state") == "unavailable"):
+                job.shell_job_observation = getattr(source, "shell_job_observation", None)
         if not getattr(job, '_dispatch_context_owned', False):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
@@ -337,7 +350,7 @@ def apply_peer_rows(sessions, by_key):
             )[:8]
 
 
-def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
     """Return (sessions, jobs).
 
     harness_filter: optional iterable of harness names (fleet + dispatch both honor it).
@@ -380,6 +393,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
     for s in sessions:
+        s._fast_first = bool(fast_first)
         fn = enrichers.get(s.harness)
         if s.harness == "claude":
             continue  # resolve once after the existing foreground pane observation
@@ -797,6 +811,21 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         if len(_JOB_OBSERVATIONS) > 16:
             _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
     return snapshot
+
+
+def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+    """Run one Fleet observation with shared artifact, admission and registry inputs."""
+    from contextlib import ExitStack
+    from . import dispatch
+    import artifact_producer
+    import dispatch_registry_cache
+    with ExitStack() as stack:
+        if dispatch.artifact_reader is not None:
+            stack.enter_context(dispatch.artifact_reader.read_scope(
+                dispatch._ARTIFACT_READ_CACHE))
+        stack.enter_context(artifact_producer.artifact_index_observation_scope())
+        stack.enter_context(dispatch_registry_cache.registry_read_scope())
+        return _collect_all(harness_filter, jobs_path, usage, fast_first)
 
 
 collect_all.last_resource_jobs = []

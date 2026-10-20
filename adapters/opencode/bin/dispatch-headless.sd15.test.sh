@@ -60,7 +60,7 @@ echo "$u" | grep -q SCAN_OK && ok "scan_death patterns (opencode provider-rate-l
 
 command -v git >/dev/null || { echo "(git 없음 — skip launch cases)"; exit $fails; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"
+AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"; export AGENT_DISPATCH_JOBS="$AH/.dispatch/jobs.log"
 
 drive=$(python3 - "$WRAP" "$AH" <<'PY'
 import importlib.util, subprocess, sys

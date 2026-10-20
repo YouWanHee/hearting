@@ -357,11 +357,11 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     Exception on record: 2026-10-12 the approved per-repository mouse fold adds
     the open-repository arrow to each heading. Only those three heading prefixes
     change in these four goldens; absent connection rows remain absent.
-    Exception on record: 2026-10-19 provider status without an account observation now
-    reads `provider availability unknown`, avoiding the unsupported inference that an
-    OpenCode Go API key is missing. At each captured width only the OpenCode usage row
-    changes from `no usage api — opencode-go key not found` to that exact status (the
-    width-60 capture contains its previously clipped text); all other bytes are kept."""
+    Exception on record: 2026-10-19 provider status without an account observation
+    reads `provider availability unknown`. The approved 2026-10-20 OpenCode header
+    cleanup now limits the default row to Go quota bars or `Go usage unavailable`;
+    provider/credential diagnostics remain in JSON. At each captured width only the
+    OpenCode usage row changes; all other bytes are kept."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

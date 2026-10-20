@@ -664,8 +664,8 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") in {"handover", "tidy-claim", "real-prompt"}:
-            # Relations and prompt provenance are not session activity timestamps.
+        if item.get("event") in {"handover", "steward-release", "tidy-claim", "real-prompt"}:
+            # Relations, revocation and prompt provenance are not session activity.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
         row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
@@ -1047,11 +1047,41 @@ def _fold_ledger(seat: Seat) -> None:
     lines = _read_ledger_lines(seat)
     if len(lines) <= LEDGER_FOLD_LINES:
         return
-    # Handover rows (A -> B, with their bindings) are the seat's authority record: they stay raw.
-    relations = [l for l in lines if l.get("event") == "handover"][-HANDOVER_KEEP_ROWS:]
+    # Registered handovers keep the existing bounded retention. Steward lineage is
+    # retained by generation/watch identity so a marker-less holder and a release
+    # remain resolvable after ordinary session rows fold.
+    handovers = [(index, row) for index, row in enumerate(lines) if row.get("event") == "handover"]
+    keep_relation_indices = {index for index, _row in handovers[-HANDOVER_KEEP_ROWS:]}
+    latest_role_rows, latest_watch_rows = {}, {}
+    release_rows = []
+    for index, item in enumerate(lines):
+        if item.get("event") == "steward-release":
+            release_rows.append((index, item))
+        steward = item.get("steward") if isinstance(item.get("steward"), dict) else {}
+        for relation in steward.get("roles") or ():
+            if isinstance(relation, dict) and relation.get("generation"):
+                latest_role_rows[(str(relation.get("seat_key") or item.get("seat_key") or ""),
+                                  str(relation["generation"]))] = index
+        for watch in steward.get("watches") or ():
+            if isinstance(watch, dict) and watch.get("watch_id"):
+                latest_watch_rows[str(watch["watch_id"])] = (index, watch)
+    keep_relation_indices.update(latest_role_rows.values())
+    for watch_id, (index, watch) in latest_watch_rows.items():
+        storage_root = watch.get("storage_root")
+        if storage_root:
+            ack = Path(str(storage_root)) / "peer-watches" / f"{watch_id}.ack.json"
+            if ack.exists():
+                continue
+        keep_relation_indices.add(index)
+    # A release can suppress an origin marker that remains on its old session
+    # after the role moved. Keep these compact tombstones in the same ledger.
+    keep_relation_indices.update(index for index, _row in release_rows)
+    relations = [row for index, row in enumerate(lines) if index in keep_relation_indices
+                 and row.get("event") in {"handover", "steward-release"}]
     claims: dict[str, dict] = {}
     real_frontiers: dict[tuple[str, str], dict] = {}
-    activity = [l for l in lines if l.get("event") not in {"handover", "tidy-claim", "real-prompt"}]
+    activity = [l for l in lines if l.get("event") not in {
+        "handover", "steward-release", "tidy-claim", "real-prompt"}]
     for item in lines:
         if item.get("event") == "tidy-claim" and item.get("claim_id"):
             claims[str(item["claim_id"])] = item

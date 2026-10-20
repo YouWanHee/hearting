@@ -108,6 +108,17 @@ class PeerReadContextTest(unittest.TestCase):
         self.assertEqual(PeerReadContext().transfer_roots(next_scan), tuple(roots))
         next_scan.assert_called_once_with()
 
+    def test_peer_notice_scan_is_shared_only_within_one_pass(self):
+        context = PeerReadContext()
+        notices = [{"transfer_ref": "a" * 32, "delivery": {"status": "received"}}]
+        loader = mock.Mock(return_value=notices)
+        self.assertIs(context.peer_notice_records(loader), context.peer_notice_records(loader))
+        loader.assert_called_once_with()
+
+        next_scan = mock.Mock(return_value=[])
+        self.assertEqual(PeerReadContext().peer_notice_records(next_scan), ())
+        next_scan.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

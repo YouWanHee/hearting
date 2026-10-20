@@ -33,6 +33,7 @@ from dispatch_contract import (
     sealed_launch_home, source_lineage_row_fields, supervisor_lease_path, workflow_completion_receipt,
     ensure_terminal_claim_absent, _atomic_registry_replace, close_attempt_row,
     parse_registry_metadata,
+    diagnostic_line,
 )
 import commit_policy
 import dispatch_parent_completion as parent_completion
@@ -855,8 +856,12 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
     if result.returncode:
         if result.stdout: print(result.stdout, end="")
         if result.stderr: print(result.stderr, end="", file=sys.stderr)
+        reason, detail = _route_guard_refusal(
+            result.stderr, returncode=result.returncode,
+            route_id=args.route_id, route_file=args.route_file)
         return fail(
-            "worker-route-validation-failed", result.returncode,
+            reason, result.returncode,
+            detail=detail,
             route_file=args.route_file, registered="0", started="0",
             child_spawned="0",
         )
@@ -870,6 +875,32 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
         reason, code, fields = refusal
         return fail(reason, code, **fields)
     return 0
+
+
+def _route_guard_refusal(stderr: str, *, returncode: int = 65,
+                         route_id: str | None = None,
+                         route_file: str | None = None) -> tuple[str, str]:
+    """Carry a bounded, typed guard refusal across the common wrapper boundary."""
+    generic = ("worker-route-validation-failed", "guard output lacked a typed refusal")
+    if returncode != 65 or not isinstance(stderr, str) or len(stderr) > 16384:
+        return generic
+    try:
+        row = json.loads(stderr)
+    except (TypeError, ValueError):
+        return generic
+    if isinstance(row, dict) and row.get("status") == "blocked":
+        # Older guards omit identity; the Git probe can fail before it knows
+        # the route. Neither case creates a new required input.
+        if route_id and row.get("route_id") not in (None, "unknown", route_id):
+            return generic
+        if route_file and row.get("route_file") not in (None, route_file):
+            return generic
+        reason, detail = row.get("reason"), row.get("detail")
+        if (isinstance(reason, str) and 1 <= len(reason) <= 128
+                and re.fullmatch(r"[a-z][a-z0-9-]*", reason)
+                and isinstance(detail, str)):
+            return reason, diagnostic_line(detail)
+    return generic
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace, *, probe) -> str:

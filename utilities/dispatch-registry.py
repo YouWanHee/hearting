@@ -130,10 +130,14 @@ def parse_meta(pipe):
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
 
 
-def read_rows(jobs):
+def read_rows(jobs, *, lines=None):
     rows = []
-    if not jobs.is_file(): return rows
-    for order, line in enumerate(jobs.read_text(encoding="utf-8", errors="replace").splitlines()):
+    if lines is None:
+        if not jobs.is_file(): return rows
+        source = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    else:
+        source = lines
+    for order, line in enumerate(source):
         fields = line.split("\t")
         if len(fields) != 6: continue
         meta = parse_meta(fields[5])

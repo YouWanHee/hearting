@@ -200,7 +200,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/start-receipt-context.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 start-receipt-context.py",
             "timeout": 3
           }
         ]
@@ -210,7 +210,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/git-index-lock-context.py\" --harness claude",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 git-index-lock-context.py --harness claude",
             "timeout": 3
           }
         ]
@@ -232,7 +232,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/git-index-lock-context.py\" --harness claude",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 git-index-lock-context.py --harness claude",
             "timeout": 3
           }
         ]

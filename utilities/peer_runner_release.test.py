@@ -298,14 +298,14 @@ print(json.dumps(result))
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
         received = peer_message._read_pending(ref)
         self.assertEqual(received["state"], "received")
-        store = obligations.ObligationStore(self.state)
-        duty_id = "message-" + ref
-        store.create(duty_id, "message",
-                     {"server": "default", "pane": "fixture-pane",
-                      "session_id": self.recipient["session_id"]},
-                     {"ref": ref, "body_digest": body_digest, "target": "fixture-target",
-                      "identity": {"server": "default", "pane": "fixture-pane"}})
-        return ref, body_digest, duty_id
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            duty = peer_steward._schedule_message_obligation(
+                received, "fixture-target", pane="fixture-pane")
+        self.assertIsNotNone(duty)
+        self.assertEqual(duty["intent"]["from"], received["from"])
+        self.assertEqual(duty["intent"]["to"], received["to"])
+        self.assertEqual(duty["intent"]["refs"], received["refs"])
+        return ref, body_digest, duty["id"]
 
     def _seed_pending_duty(self, body):
         text, ref = peer_message.prepare_peer_message(

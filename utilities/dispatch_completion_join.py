@@ -864,6 +864,18 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
               "This receipt creates no new approval step.")
 
 
+def _project_legacy_receipt(receipt, jobs: Path, parent_attempt_id: str):
+    if (isinstance(receipt, dict) and receipt.get("schema_version") == 2
+            and receipt.get("state") == "delivered"
+            and receipt.get("job_registry") == "" and receipt.get("parent_attempt_id") == ""):
+        # Legacy per-child delivery kept scope in the validated pending
+        # identity instead of its body. Project it; never rewrite the
+        # stored receipt/digest or treat a prefix alone as a peer ACK.
+        return {**receipt, "state": "ready", "job_registry": str(Path(jobs).resolve(strict=True)),
+                "parent_attempt_id": parent_attempt_id}
+    return receipt
+
+
 def _batch_receipt_projection(
     jobs: Path, attempt_ids: set[str], *, recipient_sid: str,
     parent_attempt_id: str, parent_completion_delivery: str,
@@ -926,15 +938,7 @@ def _batch_receipt_projection(
                     and not _received_ack_actor_valid(record.get("acked_by"),
                         parent_completion_delivery, recipient_sid, jobs=jobs, record=record)):
                 return None
-            receipt = record.get("receipt")
-            if (isinstance(receipt, dict) and receipt.get("schema_version") == 2
-                    and receipt.get("state") == "delivered"
-                    and receipt.get("job_registry") == "" and receipt.get("parent_attempt_id") == ""):
-                # Legacy per-child delivery kept scope in the validated pending
-                # identity instead of its body. Project it; never rewrite the
-                # stored receipt/digest or treat a prefix alone as a peer ACK.
-                receipt = {**receipt, "state": "ready", "job_registry": str(jobs.resolve(strict=True)),
-                           "parent_attempt_id": parent_attempt_id}
+            receipt = _project_legacy_receipt(record.get("receipt"), jobs, parent_attempt_id)
             if (not isinstance(receipt, dict) or receipt.get("schema_version") != 2
                     or receipt.get("state") != "ready"
                     or receipt.get("parent_attempt_id") != parent_attempt_id
@@ -1001,6 +1005,107 @@ def current_batch_receipt_projection(
     return _batch_receipt_projection(jobs, attempt_ids, recipient_sid=recipient_sid,
         parent_attempt_id=parent_attempt_id, parent_completion_delivery=parent_completion_delivery,
         require_ack=False)
+
+
+def _receipts_agree(current: dict[str, object], cached: dict[str, object]) -> bool:
+    """One delivery: every receipt field both bodies carry has the same value.
+
+    Legacy per-child bodies omit fields (a child ``reason``) that the
+    observer's normalized outcome carries. That is shape, not identity; a
+    differing value for a shared field is a different delivery.
+    """
+    try:
+        left, right = canonical_receipt(current), canonical_receipt(cached)
+    except ValueError:
+        return False
+    if any(left[key] != right[key] for key in set(left) & set(right) if key != "children"):
+        return False
+    children = []
+    for body in (left, right):
+        items = body.get("children")
+        if not isinstance(items, list) or not all(isinstance(child, dict) for child in items):
+            return False
+        by_attempt = {child.get("attempt_id"): child for child in items}
+        if len(by_attempt) != len(items):
+            return False
+        children.append(by_attempt)
+    if set(children[0]) != set(children[1]):
+        return False
+    return all(children[0][aid][key] == children[1][aid][key]
+               for aid in children[0] for key in set(children[0][aid]) & set(children[1][aid]))
+
+
+def cached_batch_delivery_state(
+    jobs: Path, attempt_ids: set[str], *, recipient_sid: str,
+    parent_attempt_id: str, parent_completion_delivery: str,
+    cached: dict[str, object],
+) -> str:
+    """Classify a cached batch outcome against its current per-child ledger.
+
+    ``resolved``: the ledger already closed this delivery. Every child record
+    is terminal (acked/expired/rejected) or was pruned after a terminal state.
+    ``unmaterialized``: a child row carries intent but has neither a record
+    nor a prune tombstone. Its terminal close or the reconcile backstop owns
+    that record, never a carrier; absence is not resolution.
+    ``partial``: some child deliveries were retired while another child's
+    record is still open. The batch can no longer be sent as one, and the
+    open record still owes its delivery, so nothing is resent or completed.
+    ``current``: every child record is open or acked under the row's exact
+    identity and agrees with ``cached`` on every receipt field both carry.
+    ``changed``: anything else. A cached outcome is never resent then.
+    """
+    if (not attempt_ids or len(attempt_ids) > MAX_BATCH_ATTEMPTS or not recipient_sid
+            or not parent_attempt_id or not isinstance(cached, dict)):
+        return "changed"
+    from dispatch_contract import terminal_conflict_pending
+    from dispatch_seat_handover import effective_parent
+
+    jobs = Path(jobs)
+    ledger = []
+    try:
+        root = jobs.resolve(strict=True).parent
+        for attempt_id in sorted(attempt_ids):
+            row = current_attempt_row(jobs, attempt_id)
+            if row is None or row.status != "done":
+                return "changed"
+            meta = row.metadata
+            if (meta.get("delivery_intent") != "1"
+                    or meta.get("parent_completion_delivery") != parent_completion_delivery
+                    or not meta.get("parent_sid")
+                    or effective_parent(meta, jobs) != recipient_sid
+                    or not meta.get("delivery_id")
+                    or not meta.get("delivery_receipt_digest")
+                    or not meta.get("delivery_row_revision")
+                    or terminal_conflict_pending(meta)):
+                return "changed"
+            record = pending_delivery.read(root, meta["parent_sid"], meta["delivery_id"])
+            if record is None:
+                record_file = pending_delivery.record_path(
+                    root, meta["parent_sid"], meta["delivery_id"])
+                ledger.append("pruned" if pending_delivery.tombstone_path(record_file).is_file()
+                              else "absent")
+                continue
+            if (record.get("recipient_kind") != parent_completion_delivery
+                    or record.get("attempt_ids") != [attempt_id]
+                    or record.get("receipt_digest") != meta["delivery_receipt_digest"]
+                    or record.get("row_revisions", {}).get(attempt_id)
+                        != meta["delivery_row_revision"]):
+                return "changed"
+            ledger.append(record.get("state"))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, JoinContractError):
+        return "changed"
+    if any(state not in pending_delivery.STATES | {"pruned", "absent"} for state in ledger):
+        return "changed"
+    if all(state in pending_delivery.TERMINAL_STATES | {"pruned"} for state in ledger):
+        return "resolved"
+    if "absent" in ledger:
+        return "unmaterialized"
+    if any(state in {"expired", "rejected", "pruned"} for state in ledger):
+        return "partial"
+    current = current_batch_receipt_projection(
+        jobs, attempt_ids, recipient_sid=recipient_sid, parent_attempt_id=parent_attempt_id,
+        parent_completion_delivery=parent_completion_delivery)
+    return "current" if current is not None and _receipts_agree(current, cached) else "changed"
 
 
 def acknowledged_attempt_receipt(

@@ -215,6 +215,7 @@ utility-deferred	model_worker_governor.test.py
 utility-deferred	nested-dispatch-eligibility.py
 utility-deferred	nested_dispatch_eligibility.test.py
 utility-deferred	opencode_runtime.py
+utility-deferred	opencode-run-terminal.py
 utility-deferred	opencode_server_log.py
 utility-deferred	owner_route_binding.py
 utility-deferred	parent_next_directive.py

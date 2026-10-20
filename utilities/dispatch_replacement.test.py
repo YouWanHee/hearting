@@ -976,6 +976,209 @@ class ReplacementTest(unittest.TestCase):
         self.assertIn('predecessor=', caught.exception.detail)
         self.assertIn('candidate=', caught.exception.detail)
 
+    def test_opencode_v1_v2_actual_recorder_and_ordered_seal_round_trip(self):
+        import opencode_runtime
+
+        configs = (
+            {"permission": {
+                "read": "allow",
+                "edit": {"*": "deny", "/approved/**": "allow"},
+                "external_directory": {"*": "deny", "/approved/**": "allow"},
+            }, "agent": {"build": {"permission": {
+                "edit": {"*": "deny", "/approved/private/**": "allow"},
+            }}}},
+            {"permissions": [
+                {"action": "read", "resource": "*", "effect": "allow"},
+                {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "/approved/**", "effect": "allow"},
+                {"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "external_directory", "resource": "/approved/**", "effect": "allow"},
+            ], "agents": {"build": {"permissions": [
+                {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "/approved/private/**", "effect": "allow"},
+            ]}}},
+        )
+        sealed = []
+        for index, config in enumerate(configs):
+            aid = f"att-opencode-policy-{index}"
+            args = SimpleNamespace(**vars(self.args))
+            args.attempt_id = aid
+            args.agent = "build"
+            args.opencode_config_content = json.dumps(config, separators=(",", ":"))
+            args.replacement_input_argv = ["--start", "--attempt-id", aid,
+                                           "--agent", args.agent, "--prompt-text", "the raw task"]
+            fragment = R.seal_launch_input(args, "opencode", "the raw task")
+            value = R.launch_input(self.jobs, aid, D.parse_registry_metadata(fragment))
+            permission = value["applied_permissions"]["opencode_permission"]
+            self.assertTrue(opencode_runtime.opencode_permission_ordered_view(permission))
+            self.assertEqual(
+                value["applied_permissions"]["opencode_selected_agent_permission"]["agent"],
+                "build")
+            sealed.append(value)
+        before, after = sealed
+        old_permission = before["applied_permissions"]["opencode_permission"]
+        new_permission = after["applied_permissions"]["opencode_permission"]
+        self.assertTrue(old_permission)
+        self.assertTrue(new_permission)
+        self.assertEqual(R.route_authority.granted_permissions(before["applied_permissions"]),
+                         R.route_authority.granted_permissions(after["applied_permissions"]))
+        self.assertEqual(R.route_authority._granted_permission_pair(
+            {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+            {"harness": "opencode", "applied_permissions": after["applied_permissions"]})[0],
+            R.route_authority._granted_permission_pair(
+                {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+                {"harness": "opencode", "applied_permissions": after["applied_permissions"]})[1])
+
+        changed_config = json.loads(json.dumps(configs[1]))
+        changed_config["agents"]["build"]["permissions"][0]["effect"] = "allow"
+        changed_args = SimpleNamespace(**vars(self.args))
+        changed_args.attempt_id = "att-opencode-selected-agent-changed"
+        changed_args.agent = "build"
+        changed_args.opencode_config_content = json.dumps(changed_config, separators=(",", ":"))
+        changed_args.replacement_input_argv = ["--start", "--attempt-id", changed_args.attempt_id,
+                                               "--agent", changed_args.agent,
+                                               "--prompt-text", "the raw task"]
+        changed_fragment = R.seal_launch_input(changed_args, "opencode", "the raw task")
+        changed = R.launch_input(self.jobs, changed_args.attempt_id,
+                                 D.parse_registry_metadata(changed_fragment))
+        self.assertEqual(
+            opencode_runtime.opencode_permission_ordered_view(
+                before["applied_permissions"]["opencode_permission"]),
+            opencode_runtime.opencode_permission_ordered_view(
+                changed["applied_permissions"]["opencode_permission"]))
+        pair = R.route_authority._granted_permission_pair(
+            {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+            {"harness": "opencode", "applied_permissions": changed["applied_permissions"]})
+        self.assertNotEqual(*pair)
+        self.assertFalse(R.route_authority.same_sealed_work(before, changed))
+
+        reordered = json.loads(json.dumps(before))
+        edit = reordered["applied_permissions"]["opencode_permission"]["edit"]
+        reordered["applied_permissions"]["opencode_permission"]["edit"] = dict(reversed(
+            list(edit.items())))
+        self.assertNotEqual(R._digest(before), R._digest(reordered))
+        pair = R.route_authority._granted_permission_pair(
+            {"harness": "opencode", "applied_permissions": before["applied_permissions"]},
+            {"harness": "opencode", "applied_permissions": reordered["applied_permissions"]})
+        self.assertNotEqual(*pair)
+
+        historical = {"applied_permissions": {"opencode_permission": {
+            "edit": {"*": "deny", "/approved/**": "allow"}, "read": "allow"}}}
+        old_sorted_bytes = (json.dumps(historical, sort_keys=True, ensure_ascii=False,
+                                       separators=(",", ":")) + "\n").encode()
+        self.assertEqual(R._bytes(json.loads(old_sorted_bytes)), old_sorted_bytes)
+
+        missing = {"harness": "opencode", "applied_permissions": {}}
+        empty = {"harness": "opencode", "applied_permissions": {"opencode_permission": {}}}
+        self.assertNotEqual(*R.route_authority._granted_permission_pair(missing, empty))
+
+    def test_selected_permission_legacy_reseal_is_bounded_and_name_independent(self):
+        def launch(attempt, agent, config):
+            args = SimpleNamespace(**vars(self.args))
+            args.attempt_id = attempt
+            args.agent = agent
+            args.opencode_config_content = json.dumps(config, separators=(",", ":"))
+            args.replacement_input_argv = ["--start", "--attempt-id", attempt,
+                                           "--agent", agent, "--prompt-text", "the raw task"]
+            fragment = R.seal_launch_input(args, "opencode", "the raw task")
+            return args, fragment
+
+        def open_row(attempt):
+            self.write({"attempt_id": attempt, "launch_claimed": "0",
+                        "launch_started": "0"}, status="open", append=True)
+
+        def remove_historical_selected_field(attempt):
+            path = R._directory(self.jobs) / "inputs" / (attempt + ".json")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["applied_permissions"].pop("opencode_selected_agent_permission", None)
+            R._replace_record(path, record)
+
+        same_policy = {"permission": {"bash": "ask", "edit": {"*": "deny"}}}
+        rename_config = {"permission": {"read": "allow", "bash": "ask"},
+                         "agent": {"build": same_policy, "builder": same_policy}}
+        attempt = "att-selected-agent-reseal"
+        _args, _fragment = launch(attempt, "build", rename_config)
+        open_row(attempt)
+        renamed_args, renamed_fragment = launch(attempt, "builder", rename_config)
+        self.assertTrue(renamed_fragment)
+        renamed = R.launch_input(self.jobs, attempt, D.parse_registry_metadata(renamed_fragment))
+        self.assertEqual(renamed["applied_permissions"]["opencode_selected_agent_permission"]["agent"],
+                         "builder")
+
+        changed_config = json.loads(json.dumps(rename_config))
+        changed_config["agent"]["builder"]["permission"]["bash"] = "allow"
+        renamed_args.opencode_config_content = json.dumps(changed_config, separators=(",", ":"))
+        with self.assertRaises(D.DispatchContractError):
+            R.seal_launch_input(renamed_args, "opencode", "the raw task")
+
+        # Old immutable input without the optional field admits a current
+        # selected definition with no policy, without fabricating old rules.
+        legacy_config = {"permission": {"read": "allow", "edit": {"*": "deny"}}}
+        legacy_attempt = "att-selected-agent-legacy-empty"
+        legacy_args, _legacy_fragment = launch(legacy_attempt, "build", legacy_config)
+        open_row(legacy_attempt)
+        remove_historical_selected_field(legacy_attempt)
+        no_policy = {**legacy_config, "agent": {"build": {"mode": "primary"}}}
+        self.assertTrue(launch(legacy_attempt, "build", no_policy)[1])
+
+        # A candidate allow is checked against the sealed worktree even when
+        # the historical selected-policy record is absent.
+        bounded_attempt = "att-selected-agent-legacy-bounded"
+        _bounded_args, _bounded_fragment = launch(bounded_attempt, "build", legacy_config)
+        open_row(bounded_attempt)
+        remove_historical_selected_field(bounded_attempt)
+        inside = {**legacy_config, "agent": {"build": {"permission": {
+            "edit": {str(self.root) + "/**": "allow"}}}}}
+        self.assertTrue(launch(bounded_attempt, "build", inside)[1])
+
+        outside_attempt = "att-selected-agent-legacy-outside"
+        _outside_args, _outside_fragment = launch(outside_attempt, "build", legacy_config)
+        open_row(outside_attempt)
+        remove_historical_selected_field(outside_attempt)
+        outside = {**legacy_config, "agent": {"build": {"permission": {
+            "edit": {str(self.root.parent / "outside") + "/**": "allow"}}}}}
+        with self.assertRaises(D.DispatchContractError):
+            launch(outside_attempt, "build", outside)
+
+    def test_equivalent_and_conflicting_opencode_policies_after_sealed_readback(self):
+        cases = (
+            ([("*", "deny"), ("/root/**", "deny")],
+             [("/root/**", "deny"), ("*", "deny")], True),
+            ([("*", "deny")],
+             [("*", "deny"), ("/root/**", "allow"), ("*", "deny")], True),
+            ([("*", "deny"), ("/root/**", "allow"), ("/root/private/**", "deny")],
+             [("*", "deny"), ("/root/**", "allow")], False),
+            ([("*", "deny"), ("/root/**", "allow")],
+             [("/root/**", "allow"), ("*", "deny")], False),
+        )
+        for index, (legacy_rules, native_rules, equivalent) in enumerate(cases):
+            with self.subTest(index=index, equivalent=equivalent):
+                configs = ({"permission": {"edit": dict(legacy_rules)}}, {
+                    "permissions": [{"action": "edit", "resource": resource, "effect": effect}
+                                    for resource, effect in native_rules],
+                })
+                self.assertIsInstance(configs[1]["permissions"], list)
+                self.assertNotIn("permission", configs[1])
+                sealed = []
+                for side, config in enumerate(configs):
+                    args = SimpleNamespace(**vars(self.args))
+                    args.attempt_id = f"att-equivalent-policy-{index}-{side}"
+                    args.opencode_config_content = json.dumps(config)
+                    args.replacement_input_argv = ["--start", "--attempt-id", args.attempt_id,
+                                                   "--prompt-text", "the raw task"]
+                    fragment = R.seal_launch_input(args, "opencode", "the raw task")
+                    value = R.launch_input(self.jobs, args.attempt_id,
+                                           D.parse_registry_metadata(fragment))
+                    self.assertTrue(value["applied_permissions"]["opencode_permission"])
+                    sealed.append(value)
+                before, after = sealed
+                grants = [R.route_authority.granted_permissions(value["applied_permissions"])
+                          for value in sealed]
+                self.assertEqual(grants[0] == grants[1], equivalent)
+                # The same work/attempt with its grant projected by either config generation.
+                candidate = {**before, "applied_permissions": after["applied_permissions"]}
+                self.assertEqual(R.route_authority.same_sealed_work(before, candidate), equivalent)
+
     def test_replay_uses_raw_task_and_new_identity(self):
         record=self.claim();source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
         cmd=R._command(self.jobs,record,source,R.launch_input(self.jobs,'att-source',source))
@@ -2480,6 +2683,11 @@ class ReplacementTest(unittest.TestCase):
         """The new harness's wrapper seals the forwarded owner command and registers the replacement."""
         aid = record['replacement_attempt_id']
         args = SimpleNamespace(**vars(self.args)); args.attempt_id = aid
+        if harness == 'opencode':
+            args.opencode_config_content = json.dumps({
+                'permissions': [{'action': 'read', 'resource': '*', 'effect': 'allow'}],
+                'agents': {},
+            })
         args.automatic_retry_of = record['original_attempt_id']
         args.replacement_input_argv = command[3:]
         meta = {k: v for k, v in self.meta.items() if k not in ('note', 'failure_class', 'launch_outcome',
@@ -3429,6 +3637,11 @@ class FrameCapacityFlow:
         # deliberately supplies its own user config; never use the operator's.
         with mock.patch('model_config.user_path', return_value=getattr(fx, 'model_config_path', fx.root/'missing-models.conf')):
             args.resolved_model_settings = self.wrapper.resolve_model_settings(args)
+        if self.harness == 'opencode':
+            args.opencode_config_content = json.dumps({
+                'permissions': [{'action': 'read', 'resource': '*', 'effect': 'allow'}],
+                'agents': {},
+            })
         return args
 
     def register(self, fx, args):

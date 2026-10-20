@@ -101,6 +101,17 @@ class PeerMessageTest(_TmpRootMixin, unittest.TestCase):
         lines = self._ledger_file().read_text().splitlines()
         self.assertEqual(len(lines), 1)
 
+    def test_generic_received_cmd_record_cannot_mint_exact_receiver_provenance(self):
+        ref = "a" * 32
+        self.assertEqual(self._record(kind="notice", status="received",
+                                      receipt="exact-peer-ref", transfer_ref=ref), 0)
+        record = json.loads(self._ledger_file().read_text().splitlines()[0])
+        self.assertNotIn("receipt_provenance", record)
+        self.assertNotIn("received_transfer_body_sha256", record)
+        self.assertNotIn("receiver_binding", record)
+        self.assertIsNone(peer_message._peer_notice_record(
+            ref, {"harness": "claude", "session_id": "sid-b"}))
+
     def test_append_only(self):
         self._record()
         first = self._ledger_file().read_text().splitlines()[0]
@@ -195,6 +206,68 @@ class PeerMessageTest(_TmpRootMixin, unittest.TestCase):
         self._record()
         path = self._ledger_file()
         self.assertTrue(str(path).startswith(str(self.tmp_root)))
+
+    def test_exact_receiver_receipt_settles_the_matching_message_obligation(self):
+        import peer_obligations
+
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "recipient-session", "name": "worker"}
+        text, ref = peer_message.prepare_peer_message(
+            "[steer] exact receipt", sender, recipient, defer=True)
+        pending = peer_message._read_pending(ref)
+        store = peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "", "harness": "codex",
+             "session_id": "recipient-session"},
+            {"ref": ref, "body_digest": pending["body_sha256"],
+             "from": sender, "to": pending["to"]})
+
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        transfer = peer_message._read_transfer_record(ref)
+        notice = peer_message._peer_notice_record(ref, recipient)
+        self.assertEqual(notice["receipt_provenance"],
+                         "validated-peer-ref-receiver-v1")
+        self.assertEqual(notice["received_transfer_body_sha256"], transfer["body_sha256"])
+        self.assertEqual(notice["body_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertNotEqual(notice["body_sha256"], notice["received_transfer_body_sha256"])
+        settled = store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                         ("complete", "received", "acknowledged"))
+        self.assertEqual(settled["observation"]["receiver_receipt"]["ref"], ref)
+        self.assertEqual(settled["observation"]["receiver_receipt"]["recipient"]["session_id"],
+                         "recipient-session")
+        revision = settled["revision"]
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        self.assertEqual(store.get(duty["id"])["revision"], revision)
+
+    def test_late_exact_receipt_updates_cancelled_duty_when_pending_row_is_missing(self):
+        import peer_obligations
+
+        sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "recipient-session", "name": "worker"}
+        text, ref = peer_message.prepare_peer_message(
+            "[steer] late receipt after terminal delivery", sender, recipient, defer=True)
+        pending = peer_message._read_pending(ref)
+        store = peer_obligations.ObligationStore()
+        identity = {"server": "default", "pane": "", "harness": "codex",
+                    "session_id": "recipient-session"}
+        duty = store.create("message-" + ref, "message", identity,
+            {"ref": ref, "body_digest": pending["body_sha256"],
+             "from": sender, "to": pending["to"]})
+        evidence = {"kind": "recipient-session-absent", "server": "default",
+                    "harness": "codex", "session_id": "recipient-session",
+                    "census_complete": True, "session_absent": True,
+                    "census_endpoint": "default"}
+        self.assertEqual(peer_message.cancel_message_obligation(
+            ref, duty_id=duty["id"], expected_revision=duty["revision"],
+            identity=identity, message=pending, evidence=evidence), "cancelled")
+        peer_message._pending_path(ref).unlink()
+
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        latest = store.get(duty["id"])
+        self.assertEqual((latest["state"], latest["result"], latest["delivery"]),
+                         ("cancelled", None, "acknowledged"))
+        self.assertEqual(latest["observation"]["receiver_receipt"]["ref"], ref)
 
     def test_path_layout(self):
         self._record()
@@ -1852,7 +1925,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
 
     def test_ledger_failure_or_publish_failure_does_not_fabricate_receipt_or_duplicate(self):
         text, ref = self.pending()
-        with mock.patch.object(peer_message, "cmd_record", return_value=1):
+        with mock.patch.object(peer_message, "_record", return_value=1):
             self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 1)
         self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
         with mock.patch.object(peer_message, "_save_pending", side_effect=OSError("publish failed")):
