@@ -693,7 +693,9 @@ The interview proceeds in this order:
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
 3. Ask the understanding sentence first, then the registered interview
-   questions in the same native question batch. Use Claude `AskUserQuestion`,
+   questions, in one native question call when the tool accepts them all;
+   otherwise continue with the remaining questions verbatim in the next call,
+   and the runtime combines the calls of one interview. Use Claude `AskUserQuestion`,
    Codex `request_user_input`, or OpenCode `question`, one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
@@ -701,7 +703,8 @@ The interview proceeds in this order:
    carry. A tired reader must be able to answer without opening the plan.
 4. The native tool's reply is kept by the harness's post-tool hook beside the
    registered question (`answers.native.json`; the restatement asked verbatim,
-   its first option confirming it), so `resume_command` alone continues. A
+   its first option confirming it — a partial reply waits beside it until every
+   registered question has an answer), so `resume_command` alone continues. A
    reply given in conversation goes into the returned `answers_template` and
    `start --route <file> --answers <file>`. The runtime renders intent and
    records the release that authorizes owner launch. A repeated submission

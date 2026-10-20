@@ -6,6 +6,7 @@ reuse the adapter's atomic claim; all completion decisions use the shared join.
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -160,8 +161,30 @@ def _frame_decision_result(decision, question, question_path, answer_path):
     return result
 
 
-def native_answer_candidate(route, jobs, asked):
-    """Purely identify a valid reply to this route's currently registered interview."""
+def _native_partial(directory, raw, round_no, route_id) -> dict:
+    """The rows an earlier native call of this exact interview left; {} for a stale or foreign file."""
+    import frame_interview as FI
+    path = directory / FI.NATIVE_PARTIAL_NAME
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        value = FI.load_json_file(path, max_bytes=FI.MAX_NATIVE_PARTIAL_BYTES, kind="answers")
+    except (OSError, ValueError):
+        return {}
+    if (isinstance(value, dict) and value.get("schema") == FI.NATIVE_PARTIAL_SCHEMA
+            and value.get("route_id") == route_id and value.get("round") == round_no
+            and value.get("interview_sha256") == hashlib.sha256(raw).hexdigest()
+            and isinstance(value.get("slots"), dict)):
+        return value["slots"]
+    return {}
+
+
+def _native_progress(route, jobs, asked):
+    """What a native call adds to this route's registered interview, or None when it adds nothing.
+
+    A call may answer only some of the registered rows (a tool shows a few questions per call);
+    its rows are combined with those an earlier call of the same interview left, the later row
+    winning. `answers` is the complete answers file once every row has an answer, else None."""
     import frame_interview as FI
     import workflow_state as WS
     if not isinstance(route, dict) or not route.get("route_id") or not route.get("route_hash"):
@@ -189,20 +212,56 @@ def native_answer_candidate(route, jobs, asked):
             existing = None
         if isinstance(existing, dict) and not FI.validate_answers(question, existing):
             return None
-    answers = FI.answers_from_native(question, asked)
-    if answers is None or FI.validate_answers(question, answers):
+    slots = FI.native_slots(question, asked)
+    if not slots:
         return None
-    target = question_path.parent / FI.NATIVE_ANSWERS_NAME
-    return target, answers
+    merged = {**_native_partial(question_path.parent, raw, question.get("round"), question["route_id"]), **slots}
+    answers = FI.answers_from_native_slots(question, merged)
+    if answers is not None and FI.validate_answers(question, answers):
+        return None
+    return SimpleNamespace(directory=question_path.parent, question=question, raw=raw, slots=merged,
+                           answers=answers, missing=FI.missing_native_slots(question, merged))
+
+
+def native_answer_candidate(route, jobs, asked):
+    """Purely identify a valid reply to this route's currently registered interview.
+
+    `(answers.native.json, answers)` when the reply completes it, `(answers.native.partial.json, None)`
+    when it answers part of it, None when it is no answer to it."""
+    import frame_interview as FI
+    progress = _native_progress(route, jobs, asked)
+    if progress is None:
+        return None
+    if progress.answers is None:
+        return progress.directory / FI.NATIVE_PARTIAL_NAME, None
+    return progress.directory / FI.NATIVE_ANSWERS_NAME, progress.answers
 
 
 def record_native_answer(route, jobs, asked):
-    """Keep a valid native reply beside the one current registered interview."""
-    candidate = native_answer_candidate(route, jobs, asked)
-    if candidate is None:
+    """Keep a valid native reply beside the one current registered interview.
+
+    A complete reply becomes `answers.native.json`. A partial one is kept as
+    `answers.native.partial.json` until a later call finishes the interview; the partial is
+    bound to this interview's digest and is never read as answers."""
+    import frame_interview as FI
+    progress = _native_progress(route, jobs, asked)
+    if progress is None:
         return None
-    target, answers = candidate
-    target.write_text(json.dumps(answers, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if progress.answers is not None:
+        target = progress.directory / FI.NATIVE_ANSWERS_NAME
+        target.write_text(json.dumps(progress.answers, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            (progress.directory / FI.NATIVE_PARTIAL_NAME).unlink()
+        return target
+    target = progress.directory / FI.NATIVE_PARTIAL_NAME
+    if target.is_symlink():
+        return None
+    staged = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    staged.write_text(json.dumps({
+        "schema": FI.NATIVE_PARTIAL_SCHEMA, "route_id": progress.question["route_id"],
+        "round": progress.question.get("round"), "interview_sha256": hashlib.sha256(progress.raw).hexdigest(),
+        "slots": progress.slots, "missing": progress.missing}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(staged, target)
     return target
 
 
@@ -336,6 +395,8 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         for node in route["nodes"] if node.get("worker_type") == "frame"]})
     if response is not None:
         _store_once(answer_path, response)
+        with contextlib.suppress(OSError):
+            (directory / FI.NATIVE_PARTIAL_NAME).unlink()      # answered: no unfinished native reply remains
         _checkpoint("after-answer-save")
 
     def command(operation, *options):
@@ -361,9 +422,11 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                               "Keep waiting for the actual answer. If this question has not yet been presented, "
                               "present human_wait.question_block now; registration alone does not prove presentation. "
                               "Do not automatically open another native question. ") +
-                    "Put the registered understanding sentence verbatim as the first question in the same native "
-                    "question batch; its first option confirms understanding and typed text corrects it. Then put "
-                    "every registered question and its choices in that batch without changing their words. "
+                    "Put the registered understanding sentence verbatim as the first question; its first option "
+                    "confirms understanding and typed text corrects it. Then put every registered question and its "
+                    "choices without changing their words, in the same native question call when the tool accepts "
+                    "them all, otherwise continuing with the remaining ones in the next call; the runtime combines "
+                    "the calls of one interview. "
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
                     "When the native question tool returns the reply, the runtime keeps it beside the question "
                     "(answers.native.json, recorded by the harness hook): then just rerun resume_command. Otherwise "
