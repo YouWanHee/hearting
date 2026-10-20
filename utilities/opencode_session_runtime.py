@@ -222,6 +222,9 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
                       "tool": part.get("tool"), "callID": part.get("callID"),
                       "id": part.get("id"), "state": {"status": state.get("status")}}})
 
+    # Credit the outcome to the account this request starts with.
+    account = (opencode_runtime.model_account_observation(getattr(args, "model", None))
+               if native_opencode else None)
     with tempfile.TemporaryFile() as input_file:
         input_file.write(prompt.encode("utf-8"))
         input_file.seek(0)
@@ -278,7 +281,9 @@ def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict
     if runtime_error:
         result["error"] = runtime_error
         if native_opencode:
-            opencode_runtime.record_model_outcome(args.model, error=runtime_error)
+            opencode_runtime.record_model_outcome(args.model, error=runtime_error,
+                                                  account_observation=account)
     elif native_opencode and session and code == 0:
-        opencode_runtime.record_model_outcome(args.model, success=True)
+        opencode_runtime.record_model_outcome(args.model, success=True,
+                                              account_observation=account)
     return result, code

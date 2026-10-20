@@ -27,6 +27,657 @@ def dispatch_defaults_config_text(text):
 
 
 class FallbackTest(unittest.TestCase):
+ def test_wrapper_stderr_cannot_replace_typed_stdout_receipt(self):
+  result=SimpleNamespace(stdout='check=failed\nreason=unsafe-git-operation\ndetail=cherry-pick\n',
+                         stderr='check=ok\nreason=launched\nstarted=1\n')
+  fields=F.wrapper_fields(result)
+  self.assertEqual(fields['check'],'failed')
+  self.assertEqual(fields['reason'],'unsafe-git-operation')
+  self.assertNotIn('started',fields)
+
+ def degradation_rows(self,path):
+  route=json.loads(path.read_text())
+  ledger=self.jobs.parent/"degradations"/f"{route['route_id']}.jsonl"
+  return [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+ def seed_terminal_row(self,route,node,attempt_id,*,note,failure_class):
+  metadata=(f"attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+            f"route_id={route['route_id']},route_node={node['id']},attempt_id={attempt_id},"
+            f"worker_type=stage,launch_claimed=1,launch_fence=registry-v1,launch_started=1,"
+            f"note={note},failure_class={failure_class}")
+  with self.jobs.open("a",encoding="utf-8") as handle:
+   handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tfixture\t{metadata}\n")
+
+ def test_interrupted_direct_attempt_has_receipt_and_ledger(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   result=SimpleNamespace(returncode=130,stdout="worker_failure=interrupted\n",stderr="")
+   out=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",return_value=result), contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   receipt=self.cli_verdict(out.getvalue())
+   rows=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual((code,receipt["reason"],receipt["candidate_outcomes_omitted"]),(130,"interrupted","0"))
+   self.assertEqual([(r["reason"],r["attempted"]) for r in rows],[("interrupted",True)])
+   self.assertEqual(receipt["last_direct_failure_attempt_id"],rows[0]["attempt_id"])
+   self.assertEqual(self.degradation_rows(path)[-1]["candidate_outcomes"],rows)
+   self.assertEqual(self.degradation_rows(path)[-1]["last_direct_failure"],"interrupted:exit-130")
+
+ def test_direct_timeout_with_registered_attempt_remains_unknown(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   out=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",side_effect=subprocess.TimeoutExpired(["fixture"],1)), \
+        mock.patch.object(F,"registry_has_attempt",return_value=True), contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   receipt=self.cli_verdict(out.getvalue())
+   rows=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual((code,receipt["reason"],receipt["child_spawned"]),
+                    (76,"direct-launch-outcome-unknown","unknown"))
+   self.assertEqual(receipt["last_direct_failure_attempt_id"],rows[0]["attempt_id"])
+   self.assertEqual(receipt["last_direct_failure_reason"],"direct-timeout")
+   self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+   saved=self.degradation_rows(path)[-1]
+   self.assertEqual(saved["candidate_outcomes"],rows)
+   self.assertEqual(saved["last_direct_failure"],"direct-timeout:exit-timeout")
+
+ def test_watchdog_fallback_and_fail_closed_preserve_current_attempt(self):
+  real_load=F.load_node
+  def load_single_node(*args):
+   route,node=real_load(*args)
+   return route,{**node,"parallel_group":None,"replica_group":None}
+  for state,expected in (("fallback",79),("fail-closed",76)):
+   with self.subTest(state=state), self.dispatch_env():
+    path=self.route(same_status="supported")
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+           "candidates":[self.tuple("codex","supported")]},
+          {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+    result=SimpleNamespace(returncode=0,stdout="check=ok\nworker_failure=-\n",stderr="")
+    patches=(mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)),
+             mock.patch.object(F,"load_node",side_effect=load_single_node),
+             mock.patch.object(F,"run_wrapper",return_value=result),
+             mock.patch.object(F,"watch_launched_attempt",return_value=(state,{"action":"registry-terminal","note":"dead-no-progress"})))
+    code,out,err=self.start(path,patches=patches)
+    self.assertEqual(code,expected,out+err)
+    receipt=self.cli_verdict(out)
+    rows=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual(len(rows),1)
+    self.assertEqual(rows[0]["attempt_id"],receipt["last_direct_failure_attempt_id"])
+    self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+    self.assertEqual(receipt["last_direct_failure_reason"],rows[0]["reason"])
+    self.assertEqual(self.degradation_rows(path)[-1]["candidate_outcomes"],rows)
+    self.assertEqual(self.degradation_rows(path)[-1]["last_direct_failure"],
+                     f"{rows[0]['reason']}:exit-0")
+
+ def test_capacity_retry_outcomes_from_direct_and_pending_callers(self):
+  for pending in (False,True):
+   for outcome in ("success","failure","interrupted","timeout","unknown"):
+    with self.subTest(pending=pending,outcome=outcome), self.dispatch_env():
+     path=self.route(same_status="supported")
+     row=self.tuple("codex","supported")
+     hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+           {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+     capacity=SimpleNamespace(returncode=0,stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+     retry={"success":SimpleNamespace(returncode=0,stdout="check=ok\nmodel=new\n",stderr=""),
+            "failure":SimpleNamespace(returncode=75,stdout="check=failed\nreason=retry-refused\ndetail=fixture\n",stderr=""),
+            "interrupted":SimpleNamespace(returncode=130,stdout="worker_failure=interrupted\n",stderr=""),
+            "timeout":subprocess.TimeoutExpired(["fixture"],1),
+            "unknown":subprocess.TimeoutExpired(["fixture"],1)}[outcome]
+     calls=[retry] if pending else [capacity,retry]
+     prior={"capacity":[{"model":"old",**dict(zip(
+       ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+       F.tuple_key(row).split("/")))}] if pending else [],"retries":[],"cooled":set()}
+     prior_ledger_count=len(self.degradation_rows(path))
+     out=io.StringIO()
+     with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+          mock.patch.object(F,"capacity_context",return_value=prior), \
+          mock.patch.object(F,"allowed_capacity_settings",return_value=True), \
+          mock.patch.object(F,"capacity_attempt_identity",return_value="att-retry"), \
+          mock.patch.object(F,"registry_has_attempt",side_effect=lambda _jobs,aid: outcome=="unknown" and aid=="att-retry"), \
+          mock.patch.object(F,"run_wrapper",side_effect=calls), contextlib.redirect_stdout(out):
+      code,_=self.run_inline(path,"--capacity-model","new","--capacity-reasoning","high")
+     receipt=self.cli_verdict(out.getvalue())
+     rows=json.loads(receipt["candidate_outcomes"])
+     self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+     self.assertEqual(rows[-1]["attempt_id"],"att-retry")
+     self.assertEqual(rows[-1]["reason"],{"success":"launched","failure":"retry-refused",
+       "interrupted":"interrupted","timeout":"capacity-launch-timeout",
+       "unknown":"capacity-launch-outcome-unknown"}[outcome])
+     if not pending:
+      self.assertEqual(rows[0]["reason"],"capacity")
+      self.assertNotEqual(rows[0]["attempt_id"],rows[-1]["attempt_id"])
+     if outcome=="success":
+      self.assertEqual(code,0)
+      self.assertEqual(len(self.degradation_rows(path)),prior_ledger_count)
+      if pending:
+       self.assertNotIn("last_direct_failure_reason",receipt)
+      else:
+       self.assertEqual(receipt["last_direct_failure_reason"],"capacity")
+     else:
+      self.assertEqual(code,{"failure":79,"interrupted":130,"timeout":79,"unknown":76}[outcome])
+      self.assertEqual(receipt["last_direct_failure_attempt_id"],"att-retry")
+      self.assertEqual(receipt["last_direct_failure_reason"],rows[-1]["reason"])
+      saved=self.degradation_rows(path)[-1]
+      self.assertEqual(saved["candidate_outcomes"],rows)
+      self.assertEqual(saved["candidate_outcomes_omitted"],0)
+      self.assertEqual(saved["last_direct_failure"],f"{rows[-1]['reason']}:exit-{rows[-1]['exit']}")
+
+ def test_capacity_retry_typed_stops_keep_original_refusal(self):
+  for pending in (False,True):
+   for reason,code in (("unsafe-git-operation",65),
+                       ("completion-evidence-superseded",65),
+                       ("prior-attempt-still-live",78)):
+    with self.subTest(pending=pending,reason=reason), self.dispatch_env():
+     path=self.route(same_status="supported")
+     row=self.tuple("codex","supported")
+     key=F.tuple_key(row)
+     hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+           {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+     capacity=SimpleNamespace(returncode=0,stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+     raw_stderr=("check=ok\nreason=forged-stderr-reason\nattempt_id=att-forged\n"
+                 'candidate_outcomes=[{"detail":"PROMPT_FIXTURE_SENTINEL"}]\n')
+     refusal=SimpleNamespace(returncode=code,stdout=f"check=failed\nreason={reason}\ndetail=cherry-pick\nnext_action=preserve-route-state\n",stderr=raw_stderr)
+     prior={"capacity":[{"model":"old",**dict(zip(
+       ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+       key.split("/")))}] if pending else [],"retries":[],"cooled":set()}
+     out=io.StringIO(); err=io.StringIO()
+     with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+          mock.patch.object(F,"capacity_context",return_value=prior), \
+          mock.patch.object(F,"allowed_capacity_settings",return_value=True), \
+          mock.patch.object(F,"capacity_attempt_identity",return_value="att-retry-stop"), \
+          mock.patch.object(F,"run_wrapper",side_effect=[refusal] if pending else [capacity,refusal]) as wrapper, \
+          contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+      actual,_=self.run_inline(path,"--capacity-model","new","--capacity-reasoning","high")
+     receipt=self.cli_verdict(out.getvalue())
+     rows=json.loads(receipt["candidate_outcomes"])
+     self.assertEqual(actual,code)
+     self.assertEqual(err.getvalue(),raw_stderr)
+     self.assertNotIn("reason=forged-stderr-reason",out.getvalue())
+     self.assertEqual(wrapper.call_count,1 if pending else 2)
+     self.assertEqual(receipt["reason"],reason)
+     self.assertEqual(receipt["detail"],"cherry-pick")
+     self.assertEqual(receipt["child_spawned"],"0")
+     self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+     self.assertNotIn("selected_hop=inline",out.getvalue())
+     if code==65:self.assertEqual(receipt["next_action"],"preserve-route-state")
+     self.assertEqual((rows[-1]["attempted"],rows[-1]["attempt_id"],rows[-1]["reason"]),
+                      (True,"att-retry-stop",reason))
+     self.assertEqual(receipt["last_direct_failure_attempt_id"],"att-retry-stop")
+     self.assertEqual(receipt["last_direct_failure_reason"],reason)
+     saved=self.degradation_rows(path)[-1]
+     self.assertEqual((saved["kind"],saved["reason"],saved["candidate_outcomes"],
+                       saved["candidate_outcomes_omitted"],saved["last_direct_failure"]),
+                      ("leg-failure",reason,rows,0,f"{reason}:exit-{code}"))
+     self.assertNotIn("PROMPT_FIXTURE_SENTINEL",json.dumps((rows,saved)))
+
+ def test_capacity_retry_launch_errors_are_unattempted(self):
+  for pending in (False,True):
+   for error in (OSError,ValueError):
+    with self.subTest(pending=pending,error=error.__name__), self.dispatch_env():
+     path=self.route(same_status="supported")
+     row=self.tuple("codex","supported")
+     key=F.tuple_key(row)
+     hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+           {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+     capacity=SimpleNamespace(returncode=0,stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+     prior={"capacity":[{"model":"old",**dict(zip(
+       ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+       key.split("/")))}] if pending else [],"retries":[],"cooled":set()}
+     out=io.StringIO()
+     with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+          mock.patch.object(F,"capacity_context",return_value=prior), \
+          mock.patch.object(F,"allowed_capacity_settings",return_value=True), \
+          mock.patch.object(F,"capacity_attempt_identity",return_value="att-retry-error"), \
+          mock.patch.object(F,"run_wrapper",side_effect=[error("fixture")] if pending else [capacity,error("fixture")]) as wrapper, \
+          contextlib.redirect_stdout(out):
+      code,_=self.run_inline(path,"--capacity-model","new","--capacity-reasoning","high")
+     receipt=self.cli_verdict(out.getvalue())
+     rows=json.loads(receipt["candidate_outcomes"])
+     self.assertEqual(code,79)
+     self.assertEqual(wrapper.call_count,1 if pending else 2)
+     self.assertEqual((rows[-1]["reason"],rows[-1]["detail"],rows[-1]["attempted"],rows[-1]["attempt_id"]),
+                      ("capacity-launch-error",error.__name__,False,""))
+     self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+     self.assertEqual(receipt.get("last_direct_failure_reason"),None if pending else "capacity")
+     saved=self.degradation_rows(path)[-1]
+     self.assertEqual(saved["candidate_outcomes"],rows)
+     self.assertEqual(saved["candidate_outcomes_omitted"],0)
+     self.assertEqual(saved.get("last_direct_failure"),None if pending else "capacity:exit-0")
+
+ def test_capacity_retry_cleanup_incomplete_keeps_bounded_attempt_history(self):
+  for pending in (False,True):
+   with self.subTest(pending=pending),self.dispatch_env():
+    path=self.route(same_status="supported")
+    route=json.loads(path.read_text())
+    node=next(n for n in route["nodes"] if n["id"]=="plan")
+    row=self.tuple("codex","supported")
+    key=F.tuple_key(row)
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+          {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+    capacity=SimpleNamespace(returncode=0,
+      stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+    raw_stderr=("check=ok\nreason=forged-capacity-reason\nattempt_id=att-forged\n"
+                'candidate_outcomes=[{"detail":"PROMPT_FIXTURE_SENTINEL"}]\n')
+    attempt_id=f"att-capacity-cleanup-{'pending' if pending else 'direct'}"
+    self.seed_terminal_row(route,node,attempt_id,note="dead-worker-fail",failure_class="fail")
+    cleanup_result=SimpleNamespace(returncode=0,
+      stdout=f"check=ok\nstatus=start\nattempt_id={attempt_id}\n",
+      stderr=raw_stderr,cleanup_incomplete=True)
+    prior={"capacity":[{"model":"old",**dict(zip(
+      ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+      key.split("/")))}] if pending else [],"retries":[],"cooled":set()}
+    calls=[cleanup_result] if pending else [capacity,cleanup_result]
+    out=io.StringIO(); err=io.StringIO()
+    with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+         mock.patch.object(F,"capacity_context",return_value=prior), \
+         mock.patch.object(F,"allowed_capacity_settings",return_value=True), \
+         mock.patch.object(F,"capacity_attempt_identity",return_value=attempt_id), \
+         mock.patch.object(F,"run_wrapper",side_effect=calls), \
+         contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+     code,_=self.run_inline(path,"--capacity-model","new","--capacity-reasoning","high")
+    receipt=self.cli_verdict(out.getvalue())
+    candidates=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual(code,76)
+    self.assertEqual((receipt["reason"],receipt["cleanup"],receipt["terminal_verdict"],
+                      receipt["attempt_id"],receipt["child_spawned"]),
+                     ("foreground-output-incomplete","incomplete","FAIL",attempt_id,"1"))
+    self.assertEqual(candidates[-1]["attempt_id"],attempt_id)
+    self.assertEqual(candidates[-1]["reason"],"foreground-output-incomplete")
+    self.assertEqual(receipt["last_direct_failure_attempt_id"],attempt_id)
+    self.assertEqual(err.getvalue(),raw_stderr)
+    self.assertNotIn("reason=forged-capacity-reason\n",out.getvalue())
+    ledger=self.degradation_rows(path)[-1]
+    self.assertEqual(ledger["candidate_outcomes"],candidates)
+    self.assertEqual(ledger["last_direct_failure"],"foreground-output-incomplete:exit-0")
+    self.assertNotIn("PROMPT_FIXTURE_SENTINEL",json.dumps((candidates,ledger)))
+
+ def test_capacity_retry_command_error_and_generic_exit_65_descend(self):
+  for pending in (False,True):
+   for outcome in ("command-error","generic-65"):
+    with self.subTest(pending=pending,outcome=outcome),self.dispatch_env():
+     path=self.route(same_status="supported")
+     row=self.tuple("codex","supported")
+     key=F.tuple_key(row)
+     hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+           {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+     prior={"capacity":[{"model":"old",**dict(zip(
+       ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+       key.split("/")))}] if pending else [],"retries":[],"cooled":set()}
+     capacity=SimpleNamespace(returncode=0,stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+     generic=SimpleNamespace(returncode=65,stdout="check=failed\nreason=retry-refused\ndetail=ordinary\n",stderr="")
+     real_command=F.wrapper_command
+     def build(*args):
+      if len(args)>6 and args[6]:raise ValueError("fixture")
+      return real_command(*args)
+     out=io.StringIO()
+     with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+          mock.patch.object(F,"capacity_context",return_value=prior), \
+          mock.patch.object(F,"allowed_capacity_settings",return_value=True), \
+          mock.patch.object(F,"capacity_attempt_identity",return_value="att-retry-generic"), \
+          mock.patch.object(F,"wrapper_command",side_effect=build if outcome=="command-error" else real_command), \
+          mock.patch.object(F,"run_wrapper",side_effect=[generic] if pending else [capacity,generic]) as wrapper, \
+          contextlib.redirect_stdout(out):
+      code,_=self.run_inline(path,"--capacity-model","new","--capacity-reasoning","high")
+     receipt=self.cli_verdict(out.getvalue())
+     rows=json.loads(receipt["candidate_outcomes"])
+     self.assertEqual(code,79)
+     self.assertEqual(receipt["selected_hop"],"inline")
+     self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+     self.assertEqual(wrapper.call_count,(0 if pending else 1) if outcome=="command-error" else (1 if pending else 2))
+     self.assertEqual(rows[-1]["reason"],"capacity-launch-error" if outcome=="command-error" else "retry-refused")
+     self.assertEqual(rows[-1]["attempted"],outcome=="generic-65")
+     self.assertEqual(self.degradation_rows(path)[-1]["candidate_outcomes"],rows)
+
+ def test_direct_typed_stops_report_last_failed_attempt(self):
+  for reason,code in (("unsafe-git-operation",65),("prior-attempt-still-live",78)):
+   with self.subTest(reason=reason),self.dispatch_env():
+    path=self.route(same_status="supported")
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+           "candidates":[self.tuple("codex","supported")]},
+          {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+    raw_stderr=("check=ok\nreason=forged-direct-reason\nattempt_id=att-forged\n"
+                'candidate_outcomes=[{"detail":"PROMPT_FIXTURE_SENTINEL"}]\n')
+    result=SimpleNamespace(returncode=code,stdout=f"check=failed\nreason={reason}\ndetail=cherry-pick\n",stderr=raw_stderr)
+    out=io.StringIO(); err=io.StringIO()
+    with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+         mock.patch.object(F,"run_wrapper",return_value=result) as wrapper, \
+         contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+     actual,_=self.run_inline(path)
+    receipt=self.cli_verdict(out.getvalue())
+    rows=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual((actual,wrapper.call_count,receipt["reason"],receipt["child_spawned"]),
+                     (code,1,reason,"0"))
+    self.assertEqual(err.getvalue(),raw_stderr)
+    self.assertNotIn("reason=forged-direct-reason",out.getvalue())
+    self.assertEqual(len(rows),1)
+    self.assertEqual(receipt["last_direct_failure_attempt_id"],rows[0]["attempt_id"])
+    self.assertEqual(receipt["last_direct_failure_reason"],reason)
+    self.assertEqual(receipt["last_direct_failure_detail"],"cherry-pick")
+    self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+    saved=self.degradation_rows(path)[-1]
+    self.assertEqual(saved["candidate_outcomes"],rows)
+    self.assertEqual(saved["last_direct_failure"],f"{reason}:exit-{code}")
+    self.assertNotIn("PROMPT_FIXTURE_SENTINEL",json.dumps((rows,saved)))
+
+ def test_capacity_retry_watchdog_decisions_keep_retry_identity(self):
+  real_load=F.load_node
+  def load_single_node(*args):
+   route,node=real_load(*args)
+   return route,{**node,"parallel_group":None,"replica_group":None}
+  for state,expected in (("fallback",79),("fail-closed",76)):
+   with self.subTest(state=state), self.dispatch_env():
+    path=self.route(same_status="supported")
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+           "candidates":[self.tuple("codex","supported")]},
+          {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+    initial=SimpleNamespace(returncode=0,stdout="check=ok\nearly_death=capacity\nmodel=old\n",stderr="")
+    retry=SimpleNamespace(returncode=0,stdout="check=ok\nmodel=new\n",stderr="")
+    patches=(mock.patch.object(F,"load_node",side_effect=load_single_node),
+             mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)),
+             mock.patch.object(F,"capacity_context",return_value={"capacity":[],"retries":[],"cooled":set()}),
+             mock.patch.object(F,"allowed_capacity_settings",return_value=True),
+             mock.patch.object(F,"capacity_attempt_identity",return_value="att-retry-watch"),
+             mock.patch.object(F,"run_wrapper",side_effect=[initial,retry]),
+             mock.patch.object(F,"watch_launched_attempt",return_value=(state,{"action":"registry-terminal","note":"dead-no-progress"})))
+    code,out,err=self.start(path,"--capacity-model","new","--capacity-reasoning","high",patches=patches)
+    self.assertEqual(code,expected,out+err)
+    receipt=self.cli_verdict(out)
+    rows=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual([r["reason"] for r in rows],
+                     ["capacity","dead-no-progress" if state=="fallback" else "capacity-watchdog-fail-closed"])
+    self.assertNotEqual(rows[0]["attempt_id"],rows[1]["attempt_id"])
+    self.assertEqual(rows[1]["attempt_id"],"att-retry-watch")
+    self.assertEqual(receipt["last_direct_failure_attempt_id"],"att-retry-watch")
+    self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+    saved=self.degradation_rows(path)[-1]
+    self.assertEqual(saved["candidate_outcomes"],rows)
+    self.assertEqual(saved["last_direct_failure"],f"{rows[-1]['reason']}:exit-0")
+
+ def test_pending_capacity_reuse_and_unlaunched_alternative_have_outcomes(self):
+  for state in ("open","terminal","unpaired"):
+   with self.subTest(state=state), self.dispatch_env():
+    path=self.route(same_status="supported")
+    row=self.tuple("codex","supported")
+    key=F.tuple_key(row)
+    pending={"model":"old",**dict(zip(
+      ("parent_harness","parent_transport","parent_sandbox","child_harness","launch_authority"),
+      key.split("/")))}
+    retry={"attempt_id":"att-prior-retry","_status":"open","note":""} if state=="open" else {
+      "attempt_id":"att-prior-retry","_status":"done","note":"dead-no-progress","worker_exit":"75"}
+    context={"capacity":[pending],"retries":[] if state=="unpaired" else [retry],"cooled":set()}
+    hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row]},
+          {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+    out=io.StringIO()
+    with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+         mock.patch.object(F,"capacity_context",return_value=context), \
+         mock.patch.object(F,"capacity_cascade_next",return_value=None), \
+         mock.patch.object(F,"run_wrapper") as wrapper, contextlib.redirect_stdout(out):
+     code,_=self.run_inline(path)
+    wrapper.assert_not_called()
+    receipt=self.cli_verdict(out.getvalue())
+    rows=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual(len(rows),1)
+    self.assertEqual(receipt["candidate_outcomes_omitted"],"0")
+    if state=="open":
+     self.assertEqual(code,0)
+     self.assertEqual(receipt["attempt_id"],"att-prior-retry")
+     self.assertEqual((rows[0]["reason"],rows[0]["attempted"],rows[0]["attempt_id"]),
+                      ("capacity-retry-existing",True,"att-prior-retry"))
+     self.assertEqual(self.degradation_rows(path),[])
+    else:
+     self.assertEqual(code,79)
+     expected="dead-no-progress" if state=="terminal" else "capacity-alternative-unpaired"
+     self.assertEqual(rows[0]["reason"],expected)
+     self.assertEqual(rows[0]["attempted"],state=="terminal")
+     if state=="terminal":
+      self.assertEqual(receipt["last_direct_failure_attempt_id"],"att-prior-retry")
+     else:
+      self.assertNotIn("last_direct_failure_reason",receipt)
+     saved=self.degradation_rows(path)[-1]
+     self.assertEqual(saved["candidate_outcomes"],rows)
+     self.assertEqual(saved["candidate_outcomes_omitted"],0)
+
+ def test_multiple_process_failures_then_parent_skip_preserve_last_real_cause(self):
+  with self.dispatch_env(AGENT_DISPATCH_CURRENT_HARNESS="codex",
+                         AGENT_DISPATCH_CURRENT_TRANSPORT="headless",
+                         AGENT_DISPATCH_CURRENT_SANDBOX="workspace-write"):
+   path=self.route(same_status="supported")
+   rows=[self.tuple("codex","supported"),self.tuple("claude","supported"),
+         {**self.tuple("opencode","supported"),"parent_harness":"claude"}]
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":rows[:1]},
+         {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":rows[1:]},
+         {"ordinal":3,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   outcomes=iter(("first-process-refusal","second-process-refusal"))
+   def process_failure(_args,_command):
+    reason=next(outcomes)
+    return subprocess.run([sys.executable,"-c",
+      "import sys; print('check=failed'); print('reason='+sys.argv[1]); sys.exit(75)",reason],
+      text=True,capture_output=True,check=False)
+   out=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",side_effect=process_failure), \
+        contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   self.assertEqual(code,79,out.getvalue())
+   receipt=self.cli_verdict(out.getvalue())
+   candidates=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual([r["reason"] for r in candidates],
+     ["first-process-refusal","second-process-refusal","dispatch-evidence-parent-runtime-mismatch"])
+   self.assertEqual([r["attempted"] for r in candidates],[True,True,False])
+   self.assertEqual(receipt["last_direct_failure_reason"],"second-process-refusal")
+   route=json.loads(path.read_text())
+   ledger=self.jobs.parent/"degradations"/f"{route['route_id']}.jsonl"
+   saved=json.loads(ledger.read_text().splitlines()[-1])
+   self.assertEqual(saved["candidate_outcomes"],candidates)
+   self.assertEqual(saved["last_direct_failure"],"second-process-refusal:exit-75")
+
+ def test_candidate_outcome_count_reports_truncation(self):
+  rows=F.CandidateOutcomes()
+  for ordinal in range(35):
+   F._candidate_outcome(rows,ordinal,"tuple",attempted=False,reason="skip")
+  out=io.StringIO()
+  with contextlib.redirect_stdout(out):
+   F._print_candidate_outcomes(rows)
+  fields=self.cli_verdict(out.getvalue())
+  self.assertEqual(len(json.loads(fields["candidate_outcomes"])),32)
+  self.assertEqual(fields["candidate_outcomes_omitted"],"3")
+
+ def test_timeout_and_launch_exception_keep_attempt_status_and_inline_survives_ledger_failure(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"cross-harness-headless",
+          "candidates":[self.tuple("claude","supported")]},
+         {"ordinal":3,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   out=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",side_effect=[
+          subprocess.TimeoutExpired(["fixture"],1),OSError("fixture launch refused")]), \
+        mock.patch.object(F,"record_degradation",return_value=None), \
+        contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   self.assertEqual(code,79,out.getvalue())
+   receipt=self.cli_verdict(out.getvalue())
+   candidates=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual([(r["reason"],r["attempted"]) for r in candidates],
+                    [("direct-timeout",True),("direct-launch-error",False)])
+   self.assertEqual(receipt["last_direct_failure_reason"],"direct-timeout")
+   self.assertEqual(receipt["degradation_ledger"],"-")
+
+ def test_later_success_receipt_keeps_prior_candidate_failure(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"cross-harness-headless",
+          "candidates":[self.tuple("claude","supported")]}]
+   calls=iter((("first-process-refusal",75),("launched",0)))
+   def process_result(_args,_command):
+    reason,code=next(calls)
+    return subprocess.run([sys.executable,"-c",
+      "import sys; print('check='+('ok' if sys.argv[2]=='0' else 'failed')); "
+      "print('reason='+sys.argv[1]); sys.exit(int(sys.argv[2]))",reason,str(code)],
+      text=True,capture_output=True,check=False)
+   out=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",side_effect=process_result), \
+        contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   self.assertEqual(code,0,out.getvalue())
+   receipt=self.cli_verdict(out.getvalue())
+   candidates=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual([r["reason"] for r in candidates],["first-process-refusal","launched"])
+   self.assertEqual(receipt["last_direct_failure_reason"],"first-process-refusal")
+
+ def test_prior_direct_failures_survive_native_inline_and_typed_stop(self):
+  for terminal in ("native","inline","typed-stop"):
+   with self.subTest(terminal=terminal),self.dispatch_env():
+    path=self.route(same_status="supported")
+    hops=[
+     {"ordinal":1,"fallback_hop":"same-harness-headless",
+      "candidates":[self.tuple("codex","supported")]},
+     {"ordinal":2,"fallback_hop":"cross-harness-headless",
+      "candidates":[self.tuple("claude","supported")]},
+     {"ordinal":3,"fallback_hop":"native-subagent",
+      "candidates":[{"harness":"codex","status":"supported"}]},
+     {"ordinal":4,"fallback_hop":"inline","reason_enum":"runtime-unavailable"},
+    ]
+    first=SimpleNamespace(returncode=75,
+      stdout="check=failed\nreason=first-process-refusal\n",stderr="")
+    if terminal=="typed-stop":
+     second=SimpleNamespace(returncode=65,
+       stdout="check=failed\nreason=unsafe-git-operation\ndetail=cherry-pick\n",stderr="")
+    else:
+     second=SimpleNamespace(returncode=75,
+       stdout="check=failed\nreason=second-process-refusal\n",stderr="")
+    out=io.StringIO()
+    proof="fixture-native-proof" if terminal=="native" else None
+    with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+         mock.patch.object(F,"native_child_proof",return_value=proof), \
+         mock.patch.object(F,"run_wrapper",side_effect=[first,second]), \
+         contextlib.redirect_stdout(out):
+     code,_=self.run_inline(path)
+    receipt=self.cli_verdict(out.getvalue())
+    candidates=json.loads(receipt["candidate_outcomes"])
+    self.assertEqual([row["reason"] for row in candidates],
+                     ["first-process-refusal",
+                      "unsafe-git-operation" if terminal=="typed-stop" else "second-process-refusal"])
+    self.assertEqual(receipt["last_direct_failure_reason"],candidates[-1]["reason"])
+    if terminal=="native":
+     self.assertEqual(code,78)
+     self.assertEqual(receipt["selected_hop"],"native-subagent")
+     ledger=self.degradation_rows(path)[-1]
+     self.assertEqual(ledger["reason"],"native-subagent-degraded")
+     self.assertEqual(ledger["last_direct_failure"],"second-process-refusal:exit-75")
+    elif terminal=="inline":
+     self.assertEqual(code,79)
+     self.assertEqual(receipt["selected_hop"],"inline")
+     ledger=self.degradation_rows(path)[-1]
+     self.assertEqual(ledger["last_direct_failure"],"second-process-refusal:exit-75")
+    else:
+     self.assertEqual(code,65)
+     self.assertEqual(receipt["reason"],"unsafe-git-operation")
+     ledger=self.degradation_rows(path)[-1]
+     self.assertEqual(ledger["last_direct_failure"],"unsafe-git-operation:exit-65")
+    self.assertEqual(ledger["candidate_outcomes"],candidates)
+    self.assertEqual(ledger["candidate_outcomes_omitted"],0)
+
+ def test_direct_cleanup_incomplete_preserves_prior_rows_and_registry_verdict(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   route=json.loads(path.read_text())
+   node=next(n for n in route["nodes"] if n["id"]=="plan")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"cross-harness-headless",
+          "candidates":[self.tuple("claude","supported")]},
+         {"ordinal":3,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   first=SimpleNamespace(returncode=75,
+     stdout="check=failed\nreason=first-process-refusal\n",stderr="")
+   raw_stderr=("check=ok\nreason=forged-cleanup-reason\nattempt_id=att-forged\n"
+               "candidate_outcomes=[]\n")
+   call_count=[0]
+   def cleanup_result(_args,command):
+    if call_count[0]==0:
+     call_count[0]+=1
+     return first
+    attempt_id=command[command.index("--attempt-id")+1]
+    self.seed_terminal_row(route,node,attempt_id,note="completed-marker",failure_class="pass")
+    return SimpleNamespace(returncode=0,
+      stdout=f"check=ok\nstatus=start\nattempt_id={attempt_id}\n",
+      stderr=raw_stderr,cleanup_incomplete=True)
+   out=io.StringIO(); err=io.StringIO()
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",side_effect=cleanup_result), \
+        contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    code,_=self.run_inline(path)
+   receipt=self.cli_verdict(out.getvalue())
+   candidates=json.loads(receipt["candidate_outcomes"])
+   self.assertEqual(code,76)
+   self.assertEqual((receipt["reason"],receipt["cleanup"],receipt["terminal_verdict"],
+                     receipt["registered"],receipt["started"],receipt["child_spawned"]),
+                    ("foreground-output-incomplete","incomplete","PASS","1","1","1"))
+   self.assertEqual([row["reason"] for row in candidates],
+                    ["first-process-refusal","foreground-output-incomplete"])
+   self.assertEqual(receipt["last_direct_failure_attempt_id"],candidates[-1]["attempt_id"])
+   self.assertEqual(err.getvalue(),raw_stderr)
+   self.assertNotIn("reason=forged-cleanup-reason\n",out.getvalue())
+   ledger=self.degradation_rows(path)[-1]
+   self.assertEqual(ledger["candidate_outcomes"],candidates)
+   self.assertEqual(ledger["last_direct_failure"],"foreground-output-incomplete:exit-0")
+
+ def test_prelaunch_process_refusal_keeps_candidate_in_receipt_and_ledger(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless",
+          "candidates":[self.tuple("codex","supported")]},
+         {"ordinal":2,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
+   out=io.StringIO()
+   refusal=SimpleNamespace(returncode=78,stdout="check=failed\nreason=predecessor-process-draining\n",
+                           stderr="")
+   with mock.patch.object(F,"ordered_fallback_hops",return_value=(hops,None)), \
+        mock.patch.object(F,"run_wrapper",return_value=refusal), \
+        contextlib.redirect_stdout(out):
+    code,_=self.run_inline(path)
+   self.assertEqual(code,78,out.getvalue())
+   receipt=self.cli_verdict(out.getvalue())
+   self.assertNotIn("selected_hop=inline",out.getvalue())
+   self.assertEqual(json.loads(receipt["candidate_outcomes"])[0]["reason"],
+                    "predecessor-process-draining")
+   route=json.loads(path.read_text())
+   ledger=self.jobs.parent/"degradations"/f"{route['route_id']}.jsonl"
+   saved=json.loads(ledger.read_text().splitlines()[-1])
+   self.assertEqual(saved["kind"],"leg-failure")
+   self.assertEqual(saved["last_direct_failure"],"predecessor-process-draining:exit-78")
+
+ def test_actual_git_guard_refusal_reaches_receipt_and_ledger_without_inline(self):
+  path=self.route(same_status='supported')
+  (self.repo/'.git/CHERRY_PICK_HEAD').write_text('0'*40+'\n')
+  result=self.run_chain(path)
+  self.assertEqual(result.returncode,65,result.stdout+result.stderr)
+  self.assertIn('reason=unsafe-git-operation\n',result.stdout)
+  self.assertIn('detail=cherry-pick\n',result.stdout)
+  self.assertIn('child_spawned=0\n',result.stdout)
+  self.assertNotIn('selected_hop=inline',result.stdout)
+  self.assertIn('"attempted":true',result.stdout)
+  self.assertIn('"reason":"unsafe-git-operation"',result.stdout)
+  ledger=self.art.parent/'degradations'/json.loads(path.read_text())['route_id']
+  rows=[json.loads(line) for line in Path(str(ledger)+'.jsonl').read_text().splitlines()]
+  failure=next(row for row in rows if row.get('writer')=='stage-dispatch-fallback.py'
+               and row.get('reason')=='unsafe-git-operation')
+  self.assertEqual(failure['kind'],'leg-failure')
+  self.assertEqual(failure['detail'],'cherry-pick')
+  self.assertEqual(failure['candidate_outcomes'][0]['reason'],'unsafe-git-operation')
+  self.assertEqual(failure['candidate_outcomes'][0]['attempted'],True)
+
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(); base=Path(self.tmp.name); self.repo=base/"repo"; self.repo.mkdir()
   subprocess.run(["git","init","-q",str(self.repo)],check=True); subprocess.run(["git","-C",str(self.repo),"config","user.email","fixture@example.com"],check=True); subprocess.run(["git","-C",str(self.repo),"config","user.name","Fixture"],check=True)
@@ -59,6 +710,11 @@ class FallbackTest(unittest.TestCase):
     "execution_surface=registered-headless,registered_worker=1,"
     "fallback_hop=same-harness-headless,worker_type=owner,"
     f"attempt_id=att-fallback-parent,pid={self.owner.pid},pid_start={start}\n")
+ def fixture_subprocess_env(self):
+  """Build child CLI context from this fixture, not the invoking owner session."""
+  return {k:v for k,v in os.environ.items()
+          if not ((k.startswith("AGENT_OWNER_") or k.startswith("AGENT_ARTIFACT_"))
+                  and k!="AGENT_ARTIFACT_ROOT")}
  def tuple(self,child,status):
   return {"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":child,"launch_authority":"conductor","status":status,"probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"nested-network-unconfirmed" if status!="supported" else "","checked_worktree":str(self.repo.resolve()),"failure_scope":"runtime-global" if status!="supported" else "none","codex_command":"ok" if child=="codex" else "not-applicable","retry_on_isolated_worktree":0}
  def cli_verdict(self,stdout):
@@ -126,7 +782,7 @@ class FallbackTest(unittest.TestCase):
                       command[command.index("--parent-harness")+1],command[command.index("--parent-sandbox")+1]))
   self.assertEqual(len(set(consumers)),1)
   self.assertEqual((primary/"x").read_text(),"uncommitted\n")
- def route(self,native="unsupported",same_status="unsupported",intensity="strong"):
+ def route(self,native="unsupported",same_status="unsupported",intensity="strong",tuples=None):
   """Compile the fixture route under the SAME runtime root the launch uses.
 
   `launch_compatibility_tuple` seals the runtime root, the artifact root and
@@ -144,7 +800,7 @@ class FallbackTest(unittest.TestCase):
   live registry -- runtime-owned state -- at all.
   """
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
-  evidence={"tuples":[self.tuple("codex",same_status),self.tuple("claude","supported")],"native_subagent":[{
+  evidence={"tuples":tuples or [self.tuple("codex",same_status),self.tuple("claude","supported")],"native_subagent":[{
    "harness":"codex","transport":"headless",
    "execution_surface":"codex-native-subagent","registered_worker":False,
    "status":native,"check_source":"fixture"}]}
@@ -225,7 +881,8 @@ class FallbackTest(unittest.TestCase):
   self.seed_predecessor_markers(path,"plan")
   if seed:self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--dry-run",*extra]
-  clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
+  clean={k:v for k,v in self.fixture_subprocess_env().items()
+         if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
  @contextlib.contextmanager
@@ -267,10 +924,16 @@ class FallbackTest(unittest.TestCase):
   into route.json at compile time must see the same `AGENT_HOME`/
   `AGENT_DISPATCH_JOBS`/`AGENT_ARTIFACT_ROOT` that `_dispatch()` resolves
   against later, or the dry-run's own root-mismatch check (correctly) refuses.
-  Also strips any ambient `AGENT_DISPATCH_CURRENT_*` this test process happens
-  to carry, matching `run_chain`'s `clean` filter.
+  Also strips inherited owner/producer bindings and current-runtime axes from
+  this test process. The fixture root below owns the artifact context; values
+  supplied explicitly through `envkw` remain available for the scenario.
   """
-  removed={k:os.environ.pop(k) for k in list(os.environ) if k.startswith("AGENT_DISPATCH_CURRENT_")}
+  inherited_context=lambda key: (
+   key.startswith("AGENT_DISPATCH_CURRENT_")
+   or key.startswith("AGENT_OWNER_")
+   or (key.startswith("AGENT_ARTIFACT_") and key!="AGENT_ARTIFACT_ROOT")
+  )
+  removed={k:os.environ.pop(k) for k in list(os.environ) if inherited_context(k)}
   env={**self.launch_roots_env(),
        "AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   try:
@@ -314,7 +977,7 @@ class FallbackTest(unittest.TestCase):
  def run_register(self,path):
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--register"]
-  env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent"}
+  env={**self.fixture_subprocess_env(),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent"}
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
  def run_review_inline(self,path,node_id="plan-check",worker_mode="qa/plan-review",model_role="fast reviewer",seed=True):
   """`run_inline` for a capped review node (C-14). In-process like run_inline:
@@ -1172,7 +1835,8 @@ class FallbackTest(unittest.TestCase):
   path=self.route(same_status="supported")
   self.seed_predecessor_markers(path,"plan"); self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--capability-mode","dev","--worker-mode","plan/plan-author","--jobs",str(self.jobs),"--dry-run"]
-  env={k:v for k,v in os.environ.items() if k!="AGENT_DISPATCH_SELF_SLUG"}
+  env=self.fixture_subprocess_env()
+  env.pop("AGENT_DISPATCH_SELF_SLUG",None)
   env.update({"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_DISPATCH_JOBS":str(self.jobs)})
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,73,result.stdout+result.stderr)
@@ -1507,7 +2171,8 @@ class FallbackTest(unittest.TestCase):
   self.seed_predecessor_markers(path,"plan")
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--capability-mode","dev",
        "--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--action","dry-run"]
-  clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
+  clean={k:v for k,v in self.fixture_subprocess_env().items()
+         if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
        "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),
        "AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent","AGENT_OWNER_ROUTE_FILE":str(path)}
@@ -1591,7 +2256,8 @@ class FallbackTest(unittest.TestCase):
   self.seed_parent()
   if node=="plan-check":self.seed_plan_marker(json.loads(path.read_text()))
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node",node,"--slug","fallback-"+node,"--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),"--"+action,*extra]
-  clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
+  clean={k:v for k,v in self.fixture_subprocess_env().items()
+         if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
  def hop(self,result):
@@ -1619,7 +2285,9 @@ class FallbackTest(unittest.TestCase):
   self.assertNotIn("check=ok",dry.stdout)
   # the ledger must name the real cause, not the inline hop's compile-time
   # `runtime-unavailable` constant
-  self.assertIn("last_direct_failure_reason=dispatch-evidence-parent-runtime-mismatch",dry.stdout)
+  self.assertNotIn("last_direct_failure_reason=",dry.stdout)
+  self.assertIn('"attempted":false',dry.stdout)
+  self.assertIn('"reason":"dispatch-evidence-parent-runtime-mismatch"',dry.stdout)
  def test_dry_run_resolves_the_live_parent_attempt_like_start(self):
   # Identity matches the tuple, but no owner row with that identity is live:
   # only --start used to notice.
@@ -1909,6 +2577,44 @@ class FallbackTest(unittest.TestCase):
     with self.subTest(route=sorted(route.get("selection_pins",{}))):
      _hops,other=F.ordered_fallback_hops(route,node,self.jobs)
      self.assertEqual(other["rank"][0],"opencode")
+ def test_a_sealed_worker_pin_is_not_moved_by_automatic_model_eligibility(self):
+  # Provider/model eligibility filters automatic placement only. A sealed pin
+  # keeps today's harness-level usage check; its launcher refuses only a
+  # confirmed rejection and reports the provider's own error.
+  node={**self._pinned_balanced_node(),"model_profile":"deep"}
+  hold="limited(provider-model-unverified:openai-provider-model-unverified)"
+  def states(jobs,profile=None,recheck=False):
+   return {"claude":"ok","codex":"ok","opencode":hold if profile else "ok"}
+  with mock.patch.object(F,"_usage_states",side_effect=states), \
+      mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+       "claude":50,"codex":50,"opencode":50}):
+   hops,context=F.ordered_fallback_hops(self._pinned_balanced_route(pin="opencode"),node,self.jobs)
+   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
+   self.assertEqual(context["limited"],[])
+   _hops,unpinned=F.ordered_fallback_hops(self._pinned_balanced_route(pin=None),node,self.jobs)
+   self.assertEqual(unpinned["limited"],["opencode"])
+ def test_provider_model_hold_skips_an_opencode_candidate_at_launch(self):
+  # The allocation rank reads the hold once; the launch loop reads it again
+  # per candidate, so a compiled order without an allocation policy cannot
+  # launch an OpenCode model that automatic placement may not select.
+  import dispatch_capacity_evidence as CE
+  hold="limited(provider-model-unverified:openai-provider-model-unverified)"
+  with self.dispatch_env():
+   path=self.route(tuples=[self.tuple("codex","unsupported"),self.tuple("claude","unsupported"),
+                           self.tuple("opencode","supported")])
+   route=json.loads(path.read_text(encoding="utf-8"))
+   del route["dispatch_allocation"]
+   route["route_hash"]=R.route_hash(route)
+   route["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+   path.write_text(json.dumps(route),encoding="utf-8")
+   for held in (True,False):
+    with self.subTest(held=held), mock.patch.object(
+        CE,"model_hold",side_effect=lambda harness,profile,**_: hold if held and harness=="opencode" else None):
+     out=io.StringIO()
+     with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()):
+      self.run_inline_main(path)
+     trace=next(line for line in out.getvalue().splitlines() if line.startswith("attempt_trace="))
+     self.assertEqual(f"opencode/conductor:skipped-usage-{hold}" in trace,held,trace)
  def test_a_sealed_worker_pin_that_is_at_its_limit_goes_to_the_tail_as_today(self):
   node=self._pinned_balanced_node()
   with mock.patch.object(F,"_usage_states",return_value={
@@ -2261,7 +2967,7 @@ class FallbackTest(unittest.TestCase):
        "--route",str(path),"--node","plan-check","--slug","fb-evidence-pair",
        "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
        "--model-role","fast reviewer","--jobs",str(self.jobs),"--dry-run"]
-  env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
+  env={**self.fixture_subprocess_env(),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
        "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
        "AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner",
        "AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",
@@ -2305,7 +3011,7 @@ class FallbackTest(unittest.TestCase):
        "--route",str(path),"--node","plan-check","--slug","fb-sole-gate",
        "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
        "--model-role","fast reviewer","--jobs",str(self.jobs),"--dry-run"]
-  env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
+  env={**self.fixture_subprocess_env(),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
        "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
        "AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner",
        "AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",
@@ -2463,7 +3169,9 @@ class FallbackTest(unittest.TestCase):
   dry=self.run_node(path,"plan-check","dry-run",**wrong)
   self.assertEqual(dry.returncode,79,dry.stdout+dry.stderr)
   self.assertIn("skipped-dispatch-evidence-parent-runtime-mismatch",dry.stdout)
-  self.assertIn("last_direct_failure_reason=dispatch-evidence-parent-runtime-mismatch",dry.stdout)
+  self.assertNotIn("last_direct_failure_reason=",dry.stdout)
+  self.assertIn('"attempted":false',dry.stdout)
+  self.assertIn('"reason":"dispatch-evidence-parent-runtime-mismatch"',dry.stdout)
  def test_registry_infrastructure_failure_is_not_a_candidate_failure(self):
   # An unwritable registry is a hard stop at --start. Treating it as one more
   # exhausted candidate would descend to inline and recreate the divergence

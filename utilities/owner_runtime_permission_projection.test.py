@@ -680,11 +680,33 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         self.assertEqual(opencode[1]["argv"][opencode[1]["argv"].index("--session") + 1],
                          "ses_fixture")
         active_config, settled_config = [row["config"] for row in opencode]
-        self.assertEqual(active_config["permission"]["edit"]["*"], "deny")
-        self.assertEqual(active_config["permission"]["bash"]["*"], "deny")
-        self.assertNotEqual(settled_config["permission"].get("edit"), "deny")
+        import dispatch_replacement
+        active_record = dispatch_replacement._applied_permissions(
+            types.SimpleNamespace(opencode_config_content=json.dumps(active_config)))
+        settled_record = dispatch_replacement._applied_permissions(
+            types.SimpleNamespace(opencode_config_content=json.dumps(settled_config)))
+        import opencode_runtime as permission_runtime
+        self.assertTrue(active_record["opencode_permission"])
+        self.assertTrue(settled_record["opencode_permission"])
+        active_legacy = (permission_runtime.opencode_v2_to_legacy_config(active_config)
+                         if "permissions" in active_config else active_config)
+        settled_legacy = (permission_runtime.opencode_v2_to_legacy_config(settled_config)
+                          if "permissions" in settled_config else settled_config)
+        if "permissions" in active_config:
+            self.assertNotIn("permission", active_config)
+            self.assertIn("agents", active_config)
+        if "permissions" in settled_config:
+            self.assertNotIn("permission", settled_config)
+            self.assertIn("agents", settled_config)
+        self.assertEqual(active_record["opencode_permission"]["edit"]["*"], "deny")
+        self.assertEqual(active_record["opencode_permission"]["bash"]["*"], "deny")
+        self.assertNotEqual(settled_record["opencode_permission"].get("edit"), "deny")
         self.assertTrue(any("gh pr create" in command and value == "allow"
-                            for command, value in settled_config["permission"]["bash"].items()))
+                            for command, value in settled_record["opencode_permission"]["bash"].items()))
+        if "agent" in active_legacy:
+            self.assertTrue(active_legacy["agent"]["build"]["permission"])
+        if "agent" in settled_legacy:
+            self.assertTrue(settled_legacy["agent"]["build"]["permission"])
 
         for harness, attempt in attempts.items():
             rows = self.jobs[harness].read_text(encoding="utf-8").splitlines()

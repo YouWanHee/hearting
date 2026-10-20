@@ -20,8 +20,10 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from argparse import Namespace
 
 import route_authority as AUTHORITY
+import dispatch_replacement as REPLACEMENT
 from dispatch_contract import DispatchContractError
 
 HERE = Path(__file__).resolve().parent
@@ -50,25 +52,56 @@ class RecoveryAuthorityTest(unittest.TestCase):
                 candidate = copy.deepcopy(self.history)
                 candidate["harness"] = harness
                 candidate["resolved"].update(model="current-model")
+                if harness == "opencode":
+                    candidate["applied_permissions"] = REPLACEMENT._applied_permissions(
+                        Namespace(opencode_config_content=json.dumps({
+                            "permissions": [{"action": "read", "resource": "*", "effect": "allow"}],
+                            "agents": {},
+                        })))
                 AUTHORITY.require_recovery_work(candidate, self.history, route=route, worker_type="owner")
         self.assertEqual(json.dumps(self.history, sort_keys=True), before)
 
     def test_cross_harness_legacy_grant_keeps_addresses_and_blocks_expansion(self):
         route = dict(self.route, selection_pins={"contract_version": 1,
                      "owner": {"harness": "opencode", "model": None, "effort": None}})
-        candidate = copy.deepcopy(self.history); candidate["harness"] = "opencode"
-        candidate["applied_permissions"] = {"opencode_permission": {
-            "external_directory": {"*": "deny", self.route["artifact_root"] + "/**": "allow"},
-            "edit": {"*": "deny", self.route["cwd"] + "/**": "allow"}}}
-        AUTHORITY.require_recovery_work(candidate, self.history, route=route, worker_type="owner")
-        for category in ("external_directory", "edit"):
-            forged = copy.deepcopy(candidate)
-            forged["applied_permissions"]["opencode_permission"][category][str(self.root) + "/**"] = "allow"
-            spawn = 0
-            with self.assertRaises(DispatchContractError):
-                AUTHORITY.require_recovery_work(forged, self.history, route=route, worker_type="owner")
-                spawn += 1
-            self.assertEqual(spawn, 0)
+        configs = (
+            {"permission": {
+                "external_directory": {"*": "deny", self.route["artifact_root"] + "/**": "allow"},
+                "edit": {"*": "deny", self.route["cwd"] + "/**": "allow"},
+            }},
+            {"permissions": [
+                {"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "external_directory", "resource": self.route["artifact_root"] + "/**",
+                 "effect": "allow"},
+                {"action": "edit", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": self.route["cwd"] + "/**", "effect": "allow"},
+            ], "agents": {}},
+        )
+        for config in configs:
+            with self.subTest(generation="v2" if "permissions" in config else "v1"):
+                candidate = copy.deepcopy(self.history)
+                candidate["harness"] = "opencode"
+                candidate["applied_permissions"] = REPLACEMENT._applied_permissions(
+                    Namespace(opencode_config_content=json.dumps(config)))
+                self.assertTrue(candidate["applied_permissions"].get("opencode_permission"))
+                AUTHORITY.require_recovery_work(candidate, self.history, route=route, worker_type="owner")
+                for category in ("external_directory", "edit"):
+                    forged_config = json.loads(json.dumps(config))
+                    outside = str(self.root) + "/**"
+                    if "permissions" in forged_config:
+                        forged_config["permissions"].append({
+                            "action": category, "resource": outside, "effect": "allow"})
+                    else:
+                        forged_config["permission"].setdefault(category, {})[outside] = "allow"
+                    forged = copy.deepcopy(candidate)
+                    forged["applied_permissions"] = REPLACEMENT._applied_permissions(
+                        Namespace(opencode_config_content=json.dumps(forged_config)))
+                    spawn = 0
+                    with self.assertRaises(DispatchContractError):
+                        AUTHORITY.require_recovery_work(
+                            forged, self.history, route=route, worker_type="owner")
+                        spawn += 1
+                    self.assertEqual(spawn, 0)
 
     def test_release_move_preserves_portable_profile_and_allows_declared_transition(self):
         candidate = copy.deepcopy(self.history)
@@ -105,7 +138,9 @@ class RecoveryAuthorityTest(unittest.TestCase):
         with patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}):
             scoped = json.loads(wrapper.scoped_external_directory_config(
                 self.route["artifact_root"], agent_home=HERE.parent, worktree=self.route["cwd"]))
-        candidate["applied_permissions"] = {"opencode_permission": scoped["permission"]}
+        candidate["applied_permissions"] = REPLACEMENT._applied_permissions(
+            Namespace(opencode_config_content=json.dumps(scoped)))
+        self.assertTrue(candidate["applied_permissions"].get("opencode_permission"))
         AUTHORITY.require_recovery_work(candidate, self.history, route=self.route, worker_type="owner")
         for category, pattern in (("external_directory", "/etc/**"), ("edit", "*")):
             forged = copy.deepcopy(candidate)

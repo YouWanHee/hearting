@@ -58,8 +58,9 @@ background — mints none, and ending the turn ends the session together with ev
 child it started, so no supervisor wake can follow and the work is lost. Run such
 work synchronously in the current turn, bounded by
 `utilities/verification-background-lease.py --timeout <seconds> -- <command>`,
-which returns the child's exit status, returns 124 on expiry, and tears down the
-process group; otherwise register it as a dispatch-depth-2 attempt. Never end a
+which returns the child's exit status, returns 124 on expiry, and ends every
+process the command started, detached ones included (125 past its memory ceiling);
+otherwise register it as a dispatch-depth-2 attempt. Never end a
 turn while unregistered background work is still running.
 
 Consume the supervisor receipt's `required_action` literally. Complete an open

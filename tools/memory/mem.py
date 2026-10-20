@@ -26,6 +26,18 @@ if str(MEM_MODULE_DIR) not in sys.path:
 if str(MEM_MODULE_DIR.parents[1] / "utilities") not in sys.path:
     sys.path.append(str(MEM_MODULE_DIR.parents[1] / "utilities"))
 
+# A managed release must stay byte-identical, so a direct run (the `mem` PATH
+# launcher, the SessionStart hook) keeps bytecode in state like harness.sh does.
+if __name__ == "__main__" and not (os.environ.get("PYTHONPYCACHEPREFIX")
+                                   or os.environ.get("PYTHONDONTWRITEBYTECODE")):
+    _state_root = (os.environ.get("HARNESS_STATE_ROOT")
+                   or (os.environ.get("XDG_STATE_HOME")
+                       and os.path.join(os.environ["XDG_STATE_HOME"], "hearting"))
+                   or (os.environ.get("HOME")
+                       and os.path.join(os.environ["HOME"], ".local", "state", "hearting")))
+    if _state_root:
+        os.environ["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix = os.path.join(_state_root, "pycache")
+
 from claude_project_dir import encode_project_dir, encode_project_dir_component
 import git_exchange_v2
 import migration_v2

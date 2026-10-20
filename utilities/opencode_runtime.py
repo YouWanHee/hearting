@@ -7,6 +7,7 @@ support from V1 flags or read the database independently.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 import json
@@ -33,6 +34,20 @@ MAX_MESSAGE_TEXT = 2048
 MAX_SHELL_TASK_PAGE = 64
 MAX_SHELL_TASK_RECENT = 32
 MAX_SHELL_TASK_REFRESH = 64
+# Providers whose account/model eligibility Hearting confirms itself: the Go
+# usage/entitlement probe observes the selected account before placement. Any
+# other provider's ``unknown`` stays unknown until a real request succeeds, so
+# automatic placement does not select it (an explicit choice still runs).
+PROBED_PROVIDERS = frozenset({"opencode-go"})
+# OpenCode 2 reports provider failures by type, without a numeric status.
+# Only an authentication type is a confirmed rejection; the rest are transient.
+TYPED_TRANSIENT_ERRORS = {
+    "provider.rate-limit": "rate-limited",
+    "provider.quota": "quota-exhausted",
+    "provider.transport": "transport-error",
+    "provider.internal": "provider-internal-error",
+    "provider.no-route": "provider-no-route",
+}
 
 
 class OpenCodeRuntimeError(RuntimeError):
@@ -55,6 +70,7 @@ class AccountScopeObservation:
     state: str
     scope: str | None
     reason: str | None = None
+    credential_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +86,7 @@ class GoUsageSelection:
     credential_type: str | None = None
     credential_source: str | None = None
     reason: str | None = None
+    credential_generation: str | None = None
 
 
 def parse_version(value: str | None) -> tuple[int, int, int] | None:
@@ -114,6 +131,441 @@ def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,
     # downgrade or migration. An unavailable version probe stays unknown and
     # must never turn a retained V2 database into a V2 CLI assumption.
     return bool(version and version[0] >= 2)
+
+
+# OpenCode V2 permissions are an ordered row stream. Keep its interpretation
+# here so config projection, the sealed recorder, and recovery compare the same
+# policy. The legacy adapter schema is still a mapping; V2-only action
+# interleaving is materialized for the action names this launcher understands.
+_OPENCODE_V2_TO_LEGACY_ACTION = {"shell": "bash", "subagent": "task"}
+_OPENCODE_LEGACY_TO_V2_ACTION = {"bash": "shell", "task": "subagent",
+                                  "write": "edit", "patch": "edit"}
+_OPENCODE_BUILTIN_LEGACY_ACTIONS = (
+    "read", "edit", "glob", "grep", "bash", "task", "skill", "question",
+    "webfetch", "websearch", "external_directory", "doom_loop", "lsp", "execute",
+)
+_OPENCODE_PERMISSION_EFFECTS = frozenset({"allow", "ask", "deny"})
+
+
+def _opencode_action_name(value):
+    return _OPENCODE_V2_TO_LEGACY_ACTION.get(value, value)
+
+
+def _opencode_legacy_action_name(value):
+    if value in {"write", "patch"}:
+        return "edit"
+    return _opencode_action_name(value)
+
+
+def _opencode_pattern_matches(pattern, value):
+    """OpenCode's simple wildcard grammar: only `*` and `?` are special."""
+    pattern = pattern.replace("\\", "/")
+    # Historical action patterns such as ``bash *`` also match the bare tool.
+    if pattern.endswith(" *"):
+        if value == pattern[:-2]:
+            return True
+    expression = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.fullmatch(expression, value, re.DOTALL) is not None
+
+
+@lru_cache(maxsize=1024)
+def _opencode_patterns_overlap(left, right):
+    """Whether two simple `*`/`?` patterns can match at least one same string."""
+    left, right = left.replace("\\", "/"), right.replace("\\", "/")
+    # Keep the legacy command-pattern shorthand's bare-tool match in the
+    # precedence relation as well as in the action evaluator.
+    if left.endswith(" *") and _opencode_patterns_overlap(left[:-2], right):
+        return True
+    if right.endswith(" *") and _opencode_patterns_overlap(left, right[:-2]):
+        return True
+
+    def closure(pattern, states):
+        result = set(states)
+        pending = list(states)
+        while pending:
+            index = pending.pop()
+            if index < len(pattern) and pattern[index] == "*" and index + 1 not in result:
+                result.add(index + 1)
+                pending.append(index + 1)
+        return frozenset(result)
+
+    def move(pattern, states, char):
+        result = set()
+        for index in states:
+            if index >= len(pattern):
+                continue
+            token = pattern[index]
+            if token == "*":
+                result.add(index)
+            elif token == "?" or char is not None and token == char:
+                result.add(index + 1)
+        return closure(pattern, result)
+
+    alphabet = set(left + right) - {"*", "?"}
+    alphabet.add(None)  # a character other than either pattern's literals
+    start = (closure(left, {0}), closure(right, {0}))
+    pending, seen = [start], {start}
+    while pending:
+        left_states, right_states = pending.pop()
+        if len(left) in left_states and len(right) in right_states:
+            return True
+        for char in alphabet:
+            next_state = (move(left, left_states, char), move(right, right_states, char))
+            if next_state not in seen:
+                seen.add(next_state)
+                pending.append(next_state)
+    return False
+
+
+def normalize_opencode_permission(permission, *, field="permission"):
+    """Return a validated legacy action/resource mapping without changing order.
+
+    A top-level or per-action scalar is the legacy spelling of a `*` rule.
+    Missing/null remains empty so callers can distinguish it from recorded
+    nonempty authority.
+    """
+    if permission is None:
+        return {}
+    if isinstance(permission, str):
+        if permission not in _OPENCODE_PERMISSION_EFFECTS:
+            raise ValueError(f"OpenCode {field} has invalid effect {permission!r}")
+        return {"*": permission}
+    if not isinstance(permission, Mapping):
+        raise ValueError(f"OpenCode {field} must be a string or object")
+    normalized = {}
+    for action, setting in permission.items():
+        if not isinstance(action, str) or not action:
+            raise ValueError(f"OpenCode {field} action must be a nonempty string")
+        if isinstance(setting, str):
+            if setting not in _OPENCODE_PERMISSION_EFFECTS:
+                raise ValueError(f"OpenCode {field}.{action} has invalid effect {setting!r}")
+            normalized[action] = setting
+            continue
+        if not isinstance(setting, Mapping):
+            raise ValueError(f"OpenCode {field}.{action} must be a string or object")
+        resources = {}
+        for resource, effect in setting.items():
+            if not isinstance(resource, str) or not isinstance(effect, str) \
+                    or effect not in _OPENCODE_PERMISSION_EFFECTS:
+                raise ValueError(f"OpenCode {field}.{action} contains an invalid resource rule")
+            resources[resource] = effect
+        normalized[action] = resources
+    return normalized
+
+
+def _opencode_append_ordered_rule(rules, resource, effect):
+    if resource in rules:
+        del rules[resource]
+    rules[resource] = effect
+
+
+def opencode_permission_rules_for_action(permission, action, default=None):
+    """Materialize one legacy action's effective ordered resource rules."""
+    normalized = normalize_opencode_permission(permission)
+    value = None if default is None else {"*": default}
+    action = _opencode_legacy_action_name(action)
+    for pattern, setting in normalized.items():
+        canonical_pattern = _opencode_legacy_action_name(pattern)
+        if not _opencode_pattern_matches(canonical_pattern, action):
+            continue
+        if isinstance(setting, str):
+            value = {"*": setting}
+        else:
+            if value is None:
+                value = {}
+            for resource, effect in setting.items():
+                _opencode_append_ordered_rule(value, resource, effect)
+    return None if value is None else list(value.items())
+
+
+def opencode_permission_effect(permission, action, resource, default=None):
+    """Return the final effect for one action/resource pair."""
+    effect = default
+    for pattern, candidate in opencode_permission_rules_for_action(
+            permission, action) or ():
+        if _opencode_pattern_matches(pattern, resource):
+            effect = candidate
+    return effect
+
+
+@lru_cache(maxsize=1024)
+def _opencode_pattern_covers(cover, pattern):
+    """Prove containment for launcher patterns; keep unproved cases distinct."""
+    cover = re.sub(r"\*+", "*", cover.replace("\\", "/"))
+    pattern = re.sub(r"\*+", "*", pattern.replace("\\", "/"))
+    if cover == "*" or cover == pattern:
+        return True
+    if "*" not in pattern and "?" not in pattern:
+        return _opencode_pattern_matches(cover, pattern)
+    # A literal directory/command prefix followed by '*' covers any narrower
+    # pattern starting with that prefix. Other glob containments stay unknown.
+    prefix = cover[:-1]
+    return (cover.endswith("*") and "*" not in prefix and "?" not in prefix
+            and pattern.startswith(prefix))
+
+
+def opencode_permission_ordered_view(permission):
+    """Compare live grants, preserving precedence only for conflicting effects."""
+    normalized = normalize_opencode_permission(permission)
+    rows = []
+    for action, setting in normalized.items():
+        action = _opencode_legacy_action_name(action)
+        resources = {"*": setting} if isinstance(setting, str) else setting
+        for resource, effect in resources.items():
+            key = (action, resource)
+            rows = [entry for entry in rows if entry[:2] != key]
+            rows.append((action, resource, effect))
+    if not rows:
+        return []
+
+    def covers(before, after):
+        return (_opencode_pattern_covers(before[0], after[0])
+                and _opencode_pattern_covers(before[1], after[1]))
+
+    def overlaps(before, after):
+        return (_opencode_patterns_overlap(before[0], after[0])
+                and _opencode_patterns_overlap(before[1], after[1]))
+
+    live = []
+    for index, row in enumerate(rows):
+        if any(covers(later, row) for later in rows[index + 1:]):
+            continue  # A later rule decides every point this row could decide.
+        for earlier_index in range(len(live) - 1, -1, -1):
+            earlier = live[earlier_index]
+            if (earlier[2] == row[2] and covers(earlier, row)
+                    and not any(between[2] != row[2] and overlaps(between, row)
+                                for between in live[earlier_index + 1:])):
+                break  # The row repeats an unchanged earlier decision.
+        else:
+            live.append(row)
+    rows = live
+    precedence = []
+    for index, before in enumerate(rows):
+        for after in rows[index + 1:]:
+            if before[2] != after[2] and overlaps(before, after):
+                precedence.append((before, after))
+    return {
+        "rules": [list(row) for row in sorted(rows)],
+        "precedence": [[list(before), list(after)]
+                       for before, after in sorted(precedence)],
+    }
+
+
+def _opencode_validate_v2_rows(rows, *, field="permissions"):
+    if rows is None:
+        raise ValueError(f"OpenCode {field} must be an ordered array")
+    if not isinstance(rows, list):
+        raise ValueError(f"OpenCode {field} must be an ordered array")
+    result = []
+    for index, row in enumerate(rows):
+        if (not isinstance(row, dict) or set(row) != {"action", "resource", "effect"}
+                or not all(isinstance(row.get(key), str) and row[key]
+                           for key in ("action", "resource", "effect"))
+                or row["effect"] not in _OPENCODE_PERMISSION_EFFECTS):
+            raise ValueError(f"OpenCode {field}[{index}] is not a supported permission rule")
+        result.append({key: row[key] for key in ("action", "resource", "effect")})
+    return result
+
+
+def _opencode_rules_from_v2(rows, action):
+    result = {}
+    for row in rows:
+        if _opencode_pattern_matches(row["action"], action):
+            _opencode_append_ordered_rule(result, row["resource"], row["effect"])
+    return list(result.items())
+
+
+def _opencode_merge_rule_lists(*groups):
+    result = {}
+    for group in groups:
+        for resource, effect in group or ():
+            _opencode_append_ordered_rule(result, resource, effect)
+    return list(result.items())
+
+
+def _opencode_set_action_rules(permission, action, rules):
+    if action in permission:
+        del permission[action]
+    permission[action] = dict(rules)
+
+
+def _opencode_v2_policy_to_legacy(rows, base, *, field):
+    rows = _opencode_validate_v2_rows(rows, field=field)
+    for row in rows:
+        for legacy_action, native_action in (("bash", "shell"), ("task", "subagent")):
+            if (_opencode_pattern_matches(row["action"], legacy_action)
+                    and not _opencode_pattern_matches(row["action"], native_action)):
+                raise ValueError(
+                    f"OpenCode {field} action pattern {row['action']!r} conflicts with "
+                    f"the V1 {legacy_action!r} alias")
+    permission = normalize_opencode_permission(base, field="permission")
+    base_permission = deepcopy(permission)
+    for row in rows:
+        action = _opencode_action_name(row["action"])
+        # These V1 aliases are independent V2 action names, so combining them
+        # into one legacy slot would discard a native permission boundary.
+        if action in {"bash", "task", "write", "patch"} and row["action"] == action:
+            raise ValueError(f"OpenCode {field} uses unsupported V2 action alias {action!r}")
+        current = permission.get(action)
+        if isinstance(current, str):
+            current = {"*": current}
+        elif not isinstance(current, dict):
+            current = {}
+        else:
+            current = dict(current)
+        _opencode_append_ordered_rule(current, row["resource"], row["effect"])
+        permission[action] = current
+
+    targets = list(_OPENCODE_BUILTIN_LEGACY_ACTIONS)
+    for row in rows:
+        if not any(char in row["action"] for char in "*?"):
+            action = _opencode_action_name(row["action"])
+            if action not in targets:
+                targets.append(action)
+    for action in targets:
+        native_action = _OPENCODE_LEGACY_TO_V2_ACTION.get(action, action)
+        base_rules = opencode_permission_rules_for_action(base_permission, action)
+        actual = _opencode_merge_rule_lists(base_rules, _opencode_rules_from_v2(rows, native_action))
+        projected = opencode_permission_rules_for_action(permission, action)
+        if actual != (projected or []):
+            _opencode_set_action_rules(permission, action, actual)
+    return permission
+
+
+def opencode_v2_to_legacy_config(config):
+    """Project V2 permission arrays into the legacy shape used by shared overlays.
+
+    Raw rows remain the adapter's serialization source. The exact action entries
+    added here repair action-pattern interleaving for launcher-supported tools.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("OpenCode config must be an object")
+    value = deepcopy(dict(config))
+    rows = value.pop("permissions", [])
+    value["permission"] = _opencode_v2_policy_to_legacy(
+        rows, value.get("permission", {}), field="permissions")
+    v2_agents = value.pop("agents", {})
+    v1_agents = value.get("agent", {})
+    if not isinstance(v2_agents, dict) or not isinstance(v1_agents, dict):
+        raise ValueError("OpenCode agent config must be an object")
+    agents = {**v2_agents, **v1_agents}
+    legacy_agents = {}
+    for name, definition in agents.items():
+        if not isinstance(definition, dict):
+            legacy_agents[name] = definition
+            continue
+        item = deepcopy(definition)
+        agent_rows = item.pop("permissions", [])
+        item["permission"] = _opencode_v2_policy_to_legacy(
+            agent_rows, item.get("permission", {}), field=f"agents.{name}.permissions")
+        legacy_agents[name] = item
+    if legacy_agents or "agent" in value or "agents" in config:
+        value["agent"] = legacy_agents
+    return value
+
+
+def _opencode_encode_legacy_rows(permission):
+    normalized = normalize_opencode_permission(permission)
+    rows = []
+    for action, setting in normalized.items():
+        native_action = _OPENCODE_LEGACY_TO_V2_ACTION.get(action, action)
+        resources = {"*": setting} if isinstance(setting, str) else setting
+        rows.extend({"action": native_action, "resource": resource, "effect": effect}
+                    for resource, effect in resources.items())
+    return rows
+
+
+def _opencode_encode_v2_policy(permission, original_rows, base_permission=None, *, field):
+    original_rows = _opencode_validate_v2_rows(original_rows, field=field)
+    original_base = normalize_opencode_permission(base_permission, field="permission")
+    desired = normalize_opencode_permission(permission, field="permission")
+    targets = list(_OPENCODE_BUILTIN_LEGACY_ACTIONS)
+    for action in desired:
+        canonical = _opencode_legacy_action_name(action)
+        if not any(char in canonical for char in "*?") and canonical not in targets:
+            targets.append(canonical)
+    result = deepcopy(original_rows)
+    for action in targets:
+        native_action = _OPENCODE_LEGACY_TO_V2_ACTION.get(action, action)
+        wanted = opencode_permission_rules_for_action(desired, action) or []
+        existing = _opencode_merge_rule_lists(
+            opencode_permission_rules_for_action(original_base, action),
+            _opencode_rules_from_v2(original_rows, native_action))
+        if wanted == existing:
+            continue
+        if not wanted and existing:
+            raise ValueError(f"OpenCode {field} cannot remove an existing {action!r} rule exactly")
+        result.extend({"action": native_action, "resource": resource, "effect": effect}
+                      for resource, effect in wanted)
+    return result
+
+
+def opencode_legacy_to_v2_config(config, *, original_v2=None):
+    """Encode a modified legacy projection as native V2 config.
+
+    When `original_v2` is supplied, preserve its ordered rows and append exact
+    action overrides only where the projected legacy policy changed.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("OpenCode config must be an object")
+    value = deepcopy(dict(config))
+    permission = value.pop("permission", {})
+    if original_v2 is None:
+        value["permissions"] = _opencode_encode_legacy_rows(permission)
+    else:
+        source = original_v2 if isinstance(original_v2, dict) else {}
+        if "permissions" in source:
+            value["permissions"] = _opencode_encode_v2_policy(
+                permission, source["permissions"], source.get("permission", {}), field="permissions")
+        else:
+            value["permissions"] = _opencode_encode_legacy_rows(permission)
+
+    agents = value.pop("agent", {})
+    if not isinstance(agents, dict):
+        raise ValueError("OpenCode agent config must be an object")
+    source_agents = original_v2.get("agents", {}) if isinstance(original_v2, dict) else {}
+    if not isinstance(source_agents, dict):
+        raise ValueError("OpenCode agents config must be an object")
+    converted = {}
+    for name, definition in agents.items():
+        if not isinstance(definition, dict):
+            converted[name] = definition
+            continue
+        item = deepcopy(definition)
+        local_permission = item.pop("permission", {})
+        if original_v2 is None:
+            item["permissions"] = _opencode_encode_legacy_rows(local_permission)
+        else:
+            source_definition = source_agents.get(name, {})
+            if not isinstance(source_definition, dict):
+                source_definition = {}
+            if "permissions" in source_definition:
+                item["permissions"] = _opencode_encode_v2_policy(
+                    local_permission, source_definition["permissions"],
+                    source_definition.get("permission", {}),
+                    field=f"agents.{name}.permissions")
+            else:
+                item["permissions"] = _opencode_encode_legacy_rows(local_permission)
+        converted[name] = item
+    if converted or (isinstance(original_v2, dict) and "agents" in original_v2):
+        value["agents"] = converted
+    return value
+
+
+def opencode_permission_from_config(config):
+    """Read the final global legacy permission from a V1 or V2 config."""
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"OpenCode config is not valid JSON: {exc}") from exc
+    if not isinstance(config, Mapping):
+        raise ValueError("OpenCode config must be an object")
+    if "permissions" in config or "agents" in config:
+        projected = opencode_v2_to_legacy_config(config)
+        if "permissions" in config:
+            return projected["permission"]
+    return normalize_opencode_permission(config.get("permission")) if "permission" in config else None
 
 
 def model_reference(model: str | None, variant: str | None) -> str | None:
@@ -227,6 +679,26 @@ def _scope_for_row(integration_id: str, row: dict | None) -> str:
     return "account:" + digest
 
 
+def _credential_generation(row) -> str | None:
+    """Opaque digest of the selected credential's material, never the material.
+
+    A re-login or token refresh can keep the same row id and therefore the same
+    account scope; this digest changes with it, so evidence recorded against an
+    older credential no longer describes the current one.
+    """
+    value = row.get("value") if isinstance(row, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    material = {key: value.get(key) for key in ("type", "key", "access", "refresh", "expires")
+                if isinstance(value.get(key), (str, int, float))
+                and not isinstance(value.get(key), bool) and value.get(key) != ""}
+    if not any(key in material for key in ("key", "access", "refresh")):
+        return None
+    payload = json.dumps([row.get("integration_id"), row.get("source"), material],
+                         sort_keys=True, separators=(",", ":"))
+    return "gen:" + hashlib.sha256(payload.encode()).hexdigest()[:20]
+
+
 def _freeze(value):
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -265,7 +737,8 @@ def account_scope_observation(integration_id: str, *, environ=None) -> AccountSc
         return AccountScopeObservation("unavailable", None, read.reason)
     if read.state == "absent":
         return AccountScopeObservation("absent", "unscoped")
-    return AccountScopeObservation("present", _scope_for_row(integration_id, read.credential))
+    return AccountScopeObservation("present", _scope_for_row(integration_id, read.credential),
+                                  credential_generation=_credential_generation(read.credential))
 
 
 def account_scope(integration_id: str, *, environ=None) -> str:
@@ -285,6 +758,7 @@ def _go_selection_from_row(integration_id: str, credential, opencode_scope: str)
         entitlement_scope=provider_scope if oauth_selected else None,
         credential_type=credential_type,
         credential_source=credential.get("source") if isinstance(credential, Mapping) else None,
+        credential_generation=_credential_generation(credential),
     )
 
 
@@ -360,8 +834,19 @@ def provider_account_observation(provider: str, *, environ=None) -> AccountScope
             return AccountScopeObservation("unavailable", None, selection.reason)
         return AccountScopeObservation(selection.state,
                                       selection.provider_scope or "unscoped",
-                                      selection.reason)
+                                      selection.reason,
+                                      credential_generation=selection.credential_generation)
     return account_scope_observation(provider, environ=env)
+
+
+def model_account_observation(model: str | None, *, environ=None) -> AccountScopeObservation | None:
+    """The account a request for ``model`` starts with; None for a malformed model."""
+    if not isinstance(model, str) or "/" not in model:
+        return None
+    try:
+        return provider_account_observation(model.split("/", 1)[0], environ=environ)
+    except Exception:
+        return AccountScopeObservation("unavailable", None, "account-scope-unavailable")
 
 
 def provider_account_scope(provider: str, *, environ=None) -> str:
@@ -370,8 +855,41 @@ def provider_account_scope(provider: str, *, environ=None) -> str:
     return observation.scope or "unscoped"
 
 
+def automatic_eligible(model: str | None, evidence: Mapping) -> bool:
+    """The one automatic-placement rule for OpenCode provider/model evidence.
+
+    A usable observation qualifies, and so does an unknown one for a provider
+    Hearting probes before placement. Anything else is not selected
+    automatically; an explicit model, pin, or harness choice is not filtered.
+    """
+    state = evidence.get("state") if isinstance(evidence, Mapping) else None
+    if state == "usable":
+        return True
+    if state != "unknown" or not isinstance(model, str) or "/" not in model:
+        return False
+    return model.split("/", 1)[0] in PROBED_PROVIDERS
+
+
+def _with_eligibility(model: str, result: dict) -> dict:
+    result = dict(result)
+    eligible = automatic_eligible(model, result)
+    result["automatic_eligible"] = eligible
+    if result.get("state") == "unknown" and not eligible:
+        result["observation_reason"] = result.get("reason")
+        result["reason"] = "provider-model-unverified"
+    return result
+
+
 def model_availability(model: str, *, environ=None) -> dict:
-    """Read provider/account/model evidence from Fleet's existing cache."""
+    """Read provider/account/model evidence from Fleet's existing cache.
+
+    ``state`` stays usable/unavailable/unknown; ``automatic_eligible`` applies
+    the shared automatic-placement rule to that evidence.
+    """
+    return _with_eligibility(model, _model_observation(model, environ=environ))
+
+
+def _model_observation(model: str, *, environ=None) -> dict:
     if not isinstance(model, str) or "/" not in model:
         return {"state": "unknown", "reason": "model-scope-unavailable"}
     provider, model_id = model.split("/", 1)
@@ -384,78 +902,119 @@ def model_availability(model: str, *, environ=None) -> dict:
         # selected row. Do not look up the current OpenCode account a second time.
         scope = selection.provider_scope or "unscoped"
         entitlement_scope = selection.entitlement_scope
+        generation = selection.credential_generation
     else:
         account = provider_account_observation(provider, environ=environ)
         if account.state == "unavailable" or account.scope is None:
             return {"state": "unknown", "reason": account.reason or "account-scope-unavailable"}
         scope = account.scope
         entitlement_scope = None
+        generation = account.credential_generation
     tools = Path(__file__).resolve().parents[1] / "tools"
     if str(tools) not in sys.path:
         sys.path.insert(0, str(tools))
     try:
         from fleet.collectors import usage_cache
-        result = usage_cache.read_provider("opencode", provider, model_id, scope)
+        result = usage_cache.read_provider("opencode", provider, model_id, scope,
+                                           credential_generation=generation)
         if result.get("state") == "unavailable":
             return result
-        general = usage_cache.read_provider("opencode", provider, "*", scope)
+        general = usage_cache.read_provider("opencode", provider, "*", scope,
+                                            credential_generation=generation)
         if general.get("state") == "unavailable":
             return general
-        if result.get("state") == "unknown":
+        # An account-wide success proves authentication, not this model. Only a
+        # probed provider's account observation stands in for an unseen model.
+        if result.get("state") == "unknown" and (
+                provider in PROBED_PROVIDERS or general.get("state") != "usable"):
             result = general
         if (provider == "opencode-go" and result.get("state") == "unknown"
                 and entitlement_scope is not None):
             result = usage_cache.read_provider("opencode", "opencode-go-entitlement", "*",
-                                               entitlement_scope)
+                                               entitlement_scope,
+                                               credential_generation=generation)
         return result
     except Exception:
         return {"state": "unknown", "reason": "availability-cache-unavailable"}
 
 
+def classify_model_error(error) -> dict:
+    """Normalize one runtime model error into confirmed or unknown evidence.
+
+    OpenCode 2 reports ``provider.auth`` without a numeric status; its type is
+    the authority, and the message is never parsed into a rejection. Transient
+    types and rate limits stay unknown so they neither persist nor clear a
+    confirmed rejection.
+    """
+    if not isinstance(error, Mapping):
+        return {"state": "unknown", "reason": "unclassified-error"}
+    kind = str(error.get("type") or "").lower()
+    detail = (str(error.get("code") or "") + " " + str(error.get("message") or "")).lower()
+    if kind == "provider.auth":
+        return {"state": "unavailable",
+                "reason": "credential-expired" if "api_key_expired" in detail
+                else "authentication-rejected"}
+    if kind in TYPED_TRANSIENT_ERRORS:
+        return {"state": "unknown", "reason": TYPED_TRANSIENT_ERRORS[kind]}
+    status = error.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return {"state": "unknown", "reason": "unclassified-error"}
+    classification = classify_usage_rejection(status, {"error": {
+        "type": str(error.get("code") or error.get("type") or ""),
+        "message": str(error.get("message") or "")}})
+    if classification:
+        return {"state": "unavailable", "reason": classification["reason"]}
+    if status == 429:
+        return {"state": "unknown", "reason": "rate-limited"}
+    return {"state": "unknown", "reason": "unclassified-error"}
+
+
 def record_model_outcome(model: str | None, *, success=False, error=None, source="opencode-run",
-                         reason_override=None):
-    """Persist only confirmed account/model outcomes; transient failures do not clear them."""
+                         reason_override=None, account_observation=None):
+    """Persist only confirmed account/model outcomes; transient failures do not clear them.
+
+    ``account_observation`` is the account observed when the request started, so
+    a credential change during a long run is not credited with its outcome.
+    """
     if not isinstance(model, str) or "/" not in model:
         return False
     provider, model_id = model.split("/", 1)
     model_id = model_id.split("#", 1)[0]
-    account = provider_account_observation(provider)
+    account = (account_observation if account_observation is not None
+               else provider_account_observation(provider))
     if account.state == "unavailable" or account.scope is None:
         return False
     scope = account.scope
     state, reason = None, None
     if success:
         state = "usable"
-    elif isinstance(error, dict):
-        status = error.get("status")
-        code = str(error.get("code") or error.get("type") or "")
-        message = str(error.get("message") or "")
-        classification = classify_usage_rejection(
-            status if isinstance(status, int) else 0,
-            {"error": {"type": code, "message": message}},
-        )
-        if classification:
-            state, reason = "unavailable", classification["reason"]
-        elif isinstance(status, int) and status == 401:
-            state, reason = "unavailable", "authentication-rejected"
-        elif isinstance(status, int) and status == 429:
-            state, reason = "unavailable", "rate-limited"
+    elif isinstance(error, Mapping):
+        outcome = classify_model_error(error)
+        if outcome["state"] == "unavailable":
+            state, reason = "unavailable", outcome["reason"]
     if reason_override and not success:
         state, reason = "unavailable", str(reason_override)
     if state is None:
+        return False
+    if state == "unavailable" and not account.credential_generation:
+        # A rejection that cannot name its credential could never be released
+        # by a re-login; leave it unknown instead of excluding indefinitely.
         return False
     tools = Path(__file__).resolve().parents[1] / "tools"
     if str(tools) not in sys.path:
         sys.path.insert(0, str(tools))
     try:
         from fleet.collectors import usage_cache
+        generation = account.credential_generation
         exact = usage_cache.record_provider("opencode", provider, model_id, scope,
-                                            state, reason=reason, source=source)
+                                            state, reason=reason, source=source,
+                                            credential_generation=generation)
         # A same-account success proves account authentication recovered. Keep
         # model-specific denials intact while allowing this provider scope to
         # recover from an older account-level rejection.
         general = usage_cache.record_provider("opencode", provider, "*", scope,
-                                              state, reason=reason, source=source)
+                                              state, reason=reason, source=source,
+                                              credential_generation=generation)
         return exact or general
     except Exception:
         return False
@@ -480,22 +1039,28 @@ def automatic_model_fallbacks(config_path: str | Path | None = None) -> list[tup
 
 def select_automatic_model(model: str, variant: str, *, config_path=None,
                            environ=None) -> tuple[str, str, dict]:
-    """Keep a usable/unknown selection; replace only a confirmed unavailable one."""
-    status = model_availability(model, environ=environ)
-    if status.get("state") != "unavailable":
-        return model, variant, status
-    for candidate, effort in automatic_model_fallbacks(config_path):
-        if candidate == model:
-            continue
-        state = model_availability(candidate, environ=environ)
-        if state.get("state") != "unavailable":
-            return candidate, effort, state
-    return model, variant, status
+    """Choose the first automatically eligible candidate in configured order.
+
+    Without one, the primary is returned unchanged: an unknown primary keeps
+    ``automatic_eligible=False`` so an explicitly chosen harness can still run
+    it while automatic callers do not, and a confirmed-unavailable primary is
+    never traded for an unverified fallback.
+    """
+    rows = automatic_candidates(model, variant, config_path=config_path, environ=environ)
+    primary = rows[0]
+    for row in rows:
+        if row["automatic_eligible"]:
+            evidence = {key: value for key, value in row.items() if key not in ("model", "variant")}
+            if row["model"] != model:
+                evidence["fallback_from_reason"] = primary.get("reason")
+            return row["model"], row["variant"], evidence
+    return model, variant, {key: value for key, value in primary.items()
+                            if key not in ("model", "variant")}
 
 
 def automatic_candidates(model: str, variant: str, *, config_path=None,
                          environ=None) -> list[dict]:
-    """Candidate evidence for a hard harness-level availability decision."""
+    """Candidate evidence, in configured order, for automatic placement."""
     rows = []
     candidates = [(model, variant), *automatic_model_fallbacks(config_path)]
     seen = set()
@@ -504,8 +1069,11 @@ def automatic_candidates(model: str, variant: str, *, config_path=None,
         if key in seen:
             continue
         seen.add(key)
-        rows.append({"model": candidate, "variant": effort,
-                     **model_availability(candidate, environ=environ)})
+        evidence = model_availability(candidate, environ=environ)
+        row = {**evidence, "model": candidate, "variant": effort}
+        if evidence.get("model") not in (None, candidate.split("/", 1)[-1].split("#", 1)[0]):
+            row["evidence_model"] = evidence["model"]
+        rows.append(row)
     return rows
 
 
@@ -735,7 +1303,11 @@ def safe_provider_error(value: object) -> dict:
 
 
 def record_model_http_result(model: str, status: int, body: bytes | str | dict = b"") -> dict:
-    """Record only successful requests or explicit auth/entitlement/rate-limit denials."""
+    """Record only successful requests or explicit auth/entitlement denials.
+
+    A rate limit is capacity, not a credential or entitlement rejection: it is
+    reported as unknown and never persisted as an exclusion.
+    """
     if isinstance(status, bool) or not isinstance(status, int):
         return {"state": "unknown", "reason": "http-status-invalid"}
     if 200 <= status < 300:
@@ -750,9 +1322,7 @@ def record_model_http_result(model: str, status: int, body: bytes | str | dict =
                              reason_override=classification.get("reason"))
         return classification
     if status == 429:
-        error = {"status": status, "code": "rate_limited", "message": "provider rate limited"}
-        record_model_outcome(model, error=error, source="opencode-v2-http")
-        return {"state": "unavailable", "reason": "rate-limited", "http_status": status}
+        return {"state": "unknown", "reason": "rate-limited", "http_status": status}
     return {"state": "unknown", "reason": "unclassified-http", "http_status": status}
 
 

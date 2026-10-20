@@ -1177,7 +1177,7 @@ def _opencode_workdir(home, agent_name="fleet-titler", agent_body=_OPENCODE_AGEN
 
 def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=False,
                      opencode_agent=None, out_tag="fleet-title", workdir=None,
-                     profile="mini"):
+                     profile="mini", explicit_provider=False):
     """One provider invocation as (argv, stdin_text, output_file), or None.
 
     The three runtimes disagree on both ends of the call — claude takes the prompt in
@@ -1191,6 +1191,8 @@ def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=Fal
     overflow argv), `opencode_agent=(name, body)` swaps the opencode agent, `out_tag`
     names the codex output file, `workdir` roots the opencode agent directory, and
     `profile` picks the portable profile the model resolves from.
+    `explicit_provider` marks an operator-pinned runtime: its configured model
+    runs even when automatic placement would not select it.
     """
     home = Path(home or agent_home())
     settings = provider_settings(adapter, home, profile=profile)
@@ -1234,6 +1236,8 @@ def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=Fal
         if v2 and not model_was_supplied and model:
             model, budget, availability = opencode_runtime.select_automatic_model(model, budget)
             if availability.get("state") == "unavailable":
+                return None
+            if not explicit_provider and not opencode_runtime.automatic_eligible(model, availability):
                 return None
         if v2 and not agent_name.startswith("hearting-"):
             agent_name = "hearting-" + agent_name
@@ -1293,7 +1297,8 @@ def _opencode_model_evidence(profile, home=None):
         settings = provider_settings("opencode", Path(home or agent_home()), profile=profile)
         if not settings.get("model"):
             return []
-        return [{key: row.get(key) for key in ("model", "state", "reason", "observed_at")}
+        return [{key: row.get(key) for key in
+                 ("model", "state", "reason", "observed_at", "automatic_eligible")}
                 for row in opencode_runtime.automatic_candidates(
                     settings["model"], settings.get("budget") or "runtime-default")]
     except Exception:
@@ -1302,7 +1307,8 @@ def _opencode_model_evidence(profile, home=None):
 
 def _opencode_models_eligible(profile, home=None):
     evidence = _opencode_model_evidence(profile, home)
-    return not evidence or any(row.get("state") != "unavailable" for row in evidence)
+    return not evidence or any(opencode_runtime.automatic_eligible(row.get("model"), row)
+                               for row in evidence)
 
 
 def _cached_provider_order(path):
@@ -1440,8 +1446,10 @@ def worker_argv(prompt, model=None):
         if not has_prompt:
             argv.append(prompt)
         return argv
+    pinned = (os.environ.get("FLEET_TITLE_PROVIDER") or "").strip().lower()
     for adapter in selected_providers():
-        command = provider_command(adapter, prompt, model=model)
+        command = provider_command(adapter, prompt, model=model,
+                                   explicit_provider=adapter == pinned)
         if command and _executable_available(command[0]):
             return command[0]
     return []
@@ -1703,7 +1711,8 @@ def _resolve_commands(prompt, model=None):
         adapter_model = model
         if adapter_model is None and override and adapter == pinned:
             adapter_model = override
-        command = provider_command(adapter, prompt, model=adapter_model)
+        command = provider_command(adapter, prompt, model=adapter_model,
+                                   explicit_provider=adapter == pinned)
         if command and _executable_available(command[0]):
             commands.append(command)
     return commands
@@ -1737,6 +1746,10 @@ def run_provider_cascade(commands, *, timeout, env, cwd=None):
         if remaining <= 0:
             break
         attempt_timeout = max(0.001, remaining / remaining_candidates)
+        # Credit an OpenCode outcome to the account this request starts with.
+        account = (opencode_runtime.model_account_observation(
+                       getattr(command, "model", None), environ=child_env)
+                   if getattr(command, "adapter", None) == "opencode" else None)
         if out_file is not None:
             # A prior interrupted Codex call can leave this pid-scoped file behind.
             # Never accept that stale answer as the next attempt's output.
@@ -1771,12 +1784,14 @@ def run_provider_cascade(commands, *, timeout, env, cwd=None):
                         runtime_error = opencode_runtime.safe_provider_error(event.get("error"))
                 if runtime_error:
                     opencode_runtime.record_model_outcome(
-                        getattr(command, "model", None), error=runtime_error)
+                        getattr(command, "model", None), error=runtime_error,
+                        account_observation=account)
                     continue
                 text = "\n".join(texts).strip()
                 if result.returncode == 0 and text:
                     opencode_runtime.record_model_outcome(
-                        getattr(command, "model", None), success=True)
+                        getattr(command, "model", None), success=True,
+                        account_observation=account)
                     return text, index
                 continue
             if result.returncode != 0:
@@ -1791,7 +1806,8 @@ def run_provider_cascade(commands, *, timeout, env, cwd=None):
             if text.strip():
                 if getattr(command, "adapter", None) == "opencode":
                     opencode_runtime.record_model_outcome(
-                        getattr(command, "model", None), success=True)
+                        getattr(command, "model", None), success=True,
+                        account_observation=account)
                 return text, index
         except Exception:
             # Provider failures are isolated. The next selected runtime gets the

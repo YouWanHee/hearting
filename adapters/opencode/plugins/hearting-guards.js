@@ -76,7 +76,41 @@ const peerGuidanceBySession = new Map()
 const contextAlertBySession = new Map()
 const v2SessionInfo = new Map()
 const v2WorkerSessions = new Set()
+const v2ContractSessions = new Set()
 const v2ActiveSession = new AsyncLocalStorage()
+let terminalContract = ""
+let terminalContractRetryAt = 0
+
+function workerTerminalContract() {
+  if (terminalContract || Date.now() < terminalContractRetryAt) return terminalContract
+  // Render the short canonical kernel section once, never the full kernel or
+  // main lifecycle context on every model request. A failed render is retried
+  // later instead of disabling the contract for a long-lived shared service.
+  const result = spawnSync(python3, ["-B", "-c",
+    "import sys; from pathlib import Path; sys.path.insert(0, str(Path(sys.argv[1]) / 'utilities')); from worker_bootstrap import worker_terminal_contract; print(worker_terminal_contract(Path(sys.argv[1])))", root],
+  { cwd: root, encoding: "utf8", timeout: 4000 })
+  terminalContract = result.status === 0 ? (result.stdout || "").trim() : ""
+  if (!terminalContract) terminalContractRetryAt = Date.now() + 60000
+  return terminalContract
+}
+
+async function sessionWorkerContract(ctx, sid) {
+  if (!sid) return ""
+  if (v2ActiveSession.getStore()) {
+    return v2ContractSessions.has(sid) ? workerTerminalContract() : ""
+  }
+  if (!isWorkerSession() || process.env.AGENT_DISPATCH_REGISTERED_WORKER !== "1") return ""
+  const info = await compactSessionInfo(ctx, sid, true)
+  // A native child inherits the private runtime's environment, not its
+  // registered parent's terminal task contract.
+  return info && !info.parentID ? workerTerminalContract() : ""
+}
+
+function compactionWorkerContract(contract) {
+  return "Preserve the following worker completion contract verbatim in the summary for " +
+    "the continuing worker. Produce the normal compaction summary; this contract applies " +
+    "to the worker's final response, not to this summary request.\n\n" + contract
+}
 
 async function contextAlert(ctx, sid, output) {
   if (!sid || isWorkerSession() || process.env.MEM_DISTILL === "1"
@@ -419,9 +453,9 @@ function completedSummary(rows, sid) {
       || String(b.id || "").localeCompare(String(a.id || "")))[0] || null
 }
 
-async function compactSessionInfo(ctx, sid) {
+async function compactSessionInfo(ctx, sid, parentOptional = false) {
   const known = sessionInfoById.get(sid)
-  if (known?.id === sid && Object.hasOwn(known, "parentID")) return known
+  if (known?.id === sid && (parentOptional || Object.hasOwn(known, "parentID"))) return known
   if (typeof ctx.client?.session?.get !== "function") return null
   const controller = new AbortController()
   let timer
@@ -431,7 +465,7 @@ async function compactSessionInfo(ctx, sid) {
       new Promise((resolve) => { timer = setTimeout(() => { controller.abort(); resolve(null) }, 750) }),
     ])
     const info = sdkResponseData(result)
-    if (!info || info.id !== sid || !Object.hasOwn(info, "parentID")) return null
+    if (!info || info.id !== sid || (!parentOptional && !Object.hasOwn(info, "parentID"))) return null
     sessionInfoById.set(sid, info)
     return info
   } catch { return null } finally { clearTimeout(timer) }
@@ -849,6 +883,11 @@ async function setupOpenCodeV2(ctx) {
     if (title.startsWith("hearting-worker-") || selectedAgent.startsWith("hearting-")) {
       v2WorkerSessions.add(sessionID)
     }
+    if (title.startsWith("hearting-worker-att-") && !info?.parentID && !info?.parent_id) {
+      v2ContractSessions.add(sessionID)
+    } else {
+      v2ContractSessions.delete(sessionID)
+    }
     return info
   }
   const withSession = (sessionID, work) => v2ActiveSession.run(sessionID || "", async () => {
@@ -921,7 +960,14 @@ async function setupOpenCodeV2(ctx) {
         parts: text ? [{ type: "text", text }] : [] })
   }))
   await ctx.session.hook("context", async (event) => withSession(event.sessionID, async () => {
-    if (v2WorkerSessions.has(event.sessionID)) return
+    if (v2WorkerSessions.has(event.sessionID)) {
+      const contract = await sessionWorkerContract(ctx, event.sessionID)
+      if (contract && Array.isArray(event.system)
+          && !event.system.some((part) => part.type === "text" && part.text === contract)) {
+        event.system.push({ type: "text", text: contract })
+      }
+      return
+    }
     const output = { system: [] }
     await hooks["experimental.chat.system.transform"]?.(
       { sessionID: event.sessionID }, output)
@@ -932,7 +978,16 @@ async function setupOpenCodeV2(ctx) {
     }
   }))
   await ctx.session.hook("compaction", async (event) => withSession(event.sessionID, async () => {
-    if (v2WorkerSessions.has(event.sessionID)) return
+    if (v2WorkerSessions.has(event.sessionID)) {
+      const contract = await sessionWorkerContract(ctx, event.sessionID)
+      if (contract && Array.isArray(event.system)) {
+        const text = compactionWorkerContract(contract)
+        if (!event.system.some((part) => part.type === "text" && part.text === text)) {
+          event.system.push({ type: "text", text })
+        }
+      }
+      return
+    }
     await hooks["experimental.session.compacting"]?.(
       { sessionID: event.sessionID }, { ...event })
   }))
@@ -968,6 +1023,7 @@ async function setupOpenCodeV2(ctx) {
         if (!sessionID) continue
         if (native.type === "session.deleted" && v2WorkerSessions.has(sessionID)) {
           v2WorkerSessions.delete(sessionID)
+          v2ContractSessions.delete(sessionID)
           v2SessionInfo.delete(sessionID)
           continue
         }
@@ -988,6 +1044,7 @@ async function setupOpenCodeV2(ctx) {
     controller.abort()
     hooks.dispose?.({ silent: true })
     v2WorkerSessions.clear()
+    v2ContractSessions.clear()
     v2SessionInfo.clear()
   }
 }
@@ -2218,12 +2275,27 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx), prompt) })
     }
   },
+  "experimental.chat.messages.transform": async (_input, output) => {
+    if (!isWorkerSession() || !Array.isArray(output.messages)) return
+    const index = output.messages.findLastIndex((row) => row.info?.role === "user")
+    const row = output.messages[index]
+    const sid = row?.info?.sessionID
+    const contract = await sessionWorkerContract(ctx, sid)
+    if (!contract || !Array.isArray(row?.parts)
+        || row.parts.some((part) => part.type === "text" && part.text === contract)) return
+    // V1's system hook also runs for title and compaction model calls and
+    // carries no request kind. Decorate only the primary transcript instead.
+    // Replace the row/parts rather than mutating a user message shared with an
+    // auxiliary title request. Native persistence is untouched.
+    output.messages[index] = { ...row, parts: [...row.parts, {
+      id: "prt_heartingterminal", sessionID: sid, messageID: row.info.id,
+      type: "text", text: contract, synthetic: true,
+    }] }
+  },
   "experimental.chat.system.transform": async (input, output) => {
     const sid = input.sessionID || "opencode-plugin"
     const cwd = baseDir(ctx)
     if (isWorkerSession()) {
-      // Dispatch prompts own explicit status/prompt-signal bootstrap;
-      // memory/briefing/context stay main-only.
       return
     }
     // Every model call re-emits the same blocks. The probe/preflight work still
@@ -2264,6 +2336,12 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
   },
   "experimental.session.compacting": async (input, output) => {
+    const contract = await sessionWorkerContract(ctx, input?.sessionID)
+    if (contract) {
+      if (!Array.isArray(output.context)) output.context = []
+      const text = compactionWorkerContract(contract)
+      if (!output.context.includes(text)) output.context.push(text)
+    }
     await beforeCompact(ctx, input || {}, output)
   },
   "shell.env": async (input, output) => {

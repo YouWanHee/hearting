@@ -34,6 +34,13 @@ R, P, L, D, nested = PF.R, PF.P, PF.L, PF.D, PF.nested
 os.environ.setdefault("AGENT_ARTIFACT_CHECKPOINT", "off")
 
 
+# The OpenCode adapter always seals its scoped launch config; recovery compares
+# that recorded permission and refuses a launch that recorded none.
+OPENCODE_OWNER_CONFIG = json.dumps({
+    "permissions": [{"action": "read", "resource": "*", "effect": "allow"}],
+    "agents": {},
+})
+
 NATIVE_OWNER_RESULT = {
     "claude": lambda text: [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
     "codex": lambda text: [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
@@ -723,7 +730,8 @@ class InlineReviewOwnerSettlesThroughAPollingParentTest(PollingParentBase):
                 "--owner", "autopilot-refine", "--route-file", str(self.path),
                 "--parent-session-id", "fixture-parent", "--prompt-file", str(prompt)]
         args = SimpleNamespace(attempt_id=self.owner, jobs_path=self.jobs, worktree=str(R.ROOT),
-                               route_id=self.route["route_id"], route_node="", replacement_input_argv=argv)
+                               route_id=self.route["route_id"], route_node="", replacement_input_argv=argv,
+                               opencode_config_content=OPENCODE_OWNER_CONFIG)
         extra = D.parse_registry_metadata(DR.seal_launch_input(args, "opencode", "Refine the README\n").lstrip(","))
         lines = self.jobs.read_text().splitlines()
         fields = lines[0].split("\t")
@@ -768,7 +776,8 @@ class InlineReviewOwnerSettlesThroughAPollingParentTest(PollingParentBase):
         source = DR._rows(self.jobs.read_text().splitlines())[prior][1]
         task = Path(value("--prompt-file")).read_text()
         args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
-                               route_id=self.route["route_id"], route_node="owner", replacement_input_argv=list(argv))
+                               route_id=self.route["route_id"], route_node="owner", replacement_input_argv=list(argv),
+                               opencode_config_content=OPENCODE_OWNER_CONFIG)
         meta = {k: v for k, v in source.items() if k not in {
             "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
             "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",

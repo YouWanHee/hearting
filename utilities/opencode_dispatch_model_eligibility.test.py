@@ -166,6 +166,36 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
         self.assertNotIn(("opencode/beam-free", "runtime-default"),
                          WRAPPER.opencode_runtime.automatic_model_fallbacks())
 
+    def test_v2_profile_launch_keeps_an_unverified_primary_and_refuses_only_a_rejection(self):
+        # Automatic placement has already left an unverified OpenCode out, so a
+        # profile launch that still arrives here was chosen explicitly and runs
+        # the configured model; only a confirmed rejection is refused.
+        args = selection(profile="balanced-deep", role="deep maker")
+        unverified = {"state": "unknown", "reason": "provider-model-unverified",
+                      "automatic_eligible": False}
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model",
+                               side_effect=lambda model, variant: (model, variant, unverified)):
+            kept = WRAPPER.resolve_model_settings(args)
+        self.assertEqual(kept["source"], "profile")
+        self.assertNotIn("provider_fallback_from", kept)
+        rejected = {"state": "unavailable", "reason": "authentication-rejected",
+                    "automatic_eligible": False}
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model",
+                               side_effect=lambda model, variant: (model, variant, rejected)), \
+             self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+            WRAPPER.resolve_model_settings(args)
+        self.assertEqual(refused.exception.reason, "opencode-model-unavailable")
+        moved = {"state": "unknown", "automatic_eligible": True,
+                 "reason": "no-observation", "fallback_from_reason": "provider-model-unverified"}
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model",
+                               return_value=("opencode-go/fallback", "max", moved)):
+            fallback = WRAPPER.resolve_model_settings(args)
+        self.assertEqual((fallback["model"], fallback["provider_fallback_reason"]),
+                         ("opencode-go/fallback", "provider-model-unverified"))
+
     def test_explicit_model_remains_exact_even_when_provider_cache_rejects_it(self):
         with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
              mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model") as select:
