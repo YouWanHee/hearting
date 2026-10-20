@@ -1374,6 +1374,12 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(len(self.calls), before)
         owns.assert_called()
         self.assertIn("parent_sid=parent", self.jobs.read_text())          # the registered identity is untouched
+        W.default_parent_session_id.return_value = "parent"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+        W.default_parent_session_id.return_value = "successor"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["state"], "preparing")
         W.default_parent_session_id.return_value = "stranger"
         with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
             self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
@@ -3346,6 +3352,29 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertNotEqual((after or {}).get("state"), "acked")
         self.assertIn("continue the approved fixture", self.delivered_prompts[result["owner_attempt_id"]])
 
+    def test_completed_node_changed_without_revise_names_that_action_not_a_retry(self):
+        import dispatch_contract as D
+        import shlex
+        owner = self._native_blocked_owner()
+        self._store(owner, "continue after the spec edit", "input-unproven")
+        evidence = str(self.root / "spec dir" / "eval-spec.md")
+        refusal = self.replacement._completion_unproven(
+            {"route_id": "rt-fixture"}, {"id": "eval-spec"}, {"evidence": {"path": evidence}},
+            D.GateCurrency("revised-unrecorded", "completion-evidence-revised-unrecorded"))
+        before = len(self.launches)
+        with mock.patch.object(self.replacement, "_reuse_snapshot", side_effect=refusal):
+            result = self._cli_start()
+        self.assertEqual(result["reason"], "replacement-completion-unproven", result)
+        self.assertEqual(len(self.launches), before)
+        self.assertIn("revise --route rt-fixture --node eval-spec "
+                      f"--evidence {shlex.quote(evidence)}", result["next_step"])
+        self.assertNotIn("launch settles", result["next_step"])
+        self.assertNotIn("next_action", result)
+        attention = result["replacement_attention"][0]
+        self.assertEqual((attention["completion_node"], attention["completion_currency"],
+                          attention["completion_evidence"]),
+                         ("eval-spec", "revised-unrecorded", evidence))
+
     def test_full_blocked_chain_normal_start_carries_late_correction_and_replays_once(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()
         late = self._store(owner_b, "late correction after C reservation", "input-late")
@@ -3400,6 +3429,20 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(replay["owner_attempt_id"], owner_d)
         self.assertTrue(replay["owner_started"])
         self.assertEqual(len(self.launches), launches_before_replay)
+
+    def test_confirmed_handover_refuses_live_start_for_old_parent_and_allows_successor(self):
+        owner_a = self._seed_initial_owner()
+        self._handover(owner_a, "successor")
+        launches_before = len(self.launches)
+        with mock.patch.object(W, "default_parent_session_id", return_value="parent"):
+            refused = self._cli_start()
+        self.assertEqual(refused.get("reason"), "work-parent-recovery-required", refused)
+        self.assertEqual(len(self.launches), launches_before)
+        with mock.patch.object(W, "default_parent_session_id", return_value="successor"):
+            admitted = self._cli_start()
+        self.assertEqual(admitted.get("owner_attempt_id"), owner_a, admitted)
+        self.assertIn(admitted.get("state"), {"running", "preparing"}, admitted)
+        self.assertEqual(len(self.launches), launches_before)
 
     def test_off_chair_start_retains_correction_without_launching(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain()

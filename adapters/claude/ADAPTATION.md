@@ -512,3 +512,7 @@ unimplemented follow-up work.
 - **Runtime support:** the Stop payload carries the main session id and transcript path; the existing latest-request reader returns input plus cache creation/read tokens for that exact session.
 - **Adapter realization:** the shared idle observer uses the configured token threshold and fixed due time. The helper sends one claim-bound card request through `peer-steward` on the verified pane or the native Claude attachment; clear waits for the matching card and durable queue receipt. The status-only successor prompt does not restart work.
 - **Cache evidence:** the installed `opus[1m]` model name does not expose the actual request cache policy. No cache expiry is inferred from it; current Stop payloads do not carry a verified expiry, so the configured idle wait is used.
+
+## Parent authority and peer transport
+
+Parent-only route actions use the shared current `effective_parent`. A readable handover chain grants them to its last confirmed recipient; an unreadable handover keeps the existing registered-parent fallback. Claude PTY and first-input delivery reserve a pending claim, repeat the native pane and draft checks, then mark it unverified immediately before `herdr prompt`. Hook context follows the same boundary immediately before output flush. A write already marked unverified is not sent again.

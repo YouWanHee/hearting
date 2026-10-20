@@ -959,14 +959,23 @@ def _own_seat(session: str):
 
 
 def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
-    """True when ``session`` is the registered parent or the end of its handover lineage.  For
-    the caller's own session its own seat is read too, like :func:`storage_recipients`."""
+    """True only for the session that answers for ``meta``'s attempt now.
+
+    Without a registry that is the registered parent.  With one it is the end of the
+    handover lineage, so a registered parent that handed the job on no longer owns it.
+    For the caller's own session its own seat is read too, like
+    :func:`storage_recipients`.  If the handover state cannot be read, ``_effective``
+    deliberately falls back to the registered parent, preserving the existing safe
+    default.
+    """
     if not session:
         return False
-    if meta.get("parent_sid") == session:
-        return True
-    return jobs is not None and _effective(
-        meta, jobs, read_context=read_context, extra_seats=(_own_seat(session),))[0] == session
+    if jobs is None:
+        return meta.get("parent_sid") == session
+    own = _own_seat(session)
+    if own is None:
+        return effective_parent(meta, jobs, read_context=read_context) == session
+    return _effective(meta, jobs, read_context=read_context, extra_seats=(own,))[0] == session
 
 
 def storage_recipients(session: str, env=None, harness: Optional[str] = None) -> list:

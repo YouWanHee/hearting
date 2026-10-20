@@ -6168,7 +6168,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     from dispatch_completion_join import current_attempt_row, materialize_after_terminal_close
     from dispatch_notice_state import keep_claim
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import effective_parent
+    from dispatch_seat_handover import effective_parent, effective_parent_harness
     from dispatch_session_sweep import addressed_records, delivery_context, is_human_gate_record
     spec = importlib.util.spec_from_file_location(
         "_retained_rewake", _UTILITIES_DIR.parent / "hooks/dispatch-owner-rewake.py")
@@ -6207,7 +6207,19 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     # The duty follows confirmed handover; the signed queue stays under the
     # registered parent, even when its current recipient is a successor.
     recipient_sid = effective_parent(row.metadata, jobs, read_context=read_context)
+    recipient_harness = (harness if recipient_sid == str(row.metadata.get("parent_sid") or "")
+                         else effective_parent_harness(row.metadata, jobs, read_context=read_context)
+                         or harness)
     storage_recipient = row.metadata.get("parent_sid", "")
+    # Transfers are immutable. A transfer reserved for an earlier recipient
+    # cannot hold the current duty open or be redirected; the current recipient
+    # receives a fresh transfer through the normal path below.
+    transferred_is_current = bool(
+        transferred
+        and (transferred.get("to") or {}).get("session_id") == recipient_sid
+        and (transferred.get("to") or {}).get("harness") == recipient_harness)
+    if transferred and not transferred_is_current:
+        transferred = None
     identity_fields = ("parent_sid", "parent_harness", "parent_completion_delivery",
                        "delivery_id", "delivery_receipt_digest", "delivery_row_revision",
                        "delivery_intent", "route_id", "route_hash", "route_node",
@@ -6215,8 +6227,11 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
 
     def fresh_recipient_row():
         fresh = current_attempt_row(jobs, identity["attempt_id"])
+        fresh_harness = (effective_parent_harness(fresh.metadata, jobs)
+                         if fresh is not None else "")
         if (fresh is None or fresh.status != row.status
                 or effective_parent(fresh.metadata, jobs) != recipient_sid
+                or (fresh_harness and fresh_harness != recipient_harness)
                 or any(fresh.metadata.get(key) != row.metadata.get(key)
                        for key in identity_fields)):
             return None
@@ -6266,7 +6281,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 return
             store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
             return
-    if transferred and transferred.get("state") in {"queued", "unverified"}:
+    if transferred_is_current and transferred and transferred.get("state") in {"queued", "unverified"}:
         return  # The existing message courier owns this accepted/ambiguous send.
     if not notice_id and holder and rewake._holder_alive(holder) and rewake._holder_alive(parent):
         return
@@ -6279,7 +6294,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             return (json.loads(result.stdout).get("result") or {}).get("agents") or []
         agents = (read_context.recipient_census(identity.get("server"), list_agents)
                   if read_context is not None else list_agents())
-        matches = [a for a in agents if a.get("agent") == harness
+        matches = [a for a in agents if a.get("agent") == recipient_harness
                    and (a.get("agent_session") or {}).get("value") == recipient_sid]
         if len(matches) != 1:
             if fresh_recipient_row() is None:
@@ -6288,9 +6303,9 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                                   "session_id": recipient_sid})
             return
         pane = matches[0]["pane_id"]
-        if _resolve_target(pane)[:2] != (harness, recipient_sid):
+        if _resolve_target(pane)[:2] != (recipient_harness, recipient_sid):
             return
-        if transferred and transferred.get("state") == "pending":
+        if transferred_is_current and transferred and transferred.get("state") == "pending":
             if fresh_recipient_row() is None:
                 return
             _schedule_message_obligation(transferred, pane, pane)
@@ -6317,7 +6332,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         record = pending.claim(jobs.parent, storage_recipient, delivery_id,
                                claim_owner=owner, lease_seconds=30, require_generation_proof=False,
                                jobs=jobs,
-                               retry_context=f"{harness}:{recipient_sid}:{pane}:{duty['id']}")
+                               retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
@@ -6330,7 +6345,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             "duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,
             "carrier": intent["carrier"], "delivery_id": delivery_id,
             "receipt_digest": record.get("receipt_digest"),
-            "recipient": {"harness": harness, "session_id": recipient_sid},
+            "recipient": {"harness": recipient_harness, "session_id": recipient_sid},
             "route_id": str(row.metadata.get("route_id") or ""),
             "route_node": str(row.metadata.get("route_node") or ""),
         }
@@ -6359,7 +6374,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
                                               "--ref", duty["id"], "--ref", row.attempt_id,
                                               "--ref", delivery_id])
-            code = cmd_prompt(args, expected_recipient=(harness, recipient_sid),
+            code = cmd_prompt(args, expected_recipient=(recipient_harness, recipient_sid),
                               on_prepared=bind_transfer, producer_binding=producer_binding)
         current = pending.read(jobs.parent, storage_recipient, delivery_id)
         if current and current.get("state") == "acked":
@@ -6834,7 +6849,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_bind
                 resolved_target, t_harness, target_pane, expected_foreground=admission_proof)
             if direct_reason is None:
                 try:
-                    claimed = peer_message.claim_pending_first_input(
+                    claimed = peer_message.reserve_pending_first_input(
                         transfer_ref, {"harness": t_harness, "pane_id": target_pane}, proof)
                 except (OSError, ValueError):
                     claimed = None
@@ -6848,6 +6863,14 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_bind
                         peer_message.release_unsent_herdr_claim(
                             claimed, receipt=direct_reason)
                     else:
+                        reserved = claimed
+                        claimed = peer_message.begin_pending_write(
+                            claimed, recipient={"harness": t_harness, "pane_id": target_pane},
+                            receipt="native-first-input-inflight")
+                        if claimed is None:
+                            peer_message.release_pending_herdr_claim(reserved)
+                            direct_reason = "peer-delivery-already-claimed"
+                    if direct_reason is None:
                         # This is the one external submission attempt. A lost or
                         # malformed reply stays unverified; it is never retried.
                         rc, payload = _herdr_prompt(
@@ -6894,7 +6917,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_bind
                 resolved_target, t_sid, target_pane)
             if direct_reason is None:
                 try:
-                    claimed = peer_message.claim_pending_herdr(
+                    claimed = peer_message.reserve_pending_herdr(
                         transfer_ref, {"harness": "claude", "session_id": t_sid,
                                        "pane_id": target_pane},
                         receipt="claude-pty-prompt-inflight")
@@ -6910,26 +6933,35 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_bind
                             claimed, receipt=direct_reason)
                         claimed = None
                     else:
-                        rc, payload = _herdr_prompt(
-                            target_pane, pending["text"], wait=False,
-                            timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
-                        if rc != 0:
-                            outcome = "unverified"
-                            verify = "native-prompt-unverified"
-                            reason = (_herdr_error_reason(payload, rc)
-                                      if rc is not None else "herdr-invocation-failed")
+                        reserved = claimed
+                        claimed = peer_message.begin_pending_write(
+                            claimed, recipient={"harness": "claude", "session_id": t_sid,
+                                                "pane_id": target_pane},
+                            receipt="claude-pty-prompt-inflight")
+                        if claimed is None:
+                            peer_message.release_pending_herdr_claim(reserved)
+                            direct_reason = "peer-delivery-already-claimed"
                         else:
-                            peer_message.mark_pending_prompt_queued(
-                                transfer_ref, claimed["rpc_claim"])
-                            current = peer_message._read_pending(transfer_ref)
-                            if current and current.get("state") == "received":
-                                outcome, verify = "true", "exact-peer-ref"
-                            elif current and current.get("state") == "queued":
-                                outcome, verify = "queued", "native-prompt-submitted"
-                                reason = "awaiting-exact-receiver-ref"
+                            rc, payload = _herdr_prompt(
+                                target_pane, pending["text"], wait=False,
+                                timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+                            if rc != 0:
+                                outcome = "unverified"
+                                verify = "native-prompt-unverified"
+                                reason = (_herdr_error_reason(payload, rc)
+                                          if rc is not None else "herdr-invocation-failed")
                             else:
-                                outcome, verify = "unverified", "native-prompt-unverified"
-                                reason = "peer-state-unavailable-after-submit"
+                                peer_message.mark_pending_prompt_queued(
+                                    transfer_ref, claimed["rpc_claim"])
+                                current = peer_message._read_pending(transfer_ref)
+                                if current and current.get("state") == "received":
+                                    outcome, verify = "true", "exact-peer-ref"
+                                elif current and current.get("state") == "queued":
+                                    outcome, verify = "queued", "native-prompt-submitted"
+                                    reason = "awaiting-exact-receiver-ref"
+                                else:
+                                    outcome, verify = "unverified", "native-prompt-unverified"
+                                    reason = "peer-state-unavailable-after-submit"
         if direct_reason is not None:
             if pending["state"] == "pending":
                 _schedule_message_obligation(pending, resolved_target, target_pane)
@@ -7780,7 +7812,7 @@ def _continue_claude_prompt(target, pane, sid, ref, text):
     if reason:
         return "native-pending", "queued", reason
     try:
-        claimed = peer_message.claim_pending_herdr(
+        claimed = peer_message.reserve_pending_herdr(
             ref, {"harness": "claude", "session_id": sid, "pane_id": pane},
             receipt="claude-pty-prompt-inflight")
     except (OSError, ValueError):
@@ -7791,6 +7823,13 @@ def _continue_claude_prompt(target, pane, sid, ref, text):
     if reason:
         peer_message.release_unsent_herdr_claim(claimed, receipt=reason)
         return "native-pending", "queued", reason
+    reserved = claimed
+    claimed = peer_message.begin_pending_write(
+        claimed, recipient={"harness": "claude", "session_id": sid, "pane_id": pane},
+        receipt="claude-pty-prompt-inflight")
+    if claimed is None:
+        peer_message.release_pending_herdr_claim(reserved)
+        return "native-pending", "queued", "peer-delivery-already-claimed"
     rc, payload = _herdr_prompt(pane, text, wait=True, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
     if rc == 0:
         peer_message.mark_pending_queued(ref, receipt="claude-pty-continue-submitted")

@@ -1621,6 +1621,7 @@ class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "jobs.log").touch()
         env = os.environ.copy()
+        env.pop("AGENT_DISPATCH_REGISTERED_WORKER", None)
         env.update({
             "AGENT_SESSION_ROLE": "worker",
             "AGENT_DISPATCH_CHILD": "1",

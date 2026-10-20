@@ -3420,7 +3420,7 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.effective(meta), "sid-B")
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
-            self.assertTrue(self.handover.owns(meta, "sid-A", self.jobs))     # the registered parent keeps its name
+            self.assertFalse(self.handover.owns(meta, "sid-A", self.jobs))    # the registered parent no longer owns after handover
             self.assertFalse(self.handover.owns(meta, "sid-Z", self.jobs))
         self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
         again, rows2 = self.start("sid-B", event="prompt", source="")
@@ -3758,7 +3758,7 @@ class SeatHandoverTest(TidyCase):
     def test_only_the_chain_end_answers_and_a_closed_route_settles(self):
         owner, _frame = self.chain()
         self.assertTrue(self.owns(owner, "sid-C"))
-        self.assertTrue(self.owns(owner, "sid-A"))                     # the registered parent keeps its name
+        self.assertFalse(self.owns(owner, "sid-A"))                    # the registered parent handed it on
         self.assertFalse(self.owns(owner, "sid-B"))                    # B handed it on
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             owed = {aid for _key, attempts in self.handover.storage_recipients("sid-B") if attempts
