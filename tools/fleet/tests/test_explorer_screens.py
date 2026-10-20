@@ -5,16 +5,21 @@ selected-scope result at 100 and 168 columns, 45 rows. Every row outside the raw
 must equal the approved text; the few cells where the product text is allowed to differ are listed
 in the scene's ``allowed`` and each of them is asserted explicitly below.
 """
+import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
-from tools.fleet.explorer.frame import compose
+from tools.fleet.explorer.focus import output_plans
+from tools.fleet.explorer.frame import compose, output_pane
 from tools.fleet.explorer.ledger import replacement_lines
 from tools.fleet.explorer.output import cell_width
-from tools.fleet.explorer.types import Rect
+from tools.fleet.explorer.state import ExplorerState
+from tools.fleet.explorer.types import AttemptRow, FocusKey, FocusResult, Rect, RequestTab
+from tools.fleet.tests import explorer_fixture as ef
 from tools.fleet.tests.explorer_fixture import (cells, collect, load_screens, materialize, scene_frame,
-                                                scene_result, tab)
+                                                scene_result, scene_state, tab)
 
 BORDER = "┃"
 COMPARED = ("first", "history", "overview", "system", "overflow", "tab-broken", "source-failed")
@@ -166,15 +171,26 @@ class OutputPaneAndBroken(unittest.TestCase):
     def tearDownClass(cls):
         cls.dir.cleanup()
 
-    def test_output_pane_shows_the_ledger_summary_not_every_job(self):
+    def test_output_pane_shows_the_selected_stages_raw_output_not_every_job(self):
         for cols, out in ((100, (27, 22, 73, 18)), (168, (104, 4, 64, 36))):
             frame = scene_frame(self.fx, self.screens["first"], cols)
             rect = frame.region("output")
             self.assertEqual((rect.x, rect.y, rect.w, rect.h), out)
             pane = [cells(line, rect.x, rect.x + rect.w).rstrip() for line in frame.lines[rect.y:rect.y + rect.h]]
-            self.assertEqual(pane[0], "test · CX · 요약")
-            self.assertIn("원문 읽는 중", pane)
-            self.assertEqual(sum(1 for line in pane if line), 4)
+            self.assertEqual(pane[0], "test · CX · 원래 출력")
+            self.assertTrue(all(line.startswith("[test] CX ") for line in pane[1:] if line), pane)
+            self.assertEqual(sum(1 for line in pane if line), min(len(pane), 21))
+
+    def test_without_a_reader_the_pane_keeps_the_ledger_summary(self):
+        scene = self.screens["first"]
+        base = collect(self.fx)
+        labels = {item.label: item.identity for item in base.tabs}
+        result = collect(self.fx, request_id=labels["b6-report"], stage_id="test")
+        frame = compose(self.fx.snapshot, result, scene_state(self.fx, scene, result), 168, 45, now=self.fx.now)
+        rect = frame.region("output")
+        pane = [cells(line, rect.x, rect.x + rect.w).rstrip() for line in frame.lines[rect.y:rect.y + rect.h]]
+        self.assertEqual(pane[0], "test · CX · 요약")
+        self.assertIn("원문 읽는 중", pane)
 
     def test_broken_tab_keeps_its_own_previous_screen_and_age_and_drops_the_output_pane(self):
         for cols in (100, 168):
@@ -202,6 +218,68 @@ class OutputPaneAndBroken(unittest.TestCase):
     def test_result_helper_injects_events_only_from_the_fixture_source(self):
         result = scene_result(self.fx, self.screens["first"])
         self.assertEqual(len(result.events), len(self.fx.source["events"]))
+
+
+class CanonicalOutputRows(unittest.TestCase):
+    """The approved B-first / B-inflight / B-output-oc output rectangles, row for row, from real sources.
+
+    The text, the glyphs, the labels, the times, the ``(+k줄)`` counts and the row order are the approved
+    ones; the only change is the stand-in for the capture machine's home path (same width), applied to the
+    fixture and to the expected rows alike. B-inflight and B-output-oc are drawn without a ledger column
+    in the approved screens, so their rows are compared at the approved output width."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.fx = ef.materialize(cls.temp.name)
+        cls.scenes = ef.load_screens()["scenes"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def compare(self, name, result, state, now):
+        for width in ("100", "168"):
+            geometry = self.scenes[name]["output_rows"][width]
+            rect = Rect(geometry["x"], geometry["y"], geometry["w"], geometry["h"])
+            rows, _ = output_pane(result, state, rect, now)
+            actual = [row.rstrip() for row in rows] + [""] * (rect.h - len(rows))
+            for index, expected in enumerate(geometry["rows"]):
+                with self.subTest(scene=name, width=width, row=index):
+                    self.assertEqual(actual[index], expected)
+
+    def test_b_first_the_selected_stage_of_a_codex_attempt(self):
+        scene = self.scenes["first"]
+        result = ef.scene_result(self.fx, scene)
+        self.assertEqual(result.output_title, "test · CX · 원래 출력")
+        self.compare("first", result, ef.scene_state(self.fx, scene, result), self.fx.now)
+
+    def test_b_inflight_supervisor_claude_and_stage_codex_mixed_by_native_time(self):
+        scene = self.scenes["inflight"]
+        result = ef.scene_result(self.fx, scene)
+        self.assertEqual(result.output_title, "fleet-explorer · 감독 CL + 단계 CX")
+        self.compare("inflight", result, ef.scene_state(self.fx, scene, result), self.fx.now)
+        times = [row.text.split(" ")[0] for row in result.output]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual({row.text.split(" ")[1] for row in result.output}, {"[owner]", "[material-strategy]"})
+
+    def test_b_output_oc_an_opencode_owner_from_its_database_in_both_generations(self):
+        for generation in ("v1", "v2"):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as root:
+                jobs, attempt, _sid, _db = ef.materialize_opencode(root, generation)
+                owner = AttemptRow(attempt_id=attempt, line=1, status="done", slug="oc-owner",
+                                   harness="opencode", worker_type="owner")
+                tab = RequestTab(identity="t", label="ac-cmd-vad-sap-leg2", attempt_ids=(attempt,))
+                key = FocusKey("opencode", "ses_main", "t")
+                title, plans, stamped = output_plans(key, tab, [owner])
+                self.assertEqual((title, stamped), ("ac-cmd-vad-sap-leg2 · 감독 OC", False))
+                env = {"AGENT_DISPATCH_JOBS": jobs, "AGENT_HOME": root + "/h", "XDG_STATE_HOME": root + "/x"}
+                with mock.patch.dict(os.environ, env):
+                    view = ef.output_reader().read(key, title, plans)
+                result = FocusResult(key, 1, 1, output=view.rows, output_title=view.title,
+                                     output_notes=view.notes, output_health=view.health)
+                self.assertEqual(view.health.state, "success")
+                self.compare("output-oc", result, ExplorerState(tab="t"), 0)
 
 
 if __name__ == "__main__":

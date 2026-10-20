@@ -56,3 +56,28 @@ What is not the captured bytes:
 | `successor-wording` | overview, source-failed | the approved `승계 ? · fixture에 확인 근거 없음` reads `승계 ? · 확인 근거 없음` (the product has no fixture) |
 | `p4-duty-order` | overview, source-failed | the five remaining duties are the approved ones, listed oldest first instead of in directory-listing order |
 | `history-replacement-section` | history | the approved scene appends the `감독 교체` section of the OpenRig 조사 request under b6-report; the product shows it only on the request whose supervisor was replaced (the test compares the section with that request's own lines; the cycle title is `openrig 조사`, the screen spells `OpenRig 조사`) |
+
+## ss-10 additions (raw output)
+
+`output_synthetic.json` holds the records behind the raw-output rectangle of three approved screens. It is
+reduced, not captured bytes:
+
+| key | content | source |
+|---|---|---|
+| `logs` | the Codex attempt logs of the b6 `test` stage (last 8 `item.completed` records, line 9–16 of the frozen file: the reader's tail window) and of the in-flight `material-strategy` stage (its first 2 records), written to the `log_file` paths of the registry rows | captured `live/output/*.jsonl` |
+| `claude_owner` | the supervised Claude owner of fleet-explorer: a supervisor log announcing its session plus the 3 assistant text rows of its native transcript (written under the `runtime_home` this fixture now gives that registry row) | captured `output/claude-native.jsonl` |
+| `cleaned_owner` | the b6 Claude owner: a supervisor log with its session announcement and no worker home, i.e. `감독 기록만 남음 · 원천 정리됨` | captured `live/output/sources.json` |
+| `opencode` | the BC_ResNet OpenCode owner as two database rows (v1 `message`/`part`, v2 `session_message`), written by `explorer_fixture.materialize_opencode` | captured `output/opencode-native.json` |
+
+Reduction rules: the first line of every command, output and message is the captured one; its further lines are
+placeholders (`…`), so only the `(+k줄)` counts are real. The capture machine's 22-cell home
+prefix is replaced by `/fixt/srv/usr/Fixtures` — the same width, so every clip position stays — in the
+records and in the expected rows alike. OpenCode row ids are `1, 2` (v1) / `seq 1` (v2)
+instead of the captured `190, 197`, in the approved order (message first, tool output second); the tool part
+carries only its `output`, as in the approved screen.
+
+`screens.json` scenes `first`, `inflight`, `output-oc` carry `output_rows`: the approved raw-output rectangle of each
+width (`x`, `y`, `w`, `h`, `rows`, right-trimmed). `first` also pins its viewer state to the top of the pane
+(`output_scroll: 0`, the approved 100-column rectangle shows the first 17 of 20 rows). `inflight` and `output-oc`
+are drawn without a ledger column in the approved screens, so their rows are compared at the approved output width
+with `frame.output_pane` instead of through a full frame; the full frame of `first` is compared row for row.

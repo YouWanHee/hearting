@@ -29,6 +29,8 @@ class FocusKey:
     request_id: str = ""
     stage_id: str = ""
     attempt_id: str = ""
+    # "harness:sid" of an earlier generation of the session, when its raw output is the selection.
+    generation: str = ""
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,16 @@ class FocusResult:
     events: Tuple[Mapping[str, Any], ...] = ()
     # Per-source health the screen shows when a source fails: (name, Health).
     sources: Tuple[Tuple[str, Health], ...] = ()
+    # The raw output pane of the selected request / stage: its title, the rows (OutputLine), what
+    # the sources said about themselves, the reading health and whether older records exist.
+    output_title: str = ""
+    output_notes: Tuple[str, ...] = ()
+    output_health: Optional[Health] = None
+    output_more: bool = False
+    # The earlier generations of the focused main session, read only while it is unfolded:
+    # a tuple of lineage entries, or None when not read; ``lineage_health`` says why not.
+    lineage: Optional[Tuple[Mapping[str, Any], ...]] = None
+    lineage_health: Optional[Health] = None
 
     def source_health(self, name: str) -> Optional[Health]:
         return dict(self.sources).get(name)

@@ -339,6 +339,70 @@ class SelectionFeed(IntegrationEnv):
         self.assertEqual(self.calls, [])
 
 
+class LineageAndEarlierRequests(IntegrationEnv):
+    def test_the_feed_passes_the_open_focused_session_and_a_change_of_it_forces_a_read(self):
+        seen, lock = [], threading.Lock()
+
+        def reader(request):
+            with lock:
+                seen.append(request.expanded_sessions)
+            return FocusResult(request.key, request.epoch, request.snapshot_generation,
+                               health=Health("success", time.time()))
+
+        feed = render._SelectionFeed(SelectionPump(reader, 0.1))
+        self.addCleanup(feed.stop)
+        state = ExplorerState(focus="claude:s1")
+
+        def wait(count):
+            end = time.monotonic() + 3
+            while time.monotonic() < end and len(seen) < count:
+                time.sleep(0.01)
+
+        feed.update(state, 1, time.monotonic(), expanded=("claude:s1",))
+        wait(1)
+        feed.update(state, 1, time.monotonic(), expanded=())            # the session was folded
+        wait(2)
+        self.assertEqual(seen, [("claude:s1",), ()])
+
+    def test_only_an_open_focused_session_counts_as_expanded(self):
+        from tools.fleet.explorer.types import NavRow
+        old = render._EXPLORER_NAV_ROWS
+        self.addCleanup(setattr, render, "_EXPLORER_NAV_ROWS", old)
+        state = ExplorerState(focus="claude:s1")
+        render._EXPLORER_NAV_ROWS = (NavRow("session:claude:s1", "session", 2, "x", open=True),)
+        self.assertEqual(render._explorer_expanded(state), ("claude:s1",))
+        render._EXPLORER_NAV_ROWS = (NavRow("session:claude:s1", "session", 2, "x", open=False),)
+        self.assertEqual(render._explorer_expanded(state), ())
+        render._EXPLORER_NAV_ROWS = ()                                    # its project is folded: no row at all
+        self.assertEqual(render._explorer_expanded(state), ())
+        self.assertEqual(render._explorer_expanded(ExplorerState()), ())
+
+    def test_scrolling_up_from_the_first_output_row_asks_for_older_records_once_and_only_then(self):
+        from tools.fleet.explorer.types import Frame
+        olds = (render._EXPLORER_FRAME, render._EXPLORER_RESULT, render._EXPLORER_EARLIER)
+        self.addCleanup(lambda: (setattr(render, "_EXPLORER_FRAME", olds[0]),
+                                 setattr(render, "_EXPLORER_RESULT", olds[1]),
+                                 setattr(render, "_EXPLORER_EARLIER", olds[2])))
+        render._EXPLORER_FRAME = Frame(lines=(), regions=(), scroll_max=(("output:t", 5),))
+        more = FocusResult(FocusKey("claude", "s1", "t"), 1, 1, output_more=True)
+        render._EXPLORER_RESULT = more
+
+        def asked(state, key):
+            render._EXPLORER_EARLIER = False
+            render._explorer_note_earlier(state, key)
+            return render._EXPLORER_EARLIER
+
+        region = dict(active_region="output", tab="t")
+        self.assertFalse(asked(ExplorerState(**region), "up"))                          # following the newest rows
+        self.assertFalse(asked(ExplorerState(scrolls=(("output:t", 3),), **region), "up"))
+        self.assertTrue(asked(ExplorerState(scrolls=(("output:t", 0),), **region), "up"))   # already at the top
+        self.assertTrue(asked(ExplorerState(scrolls=(("output:t", 0),), **region), "pageup"))
+        self.assertFalse(asked(ExplorerState(scrolls=(("output:t", 0),), **region), "down"))
+        self.assertFalse(asked(ExplorerState(scrolls=(("output:t", 0),), active_region="ledger", tab="t"), "up"))
+        render._EXPLORER_RESULT = FocusResult(FocusKey("claude", "s1", "t"), 1, 1, output_more=False)
+        self.assertFalse(asked(ExplorerState(scrolls=(("output:t", 0),), **region), "up"))   # nothing older exists
+
+
 class LiveLoop(IntegrationEnv):
     """The real ``_loop`` on the B surface, with a fake terminal: keys, status updates and an orderly
     stop while the selected-scope reader is still blocked."""

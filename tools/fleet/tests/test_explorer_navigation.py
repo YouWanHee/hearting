@@ -135,24 +135,82 @@ class ProjectName(unittest.TestCase):
         self.assertEqual([r.label for r in frame.nav_rows if r.kind == "project"], ["git:/w/app ·1"])
 
 
-class PreviousGenerationSlot(unittest.TestCase):
-    """The entrance to a previous generation exists only when a source says there is one."""
+class PreviousConversations(unittest.TestCase):
+    """The entrance to earlier conversations exists only for the focused, open session and only when
+    its seat's lineage read found some; a failed read is a ``?`` with the reason, never a made-up row."""
 
-    def snapshot(self, **extra):
+    SESSION = "session:claude:sid-a"
+
+    def snapshot(self):
         main = dict(session_id="sid-a", harness="claude", cwd="/work/repo", title="backend",
-                    liveness="working", session_tag="aa", **extra)
+                    liveness="working", session_tag="aa")
         return SimpleNamespace(sessions=[main], jobs=[])
 
-    def test_no_source_means_no_row(self):
-        rows = build_nav(self.snapshot())
-        self.assertEqual([r for r in rows if r.kind == "previous-generation"], [])
+    def result(self, lineage=None, health=None):
+        from tools.fleet.explorer.types import FocusKey, FocusResult
+        return FocusResult(FocusKey("claude", "sid-a"), 1, 1, lineage=lineage, lineage_health=health)
 
-    def test_a_source_adds_the_row_under_its_session_and_it_is_not_a_target(self):
-        rows = build_nav(self.snapshot(previous_generation="sid-old-0000"))
-        slot = [r for r in rows if r.kind == "previous-generation"]
-        self.assertEqual(len(slot), 1)
-        self.assertEqual((slot[0].parent, slot[0].depth, slot[0].label), ("session:claude:sid-a", 3, "이전 세대 sid-old-"))
-        self.assertIsNone(slot[0].target_ref)
+    ENTRIES = (
+        {"harness": "claude", "sid": "sid-old-111122223333", "source": "clear", "title": "이전 카드 제목"},
+        {"harness": "codex", "sid": "cx-older-9999", "source": "resume", "title": ""},
+    )
+
+    def kinds(self, rows, kind):
+        return [r for r in rows if r.kind == kind]
+
+    def test_no_read_means_no_row(self):
+        self.assertEqual(self.kinds(build_nav(self.snapshot(), self.result()), "previous-generation"), [])
+        self.assertEqual(self.kinds(build_nav(self.snapshot()), "previous-generation"), [])
+
+    def test_no_earlier_conversation_means_no_row(self):
+        rows = build_nav(self.snapshot(), self.result(lineage=()))
+        self.assertEqual(self.kinds(rows, "previous-generation"), [])
+
+    def test_the_entrance_is_closed_by_default_and_counts_the_generations(self):
+        rows = build_nav(self.snapshot(), self.result(lineage=self.ENTRIES))
+        entrance = self.kinds(rows, "previous-generation")
+        self.assertEqual(len(entrance), 1)
+        self.assertEqual((entrance[0].parent, entrance[0].depth, entrance[0].label, entrance[0].marker),
+                         (self.SESSION, 3, "이전 대화 2", "▸"))
+        self.assertIsNone(entrance[0].target_ref)
+        self.assertEqual(self.kinds(rows, "generation"), [])
+
+    def test_opening_it_lists_one_row_per_generation_with_harness_sid_source_and_card_title(self):
+        state = ExplorerState(nav_open=("previous-generation:claude:sid-a",))
+        rows = build_nav(self.snapshot(), self.result(lineage=self.ENTRIES), state)
+        entrance = self.kinds(rows, "previous-generation")[0]
+        self.assertEqual((entrance.marker, entrance.open), ("▾", True))
+        generations = self.kinds(rows, "generation")
+        self.assertEqual([g.label for g in generations], ["CL sid-old- clear 이전 카드 제목", "CX cx-older resume"])
+        self.assertEqual([g.identity for g in generations], [
+            "generation:claude:sid-a:claude:sid-old-111122223333", "generation:claude:sid-a:codex:cx-older-9999"])
+        self.assertTrue(all(g.parent == entrance.identity and g.depth == 4 and g.target_ref is None
+                            for g in generations))
+
+    def test_the_rows_are_never_kill_targets(self):
+        state = ExplorerState(nav_open=("previous-generation:claude:sid-a",))
+        rows = build_nav(self.snapshot(), self.result(lineage=self.ENTRIES), state)
+        for row in rows:
+            if row.kind in ("previous-generation", "generation"):
+                self.assertIsNone(row.target_ref)
+
+    def test_a_failed_read_is_a_question_mark_with_the_reason(self):
+        from tools.fleet.explorer.types import Health
+        rows = build_nav(self.snapshot(), self.result(health=Health("failed", None, "OSError")))
+        entrance = self.kinds(rows, "previous-generation")
+        self.assertEqual([r.label for r in entrance], ["이전 대화 ? · OSError"])
+        self.assertIsNone(entrance[0].open)
+
+    def test_a_folded_session_has_no_entrance(self):
+        state = ExplorerState(nav_fold=(self.SESSION,))
+        rows = build_nav(self.snapshot(), self.result(lineage=self.ENTRIES), state)
+        self.assertEqual(self.kinds(rows, "previous-generation"), [])
+
+    def test_a_session_that_is_not_the_focus_has_no_entrance(self):
+        from tools.fleet.explorer.types import FocusKey, FocusResult
+        other = FocusResult(FocusKey("claude", "someone-else"), 1, 1, lineage=self.ENTRIES)
+        rows = build_nav(self.snapshot(), other)
+        self.assertEqual(self.kinds(rows, "previous-generation"), [])
 
 
 class RoleNameAndStewardFlag(unittest.TestCase):

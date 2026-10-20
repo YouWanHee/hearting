@@ -258,11 +258,35 @@ def _tab_text(focus_result, state, width):
     return requests.tab_bar(tabs, active=state.tab, selected=selected or None, keep=state.keep, width=width)
 
 
-def _output_lines(snapshot, focus_result, state, rect, now=None):
+def output_pane(focus_result, state, rect, now=None):
+    """(rows, how far the output may scroll) of the raw-output pane.
+
+    The title and what the sources said about themselves stay on top; the records below scroll on
+    their own and follow the newest ones until the person scrolls.
+    """
     records = tuple(getattr(focus_result, "output", ()) or ())
-    scroll = dict(state.scrolls).get(f"output:{state.tab}", 0)
-    if records:
-        return render_output(records, rect.w, rect.h, scroll=scroll)
+    notes = tuple(getattr(focus_result, "output_notes", ()) or ())
+    title = getattr(focus_result, "output_title", "") or ""
+    health = getattr(focus_result, "output_health", None)
+    if not (title or records or notes):
+        return None, 0
+    head = [title] + list(notes)
+    if health is not None and health.state in ("stale", "failed", "partial"):
+        text = focus.status_text(health, now)
+        head.append(text if health.state != "partial" else
+                    "일부 읽지 못함" + (f" · {health.error}" if health.error else ""))
+    if not records and not notes and (health is None or health.state in ("success", "partial")):
+        head.append("출력 기록 없음")
+    body_h = max(0, rect.h - len(head))
+    scroll = dict(state.scrolls).get(f"output:{state.tab}")
+    rows = render_output(records, rect.w, body_h, scroll=scroll)
+    return tuple(head) + rows, max(0, len(records) - body_h)
+
+
+def _output_lines(snapshot, focus_result, state, rect, now=None):
+    rows, _limit = output_pane(focus_result, state, rect, now)
+    if rows is not None:
+        return rows
     view = _matching_ledger(focus_result, state)
     if view is None:
         return (_waiting(focus_result, now),)
@@ -317,8 +341,7 @@ def compose(snapshot=None, focus_result=None, state=None, cols=100, rows=45, *, 
             extent[_body_slot(state)] = max(0, len(lines) - rect.h)
             return _scroll(lines, state, _body_slot(state), rect.h)
         if name == "output":
-            records = tuple(getattr(focus_result, "output", ()) or ())
-            extent[f"output:{state.tab}"] = max(0, len(records) - rect.h)
+            extent[f"output:{state.tab}"] = output_pane(focus_result, state, rect, now)[1]
             return _output_lines(snapshot, focus_result, state, rect, now)
         if name == "separator":
             return (SEPARATOR_CHAR * rect.w,)

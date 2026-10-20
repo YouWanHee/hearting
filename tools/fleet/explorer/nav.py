@@ -190,12 +190,41 @@ def _jobs_of(snapshot, session):
             and _job_is_live(job)]
 
 
-def _previous_generation(session):
-    previous = _get(session, "previous_generation", "previous_sid")
-    if previous is None:
-        return None
-    sid = previous if isinstance(previous, str) else _get(previous, "session_id", "sid", "id")
-    return str(sid or "")
+def _generation_label(item):
+    parts = [harness_abbr(item.get("harness")), str(item.get("sid") or "")[:8]]
+    if item.get("source") and item.get("source") != "unknown":
+        parts.append(str(item["source"]))
+    if item.get("title"):
+        parts.append(str(item["title"]))
+    return " ".join(part for part in parts if part)
+
+
+def _lineage_rows(focus_result, harness, sid, rid, open_set, fold_set):
+    """``이전 대화 n`` (closed by default) and, once opened, one row per earlier generation.
+
+    Only the focused session has one: its lineage is read when the session is unfolded. No earlier
+    generation means no row; a lineage that could not be read is ``이전 대화 ?`` with the reason.
+    """
+    entries = getattr(focus_result, "lineage", None)
+    health = getattr(focus_result, "lineage_health", None)
+    entry_id = f"previous-generation:{harness}:{sid}"
+    if entries is None:
+        if health is not None and health.state == "failed":
+            reason = f" · {health.error}" if health.error else ""
+            return [NavRow(entry_id, "previous-generation", 3, f"이전 대화 ?{reason}", parent=rid)]
+        return []
+    if not entries:
+        return []
+    opened = entry_id in open_set and entry_id not in fold_set
+    rows = [NavRow(entry_id, "previous-generation", 3, f"이전 대화 {len(entries)}",
+                   marker="▾" if opened else "▸", parent=rid, open=opened)]
+    if opened:
+        for item in entries:
+            rows.append(NavRow(f"generation:{harness}:{sid}:{item.get('harness')}:{item.get('sid')}",
+                               "generation", 4, _generation_label(item),
+                               (("harness", str(item.get("harness") or "")), ("sid", str(item.get("sid") or ""))),
+                               parent=entry_id))
+    return rows
 
 
 def _request_rows(tabs, focus_result, snapshot, session, parent_id, state):
@@ -298,12 +327,8 @@ def build_nav(snapshot, focus_result=None, state=None, *, width=None, project_re
             if is_focus and tabs:
                 block, unclaimed = _request_rows(tabs, focus_result, snapshot, session, rid, state)
                 rows.extend(block)
-            previous = _previous_generation(session)
-            if previous is not None:
-                tag = _get(find_session(snapshot, previous), "session_tag") if previous else None
-                shown = f"[{tag}]" if tag else (previous[:8] if previous else NO_ROLE)
-                rows.append(NavRow(f"previous-generation:{harness}:{sid}", "previous-generation", 3,
-                                   f"이전 세대 {shown}", (("sid", previous),), marker="▸", parent=rid))
+            if is_focus and expanded:
+                rows.extend(_lineage_rows(focus_result, harness, sid, rid, open_set, fold_set))
             for job in unclaimed:
                 rows.append(_worker_row(job, session, 3, rid))
 

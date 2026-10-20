@@ -71,6 +71,22 @@ class ExplorerFixtureTests(unittest.TestCase):
         self.assertEqual(first["100"]["output"], {"x": 27, "y": 22, "w": 73, "h": 18})
         self.assertEqual(first["168"]["output"], {"x": 104, "y": 4, "w": 64, "h": 36})
 
+    def test_output_fixture_has_no_real_home_path_and_its_records_are_written_to_the_registry_log_paths(self):
+        from tools.fleet.tests.explorer_fixture import load_output, materialize_output
+        rendered = json.dumps(load_output(), ensure_ascii=False)
+        for forbidden in ("/home/", "/nas/user/", "Uihyeop"):
+            self.assertNotIn(forbidden, rendered)
+        with tempfile.TemporaryDirectory() as root:
+            fx = materialize_output(materialize(root))
+            for attempt_id in load_output()["logs"]:
+                meta = next(r["metadata"] for r in fx.source["registry"] if r["metadata"]["attempt_id"] == attempt_id)
+                self.assertTrue(os.path.isfile(meta["log_file"]), meta["log_file"])
+                self.assertTrue(meta["log_file"].startswith(os.path.join(root, "state", "logs")))
+            for folder, _dirs, files in os.walk(root):
+                for name in files:
+                    with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                        self.assertNotIn("$FIXTURE_ROOT", handle.read(), os.path.join(folder, name))
+
     def test_source_carries_every_value_the_status_band_and_system_page_show(self):
         snapshot = load_source()["snapshot"]
         self.assertEqual(len(snapshot["jobs"]), 16)

@@ -3611,7 +3611,8 @@
     "model_profile": "deep",
     "artifact_root": "$FIXTURE_ROOT/artifacts",
     "log_file": "$FIXTURE_ROOT/state/logs/framed-fleet-explorer-tui-exlorer-fle-84559312d7-owner.att-ad605131fead711661cb52a21c9da2bd.claude.jsonl",
-    "attempt_id": "att-ad605131fead711661cb52a21c9da2bd"
+    "attempt_id": "att-ad605131fead711661cb52a21c9da2bd",
+    "runtime_home": "$FIXTURE_ROOT/homes/ad605131"
    }
   },
   {

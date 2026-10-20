@@ -406,5 +406,39 @@ class Settling(unittest.TestCase):
         self.assertEqual(focus_key(ExplorerState(focus="codex:abc", stage="test")).stage_id, "")
 
 
+class OutputScrollAndGenerationFocus(unittest.TestCase):
+    def test_a_never_scrolled_output_follows_the_newest_rows_so_up_moves_one_row_from_the_bottom(self):
+        state = ExplorerState(active_region="output", tab="t")
+        up = reduce_key(state, {"key": "up", "max_scroll": 20})
+        self.assertEqual(up.scroll_map()["output:t"], 19)
+        self.assertEqual(reduce_key(up, {"key": "up", "max_scroll": 20}).scroll_map()["output:t"], 18)
+        self.assertEqual(reduce_key(state, {"key": "pageup", "viewport": 8, "max_scroll": 20}).scroll_map()["output:t"], 12)
+        self.assertEqual(reduce_key(state, {"key": "home", "max_scroll": 20}).scroll_map()["output:t"], 0)
+        self.assertEqual(reduce_key(state, {"key": "end", "max_scroll": 20}).scroll_map()["output:t"], 20)
+
+    def test_the_ledger_and_the_navigation_still_start_at_the_top(self):
+        for region, slot in (("ledger", "ledger:t"), ("nav", "nav")):
+            moved = reduce_key(ExplorerState(active_region=region, tab="t"), {"key": "down", "nav_rows": [],
+                                                                                "max_scroll": 20})
+            self.assertEqual(moved.scroll_map()[slot], 1)
+
+    def test_a_generation_row_selects_that_earlier_conversation_for_the_pump(self):
+        state = ExplorerState(focus="claude:s1", tab="t", selection="generation:claude:s1:codex:old-sid")
+        key = focus_key(state)
+        self.assertEqual((key.harness, key.sid, key.request_id, key.generation), ("claude", "s1", "t", "codex:old-sid"))
+        elsewhere = ExplorerState(focus="claude:s2", selection="generation:claude:s1:codex:old-sid")
+        self.assertEqual(focus_key(elsewhere).generation, "")
+        self.assertEqual(focus_key(ExplorerState(focus="claude:s1", selection="session:claude:s1")).generation, "")
+
+    def test_a_generation_selection_waits_for_the_lineage_and_falls_back_to_its_session(self):
+        from types import SimpleNamespace
+        session = SimpleNamespace(identity="session:claude:s1", kind="session", target_ref=None, parent="", open=True)
+        state = ExplorerState(focus="claude:s1", selection="generation:claude:s1:codex:old-sid")
+        kept = settle(state, [session])
+        self.assertEqual(kept.selection, state.selection)           # not read yet: nothing is judged vanished
+        gone = settle(state, [session], tabs=())
+        self.assertEqual(gone.selection, "session:claude:s1")
+
+
 if __name__ == "__main__":
     unittest.main()

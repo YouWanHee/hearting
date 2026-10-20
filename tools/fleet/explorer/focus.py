@@ -17,7 +17,8 @@ import re
 import threading
 import time
 
-from .ledger import build_request_ledger
+from .ledger import build_request_ledger, harness_abbr
+from .output import MAX_STAGE_SOURCES, OutputReader, SourcePlan, read_generation, utility
 from .overview import build_overview
 from .requests import build_tabs, latest_results, request_header
 from .types import AttemptRow, FocusRequest, FocusResult, Health
@@ -310,6 +311,96 @@ def read_obligations(state_roots, session_id, now, cache):
     return tuple(items)
 
 
+def _plan_of(row, label, role):
+    meta = {key: row.meta.get(key) for key in ("artifact_root", "launch_home") if row.meta.get(key)}
+    return SourcePlan(row.attempt_id, label, row.harness, harness_abbr(row.harness), role,
+                      row.meta.get("log_file") or "", tuple(sorted(meta.items())))
+
+
+def output_plans(key, tab, rows):
+    """(title, plans, stamped) for the selected request: the chosen attempt, the chosen stage's latest
+    attempt, or the supervisor plus the latest attempt of each stage (mixed by native time)."""
+    by_id = {row.attempt_id: row for row in rows}
+    mine = [by_id[a] for a in tab.attempt_ids if a in by_id]
+    stages = [row for row in mine if row.worker_type not in ("owner", "frame") and row.route_node]
+    if key.attempt_id and key.attempt_id in by_id:
+        row = by_id[key.attempt_id]
+        label = "owner" if row.worker_type == "owner" else (row.route_node or row.worker_type or "시도")
+        return f"{label} · {harness_abbr(row.harness)} · 원래 출력", [_plan_of(row, label, "stage")], False
+    if key.stage_id:
+        picked = [row for row in stages if row.route_node == key.stage_id]
+        if not picked:
+            return f"{key.stage_id} · 원래 출력", [], False
+        row = max(picked, key=lambda r: r.line)
+        return f"{key.stage_id} · {harness_abbr(row.harness)} · 원래 출력", [_plan_of(row, key.stage_id, "stage")], False
+    owners = [row for row in mine if row.worker_type == "owner"]
+    latest = {}
+    for row in stages:
+        if row.route_node not in latest or row.line > latest[row.route_node].line:
+            latest[row.route_node] = row
+    chosen = sorted(sorted(latest.values(), key=lambda r: r.line)[-MAX_STAGE_SOURCES:], key=lambda r: r.line)
+    plans, parts = [], []
+    if owners:
+        owner = max(owners, key=lambda r: r.line)
+        plans.append(_plan_of(owner, "owner", "owner"))
+        parts.append(f"감독 {harness_abbr(owner.harness)}")
+    if chosen:
+        plans.extend(_plan_of(row, row.route_node, "stage") for row in chosen)
+        abbrs = list(dict.fromkeys(harness_abbr(row.harness) for row in chosen))
+        parts.append("단계 " + "+".join(abbrs))
+    return f"{tab.label} · " + " + ".join(parts or ["원래 출력"]), plans, len(plans) > 1
+
+
+LINEAGE_LIMIT = 12
+
+
+def _card_title(module, card):
+    """First line of the earlier generation's card, or ''."""
+    path = (card or {}).get("path")
+    if not path or (card or {}).get("status") != "available":
+        return ""
+    data = module.read_json(Path(path))
+    body = data.get("body") if isinstance(data, dict) else None
+    for line in str(body or "").splitlines():
+        if line.strip():
+            return line.strip()[:48]
+    return ""
+
+
+def read_lineage(session, harness, sid):
+    """``(entries, Health)``: the earlier generations of a main session's seat (read only).
+
+    The seat is made the way ``session_tidy`` makes it (harness, sid, cwd and, when the session
+    reports one, its pane). ``entries`` is None when the lineage could not be read, never a guess.
+    """
+    from . import nav
+    try:
+        module = utility("session_tidy")
+        env = {}
+        pane = nav._get(session, "herdr_pane", "pane", "pane_id")
+        if pane:
+            env["HERDR_PANE_ID"] = str(pane)
+        seat = module.resolve_seat(harness, cwd=nav._get(session, "cwd", "project"), env=env, sid=sid)
+    except Exception as exc:
+        return None, Health("failed", None, f"seat 없음 · {type(exc).__name__}")
+    try:
+        rows = module.seat_lineage(seat, sid=sid)
+    except Exception as exc:
+        return None, Health("failed", None, type(exc).__name__)
+    entries = []
+    for row in rows:
+        if row.get("harness") == harness and row.get("sid") == sid:
+            continue
+        entries.append({"harness": row.get("harness"), "sid": row.get("sid"),
+                        "source": row.get("source"), "relation": row.get("relation"),
+                        "title": _card_title(module, row.get("card")),
+                        "card_status": (row.get("card") or {}).get("status"),
+                        "transcript": dict(row.get("transcript") or {})})
+        if len(entries) >= LINEAGE_LIMIT:
+            break
+    return tuple(entries), Health("success", time.time())
+
+
 def nav_tag(session):
     tag = _get(session, "session_tag")
     return str(tag) if tag else None
@@ -325,13 +416,17 @@ def _as_mapping(value):
 
 
 def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=None, now=None,
-                  live_jobs=None, snapshot=None, state_roots=None, cache=None):
+                  live_jobs=None, snapshot=None, state_roots=None, cache=None, output_reader=None,
+                  earlier=False):
     """Read everything the selected main session's request tabs, ledger and overview need.
 
     ``live_jobs`` (mapping or list of the current snapshot's jobs, or a callable returning
     them) supplies liveness and process evidence for rows that are still live; every other
     row is ``unknown`` and decided without process proof. ``snapshot`` is the already
-    published immutable snapshot, used only to build the overview text.
+    published immutable snapshot, used only to build the overview text. ``output_reader`` (an
+    ``OutputReader``) reads the raw output of the selected request, or of its selected stage; without
+    one nothing is opened, and a request tab that is not selected never reaches it. ``earlier`` asks
+    that reader to read further back first.
     """
     from .. import route as route_module
     route_loader = route_loader or route_module.load
@@ -388,6 +483,37 @@ def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=N
         request_ledger, ledger_rows = None, ()
 
     sources = []
+    output, lineage = {}, {}
+    session = None
+    if snapshot is not None:
+        from . import nav
+        session = nav.find_session(snapshot, key.sid)
+    focus_ref = f"{key.harness}:{key.sid}"
+    if focus_ref in tuple(getattr(request, "expanded_sessions", ()) or ()) and session is not None:
+        try:
+            earlier_sessions, health = read_lineage(session, key.harness, key.sid)
+        except Exception as exc:                 # a lineage fault is the entry row's ``?``, nothing else
+            earlier_sessions, health = None, Health("failed", None, type(exc).__name__)
+        lineage = {"lineage": earlier_sessions, "lineage_health": health}
+    generation = None
+    if key.generation and lineage.get("lineage"):
+        generation = next((item for item in lineage["lineage"]
+                           if f"{item['harness']}:{item['sid']}" == key.generation), None)
+    if output_reader is not None and (generation is not None or tab is not None):
+        title = ""
+        try:
+            if generation is not None:
+                view = read_generation(output_reader, generation)
+            else:
+                title, plans, stamped = output_plans(key, tab, rows)
+                view = output_reader.read(key, title, plans, stamped=stamped, earlier=earlier)
+            output = {"output": view.rows, "output_title": view.title, "output_notes": view.notes,
+                      "output_health": view.health, "output_more": view.more}
+            sources.append(("output", view.health))
+        except Exception as exc:                 # an output fault must not hide the tabs or the ledger
+            errors.append(f"output: {type(exc).__name__}")
+            sources.append(("output", Health("failed", None, type(exc).__name__)))
+            output = {"output_title": title, "output_health": Health("failed", None, type(exc).__name__)}
     try:
         obligations = read_obligations(state_roots, key.sid, wall, cache)
         sources.append(("obligations", Health("success", wall)))
@@ -395,17 +521,14 @@ def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=N
         obligations = None
         errors.append(f"obligations: {type(exc).__name__}")
         sources.append(("obligations", Health("failed", None, type(exc).__name__)))
-    session = None
-    if snapshot is not None:
-        from . import nav
-        session = nav.find_session(snapshot, key.sid)
     events = read_events(entries, nav_tag(session))
 
     result = FocusResult(
         key=key, epoch=request.epoch, snapshot_generation=request.snapshot_generation,
         tabs=tabs, ledger=ledger_rows, header=header, request_ledger=request_ledger,
         obligations=obligations, open_results=open_results, events=events, sources=tuple(sources),
-        health=Health("partial" if errors else "success", wall, "; ".join(errors) or None))
+        health=Health("partial" if errors else "success", wall, "; ".join(errors) or None),
+        **output, **lineage)
     if snapshot is not None:
         lines = build_overview(snapshot, result, sid=key.sid)
         result = FocusResult(**{**result.__dict__, "overview": lines})
@@ -416,7 +539,7 @@ class FocusReader:
     """``SelectionReader`` provider with one source cache for the process lifetime."""
 
     def __init__(self, jobs_path=None, artifact_root=None, *, route_loader=None, live_jobs=None,
-                 snapshot=None, state_roots=None, now=None):
+                 snapshot=None, state_roots=None, now=None, output_reader=None):
         self.jobs_path = jobs_path
         self.artifact_root = artifact_root
         self.route_loader = route_loader
@@ -425,14 +548,26 @@ class FocusReader:
         self.state_roots = state_roots
         self.now = now
         self.cache = SourceCache()
+        self.output_reader = OutputReader() if output_reader is None else (output_reader or None)
+        self._lock = threading.Lock()
+        self._earlier = set()
+
+    def load_earlier(self, key):
+        """Ask for the records before the oldest one shown for ``key`` (read on the next pass)."""
+        with self._lock:
+            self._earlier.add(key)
 
     def __call__(self, request):
+        with self._lock:
+            earlier = request.key in self._earlier
+            self._earlier.discard(request.key)
         return collect_focus(
             request, jobs_path=self.jobs_path, artifact_root=self.artifact_root,
             route_loader=self.route_loader, now=self.now() if callable(self.now) else self.now,
             live_jobs=self.live_jobs,
             snapshot=self.snapshot() if callable(self.snapshot) else self.snapshot,
-            state_roots=self.state_roots, cache=self.cache)
+            state_roots=self.state_roots, cache=self.cache, output_reader=self.output_reader,
+            earlier=earlier)
 
 
 class SelectionReader:
@@ -491,6 +626,17 @@ class SelectionPump:
 
     def request(self, force=True):
         return self._pump.request(force=force)
+
+    def load_earlier(self):
+        """Read further back in the raw output of the current selection (only when the person asks)."""
+        with self._lock:
+            current = self._request
+        loader = getattr(self.reader.providers, "load_earlier", None)
+        if current is None or loader is None:
+            return False
+        loader(current.key)
+        self._pump.request(force=True)
+        return True
 
     def request_due(self, now=None):
         return self._pump.request_due(now)

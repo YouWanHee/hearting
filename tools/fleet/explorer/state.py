@@ -183,7 +183,7 @@ def reconcile(state, tabs):
 # -- settling against the navigation --------------------------------------------------------------
 
 # Rows that exist only once the focused session's request data has been read.
-_REQUEST_ROWS = ("request:", "stages:", "stage:", "requests-other:", "worker:")
+_REQUEST_ROWS = ("request:", "stages:", "stage:", "requests-other:", "worker:", "previous-generation:", "generation:")
 
 
 def _row_session(rows, identity):
@@ -278,7 +278,7 @@ def settle(state, rows, tabs=None):
             fallback = f"request:{state.tab}" if state.tab and f"request:{state.tab}" in identities else \
                 _row_session_identity(rows, focus)
             state = replace(state, selection=fallback or state.selection)
-        elif selection.startswith("worker:") and selection not in identities:
+        elif selection.startswith(("worker:", "previous-generation:", "generation:")) and selection not in identities:
             state = replace(state, selection=_row_session_identity(rows, focus) or state.selection)
     return state
 
@@ -287,14 +287,26 @@ def _row_session_identity(rows, focus):
     return next((row.identity for row in rows if row.kind == "session" and _session_ref(row) == focus), "")
 
 
+GENERATION_PREFIX = "generation:"
+
+
+def generation_ref(selection, focus):
+    """``harness:sid`` of the earlier generation a ``generation:`` row names, when it belongs to ``focus``."""
+    if not str(selection).startswith(GENERATION_PREFIX):
+        return ""
+    parts = selection.split(":", 4)
+    return f"{parts[3]}:{parts[4]}" if len(parts) == 5 and f"{parts[1]}:{parts[2]}" == focus else ""
+
+
 def focus_key(state):
-    """The selected-scope key the pump reads for: session, request tab and stage."""
+    """The selected-scope key the pump reads for: session, request tab, stage (or earlier generation)."""
     from .types import FocusKey
     state = coerce(state)
     harness, _, sid = state.focus.partition(":")
     if not sid:
         return None
-    return FocusKey(harness, sid, state.tab, state.stage if state.tab else "")
+    return FocusKey(harness, sid, state.tab, state.stage if state.tab else "",
+                    generation=generation_ref(state.selection, state.focus))
 
 
 # -- keyboard ------------------------------------------------------------------------------------
@@ -426,10 +438,12 @@ def reduce_key(state, key, frame=None):
             return _move_selection(state, rows, -1 if key in ("up", "k") else 1)
         offsets = state.scroll_map()
         slot = _scroll_key(state)
-        current = offsets.get(slot, 0)
         viewport = int(event.get("viewport") or _viewport(frame, state.active_region) or 1)
         delta = {"up": -1, "k": -1, "down": 1, "j": 1, "pageup": -viewport, "pagedown": viewport}.get(key, 0)
         limit = event.get("max_scroll", dict(getattr(frame, "scroll_max", ()) or ()).get(slot))
+        current = offsets.get(slot)
+        if current is None:                       # never scrolled: the raw output follows its newest rows
+            current = max(0, int(limit)) if (slot.startswith("output:") and limit is not None) else 0
         if key == "home":
             current = 0
         elif key == "end":

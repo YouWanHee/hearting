@@ -6648,6 +6648,7 @@ _EXPLORER_ALL_ROWS = ()      # every navigation row, folded or not: the s/x targ
 _EXPLORER_RESULT = None      # the accepted selected-scope result; never one read for another session
 _EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
 _EXPLORER_SIZE = None
+_EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: read further back once
 
 
 def set_explorer_mode(enabled=True):
@@ -6893,6 +6894,28 @@ def _draw_explorer(stdscr, snapshot):
         refresh()
 
 
+def _explorer_output_reader():
+    """The raw-output reader of the live view: the shared viewer, with the registry home as its fallback."""
+    from .explorer.output import OutputReader
+    try:
+        from .collectors import dispatch
+        return OutputReader(fallback_home=dispatch._registry_home())
+    except Exception:
+        return OutputReader()
+
+
+def _explorer_expanded(state):
+    """The focused main session when its row is open (a closed session or a folded project has no lineage read)."""
+    ref = str(getattr(state, "focus", "") or "")
+    if not ref:
+        return ()
+    row_id = f"session:{ref}"
+    for row in _EXPLORER_NAV_ROWS:
+        if row.identity == row_id:
+            return (ref,) if row.open else ()
+    return ()
+
+
 class _SelectionFeed:
     """Viewer state -> SelectionPump. A changed selection (session, tab or stage) selects and forces a
     read; every tick polls. No result for the current scope yet draws the previous result of the same
@@ -6903,16 +6926,17 @@ class _SelectionFeed:
         self.key = None
         self.last = None
 
-    def update(self, state, generation, now_mono):
+    def update(self, state, generation, now_mono, expanded=None):
         from .explorer.state import focus_key
         from .explorer.types import FocusResult, Health
         key = focus_key(state)
         if key is None:
-            self.key, changed, self.last = None, self.last is not None, None
+            self.key, self.expanded, changed, self.last = None, (), self.last is not None, None
             return None, changed
-        if key != self.key:
-            self.key = key
-            self.pump.select(key, generation)
+        expanded = _explorer_expanded(state) if expanded is None else tuple(expanded)
+        if key != self.key or expanded != getattr(self, "expanded", ()):
+            self.key, self.expanded = key, expanded
+            self.pump.select(key, generation, expanded)
             self.pump.request(force=True)
         else:
             self.pump.request_due(now=now_mono)
@@ -10837,10 +10861,25 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     key = _explorer_key_name(ch)
     if key:
         _EXPLORER_STATE = reduce_key(state, key, frame=_EXPLORER_FRAME)
+        _explorer_note_earlier(state, key)
+
+
+def _explorer_note_earlier(before, key):
+    """Scrolling up in the raw-output pane while it already shows its first row asks for older records."""
+    global _EXPLORER_EARLIER
+    if before.active_region != "output" or key not in ("up", "k", "pageup", "home"):
+        return
+    slot = f"output:{before.tab}"
+    shown = dict(before.scrolls).get(slot)
+    limit = dict(getattr(_EXPLORER_FRAME, "scroll_max", ()) or ()).get(slot)
+    if shown is None:
+        shown = limit
+    if shown is not None and int(shown) == 0 and getattr(_EXPLORER_RESULT, "output_more", False):
+        _EXPLORER_EARLIER = True
 
 
 def _loop(stdscr, collect_all, hfilter, section, interval):
-    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT
+    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT, _EXPLORER_EARLIER
     curses.curs_set(0)
     _init_colors()
     live_order = _RESUME_ORDER or _LiveOrderState()
@@ -10926,7 +10965,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         from .explorer.focus import FocusReader, SelectionPump
         selection_feed = _SelectionFeed(SelectionPump(
             FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
-                        snapshot=lambda: latest_view[0]), interval))
+                        snapshot=lambda: latest_view[0], output_reader=_explorer_output_reader()), interval))
     sessions, jobs = snapshot.sessions, snapshot.jobs
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots
@@ -11040,6 +11079,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 continue
             if _EXPLORER_ENABLED:
                 _explorer_handle(ch, mouse_event, (h, w), snapshot)
+                if _EXPLORER_EARLIER:
+                    _EXPLORER_EARLIER = False
+                    if selection_feed is not None:
+                        selection_feed.pump.load_earlier()
                 if ch in (ord("r"), ord("R")) and not _explorer_searching():
                     pump.request(force=True)
                     detail_pump.request(force=True)
