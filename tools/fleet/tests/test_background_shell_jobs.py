@@ -61,8 +61,10 @@ class BackgroundShellJobsTests(unittest.TestCase):
         job = jobs[0]
         self.assertEqual(job["native_task_id"], "task-123")
         self.assertEqual(job["native_record_kind"], "claude.background-bash-task-ack")
-        self.assertEqual(job["background_state"], "confirmed")
-        self.assertEqual(job["background_source"], "claude.bash.background-ack")
+        self.assertEqual(job["background_state"], "unknown")
+        self.assertIsNone(job["background_source"])
+        self.assertEqual(job["background_reason"],
+                         "claude-native-background-task-metadata-unavailable")
         self.assertEqual(job["native_status"], "acknowledged")
         self.assertEqual(job["process_state"], "unknown")
         self.assertEqual(job["output_path"], str(output))
@@ -74,6 +76,140 @@ class BackgroundShellJobsTests(unittest.TestCase):
         wrong_result, _ = self.claude_result(session_id="sid-other", task_id="task-other")
         self.write_jsonl(other, [wrong_call, wrong_result])
         self.assertEqual(shell_jobs.read_claude_jobs(other, session_id="sid-a"), [])
+
+    def test_claude_echoed_native_ack_is_unknown_with_or_without_request_flag(self):
+        now = shell_jobs.parse_time("2026-10-20T00:00:05Z")
+        for requested in (True, False):
+            with self.subTest(run_in_background=requested):
+                task_id = "task-echoed-true" if requested else "task-echoed-false"
+                call_id = "call-echo-true" if requested else "call-echo-false"
+                output = self.root / "tasks" / (task_id + ".output")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.touch()
+                call = self.claude_call(call_id=call_id)
+                call["message"]["content"][0]["input"]["run_in_background"] = requested
+                result = {
+                    "type": "user", "session_id": "sid-a",
+                    "timestamp": "2026-10-20T00:00:01Z",
+                    "message": {"content": [{
+                        "type": "tool_result", "tool_use_id": call_id,
+                        "content": [{"type": "text", "text":
+                            "Command running in background. Task ID: %s. Output: %s"
+                            % (task_id, output)}],
+                    }]},
+                }
+                path = self.root / ("echoed-%s.jsonl" % requested)
+                self.write_jsonl(path, [call, result])
+
+                jobs = shell_jobs.read_claude_jobs(
+                    path, session_id="sid-a", attempt_id="attempt-echo",
+                    now=now)
+                self.assertEqual(len(jobs), 1)
+                job = jobs[0]
+                self.assertEqual(job["native_task_id"], task_id)
+                self.assertEqual(job["output_path"], str(output))
+                self.assertEqual(job["process_state"], "unknown")
+                self.assertEqual(job["background_state"], "unknown")
+                self.assertIsNone(job["background_source"])
+                self.assertEqual(job["background_reason"],
+                                 "claude-native-background-task-metadata-unavailable")
+
+                observed = shell_jobs.observe_jobs(jobs, now=now)
+                session = Session(harness="claude", pid=1, cwd=str(self.root),
+                                  shell_jobs=observed)
+                with mock.patch("time.time", return_value=now):
+                    public = session.to_dict()
+                    rows = render._shell_job_rows(session, term_width=100)
+                json_job = public["shell_jobs"][0]
+                self.assertEqual(json_job["native_task_id"], task_id)
+                self.assertEqual(json_job["background_state"], "unknown")
+                self.assertIsNone(json_job["background_source"])
+                self.assertEqual(json_job["background_reason"], job["background_reason"])
+                row_text = "\n".join("".join(text for text, _key in line)
+                                      for line in rows)
+                self.assertIn("background unknown", row_text)
+                self.assertNotIn("background confirmed", row_text)
+
+    def test_claude_native_task_metadata_confirms_without_request_flag(self):
+        path = self.root / "native-metadata.jsonl"
+        call_id = "toolu-native-background-call"
+        task_id = "native-task-1234"
+        echoed_id = "task-echoed-mismatch"
+        call = self.claude_call(call_id=call_id)
+        call["message"]["content"][0]["input"]["run_in_background"] = False
+        result = {
+            "type": "user", "sessionId": "sid-a", "session_id": "runtime-other",
+            "timestamp": "2026-10-20T00:00:01Z",
+            "toolUseResult": {"backgroundTaskId": task_id},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": call_id,
+                "content": "Command running in background. Task ID: %s. Output: %s"
+                % (echoed_id, self.root / "tasks" / (echoed_id + ".output"))}]},
+        }
+        self.write_jsonl(path, [call, result])
+
+        jobs = shell_jobs.read_claude_jobs(
+            path, session_id="sid-a", attempt_id="attempt-native",
+            now=shell_jobs.parse_time("2026-10-20T00:00:05Z"))
+        self.assertEqual(len(jobs), 1)
+        job = jobs[0]
+        self.assertEqual(job["native_task_id"], task_id)
+        self.assertEqual(job["native_call_id"], call_id)
+        self.assertEqual(job["session_id"], "sid-a")
+        self.assertEqual(job["attempt_id"], "attempt-native")
+        self.assertEqual(job["source_locator"], os.path.abspath(path))
+        self.assertTrue(job["source_generation"])
+        self.assertEqual(job["native_record_kind"],
+                         "claude.toolUseResult.backgroundTaskId")
+        self.assertEqual(job["background_state"], "confirmed")
+        self.assertEqual(job["background_source"],
+                         "claude.toolUseResult.backgroundTaskId")
+        self.assertIsNone(job["background_reason"])
+        self.assertIsNone(job["output_path"])
+
+        observed = shell_jobs.observe_jobs(jobs, now=job["observed_at"])
+        session = Session(harness="claude", pid=1, cwd=str(self.root),
+                          shell_jobs=observed)
+        with mock.patch("time.time", return_value=job["observed_at"]):
+            public = session.to_dict()
+            rows = render._shell_job_rows(session, term_width=100)
+        json_job = public["shell_jobs"][0]
+        self.assertEqual(json_job["native_task_id"], task_id)
+        self.assertEqual(json_job["background_state"], "confirmed")
+        self.assertEqual(json_job["background_source"], job["background_source"])
+        self.assertIsNone(json_job["background_reason"])
+        row_text = "\n".join("".join(text for text, _key in line)
+                              for line in rows)
+        self.assertIn("background confirmed", row_text)
+        self.assertNotIn(echoed_id, row_text)
+
+    def test_claude_task_metadata_needs_valid_id_and_exact_result_pair(self):
+        cases = (
+            ("invalid-id", "task/invalid", "call-invalid", "call-invalid", "sid-a", 1),
+            ("wrong-call", "task-wrong-call", "call-wrong-call", "other-call", "sid-a", 1),
+            ("wrong-session", "task-wrong-session", "call-wrong-session",
+             "call-wrong-session", "sid-other", 1),
+            ("ambiguous-results", "task-ambiguous", "call-ambiguous",
+             "call-ambiguous", "sid-a", 2),
+        )
+        for label, task_id, call_id, result_call_id, result_sid, result_count in cases:
+            with self.subTest(case=label):
+                path = self.root / (label + ".jsonl")
+                call = self.claude_call(call_id=call_id)
+                result_parts = [{"type": "tool_result", "tool_use_id": result_call_id,
+                                 "content": ""}]
+                if result_count == 2:
+                    result_parts.append({"type": "tool_result", "tool_use_id": "other-result",
+                                         "content": ""})
+                result = {
+                    "type": "user", "sessionId": result_sid,
+                    "timestamp": "2026-10-20T00:00:01Z",
+                    "toolUseResult": {"backgroundTaskId": task_id},
+                    "message": {"content": result_parts},
+                }
+                self.write_jsonl(path, [call, result])
+                self.assertEqual(shell_jobs.read_claude_jobs(
+                    path, session_id="sid-a", attempt_id="attempt-negative",
+                    now=shell_jobs.parse_time("2026-10-20T00:00:05Z")), [])
 
     def test_claude_native_session_binding_and_trusted_task_notifications(self):
         path = self.root / "054aa76e-7697-468f-b91c-783e9bd8fd01.jsonl"
@@ -216,6 +352,9 @@ class BackgroundShellJobsTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["native_task_id"], "task-auto-123")
         self.assertEqual(jobs[0]["native_status"], "acknowledged")
+        self.assertEqual(jobs[0]["background_state"], "unknown")
+        self.assertEqual(jobs[0]["background_reason"],
+                         "claude-native-background-task-metadata-unavailable")
 
     def test_claude_notification_cannot_cross_source_generation(self):
         sid = "native-session-12345"

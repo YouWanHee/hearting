@@ -503,7 +503,7 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                     text_task_id, text_output_path = _claude_task_ack(
                         _claude_result_text(part.get("content")),
                         background_requested=call.get("run_in_background") is True)
-                    if structured_task_id and call.get("run_in_background") is True:
+                    if structured_task_id:
                         task_id = structured_task_id
                         output_path = (text_output_path if text_task_id in (None, task_id)
                                        else None)
@@ -511,14 +511,20 @@ def read_claude_jobs(path, *, session_id, attempt_id=None, now=None):
                         task_id, output_path = text_task_id, text_output_path
                     if not task_id:
                         continue
+                    background_confirmed = structured_task_id is not None
                     _store_task(state, task_id, {
                         "harness": "claude", "session_id": session_id,
                         "attempt_id": attempt_id, "source_generation": str(delta.get("generation")),
                         "source_locator": os.path.abspath(path), "native_id": task_id,
-                        "native_record_kind": "claude.background-bash-task-ack",
-                        "background_state": "confirmed",
-                        "background_source": "claude.bash.background-ack",
-                        "background_reason": None,
+                        "native_record_kind": (
+                            "claude.toolUseResult.backgroundTaskId" if background_confirmed
+                            else "claude.background-bash-task-ack"),
+                        "background_state": "confirmed" if background_confirmed else "unknown",
+                        "background_source": (
+                            "claude.toolUseResult.backgroundTaskId" if background_confirmed
+                            else None),
+                        "background_reason": (None if background_confirmed else
+                                              "claude-native-background-task-metadata-unavailable"),
                         "native_call_id": call_id, "native_task_id": task_id,
                         "command": call.get("command"),
                         "command_source": "Bash.input.command" if call.get("command") else None,

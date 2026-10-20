@@ -2550,97 +2550,93 @@ successful complete snapshot before using cached pane state again.
 
 ## Fleet background shell observation
 
-Fleet may project several exact native background shell tasks under one exact
-interactive session or registered attempt. A task identity is the harness,
-full session ID, attempt ID when present, source generation, and native call or
-task handle. A native handle is never an operating-system PID. Task discovery,
-native lifecycle, process liveness, command summary, timestamps, and output
-coverage are separate evidence; a missing fact stays unknown with its source
-reason.
+Fleet projects multiple exact native background shell tasks under an
+interactive session or registered attempt. Identity is `(harness, full session
+ID, optional attempt ID, source generation, native call/task ID)`; native IDs
+are runtime handles, not OS PIDs. Discovery, native lifecycle, process
+liveness, command, time, and output coverage are separate evidence, with a
+source reason for every unknown fact.
 
-The shared row is advisory and passive. It does not alter parent session
-liveness, pulse, route state, gate, or controls. It carries a bounded sanitized
-command, start/elapsed when its timestamp is valid, native completion/exit when
-explicit, and process alive/dead only when the exact process generation and
-namespace or an exact writable output-file descriptor is verified. A running
-task's elapsed time uses its start and current observation time. A completed
-task's duration uses its observed native completion timestamp and stops there;
-missing, invalid, future, or pre-start completion time leaves duration unknown.
-The row never substitutes a refreshed observation timestamp for completion.
-Every shared job also carries its native record kind and a separate background
-classification: `background_state=confirmed` only with exact native evidence,
-otherwise `unknown`, with its evidence source or reason. This classification is
-independent of native lifecycle, process liveness, and output coverage; a
-continuation handle or completed command never becomes a PID or process claim.
-Completed rows use the existing 15-minute dispatch afterglow in JSON and child
-rows. Only a known completion age can expire a row; live, pending, unknown, or
-untimed terminal work stays visible. Display expiry does not remove reader cache
-state, so later native updates can still revise the same task. A previously
-verified writer becomes dead only after same-observer proof of disappearance or
-PID-generation replacement; permission failures, namespace visibility changes,
-and other unreadable identity checks remain unknown. Stale output files, native
-handles, similar commands/cwd, poll timestamps, and model-turn completion do not
-prove process liveness or task exit. Output age is shown with its coverage; a
-ten-minute quiet hint requires a continuous file window with valid, non-future,
-non-backward output time. Invalid time evidence resets the quiet interval until
-a later valid observation establishes a new one, and completion suppresses the
-hint. Missing clocks and failed or partial reads remain visible as gaps.
+Rows are passive and advisory: parent liveness, pulse, route, gate, and controls
+remain unchanged. Each carries a bounded sanitized command, valid start and
+elapsed time, explicit native completion/exit, and process alive/dead only when
+the exact process generation and namespace or an exact writable output-file
+descriptor is verified. Running elapsed time uses start and current observation;
+completed duration ends at the native completion timestamp. Missing, invalid,
+future, or pre-start completion time leaves duration unknown, and a refreshed
+observation time does not extend it. Background classification is separate from
+record kind, lifecycle, process, and output evidence: `confirmed` needs exact
+native evidence, otherwise it is `unknown` with its source or reason. Runtime
+handles and completion records describe runtime state, not a process.
 
-Readers stay on the existing Claude transcript, Codex rollout/App Server
+Completed rows retain the 15-minute dispatch afterglow in JSON and child rows;
+only a known completion age expires them. Live, pending, unknown, and untimed
+terminal work stays visible, and display expiry leaves reader cache available
+for later native updates. A verified writer becomes dead only after the same
+observer proves disappearance or PID-generation replacement; unreadable
+identity checks remain unknown. Stale files, native handles, similar
+commands/cwd, poll times, and model-turn completion are insufficient for
+process liveness or task exit. Output age includes its coverage. A ten-minute
+quiet hint needs a continuous file window with valid, non-future, non-backward
+output time; invalid time resets the interval, later valid observation starts
+it again, and completion suppresses the hint. Missing clocks and failed or
+partial reads remain visible as gaps.
+
+Readers use the existing Claude transcript, Codex rollout/App Server
 command-event stream, OpenCode native reader, and exact attempt/companion paths.
 Reads are bounded and catch up by source generation; rendering performs no
-observation I/O. JSON keeps the
-legacy `exec_child` and `exec_tool` fields and adds the same per-task evidence.
-Rows use the existing child layout and never borrow another session or attempt.
-No process is started, stopped, or restarted by this observation.
+observation I/O. JSON retains legacy `exec_child`/`exec_tool` and adds the same
+per-task evidence. Rows use the child layout within their exact session and
+attempt. Observation starts, stops, or restarts no process.
 
-Claude transcript binding prefers its native `sessionId` when a row also has a
-different runtime `session_id`; the latter is only a fallback when the native
-field is absent. A task notification may update lifecycle only from a native
-user string-content envelope with `origin.kind=task-notification`,
+Claude rows prefer native `sessionId`; runtime `session_id` is fallback only
+when the native field is absent. A `toolUseResult.backgroundTaskId` confirms
+background mode only when its user `tool_result` is the single exact result for
+the retained Bash call in the same transcript generation, full session, and
+attempt. This runtime metadata works even when `run_in_background` was not set.
+Requested mode, echoed acknowledgement text, and output-path text can support
+weak task discovery, but background state remains unknown without that native
+ID. A task notification updates lifecycle only from a user string-content
+envelope with `origin.kind=task-notification`,
 `origin.producer=session-task`, `promptSource=system`, and
-`turnOrigin=task_notification`, and only when its task ID and tool-use ID match
-an acknowledged Bash task in the same transcript generation, full session, and
-attempt. The notification timestamp is completion evidence; its output file is
-only an output locator and never process-liveness proof. API-request copies,
-ordinary user text, tool output, quotes, and mismatched identities are not
-terminal evidence.
+`turnOrigin=task_notification`, matching task and tool-use IDs in that same
+generation/session/attempt. Its timestamp is completion evidence; its output
+file is a locator separate from process liveness. API-request copies, ordinary
+user text, tool output, quotes, and mismatched identities have no terminal
+authority.
 
 For Codex, trusted App Server `command_execution` events and exact native
-`exec_command`/`write_stdin` call/output pairs may establish task identity and
-lifecycle. Output text from an outer `functions.exec`/`functions.write_stdin`
-script is arbitrary stdout and cannot create or complete a job from JSON-looking
-text; that path is reported as unobserved with partial source coverage. Pending
-call correlation is bounded; eviction that may lose a pair also makes coverage
-partial. The retained App Server command record proves native command lifecycle
-and retains its ID, command, aggregated output, exit code, and status; it has no
-authoritative background-mode or PID field. Keep it useful as
-`native_record_kind=codex.command_execution`, preserve its observed lifecycle,
-and report `background_state=unknown` with the missing-mode reason. Do not
-promote an unrecognized raw field or infer mode from command, duration, cwd, or
-process guesses. A structured direct `exec_command` response may confirm a
-persistent background task when its exact call/output pair returns an integer
-native continuation handle and no terminal result. A `write_stdin` continuation
-may confirm or preserve that state only for the exact matching handle and an
-ongoing structured response. This handle proves a native continuation, never
-OS process liveness. A readable command summary may unwrap an exact native
-shell `-c`/`-lc` argv shape and the exact verification-lease argv delimiter
+`exec_command`/`write_stdin` call/output pairs establish task identity and
+lifecycle. Outer `functions.exec`/`functions.write_stdin` text is arbitrary
+stdout; JSON-looking output cannot create or complete a job, and this path has
+partial source coverage. Pending-call correlation is bounded, with eviction
+reported as partial coverage. The App Server command record preserves native
+lifecycle, ID, command, aggregated output, exit code, and status, but exposes no
+authoritative background-mode or PID field. It remains useful as
+`native_record_kind=codex.command_execution`, with its observed lifecycle and
+`background_state=unknown` reason. Raw fields and command, duration, cwd, or
+process heuristics provide no background-mode evidence. A direct structured
+`exec_command` response can confirm a persistent background task when its exact
+call/output pair returns an integer native continuation handle without terminal
+result. `write_stdin` can confirm or preserve it for the exact matching handle
+and an ongoing structured response. The handle establishes native continuation,
+not OS process liveness. Command display may unwrap an exact native shell
+`-c`/`-lc` argv shape and the verification-lease delimiter
 `utilities/verification-background-lease.py --timeout N -- <argv>`, while
-retaining the original command. It does not inspect outer `functions.exec`
-source or infer an inner command from arbitrary script text.
+retaining the original command. Outer `functions.exec` source and arbitrary
+script text provide no reliable inner command.
 
-OpenCode V2 exposes two distinct native record forms: assistant `shell` tool
-parts and `session_message` rows whose type is `shell` and whose native
-metadata says `background: true`. Keep their native ID namespaces separate;
-do not infer an alias from matching command, cwd, or time. A shell row's own
-status, `time.created`/`time.completed`, exit code, and output cursor/size are
-task evidence; completion of an assistant invocation alone is not process
-exit. Page across every session-message type so non-candidates advance the
-cursor, and refresh known mutable rows by exact sequence even after they leave
-the recent window. Resolve a live output file only by exact `shellID` beneath
-the configured original OpenCode data directory. A copied snapshot database's
-parent, guessed location key, or retained file cannot prove a process alive or
-exited. V1 remains unobserved for this native background record form.
+OpenCode V2 has two native record forms: assistant `shell` tool parts and
+`session_message` rows with type `shell` and native metadata `background: true`.
+Their ID namespaces remain separate; matching command, cwd, or time does not
+join them. A shell row's status, `time.created`/`time.completed`, exit code, and
+output cursor/size are task evidence; assistant invocation completion alone is
+not process exit. Paging covers every session-message type, and known mutable
+rows refresh by exact sequence outside the recent window. A live output file is
+resolved by exact `shellID` under the configured original OpenCode data
+directory. Copied database parents, guessed location keys, and retained files
+cannot prove process alive or exited. V1 remains unobserved for this native
+background record form.
 
 **Accepted PRD delta (2026-10-20):** the current shared Fleet PRD v86 F-47 still
 describes one session badge and hides calls younger than 60 seconds. The
