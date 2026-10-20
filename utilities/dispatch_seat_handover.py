@@ -625,6 +625,35 @@ def watch_delivery_binding_lock(binding: dict):
         stack.close()
 
 
+def watch_acknowledgements_valid(binding: dict) -> bool:
+    """Confirm every exact watch in a locked current binding has a durable ACK."""
+    watches = binding.get("watches") if isinstance(binding, dict) else None
+    recipient = binding.get("recipient") if isinstance(binding, dict) else None
+    if not isinstance(watches, list) or not watches or not isinstance(recipient, dict):
+        return False
+    for watch in watches:
+        if not isinstance(watch, dict):
+            return False
+        watch_id, seat_key = watch.get("watch_id"), watch.get("seat_key")
+        if (not isinstance(watch_id, str) or not watch_id
+                or not isinstance(seat_key, str) or not seat_key):
+            return False
+        relation = resolve_watch(watch_id, seat_key=seat_key, include_acked=True)
+        if not isinstance(relation, dict) or relation.get("watch_id") != watch_id:
+            return False
+        holder = relation.get("holder") or {}
+        if (holder.get("harness") != recipient.get("harness")
+                or holder.get("sid") != recipient.get("session_id")):
+            return False
+        root = Path(str(relation.get("storage_root") or ""))
+        if (not root.is_absolute()
+                or not watch_ack_valid(root / "peer-watches" / f"{watch_id}.ack.json",
+                                       watch_id, recipient.get("harness"),
+                                       recipient.get("session_id"))):
+            return False
+    return True
+
+
 def acknowledge_watch(watch_id: str, harness: str, sid: str, carrier: str) -> str:
     """Create the original watch ACK only for its revalidated current recipient."""
     try:

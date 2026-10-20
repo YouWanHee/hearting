@@ -2269,6 +2269,27 @@ payload: receipt proves delivery, not that the receiver read the file. Retain
 payloads through receipt and handoff settlement; this checkout has no safe
 payload garbage-collection boundary, so automatic removal is not implied.
 Unknown, stale or ambiguous identities keep their original binding.
+
+Normal reconciliation may validate a historical pending row whose state is
+`received` and receipt is `exact-peer-ref` even when it predates the derived
+receiver-proof field. It rechecks the immutable transfer ref, body digest,
+sender, target, and current confirmed watch holder/generation under the existing
+mutation locks. For old version-1 transfers without `refs`, it uses the refs
+from that validated pending row. Native-history receipt still requires the
+trusted callback's matching actual native message ID and verified pending row.
+Only exact receiver evidence from the peer-ref or native-history paths
+establishes body receipt; missing-pending recovery retains its exact receiver
+provenance and original-transfer digest.
+
+The current watch holder's durable ACK settles only the watch notice's ordinary
+transport duty. `cmd_ack` revalidates the holder and ACK before the existing
+settlement path marks the pending row `received` with
+`watch-receipt-displayed`. Normal reconciliation rechecks the exact watch
+binding, generation, and durable ACK under the seat lock, then closes that
+transport duty with `delivery=not-required` and no body-receipt result. This
+does not acknowledge reading or consuming the original message body, and the
+existing registered-delivery and native-continuation callbacks remain active.
+
 An external shell may have no sender session: `unknown`/empty and null sender
 fields mean an unattributed sender, not an invalid message. Its sealed ref/body
 and exact known recipient still govern delivery and receipt. Legacy unsent rows

@@ -1319,6 +1319,13 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "unverified", "reason": str(error)}
         if result["status"] == "consumed":
             # Native input consumption is a transport observation, not semantic understanding.
+            native_message_id = "delivery-peer-" + ref
+            proof = _validated_native_history_receipt(
+                ref, current, recipient, delivery_binding,
+                "validated-codex-native-history-v1", native_message_id)
+            if proof is None:
+                _save_pending(dict(current, rpc_claim=None))
+                return {"status": "unverified", "reason": "native-receipt-binding-unverified"}
             rc = 0 if _received_notice_exists(ref, recipient) else cmd_record(argparse.Namespace(
                 from_harness=row["from"].get("harness") or "unknown", from_session_id=row["from"].get("session_id") or "",
                 from_name=row["from"].get("name"), from_project="", to_harness="codex",
@@ -1328,13 +1335,10 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             if rc:
                 _save_pending(dict(current, rpc_claim=None))
                 return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
-            proof = _validated_native_history_receipt(
-                ref, current, recipient, delivery_binding,
-                "validated-codex-native-history-v1")
             received = dict(current, state="received", text=None, rpc_claim=None,
-                            receipt="exact-native-history")
-            if proof is not None:
-                received["exact_receiver_receipt"] = proof
+                            receipt="exact-native-history",
+                            actual_message_id=native_message_id,
+                            exact_receiver_receipt=proof)
             _save_pending(received)
             _ack_registered_delivery(received)
             _observe_continue_receipt(recipient, ref)
@@ -1554,23 +1558,78 @@ def _received_notice_exists(ref, recipient):
             or _native_history_notice_exists(ref, recipient))
 
 
-def _validated_native_history_receipt(ref, row, recipient, binding, provenance):
+def _validated_pending_transfer(ref, row):
+    """Recheck the immutable transfer against its verified pending row.
+
+    Version-1 transfers written before refs were added remain valid when the
+    pending row supplies that same immutable callback binding.
+    """
     try:
         transfer = _read_transfer_record(ref)
     except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    pending_refs = (row or {}).get("refs", [])
+    if (not isinstance(row, dict) or row.get("ref") != ref
+            or not isinstance(pending_refs, list)
+            or any(not isinstance(item, str) for item in pending_refs)):
+        return None, None
+    transfer_refs = transfer.get("refs") if isinstance(transfer, dict) else None
+    if "refs" in (transfer or {}):
+        if (not isinstance(transfer_refs, list)
+                or any(not isinstance(item, str) for item in transfer_refs)
+                or transfer_refs != pending_refs):
+            return None, None
+    elif transfer_refs is not None:
+        return None, None
+    if (not isinstance(transfer, dict)
+            or type(transfer.get("schema_version")) is not int
+            or transfer.get("schema_version") != 1
+            or transfer.get("message_id") != ref
+            or not isinstance(transfer.get("body_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", transfer["body_sha256"])
+            or row.get("body_sha256") != transfer.get("body_sha256")
+            or row.get("from") != transfer.get("from")
+            or row.get("to") != transfer.get("to")
+            or row.get("body_ref") != transfer.get("body_ref")
+            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_target(transfer.get("to"))):
+        return None, None
+    return transfer, list(pending_refs)
+
+
+def _validated_native_history_receipt(ref, row, recipient, binding, provenance,
+                                      actual_message_id):
+    transfer, _refs = _validated_pending_transfer(ref, row)
+    if transfer is None:
         return None
     bound_recipient = (binding or {}).get("recipient") or {}
-    if (not isinstance(transfer, dict) or transfer.get("message_id") != ref
-            or transfer.get("body_sha256") != (row or {}).get("body_sha256")
-            or transfer.get("refs") != (row or {}).get("refs")
-            or not isinstance(transfer.get("refs"), list)
+    current_binding = pending_delivery_binding(row, include_acked=True)
+    if (provenance not in {"validated-codex-native-history-v1",
+                           "validated-opencode-native-history-v1"}
+            or not isinstance(actual_message_id, str) or not actual_message_id
+            or len(actual_message_id) > 512
+            or any(ord(ch) < 32 for ch in actual_message_id)
+            or (row.get("actual_message_id") is not None
+                and row.get("actual_message_id") != actual_message_id)
+            or current_binding != binding
+            or not isinstance(binding, dict)
             or not all(bound_recipient.get(key) == recipient.get(key)
-                       for key in ("harness", "session_id"))):
+                       for key in ("harness", "session_id"))
+            or ((provenance == "validated-codex-native-history-v1")
+                != (recipient.get("harness") == "codex"))
+            or (provenance == "validated-opencode-native-history-v1"
+                and recipient.get("harness") != "opencode")
+            or (recipient.get("pane_id") is not None
+                and recipient.get("pane_id") != (transfer.get("to") or {}).get("pane_id"))):
+        return None
+    if (recipient.get("harness") == "codex"
+            and actual_message_id != "delivery-peer-" + ref):
         return None
     return {"receipt_type": "exact-native-history",
             "provenance": provenance,
             "transfer_ref": ref,
             "transfer_body_sha256": transfer["body_sha256"],
+            "actual_message_id": actual_message_id,
             "effective_recipient": dict(bound_recipient),
             "recipient_binding": binding,
             "received_at": time.time()}
@@ -1641,52 +1700,217 @@ def recover_missing_pending_receipt(ref, intent, *, roots=None, read_context=Non
              "notice_body_sha256": notice["body_sha256"],
              "received_at": notice.get("ts")}
     return ({"ref": ref, "body_sha256": transfer["body_sha256"], "state": "received",
-             "to": dict(target), "refs": list(refs), "receipt": "exact-peer-ref",
+             "from": dict(transfer_sender), "to": dict(target),
+             "refs": list(refs), "receipt": "exact-peer-ref",
              "received_at": notice.get("ts"), "exact_receiver_receipt": proof},
             dict(effective))
 
 
-def acknowledge_message_obligations(received):
-    """Apply one receiver-proven exact receipt to its ordinary message duties."""
-    proof = received.get("exact_receiver_receipt") if isinstance(received, dict) else None
-    recipient = proof.get("effective_recipient") if isinstance(proof, dict) else None
-    ref = received.get("ref") if isinstance(received, dict) else None
-    if (not isinstance(proof, dict) or not isinstance(recipient, dict)
+def _validated_pending_receiver_proof(row):
+    """Build exact receipt evidence from a current trusted pending receipt row."""
+    ref = (row or {}).get("ref")
+    if (not isinstance(row, dict) or row.get("state") != "received"
             or not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref)):
+        return None
+    transfer, _refs = _validated_pending_transfer(ref, row)
+    if transfer is None:
+        return None
+    binding = pending_delivery_binding(row, include_acked=True)
+    recipient = binding.get("recipient") if isinstance(binding, dict) else None
+    if not isinstance(recipient, dict):
+        return None
+    if row.get("receipt") == "exact-peer-ref":
+        candidate = _exact_receiver_evidence(ref, transfer, row, recipient)
+        if candidate is None:
+            return None
+        saved = row.get("exact_receiver_receipt")
+        if saved is None:
+            return {**candidate,
+                    "provenance": "validated-legacy-pending-receipt-v1",
+                    "received_at": row.get("received_at")}
+        fields = ("receipt_type", "provenance", "transfer_ref",
+                  "transfer_body_sha256", "effective_recipient", "recipient_binding")
+        if (not isinstance(saved, dict)
+                or saved.get("provenance") != _EXACT_RECEIVER_PROVENANCE
+                or any(saved.get(key) != candidate.get(key) for key in fields)):
+            return None
+        return dict(saved)
+    if row.get("receipt") == "exact-native-history":
+        provenance = {
+            "codex": "validated-codex-native-history-v1",
+            "opencode": "validated-opencode-native-history-v1",
+        }.get(recipient.get("harness"))
+        if provenance is None:
+            return None
+        candidate = _validated_native_history_receipt(
+            ref, row, recipient, binding, provenance, row.get("actual_message_id"))
+        if candidate is None:
+            return None
+        saved = row.get("exact_receiver_receipt")
+        if saved is None:
+            return candidate
+        fields = ("receipt_type", "provenance", "transfer_ref",
+                  "transfer_body_sha256", "actual_message_id",
+                  "effective_recipient", "recipient_binding")
+        if (not isinstance(saved, dict)
+                or any(saved.get(key) != candidate.get(key) for key in fields)):
+            return None
+        return dict(saved)
+    return None
+
+
+def _validated_missing_pending_receiver_proof(message):
+    """Validate a live exact receiver callback when its pending row is absent."""
+    if (not isinstance(message, dict) or message.get("state") != "received"
+            or message.get("receipt") != "exact-peer-ref"):
+        return None
+    ref = message.get("ref")
+    saved = message.get("exact_receiver_receipt")
+    if (not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref)
+            or not isinstance(saved, dict)
+            or saved.get("provenance") != _EXACT_RECEIVER_PROVENANCE):
+        return None
+    try:
+        transfer = _read_transfer_record(ref)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+    refs = transfer.get("refs") if isinstance(transfer, dict) else None
+    if (not isinstance(transfer, dict)
+            or type(transfer.get("schema_version")) is not int
+            or transfer.get("schema_version") != 1
+            or transfer.get("message_id") != ref
+            or not isinstance(refs, list)
+            or any(not isinstance(item, str) for item in refs)
+            or transfer.get("body_sha256") != message.get("body_sha256")
+            or transfer.get("from") != message.get("from")
+            or transfer.get("to") != message.get("to")
+            or refs != message.get("refs")
+            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_target(transfer.get("to"))):
+        return None
+    recipient = saved.get("effective_recipient")
+    if not isinstance(recipient, dict):
+        return None
+    candidate = _exact_receiver_evidence(ref, transfer, None, recipient)
+    fields = ("receipt_type", "provenance", "transfer_ref",
+              "transfer_body_sha256", "effective_recipient", "recipient_binding")
+    if (candidate is None
+            or any(saved.get(key) != candidate.get(key) for key in fields)):
+        return None
+    return dict(saved)
+
+
+def _acknowledge_watch_transport_locked(row):
+    ref = row.get("ref") if isinstance(row, dict) else None
+    if (not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref)
+            or row.get("state") != "received"
+            or row.get("receipt") != "watch-receipt-displayed"):
+        return False
+    transfer, refs = _validated_pending_transfer(ref, row)
+    if transfer is None:
+        return False
+    watch_ids = [item[len("peer-watch:"):]
+                 for item in refs if item.startswith("peer-watch:")]
+    binding = pending_delivery_binding(row, include_acked=True)
+    if (not watch_ids or not isinstance(binding, dict)
+            or [watch.get("watch_id") for watch in binding.get("watches", [])
+                if isinstance(watch, dict)] != watch_ids
+            or (row.get("watch_receipt_binding") is not None
+                and row.get("watch_receipt_binding") != binding)):
         return False
     try:
         from peer_obligations import ObligationStore
         store = ObligationStore()
         duty_ids = ["message-" + ref]
-        for item in received.get("refs") or ():
-            if isinstance(item, str) and item.startswith("delay-notice:"):
+        for item in refs:
+            if item.startswith("delay-notice:"):
                 original_ref = item[len("delay-notice:"):]
                 if re.fullmatch(r"[0-9a-f]{32}", original_ref):
                     duty_ids.append("delay-" + original_ref)
         applied = False
         for duty_id in duty_ids:
-            applied = store.acknowledge_message_receipt(
-                duty_id, received, recipient) or applied
+            applied = store.settle_message_transport(duty_id, row, binding) or applied
         return applied
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-        # Receipt persistence is authoritative; a later normal callback retries
-        # this same exact ref without preparing another transfer.
         return False
 
 
-def _ack_registered_delivery(received):
+def acknowledge_message_obligations(received, *, pending_lock_held=False):
+    """Apply a verified body receipt or durable watch transport ACK to duties."""
+    if not isinstance(received, dict):
+        return False
+    ref = received.get("ref") if isinstance(received, dict) else None
+    if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+        return False
+
+    def apply_current():
+        try:
+            current = _read_pending(ref)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
+        live_missing_proof = None
+        if current is None:
+            live_missing_proof = _validated_missing_pending_receiver_proof(received)
+            if live_missing_proof is None:
+                return False
+            current = dict(received, exact_receiver_receipt=live_missing_proof)
+        elif not isinstance(current, dict) or current.get("state") != "received":
+            return False
+        else:
+            for key in ("ref", "body_sha256", "from", "to", "refs", "receipt", "actual_message_id"):
+                if key in received and current.get(key) != received.get(key):
+                    return False
+        if current.get("receipt") == "watch-receipt-displayed":
+            return _acknowledge_watch_transport_locked(current)
+        proof = live_missing_proof or _validated_pending_receiver_proof(current)
+        recipient = proof.get("effective_recipient") if isinstance(proof, dict) else None
+        if not isinstance(proof, dict) or not isinstance(recipient, dict):
+            return False
+        verified = dict(current, exact_receiver_receipt=proof)
+        try:
+            from peer_obligations import ObligationStore
+            store = ObligationStore()
+            duty_ids = ["message-" + ref]
+            for item in current.get("refs") or ():
+                if isinstance(item, str) and item.startswith("delay-notice:"):
+                    original_ref = item[len("delay-notice:"):]
+                    if re.fullmatch(r"[0-9a-f]{32}", original_ref):
+                        duty_ids.append("delay-" + original_ref)
+            applied = False
+            for duty_id in duty_ids:
+                applied = store.acknowledge_message_receipt(
+                    duty_id, verified, recipient) or applied
+            return applied
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            # Receipt persistence is authoritative; a later normal callback retries
+            # this same exact ref without preparing another transfer.
+            return False
+
+    if pending_lock_held:
+        return apply_current()
+    try:
+        with pending_lock(ref):
+            return apply_current()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
+def _ack_registered_delivery(received, *, message_obligation=True):
     registered = False
     try:
         from peer_obligations import acknowledge_registered_delivery
         registered = acknowledge_registered_delivery(received)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         pass  # The retained courier retries the same receipt, never another send.
-    try:
-        acknowledge_message_obligations(received)
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-        # Receipt persistence is authoritative; a later normal callback retries
-        # this same exact ref without preparing another transfer.
-        pass
+    if message_obligation:
+        try:
+            # Every caller holds the exact pending-row lock; do not reacquire its
+            # nonblocking flock while retaining the row mutation boundary.
+            acknowledge_message_obligations(received, pending_lock_held=True)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            # Receipt persistence is authoritative; a later normal callback retries
+            # this same exact ref without preparing another transfer.
+            pass
     return registered
 
 
@@ -1782,19 +2006,21 @@ def _exact_receiver_evidence(ref, transfer, pending, recipient):
     if (not isinstance(transfer, dict) or transfer.get("message_id") != ref
             or type(transfer.get("schema_version")) is not int
             or transfer.get("schema_version") != 1
-            or not isinstance(transfer.get("body_sha256"), str)):
+            or not isinstance(transfer.get("body_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", transfer["body_sha256"])
+            or not _valid_transfer_sender(transfer.get("from"))
+            or not _valid_transfer_target(transfer.get("to"))):
         return None
-    transfer_refs = transfer.get("refs")
-    pending_refs = (pending or {}).get("refs")
-    if isinstance(transfer_refs, list):
-        if (not all(isinstance(item, str) for item in transfer_refs)
-                or (pending is not None and pending_refs != transfer_refs)):
+    if pending is not None:
+        checked_transfer, refs = _validated_pending_transfer(ref, pending)
+        if checked_transfer is None or checked_transfer != transfer:
+            return None
+    else:
+        transfer_refs = transfer.get("refs")
+        if (not isinstance(transfer_refs, list)
+                or any(not isinstance(item, str) for item in transfer_refs)):
             return None
         refs = transfer_refs
-    elif pending is not None and isinstance(pending_refs, list):
-        refs = pending_refs
-    else:
-        return None
     target = transfer.get("to") or {}
     binding = (pending_delivery_binding(pending, include_acked=True)
                if _valid_pane_bound_endpoint(target) and pending is not None
@@ -2008,21 +2234,9 @@ def _ack_watch_refs(pending, recipient, carrier):
 
 
 def settle_watch_transfers(watch_id, harness, sid):
-    """Settle a queued watch notice only when its durable exact recipient ACK exists."""
+    """Record transport settlement only for a durable ACK by the current holder."""
     try:
         import dispatch_seat_handover as handover
-        pm = handover._peer_message()
-        roots = handover._watch_roots(pm)
-        ack = None
-        for root in roots:
-            candidate = Path(root) / "peer-watches" / f"{watch_id}.ack.json"
-            data = _read_json(candidate)
-            if (isinstance(data, dict) and data.get("watch_id") == watch_id
-                    and data.get("harness") == harness and data.get("session_id") == sid):
-                ack = data
-                break
-        if ack is None:
-            return False
         ref = f"peer-watch:{watch_id}"
         settled = False
         for row in list(_pending_rows()):
@@ -2030,13 +2244,33 @@ def settle_watch_transfers(watch_id, harness, sid):
                 continue
             with pending_lock(row["ref"]):
                 current = _read_pending(row["ref"])
-                if (not current or current.get("state") == "received"
-                        or ref not in (current.get("refs") or ())):
+                transfer, refs = _validated_pending_transfer(row["ref"], current)
+                watch_ids = ([item[len("peer-watch:"):]
+                              for item in refs if item.startswith("peer-watch:")]
+                             if refs is not None else [])
+                if (transfer is None or watch_id not in watch_ids):
                     continue
-                received = dict(current, state="received", text=None, rpc_claim=None,
-                                receipt="watch-receipt-displayed", received_at=time.time())
-                _save_pending(received)
-                _ack_registered_delivery(received)
+                binding = pending_delivery_binding(current, include_acked=True)
+                recipient = binding.get("recipient") if isinstance(binding, dict) else None
+                if (not isinstance(recipient, dict)
+                        or recipient.get("harness") != harness
+                        or recipient.get("session_id") != sid):
+                    continue
+                with handover.watch_delivery_binding_lock(binding) as current_binding:
+                    if (not current_binding
+                            or not handover.watch_acknowledgements_valid(binding)):
+                        continue
+                    if current.get("state") == "received":
+                        if current.get("receipt") != "watch-receipt-displayed":
+                            continue
+                        received = current
+                    else:
+                        received = dict(current, state="received", text=None, rpc_claim=None,
+                                        receipt="watch-receipt-displayed",
+                                        watch_receipt_binding=binding,
+                                        received_at=time.time())
+                        _save_pending(received)
+                _ack_registered_delivery(received, message_obligation=False)
                 settled = True
         return settled
     except Exception:  # noqa: BLE001 - unresolved transfers remain visible to their normal carrier
@@ -2351,6 +2585,11 @@ def cmd_pending(args):
                 return 0
             if row["state"] != "queued" or row.get("actual_message_id") != message_id:
                 return 1
+            proof = _validated_native_history_receipt(
+                ref, row, recipient, binding,
+                "validated-opencode-native-history-v1", message_id)
+            if proof is None:
+                return 1
             if not _received_notice_exists(ref, recipient):
                 rc = cmd_record(argparse.Namespace(
                     from_harness=row["from"].get("harness") or "unknown",
@@ -2363,12 +2602,10 @@ def cmd_pending(args):
                     body_file=None, body_stdin=False))
                 if rc:
                     return rc
-            proof = _validated_native_history_receipt(
-                ref, row, recipient, binding, "validated-opencode-native-history-v1")
             received = dict(row, state="received", text=None, rpc_claim=None,
-                            receipt="exact-native-history", received_at=time.time())
-            if proof is not None:
-                received["exact_receiver_receipt"] = proof
+                            receipt="exact-native-history", received_at=time.time(),
+                            actual_message_id=message_id,
+                            exact_receiver_receipt=proof)
             _save_pending(received)
             _ack_registered_delivery(received)
             _observe_continue_receipt(recipient, ref)

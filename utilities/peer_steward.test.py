@@ -3212,6 +3212,117 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self._release()
 
 
+class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
+    def _watch(self, target):
+        import session_tidy
+
+        env = self._env("idle")
+        env.update({"HERDR_PANE_ID": "fixture:watch-transport-seat",
+                    "AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+        proc = self._run("watch", target, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        fields = self._fields(proc.stdout.splitlines()[0])
+        self._wait_for_receipt(fields["watch_id"])
+        seat = session_tidy.Seat("pane", "watch-transport-" + fields["watch_id"],
+                                 "w1:p9", "claude")
+        arm_path = self.watch_root / f"{fields['watch_id']}.json"
+        arm = json.loads(arm_path.read_text(encoding="utf-8"))
+        arm["steward_seat"] = seat.as_dict()
+        peer_steward._write_json_atomic(arm_path, arm)
+        return fields, env, seat
+
+    def _transfer_duty(self, watch_id, *, old_transfer):
+        sender = {"harness": "claude", "session_id": "transport-sender", "name": "sender"}
+        recipient = {"harness": "claude", "session_id": "steward-1", "name": "steward"}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[peer-steward] watch receipt transport", sender, recipient, defer=True,
+            refs=[f"peer-watch:{watch_id}"])
+        if old_transfer:
+            path = peer_steward.peer_message._transfer_path(ref)
+            transfer = json.loads(path.read_text(encoding="utf-8"))
+            transfer.pop("refs", None)
+            path.write_text(json.dumps(transfer), encoding="utf-8")
+        row = peer_steward.peer_message._read_pending(ref)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "fixture:watch-transport-seat", **recipient},
+            {"ref": ref, "body_digest": row["body_sha256"], "from": sender,
+             "to": row["to"], "refs": row["refs"]})
+        return ref, row, store, duty
+
+    def test_cmd_ack_settles_old_and_new_watch_transport_without_body_receipt(self):
+        for target, old_transfer in (("watch-old-transfer", True),
+                                     ("watch-new-transfer", False)):
+            with self.subTest(old_transfer=old_transfer):
+                fields, env, _seat = self._watch(target)
+                ref, _row, store, duty = self._transfer_duty(
+                    fields["watch_id"], old_transfer=old_transfer)
+                first = self._run("ack", fields["watch_id"], "--carrier", "fixture-test",
+                                  env=env)
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                self.assertIn("ack=created", first.stdout)
+                second = self._run("ack", fields["watch_id"], "--carrier", "fixture-replay",
+                                   env=env)
+                self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+                self.assertIn("ack=already", second.stdout)
+
+                row = peer_steward.peer_message._read_pending(ref)
+                self.assertEqual((row["state"], row["receipt"]),
+                                 ("received", "watch-receipt-displayed"))
+                self.assertNotIn("exact_receiver_receipt", row)
+                self.assertEqual(row["watch_receipt_binding"]["recipient"],
+                                 {"harness": "claude", "session_id": "steward-1"})
+
+                peer_steward._resume_message_obligation(duty, store)
+                settled = store.get(duty["id"])
+                self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                                 ("complete", None, "not-required"))
+                self.assertNotIn("receiver_receipt", settled["observation"])
+                self.assertEqual(settled["observation"]["watch_transport_receipt"]["receipt"],
+                                 "watch-receipt-displayed")
+
+                with mock.patch.object(peer_steward, "_resume_message_obligation",
+                                       wraps=peer_steward._resume_message_obligation) as resume:
+                    peer_steward._reconcile_obligations(store)
+                resume.assert_not_called()
+
+    def test_watch_transport_rejects_ack_from_a_stale_handover_generation(self):
+        import session_tidy
+        import dispatch_seat_handover as handover
+
+        fields, env, seat = self._watch("watch-stale-transport")
+        ref, _row, store, duty = self._transfer_duty(
+            fields["watch_id"], old_transfer=True)
+        ack = self._run("ack", fields["watch_id"], "--carrier", "fixture-test", env=env)
+        self.assertEqual(ack.returncode, 0, ack.stdout + ack.stderr)
+        pending = peer_steward.peer_message._read_pending(ref)
+        old_binding = pending["watch_receipt_binding"]
+
+        with mock.patch.dict(os.environ, env):
+            current = handover.resolve_watch(fields["watch_id"], include_acked=True)
+            self.assertEqual(current["seat_key"], seat.key)
+            successor = dict(current,
+                holder={"harness": "claude", "sid": "steward-2"},
+                lineage=[{"from": "steward-1", "to": "steward-2",
+                          "snapshot_id": "fixture-stale-ack"}])
+            with session_tidy.seat_lock(seat.key):
+                session_tidy._append_ledger_entry(seat, {
+                    "ts": session_tidy.now_epoch(), "harness": "claude", "sid": "steward-2",
+                    "event": "handover", "from": "steward-1", "seat_key": seat.key,
+                    "bindings": [],
+                    "steward": {"schema": 1, "roles": [], "watches": [successor]},
+                })
+            current_binding = peer_steward.peer_message.pending_delivery_binding(
+                pending, include_acked=True)
+            self.assertNotEqual(current_binding, old_binding)
+
+        peer_steward._resume_message_obligation(duty, store)
+        latest = store.get(duty["id"])
+        self.assertEqual(latest["state"], "unknown")
+        self.assertEqual(latest["observation"]["reason"], "received-binding-unverified")
+        self.assertEqual(latest["delivery"], "pending")
+
+
 class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
     def test_rearm_keeps_the_original_steward_identity_without_env(self):
         # M1: a rearm issued from a process that carries no session id (the
@@ -4818,6 +4929,103 @@ class MessageTerminalObligationTest(_TmpRootMixin, unittest.TestCase):
                 latest = store.get(duty["id"])
                 self.assertEqual(latest["state"], "unknown")
                 self.assertNotIn("terminal_evidence", latest["observation"])
+
+    def test_historical_exact_pending_receipt_closes_and_is_excluded_next_pass(self):
+        sender = {"harness": "claude", "session_id": "legacy-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "legacy-receiver", "name": "worker"}
+        text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] historical exact receipt", sender, recipient, defer=True)
+        self.assertEqual(peer_steward.peer_message.receive_peer_message(text, recipient), 0)
+
+        # Match the real version-1 layout written before transfer refs and the
+        # derived exact_receiver_receipt field existed.
+        transfer_path = peer_steward.peer_message._transfer_path(ref)
+        transfer = json.loads(transfer_path.read_text(encoding="utf-8"))
+        transfer.pop("refs", None)
+        transfer_path.write_text(json.dumps(transfer), encoding="utf-8")
+        row = peer_steward.peer_message._read_pending(ref)
+        row.pop("exact_receiver_receipt", None)
+        peer_steward.peer_message._save_pending(row)
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.create("message-" + ref, "message",
+            {"server": "default", "pane": "", **recipient},
+            {"ref": ref, "body_digest": row["body_sha256"], "from": sender,
+             "to": row["to"], "refs": row["refs"]})
+        peer_steward._resume_message_obligation(duty, store)
+        settled = store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                         ("complete", "received", "acknowledged"))
+        self.assertEqual(settled["observation"]["receiver_receipt"]["ref"], ref)
+
+        with mock.patch.object(peer_steward, "_resume_message_obligation",
+                               wraps=peer_steward._resume_message_obligation) as resume:
+            peer_steward._reconcile_obligations(store)
+        resume.assert_not_called()
+
+    def test_codex_and_opencode_native_callbacks_ack_old_transfer_refs(self):
+        import codex_queue_delivery as queue
+        import codex_queue_dispatch as queue_dispatch
+
+        for harness in ("codex", "opencode"):
+            with self.subTest(harness=harness):
+                sender = {"harness": "claude", "session_id": "native-old-sender",
+                          "name": "sender"}
+                recipient = {"harness": harness, "session_id": "native-old-" + harness,
+                             "name": "worker"}
+                _text, ref = peer_steward.peer_message.prepare_peer_message(
+                    "[steer] late native ACK on old transfer", sender, recipient, defer=True)
+                transfer_path = peer_steward.peer_message._transfer_path(ref)
+                transfer = json.loads(transfer_path.read_text(encoding="utf-8"))
+                transfer.pop("refs", None)
+                transfer_path.write_text(json.dumps(transfer), encoding="utf-8")
+                row = peer_steward.peer_message._read_pending(ref)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.create("message-" + ref, "message",
+                    {"server": "default", "pane": "", **recipient},
+                    {"ref": ref, "body_digest": row["body_sha256"], "from": sender,
+                     "to": row["to"], "refs": row["refs"]})
+
+                if harness == "codex":
+                    with mock.patch.object(queue_dispatch, "resolve_queue_socket",
+                                           return_value="fixture-socket"), \
+                         mock.patch.object(queue, "send_at_least_once",
+                                           return_value={"status": "consumed"}):
+                        result = peer_steward.peer_message.deliver_pending_codex(ref)
+                    self.assertEqual(result["status"], "received")
+                    expected_id = "delivery-peer-" + ref
+                else:
+                    args = peer_steward.peer_message.argparse.Namespace(
+                        to_harness=harness, to_session_id=recipient["session_id"],
+                        claim=None, queued=ref, resuming=None, received=None,
+                        message_id="native-message-" + harness)
+                    self.assertEqual(peer_steward.peer_message.cmd_pending(args), 0)
+                    wrong_id = peer_steward.peer_message.argparse.Namespace(
+                        to_harness=harness, to_session_id=recipient["session_id"],
+                        claim=None, queued=None, resuming=None, received=ref,
+                        message_id="foreign-native-message")
+                    self.assertEqual(peer_steward.peer_message.cmd_pending(wrong_id), 1)
+                    wrong_recipient = peer_steward.peer_message.argparse.Namespace(
+                        to_harness=harness, to_session_id="foreign-native-recipient",
+                        claim=None, queued=None, resuming=None, received=ref,
+                        message_id=args.message_id)
+                    self.assertEqual(peer_steward.peer_message.cmd_pending(wrong_recipient), 1)
+                    received = peer_steward.peer_message.argparse.Namespace(
+                        to_harness=harness, to_session_id=recipient["session_id"],
+                        claim=None, queued=None, resuming=None, received=ref,
+                        message_id=args.message_id)
+                    self.assertEqual(peer_steward.peer_message.cmd_pending(received), 0)
+                    expected_id = args.message_id
+
+                pending = peer_steward.peer_message._read_pending(ref)
+                self.assertEqual((pending["state"], pending["receipt"],
+                                  pending["actual_message_id"]),
+                                 ("received", "exact-native-history", expected_id))
+                self.assertEqual(pending["exact_receiver_receipt"]["actual_message_id"],
+                                 expected_id)
+                settled = store.get(duty["id"])
+                self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
+                                 ("complete", "received", "acknowledged"))
 
     def test_exact_received_ledger_recovers_missing_pending_row(self):
         sender = {"harness": "claude", "session_id": "sender-session", "name": "sender"}

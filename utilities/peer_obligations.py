@@ -38,7 +38,7 @@ _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
 _MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
-_MESSAGE_RECEIPT_TYPES = frozenset({"exact-peer-ref", "exact-native-history"})
+_LEGACY_PENDING_RECEIPT_PROVENANCE = "validated-legacy-pending-receipt-v1"
 
 
 def _message_watch_ids(refs):
@@ -1326,10 +1326,11 @@ class ObligationStore:
         binding = proof.get("recipient_binding") if isinstance(proof, dict) else None
         effective = proof.get("effective_recipient") if isinstance(proof, dict) else None
         if (not isinstance(proof, dict)
-                or proof.get("provenance") not in {
-                    _MESSAGE_RECEIVER_PROVENANCE, "validated-codex-native-history-v1",
-                    "validated-opencode-native-history-v1"}
-                or proof.get("receipt_type") not in _MESSAGE_RECEIPT_TYPES
+                or (proof.get("receipt_type"), proof.get("provenance")) not in {
+                    ("exact-peer-ref", _MESSAGE_RECEIVER_PROVENANCE),
+                    ("exact-peer-ref", _LEGACY_PENDING_RECEIPT_PROVENANCE),
+                    ("exact-native-history", "validated-codex-native-history-v1"),
+                    ("exact-native-history", "validated-opencode-native-history-v1")}
                 or message.get("receipt") != proof.get("receipt_type")
                 or proof.get("transfer_ref") != ref
                 or proof.get("transfer_body_sha256") != body_digest
@@ -1351,11 +1352,20 @@ class ObligationStore:
                     return False
                 intent = record.get("intent") or {}
                 observation = record.get("observation") or {}
+                expected_sender = intent.get("from") or {}
+                saved_sender = message.get("from") or {}
                 if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
                         or (intent.get("ref") or observation.get("transfer_ref")) != ref
                         or intent.get("body_digest") != body_digest
-                        or intent.get("refs", []) != message.get("refs", [])):
+                        or intent.get("refs", []) != message.get("refs", [])
+                        or (expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
+                                                    for key in ("harness", "session_id")))):
                     return False
+                if proof.get("receipt_type") == "exact-native-history":
+                    native_id = proof.get("actual_message_id")
+                    if (not isinstance(native_id, str) or not native_id
+                            or message.get("actual_message_id") != native_id):
+                        return False
                 original = intent.get("to") or {}
                 saved_target = message.get("to") or {}
                 target_keys = ("harness", "session_id", "pane_id")
@@ -1404,6 +1414,88 @@ class ObligationStore:
                     record["state"] = "complete"
                     record["result"] = "received"
                     record["cleanup"] = "complete"
+                record["revision"] = int(record.get("revision", 0)) + 1
+                record["updated_at"] = time.time()
+                _write_atomic(path, record)
+                return True
+            finally:
+                os.close(fd)
+                self._invalidate_list_record(duty_id)
+
+        return _with_current_message_watch_binding(message, binding, mutate, False)
+
+    def settle_message_transport(self, duty_id: str, message: dict, binding: dict) -> bool:
+        """Close transport only after the exact current watch holder durably ACKed."""
+        if (not isinstance(message, dict) or message.get("state") != "received"
+                or message.get("receipt") != "watch-receipt-displayed"):
+            return False
+        ref, body_digest = message.get("ref"), message.get("body_sha256")
+        if not isinstance(ref, str) or not isinstance(body_digest, str):
+            return False
+        refs = message.get("refs")
+        watch_ids = _message_watch_ids(refs)
+        watches = binding.get("watches") if isinstance(binding, dict) else None
+        recipient = binding.get("recipient") if isinstance(binding, dict) else None
+        if (not watch_ids or not isinstance(watches, list) or not isinstance(recipient, dict)
+                or [watch.get("watch_id") for watch in watches if isinstance(watch, dict)] != watch_ids):
+            return False
+        saved_binding = message.get("watch_receipt_binding")
+        if saved_binding is not None and saved_binding != binding:
+            return False
+        path = self._record_path(duty_id)
+        if not path.exists():
+            return False
+
+        def mutate():
+            try:
+                import dispatch_seat_handover as handover
+                if not handover.watch_acknowledgements_valid(binding):
+                    return False
+            except (ImportError, OSError, ValueError, RuntimeError):
+                return False
+            fd = self._lock(duty_id)
+            try:
+                record = _read_record(path)
+                if record is None:
+                    return False
+                intent = record.get("intent") or {}
+                observation = record.get("observation") or {}
+                if (intent.get("kind") != "message" or intent.get("handoff_acceptance")
+                        or (intent.get("ref") or observation.get("transfer_ref")) != ref
+                        or intent.get("body_digest") != body_digest
+                        or intent.get("refs", []) != refs):
+                    return False
+                expected_sender, saved_sender = intent.get("from") or {}, message.get("from") or {}
+                if expected_sender and any(expected_sender.get(key) != saved_sender.get(key)
+                                           for key in ("harness", "session_id")):
+                    return False
+                original, saved_target = intent.get("to") or {}, message.get("to") or {}
+                if any(original.get(key) != saved_target.get(key)
+                       for key in ("harness", "session_id", "pane_id")):
+                    return False
+                if (not isinstance(recipient.get("harness"), str)
+                        or not isinstance(recipient.get("session_id"), str)
+                        or not recipient.get("session_id")):
+                    return False
+                if record.get("delivery") == "acknowledged":
+                    return record.get("state") in {"complete", "cancelled"}
+                receipt = {
+                    "ref": ref,
+                    "recipient": dict(recipient),
+                    "receipt": "watch-receipt-displayed",
+                    "recipient_binding": copy.deepcopy(binding),
+                    "received_at": message.get("received_at"),
+                }
+                updated_observation = dict(observation)
+                if (updated_observation.get("watch_transport_receipt") == receipt
+                        and record.get("delivery") == "not-required"):
+                    return True
+                updated_observation["watch_transport_receipt"] = receipt
+                record["observation"] = updated_observation
+                record["delivery"] = "not-required"
+                record["cleanup"] = "complete"
+                if record.get("state") not in {"complete", "cancelled"}:
+                    record["state"] = "complete"
                 record["revision"] = int(record.get("revision", 0)) + 1
                 record["updated_at"] = time.time()
                 _write_atomic(path, record)
