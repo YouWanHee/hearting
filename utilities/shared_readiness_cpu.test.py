@@ -1028,7 +1028,7 @@ try:
 
     transport = PipeObservationTransport()
     getattr(module, "_RUNNER_READINESS_TRANSPORTS", {}).clear()
-    module._runner_readiness_transport = lambda _server: transport
+    module._runner_readiness_transport = lambda _server, endpoint=None: transport
     code = module.cmd_obligation_runner(SimpleNamespace(
         lock_fd=lock_fd, state_root=state_root, service_current=None))
     transport.close()

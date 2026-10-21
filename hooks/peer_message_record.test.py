@@ -577,10 +577,6 @@ class SweepTest(_BaseTest):
         fake.write_text(_FAKE_HERDR)
         fake.chmod(0o755)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
-        # The readiness contract binds a shared result to its selected server
-        # endpoint. Give the fixture that endpoint identity while leaving the
-        # socket absent, so the production runner exercises its CLI fallback.
-        self.env["HERDR_SOCKET_PATH"] = str(self.tmp_root / "herdr-observation.sock")
         self.session = "sweep-session-1"
         # A pane census must report a live, fixture-owned foreground shell;
         # the hook/observer children must not borrow a caller's Herdr socket.

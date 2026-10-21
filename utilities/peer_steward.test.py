@@ -398,8 +398,18 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                         suffix = "pending" if process_state == "live" else "unknown"
                         self.assertEqual(checkpoints, ["bound-registered-work-" + suffix],
                                          f"runner passes={runner_passes}; diagnostics={runner_diagnostics}")
-                        self.assertEqual(len(runner_passes), 3,
-                                         "the production publisher handles initial, changed, and token-bound passes")
+                        self.assertEqual(len(runner_passes), 2,
+                                         f"the persisted refresh request is handled in the initial and changed passes: "
+                                         f"{runner_diagnostics}")
+                        projection_states = [
+                            (item.get("projection") or {}).get("state")
+                            for item in runner_diagnostics
+                        ]
+                        self.assertEqual(projection_states,
+                                         ["pending" if process_state == "live" else "unknown",
+                                          "ready"],
+                                         f"the second pass must consume changed registry authority: "
+                                         f"{runner_diagnostics}")
                 finally:
                     os.close(fd)
 
@@ -1494,9 +1504,6 @@ class _WatchMixin(_TmpRootMixin):
             env.pop(key, None)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
-        # A selected endpoint name binds shared readiness identity. No listener
-        # is created here, so the runner still exercises the real CLI fallback.
-        env["HERDR_SOCKET_PATH"] = str(self.tmp_root / "herdr-observation.sock")
         env["FAKE_HERDR_SHELL_PID"] = str(self.shell.pid)
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_CALLLOG"] = str(self.calllog)
@@ -2499,9 +2506,8 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
 
     def test_name_pane_and_agent_id_aliases_share_one_watch_and_native_wait(self):
         env = self._env("held")
-        # Without any selected endpoint, shared readiness has no exact endpoint
-        # identity and the accepted watch correctly remains pending.
-        env.pop("HERDR_SOCKET_PATH", None)
+        # The selected server name is sufficient endpoint identity when the
+        # optional observation socket is absent; readiness comes from CLI.
         first = self._run("watch", "peer-a", env=env)
         self.assertEqual(first.returncode, 0, first.stderr)
         first_fields = self._fields(first.stdout)
@@ -2536,8 +2542,8 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             observation = peer_steward._read_json(
                 self.watch_root / f"{watch_id}.observation.json") or {}
         self.assertEqual((observation.get("native_wait") or {}).get("agent_state"), "idle")
-        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists(),
-                         "without a shared endpoint projection, the accepted watch stays pending")
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["state"], "idle")
 
     def test_concurrent_alias_registration_is_serialized_to_one_arm(self):
         env = self._env("held")
@@ -2619,6 +2625,12 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(receipt["target"], "peer-a")
 
     def test_alias_scope_keeps_steward_endpoint_and_until_obligations_distinct(self):
+        other_endpoint_env = self._env("held", session_id="steward-1")
+        other_endpoint_env["AGENT_HERDR_SESSION"] = "other-endpoint"
+        other_endpoint = self._fields(self._run(
+            "watch", "sid-fake", env=other_endpoint_env).stdout)
+        self.assertEqual(other_endpoint["state"], "armed")
+
         first_env = self._env("held", session_id="steward-1")
         first = self._fields(self._run("watch", "peer-a", env=first_env).stdout)
 
@@ -2638,48 +2650,40 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         default_ids = {first["watch_id"], other_steward["watch_id"],
                        other_until["watch_id"], explicit_default["watch_id"]}
         self.assertEqual(len(default_ids), 4)
+        self.assertNotIn(other_endpoint["watch_id"], default_ids)
         self.assertEqual([first["state"], other_steward["state"],
                           other_until["state"], explicit_default["state"]],
                          ["armed", "armed", "armed", "armed"])
         self.assertEqual((reordered_default["state"], reordered_default["watch_id"]),
                          ("already-armed", explicit_default["watch_id"]))
         arms = [json.loads(path.read_text()) for path in self._arm_records()]
-        self.assertEqual(len(arms), 4)
+        self.assertEqual(len(arms), 5)
         by_id = {arm["watch_id"]: arm for arm in arms}
         self.assertEqual(by_id[first["watch_id"]]["server"], "default")
         self.assertEqual(by_id[other_steward["watch_id"]]["steward"]["session_id"], "steward-2")
         self.assertEqual(by_id[other_until["watch_id"]]["until"], ["idle"])
         self.assertEqual(set(by_id[explicit_default["watch_id"]]["until"]),
                          {"idle", "done", "blocked"})
+        self.assertEqual(by_id[other_endpoint["watch_id"]]["server"], "other-endpoint")
+        self.assertEqual(by_id[other_endpoint["watch_id"]]["readiness_endpoint"],
+                         "server:other-endpoint")
+        self.assertTrue(all(by_id[watch_id]["readiness_endpoint"] == "server:default"
+                            for watch_id in default_ids))
         self._wait_for_wait_calls(len(arms))
-        for _ in default_ids:
+        for _ in arms:
             self._release()
-        for watch_id in default_ids:
+        for watch_id in (*default_ids, other_endpoint["watch_id"]):
             self._wait_for_receipt(watch_id)
 
-        store = peer_steward.peer_obligations.ObligationStore()
-        runner_lock = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
-        deadline = time.monotonic() + 10
-        while (time.monotonic() < deadline
-               and peer_steward._lock_held(runner_lock)):
-            time.sleep(0.02)
-        self.assertFalse(peer_steward._lock_held(runner_lock),
-                         "the default endpoint runner must release before another endpoint starts")
-
-        # A different selected Herdr endpoint starts its own existing runner
-        # after the default endpoint's shared runner has released its lease.
-        other_endpoint_env = self._env("held", session_id="steward-1")
-        other_endpoint_env["AGENT_HERDR_SESSION"] = "other-endpoint"
-        other_endpoint = self._fields(self._run(
-            "watch", "sid-fake", env=other_endpoint_env).stdout)
-        self.assertEqual(other_endpoint["state"], "armed")
-        self.assertNotIn(other_endpoint["watch_id"], default_ids)
-        other_arm = json.loads((self.watch_root / f"{other_endpoint['watch_id']}.json").read_text())
-        self.assertEqual(other_arm["server"], "other-endpoint")
-        self._wait_for_wait_calls(len(arms) + 1)
-        self._release()
         self.assertEqual(self._wait_for_receipt(other_endpoint["watch_id"])["server"],
                          "other-endpoint")
+        from dispatch_seat_handover import acknowledge_watch
+        for watch_id in (*default_ids, other_endpoint["watch_id"]):
+            arm = by_id[watch_id]
+            self.assertEqual(acknowledge_watch(
+                watch_id, "claude", arm["steward"]["session_id"],
+                "concurrent-endpoint-test"), "created")
+            self.assertTrue(peer_steward._watch_paths(watch_id, self.watch_root).ack.exists())
 
     def test_different_steward_seats_stay_independent_and_successor_retirement_is_separate(self):
         import contextlib
@@ -2969,9 +2973,10 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertTrue(refresh.call_args.kwargs.get("authority_lock_held"))
         self.assertEqual(len(self._wait_calls()), 0)
 
-    def test_idle_result_without_shared_authority_stays_pending_without_replaying_wait(self):
+    def test_conflicting_native_session_stays_unknown_without_replaying_wait(self):
         env = self._env("held")
-        env.pop("HERDR_SOCKET_PATH", None)
+        identity_path = self.tmp_root / "conflicting-native-identity.json"
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
         armed = self._fields(self._run("watch", "peer-a", env=env).stdout)
         watch_id = armed["watch_id"]
         wait_record = self._wait_for_native_wait_started(watch_id)
@@ -2987,6 +2992,8 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertTrue(peer_steward._pid_identity_ok(
             wait_record["pid"], wait_record["pid_start"]))
 
+        identity_path.write_text(json.dumps({"session_id": "sid-contradictory",
+                                             "pane": "w1:p9"}), encoding="utf-8")
         self._release()
         deadline = time.monotonic() + 10
         observation = {}
@@ -2994,17 +3001,19 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
             observation = peer_steward._read_json(
                 self.watch_root / f"{watch_id}.observation.json") or {}
             native = observation.get("native_wait") or {}
-            if native.get("state") == "result" and observation.get("state") == "pending":
+            if native.get("state") == "unknown" and observation.get("state") == "unknown":
                 break
             time.sleep(0.02)
         self.assertEqual((observation.get("state"),
                           (observation.get("native_wait") or {}).get("agent_state")),
-                         ("pending", "idle"),
+                         ("unknown", "idle"),
                          f"observation={observation}; watcher_log="
                          f"{(self.watch_root / f'{watch_id}.log').read_text(errors='replace')[-2000:]}")
-        time.sleep(0.2)
+        self.assertEqual(observation.get("reason"), "target-identity-conflict")
+        self.assertEqual(((observation.get("native_wait") or {}).get("unresolved_result")
+                          or {}).get("agent", {}).get("session_id"), "sid-contradictory")
         self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists(),
-                         "unknown completion authority must not settle an idle watch")
+                         "a conflicting nonempty native SID must not settle a watch")
         self.assertEqual(len(self._wait_calls()), 1)
 
     def test_receipt_is_atomic_complete_and_text_free(self):
@@ -11116,7 +11125,12 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
                 {"pane": self.pane, "harness": "claude", "session_id": "target-session"},
                 self.server, self.watch_id, self.paths)
         self.assertEqual((result.state, result.reason),
-                         ("unknown", "shared-readiness-unavailable"))
+                         ("pending", "shared-readiness-revalidating"))
+        request = peer_steward._read_json(self.paths.observation)["readiness_transition"]
+        self.assertEqual(request["identity"], self.identity)
+        self.assertTrue(peer_steward.shared_readiness.consumer_is_current(
+            {"consumer": request["consumer"]}))
+        self.assertTrue(request["token"])
         wake.assert_called_once_with(self.store.root)
         ensure.assert_called_once_with(reconciliation_required=True)
 
@@ -11363,6 +11377,76 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
 
 
 class SharedReadinessRunnerTest(unittest.TestCase):
+    def test_known_watch_sidless_census_requires_matching_foreground_proof(self):
+        from dispatch_contract import process_start_ticks
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("", encoding="utf-8")
+            state_root = root / "peer-state"
+            start = str(process_start_ticks(os.getpid()))
+            identity = peer_steward.shared_readiness.target_identity(
+                server="fixture", endpoint="/fixture.sock", pane="w1:p1",
+                harness="codex", session_id="thread-a", shell_pid=os.getpid(),
+                shell_start=start, native_state="idle")
+            result = {"state": "ready", "reason": "native-turn-ready",
+                      "lineage": {"shell_pid": os.getpid(), "shell_start": start}}
+            pane_info = {"shell_pid": os.getpid(),
+                         "foreground_processes": [{"pid": os.getpid()}]}
+            selected_env = {"AGENT_HOME": str(_HERE.parent),
+                            "AGENT_DISPATCH_JOBS": str(jobs),
+                            "AGENT_PEER_LEDGER_ROOT": str(state_root)}
+            with mock.patch.dict(os.environ, selected_env), \
+                    mock.patch.object(peer_steward, "_retire_target", return_value=(
+                        "idle", {"server": "fixture", "pane": "w1:p1",
+                                 "harness": "codex", "session_id": "-",
+                                 "name": "agent-a"}, 0, "")), \
+                    mock.patch.object(peer_steward, "_retire_pane_info",
+                                      return_value=pane_info), \
+                    mock.patch.object(peer_steward.peer_obligations,
+                                      "execution_attempts_for_processes", return_value=()):
+                with mock.patch.object(peer_steward, "_proven_session",
+                                       return_value="thread-a"):
+                    proven = peer_steward._watch_readiness_result(
+                        "agent-a", "idle", identity, result, "fixture")
+                self.assertEqual((proven.state, proven.reason),
+                                 ("ready", "native-turn-ready"))
+                with mock.patch.object(peer_steward, "_proven_session",
+                                       return_value="thread-b"):
+                    unproven = peer_steward._watch_readiness_result(
+                        "agent-a", "idle", identity, result, "fixture")
+                self.assertEqual(unproven.state, "unknown")
+                with mock.patch.object(peer_steward, "_retire_target", return_value=(
+                        "idle", {"server": "fixture", "pane": "w1:p1",
+                                 "harness": "codex", "session_id": "thread-b",
+                                 "name": "agent-a"}, 0, "")), \
+                        mock.patch.object(peer_steward, "_proven_session",
+                                          return_value="thread-a"):
+                    conflicting = peer_steward._watch_readiness_result(
+                        "agent-a", "idle", identity, result, "fixture")
+                self.assertEqual(conflicting.state, "unknown")
+
+    def test_watch_identity_keeps_its_selected_endpoint_across_runner_contexts(self):
+        from dispatch_contract import process_start_ticks
+        start = str(process_start_ticks(os.getpid()))
+        arm = {
+            "server": "default", "target": "agent-a",
+            "readiness_endpoint": "/fixture/default.sock",
+            "agent": {"pane": "w1:p1", "harness": "claude", "session_id": "sid-a"},
+            "pane_identity": {"shell_pid": os.getpid(), "shell_start": start},
+        }
+        with mock.patch.dict(os.environ, {
+                "AGENT_HERDR_SESSION": "secondary",
+                "HERDR_SOCKET_PATH": "/fixture/secondary.sock"}):
+            identity = peer_steward._watch_readiness_identity(arm, "idle")
+            self.assertEqual(identity["endpoint"], "/fixture/default.sock")
+            self.assertTrue(peer_steward._watch_readiness_identity_matches_arm(
+                identity, arm, "idle"))
+            crossed = {**identity, "endpoint": "/fixture/secondary.sock"}
+            self.assertFalse(peer_steward._watch_readiness_identity_matches_arm(
+                crossed, arm, "idle"), "a runner's endpoint cannot replace the arm's endpoint")
+
     def test_one_selection_observation_fans_out_to_live_consumer_duties(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = Path(temporary)

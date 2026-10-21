@@ -3429,8 +3429,12 @@ def _watch_native_binding_evidence(paths, arm):
             return "conflict", sid, result
         if reason is not None or state == "unknown":
             return "unknown", None, None
+        if identity == "unbound" and sid is None:
+            return "sidless", None, result
         if identity in {"match", "unbound"}:
             return "bound", sid, result
+        if identity == "sidless":
+            return "sidless", sid, result
         return "unknown", None, None
 
     if isinstance(wait_record, dict) and wait_record.get("state") == "result":
@@ -3442,8 +3446,12 @@ def _watch_native_binding_evidence(paths, arm):
                 "reason": wait_record.get("reason", "native-wait-result"),
             }
             identity, sid, _identity_reason = _watch_native_result_identity(arm, result)
+            if identity == "unbound" and sid is None:
+                return "sidless", None, result
             if identity in {"match", "unbound"}:
                 return "bound", sid, result
+            if identity == "sidless":
+                return "sidless", sid, result
             if identity == "conflict":
                 return "conflict", sid, result
             return "unknown", None, None
@@ -3470,11 +3478,15 @@ def _watch_native_result_identity(arm, result):
            for key in ("harness", "pane")):
         return "unknown", None, "target-identity-unverified"
     sid = observed.get("session_id")
-    if not isinstance(sid, str) or sid in {"", "-"}:
+    if not isinstance(sid, str):
         return "unknown", None, "target-identity-unverified"
     expected_sid = expected.get("session_id")
     if expected_sid in {None, "", "-"}:
+        if sid in {"", "-"}:
+            return "unbound", None, None
         return "unbound", sid, None
+    if sid in {"", "-"}:
+        return "sidless", expected_sid, None
     if expected_sid != sid:
         return "conflict", sid, "target-identity-conflict"
     return "match", sid, None
@@ -3512,7 +3524,7 @@ def _record_watch_native_result(paths, arm, result):
     if not isinstance(result, dict):
         return False
     identity, _sid, identity_reason = _watch_native_result_identity(arm, result)
-    if identity != "match":
+    if identity not in {"match", "unbound", "sidless"}:
         _preserve_watch_native_result_unknown(
             paths, arm, result, identity_reason or "target-identity-unverified")
         return False
@@ -3741,6 +3753,15 @@ def cmd_watch(args):
                 by_id[existing_id] = existing_arm
             if not _record_watch_native_result(existing_paths, existing_arm, wait_result):
                 continue
+        elif evidence == "sidless":
+            if (existing_sid not in {None, "", "-"}
+                    and evidence_sid != existing_sid):
+                _preserve_watch_native_result_unknown(
+                    existing_paths, existing_arm, wait_result,
+                    "target-identity-conflict")
+                continue
+            if not _record_watch_native_result(existing_paths, existing_arm, wait_result):
+                continue
         elif evidence == "conflict":
             _preserve_watch_native_result_unknown(
                 existing_paths, existing_arm, wait_result,
@@ -3871,6 +3892,9 @@ def cmd_watch(args):
             "timeout": args.timeout,
             "refs": list(args.ref or []),
             "server": server,
+            "readiness_endpoint": (
+                herdr_observation.socket_path_for_endpoint(server)
+                or _WATCH_SERVER_ENDPOINT_PREFIX + herdr_observation.endpoint_name(server)),
             "agent": {key: agent.get(key, "-") for key in ("harness", "session_id", "name", "pane")},
             "steward": {
                 "harness": steward_harness,
@@ -4135,7 +4159,7 @@ def cmd_watch_run(args):
                 and not terminal_reason):
             identity, result_sid, identity_reason = _watch_native_result_identity(
                 arm, wait_record)
-            if identity == "unbound":
+            if identity == "unbound" and result_sid is not None:
                 bound = _persist_watch_session(args, paths, server, result_sid)
                 arm = _read_json(paths.arm) or arm
                 expected_agent = dict(arm.get("agent") or expected_agent)
@@ -4146,7 +4170,7 @@ def cmd_watch_run(args):
                 if identity == "unbound" and not bound:
                     identity_reason = "target-identity-unverified"
                     identity = "unknown"
-            if identity not in {"match", "terminal"}:
+            if identity not in {"match", "terminal", "unbound", "sidless"}:
                 _preserve_watch_native_result_unknown(
                     paths, arm, wait_record,
                     identity_reason or "target-identity-unverified")
@@ -4284,7 +4308,7 @@ def cmd_watch_run(args):
                           "reason": result_reason}
                 identity, observed_sid, identity_reason = _watch_native_result_identity(
                     arm, result)
-                if identity == "unbound":
+                if identity == "unbound" and observed_sid is not None:
                     bound = _persist_watch_session(args, paths, server, observed_sid)
                     arm = _read_json(paths.arm) or arm
                     expected_agent = dict(arm.get("agent") or expected_agent)
@@ -4295,7 +4319,7 @@ def cmd_watch_run(args):
                     if identity == "unbound" and not bound:
                         identity_reason = "target-identity-unverified"
                         identity = "unknown"
-                if identity != "match":
+                if identity not in {"match", "unbound", "sidless"}:
                     return {"unverified": identity_reason or "target-identity-unverified",
                             "agent": result_agent, "agent_state": result_state,
                             "reason": result_reason}
@@ -5615,6 +5639,81 @@ def _watch_selected_jobs_path():
     return resolve_dispatch_state_root(resolve_agent_home()) / "jobs.log"
 
 
+_WATCH_SERVER_ENDPOINT_PREFIX = "server:"
+
+
+def _watch_selected_readiness_endpoint(arm, server=None):
+    """Return this watch's selected endpoint, independent of the runner's env."""
+    selected_server = server or (arm.get("server") if isinstance(arm, dict) else None) or "default"
+    if isinstance(arm, dict) and "readiness_endpoint" in arm:
+        endpoint = arm.get("readiness_endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            return None
+        if endpoint.startswith(_WATCH_SERVER_ENDPOINT_PREFIX):
+            expected = (_WATCH_SERVER_ENDPOINT_PREFIX
+                        + herdr_observation.endpoint_name(selected_server))
+            return endpoint if endpoint == expected else None
+        return endpoint
+    endpoint = herdr_observation.socket_path_for_endpoint(selected_server)
+    if endpoint:
+        return endpoint
+    return (_WATCH_SERVER_ENDPOINT_PREFIX
+            + herdr_observation.endpoint_name(selected_server))
+
+
+def _watch_readiness_identity_matches_arm(identity, arm, native_state):
+    """Validate a watch-carried endpoint identity against its immutable target."""
+    if not isinstance(identity, dict) or not isinstance(arm, dict):
+        return False
+    agent = arm.get("agent") or {}
+    server = arm.get("server") or "default"
+    session_id = agent.get("session_id") or ""
+    if session_id == "-":
+        session_id = ""
+    endpoint = identity.get("endpoint")
+    if (not isinstance(endpoint, str) or not endpoint
+            or identity.get("server") != server
+            or identity.get("pane") != agent.get("pane")
+            or identity.get("harness") != agent.get("harness")
+            or identity.get("session_id") != session_id
+            or identity.get("native_state") != native_state
+            or identity.get("purpose") != "completion"):
+        return False
+    if endpoint.startswith(_WATCH_SERVER_ENDPOINT_PREFIX):
+        if endpoint != (_WATCH_SERVER_ENDPOINT_PREFIX
+                        + herdr_observation.endpoint_name(server)):
+            return False
+    if ("readiness_endpoint" in arm
+            and endpoint != _watch_selected_readiness_endpoint(arm, server)):
+        return False
+    pane_identity = arm.get("pane_identity") or arm.get("foreground_identity") or {}
+    shell_pid = pane_identity.get("shell_pid")
+    shell_start = str(pane_identity.get("shell_start") or "")
+    if shell_pid is not None:
+        try:
+            if (int(identity.get("shell_pid")) != int(shell_pid)
+                    or str(identity.get("shell_start") or "") != shell_start):
+                return False
+        except (TypeError, ValueError):
+            return False
+    elif identity.get("shell_pid") is not None or identity.get("shell_start") not in {None, ""}:
+        return False
+    return True
+
+
+def _watch_readiness_fields_match(expected, observed):
+    """Let the common classifier contribute only a proven SID for a sidless pane."""
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return False
+    if any(observed.get(key) != expected.get(key)
+           for key in ("server", "pane", "harness", "pid_birth")):
+        return False
+    expected_sid = expected.get("session_id", "")
+    observed_sid = observed.get("session_id", "")
+    return (observed_sid == expected_sid
+            or (expected_sid == "" and isinstance(observed_sid, str) and bool(observed_sid)))
+
+
 @contextlib.contextmanager
 def _watch_transition_authority_lock(identity, server, *, deadline=None):
     """Join jobs then target-seat locks within one bounded receipt-edge budget."""
@@ -5656,7 +5755,11 @@ def _watch_transition_authority_lock(identity, server, *, deadline=None):
             raise _WatchDeadlineExpired("watch-deadline")
         if now >= transition_deadline:
             raise _WatchTransitionLockBusy("jobs-lock-budget-expired")
-        socket_path = herdr_observation.socket_path_for_endpoint(server)
+        endpoint = identity.get("endpoint") if isinstance(identity, dict) else None
+        socket_path = (None if isinstance(endpoint, str)
+                       and endpoint.startswith(_WATCH_SERVER_ENDPOINT_PREFIX)
+                       else endpoint if isinstance(endpoint, str) and endpoint
+                       else herdr_observation.socket_path_for_endpoint(server))
         now = time.monotonic()
         if deadline is not None and now >= deadline:
             raise _WatchDeadlineExpired("watch-deadline")
@@ -5700,7 +5803,7 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
         lineage = {"shell_pid": identity.get("shell_pid"),
                    "shell_start": identity.get("shell_start")}
     try:
-        observed_state, current, _code, _detail = _retire_target(target)
+        observed_state, current, _code, _detail = _retire_target(target, server=server)
         pane_info = _retire_pane_info(identity["pane"], server=server)
         shell_pid = int(lineage.get("shell_pid"))
         shell_start = str(lineage.get("shell_start") or "")
@@ -5712,18 +5815,35 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
     if current_sid == "-":
         current_sid = ""
     expected_sid = identity.get("session_id", "")
+    sidless_current = not current_sid and bool(expected_sid)
     if (observed_state not in {"idle", "done"}
             or not isinstance(current, dict)
             or current.get("pane") != identity.get("pane")
             or current.get("harness") != identity.get("harness")
-            or current_sid != expected_sid
+            or (current_sid != expected_sid and not sidless_current)
             or shell_pid != current_pid or shell_start != current_start):
         return SimpleNamespace(state="unknown", reason="shared-readiness-identity-changed")
     current_identity = {
         "server": server, "pane": identity["pane"],
-        "harness": identity["harness"], "session_id": current_sid,
+        "harness": identity["harness"],
+        "session_id": expected_sid if sidless_current else current_sid,
         "pid_birth": f"{current_pid}:{current_start}",
     }
+    if sidless_current and not require_authority:
+        from peer_read_context import PeerReadContext
+        readiness = _pane_readiness(
+            target, native_state,
+            expected_harness=identity["harness"], expected_sid=expected_sid,
+            expected_pane=identity["pane"],
+            target_observation=(observed_state, current), pane_info=pane_info,
+            registry_append_only=True,
+            read_context=PeerReadContext(registry_append_only=True), server=server)
+        readiness_identity = dict(getattr(readiness, "identity", ()) or ())
+        if not _watch_readiness_fields_match(current_identity, readiness_identity):
+            return SimpleNamespace(state="unknown",
+                                   reason="shared-readiness-identity-unverified")
+        return SimpleNamespace(state=readiness.state, reason=readiness.reason,
+                               identity=tuple(current_identity.items()))
     if require_authority:
         authority = result.get("authority")
         if not shared_readiness.valid_watch_authority(authority):
@@ -5744,7 +5864,7 @@ def _watch_readiness_result(target, native_state, identity, result, server, *,
                 selected_authority=authority,
                 server=server)
             readiness_identity = dict(getattr(readiness, "identity", ()) or ())
-            if readiness_identity != current_identity:
+            if not _watch_readiness_fields_match(current_identity, readiness_identity):
                 return SimpleNamespace(state="unknown",
                                        reason="shared-readiness-identity-changed")
             return SimpleNamespace(state=readiness.state, reason=readiness.reason,
@@ -5829,6 +5949,27 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
     consumer = {"pid": os.getpid(), "pid_start": str(consumer_start or "")}
     if not consumer["pid_start"]:
         return SimpleNamespace(state="unknown", reason="shared-readiness-consumer-unverified")
+
+    def request_refresh():
+        token = os.urandom(16).hex()
+        request = {"token": token, "identity": identity, "consumer": consumer,
+                   "requested_at": time.time()}
+        updated = {**observation, "readiness_transition": request}
+        updated.pop("readiness_contention", None)
+        try:
+            shared_readiness.clear_watch_transition(root, watch_id)
+        except (OSError, ValueError):
+            return SimpleNamespace(state="unknown",
+                                   reason="shared-readiness-refresh-unavailable")
+        _write_json_atomic(paths.observation, updated)
+        try:
+            shared_readiness.wake_runner(root)
+            peer_obligations.ensure_normal_runner(reconciliation_required=True)
+        except Exception:
+            # A missing response stays pending and reuses this exact request.
+            pass
+        return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
+
     if (isinstance(request, dict) and request.get("identity") == identity
             and request.get("consumer") == consumer
             and isinstance(request.get("token"), str) and request.get("token")):
@@ -5860,33 +6001,11 @@ def _watch_transition_readiness(target, native_state, arm, expected, server,
     if cached.state != "ready":
         if cached.reason == "shared-readiness-unavailable":
             # A fresh native result can be the first accepted readiness duty
-            # in this state root. Start the existing runner so that it can
-            # publish the projection this observer is waiting for.
-            try:
-                shared_readiness.wake_runner(root)
-                peer_obligations.ensure_normal_runner(reconciliation_required=True)
-            except Exception:
-                pass
+            # in this state root. Carry this watcher's selected endpoint and
+            # identity into the existing runner's first classification pass.
+            return request_refresh()
         return cached
-
-    token = os.urandom(16).hex()
-    request = {"token": token, "identity": identity, "consumer": consumer,
-               "requested_at": time.time()}
-    observation = {**observation, "readiness_transition": request}
-    observation.pop("readiness_contention", None)
-    try:
-        shared_readiness.clear_watch_transition(root, watch_id)
-    except (OSError, ValueError):
-        return SimpleNamespace(state="unknown", reason="shared-readiness-refresh-unavailable")
-    _write_json_atomic(paths.observation, observation)
-    try:
-        shared_readiness.wake_runner(root)
-        peer_obligations.ensure_normal_runner(reconciliation_required=True)
-    except Exception:
-        # No transition response means no ready receipt; the same stored
-        # native result remains available to the existing recovery path.
-        pass
-    return SimpleNamespace(state="pending", reason="shared-readiness-revalidating")
+    return request_refresh()
 
 
 def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
@@ -7022,15 +7141,17 @@ def _reconcile_readiness_observations(store, duties, *, read_context,
 _RUNNER_READINESS_TRANSPORTS = {}
 
 
-def _runner_readiness_transport(server):
-    endpoint = herdr_observation.socket_path_for_endpoint(server)
-    if not endpoint:
+def _runner_readiness_transport(server, endpoint=None):
+    selected_endpoint = (herdr_observation.socket_path_for_endpoint(server)
+                         if endpoint is None else endpoint)
+    if (not isinstance(selected_endpoint, str) or not selected_endpoint
+            or selected_endpoint.startswith(_WATCH_SERVER_ENDPOINT_PREFIX)):
         return None
-    key = (server or "default", str(endpoint))
+    key = (server or "default", selected_endpoint)
     transport = _RUNNER_READINESS_TRANSPORTS.get(key)
     if transport is None:
         transport = herdr_observation.ObservationTransport(
-            key[0], key[1], timeout=min(0.5, _HERDR_GET_TIMEOUT_SECONDS))
+            key[0], selected_endpoint, timeout=min(0.5, _HERDR_GET_TIMEOUT_SECONDS))
         _RUNNER_READINESS_TRANSPORTS[key] = transport
     return transport
 
@@ -7069,7 +7190,7 @@ def _watch_readiness_identity(arm, native_state):
     pane_identity = arm.get("pane_identity") or arm.get("foreground_identity") or {}
     server = arm.get("server") or "default"
     session_id = agent.get("session_id") or ""
-    endpoint = herdr_observation.socket_path_for_endpoint(server)
+    endpoint = _watch_selected_readiness_endpoint(arm, server)
     if not endpoint:
         return None
     identity = shared_readiness.target_identity(
@@ -7120,13 +7241,24 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         if (native.get("state") != "result"
                 or native.get("agent_state") not in {"idle", "done"}):
             continue
-        identity = _watch_readiness_identity(arm, native.get("agent_state"))
+        native_state = native.get("agent_state")
+        transition = observation.get("readiness_transition")
+        transition_is_current = (
+            isinstance(transition, dict)
+            and isinstance(transition.get("token"), str) and bool(transition.get("token"))
+            and shared_readiness.consumer_is_current(
+                {"consumer": transition.get("consumer")})
+            and _watch_readiness_identity_matches_arm(
+                transition.get("identity"), arm, native_state))
+        identity = (transition.get("identity") if transition_is_current else
+                    _watch_readiness_identity(arm, native_state))
         if identity is None:
             continue
+        if not transition_is_current:
+            transition = None
         target_key = {key: value for key, value in identity.items()
                       if key not in {"shell_pid", "shell_start"}}
         key = json.dumps(target_key, sort_keys=True, separators=(",", ":"))
-        transition = observation.get("readiness_transition")
         if (not isinstance(transition, dict)
                 or transition.get("identity") != identity
                 or not shared_readiness.consumer_is_current(
@@ -7143,9 +7275,13 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                 transport.close()
         _RUNNER_READINESS_TRANSPORTS.clear()
         return False
-    active_servers = {requests[0][2]["server"] for requests in groups.values()}
+    active_endpoints = {
+        (requests[0][2]["server"], requests[0][2]["endpoint"])
+        for requests in groups.values()
+        if not requests[0][2]["endpoint"].startswith(_WATCH_SERVER_ENDPOINT_PREFIX)
+    }
     for key, transport in tuple(_RUNNER_READINESS_TRANSPORTS.items()):
-        if key[0] not in active_servers:
+        if key not in active_endpoints:
             with contextlib.suppress(Exception):
                 transport.close()
             _RUNNER_READINESS_TRANSPORTS.pop(key, None)
@@ -7154,7 +7290,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         jobs = _watch_selected_jobs_path()
     except (OSError, ValueError, RuntimeError):
         jobs = None
-    views_by_server = {}
+    views_by_endpoint = {}
     for requests in groups.values():
         _watch_id, arm, identity, native_state, _transition = requests[0]
         server = identity["server"]
@@ -7169,10 +7305,12 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
         try:
             if jobs is None:
                 raise ValueError("selected-dispatch-registry-unavailable")
-            if server not in views_by_server:
-                transport = _runner_readiness_transport(server)
-                views_by_server[server] = transport.observe() if transport is not None else None
-            view = views_by_server[server]
+            endpoint_key = (server, identity["endpoint"])
+            if endpoint_key not in views_by_endpoint:
+                transport = _runner_readiness_transport(server, identity["endpoint"])
+                views_by_endpoint[endpoint_key] = (
+                    transport.observe() if transport is not None else None)
+            view = views_by_endpoint[endpoint_key]
             if view is None or getattr(view, "complete", True) is not True:
                 # Preserve the legacy positive CLI observation when the optional
                 # transport has no usable census. The group key already limits
@@ -7182,6 +7320,12 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             else:
                 observed_state, observed_ident, _code, _reason = _target_from_readiness_view(
                     view, target)
+            observed_session_id = observed_ident.get("session_id")
+            if observed_session_id in {None, "-"}:
+                observed_session_id = ""
+            session_candidate = (observed_session_id == identity["session_id"]
+                                 or (not observed_session_id
+                                     and bool(identity["session_id"])))
             pane_info = _retire_pane_info(identity["pane"], server=server)
             shell_pid = (int(pane_info.get("shell_pid", 0))
                          if isinstance(pane_info, dict) else 0)
@@ -7191,7 +7335,7 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
             if (observed_state not in {"unknown", "herdr-unavailable", "agent-not-found"}
                     and observed_ident.get("pane") == identity["pane"]
                     and observed_ident.get("harness") == identity["harness"]
-                    and (observed_ident.get("session_id") or "") == identity["session_id"]
+                    and session_candidate
                     and isinstance(pane_info, dict) and lineage is not None):
                 readiness = _pane_readiness(
                     target, native_state,
@@ -7202,12 +7346,14 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     pane_info=pane_info, registry_append_only=True,
                     read_context=read_context, server=server)
                 readiness_identity = dict(readiness.identity)
-                if (readiness_identity.get("server") == identity["server"]
-                        and readiness_identity.get("pane") == identity["pane"]
-                        and readiness_identity.get("harness") == identity["harness"]
-                        and readiness_identity.get("session_id", "") == identity["session_id"]
-                        and readiness_identity.get("pid_birth") ==
-                            f"{shell_pid}:{shell_start}"):
+                expected_readiness_identity = {
+                    "server": identity["server"], "pane": identity["pane"],
+                    "harness": identity["harness"],
+                    "session_id": identity["session_id"],
+                    "pid_birth": f"{shell_pid}:{shell_start}",
+                }
+                if _watch_readiness_fields_match(
+                        expected_readiness_identity, readiness_identity):
                     readiness_state, reason = readiness.state, readiness.reason
                 else:
                     reason = "shared-readiness-identity-changed"
@@ -7241,12 +7387,14 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                     read_context=transition_read_context, server=server,
                     authority_out=transition_authority)
                 readiness_identity = dict(readiness.identity)
-                if (readiness_identity.get("server") == identity["server"]
-                        and readiness_identity.get("pane") == identity["pane"]
-                        and readiness_identity.get("harness") == identity["harness"]
-                        and readiness_identity.get("session_id", "") == identity["session_id"]
-                        and readiness_identity.get("pid_birth") ==
-                            f"{shell_pid}:{shell_start}"):
+                expected_readiness_identity = {
+                    "server": identity["server"], "pane": identity["pane"],
+                    "harness": identity["harness"],
+                    "session_id": identity["session_id"],
+                    "pid_birth": f"{shell_pid}:{shell_start}",
+                }
+                if _watch_readiness_fields_match(
+                        expected_readiness_identity, readiness_identity):
                     readiness_state, reason = readiness.state, readiness.reason
                 else:
                     readiness_state, reason = "unknown", "shared-readiness-identity-changed"
