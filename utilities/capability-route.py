@@ -6068,7 +6068,8 @@ def _migrate_completion_dir_forward(route_id, *, jobs=None):
 # route hash, node id, terminal-gate name, evidence readability, evidence hash), so it
 # lives once here and `workflow-supervisor.py` dynamically loads this module rather than
 # re-deriving it -- the dependency stays one-way (supervisor -> capability-route).
-def terminal_gate_observation(route, *, jobs=None, exact_terminal=False, registry_rows=None):
+def terminal_gate_observation(route, *, jobs=None, exact_terminal=False, registry_rows=None,
+                              registry_snapshot=None):
     """Per declared-terminal-node completion-gate truth, verified fresh from disk.
 
     An owner-merge auxiliary-bearing group contributes one extra row keyed
@@ -6082,14 +6083,32 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False, registr
     nodes={node.get("id"):node for node in route.get("nodes",[])}
     terminal_ids=[node_id for node_id,node in nodes.items() if node.get("terminal") is True]
     rows={}
-    registry_lines = (["\t".join(fields) for fields, _metadata in registry_rows]
-                      if registry_rows is not None else None)
+    if registry_snapshot is not None:
+        try:
+            snapshot_valid = (registry_snapshot.matches_jobs(jobs)
+                              and registry_snapshot.complete)
+        except (AttributeError, OSError, TypeError, ValueError):
+            snapshot_valid = False
+        if not snapshot_valid:
+            reason = "registry-unreadable"
+            for node_id in terminal_ids:
+                rows[node_id] = {"passed": False, "reason": reason}
+            for group_id, _error in sorted(owner_merge_auxiliary_groups(route).items()):
+                rows[f"parallel_group:{group_id}"] = {"passed": False, "reason": reason}
+            return rows
+        registry_view = registry_snapshot.view
+        registry_lines = registry_snapshot.lines
+    else:
+        registry_view = None
+        registry_lines = (["\t".join(fields) for fields, _metadata in registry_rows]
+                          if registry_rows is not None else None)
     for node_id in terminal_ids:
         node=nodes[node_id]
         marker=completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
         if owner_executed_terminal(node) and not (marker.exists() or marker.is_symlink()):
             rows[node_id]=_owner_terminal_observation(
-                route,node,jobs=jobs,registry_rows=registry_rows)
+                route,node,jobs=jobs,registry_rows=registry_rows,
+                registry_lines=registry_lines,registry_view=registry_view)
         else:
             rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
                                               exact_terminal=exact_terminal,
@@ -6102,7 +6121,8 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False, registr
                 raw=arbitration_path(route["route_id"],group_id).read_bytes()
                 record=json.loads(raw); anchor=nodes[record["anchor_node"]]
                 proof=_marker_identity_row(route,anchor,anchor["id"],anchor["completion_gate"],
-                                           jobs=jobs,exact_terminal=True)
+                                           jobs=jobs,exact_terminal=True,
+                                           registry_lines=registry_lines)
                 if not proof.get("passed"):
                     row=proof
                 else:
@@ -6120,7 +6140,8 @@ def owner_executed_terminal(node):
             and node.get("unit") == "_kernel/owner" and node.get("dispatch_depth") == 1)
 
 
-def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None):
+def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None,
+                                registry_lines=None,registry_view=None):
     """Consume the same exact native handoff as worker completion, without
     inventing a second attempt or publishing a synthetic worker marker.
 
@@ -6132,11 +6153,15 @@ def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None):
         return {"passed":False,"reason":reason}
     try:
         jobs=Path(jobs) if jobs is not None else completion_dir(route["route_id"]).parents[1]/"jobs.log"
-        if registry_rows is not None:
+        if registry_view is not None:
+            candidates=((record.fields,record.completion_metadata()) for record in
+                        registry_view.completion_related("",route["route_id"],route["route_hash"]))
+        elif registry_rows is not None:
             candidates=registry_rows
         else:
-            from dispatch_registry_cache import registry_view
-            view=registry_view(jobs)
+            from dispatch_registry_cache import registry_view as load_registry_view
+            view=load_registry_view(jobs)
+            registry_view=view
             if view.has_invalid_utf8 or view.has_partial_tail:
                 # Keep the existing strict decoder and incomplete-line semantics.
                 lines=jobs.read_text(encoding="utf-8").splitlines()
@@ -6175,7 +6200,8 @@ def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None):
         if process.state!="quiescent": return absent("owner-not-quiescent")
         # A PASS proposal cannot erase a missing review or other prerequisite.
         prerequisites=owner_terminal_prerequisites(
-            route,node,jobs,registry_rows=registry_rows)
+            route,node,jobs,registry_rows=registry_rows,
+            registry_lines=registry_lines)
         if prerequisites:
             return absent("owner-prerequisite-unproven:"+json.dumps(prerequisites,sort_keys=True))
         # The owner's own operation is a node entry like any other: a PASS does not stand in
@@ -6207,7 +6233,7 @@ def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None):
         return absent("owner-terminal-evidence-unverified")
 
 
-def owner_terminal_prerequisites(route,node,jobs,*,registry_rows=None):
+def owner_terminal_prerequisites(route,node,jobs,*,registry_rows=None,registry_lines=None):
     nodes={n["id"]:n for n in route["nodes"]}
     pending=list(node.get("depends_on",[])); seen=set(); missing={}
     while pending:
@@ -6221,9 +6247,10 @@ def owner_terminal_prerequisites(route,node,jobs,*,registry_rows=None):
             continue  # This executor's final handoff includes its own preceding operations.
         proof=_marker_identity_row(route,predecessor,node_id,predecessor.get("completion_gate"),
                                    jobs=jobs,exact_terminal=predecessor.get("dispatch_depth") in (1,2),
-                                   registry_lines=(None if registry_rows is None else
-                                                   ["\t".join(fields)
-                                                    for fields, _metadata in registry_rows]))
+                                   registry_lines=(registry_lines if registry_lines is not None else
+                                                   (None if registry_rows is None else
+                                                    ["\t".join(fields)
+                                                     for fields, _metadata in registry_rows])))
         if not proof.get("passed"): missing[node_id]=proof["reason"]
     return missing
 

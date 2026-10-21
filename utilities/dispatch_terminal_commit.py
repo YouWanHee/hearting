@@ -1964,7 +1964,25 @@ def _owner_completion_state_scoped(jobs, status, metadata, *, selected_registry_
             request = _completion_request(
                 jobs, status, metadata, selected_registry_rows=selected_registry_rows)
             route = json.loads(request.route_file.read_text())
-            facts["gates"] = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+            import dispatch_registry_cache
+            snapshot = dispatch_registry_cache.registry_snapshot(request.jobs)
+            if not snapshot.matches_jobs(request.jobs):
+                facts["error"] = "registry-generation-changed"
+            elif not snapshot.complete:
+                facts["error"] = snapshot.reason or "registry-incomplete"
+            elif (selected_registry_rows is not None
+                    and not snapshot.contains_current_attempt(
+                        selected_registry_rows,
+                        attempt_id=str(metadata.get("attempt_id") or ""),
+                        status=status)):
+                # A bounded selection identifies the owner candidate only. It
+                # cannot be promoted to complete authority or mixed with a
+                # different current registry generation at the terminal gate.
+                facts["error"] = "registry-generation-changed"
+            else:
+                facts["gates"] = _route_module().terminal_gate_observation(
+                    route, jobs=request.jobs, exact_terminal=True,
+                    registry_snapshot=snapshot)
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
         facts["error"] = str(getattr(exc, "code", type(exc).__name__))
     choice = decide_continuation(action="completion-state", facts=facts)

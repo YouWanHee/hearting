@@ -528,6 +528,56 @@ class RegistryView:
         return tuple(result)
 
 
+@dataclass(frozen=True, slots=True)
+class RegistrySnapshot:
+    """One complete registry generation with the exact lines decoded from it.
+
+    Selected authority envelopes intentionally remain separate: a bounded row
+    selection can identify candidates, but it cannot establish registry-wide
+    absence. Consumers that need absence proofs must use a complete snapshot.
+    """
+
+    path_identity: str
+    resolved_path: str
+    signature: tuple[int, int, int, int, int]
+    view: RegistryView
+    lines: tuple[str, ...]
+    complete: bool
+    reason: str = ""
+
+    def matches_jobs(self, jobs) -> bool:
+        path = Path(jobs)
+        try:
+            return (str(path.absolute()) == self.path_identity
+                    and str(path.resolve(strict=True)) == self.resolved_path
+                    and tuple(self.view.signature) == tuple(self.signature))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def contains_current_attempt(self, rows, *, attempt_id: str, status: str) -> bool:
+        """Match the selected owner row to this generation's current attempt.
+
+        This checks only the selected target. Registry-wide absence and
+        prerequisite proofs still use ``rows`` from the complete snapshot.
+        """
+        if (not self.complete or not attempt_id
+                or not isinstance(rows, (list, tuple))):
+            return False
+        latest, error = self.view.completion_attempt(attempt_id)
+        if error or latest is None or latest.status != status:
+            return False
+        latest_metadata = latest.completion_metadata()
+        try:
+            for fields, metadata in rows:
+                if (isinstance(fields, (list, tuple)) and isinstance(metadata, dict)
+                        and tuple(fields) == latest.fields
+                        and metadata == latest_metadata):
+                    return True
+        except (TypeError, ValueError):
+            return False
+        return False
+
+
 def _stable_read(path: Path, path_identity: str, *, start: int = 0):
     last_error = None
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -677,6 +727,38 @@ def registry_text_lines(jobs: Path) -> tuple[str, ...] | None:
     if scope is None:
         return None
     return _pinned_generation(scope, jobs)[1]
+
+
+def registry_snapshot(jobs: Path) -> RegistrySnapshot:
+    """Return the complete view and exact source lines from one stable generation.
+
+    Outside an existing pass, the temporary scope ensures the view and text
+    lines come from the same stable read. Inside a pass, every consumer of this
+    path receives the already pinned generation and a failed read stays failed
+    until that pass ends.
+    """
+    path = Path(jobs)
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        with registry_read_scope():
+            return registry_snapshot(path)
+    view, lines = _pinned_generation(scope, path)
+    reason = ""
+    if view.has_invalid_utf8:
+        reason = "registry-invalid-utf8"
+    elif view.has_partial_tail:
+        reason = "registry-partial-tail"
+    elif view.malformed_rows:
+        reason = "registry-malformed"
+    elif tuple(lines) != view.lines:
+        # The segmented view indexes LF records. Non-canonical splitlines
+        # separators remain readable for diagnostics but cannot prove absence.
+        reason = "registry-line-boundary-invalid"
+    return RegistrySnapshot(
+        path_identity=str(path.absolute()), resolved_path=view.resolved_path,
+        signature=tuple(view.signature), view=view, lines=tuple(lines),
+        complete=not reason, reason=reason,
+    )
 
 
 def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:

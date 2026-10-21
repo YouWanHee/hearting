@@ -7777,9 +7777,15 @@ def cmd_obligation_runner(args):
             settlement_context=settlement_context)
         if runner_incarnation:
             try:
-                _publish_watch_readiness(
-                    store, external_snapshot, read_context=read_context,
-                    incarnation=runner_incarnation)
+                # This is one complete readiness pass after service work may
+                # have changed jobs.log. Pin its own generation before selecting
+                # rows so every owner gate in the pass sees the same full view.
+                readiness_context = PeerReadContext(registry_append_only=True)
+                from dispatch_registry_cache import registry_read_scope
+                with registry_read_scope():
+                    _publish_watch_readiness(
+                        store, external_snapshot, read_context=readiness_context,
+                        incarnation=runner_incarnation)
             except Exception:
                 pass
         current_duties = store.list()

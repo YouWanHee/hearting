@@ -141,16 +141,84 @@ class RegistryLinesCacheTest(unittest.TestCase):
         with CACHE.registry_read_scope():
             self.assertEqual(len(CACHE.registry_text_lines(self.jobs)), 2)
 
+    def test_complete_snapshot_keeps_full_coverage_separate_from_selected_rows(self):
+        self.jobs.write_text(
+            "job\tdone\t/repo\t/wt\towner\tattempt_id=owner,attempt_schema_version=2\n"
+            "job\topen\t/repo\t/wt\tprerequisite\tattempt_id=prereq,attempt_schema_version=2\n",
+            encoding="utf-8")
+        CACHE.reset_metrics()
+        with CACHE.registry_read_scope():
+            view = CACHE.registry_view(self.jobs)
+            selected = view.select_rows(attempt_id="owner")
+            snapshot = CACHE.registry_snapshot(self.jobs)
+            self.assertTrue(snapshot.complete)
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(len(snapshot.view.records), 2)
+            self.assertEqual(snapshot.lines, view.lines)
+            self.assertTrue(snapshot.contains_current_attempt(
+                selected, attempt_id="owner", status="done"))
+            self.assertFalse(snapshot.contains_current_attempt(
+                [], attempt_id="owner", status="done"))
+            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 1)
+
+    def test_snapshot_keeps_malformed_partial_unicode_and_noncanonical_text_unknown(self):
+        damaged = (
+            (b"job\tdone\t/repo\t/wt\towner\tattempt_id=one\nmalformed\n",
+             "registry-malformed"),
+            (b"job\tdone\t/repo\t/wt\towner\tattempt_id=one", "registry-partial-tail"),
+            (b"job\tdone\t/repo\t/wt\towner\tvalue=\xff\n", "registry-invalid-utf8"),
+            (b"job\tdone\t/repo\t/wt\towner\tattempt_id=one\rnext\n",
+             "registry-malformed"),
+        )
+        for raw, reason in damaged:
+            with self.subTest(reason=reason):
+                self.jobs.write_bytes(raw)
+                snapshot = CACHE.registry_snapshot(self.jobs)
+                self.assertFalse(snapshot.complete)
+                self.assertEqual(snapshot.reason, reason)
+
+    def test_snapshot_missing_read_stays_missing_only_for_its_scope(self):
+        missing = self.jobs.with_name("appears-during-pass.log")
+        with CACHE.registry_read_scope():
+            with self.assertRaises(FileNotFoundError):
+                CACHE.registry_snapshot(missing)
+            missing.write_text("job\tdone\t/repo\t/wt\tone\tattempt_id=one\n",
+                               encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                CACHE.registry_snapshot(missing)
+        self.assertTrue(CACHE.registry_snapshot(missing).complete)
+
+    def test_snapshot_generation_isolated_by_jobs_root_and_refreshed_next_pass(self):
+        other = self.jobs.with_name("other-jobs.log")
+        self.jobs.write_text("job\topen\t/repo\t/wt\tfirst\tattempt_id=one\n",
+                             encoding="utf-8")
+        other.write_text("job\tdone\t/repo\t/wt\tsecond\tattempt_id=two\n",
+                         encoding="utf-8")
+        CACHE.reset_metrics()
+        with CACHE.registry_read_scope():
+            first = CACHE.registry_snapshot(self.jobs)
+            separate = CACHE.registry_snapshot(other)
+            self.assertNotEqual(first.path_identity, separate.path_identity)
+            self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 2)
+        with self.jobs.open("a", encoding="utf-8") as stream:
+            stream.write("job\topen\t/repo\t/wt\tthird\tattempt_id=three\n")
+        with CACHE.registry_read_scope():
+            fresh = CACHE.registry_snapshot(self.jobs)
+        self.assertNotEqual(first.signature, fresh.signature)
+        self.assertEqual(len(first.view.records), 1)
+        self.assertEqual(len(fresh.view.records), 2)
+        self.assertEqual(CACHE.metrics_snapshot()["content_reads"], 3)
+
     def test_scope_keeps_a_failed_read_failed_for_that_pass_only(self):
         missing = self.jobs.with_name("missing.log")
         with CACHE.registry_read_scope():
             with self.assertRaises(FileNotFoundError):
-                CACHE.registry_text_lines(missing)
+                CACHE.registry_snapshot(missing)
             missing.write_text("t\topen\t/repo\t/wt\tone\tattempt_id=one\n", encoding="utf-8")
             with self.assertRaises(FileNotFoundError):
-                CACHE.registry_view(missing)
+                CACHE.registry_snapshot(missing)
         with CACHE.registry_read_scope():
-            self.assertEqual(len(CACHE.registry_text_lines(missing)), 1)
+            self.assertTrue(CACHE.registry_snapshot(missing).complete)
 
     def test_unchanged_file_parses_only_once(self):
         self.jobs.write_text("a\tb\tc\td\te\tf=1\n", encoding="utf-8")
