@@ -677,6 +677,264 @@ class PathNamespaceSerializationTest(unittest.TestCase):
             compile(captured["runner"], "namespace-runner", "exec")
             self.assertIn("_ns_record_refusal(safe_fd, exc)", captured["runner"])
             self.assertIn('b"125\\n"', captured["runner"])
+            self.assertIn("_NamespaceRefusal('runner', 'runner failed: '", captured["runner"])
+
+    def test_mountinfo_chooses_top_stacked_mount_and_namespace_ids_are_not_rechecked(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        rows = [(10, "/", "rootfs"), (54, "/mnt/nas", "lab"),
+                (88, "/mnt/nas", "company")]
+        self.assertEqual(namespace["_ns_mount_id"]("/mnt/nas", rows), 88)
+        # Mount IDs are namespace-local. _ns_enter consumes the outside snapshot
+        # once and validates the bound paths by their captured inode identities.
+        self.assertNotIn("_ns_mount_id(source, rows_after)", G._PATH_NAMESPACE_SOURCE)
+
+    def test_namespace_identity_checks_compare_run_root_and_bound_target(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, target = root / "source", root / "target"
+            (source / "runs").mkdir(parents=True)
+            (target / "runs").mkdir(parents=True)
+            rows = [(42, str(source), "nfs"), (1, "/", "rootfs")]
+            libc = mock.MagicMock()
+            libc.unshare.return_value = 0
+            libc.mount.return_value = 0
+            original_stat = os.stat
+            calls = {"target": 0, "run_root": 0}
+            def fake_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                if path == str(target):
+                    calls["target"] += 1
+                    if calls["target"] > 1 and mismatch == "target":
+                        return SimpleNamespace(st_dev=value.st_dev + 1, st_ino=value.st_ino,
+                                               st_mode=value.st_mode)
+                if path == str(target / "runs") and mismatch.startswith("run_root"):
+                    calls["run_root"] += 1
+                    if calls["run_root"] > 1:
+                        return SimpleNamespace(st_dev=value.st_dev + (mismatch == "run_root_dev"),
+                                               st_ino=value.st_ino + (mismatch == "run_root_ino"),
+                                               st_mode=value.st_mode)
+                return value
+            for mismatch in ("run_root_dev", "run_root_ino", "target"):
+                calls.update(target=0, run_root=0)
+                with mock.patch.dict(namespace, {"_ns_mountinfo": mock.Mock(return_value=rows),
+                                                   "open": mock.mock_open()}), \
+                     mock.patch.object(namespace["_ns_os"].path, "ismount", return_value=True), \
+                     mock.patch.object(namespace["_ns_ctypes"], "CDLL", return_value=libc), \
+                     mock.patch.object(namespace["_ns_os"], "stat", side_effect=fake_stat), \
+                     mock.patch.object(namespace["_ns_os"], "chdir"):
+                    with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
+                        namespace["_ns_enter"]({str(target): str(source)}, str(target / "runs"))
+                self.assertEqual(caught.exception.code, "identity-mismatch")
+
+    def test_new_mount_ids_after_unshare_do_not_refuse_matching_identities(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source, target = base / "source", base / "target"
+            (source / "runs").mkdir(parents=True)
+            (target / "runs").mkdir(parents=True)
+            real_stat = os.stat
+            source_stat, runs_stat = real_stat(source), real_stat(source / "runs")
+            rows_before = [(54, str(source), "lab"), (1, "/", "rootfs")]
+            rows_after = [(2150, str(source), "lab"), (1364, "/", "rootfs")]
+            mountinfo = mock.Mock(side_effect=[rows_before, rows_after])
+            libc = mock.MagicMock()
+            libc.unshare.return_value = 0
+            libc.mount.return_value = 0
+            def fake_stat(path, *args, **kwargs):
+                if path == str(target): return source_stat
+                if path == str(target / "runs"): return runs_stat
+                return real_stat(path, *args, **kwargs)
+            with mock.patch.dict(namespace, {"_ns_mountinfo": mountinfo, "open": mock.mock_open()}), \
+                 mock.patch.object(namespace["_ns_os"].path, "ismount", return_value=True), \
+                 mock.patch.object(namespace["_ns_ctypes"], "CDLL", return_value=libc), \
+                 mock.patch.object(namespace["_ns_os"], "stat", side_effect=fake_stat), \
+                 mock.patch.object(namespace["_ns_os"], "chdir"):
+                root_fd, run_fd = namespace["_ns_enter"](
+                    {str(target): str(source)}, str(target / "runs"), "/")
+            self.assertGreaterEqual(root_fd, 0)
+            self.assertIsNone(run_fd)
+            namespace["_ns_os"].close(root_fd)
+            self.assertEqual(mountinfo.call_count, 1)
+
+    def test_namespaced_launch_restores_wrapper_wait_and_input_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            options = {"state_path": str(Path(td) / "state"),
+                       "observation": {"reachable": True, "gpus": []},
+                       "requested": "0", "task": "wait", "run_id": "wait-run",
+                       "run_dir": str(Path(td) / "run"), "inner": "true",
+                       "path_namespace": {"/target": "/source"},
+                       "run_root": "/target/runs"}
+            lease = {"token": "token", "pid": 77, "gpus": ["0"]}
+            context = mock.MagicMock()
+            context.__enter__.return_value = {"leases": {"token": lease}}
+            with mock.patch.object(G, "acquire", return_value=lease), \
+                 mock.patch.object(G, "release") as release, \
+                 mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G.subprocess, "call", return_value=1), \
+                 mock.patch.object(G.subprocess, "Popen") as popen_mock, \
+                 mock.patch.object(G, "locked", return_value=context), \
+                 mock.patch.object(G.time, "monotonic", side_effect=[0, 6]):
+                with self.assertRaisesRegex(G.GPUUnavailable, "did not establish its wrapper"):
+                    G.launch_compute_namespaced(options, G.serialized_payload_source())
+            release.assert_called_once_with(options["state_path"], lease)
+            popen_mock.assert_called_once()
+
+            bound = mock.MagicMock()
+            bound.__enter__.return_value = {"leases": {"token": {**lease, "pid": 88}}}
+            with mock.patch.object(G, "acquire", return_value=lease), \
+                 mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G.subprocess, "call", return_value=1), \
+                 mock.patch.object(G.subprocess, "Popen"), \
+                 mock.patch.object(G, "locked", return_value=bound), \
+                 mock.patch.object(G.time, "monotonic", side_effect=[0, 1]):
+                result = G.launch_compute_namespaced(options, G.serialized_payload_source())
+            self.assertEqual(result["gpu_lease"], lease)
+
+            # Child failure is synchronous and happens before either transport.
+            for lease_value in (None, lease):
+                run_dir = Path(td) / ("cpu" if lease_value is None else "gpu")
+                child_options = dict(options, run_dir=str(run_dir),
+                                     requested="" if lease_value is None else "0")
+                with mock.patch.object(G, "acquire", return_value=lease_value), \
+                     mock.patch.object(G, "release") as release_child, \
+                     mock.patch.object(G, "_ns_namespace_creation",
+                                       side_effect=G.GPUUnavailable("creation child failed: missing receipt")), \
+                     mock.patch.object(G.subprocess, "call") as tmux_check, \
+                     mock.patch.object(G.subprocess, "Popen") as child_popen:
+                    with self.assertRaisesRegex(G.GPUUnavailable, "missing receipt"):
+                        G.launch_compute_namespaced(child_options, G.serialized_payload_source())
+                    release_child.assert_called_once_with(child_options["state_path"], lease_value)
+                    tmux_check.assert_not_called()
+                    child_popen.assert_not_called()
+                    self.assertFalse(run_dir.exists())
+
+            for key, value in (("tmux_environment", []), ("tmux_environment", None),
+                               ("cwd", "relative"), ("cwd", "")):
+                bad = dict(options, **{key: value})
+                with mock.patch.object(G, "acquire", return_value=None), \
+                     mock.patch.object(G, "release") as release_bad, \
+                     mock.patch.object(G, "_ns_namespace_creation") as creation:
+                    with self.assertRaises(G.GPUUnavailable):
+                        G.launch_compute_namespaced(bad, G.serialized_payload_source())
+                    release_bad.assert_called_once()
+                    creation.assert_not_called()
+
+    def test_refusal_record_is_descriptor_relative_exclusive_and_ordered(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "run"
+            run.mkdir()
+            fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, fd)
+            error = namespace["_NamespaceRefusal"]("unshare", "unshare failed: EPERM (1)")
+            namespace["_ns_record_refusal"](fd, error)
+            self.assertEqual((run / "stop_reason").read_text(), "path-namespace-unshare\n")
+            self.assertEqual((run / "exit_code").read_text(), "125\n")
+            (run / "natural").write_text("0\n")
+            with self.assertRaises(FileExistsError):
+                namespace["_ns_os"].open("exit_code", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                           0o600, dir_fd=fd)
+            (run / "exit_code").unlink()
+            (run / "exit_code").symlink_to("natural")
+            with self.assertRaises(OSError):
+                namespace["_ns_record_refusal"](fd, error)
+            self.assertEqual((run / "natural").read_text(), "0\n")
+
+    def test_private_bind_proc_map_and_chdir_failures_are_closed(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        failures = [("private-mount", "private"), ("bind-mount", "bind"),
+                    ("setgroups", "setgroups"), ("uid-map", "uid_map"),
+                    ("gid-map", "gid_map"), ("cwd", "chdir")]
+        for expected, failure in failures:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                source, target = base / "source", base / "target"
+                (source / "runs").mkdir(parents=True)
+                (target / "runs").mkdir(parents=True)
+                real_stat = os.stat
+                source_stat = real_stat(source)
+                source_run_stat = real_stat(source / "runs")
+                rows = [(41, str(source), "nfs"), (1, "/", "rootfs")]
+                libc = mock.MagicMock()
+                libc.unshare.return_value = 0
+                mount_calls = {"n": 0}
+                def mount(*_args):
+                    mount_calls["n"] += 1
+                    if failure == "private" and mount_calls["n"] == 1:
+                        return -1
+                    if failure == "bind" and mount_calls["n"] == 2:
+                        return -1
+                    return 0
+                libc.mount.side_effect = mount
+                writes = []
+                class FakeFile(io.StringIO):
+                    def __init__(self, path):
+                        super().__init__()
+                        self.name = path
+                    def __enter__(self): return self
+                    def __exit__(self, *_args): return False
+                    def write(self, content):
+                        writes.append((self.name, content))
+                        if failure == self.name.rsplit("/", 1)[-1]:
+                            raise PermissionError(1, "denied")
+                        return len(content)
+                def fake_open(path, mode="r", **_kwargs):
+                    if path.startswith("/proc/self/"):
+                        if failure == path.rsplit("/", 1)[-1]:
+                            raise PermissionError(1, "denied")
+                        return FakeFile(path)
+                    return __builtins__["open"](path, mode)
+                def fake_stat(path, *args, **kwargs):
+                    if path == str(target): return source_stat
+                    if path == str(target / "runs"): return source_run_stat
+                    return real_stat(path, *args, **kwargs)
+                def chdir(_path):
+                    if failure == "chdir": raise OSError(1, "denied")
+                with mock.patch.dict(namespace, {"_ns_mountinfo": mock.Mock(return_value=rows),
+                                                   "open": fake_open}), \
+                     mock.patch.object(namespace["_ns_os"].path, "ismount", return_value=True), \
+                     mock.patch.object(namespace["_ns_ctypes"], "CDLL", return_value=libc), \
+                     mock.patch.object(namespace["_ns_ctypes"], "get_errno", return_value=1), \
+                     mock.patch.object(namespace["_ns_os"], "stat", side_effect=fake_stat), \
+                     mock.patch.object(namespace["_ns_os"], "chdir", side_effect=chdir):
+                    with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
+                        namespace["_ns_enter"]({str(target): str(source)}, str(target / "runs"), "/cwd")
+                self.assertEqual(caught.exception.code, expected)
+                self.assertFalse((source / "runs" / "new-run").exists())
+
+    def test_creation_child_waits_for_check_before_mkdir_and_reports_failure(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            checked = root / "checked"
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            def enter(*_args):
+                checked.write_text("verified")
+                return os.dup(fd), None
+            with mock.patch.dict(namespace, {"_ns_enter": enter}):
+                namespace["_ns_namespace_creation"]({"/target": "/source"},
+                                                      "/target/runs", str(run_dir), None)
+            self.assertEqual(checked.read_text(), "verified")
+            self.assertTrue(run_dir.is_dir())
+
+            failed_dir = root / "failed"
+            def refuse(*_args):
+                raise namespace["_NamespaceRefusal"]("unshare", "unshare failed: EPERM (1)")
+            with mock.patch.dict(namespace, {"_ns_enter": refuse}):
+                with self.assertRaisesRegex(namespace["_NamespaceRefusal"], "creation child failed"):
+                    namespace["_ns_namespace_creation"]({"/target": "/source"},
+                                                          "/target/runs", str(failed_dir), None)
+            self.assertFalse(failed_dir.exists())
+            os.close(fd)
 
 
 if __name__ == "__main__":

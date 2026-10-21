@@ -2025,6 +2025,112 @@ class PathNamespaceInventoryTest(unittest.TestCase):
         self.assertIn("path_namespace", script)
         self.assertIn(str(run_root), script)
 
+    def test_configured_self_launcher_refuses_all_run_root_commands_before_access(self):
+        target = {"ssh_host": "remote.example"}
+        self_host = {"ssh_host": "local", "path_namespace": {"/home/nas": "/mnt/lab"}}
+        config = {"run_root": Path(self.tmp.name) / "must-not-touch",
+                  "hosts": {"self": self_host, "other": target}}
+        module = self.module
+        calls = (
+            (module.cmd_run, SimpleNamespace(host="other", command=["true"], dry_run=True, name=None)),
+            (module.cmd_claim, SimpleNamespace(host="other", session=None, harness=None, pid=1)),
+            (module.cmd_runs, SimpleNamespace(limit=10, host=None, json=False)),
+            (module.cmd_tail, SimpleNamespace(run_id="anything", lines=10)),
+            (module.cmd_stop, SimpleNamespace(run_id="anything")),
+            (module.cmd_watch_run, SimpleNamespace(run_dir=str(config["run_root"] / "anything"))),
+        )
+        for command, args in calls:
+            with self.subTest(command=command.__name__), \
+                 mock.patch.object(module, "load_config", return_value=config), \
+                 mock.patch.object(module.Path, "is_dir", side_effect=AssertionError("run_root accessed")), \
+                 mock.patch.object(module, "_run_id", side_effect=AssertionError("run_id reached")), \
+                 mock.patch.object(module, "remote", side_effect=AssertionError("remote reached")):
+                with self.assertRaisesRegex(module.ConfigError, "path_namespace refuses local"):
+                    command(args)
+
+    def test_configured_self_probe_and_list_skip_claim_root(self):
+        config = {"run_root": Path(self.tmp.name) / "must-not-touch",
+                  "hosts": {"self": {"ssh_host": "local",
+                                      "path_namespace": {"/home/nas": "/mnt/lab"}}}}
+        module = self.module
+        row = {"host": "self", "reachable": True, "gpus": [], "load": "0",
+               "cpu_utilization_pct": 0, "gpu_status": None}
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.object(module, "_probe_selected", return_value=[row]) as probe, \
+             mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(module.cmd_list(SimpleNamespace(hosts=[], static=False, json=False)), 0)
+            self.assertIsNone(probe.call_args.args[1])
+            self.assertEqual(module.cmd_probe(SimpleNamespace(hosts=[], json=True)), 0)
+            self.assertIsNone(probe.call_args.args[1])
+
+    def test_configured_host_non_run_remote_scripts_match_unconfigured(self):
+        module = self.module
+        plain = {"ssh_host": "fixture.example"}
+        mapped = {**plain, "path_namespace": {"/home/nas": "/home/nas_IIP"}}
+        captured = []
+        def capture(_host, script, **_kwargs):
+            captured.append(script)
+            if "HEARTING_CLAIM_PID" in script:
+                return subprocess.CompletedProcess([], 0, json.dumps(
+                    {"pid": 7, "start": 11, "cmdline_sha256": "fixture"}), "")
+            return subprocess.CompletedProcess([], 0, json.dumps({"gpus": [], "gpu_leases": []}), "")
+
+        with mock.patch.object(module, "remote", side_effect=capture), \
+             mock.patch.object(module, "collect_ssh_session_bridges", return_value=[]):
+            module.probe_host("mpwav", plain, [], [])
+            probe_plain = captured.pop()
+            module.probe_host("mpwav", mapped, [], [])
+            self.assertEqual(probe_plain, captured.pop())
+
+        for host in (plain, mapped):
+            config = {"run_root": Path(self.tmp.name), "hosts": {"mpwav": host}}
+            with mock.patch.object(module, "load_config", return_value=config), \
+                 mock.patch.object(module, "remote", side_effect=capture), \
+                 mock.patch.object(module, "_record_claim"), \
+                 mock.patch("sys.stdout", io.StringIO()):
+                args = SimpleNamespace(host="mpwav", session="session", harness="codex",
+                                       pid=7, json=True)
+                self.assertEqual(module.cmd_claim(args), 0)
+        claim_plain, claim_mapped = captured[-2:]
+        self.assertEqual(claim_plain, claim_mapped)
+
+        captured.clear()
+        def capture_stop(_host, script, **_kwargs):
+            captured.append(script)
+            return subprocess.CompletedProcess([], 1, "", "")
+        state = {"meta": {"host": "mpwav", "tmux_transport": {
+                    "kind": "hearting-tmux-v1", "server": "hearting-0123456789abcdefabcd"}},
+                 "dir": Path(self.tmp.name), "exit_code": None, "stop_reason": None}
+        for host in (plain, mapped):
+            config = {"run_root": Path(self.tmp.name), "hosts": {"mpwav": host}}
+            with mock.patch.object(module, "load_config", return_value=config), \
+                 mock.patch.object(module, "_run_state", return_value=state), \
+                 mock.patch.object(module, "remote", side_effect=capture_stop):
+                self.assertEqual(module.cmd_stop(SimpleNamespace(run_id="fixture-run")), 0)
+                module._tmux_session_alive(host, "fixture-run", transport=state["meta"]["tmux_transport"])
+        self.assertEqual(captured[0], captured[2])
+        self.assertEqual(captured[1], captured[3])
+
+    def test_namespace_refusal_record_is_terminal_to_state_and_watch(self):
+        module = self.module
+        run_dir = Path(self.tmp.name) / "run"
+        run_dir.mkdir()
+        (run_dir / "stop_reason").write_text("path-namespace-unshare\n")
+        (run_dir / "exit_code").write_text("125\n")
+        meta = {"run_id": "fixture-run", "host": "mpwav",
+                "provenance": {"notify": {"harness": "codex", "id": "session-1"}}}
+        (run_dir / "meta.json").write_text(json.dumps(meta))
+        config = {"run_root": Path(self.tmp.name), "hosts": {}}
+        state = module._run_state(config, "run")
+        self.assertEqual((state["state"], state["exit_code"], state["stop_reason"]),
+                         ("finished", 125, "path-namespace-unshare"))
+        notice = mock.Mock()
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.dict(sys.modules, {"session_notice": SimpleNamespace(notify=notice)}):
+            self.assertEqual(module.cmd_watch_run(SimpleNamespace(run_dir=str(run_dir))), 0)
+        notice.assert_called_once()
+        self.assertIn("exit 125", notice.call_args.kwargs["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

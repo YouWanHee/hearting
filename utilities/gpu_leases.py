@@ -700,9 +700,10 @@ def _ns_fail_errno(code, operation, err, extra=""):
     raise _NamespaceRefusal(code, message)
 
 def _ns_mount_id(path, rows):
-    candidates = [(mid, mount) for mid, mount, _source in rows
+    candidates = [(index, mid, mount) for index, (mid, mount, _source) in enumerate(rows)
                   if path == mount or _ns_below(mount, path)]
-    return max(candidates, key=lambda row: len(row[1]))[0] if candidates else None
+    # Mountinfo lists stacked mounts in order; the last longest match is visible.
+    return max(candidates, key=lambda row: (len(row[2]), row[0]))[1] if candidates else None
 
 def _ns_enter(mapping, run_root, cwd=None, run_dir=None):
     pairs, covered = _ns_validate(mapping, run_root)
@@ -788,17 +789,12 @@ def _ns_enter(mapping, run_root, cwd=None, run_dir=None):
         _ns_os.close(root_fd)
         if run_fd is not None: _ns_os.close(run_fd)
         raise _NamespaceRefusal("identity-mismatch", "run_root identity mismatch: " + run_root)
-    rows_after = _ns_mountinfo()
-    for target, source, dev, ino, mount_id in captured:
-        if _ns_mount_id(source, rows_after) != mount_id:
-            _ns_os.close(root_fd)
-            if run_fd is not None: _ns_os.close(run_fd)
-            raise _NamespaceRefusal("identity-mismatch", "run_root identity mismatch: " + run_root)
+    for target, source, dev, ino, _mount_id in captured:
         visible = _ns_os.stat(target)
         if (visible.st_dev, visible.st_ino) != (dev, ino):
             _ns_os.close(root_fd)
             if run_fd is not None: _ns_os.close(run_fd)
-            raise _NamespaceRefusal("identity-mismatch", "run_root identity mismatch: " + target)
+            raise _NamespaceRefusal("identity-mismatch", "bound target identity mismatch: " + target)
     if run_dir:
         visible_run = _ns_os.stat(run_dir)
         if (visible_run.st_dev, visible_run.st_ino) != (run_stat.st_dev, run_stat.st_ino):
@@ -895,6 +891,14 @@ def launch_compute_namespaced(options, payload_source):
     inner = options["inner"].replace("__HEARTING_GPU_SETUP__",
         "export CUDA_VISIBLE_DEVICES=%s" % shlex.quote(devices) if devices is not None else ":")
     mapping, run_root = options["path_namespace"], options["run_root"]
+    launch_cwd = "/" if options.get("cwd") is None else options["cwd"]
+    if not isinstance(launch_cwd, str) or not os.path.isabs(launch_cwd):
+        release(path, lease)
+        raise GPUUnavailable("compute launch directory must be absolute")
+    tmux_environment = options.get("tmux_environment", {})
+    if not isinstance(tmux_environment, dict):
+        release(path, lease)
+        raise GPUUnavailable("invalid tmux launch environment")
     try:
         _ns_namespace_creation(mapping, run_root, options["run_dir"], options.get("cwd"))
         runner = payload_source + "\n" + _PATH_NAMESPACE_SOURCE + "\n" + (
@@ -910,7 +914,7 @@ def launch_compute_namespaced(options, payload_source):
             "    print(str(exc), file=__import__('sys').stderr)\n"
             "    raise SystemExit(125)\n"
             "except Exception as raw:\n"
-            "    exc = _NamespaceRefusal('child', 'creation child failed: ' + str(raw))\n"
+            "    exc = _NamespaceRefusal('runner', 'runner failed: ' + str(raw))\n"
             "    if safe_fd is not None:\n"
             "        try: _ns_record_refusal(safe_fd, exc)\n"
             "        except OSError: pass\n"
@@ -926,7 +930,7 @@ def launch_compute_namespaced(options, payload_source):
                 path, lease, path, lease, path, lease, inner)
         command = "python3 -c " + shlex.quote(runner)
         env = dict(os.environ)
-        tmux_environment = dict(options.get("tmux_environment") or {})
+        tmux_environment = dict(tmux_environment)
         for key in (*_TMUX_SESSION_ENV_KEYS, "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
                     "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
                     "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE"):
@@ -951,6 +955,16 @@ def launch_compute_namespaced(options, payload_source):
                 subprocess.Popen(["python3", "-c", runner], stdin=stdin, stdout=output,
                                  stderr=output, start_new_session=True, cwd="/")
             transport = {"kind": "nohup-v1"}
+        deadline = time.monotonic() + 5
+        while lease and time.monotonic() < deadline:
+            with locked(path) as data:
+                current = data["leases"].get(lease["token"])
+                if current is None or current["pid"] != lease["pid"]:
+                    break
+            time.sleep(.02)
+        else:
+            if lease:
+                raise GPUUnavailable("GPU launch did not establish its wrapper")
         return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport}
     except Exception:
         release(path, lease)
