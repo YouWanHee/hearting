@@ -834,11 +834,15 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
                          "sidless native result did not reach the watch receipt")
         receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
         observation = peer_steward._read_json(paths.observation) or {}
+        native_session_id = (observation.get("native_wait") or {}).get(
+            "agent", {}).get("session_id")
+        if native_session_id in {None, ""}:
+            native_session_id = "-"
         identity = peer_steward._watch_readiness_identity(arm, "idle")
         store = peer_steward.peer_obligations.ObligationStore(self.state_root)
         projection = shared_readiness.target_result(store.root, identity)
         self.assertEqual((arm["agent"]["session_id"],
-                          (observation.get("native_wait") or {}).get("agent", {}).get("session_id"),
+                          native_session_id,
                           receipt["state"], projection["state"], projection["reason"]),
                          ("-", "-", "idle", "ready", "native-turn-ready"))
         from dispatch_seat_handover import acknowledge_watch
