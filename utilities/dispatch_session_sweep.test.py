@@ -1121,9 +1121,10 @@ const session = {
   messages: async () => ({data: nativeMessages}), prompt: async () => ({data: null}),
   promptAsync: async (request) => {
     prompts.push(request);
-    if (MODE === "accept") nativeMessages.push({
+    if (MODE === "accept" || MODE === "timeout-native") nativeMessages.push({
       info: {sessionID: "ses-oc-parent", role: "user"}, parts: request.body.parts,
     });
+    if (MODE.startsWith("timeout")) throw new Error("carrier-timeout");
     return MODE === "accept" ? {data: undefined, response: {ok: true, status: 204}} : {error: {name: "NotFound"}, response: {ok: false, status: 404}};
   },
 };
@@ -1282,6 +1283,26 @@ await new Promise(r => setTimeout(r, 1500));
         self.assertEqual(self.state(), "pending")
         self.assertIn("not-accepted", [item["extra"]["reason"] for item in result["logs"]
                                        if item["service"] == "hearting-completion-carrier"])
+
+    def test_timeout_with_exact_native_user_message_settles_without_resend(self):
+        self.seed_turn()
+        result = self.run_plugin(self.IDLE_THEN_WAIT, prompt_async="timeout-native")
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertEqual(self.state(), "acked")
+        carrier = [item["extra"] for item in result["logs"]
+                   if item["service"] == "hearting-completion-carrier"]
+        self.assertIn(("prompt", "timeout"), [(item["stage"], item["reason"]) for item in carrier])
+        self.assertIn(("settle", "native-receipt"), [(item["stage"], item["reason"]) for item in carrier])
+
+    def test_timeout_without_native_user_message_releases_for_fallback(self):
+        self.seed_turn()
+        result = self.run_plugin(self.IDLE_THEN_WAIT, prompt_async="timeout-absent")
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertEqual(self.state(), "pending")
+        carrier = [item["extra"] for item in result["logs"]
+                   if item["service"] == "hearting-completion-carrier"]
+        self.assertIn(("settle", "release-fallback"),
+                      [(item["stage"], item["reason"]) for item in carrier])
 
     def test_a_pruned_import_root_keeps_the_exact_registry_and_wakes_the_parent(self):
         for cached_roots in (False, True):
