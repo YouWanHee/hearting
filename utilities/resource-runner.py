@@ -303,7 +303,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         wait_read, release = os.pipe()
         # Bash is required because retained generation descriptors can be multi-digit;
         # dash rejects dynamic fd duplication for descriptors >= 10.
-        launch_argv = ["/bin/bash", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
+        # -p skips ambient Bash startup files/functions/options before the release
+        # fence, while leaving the payload's environment intact.
+        launch_argv = ["/bin/bash", "-p", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                        + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
         environment.update(progress_environment(placeholder))
         environment.update(HEARTING_GPU_LEASE_RELEASE="")
@@ -650,7 +652,7 @@ def _main(argv=None, *, controller=None):
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             raise
         wait_read, release = os.pipe()
-        launch_argv=["/bin/bash","-c",'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
+        launch_argv=["/bin/bash","-p","-c",'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                      + SENTINEL_SCRIPT,"resource-runner",*command]
         environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
                      "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve()),
