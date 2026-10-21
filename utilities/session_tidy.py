@@ -1558,7 +1558,7 @@ def _compact_body(compact: dict) -> str:
     summary_text = str(compact.get("summary") or "")
     recent = str(compact.get("recent") or "")
     preserved = str(compact.get("recent_preserved") or "")
-    post_recent = str(compact.get("recent_post") or recent)
+    post_recent = str(compact.get("recent_post", recent) or "")
     source = _cut_bytes(_normalize_body(str(compact.get("source") or compact.get("transcript") or "")),
                         COMPACT_METADATA_MAX_BYTES)[0]
     partial_note = "\n[최근 대화의 일부만 보존됨; 원본 기록을 확인하세요.]" if compact.get("recent_partial") else ""
@@ -1596,9 +1596,11 @@ def update_compact_card_locked(seat: Seat, generation: int, identity: str, *, re
     if (not card or int(card.get("generation", 0)) != int(generation)
             or not isinstance(compact, dict) or compact.get("identity") != identity):
         return False
-    compact["recent"] = _cut_bytes(_normalize_body(recent), COMPACT_RECENT_MAX_BYTES)[0]
+    compact["recent"], recent_cut = _cut_bytes(_normalize_body(recent), COMPACT_RECENT_MAX_BYTES)
     compact["recent_post"] = compact["recent"]
-    compact["recent_preserved"] = _cut_bytes(_normalize_body(recent_preserved), COMPACT_RECENT_MAX_BYTES)[0]
+    # Preserve the original total tail budget, prioritizing the newest dialogue.
+    remaining = COMPACT_RECENT_MAX_BYTES - len(compact["recent"].encode("utf-8"))
+    compact["recent_preserved"], preserved_cut = _cut_bytes(_normalize_body(recent_preserved), remaining)
     if isinstance(last_reply, dict) and last_reply.get("first_line"):
         compact["last_reply"] = {
             "uuid": str(last_reply.get("uuid") or "")[:96],
@@ -1606,7 +1608,7 @@ def update_compact_card_locked(seat: Seat, generation: int, identity: str, *, re
             "timestamp": str(last_reply.get("timestamp") or "")[:64],
             "first_line": _cut_bytes(_normalize_body(str(last_reply["first_line"])), 1024)[0],
         }
-    compact["recent_partial"] = bool(recent_partial)
+    compact["recent_partial"] = bool(recent_partial or recent_cut or preserved_cut)
     if source:
         compact["source"] = _cut_bytes(_normalize_body(source), COMPACT_METADATA_MAX_BYTES)[0]
     card["body"] = _compact_body(compact)
