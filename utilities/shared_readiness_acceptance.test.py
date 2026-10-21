@@ -74,6 +74,7 @@ def _lifecycle_child(evidence_dir):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     cleanup_results = []
+    supplemental_cleanup_results = []
     original_cleanup = module.LifecycleRunnerProcessTest._cleanup_processes
 
     def record_cleanup(test_case):
@@ -107,7 +108,12 @@ def _lifecycle_child(evidence_dir):
                 "ok": (all(item["reaped"] for item in watcher_rows)
                        and runner_reaped and locked_fd_closed),
             }
-            cleanup_results.append(row)
+            if (test_case._testMethodName ==
+                    "test_runner_recovers_independent_watches_and_refreshes_without_jobs_change"
+                    and runner_pid is not None and len(watcher_rows) == 6):
+                cleanup_results.append(row)
+            else:
+                supplemental_cleanup_results.append(row)
 
             if (module.EVIDENCE_ROWS
                     and test_case._testMethodName ==
@@ -147,11 +153,13 @@ def _lifecycle_child(evidence_dir):
         "errors": ["lifecycle suite did not write its evidence file"],
         "fixtures": [],
     }
-    cleanup_status = ("pass" if cleanup_results and
-                      all(row.get("ok") for row in cleanup_results) else "fail")
+    all_cleanup_rows = [*cleanup_results, *supplemental_cleanup_results]
+    cleanup_status = ("pass" if cleanup_results and all_cleanup_rows
+                      and all(row.get("ok") for row in all_cleanup_rows) else "fail")
     evidence["fixture_cleanup"] = {
         "status": cleanup_status,
         "results": cleanup_results,
+        "supplemental_results": supplemental_cleanup_results,
         "ownership": "unittest process cleanup, under the assigned verification lease",
     }
     evidence["suite_exit_code"] = suite_exit
